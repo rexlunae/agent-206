@@ -596,8 +596,15 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let control = Control::bind(&directory.path().join("control"), 1).unwrap();
         let diagnostic = Id::new_v4().to_string();
-        let mut child = shell(&format!("echo {diagnostic} >&2; sleep 5 & exit 3"));
-        let error = control.ready(&mut child).await.unwrap_err();
+        // The descendant outlives any reasonable wait; it ends on its own.
+        let mut child = shell(&format!("echo {diagnostic} >&2; sleep 60 & exit 3"));
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            control.ready(&mut child),
+        )
+        .await
+        .expect("an open stderr must not hold up the result")
+        .unwrap_err();
         let BackendError::SandboxExited {
             diagnostic: reported,
             ..
