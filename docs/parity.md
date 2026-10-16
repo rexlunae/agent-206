@@ -14,7 +14,7 @@ WASM tools, MessagePack APIs, API-only model facts, fc-dioxus shared UI). Status
 **present** (works end to end in a206), **partial** (structure or subset exists), **missing**.
 
 Key a206 facts that drive most rows: the native engine is text-only, no tool-call loop
-(`a206/crates/runtime/src/provider.rs:342` sends `"stream": false`, no `tools`); credentialed providers
+(`a206/crates/runtime/src/provider.rs` streams text but sends no `tools`); credentialed providers
 now go through the vault broker (survey time: refused); the agent-facing surface is the MCP harness with
 one tool, `rename_thread` (`a206/crates/runtime/src/mcp.rs`); the `Command` enum
 (`a206/crates/core/src/lib.rs:418`) is the entire gateway API; WASM ABI v1 has no inputs or host calls
@@ -47,7 +47,7 @@ one tool, `rename_thread` (`a206/crates/runtime/src/mcp.rs`); the `Command` enum
 | `ask_user` structured prompts (`user_prompt_types.rs`, desktop `user_prompt.rs`) | missing | Typed prompt event + UI response command |
 | Tool-call healing: malformed JSON, dupes, leaked markup (`tool_healing.rs`) | missing | Part of run engine's parse stage |
 | Tool-output compression rules (`rc/crates/tokenjuice`, `tool_pipeline.rs`) | missing | Reusable crate (MIT attribution); TOML rule overlays |
-| Provider SSE streaming OpenAI/Anthropic (`streaming.rs`, `gateway/providers/mod.rs`) | partial: streamed text only from external backends; native `stream:false` (`provider.rs:342`) | Stream deltas as durable events with cursors |
+| Provider SSE streaming OpenAI/Anthropic (`streaming.rs`, `gateway/providers/mod.rs`) | present for text: native OpenAI-compatible, Anthropic and Gemini replies stream; the broker relays credentialed bodies in bounded, ordered frames (protocol v4, negotiated down to v3 brokers, which answer buffered); bounded incremental SSE decoding (`a206/crates/runtime/src/sse.rs`); deltas published as journaled `ThreadChanged` events at most every 100 ms; lock, pairing revocation, cancellation and client disconnect stop the upstream request; mid-stream failures keep partial text in a Failed run with a structured report. Streamed tool calls, reasoning/thinking display and retries are not implemented | Streamed tool-call deltas with the run engine; per-delta event payloads if snapshot republishing becomes too costly |
 | Context compaction at 75% window + pre-compaction memory flush (`gateway/helpers.rs`, `memory_flush.rs`) | missing (context used/limit widget only) | Use API-reported context limit; unknown limit ⇒ no auto-compaction, user control |
 | Retry policy + model/auth-profile failover (`retry/policy.rs`, `models/failover.rs`) | missing | Retries with explicit external-effect semantics; **no silent model fallback** (thread allowlist) |
 | System prompt + workspace files SOUL/AGENTS/TOOLS/MEMORY (`soul.rs`, `workspace_context.rs`, `gateway/system_prompt.rs`) | partial: editable per-mode prompts (`ui/src/settings.rs` PromptEditor) | Project-scoped instruction files read via ReadWorkspace grant |
@@ -142,10 +142,10 @@ one tool, `rename_thread` (`a206/crates/runtime/src/mcp.rs`); the `Command` enum
 
 | RustyClaw command | Agent 206 status (`a206/crates/app/src/main.rs` Action) | Notes |
 | --- | --- | --- |
-| `setup`, `onboard`, `configure` | missing | Same enrollment state machine as GUI (`docs/cli.md`) |
-| `import` (OpenClaw), `refresh-token` | missing | Adapters per `docs/imports.md` |
+| `setup`, `onboard`, `configure` | partial: `setup [--local\|--ssh]` resumes gateway, vault, TOTP and pairing on the shared flows, then runs doctor (`a206/crates/app/src/setup_cli.rs`); no `onboard`/`configure` aliases (their provider-key flags do not match) | Desktop/TUI wizard on the same steps; provider step |
+| `import` (OpenClaw), `refresh-token` | partial: `import rustyclaw [PATH] [--apply]` with preview, broker-only vault copy and receipts (`a206/crates/import`); OpenClaw and `refresh-token` missing | More adapters per `docs/imports.md`; OAuth import through the broker |
 | `config get/set/unset` | partial: `settings [--apply FILE]` TOML | Field-level commands |
-| `doctor [--repair]` | missing | Read-only by default |
+| `doctor [--repair]` | partial: read-only `doctor [--toml]` over profile, gateway, broker, pairing and providers (`a206/crates/runtime/src/doctor.rs`), also on the desktop/TUI Gateway page; no `--repair` | Explicit, reviewed repairs |
 | `tui`, `desktop` | present | TUI interaction QA pending |
 | `command`, `ask` | partial: `new`, `chat THREAD TEXT`, `cancel` | Streaming, stdin/file prompts |
 | `status`, `gateway start/stop/restart/status/reload/run` | present (no `reload`; adds `reconnect`, `--stdio`) | — |
@@ -157,7 +157,7 @@ one tool, `rename_thread` (`a206/crates/runtime/src/mcp.rs`); the `Command` enum
 
 | RustyClaw capability | Agent 206 status | How it should land |
 | --- | --- | --- |
-| Onboard wizard: provider, key, vault, workspace, messaging, skills (`rustyclaw-onboard/src/*`) | missing | GUI-first wizard; CLI uses same API |
+| Onboard wizard: provider, key, vault, workspace, messaging, skills (`rustyclaw-onboard/src/*`) | partial: CLI `setup` walkthrough (gateway, vault, TOTP, pairing); the desktop/TUI have the gateway setup screen and Security page but no single wizard | GUI-first wizard; CLI uses same API |
 | First-run "hatching" SOUL personality (desktop `components/hatching.rs`) | missing | Optional mode-prompt step |
 | Panels: secrets, vault unlock, credential request, approvals, cron, memory, MCP, channels, messengers, skills, services, engines, logs, analytics, system info, swarm, tool perms (desktop `components/*`, TUI `components/*_dialog.rs`) | partial: workspace, conversations, projects, connections, downloads, extensions, browser, documents, appearance, modes, security (vault create/unlock/lock, gateway pairing and TOTP enrollment for local profiles; `ui/src/vault.rs`), Joshua, gateway (`ui/src/route.rs`); secrets, credential request and approvals panels are not built | Each lands as routes when backing feature exists; no placeholder controls |
 | TUI slash commands + tab completion (`rustyclaw-tui/src/components/command_menu.rs`) | partial: shared Dioxus TUI renders, untested interaction | Command palette in shared fc-dioxus |

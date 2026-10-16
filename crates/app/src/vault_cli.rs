@@ -155,21 +155,21 @@ fn policy(policy: Policy, skills: Vec<String>, triggers: Vec<String>) -> AccessP
     }
 }
 
-fn hidden(prompt: &str) -> Result<WireSecret> {
+pub(crate) fn hidden(prompt: &str) -> Result<WireSecret> {
     Ok(WireSecret::new(rpassword::prompt_password(prompt)?))
 }
 
-async fn connect(root: &Path) -> Result<Client> {
+pub(crate) async fn connect(root: &Path) -> Result<Client> {
     Ok(vault::connect(root).await?)
 }
 
-async fn status(client: &mut Client) -> Result<a206_broker::BrokerStatus> {
+pub(crate) async fn status(client: &mut Client) -> Result<a206_broker::BrokerStatus> {
     Ok(vault::status(client).await?)
 }
 
 /// Unlock with the password, then the authenticator code only when the
 /// encrypted vault says two-factor is enrolled.
-async fn unlock(client: &mut Client, create: bool) -> Result<()> {
+pub(crate) async fn unlock(client: &mut Client, create: bool) -> Result<()> {
     let password = hidden(if create {
         "New vault password: "
     } else {
@@ -230,7 +230,7 @@ async fn step_up(client: &mut Client) -> Result<()> {
     }
 }
 
-async fn pair_if_running(client: &mut Client, root: &Path) -> Result<()> {
+pub(crate) async fn pair_if_running(client: &mut Client, root: &Path) -> Result<()> {
     if vault::gateway_running(root).await {
         // The unlock itself succeeded; a failed pairing is reported, not fatal.
         match vault::pair_gateway(client, root).await {
@@ -300,6 +300,35 @@ async fn set_disabled(client: &mut Client, name: String, disabled: bool) -> Resu
         "Credential {}",
         if disabled { "disabled" } else { "enabled" }
     );
+    Ok(())
+}
+
+/// Enroll an authenticator: the broker generates the seed and commits it only
+/// after a code from the app matches.
+pub(crate) async fn enroll_totp(client: &mut Client, account: String) -> Result<()> {
+    step_up(client).await?;
+    let Reply::TotpEnrollment {
+        otpauth_url,
+        manual_key,
+        ..
+    } = client.call(Request::BeginTotp { account }).await?
+    else {
+        bail!("unexpected broker reply");
+    };
+    println!("Add this account to your authenticator app.");
+    println!("Setup key: {}", manual_key.expose());
+    println!("Or open: {}", otpauth_url.expose());
+    loop {
+        let code = rpassword::prompt_password("Code from the app: ")?;
+        match client.call(Request::ConfirmTotp { code }).await {
+            Ok(_) => break,
+            Err(ClientError::Broker(BrokerError::AuthenticationFailed)) => {
+                eprintln!("That code did not match; try the next one.");
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    println!("Two-factor authentication enrolled");
     Ok(())
 }
 
@@ -532,31 +561,7 @@ pub fn run(root: &Path, action: VaultAction) -> Result<()> {
                 }
             }
             VaultAction::Totp { command } => match command {
-                TotpAction::Enroll { account } => {
-                    step_up(&mut client).await?;
-                    let Reply::TotpEnrollment {
-                        otpauth_url,
-                        manual_key,
-                        ..
-                    } = client.call(Request::BeginTotp { account }).await?
-                    else {
-                        bail!("unexpected broker reply");
-                    };
-                    println!("Add this account to your authenticator app.");
-                    println!("Setup key: {}", manual_key.expose());
-                    println!("Or open: {}", otpauth_url.expose());
-                    loop {
-                        let code = rpassword::prompt_password("Code from the app: ")?;
-                        match client.call(Request::ConfirmTotp { code }).await {
-                            Ok(_) => break,
-                            Err(ClientError::Broker(BrokerError::AuthenticationFailed)) => {
-                                eprintln!("That code did not match; try the next one.");
-                            }
-                            Err(error) => return Err(error.into()),
-                        }
-                    }
-                    println!("Two-factor authentication enrolled");
-                }
+                TotpAction::Enroll { account } => enroll_totp(&mut client, account).await?,
                 TotpAction::Remove => {
                     let password = hidden("Vault password: ")?;
                     let code = rpassword::prompt_password("Authenticator code: ")?;

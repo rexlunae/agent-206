@@ -2,6 +2,38 @@
 use crate::{Id, ProviderConfig};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
+/// A provider endpoint the gateway refuses to call.
+#[derive(Debug, thiserror::Error)]
+pub enum EndpointError {
+    #[error("provider endpoint is not a valid URL")]
+    Url(#[from] url::ParseError),
+    #[error("endpoint must not contain credentials, query or fragment")]
+    Shape,
+    #[error("use HTTPS or an SSH-forwarded loopback endpoint")]
+    Insecure,
+    #[error("API path escaped the configured endpoint")]
+    Escaped,
+}
+/// A provider account's endpoint as a directory URL, refused unless it is
+/// HTTPS or loopback HTTP without credentials, query or fragment.
+pub fn base_url(base_url: &str) -> Result<url::Url, EndpointError> {
+    let url = url::Url::parse(&format!("{}/", base_url.trim_end_matches('/')))?;
+    if !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(EndpointError::Shape);
+    }
+    let local = url
+        .host_str()
+        .is_some_and(|h| matches!(h, "localhost" | "127.0.0.1" | "[::1]" | "::1"));
+    if url.scheme() == "https" || (url.scheme() == "http" && local) {
+        Ok(url)
+    } else {
+        Err(EndpointError::Insecure)
+    }
+}
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderApi {

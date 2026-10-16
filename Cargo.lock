@@ -54,6 +54,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "a206-import"
+version = "0.1.0"
+dependencies = [
+ "a206-core",
+ "rmp-serde",
+ "serde",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.21",
+ "toml 0.9.12+spec-1.1.0",
+ "url",
+ "uuid",
+]
+
+[[package]]
 name = "a206-protocol"
 version = "0.1.0"
 dependencies = [
@@ -228,6 +243,7 @@ dependencies = [
  "a206-broker",
  "a206-core",
  "a206-extensions",
+ "a206-import",
  "a206-protocol",
  "a206-runtime",
  "a206-sandbox",
