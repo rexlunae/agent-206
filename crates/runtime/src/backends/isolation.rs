@@ -487,12 +487,11 @@ mod linux {
                             Err(_) => {
                                 let mut diagnostic = Vec::new();
                                 if let Some(stderr) = child.stderr.take() {
-                                    // Whatever arrived is the diagnostic; a read error leaves it partial.
-                                    stderr
-                                        .take(MAX_DIAGNOSTIC)
-                                        .read_to_end(&mut diagnostic)
-                                        .await
-                                        .ignore();
+                                    // Whatever arrived is the diagnostic; a read error, or a
+                                    // descendant still holding stderr open, leaves it partial.
+                                    let mut stderr = stderr.take(MAX_DIAGNOSTIC);
+                                    let read = stderr.read_to_end(&mut diagnostic);
+                                    tokio::time::timeout(EXIT_GRACE, read).await.ignore();
                                 }
                                 Err(BackendError::SandboxExited {
                                     status,
@@ -590,6 +589,23 @@ mod tests {
         assert_eq!(*reported, diagnostic);
         assert_eq!(crate::error::report(&error).kind, ErrorKind::Unavailable);
         assert!(child.stdin.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_descendant_holding_stderr_cannot_stall_the_diagnostic() {
+        let directory = tempfile::tempdir().unwrap();
+        let control = Control::bind(&directory.path().join("control"), 1).unwrap();
+        let diagnostic = Id::new_v4().to_string();
+        let mut child = shell(&format!("echo {diagnostic} >&2; sleep 5 & exit 3"));
+        let error = control.ready(&mut child).await.unwrap_err();
+        let BackendError::SandboxExited {
+            diagnostic: reported,
+            ..
+        } = &error
+        else {
+            panic!("{error:?}");
+        };
+        assert_eq!(*reported, diagnostic);
     }
 
     #[tokio::test]
