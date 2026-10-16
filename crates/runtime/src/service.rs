@@ -152,6 +152,24 @@ pub async fn daemon(root: &Path, explicit: bool) -> Result<()> {
                 continue;
             }
         };
+        // gateway.sock is mode 0600; refuse other users at the kernel level too.
+        match stream.peer_cred() {
+            Ok(peer) if peer.uid() == nix::unistd::geteuid().as_raw() => {}
+            Ok(peer) => {
+                tracing::warn!(
+                    uid = peer.uid(),
+                    "refused a gateway connection from another user"
+                );
+                continue;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    error = &error as &dyn std::error::Error,
+                    "could not identify a gateway client"
+                );
+                continue;
+            }
+        }
         let (read, write) = stream.into_split();
         let gateway = gateway.clone();
         connections.spawn(async move {

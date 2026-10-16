@@ -185,6 +185,10 @@ async fn paginates_native_catalogs_and_dispatches_protocol_specific_text() {
             pairing: Some(&forged),
         };
         assert!(provider::catalog(&config, forged).await.is_err());
+        // As the gateway does, keep the connection that claims the pairing open.
+        let _anchor = provider::verify_pairing(broker.path(), &pairing)
+            .await
+            .unwrap();
         let broker = provider::Broker {
             root: broker.path(),
             pairing: Some(&pairing),
@@ -389,10 +393,51 @@ async fn gateway_needs_a_verified_pairing_and_never_persists_it() {
     let catalogs = gateway.snapshot().unwrap().catalogs;
     assert_eq!(catalogs.len(), 1);
     assert_eq!(catalogs[0].models[0].key.model, api.id);
+    // A retried delivery of the same pairing must not drop the connection
+    // that anchors it at the broker.
+    assert_eq!(
+        run(Command::PairBroker {
+            pairing: pairing.clone()
+        })
+        .await,
+        Reply::Ok
+    );
+    // A dropped anchor is noticed by the broker asynchronously; keep using the
+    // pairing for a while to make sure it stays valid.
+    for _ in 0..20 {
+        assert!(matches!(run(refresh()).await, Reply::Catalog(_)));
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
     let Reply::Catalog(catalog) = run(refresh()).await else {
         panic!("paired refresh failed");
     };
     assert_eq!(catalog.models[0].key.model, api.id);
+    // A retry that cannot reach the broker is reported but keeps the pairing.
+    let socket = a206_broker::socket_path(dir.path());
+    let aside = socket.with_extension("aside");
+    std::fs::rename(&socket, &aside).unwrap();
+    assert!(matches!(
+        run(Command::PairBroker {
+            pairing: pairing.clone()
+        })
+        .await,
+        Reply::Error { .. }
+    ));
+    std::fs::rename(&aside, &socket).unwrap();
+    assert!(matches!(run(refresh()).await, Reply::Catalog(_)));
+    // Once the broker voids the pairing, a retry is no longer acknowledged.
+    let mut user = a206_broker::Client::connect(dir.path(), a206_broker::Role::User)
+        .await
+        .unwrap();
+    user.call(a206_broker::Request::Lock).await.unwrap();
+    assert!(matches!(
+        run(Command::PairBroker {
+            pairing: pairing.clone()
+        })
+        .await,
+        Reply::Error { .. }
+    ));
+    assert!(matches!(run(refresh()).await, Reply::Error { .. }));
     assert_eq!(format!("{pairing:?}"), "[REDACTED]");
     // The request journal and every other profile file stay free of it.
     let mut pending = vec![dir.path().to_owned()];

@@ -37,7 +37,7 @@ agent-client-protocol = { version = "3.3", features = ["stdio"] }
 tempfile.workspace = true
 [target.'cfg(unix)'.dependencies]
 async-io = "2"
-nix = { version = "0.31", features = ["signal", "process", "fs"] }
+nix = { version = "0.31", features = ["signal", "process", "fs", "user"] }
 [dev-dependencies]
 tracing-subscriber.workspace = true
 tempfile.workspace = true

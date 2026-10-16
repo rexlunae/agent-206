@@ -311,19 +311,29 @@ async fn paired_client(
         .map_err(ProviderError::Broker)?;
     Ok(client)
 }
+/// The connection that first proved a pairing. The broker voids the pairing
+/// when it closes, so the gateway holds it for as long as it keeps the pairing.
+pub struct PairingAnchor {
+    #[cfg(unix)]
+    _connection: a206_broker::Client,
+}
 /// Check a pairing against the broker before the gateway keeps it.
 #[cfg(unix)]
 pub async fn verify_pairing(
     root: &std::path::Path,
     pairing: &a206_core::BrokerPairing,
-) -> Result<(), ProviderError> {
-    paired_client(root, Some(pairing)).await.map(drop)
+) -> Result<PairingAnchor, ProviderError> {
+    paired_client(root, Some(pairing))
+        .await
+        .map(|connection| PairingAnchor {
+            _connection: connection,
+        })
 }
 #[cfg(not(unix))]
 pub async fn verify_pairing(
     _: &std::path::Path,
     _: &a206_core::BrokerPairing,
-) -> Result<(), ProviderError> {
+) -> Result<PairingAnchor, ProviderError> {
     Err(ProviderError::NoBroker)
 }
 /// Serialize a request body, stopping as soon as it exceeds what one broker

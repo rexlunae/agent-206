@@ -218,10 +218,19 @@ pub struct Gateway {
     downloads: Arc<Mutex<BTreeMap<Id, tokio_util::sync::CancellationToken>>>,
     running: Arc<Mutex<BTreeMap<Id, tokio_util::sync::CancellationToken>>>,
     /// Held only in memory: a restart needs a fresh pairing from the user.
-    pairing: Arc<Mutex<Option<BrokerPairing>>>,
+    pairing: Arc<Mutex<Option<Paired>>>,
+    /// Orders PairBroker commands, so a slow older verification never
+    /// replaces a newer pairing.
+    pair_requests: Arc<std::sync::atomic::AtomicU64>,
     /// Last automatic catalog attempt per provider, reset by a new pairing.
     refreshed: Arc<Mutex<BTreeMap<Id, u64>>>,
     paired: Arc<tokio::sync::Notify>,
+}
+/// The broker pairing this gateway holds, with the connection that anchors it.
+struct Paired {
+    pairing: BrokerPairing,
+    _anchor: provider::PairingAnchor,
+    order: u64,
 }
 /// Minimum seconds between automatic refreshes of one stale catalog.
 const REFRESH_RETRY: u64 = 300;
@@ -237,12 +246,18 @@ impl Gateway {
             downloads: Arc::new(Mutex::new(BTreeMap::new())),
             running: Arc::new(Mutex::new(BTreeMap::new())),
             pairing: Arc::new(Mutex::new(None)),
+            pair_requests: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             refreshed: Arc::new(Mutex::new(BTreeMap::new())),
             paired: Arc::new(tokio::sync::Notify::new()),
         })
     }
     fn pairing(&self) -> Result<Option<BrokerPairing>> {
-        Ok(self.pairing.lock().map_err(poisoned("pairing"))?.clone())
+        Ok(self
+            .pairing
+            .lock()
+            .map_err(poisoned("pairing"))?
+            .as_ref()
+            .map(|paired| paired.pairing.clone()))
     }
     fn lock(&self) -> Result<MutexGuard<'_, Store>> {
         self.store.lock().map_err(poisoned("state"))
@@ -417,9 +432,41 @@ impl Gateway {
             })),
             Command::Snapshot => Ok(Reply::Snapshot(Box::new(self.snapshot()?))),
             Command::PairBroker { pairing } => {
+                let order = self
+                    .pair_requests
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                // A retried delivery must keep the anchor the broker voids the
+                // pairing without, but is still checked against the broker.
+                let retry = self
+                    .pairing
+                    .lock()
+                    .map_err(poisoned("pairing"))?
+                    .as_ref()
+                    .is_some_and(|paired| paired.pairing == pairing);
                 let root = self.lock()?.root.clone();
-                provider::verify_pairing(&root, &pairing).await?;
-                *self.pairing.lock().map_err(poisoned("pairing"))? = Some(pairing);
+                let verified = provider::verify_pairing(&root, &pairing).await;
+                if retry {
+                    // The extra connection is not the anchor, so dropping it
+                    // leaves the pairing intact.
+                    // A failed check is reported, but only the broker voids a
+                    // pairing: a transient failure must not drop a good anchor.
+                    verified?;
+                    return Ok(Reply::Ok);
+                }
+                let anchor = verified?;
+                {
+                    let mut current = self.pairing.lock().map_err(poisoned("pairing"))?;
+                    if current.as_ref().is_some_and(|paired| paired.order > order) {
+                        // A newer pairing arrived meanwhile; this one is superseded.
+                        return Ok(Reply::Ok);
+                    }
+                    // Replacing the old anchor closes it; its pairing is already superseded.
+                    *current = Some(Paired {
+                        pairing,
+                        _anchor: anchor,
+                        order,
+                    });
+                }
                 // Discovery that failed for want of a pairing may retry now.
                 self.refreshed
                     .lock()

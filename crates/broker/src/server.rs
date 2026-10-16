@@ -27,8 +27,23 @@ struct Shared {
     http: reqwest::Client,
     /// Cancels provider requests started under an earlier vault generation.
     in_flight: Mutex<(u64, CancellationToken)>,
-    /// The current gateway pairing and the vault generation it belongs to.
-    pairing: Mutex<Option<(Zeroizing<String>, u64)>>,
+    pairing: Mutex<Option<Pairing>>,
+    /// Numbers pairings so a replaced one stops working for sessions that proved it.
+    serials: std::sync::atomic::AtomicU64,
+    /// Counts pairing replacements and voids; changed only under the pairing lock.
+    revocations: std::sync::atomic::AtomicU64,
+}
+
+/// The current gateway pairing. The first process to prove it becomes its
+/// holder; a copied token is useless to any other process afterwards. The
+/// holder's first connection anchors it: when that connection closes (the
+/// gateway exited), the pairing is void, so a reused pid finds nothing.
+struct Pairing {
+    serial: u64,
+    token: Zeroizing<String>,
+    /// The vault generation it was minted under; any lock or unlock voids it.
+    generation: u64,
+    holder: Option<i32>,
 }
 
 impl Shared {
@@ -36,18 +51,35 @@ impl Shared {
         self.vault.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn pairing(&self) -> MutexGuard<'_, Option<(Zeroizing<String>, u64)>> {
+    fn pairing(&self) -> MutexGuard<'_, Option<Pairing>> {
         self.pairing.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// The token for requests sent under `generation`. Moving to a new
-    /// generation (any lock or unlock) cancels every older request.
-    fn in_flight(&self, generation: u64) -> CancellationToken {
+    /// Advances with every lock, unlock, pairing replacement and pairing void.
+    /// Read the revocation count under the pairing lock it was checked with.
+    fn epoch(&self, generation: u64) -> u64 {
+        generation + self.revocations.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn revoke(&self) {
+        self.revocations
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// The token for requests sent under `epoch`. Moving to a newer epoch
+    /// cancels every older request.
+    fn in_flight(&self, epoch: u64) -> CancellationToken {
         let mut current = self.in_flight.lock().unwrap_or_else(|e| e.into_inner());
-        // Generations only grow; a stale reader must not cancel newer sends.
-        if generation > current.0 {
+        // Epochs only grow; a stale reader must not cancel newer sends, and
+        // gets a token that is already cancelled.
+        if epoch < current.0 {
+            let stale = CancellationToken::new();
+            stale.cancel();
+            return stale;
+        }
+        if epoch > current.0 {
             current.1.cancel();
-            *current = (generation, CancellationToken::new());
+            *current = (epoch, CancellationToken::new());
         }
         current.1.clone()
     }
@@ -59,8 +91,12 @@ struct Session {
     step_up: StepUpWindow,
     /// A pending enrollment and the vault generation it was started under.
     pending: Option<(PendingTotp, u64)>,
-    /// The vault generation this gateway connection proved pairing for.
+    /// The serial of the pairing this gateway connection proved.
     paired: Option<u64>,
+    /// This connection is the holder's anchor for that pairing.
+    anchor: Option<u64>,
+    /// The connected process, from the kernel's socket credentials.
+    peer: Option<i32>,
 }
 
 struct Outbound {
@@ -120,6 +156,20 @@ fn upstream(error: reqwest::Error) -> BrokerError {
     } else {
         UpstreamFailure::Transfer
     })
+}
+
+/// Bind a pairing to the first process that proves it: `Some(true)` for that
+/// first claim, `Some(false)` for its holder again, `None` for anyone else. A
+/// caller the kernel cannot identify is refused rather than trusted.
+fn claim(holder: &mut Option<i32>, peer: Option<i32>) -> Option<bool> {
+    match (*holder, peer) {
+        (_, None) => None,
+        (None, Some(pid)) => {
+            *holder = Some(pid);
+            Some(true)
+        }
+        (Some(holder), Some(pid)) => (holder == pid).then_some(false),
+    }
 }
 
 /// Compare without an early exit on the first differing byte.
@@ -519,19 +569,41 @@ fn handle(shared: &Shared, session: &mut Session, request: Request) -> Handled {
             let reply = Reply::GatewayPairing {
                 token: WireSecret::new(token.clone()),
             };
-            *shared.pairing() = Some((Zeroizing::new(token), generation));
+            let mut pairing = shared.pairing();
+            if pairing.is_some() {
+                shared.revoke();
+            }
+            *pairing = Some(Pairing {
+                serial: shared
+                    .serials
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                token: Zeroizing::new(token),
+                generation,
+                holder: None,
+            });
             Ok(Outcome::Reply(reply))
         }
         Request::GatewayAuth { token } => {
             let vault = shared.vault();
             let generation = vault.generation();
-            let valid = shared.pairing().as_ref().is_some_and(|(expected, paired)| {
-                *paired == generation && same_secret(expected, token.expose())
-            });
-            if !valid || vault.is_locked() {
+            let mut pairing = shared.pairing();
+            let claimed = match pairing.as_mut() {
+                Some(pairing)
+                    if !vault.is_locked()
+                        && pairing.generation == generation
+                        && same_secret(&pairing.token, token.expose()) =>
+                {
+                    claim(&mut pairing.holder, session.peer).map(|first| (pairing.serial, first))
+                }
+                _ => None,
+            };
+            let Some((serial, first)) = claimed else {
                 return Err(BrokerError::GatewayNotPaired);
+            };
+            session.paired = Some(serial);
+            if first {
+                session.anchor = Some(serial);
             }
-            session.paired = Some(generation);
             ok()
         }
         Request::Provider(call) => {
@@ -540,7 +612,14 @@ fn handle(shared: &Shared, session: &mut Session, request: Request) -> Handled {
             if vault.is_locked() {
                 return Err(BrokerError::Locked);
             }
-            if session.paired != Some(vault.generation()) {
+            let (current, epoch) = {
+                let pairing = shared.pairing();
+                let current = pairing.as_ref().and_then(|pairing| {
+                    (pairing.generation == vault.generation()).then_some(pairing.serial)
+                });
+                (current, shared.epoch(vault.generation()))
+            };
+            if current.is_none() || session.paired != current {
                 return Err(BrokerError::GatewayNotPaired);
             }
             let url = url::Url::parse(&call.url)
@@ -557,8 +636,9 @@ fn handle(shared: &Shared, session: &mut Session, request: Request) -> Handled {
                 return Err(BrokerError::Invalid(InvalidRequest::ProviderBody));
             }
             let origin = url.origin().ascii_serialization();
-            // Taken under the vault mutex, so a later lock always cancels it.
-            let cancel = shared.in_flight(vault.generation());
+            // The epoch was read with the pairing check, so a later lock,
+            // replacement or void always cancels this send.
+            let cancel = shared.in_flight(epoch);
             let value = vault
                 .use_for_destination(&call.credential, &origin, |s| {
                     Zeroizing::new(match call.auth {
@@ -586,17 +666,21 @@ fn handle(shared: &Shared, session: &mut Session, request: Request) -> Handled {
     }
 }
 
-/// Send a prepared request unless the vault is locked first; a lock while it
-/// is in flight abandons it.
-async fn send(http: &reqwest::Client, out: Outbound) -> Result<Reply, BrokerError> {
+/// Send a prepared request unless its epoch ended first; a lock, pairing
+/// replacement or pairing void while it is in flight abandons it.
+async fn send(shared: &Shared, out: Outbound) -> Result<Reply, BrokerError> {
     let cancel = out.cancel.clone();
-    if cancel.is_cancelled() {
-        return Err(BrokerError::Locked);
+    if !cancel.is_cancelled() {
+        tokio::select! {
+            reply = transmit(&shared.http, out) => return reply,
+            _ = cancel.cancelled() => {}
+        }
     }
-    tokio::select! {
-        reply = transmit(http, out) => reply,
-        _ = cancel.cancelled() => Err(BrokerError::Locked),
-    }
+    Err(if shared.vault().is_locked() {
+        BrokerError::Locked
+    } else {
+        BrokerError::GatewayNotPaired
+    })
 }
 
 async fn transmit(http: &reqwest::Client, out: Outbound) -> Result<Reply, BrokerError> {
@@ -638,9 +722,41 @@ async fn transmit(http: &reqwest::Client, out: Outbound) -> Result<Reply, Broker
 }
 
 async fn connection(shared: Arc<Shared>, stream: tokio::net::UnixStream) -> std::io::Result<()> {
+    let mut anchor = None;
+    let result = session(&shared, stream, &mut anchor).await;
+    if let Some(serial) = anchor {
+        let vault = shared.vault();
+        let mut pairing = shared.pairing();
+        if pairing.as_ref().is_some_and(|p| p.serial == serial) {
+            // The holding gateway went away; its pid may be reused.
+            *pairing = None;
+            shared.revoke();
+            shared.in_flight(shared.epoch(vault.generation()));
+        }
+    }
+    result
+}
+
+async fn session(
+    shared: &Arc<Shared>,
+    stream: tokio::net::UnixStream,
+    anchor: &mut Option<u64>,
+) -> std::io::Result<()> {
+    // The socket is mode 0600 in a 0700 directory; check the kernel's view too.
+    let credentials = stream.peer_cred()?;
+    if credentials.uid() != nix::unistd::geteuid().as_raw() {
+        tracing::warn!(
+            uid = credentials.uid(),
+            "refused a vault broker connection from another user"
+        );
+        return Ok(());
+    }
     let (mut reader, mut writer) = stream.into_split();
     let mut decoder = Decoder::default();
-    let mut session = Session::default();
+    let mut session = Session {
+        peer: credentials.pid(),
+        ..Session::default()
+    };
     let mut bytes = vec![0; 8192];
     loop {
         let count = tokio::select! {
@@ -663,16 +779,16 @@ async fn connection(shared: Arc<Shared>, stream: tokio::net::UnixStream) -> std:
             .await
             .map_err(std::io::Error::other)?;
             session = returned;
+            *anchor = anchor.or(session.anchor);
             // Any lock or unlock during this request cancels older sends.
             {
                 let vault = shared.vault();
-                shared.in_flight(vault.generation());
+                let _pairing = shared.pairing();
+                shared.in_flight(shared.epoch(vault.generation()));
             }
             let body = match outcome {
                 Ok(Outcome::Reply(reply)) => reply,
-                Ok(Outcome::Send(out)) => {
-                    send(&shared.http, *out).await.unwrap_or_else(Reply::Error)
-                }
+                Ok(Outcome::Send(out)) => send(shared, *out).await.unwrap_or_else(Reply::Error),
                 Err(error) => {
                     tracing::info!(
                         error = &error as &dyn std::error::Error,
@@ -729,6 +845,8 @@ pub async fn serve(root: &Path) -> std::io::Result<()> {
             .map_err(std::io::Error::other)?,
         in_flight: Mutex::new((0, CancellationToken::new())),
         pairing: Mutex::new(None),
+        serials: std::sync::atomic::AtomicU64::new(0),
+        revocations: std::sync::atomic::AtomicU64::new(0),
     });
     let mut connections = tokio::task::JoinSet::new();
     loop {

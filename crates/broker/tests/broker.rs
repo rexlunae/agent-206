@@ -546,6 +546,34 @@ async fn lock_cancels_in_flight_sends_and_body_limits_are_structured() {
         .expect("lock must abandon the in-flight request")
         .unwrap();
     assert_eq!(denied(result), BrokerError::Locked);
+
+    // Revoking the pairing (a replacement, or its anchor closing) abandons
+    // in-flight sends just as a lock does.
+    a.call(unlock(&password, None, false)).await.unwrap();
+    for revoke in ["replace", "close anchor"] {
+        let token = pairing(&mut a).await;
+        let (anchor, claimed) = present(&root, &token).await;
+        claimed.unwrap();
+        let (mut gateway, result) = present(&root, &token).await;
+        result.unwrap();
+        let request = call("/slow", None);
+        let slow = tokio::spawn(async move { gateway.call(request).await });
+        tokio::time::timeout(Duration::from_secs(10), entered_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let _replacement = if revoke == "replace" {
+            Some(pairing(&mut a).await)
+        } else {
+            None
+        };
+        drop(anchor);
+        let result = tokio::time::timeout(Duration::from_secs(10), slow)
+            .await
+            .unwrap_or_else(|_| panic!("{revoke} must abandon the in-flight request"))
+            .unwrap();
+        assert_eq!(denied(result), BrokerError::GatewayNotPaired);
+    }
 }
 
 /// Stands in for a version-1 broker: it refuses everything before a v1
@@ -710,4 +738,129 @@ async fn only_a_paired_gateway_spends_credentials_and_lock_voids_pairing() {
     );
     let mut repaired = paired_gateway(&mut a, &root).await;
     assert!(paired(repaired.call(call()).await));
+}
+
+/// Child-process half of `a_pairing_belongs_to_the_first_process_to_prove_it`;
+/// it does nothing unless that test spawned it.
+#[tokio::test]
+async fn pairing_helper_process() {
+    let (Ok(root), Ok(token), Ok(expect)) = (
+        std::env::var("A206_PAIR_ROOT"),
+        std::env::var("A206_PAIR_TOKEN"),
+        std::env::var("A206_PAIR_EXPECT"),
+    ) else {
+        return;
+    };
+    let mut gateway = Client::connect(Path::new(&root), Role::Gateway)
+        .await
+        .unwrap();
+    let result = gateway
+        .call(Request::GatewayAuth {
+            token: WireSecret::new(token),
+        })
+        .await;
+    if expect == "accepted" {
+        result.unwrap();
+    } else {
+        assert_eq!(denied(result), BrokerError::GatewayNotPaired);
+    }
+}
+
+/// Present `token` from a separate process, which has its own pid.
+async fn from_another_process(root: &Path, token: &WireSecret, expect: &str) {
+    let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
+    command
+        .args(["--exact", "pairing_helper_process", "--test-threads=1"])
+        .env("A206_PAIR_ROOT", root)
+        .env("A206_PAIR_TOKEN", token.expose())
+        .env("A206_PAIR_EXPECT", expect);
+    let output = command.output().await.unwrap();
+    assert!(
+        output.status.success(),
+        "helper expecting {expect} failed: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+async fn present(root: &Path, token: &WireSecret) -> (Client, Result<Reply, ClientError>) {
+    let mut gateway = Client::connect(root, Role::Gateway).await.unwrap();
+    let result = gateway
+        .call(Request::GatewayAuth {
+            token: WireSecret::new(token.expose().to_owned()),
+        })
+        .await;
+    (gateway, result)
+}
+
+/// Whether this gateway connection may currently spend credentials: a paired
+/// session gets as far as looking up the (unknown) credential.
+async fn spends(gateway: &mut Client) -> bool {
+    let call = Request::Provider(ProviderCall {
+        credential: random(),
+        method: HttpMethod::Get,
+        url: "https://example.invalid/".into(),
+        auth: AuthScheme::Bearer,
+        anthropic_version: None,
+        body: None,
+    });
+    match denied(gateway.call(call).await) {
+        BrokerError::GatewayNotPaired => false,
+        BrokerError::NotFound => true,
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pairing_belongs_to_the_first_process_to_prove_it() {
+    let (_dir, root, task) = start().await;
+    let mut user = user(&root).await;
+    user.call(unlock(&random(), None, true)).await.unwrap();
+
+    // Another process claims the pairing first, then exits: a copy is useless
+    // here, both because this pid is not the holder and because it is void.
+    let first = pairing(&mut user).await;
+    from_another_process(&root, &first, "accepted").await;
+    assert_eq!(
+        denied(present(&root, &first).await.1),
+        BrokerError::GatewayNotPaired
+    );
+
+    // A fresh pairing claimed here works on further connections from this
+    // process while its anchor stays open, and is refused to any other.
+    let second = pairing(&mut user).await;
+    let (mut anchor, claimed) = present(&root, &second).await;
+    claimed.unwrap();
+    let (mut again, result) = present(&root, &second).await;
+    result.unwrap();
+    assert!(spends(&mut anchor).await && spends(&mut again).await);
+    from_another_process(&root, &second, "refused").await;
+
+    // Replacing the pairing stops sessions that proved the old one.
+    let third = pairing(&mut user).await;
+    assert!(!spends(&mut again).await);
+    let (mut holder, claimed) = present(&root, &third).await;
+    claimed.unwrap();
+    let (mut other, result) = present(&root, &third).await;
+    result.unwrap();
+    assert!(spends(&mut other).await);
+
+    // Closing the anchor (the gateway exiting) voids the pairing, so a pid
+    // reused by another process later finds nothing to claim.
+    assert!(spends(&mut holder).await);
+    drop(holder);
+    let mut gone = false;
+    for _ in 0..200 {
+        if !spends(&mut other).await {
+            gone = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(gone, "the pairing outlived its anchor connection");
+    assert_eq!(
+        denied(present(&root, &third).await.1),
+        BrokerError::GatewayNotPaired
+    );
+    drop(anchor);
+    task.abort();
 }
