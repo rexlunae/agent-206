@@ -13,7 +13,8 @@ implemented structure for finished agent execution or security parity.
 | Gateway lifecycle | Shared Gateway page and controller, status from the actual process, start/stop/restart/reconnect, durable deliberate-stop marker, cleanup before acknowledgement, bounded control receipts; web uses an authenticated user-only binary endpoint | Remote SSH acceptance, stronger cross-process lifecycle coordination, encrypted enrollment and authentication; running is not security readiness |
 | Initial setup/import | Source-backed security parity and reviewed import contracts; RustyClaw, Cline, Claude Code, Codex, DeepSeek Harness identified | Isolated encrypted vault broker, encryption/key setup, TOTP enrollment/authentication, policy migration, GUI wizard and versioned import adapters are not implemented |
 | CLI | Headless build, system status, nested gateway lifecycle/status, chat, projects, settings, catalog refresh, downloads, text documents, Git status, vault, ACP/MCP, renderer entry points and ui alias | Full RustyClaw-compatible command families in docs/cli.md; secure setup/import/auth/doctor and remaining parity |
-| SSH | Ordinary OpenSSH, strict host verification, configured identities, keepalives, remote stdio bridge | In-app host pairing, remote installers/updaters, remote acceptance test |
+| Gateway setup | Clients connect only after first-time setup (desktop/TUI screen or `gateway setup`) saves a local or SSH target in `connection.toml`; unknown SSH hosts require fingerprint confirmation into the profile's own known_hosts; changed keys are refused; typed `ConnectionError`s are traced and shown | Web clients use the bridge's server-side setup; gateway enrollment (vault/TOTP) is a separate gate |
+| SSH | Ordinary OpenSSH, strict host verification, configured identities, keepalives, remote stdio bridge |  remote installers/updaters, remote acceptance test |
 | Wire protocol | Versioned bounded MessagePack, fragmented/coalesced reads, strict decode, durable request receipts | Negotiated feature sets, pushed subscriptions, full reconnect/resume UX |
 | Persistence | One gateway writer, SQLite WAL snapshots/journal, revision checks, restart recovery, explicit replay gaps | Paginated/archived history, migration tooling; current snapshot is bounded below 4 MiB |
 | Chat | API-discovered model selection, native/compatible text generation, cancellation, persisted text attachments (8 files/128 KiB), API-advertised reasoning effort; streamed text from external backends | Native provider streaming, image/PDF/audio attachments, native tool-call loop, retries with explicit external-effect semantics |
@@ -101,7 +102,10 @@ local API; there are no copied model/provider fixtures.
 Router tests render the shared application with in-memory history, exercise
 Back/Forward and initial page selection, and check exact thread identity, split
 selection, missing-thread recovery and malformed routes. Web service tests cover
-HTML deep-link reloads, HEAD, existing assets and reserved/non-HTML/method errors.
+HTML deep-link reloads, HEAD, existing assets and reserved/non-HTML/method errors,
+the localhost-to-127.0.0.1 redirect and one-use authorization links. A headless
+Chromium check confirmed a second tab, a reload, the localhost URL and a restarted
+bridge (stale bearer discarded, new link accepted) all reach a connected gateway.
 Browser checks verify router-aware links, app Back/browser Forward, new-conversation
 navigation, direct split-view reloads with the selected second thread, and
 unavailable/malformed conversation recovery. Desktop and web release builds and
@@ -124,7 +128,12 @@ creation/hiding/deletion, and restoring a bundled override with refreshed fields
 
 See `README.md` for reproducible commands. The GitHub Actions workflow checks the
 workspace on macOS; check its run results separately from the local evidence above.
-Build success is not evidence of real remote SSH, real Joshua model inference,
+An SSH gateway was exercised end to end against a local OpenSSH server: setup
+refused the unknown host until its fingerprint was given, then gateway start,
+status, snapshot and stop ran over SSH; a changed host key and an unreachable
+port were reported as errors. A terminal-client run of an unconfigured profile
+showed the setup screen without creating the profile or launching a gateway.
+Build success is not evidence of real remote SSH across networks, real Joshua model inference,
 vault migration or production security certification.
 
 ## Next gates

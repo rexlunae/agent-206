@@ -28,24 +28,39 @@ struct Web {
     origin: Arc<String>,
     host: Arc<String>,
 }
-pub async fn serve(root: PathBuf, static_dir: PathBuf, port: u16) -> anyhow::Result<()> {
+/// The bridge connects to the configured gateway, local or SSH, on the browser's behalf.
+pub async fn serve(
+    root: PathBuf,
+    remote: Option<String>,
+    static_dir: PathBuf,
+    port: u16,
+) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).await?;
     let port = listener.local_addr()?.port();
     let token = uuid::Uuid::new_v4().simple().to_string();
     let state = Web {
-        client: GatewayController::new(root, None),
+        client: GatewayController::new(root, remote),
         token: Arc::new(uuid::Uuid::new_v4().simple().to_string()),
         bootstrap: Arc::new(token.clone()),
         claimed: Arc::new(AtomicBool::new(false)),
         origin: Arc::new(format!("http://127.0.0.1:{port}")),
         host: Arc::new(format!("127.0.0.1:{port}")),
     };
-    let app = Router::new()
+    println!("Open http://127.0.0.1:{port}/connect/{token} to authorize this browser.");
+    axum::serve(listener, app(state, static_dir)).await?;
+    Ok(())
+}
+fn app(state: Web, static_dir: PathBuf) -> Router {
+    Router::new()
         .route("/connect/{token}", get(connect))
         .route("/api/command", post(command))
         .route("/api/gateway", post(control))
         .layer(DefaultBodyLimit::max(a206_protocol::MAX_FRAME + 10))
         .fallback_service(static_files(static_dir))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            canonical_host,
+        ))
         .layer(tower_http::set_header::SetResponseHeaderLayer::overriding(
             header::REFERRER_POLICY,
             axum::http::HeaderValue::from_static("no-referrer"),
@@ -60,10 +75,37 @@ pub async fn serve(root: PathBuf, static_dir: PathBuf, port: u16) -> anyhow::Res
                 "frame-ancestors 'none'; base-uri 'self'; object-src 'none'",
             ),
         ))
-        .with_state(state);
-    println!("Open http://127.0.0.1:{port}/connect/{token} to authorize this browser session.");
-    axum::serve(listener, app).await?;
-    Ok(())
+        .with_state(state)
+}
+
+/// `localhost` is a different browser origin from `127.0.0.1`, so its storage
+/// would never hold the bearer. Send it to the canonical origin before anything
+/// else runs; the bootstrap token stays unclaimed and only travels to loopback.
+async fn canonical_host(
+    State(state): State<Web>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let host = request
+        .headers()
+        .get(header::HOST)
+        .and_then(|h| h.to_str().ok());
+    let alias = host.and_then(|h| h.strip_prefix("localhost:"));
+    if alias.is_some() && alias == state.host.split_once(':').map(|(_, port)| port) {
+        let path = request
+            .uri()
+            .path_and_query()
+            .map_or("/", |path| path.as_str());
+        return (
+            StatusCode::TEMPORARY_REDIRECT,
+            [
+                (header::LOCATION, format!("{}{path}", state.origin)),
+                (header::CACHE_CONTROL, "no-store".into()),
+            ],
+        )
+            .into_response();
+    }
+    next.run(request).await
 }
 
 /// Serve built assets first, then the SPA entry point for browser page requests.
@@ -109,14 +151,25 @@ async fn connect(
     if token != *state.bootstrap
         || headers.get(header::HOST).and_then(|h| h.to_str().ok()) != Some(state.host.as_str())
     {
-        return StatusCode::FORBIDDEN.into_response();
+        return (
+            StatusCode::FORBIDDEN,
+            "This is not the current Agent 206 authorization link. Use the newest link printed by `agent206 web`.",
+        )
+            .into_response();
     }
     if state
         .claimed
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .is_err()
     {
-        return StatusCode::FORBIDDEN.into_response();
+        return (
+            StatusCode::FORBIDDEN,
+            format!(
+                "This authorization link was already used. Open {}/ in the browser that used it, or restart `agent206 web` for a new link.",
+                state.origin
+            ),
+        )
+            .into_response();
     }
     (
         [
@@ -322,6 +375,68 @@ mod tests {
                 );
             }
         }
+    }
+    fn bridge(port: u16) -> Web {
+        Web {
+            client: GatewayController::attach(
+                std::env::temp_dir().join(uuid::Uuid::new_v4().to_string()),
+                None,
+            ),
+            token: Arc::new(uuid::Uuid::new_v4().simple().to_string()),
+            bootstrap: Arc::new(uuid::Uuid::new_v4().simple().to_string()),
+            claimed: Arc::new(AtomicBool::new(false)),
+            host: Arc::new(format!("127.0.0.1:{port}")),
+            origin: Arc::new(format!("http://127.0.0.1:{port}")),
+        }
+    }
+    async fn get_with_host(app: &Router, path: &str, host: &str) -> Response {
+        app.clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(path)
+                    .header(header::HOST, host)
+                    .header(header::ACCEPT, "text/html")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+    #[tokio::test]
+    async fn localhost_is_sent_to_the_canonical_origin_without_claiming_the_link() {
+        let directory = tempfile::tempdir().unwrap();
+        tokio::fs::write(directory.path().join("index.html"), "<!doctype html>")
+            .await
+            .unwrap();
+        let port = 20_000 + (uuid::Uuid::new_v4().as_u128() % 10_000) as u16;
+        let state = bridge(port);
+        let link = format!("/connect/{}", state.bootstrap);
+        let app = app(state.clone(), directory.path().into());
+        let response =
+            get_with_host(&app, &format!("{link}?x=1"), &format!("localhost:{port}")).await;
+        assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(
+            response.headers()[header::LOCATION],
+            format!("{}{link}?x=1", state.origin).as_str()
+        );
+        assert!(!state.claimed.load(Ordering::Acquire));
+        // Another port's localhost is not this bridge's alias.
+        let other = get_with_host(&app, "/", &format!("localhost:{}", port + 1)).await;
+        assert_ne!(other.status(), StatusCode::TEMPORARY_REDIRECT);
+        let claimed = get_with_host(&app, &link, &state.host).await;
+        assert_eq!(claimed.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            claimed.headers()[header::LOCATION],
+            format!("/#a206={}", state.token).as_str()
+        );
+        let reused = get_with_host(&app, &link, &state.host).await;
+        assert_eq!(reused.status(), StatusCode::FORBIDDEN);
+        let body = axum::body::to_bytes(reused.into_body(), 4096)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("already used"), "{body}");
+        assert!(!body.contains(state.token.as_str()));
     }
     #[test]
     fn auth_requires_an_explicit_origin_bound_bearer() {

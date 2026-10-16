@@ -557,6 +557,40 @@ pub struct GatewayReport {
     pub error: Option<String>,
 }
 
+/// Where a client finds its gateway. Saved by first-time setup as human-editable
+/// TOML; no client connects (or launches a local gateway) until one is chosen.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum GatewayTarget {
+    /// A gateway on this computer, launched on demand with this profile.
+    Local,
+    /// An installed `agent206` reached with OpenSSH: `ssh://[user@]host[:port]`.
+    Ssh { endpoint: String },
+}
+impl GatewayTarget {
+    /// The `--remote` endpoint for transports, or `None` for a local gateway.
+    pub fn remote(&self) -> Option<&str> {
+        match self {
+            Self::Local => None,
+            Self::Ssh { endpoint } => Some(endpoint),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GatewayConnection {
+    pub target: GatewayTarget,
+}
+
+/// An SSH host key offered during setup. Only the fingerprint is shown to the user;
+/// `entry` is the known_hosts line recorded once they confirm it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostKey {
+    pub algorithm: String,
+    pub fingerprint: String,
+    pub entry: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

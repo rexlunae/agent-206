@@ -247,8 +247,12 @@ terminal validation and fallback work.
 ## Local web authority
 
 The web bridge binds only to 127.0.0.1. A one-use bootstrap URL establishes a
-bearer session in origin-scoped browser sessionStorage; the fragment is removed
-from the address bar immediately. Application-owned requests carry the bearer in
+bearer session in origin-scoped browser localStorage, shared by tabs of that exact
+origin and invalidated when the bridge process restarts (a rejected bearer is
+discarded); the fragment is removed from the address bar immediately. Requests
+for `localhost:<port>` redirect to the canonical `127.0.0.1` origin before any
+handler runs, so the one-use link is never claimed from an origin that cannot
+hold the bearer. Application-owned requests carry the bearer in
 an explicit Authorization header and require the exact Host, Origin and binary
 content type. The application issues no session cookie: cookies ignore ports and
 could otherwise be sent to a local development server inside the preview browser.
