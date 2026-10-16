@@ -429,6 +429,7 @@ impl Gateway {
                         .map_err(poisoned("gateway admission"))?
                         .draining,
                 ),
+                vault_paired: Some(self.pairing()?.is_some()),
             })),
             Command::Snapshot => Ok(Reply::Snapshot(Box::new(self.snapshot()?))),
             Command::PairBroker { pairing } => {

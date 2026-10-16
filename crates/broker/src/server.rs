@@ -4,8 +4,8 @@
 use crate::proto::*;
 use a206_protocol::{Decoder, Response, encode};
 use a206_vault::{
-    AuthThrottle, CredentialMeta, Error as VaultError, PendingTotp, Secret, StepUpWindow,
-    TotpOutcome, Vault, unix_now,
+    AuthThrottle, CredentialMeta, Error as VaultError, ImportCheck, PendingTotp, Secret,
+    StepUpWindow, TotpOutcome, Vault, unix_now,
 };
 use futures_util::StreamExt;
 use std::{
@@ -140,6 +140,8 @@ fn vault_error(error: VaultError) -> BrokerError {
         VaultError::Corrupted => BrokerError::Vault(VaultFailure::Corrupted),
         VaultError::Crypto => BrokerError::Vault(VaultFailure::Crypto),
         VaultError::Io(_) => BrokerError::Vault(VaultFailure::Storage),
+        VaultError::Exists => BrokerError::VaultExists,
+        VaultError::ImportSource(_) => BrokerError::Invalid(I::ImportSource),
     }
 }
 
@@ -334,6 +336,47 @@ fn handle(shared: &Shared, session: &mut Session, request: Request) -> Handled {
                     relock(&mut vault);
                     return Err(failed(shared, now, totp_error(outcome)));
                 }
+            }
+            let generation = vault.generation();
+            drop(vault);
+            shared.throttle.success(&());
+            session.step_up.grant(now, generation);
+            ok()
+        }
+        Request::ImportVault {
+            source,
+            password,
+            totp,
+        } => {
+            shared
+                .throttle
+                .check(&(), now)
+                .map_err(|l| BrokerError::LockedOut {
+                    retry_after_secs: l.retry_after.as_secs().max(1),
+                })?;
+            if !source.is_absolute() {
+                return Err(BrokerError::Invalid(InvalidRequest::ImportSource));
+            }
+            let mut vault = shared.vault();
+            let secret = Secret::new(password.expose().to_owned());
+            match vault.import(&source, &secret, totp.as_deref(), unix_now()) {
+                Ok(ImportCheck::Imported) => {}
+                Ok(ImportCheck::TotpRequired) => return Err(BrokerError::TotpRequired),
+                Ok(ImportCheck::Totp(outcome)) => {
+                    return Err(failed(shared, now, totp_error(outcome)));
+                }
+                // A wrong password for the source counts like a failed unlock.
+                Err(VaultError::Crypto) => {
+                    return Err(failed(shared, now, BrokerError::AuthenticationFailed));
+                }
+                Err(error @ VaultError::ImportSource(_)) => {
+                    tracing::info!(
+                        error = &error as &dyn std::error::Error,
+                        "vault import source refused"
+                    );
+                    return Err(vault_error(error));
+                }
+                Err(error) => return Err(vault_error(error)),
             }
             let generation = vault.generation();
             drop(vault);
@@ -834,7 +877,7 @@ pub async fn serve(root: &Path) -> std::io::Result<()> {
     let listener = tokio::net::UnixListener::bind(&path)?;
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
     let shared = Arc::new(Shared {
-        vault: Mutex::new(Vault::locked(dir.join("secrets.json"))),
+        vault: Mutex::new(Vault::locked(crate::vault_path(root))),
         throttle: AuthThrottle::default(),
         stop: CancellationToken::new(),
         http: reqwest::Client::builder()

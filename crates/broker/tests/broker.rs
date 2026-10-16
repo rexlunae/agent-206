@@ -864,3 +864,72 @@ async fn a_pairing_belongs_to_the_first_process_to_prove_it() {
     drop(anchor);
     task.abort();
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn importing_a_vault_verifies_it_and_never_replaces_one() {
+    let (_dir, root, task) = start().await;
+    // An independent password vault, as an existing installation would hold.
+    let source_dir = tempfile::tempdir().unwrap();
+    let source = source_dir.path().join("secrets.json");
+    let password = random();
+    let name = random();
+    {
+        let mut vault = a206_vault::Vault::locked(source.clone());
+        vault
+            .unlock(&a206_vault::Secret::new(password.clone()))
+            .unwrap();
+        vault
+            .put_credential(
+                &name,
+                &meta(vec![]),
+                a206_vault::CredentialValue::Single(a206_vault::Secret::new(random())),
+            )
+            .unwrap();
+    }
+    let original = std::fs::read(&source).unwrap();
+    let import = |source: PathBuf, password: &str| Request::ImportVault {
+        source,
+        password: WireSecret::new(password.to_owned()),
+        totp: None,
+    };
+    let mut a = user(&root).await;
+    assert_eq!(
+        denied(a.call(import("secrets.json".into(), &password)).await),
+        BrokerError::Invalid(InvalidRequest::ImportSource)
+    );
+    assert_eq!(
+        denied(
+            a.call(import(source_dir.path().join(random()), &password))
+                .await
+        ),
+        BrokerError::Invalid(InvalidRequest::ImportSource)
+    );
+    assert_eq!(
+        denied(a.call(import(source.clone(), &random())).await),
+        BrokerError::AuthenticationFailed
+    );
+    assert!(!status(&mut a).await.exists);
+    a.call(import(source.clone(), &password)).await.unwrap();
+    let s = status(&mut a).await;
+    assert!(s.exists && s.unlocked && s.step_up_active);
+    match a.call(Request::Credentials).await.unwrap() {
+        Reply::Credentials { typed, .. } => {
+            assert_eq!(
+                typed.into_iter().map(|(n, _)| n).collect::<Vec<_>>(),
+                [name]
+            )
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+    assert_eq!(
+        denied(a.call(import(source.clone(), &password)).await),
+        BrokerError::VaultExists
+    );
+    assert_eq!(std::fs::read(&source).unwrap(), original);
+    // The imported vault opens with its own password from a fresh connection.
+    a.call(Request::Lock).await.unwrap();
+    let mut b = user(&root).await;
+    b.call(unlock(&password, None, false)).await.unwrap();
+    b.call(Request::Shutdown).await.unwrap();
+    task.await.unwrap();
+}

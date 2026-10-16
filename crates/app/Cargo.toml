@@ -18,6 +18,7 @@ a206-runtime.workspace = true
 a206-protocol.workspace = true
 a206-vault.workspace = true
 a206-broker.workspace = true
+a206-import.workspace = true
 a206-extensions.workspace = true
 anyhow.workspace = true
 tracing.workspace = true

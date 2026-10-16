@@ -11,7 +11,7 @@ use zeroize::Zeroizing;
 /// `Request::Hello`, `Request::Shutdown` (accepted before `Hello`) and
 /// `Reply::Ok`/`Reply::Error` must stay compatible across versions; variants
 /// are encoded by name.
-pub const BROKER_VERSION: u16 = 3;
+pub const BROKER_VERSION: u16 = 4;
 /// Largest provider request or response body the broker carries. The rest of
 /// the 4 MiB frame is reserved for the envelope, so a body at this limit still
 /// fits in one frame.
@@ -192,6 +192,16 @@ pub enum Request {
         version: u16,
     },
     Status,
+    /// Adopt an existing password-protected SecureStore vault (such as
+    /// RustyClaw's) as this profile's vault when none exists yet. The broker
+    /// copies the encrypted file and opens only its copy; the source is never
+    /// written. `totp` is required when the source has two-factor enrolled.
+    /// On success the vault is unlocked, as after `Unlock`.
+    ImportVault {
+        source: std::path::PathBuf,
+        password: WireSecret,
+        totp: Option<String>,
+    },
     /// `create` permits creating a vault when none exists.
     Unlock {
         password: WireSecret,
@@ -299,6 +309,8 @@ pub enum BrokerError {
     NotFound,
     #[error("a credential with that name already exists")]
     AlreadyExists,
+    #[error("this profile already has a vault; an import never replaces or merges into it")]
+    VaultExists,
     #[error("invalid request")]
     Invalid(#[source] InvalidRequest),
     #[error("vault storage failed")]
@@ -333,6 +345,10 @@ pub enum InvalidRequest {
     TotpNotEnrolled,
     #[error("the two-factor enrollment expired; start again")]
     EnrollmentExpired,
+    #[error(
+        "the vault to import must be an absolute path to a readable regular file of at most 16 MiB"
+    )]
+    ImportSource,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]

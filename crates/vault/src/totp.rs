@@ -206,11 +206,11 @@ impl Vault {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::tests::unlocked;
 
-    fn code_at(pending: &PendingTotp, t: u64) -> String {
+    pub(crate) fn code_at(pending: &PendingTotp, t: u64) -> String {
         pending.totp().unwrap().generate(t)
     }
     fn now() -> u64 {

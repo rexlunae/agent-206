@@ -1,8 +1,31 @@
 # Reviewed migration during setup
 
-Import is a required setup feature; adapters are not implemented yet. This
-contract separates source discovery, review and application so migration cannot
-silently grant authority or activate foreign code.
+Import is a required setup feature. This contract separates source discovery,
+review and application so migration cannot silently grant authority or activate
+foreign code. The RustyClaw adapter is implemented (below); the others are not.
+
+## RustyClaw adapter
+
+`agent206 import rustyclaw [PATH]` (default `~/.rustyclaw`, reference
+`481a428c`) reads `config.toml`, the vault under `credentials/` (or the older
+root `secrets.json`) and the presence of workspace files, through
+`a206_import::rustyclaw::preview`. Reads are bounded (1 MiB configuration), refuse
+symlinked files and keep only the fields mapped below; values that may hold
+secrets or commands are counted, never stored, so they cannot reach the preview.
+
+| Source | Result |
+| --- | --- |
+| `[model]` provider and `[[custom_providers]]` | Provider account from the matching preset (endpoint from the source, else the preset), added only when no account has the same API and endpoint. The credential name RustyClaw used (for example `OPENAI_API_KEY`) is referenced, and the broker refuses it until the user types and binds it (`vault adopt … --destination`). The old default model is shown as a note and never selected. Copilot device-flow and unknown providers are reported and skipped |
+| `credentials/secrets.json`, password-protected | `--apply` asks for its password (and TOTP code when enrolled) and sends `ImportVault` to the broker, which copies the encrypted file, opens only the copy, verifies both factors there and links it in only if this profile has no vault. Policies, kinds, disabled flags, agent access and TOTP enrollment travel inside the vault unchanged; the source is never written. Key-file vaults are reported as unsupported |
+| Messengers, MCP servers, tool permissions, disabled tool groups, services, engines, sandbox, skills, plaintext registry token | Counted and left inactive. Denies in tool permissions cannot be represented yet, so nothing is granted in their place |
+| SOUL.md/AGENTS.md, conversations, memory, messenger system prompt | Reported as not imported yet |
+| `totp_enabled`, `agent_access` configuration flags | Ignored: enrollment and agent access come from the encrypted vault |
+
+Applying writes an owner-only receipt (`imports/<id>.toml`) with the source
+digest, accounts added and whether the vault was copied, which is the rollback
+record; a rollback command does not exist yet. A repeated import adds nothing.
+Readers run in the CLI process; the isolated reader process described below is
+still to be built.
 
 ## Sources and evidence
 

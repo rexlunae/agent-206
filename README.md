@@ -63,6 +63,16 @@ Don't edit `state.sqlite3` while it is running.
 ./target/debug/agent206 gateway setup --local
 ./target/debug/agent206 gateway setup --ssh ssh://user@host --trust SHA256:...
 
+# Or walk through first-run setup (gateway, vault, two-factor, pairing); rerun
+# to resume. Doctor checks everything without starting or changing anything.
+./target/debug/agent206 setup --local
+./target/debug/agent206 doctor
+
+# Preview an import from RustyClaw, then apply it (the vault is copied by the
+# broker after you enter its password; nothing inactive is switched on).
+./target/debug/agent206 import rustyclaw ~/.rustyclaw
+./target/debug/agent206 import rustyclaw ~/.rustyclaw --apply
+
 # Lifecycle controls; status and reconnect never start a missing gateway.
 ./target/debug/agent206 status
 ./target/debug/agent206 gateway status

@@ -5,11 +5,13 @@
 #![forbid(unsafe_code)]
 mod auth;
 mod credential;
+mod import;
 mod policy;
 mod totp;
 
 pub use auth::{AuthThrottle, Lockout, StepUpWindow};
 pub use credential::CredentialValue;
+pub use import::{ImportCheck, MAX_IMPORT_BYTES};
 pub use policy::{AccessContext, AccessPolicy, CredentialKind, CredentialMeta, Denial};
 pub use totp::{PendingTotp, TotpOutcome, unix_now};
 
@@ -60,6 +62,10 @@ pub enum Error {
     EnrollmentExpired,
     #[error("two-factor code was not accepted")]
     TotpRejected,
+    #[error("a vault already exists for this profile")]
+    Exists,
+    #[error("the vault to import could not be read")]
+    ImportSource(#[source] std::io::Error),
 }
 
 /// Raw keys an ordinary caller may never write or read, because they hold
