@@ -204,6 +204,8 @@ impl Process {
                 .and_then(|id| i32::try_from(id).ok())
                 .ok_or(BackendError::ProcessId)?,
         ));
+        // Only the Linux readiness check below needs `mut`.
+        #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
         let mut process = Self {
             child,
             cwd,
