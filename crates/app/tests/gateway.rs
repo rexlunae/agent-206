@@ -66,6 +66,53 @@ async fn stop_persists_for_a_fresh_offline_profile() -> Result<()> {
 }
 
 #[tokio::test]
+async fn stop_upgrades_legacy_gateways_without_requiring_new_status() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let root = directory.path().join("legacy");
+    let owner = a206_runtime::gateway::Gateway::open(&root)?;
+    let path = root.join("gateway.sock");
+    let listener = tokio::net::UnixListener::bind(&path)?;
+    // Model the old wire boundary: an unknown status variant closes its
+    // connection, but the established Shutdown request is still supported.
+    let _legacy = TestServer(tokio::spawn(async move {
+        let _owner = owner;
+        loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let request =
+                a206_runtime::transport::read_frame::<a206_protocol::Request<Command>>(&mut socket)
+                    .await
+                    .unwrap();
+            if let Some(request) = request
+                && matches!(request.body, Command::Shutdown)
+            {
+                a206_runtime::transport::write_frame(
+                    &mut socket,
+                    &a206_protocol::Response {
+                        id: request.id,
+                        body: Reply::Ok,
+                    },
+                )
+                .await
+                .unwrap();
+                break;
+            }
+        }
+        drop(listener);
+        std::fs::remove_file(path).unwrap();
+    }));
+    let mut command = tokio::process::Command::new(support::binary()?);
+    command
+        .arg("--data-dir")
+        .arg(&root)
+        .args(["gateway", "stop"]);
+    let stopped: GatewayReport = toml::from_str(&support::checked(capture(command).await?)?)?;
+    ensure!(stopped.phase == GatewayPhase::Stopped && stopped.error.is_none());
+    ensure!(root.join("gateway.stopped").exists());
+    ensure!(!root.join("gateway.sock").exists());
+    Ok(())
+}
+
+#[tokio::test]
 async fn replayed_shutdown_does_not_stop_a_restarted_process() -> Result<()> {
     let mut app = App::start(tempfile::tempdir()?, BTreeMap::new()).await?;
     let original = report(&app, "status").await?.info.unwrap().pid;

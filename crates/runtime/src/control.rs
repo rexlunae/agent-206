@@ -165,7 +165,10 @@ async fn stop(
             // A starting daemon may own the profile lock before binding its
             // socket. Wait for it rather than mistaking that gap for an offline
             // profile, or starting another daemon to deliver the stop request.
-            if current(shared)?.call(Command::GatewayStatus).await.is_ok() {
+            // Readiness must not require the newer status command: older
+            // gateways may close a connection on that unknown enum variant,
+            // while still supporting the established Shutdown command.
+            if crate::service::is_ready(root).await {
                 break;
             }
             replace(shared, Client::attach(root.into(), None))?;
@@ -206,8 +209,9 @@ async fn stop(
     }
     if remote.is_none() {
         loop {
-            let lock = crate::store::profile_lock(root)?;
-            if fs2::FileExt::try_lock_exclusive(&lock).is_ok() {
+            // Older gateways do not persist stop intent themselves. Do so
+            // under released ownership before acknowledging their shutdown.
+            if crate::service::stop_if_offline(root)? {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(25)).await;

@@ -82,6 +82,12 @@ async fn web_request<T: serde::Serialize, R: serde::de::DeserializeOwned>(
         .await
         .map_err(|e| e.to_string())?;
     if !response.status().is_success() {
+        if matches!(response.status().as_u16(), 404 | 405) {
+            return Err("This web server does not provide the current app controls. Restart the Agent 206 web server from the current build, then open its authorization URL.".into());
+        }
+        if matches!(response.status().as_u16(), 401 | 403) {
+            return Err("This browser session is not authorized. Open the authorization URL printed by the Agent 206 web server.".into());
+        }
         return Err(format!("web gateway returned {}", response.status()));
     }
     let bytes = response.bytes().await.map_err(|e| e.to_string())?;
@@ -380,6 +386,7 @@ fn Header() -> Element {
                 availability: if state.navigator.can_go_forward() { Availability::Enabled } else { Availability::Disabled },
                 onclick: move |_| state.navigator.go_forward() }
             Badge { tone: BadgeTone::Accent, "{route.label()}" }
+            LinkButton { size: ButtonSize::Sm, variant: ButtonVariant::Ghost, href: Route::Gateway {}.to_string(), Icon { name: Route::Gateway {}.icon() } "Gateway" }
             LinkButton { size: ButtonSize::Sm, variant: ButtonVariant::Ghost, href: Route::Appearance {}.to_string(), Icon { name: IconName::Settings } "Theme" }
             Button { size: ButtonSize::Sm, variant: ButtonVariant::Primary, availability: if (state.connected)() && state.gateway_busy.read().is_none() { Availability::Enabled } else { Availability::Disabled }, onclick: move |_| dispatch(state, Command::CreateThread { title: "New conversation".into(), mode: Mode::Chat }), "+ New chat" }
         }

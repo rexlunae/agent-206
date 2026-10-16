@@ -25,6 +25,19 @@ pub(crate) fn stop_if_offline(root: &Path) -> Result<bool> {
         Err(error) => Err(error.into()),
     }
 }
+pub(crate) async fn is_ready(root: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        tokio::net::UnixStream::connect(root.join("gateway.sock"))
+            .await
+            .is_ok()
+    }
+    #[cfg(not(unix))]
+    {
+        let _root = root;
+        false
+    }
+}
 #[cfg(unix)]
 pub async fn daemon(root: &Path, explicit: bool) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
