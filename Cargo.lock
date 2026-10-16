@@ -107,6 +107,7 @@ dependencies = [
 name = "a206-ui"
 version = "0.1.0"
 dependencies = [
+ "a206-broker",
  "a206-core",
  "a206-protocol",
  "a206-runtime",

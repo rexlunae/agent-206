@@ -1,11 +1,9 @@
 //! `agent206 vault …`: a trusted terminal surface for the vault broker. It uses
 //! the same broker requests, throttling and step-up rules as the GUI.
-use a206_broker::{
-    BrokerError, Client, ClientError, InvalidRequest, Reply, Request, Role, WireSecret, WireValue,
-};
-use a206_core::Ignore;
+use a206_broker::{BrokerError, Client, ClientError, Reply, Request, WireSecret, WireValue};
+use a206_runtime::vault;
 use a206_vault::{AccessPolicy, CredentialKind, CredentialMeta};
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use clap::{Subcommand, ValueEnum};
 use std::path::Path;
 
@@ -162,64 +160,11 @@ fn hidden(prompt: &str) -> Result<WireSecret> {
 }
 
 async fn connect(root: &Path) -> Result<Client> {
-    match Client::connect(root, Role::User).await {
-        Ok(client) => return Ok(client),
-        Err(ClientError::Broker(BrokerError::Invalid(InvalidRequest::UnsupportedVersion))) => {
-            bail!(
-                "the running vault broker is from a different Agent 206 version; \
-                 run `agent206 vault stop`, then retry"
-            )
-        }
-        // Not running yet: start it below.
-        Err(_) => {}
-    }
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-    let dir = root.join("vault");
-    std::fs::create_dir_all(&dir)?;
-    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
-    let log = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(0o600)
-        .open(dir.join("broker.log"))?;
-    let mut child = std::process::Command::new(std::env::current_exe()?)
-        .arg("--data-dir")
-        .arg(root)
-        .args(["vault", "broker"])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(log)
-        .spawn()
-        .context("start the vault broker")?;
-    let mut last = None;
-    for _ in 0..100 {
-        match Client::connect(root, Role::User).await {
-            Ok(client) => {
-                // The broker outlives this command; reap it if it exits first.
-                std::thread::spawn(move || child.wait());
-                return Ok(client);
-            }
-            Err(error) => last = Some(error),
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
-    // Killing fails only if the broker already exited, which is the goal.
-    child.kill().ignore();
-    let message = format!(
-        "vault broker did not start; inspect {}",
-        dir.join("broker.log").display()
-    );
-    Err(match last {
-        Some(error) => anyhow::Error::from(error).context(message),
-        None => anyhow::anyhow!(message),
-    })
+    Ok(vault::connect(root).await?)
 }
 
 async fn status(client: &mut Client) -> Result<a206_broker::BrokerStatus> {
-    match client.call(Request::Status).await? {
-        Reply::Status(status) => Ok(status),
-        _ => bail!("unexpected broker reply"),
-    }
+    Ok(vault::status(client).await?)
 }
 
 /// Unlock with the password, then the authenticator code only when the
@@ -285,39 +230,13 @@ async fn step_up(client: &mut Client) -> Result<()> {
     }
 }
 
-async fn gateway_running(root: &Path) -> bool {
-    a206_runtime::service::connect(root, false, false)
-        .await
-        .is_ok()
-}
-
-/// Mint this unlock's gateway pairing (the connection already holds a
-/// step-up) and hand it straight to the local gateway, never to disk.
-async fn pair_gateway(client: &mut Client, root: &Path) -> Result<()> {
-    let Reply::GatewayPairing { token } = client.call(Request::PairGateway).await? else {
-        bail!("unexpected broker reply");
-    };
-    let pairing = a206_core::BrokerPairing::new(token.expose().to_owned());
-    drop(token);
-    let gateway = a206_runtime::client::Client::attach(root.to_owned(), None);
-    match gateway
-        .call(a206_core::Command::PairBroker { pairing })
-        .await?
-    {
-        a206_core::Reply::Ok => Ok(()),
-        a206_core::Reply::Error(report) => {
-            Err(anyhow::Error::from(report).context("the gateway refused the pairing"))
-        }
-        _ => bail!("unexpected gateway reply"),
-    }
-}
-
 async fn pair_if_running(client: &mut Client, root: &Path) -> Result<()> {
-    if gateway_running(root).await {
+    if vault::gateway_running(root).await {
         // The unlock itself succeeded; a failed pairing is reported, not fatal.
-        match pair_gateway(client, root).await {
+        match vault::pair_gateway(client, root).await {
             Ok(()) => println!("Gateway paired with the vault"),
             Err(error) => {
+                let error = anyhow::Error::from(error);
                 eprintln!("Could not pair the gateway ({error:#}); run `agent206 vault pair`")
             }
         }
@@ -426,11 +345,11 @@ pub fn run(root: &Path, action: VaultAction) -> Result<()> {
                 pair_if_running(&mut client, root).await?;
             }
             VaultAction::Pair => {
-                if !gateway_running(root).await {
+                if !vault::gateway_running(root).await {
                     bail!("the gateway is not running; start it with `agent206 gateway start`");
                 }
                 step_up(&mut client).await?;
-                pair_gateway(&mut client, root).await?;
+                vault::pair_gateway(&mut client, root).await?;
                 println!("Gateway paired with the vault");
             }
             VaultAction::Lock => {

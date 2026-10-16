@@ -119,3 +119,4 @@ body { max-inline-size: none; inline-size: 100%; padding: 0; background: var(--f
 .a206-recent-thread { inline-size: 100%; justify-content: flex-start; gap: var(--fc-space-3); padding-block: var(--fc-space-2); }
 .a206-recent-thread .a206-nav-title { display: flex; flex-direction: column; gap: var(--fc-space-1); font-size: .75rem; }
 .a206-recent-thread .a206-muted { font-size: .7rem; }
+.a206-secret-text { overflow-wrap: anywhere; user-select: all; }
