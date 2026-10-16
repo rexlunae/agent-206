@@ -86,7 +86,10 @@ async fn web_request<T: serde::Serialize, R: serde::de::DeserializeOwned>(
             return Err("This web server does not provide the current app controls. Restart the Agent 206 web server from the current build, then open its authorization URL.".into());
         }
         if matches!(response.status().as_u16(), 401 | 403) {
-            return Err("This browser session is not authorized. Open the authorization URL printed by the Agent 206 web server.".into());
+            // A restarted bridge issues a new bearer; drop the stale one so the
+            // next authorization link is not shadowed by it.
+            forget_web_session();
+            return Err("This browser is not authorized for the running web bridge. Open the authorization URL printed by `agent206 web`; restart it for a new link if that one was already used.".into());
         }
         return Err(format!("web gateway returned {}", response.status()));
     }
@@ -143,13 +146,28 @@ pub(crate) fn control_gateway(mut state: State, action: GatewayAction) {
         refresh(state).await;
     });
 }
+/// The bridge bearer is shared by every tab of this exact origin (scheme, host and
+/// port) and dies with the bridge process, so it lives in origin-scoped local
+/// storage: per-tab session storage stranded new tabs because the bootstrap link
+/// is one-use.
+#[cfg(target_arch = "wasm32")]
+fn web_storage() -> Result<web_sys::Storage, String> {
+    web_sys::window()
+        .ok_or("browser unavailable")?
+        .local_storage()
+        .map_err(|_| "browser storage unavailable")?
+        .ok_or_else(|| "browser storage unavailable".into())
+}
+#[cfg(target_arch = "wasm32")]
+fn forget_web_session() {
+    if let Ok(storage) = web_storage() {
+        let _ = storage.remove_item("a206.session");
+    }
+}
 #[cfg(target_arch = "wasm32")]
 fn web_session() -> Result<String, String> {
     let window = web_sys::window().ok_or("browser unavailable")?;
-    let storage = window
-        .session_storage()
-        .map_err(|_| "session storage unavailable")?
-        .ok_or("session storage unavailable")?;
+    let storage = web_storage()?;
     let fragment = window
         .location()
         .hash()
@@ -160,7 +178,7 @@ fn web_session() -> Result<String, String> {
         }
         storage
             .set_item("a206.session", token)
-            .map_err(|_| "session storage unavailable")?;
+            .map_err(|_| "browser storage unavailable")?;
         let history = window
             .history()
             .map_err(|_| "browser history unavailable")?;
@@ -185,8 +203,10 @@ fn web_session() -> Result<String, String> {
     }
     storage
         .get_item("a206.session")
-        .map_err(|_| "session storage unavailable")?
-        .ok_or_else(|| "Open the authorization URL printed by the web gateway".into())
+        .map_err(|_| "browser storage unavailable")?
+        .ok_or_else(|| {
+            "Open the authorization URL printed by `agent206 web` to connect this browser.".into()
+        })
 }
 pub(crate) fn dispatch(mut state: State, command: Command) {
     let navigate = matches!(

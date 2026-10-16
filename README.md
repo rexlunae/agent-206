@@ -95,7 +95,7 @@ cargo build -p agent206 --no-default-features
 Open the one-session authorization URL printed by the server. It binds only to
 127.0.0.1 and establishes an origin-scoped bearer session through a one-use link.
 POST requests need the exact Host/Origin and explicit Authorization header.
-The browser token lives in sessionStorage and is removed from the address bar. Do not reverse-proxy this preview onto
+The browser token lives in storage scoped to that exact origin, so other tabs of the same browser stay connected; it is removed from the address bar and expires when the bridge restarts. `http://localhost:<port>` redirects to the `127.0.0.1` origin. Do not reverse-proxy this preview onto
 a public network: multi-user authentication, HTTPS deployment and remote web
 sessions are not implemented.
 

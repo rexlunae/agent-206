@@ -88,7 +88,10 @@ local API; there are no copied model/provider fixtures.
 Router tests render the shared application with in-memory history, exercise
 Back/Forward and initial page selection, and check exact thread identity, split
 selection, missing-thread recovery and malformed routes. Web service tests cover
-HTML deep-link reloads, HEAD, existing assets and reserved/non-HTML/method errors.
+HTML deep-link reloads, HEAD, existing assets and reserved/non-HTML/method errors,
+the localhost-to-127.0.0.1 redirect and one-use authorization links. A headless
+Chromium check confirmed a second tab, a reload, the localhost URL and a restarted
+bridge (stale bearer discarded, new link accepted) all reach a connected gateway.
 Browser checks verify router-aware links, app Back/browser Forward, new-conversation
 navigation, direct split-view reloads with the selected second thread, and
 unavailable/malformed conversation recovery. Desktop and web release builds and
