@@ -7,6 +7,8 @@ mod route;
 mod settings;
 #[cfg(target_arch = "wasm32")]
 use a206_core::Ignore;
+#[cfg(not(target_arch = "wasm32"))]
+mod setup;
 use a206_core::{
     Command, ErrorKind, ErrorReport, GatewayAction, GatewayPhase, GatewayReport, Mode, Reply,
     Settings, Snapshot,
@@ -20,10 +22,54 @@ use uuid::Uuid;
 #[cfg(not(target_arch = "wasm32"))]
 static CLIENT: std::sync::Mutex<Option<a206_runtime::control::GatewayController>> =
     std::sync::Mutex::new(None);
+/// Profile root and any `--remote` override, kept for first-time setup.
+#[cfg(not(target_arch = "wasm32"))]
+static PROFILE: std::sync::Mutex<Option<(std::path::PathBuf, Option<String>)>> =
+    std::sync::Mutex::new(None);
+/// A saved setup that could not be loaded; the setup screen shows it.
+#[cfg(not(target_arch = "wasm32"))]
+static SETUP_ERROR: std::sync::Mutex<
+    Option<std::sync::Arc<a206_runtime::connection::ConnectionError>>,
+> = std::sync::Mutex::new(None);
+/// Connect only to an explicit `--remote` or a saved setup. Without either, the
+/// desktop and terminal clients open first-time setup instead of launching a gateway.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn configure(root: std::path::PathBuf, remote: Option<String>) {
+    if let Ok(mut profile) = PROFILE.lock() {
+        *profile = Some((root.clone(), remote.clone()));
+    }
+    match a206_runtime::connection::resolve(&root, remote) {
+        Ok(Some(target)) => connect(root, &target),
+        Ok(None) => {}
+        Err(error) => {
+            if let Ok(mut slot) = SETUP_ERROR.lock() {
+                *slot = Some(std::sync::Arc::new(error));
+            }
+        }
+    }
+}
+#[cfg(not(target_arch = "wasm32"))]
+fn connect(root: std::path::PathBuf, target: &a206_core::GatewayTarget) {
     if let Ok(mut client) = CLIENT.lock() {
-        *client = Some(a206_runtime::control::GatewayController::new(root, remote));
+        *client = Some(a206_runtime::control::GatewayController::new(
+            root,
+            target.remote().map(str::to_owned),
+        ));
+    }
+}
+/// True until this client has a gateway to talk to.
+fn setup_required() -> bool {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        CLIENT
+            .lock()
+            .map(|client| client.is_none())
+            .unwrap_or(false)
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        // The web bridge is configured on the server with `agent206 gateway setup`.
+        false
     }
 }
 
@@ -40,6 +86,8 @@ pub(crate) struct State {
     pub gateway_busy: Signal<Option<GatewayAction>>,
     pub gateway_generation: Signal<u64>,
     pub theme: Signal<ThemeChoice>,
+    /// First-time (or changed) gateway setup is showing instead of the workspace.
+    pub setup: Signal<bool>,
 }
 fn empty_snapshot() -> Snapshot {
     Snapshot {
@@ -103,13 +151,12 @@ async fn web_request<T: serde::Serialize, R: serde::de::DeserializeOwned>(
         .location()
         .origin()
         .map_err(|_| unavailable("browser origin unavailable"))?;
+    let bearer =
+        web_session().map_err(|message| ErrorReport::new(ErrorKind::PermissionDenied, message))?;
     let response = reqwest::Client::new()
         .post(format!("{origin}{path}"))
         .header("Content-Type", "application/msgpack")
-        .bearer_auth(
-            web_session()
-                .map_err(|message| ErrorReport::new(ErrorKind::PermissionDenied, message))?,
-        )
+        .bearer_auth(&bearer)
         .body(a206_protocol::encode(&request).map_err(|e| captured(ErrorKind::Protocol)(&e))?)
         .send()
         .await
@@ -122,9 +169,12 @@ async fn web_request<T: serde::Serialize, R: serde::de::DeserializeOwned>(
             ));
         }
         if matches!(response.status().as_u16(), 401 | 403) {
+            // A restarted bridge issues a new bearer; drop the stale one so the
+            // next authorization link is not shadowed by it.
+            forget_web_session(&bearer);
             return Err(ErrorReport::new(
                 ErrorKind::PermissionDenied,
-                "This browser session is not authorized. Open the authorization URL printed by the Agent 206 web server.",
+                "This browser is not authorized for the running web bridge. Open the authorization URL printed by `agent206 web`; restart it for a new link if that one was already used.",
             ));
         }
         return Err(unavailable(format!(
@@ -197,13 +247,33 @@ pub(crate) fn control_gateway(mut state: State, action: GatewayAction) {
         refresh(state).await;
     });
 }
+/// The bridge bearer is shared by every tab of this exact origin (scheme, host and
+/// port) and dies with the bridge process, so it lives in origin-scoped local
+/// storage: per-tab session storage stranded new tabs because the bootstrap link
+/// is one-use.
+#[cfg(target_arch = "wasm32")]
+fn web_storage() -> Result<web_sys::Storage, String> {
+    web_sys::window()
+        .ok_or("browser unavailable")?
+        .local_storage()
+        .map_err(|_| "browser storage unavailable")?
+        .ok_or_else(|| "browser storage unavailable".into())
+}
+/// Forget a rejected bearer, unless another tab has already stored a newer one.
+#[cfg(target_arch = "wasm32")]
+fn forget_web_session(rejected: &str) {
+    if let Ok(storage) = web_storage()
+        && storage.get_item("a206.session").ok().flatten().as_deref() == Some(rejected)
+    {
+        // If storage refuses, the stale bearer is rejected again and replaced
+        // by the next authorization link; nothing more can be done here.
+        storage.remove_item("a206.session").ignore();
+    }
+}
 #[cfg(target_arch = "wasm32")]
 fn web_session() -> Result<String, String> {
     let window = web_sys::window().ok_or("browser unavailable")?;
-    let storage = window
-        .session_storage()
-        .map_err(|_| "session storage unavailable")?
-        .ok_or("session storage unavailable")?;
+    let storage = web_storage()?;
     let fragment = window
         .location()
         .hash()
@@ -214,7 +284,7 @@ fn web_session() -> Result<String, String> {
         }
         storage
             .set_item("a206.session", token)
-            .map_err(|_| "session storage unavailable")?;
+            .map_err(|_| "browser storage unavailable")?;
         let history = window
             .history()
             .map_err(|_| "browser history unavailable")?;
@@ -239,8 +309,10 @@ fn web_session() -> Result<String, String> {
     }
     storage
         .get_item("a206.session")
-        .map_err(|_| "session storage unavailable")?
-        .ok_or_else(|| "Open the authorization URL printed by the web gateway".into())
+        .map_err(|_| "browser storage unavailable")?
+        .ok_or_else(|| {
+            "Open the authorization URL printed by `agent206 web` to connect this browser.".into()
+        })
 }
 pub(crate) fn dispatch(mut state: State, command: Command) {
     let navigate = matches!(
@@ -408,6 +480,7 @@ fn Shell() -> Element {
     let gateway = use_signal(|| None);
     let gateway_busy = use_signal(|| None);
     let gateway_generation = use_signal(|| 0);
+    let setup = use_signal(setup_required);
     let mut theme = use_context::<Signal<ThemeChoice>>();
     let state = State {
         data,
@@ -420,15 +493,28 @@ fn Shell() -> Element {
         gateway_generation,
         loaded,
         theme,
+        setup,
         navigator: navigator(),
     };
     use_context_provider(|| state);
     use_future(move || async move {
-        refresh(state).await;
-        theme.set(theme_from(&state.data.peek().settings));
+        let mut themed = false;
         loop {
+            // Never poll (or launch) a gateway before the user has chosen one.
+            if !*state.setup.peek() {
+                refresh(state).await;
+                // Apply each gateway's theme once its first snapshot arrives
+                // (switching gateways resets `loaded`).
+                let loaded = *state.loaded.peek();
+                if loaded && !themed {
+                    theme.set(theme_from(&state.data.peek().settings));
+                }
+                themed = loaded;
+            } else {
+                // Whatever is chosen next gets its own theme on its first snapshot.
+                themed = false;
+            }
             futures_timer::Delay::new(std::time::Duration::from_secs(2)).await;
-            refresh(state).await;
         }
     });
     rsx! {
@@ -445,7 +531,7 @@ fn Shell() -> Element {
                 Split { label: name!("Workspace navigation width"), default_value: 18.0, min: 12.0, max: 32.0,
                     primary: rsx! { Sidebar {} },
                     secondary: rsx! { main { class: "a206-main", id: "workspace-main",
-                        Outlet::<Route> {}
+                        if setup() { GatewaySetupGate {} } else { Outlet::<Route> {} }
                     } }
                 }
             }
@@ -457,6 +543,17 @@ fn Shell() -> Element {
                 span { "Agent 206 / development preview" }
             }
         }
+    }
+}
+#[component]
+fn GatewaySetupGate() -> Element {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        rsx! { setup::GatewaySetup {} }
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        rsx! {}
     }
 }
 #[component]

@@ -99,6 +99,16 @@ impl Drop for App {
         let _reap = self.daemon.wait();
     }
 }
+/// Complete first-time setup for a local gateway, as `gateway setup --local` does.
+pub fn configure_local(root: &std::path::Path) -> Result<()> {
+    a206_runtime::connection::save(
+        root,
+        &a206_core::GatewayConnection {
+            target: a206_core::GatewayTarget::Local,
+        },
+    )?;
+    Ok(())
+}
 impl App {
     pub async fn start(
         directory: tempfile::TempDir,
@@ -107,6 +117,7 @@ impl App {
         let binary = binary()?;
         let root = directory.path().join("state");
         std::fs::create_dir(&root)?;
+        configure_local(&root)?;
         let log = std::fs::File::create(root.join("gateway.log"))?;
         let daemon = std::process::Command::new(&binary)
             .arg("--data-dir")

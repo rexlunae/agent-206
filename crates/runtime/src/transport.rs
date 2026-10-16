@@ -1,6 +1,6 @@
 //! OpenSSH transport adapted from RustyClaw's gateway/ssh_connection.rs.
 use a206_protocol::{decode_payload, encode, payload_size};
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result};
 use serde::{Serialize, de::DeserializeOwned};
 use std::{path::Path, process::Stdio};
 use tokio::{
@@ -34,25 +34,77 @@ pub async fn write_frame<T: Serialize>(
     writer.flush().await?;
     Ok(())
 }
-pub fn ssh_command(endpoint: &str) -> Result<Command> {
+/// A validated `ssh://[user@]host[:port]` endpoint.
+pub struct SshEndpoint {
+    pub user: Option<String>,
+    pub host: String,
+    pub port: Option<u16>,
+}
+/// Why an SSH endpoint or command was refused before running OpenSSH.
+#[derive(Debug, thiserror::Error)]
+pub enum SshEndpointError {
+    #[error("not a URL")]
+    Url(#[from] url::ParseError),
+    #[error("expected ssh://[user@]host[:port] with no password, path, query or fragment")]
+    Shape,
+    #[error("SSH host missing")]
+    MissingHost,
+    #[error("SSH host may not start with '-'")]
+    OptionLikeHost,
+    #[error("SSH username may contain only letters, digits, '.', '_' and '-'")]
+    Username,
+    #[error("profile path {} cannot be passed to OpenSSH", path.display())]
+    ProfilePath { path: std::path::PathBuf },
+}
+pub fn parse_ssh_endpoint(endpoint: &str) -> Result<SshEndpoint, SshEndpointError> {
     let url = url::Url::parse(endpoint)?;
-    ensure!(
-        url.scheme() == "ssh"
-            && url.password().is_none()
-            && url.query().is_none()
-            && url.fragment().is_none()
-            && (url.path().is_empty() || url.path() == "/"),
-        "expected ssh://[user@]host[:port]"
-    );
-    let host = url.host_str().context("SSH host missing")?;
-    ensure!(!host.starts_with('-'), "invalid SSH host");
-    ensure!(
-        url.username()
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b)),
-        "invalid SSH username"
-    );
+    if !(url.scheme() == "ssh"
+        && url.password().is_none()
+        && url.query().is_none()
+        && url.fragment().is_none()
+        && (url.path().is_empty() || url.path() == "/"))
+    {
+        return Err(SshEndpointError::Shape);
+    }
+    let host = url.host_str().ok_or(SshEndpointError::MissingHost)?;
+    if host.starts_with('-') {
+        return Err(SshEndpointError::OptionLikeHost);
+    }
+    if !url
+        .username()
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+    {
+        return Err(SshEndpointError::Username);
+    }
+    Ok(SshEndpoint {
+        user: (!url.username().is_empty()).then(|| url.username().to_owned()),
+        host: host.to_owned(),
+        port: url.port(),
+    })
+}
+pub fn ssh_command(endpoint: &str) -> Result<Command, SshEndpointError> {
+    ssh_base(endpoint, None, false)
+}
+/// `ssh -G`: print the configuration OpenSSH would use for an endpoint, without connecting.
+pub fn ssh_config_command(endpoint: &str) -> Result<Command, SshEndpointError> {
+    ssh_base(endpoint, None, true)
+}
+/// Gateway SSH also trusts host keys the user confirmed during setup, kept in
+/// the profile's own known_hosts after the user's `~/.ssh/known_hosts`.
+pub fn gateway_ssh_command(root: &Path, endpoint: &str) -> Result<Command, SshEndpointError> {
+    ssh_base(endpoint, Some(&crate::connection::known_hosts(root)), false)
+}
+fn ssh_base(
+    endpoint: &str,
+    known_hosts: Option<&Path>,
+    print_config: bool,
+) -> Result<Command, SshEndpointError> {
+    let endpoint = parse_ssh_endpoint(endpoint)?;
     let mut command = Command::new("ssh");
+    if print_config {
+        command.arg("-G");
+    }
     command.args([
         "-T",
         "-o",
@@ -66,13 +118,24 @@ pub fn ssh_command(endpoint: &str) -> Result<Command> {
         "-o",
         "ConnectTimeout=10",
     ]);
-    if let Some(port) = url.port() {
+    if let Some(path) = known_hosts {
+        let file = path
+            .to_str()
+            .filter(|file| !file.contains('"') && !file.contains('\n'))
+            .ok_or_else(|| SshEndpointError::ProfilePath {
+                path: path.to_owned(),
+            })?;
+        command
+            .arg("-o")
+            .arg(format!("UserKnownHostsFile=~/.ssh/known_hosts \"{file}\""));
+    }
+    if let Some(port) = endpoint.port {
         command.arg("-p").arg(port.to_string());
     }
-    if !url.username().is_empty() {
-        command.arg("-l").arg(url.username());
+    if let Some(user) = endpoint.user {
+        command.arg("-l").arg(user);
     }
-    command.arg("--").arg(host);
+    command.arg("--").arg(endpoint.host);
     Ok(command)
 }
 pub fn gateway_command(
@@ -82,7 +145,7 @@ pub fn gateway_command(
     explicit: bool,
 ) -> Result<Command> {
     let mut command = if let Some(remote) = remote {
-        let mut command = ssh_command(remote)?;
+        let mut command = gateway_ssh_command(root, remote)?;
         // Fixed command text: OpenSSH executes remote arguments through a shell.
         command.arg(if explicit {
             "agent206 gateway --stdio --start"

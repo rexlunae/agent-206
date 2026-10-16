@@ -41,9 +41,53 @@ async fn socket_request(app: &App, id: uuid::Uuid, body: Command) -> Result<Repl
 }
 
 #[tokio::test]
+async fn clients_require_gateway_setup_before_connecting() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let root = directory.path().join("unconfigured");
+    let command = |args: &[&str]| {
+        let mut command = tokio::process::Command::new(support::binary().unwrap());
+        command.arg("--data-dir").arg(&root).args(args);
+        command
+    };
+    for args in [
+        vec!["snapshot"],
+        vec!["status"],
+        vec!["gateway", "start"],
+        vec!["gateway", "status"],
+    ] {
+        let output = capture(command(&args)).await?;
+        ensure!(!output.status.success(), "{args:?} ran without setup");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        ensure!(stderr.contains("gateway setup"), "{args:?}: {stderr}");
+        ensure!(
+            !root.join("gateway.sock").exists(),
+            "{args:?} started a gateway"
+        );
+    }
+    // A malformed endpoint is refused before anything is saved or run.
+    let output = capture(command(&[
+        "gateway",
+        "setup",
+        "--ssh",
+        "ssh://-oProxyCommand=x",
+    ]))
+    .await?;
+    ensure!(!output.status.success());
+    ensure!(!root.join("connection.toml").exists());
+    support::checked(capture(command(&["gateway", "setup", "--local"])).await?)?;
+    let started: GatewayReport = toml::from_str(&support::checked(
+        capture(command(&["gateway", "start"])).await?,
+    )?)?;
+    ensure!(started.phase == GatewayPhase::Running, "{started:?}");
+    support::checked(capture(command(&["gateway", "stop"])).await?)?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn stop_persists_for_a_fresh_offline_profile() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let root = directory.path().join("fresh");
+    support::configure_local(&root)?;
     let command = |args: &[&str]| {
         let mut command = tokio::process::Command::new(support::binary().unwrap());
         command.arg("--data-dir").arg(&root).args(args);
@@ -70,6 +114,7 @@ async fn stop_upgrades_legacy_gateways_without_requiring_new_status() -> Result<
     let directory = tempfile::tempdir()?;
     let root = directory.path().join("legacy");
     let owner = a206_runtime::gateway::Gateway::open(&root)?;
+    support::configure_local(&root)?;
     let path = root.join("gateway.sock");
     let listener = tokio::net::UnixListener::bind(&path)?;
     // Model the old wire boundary: an unknown status variant closes its

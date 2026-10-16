@@ -16,24 +16,29 @@ On macOS the desktop build uses the system webview. Linux desktop additionally
 needs Dioxus's WebKitGTK development dependencies.
 
 ```sh
-# Primary desktop experience, with the gateway started automatically.
+# Primary desktop experience; first launch asks which gateway to use.
 dx serve --platform desktop -p agent206
 
 # Headless CLI and local gateway; no GUI system dependencies.
 cargo build -p agent206 --no-default-features
+./target/debug/agent206 gateway setup --local   # once per profile
 ./target/debug/agent206 new 'A new idea'
 ./target/debug/agent206 snapshot
 
 # Same component tree in the Dioxus terminal renderer.
 cargo run -p agent206 --no-default-features --features tui -- tui
 
-# Remote gateway using your existing SSH identities and verified known_hosts.
+# Remote gateway using your existing SSH identities and verified host keys:
+# save it as the profile's gateway, or override per command with --remote.
+./target/debug/agent206 gateway setup --ssh ssh://user@host
 ./target/debug/agent206 --remote ssh://user@host snapshot
 ```
 
 The remote host needs an installed `agent206` executable. Automatic remote
-installation/updating is not implemented. Unknown SSH host keys are refused;
-verify them using your ordinary SSH workflow first.
+installation/updating is not implemented. Setup shows an unknown host's key
+fingerprints (after applying your ssh_config aliases) and trusts only one you
+confirm; hosts behind a ProxyJump/ProxyCommand must first be verified with
+`ssh` itself. Changed host keys are refused.
 
 State is stored under `~/.agent206`; pass `--data-dir /absolute/path` to use an
 isolated profile. Settings are exported as TOML; apply edits through the shared
@@ -52,6 +57,11 @@ Don't edit `state.sqlite3` while it is running.
 
 # Stop the shared gateway (interrupts active work).
 ./target/debug/agent206 stop-gateway
+
+# Choose the gateway once per profile (the desktop and terminal clients ask on
+# first launch). Unknown SSH hosts print fingerprints to verify, then --trust one.
+./target/debug/agent206 gateway setup --local
+./target/debug/agent206 gateway setup --ssh ssh://user@host --trust SHA256:...
 
 # Lifecycle controls; status and reconnect never start a missing gateway.
 ./target/debug/agent206 status
@@ -89,13 +99,14 @@ authorization URL after restarting so the browser uses the new session.
 rustup target add wasm32-unknown-unknown
 dx build --platform web -p agent206 --release --no-default-features --features web
 cargo build -p agent206 --no-default-features
+./target/debug/agent206 gateway setup --local   # or --ssh; the bridge connects for the browser
 ./target/debug/agent206 web --static-dir target/dx/agent206/release/web/public
 ```
 
 Open the one-session authorization URL printed by the server. It binds only to
 127.0.0.1 and establishes an origin-scoped bearer session through a one-use link.
 POST requests need the exact Host/Origin and explicit Authorization header.
-The browser token lives in sessionStorage and is removed from the address bar. Do not reverse-proxy this preview onto
+The browser token lives in storage scoped to that exact origin, so other tabs of the same browser stay connected; it is removed from the address bar and expires when the bridge restarts. `http://localhost:<port>` redirects to the `127.0.0.1` origin. Do not reverse-proxy this preview onto
 a public network: multi-user authentication, HTTPS deployment and remote web
 sessions are not implemented.
 

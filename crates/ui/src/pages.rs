@@ -207,7 +207,7 @@ pub fn Security() -> Element {
         div { class: "a206-grid",
             Card { CardHeader { CardTitle { "Least privilege" } } CardBody { p { "New conversations have no tool grants. Delegated capabilities are intersected with their parent, mode and extension manifest." } } }
             Card { CardHeader { CardTitle { "Encrypted vault" } } CardBody { p { "SecureStore-compatible encrypted storage with explicit locking, redacted secret types and atomic private writes." } } }
-            Card { CardHeader { CardTitle { "Verified SSH" } } CardBody { p { "Remote connections use your OpenSSH configuration and verified host keys. Unknown hosts must be paired through SSH first." } } }
+            Card { CardHeader { CardTitle { "Verified SSH" } } CardBody { p { "Remote connections use your OpenSSH configuration and verified host keys. Gateway setup shows an unknown host's fingerprint and trusts it only after you confirm it." } } }
         }
         GatewayControls {}
         Alert { title: rsx! { "Security implementation status" }, "Provider API keys are used only inside the separate vault broker, for the exact origins you bind them to. Unlock, two-factor enrollment and credential management currently run from `agent206 vault`; the desktop controls and agent approval flow are not built yet, so agents still cannot use credentials and privileged extension imports remain unavailable." }
@@ -266,6 +266,10 @@ pub fn Gateway() -> Element {
                 if let Some(error) = report.as_ref().and_then(|report| report.failure_report()) {
                     ErrorNotice { report: error, title: "Connection needs attention".to_string() }
                 }
+            }
+            // The web bridge's gateway is chosen on its server with `agent206 gateway setup`.
+            if !cfg!(target_arch = "wasm32") {
+                CardFooter { Button { variant: ButtonVariant::Secondary, onclick: move |_| { let mut setup = state.setup; setup.set(true); }, "Change gateway" } }
             }
         }
         Card { variant: CardVariant::Subtle, CardHeader { CardTitle { "Security setup" } }
