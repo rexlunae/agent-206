@@ -27,7 +27,7 @@ default_policy = "ask"              # allow | ask | deny for unlisted tools
 timeout_seconds = 120               # per call, 1..=1800
 
 [mcp_servers.env]                   # non-secret only; nothing is inherited
-LOG_LEVEL = "warn"
+LOG_LEVEL = "warn"                  # HOME, TMPDIR, PATH, LANG, NO_COLOR are reserved
 
 [mcp_servers.tools]
 read_file = "allow"
@@ -50,6 +50,8 @@ private scratch directory, and nothing else unless the entry holds:
 | `execute` | run `/bin` and `/usr/bin` programs |
 | `network` | outbound network, DNS and system trust store (untested on CI) |
 
+Seatbelt checks resolved paths, so a symlink inside the project that points
+outside it reaches nothing the server could not already read (tested on macOS CI).
 Private application state and common credential stores (`~/.ssh`, `~/.aws`,
 `~/.agent206`, keychains and agent configuration) are denied even inside a
 project. Any other capability (secrets, git, agents, browser) is rejected:
@@ -64,14 +66,19 @@ The gateway authorizes every call against current state
 the calling thread's grant includes **every** capability the server holds; a
 server with workspace access serves only threads in its bound project; and an
 `ask` tool needs the user's approval for that call. An MCP server never adds
-authority to a thread, and a model's request is never an approval.
+authority to a thread, and a model's request is never an approval. The check
+repeats after every gateway state change while a call runs; a call the thread may
+no longer make is cancelled (`McpError::Revoked`) and the server receives an MCP
+cancellation notice.
 
 ## Lifecycle
 
 `ConnectMcpServer` starts an enabled server, initializes the session and records
 its tools; `DisconnectMcpServer` stops it until the user connects it again.
 Enabled servers also start on first use by the run engine. Changing, disabling or
-removing an entry stops its session. A gateway restart leaves every server
+removing an entry stops its session. A server that exits or closes its pipe is
+marked failed (`McpError::Exited`); its next use starts it again. Concurrent
+first uses share one start. A gateway restart leaves every server
 disconnected. Status (state, server-reported name/version, tools, last failure as
 an `ErrorReport`) is part of the snapshot and announced with
 `EventKind::McpServerChanged`.
@@ -93,6 +100,8 @@ The run engine calls two gateway methods (`crates/runtime/src/gateway/mcp_server
   structured JSON). Pass `Approval::Approved` only after the user approved this
   call in the trusted approval surface. Failures are `GatewayError::Mcp(McpError)`
   with stable kinds (permission denied, unavailable, protocol, timeout).
+  To cancel a call when its run is cancelled, drop the future; the server is
+  not told, and its eventual reply is discarded.
 
 ## Not yet implemented
 

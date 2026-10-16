@@ -407,6 +407,10 @@ impl Gateway {
                     Ok(reply) => reply,
                     Err(error) => Reply::Error(crate::error::correlated(operation, id, &error)),
                 };
+                if mutation {
+                    // In-flight MCP calls re-check their authorization.
+                    self.mcp.state_changed();
+                }
                 let stop = is_shutdown && matches!(reply, Reply::Ok);
                 if mutation
                     && let Err(error) = self

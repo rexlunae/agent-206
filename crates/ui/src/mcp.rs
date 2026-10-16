@@ -38,16 +38,13 @@ fn save_servers(state: State, edit: impl FnOnce(&mut Vec<McpServerConfig>)) {
 fn McpServerCard(config: McpServerConfig, status: McpServerStatus) -> Element {
     let state = use_context::<State>();
     let name = config.name.clone();
-    let enabled = use_memo({
-        let enabled = config.enabled;
-        move || {
-            if enabled {
-                CheckState::On
-            } else {
-                CheckState::Off
-            }
-        }
-    });
+    // Reactive on the prop, so a change saved elsewhere reaches this control.
+    let enabled = config.enabled;
+    let enabled = use_memo(use_reactive!(|enabled| if enabled {
+        CheckState::On
+    } else {
+        CheckState::Off
+    }));
     let authority = AUTHORITY
         .iter()
         .filter(|(c, _)| config.capabilities.contains(c))
@@ -88,7 +85,7 @@ fn McpServerCard(config: McpServerConfig, status: McpServerStatus) -> Element {
 #[component]
 fn ToolRow(server: String, tool: String, description: String, policy: ToolPolicy) -> Element {
     let state = use_context::<State>();
-    let value = use_memo(move || Some(policy.label().to_owned()));
+    let value = use_memo(use_reactive!(|policy| Some(policy.label().to_owned())));
     rsx! { div { class: "a206-row a206-between",
         div { strong { "{tool}" } if !description.is_empty() { p { class: "a206-muted", "{description}" } } }
         Select { label: name!("Policy for this tool"), value: ReadSignal::from(value),

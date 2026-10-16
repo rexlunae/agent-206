@@ -126,6 +126,7 @@ impl Classified for a206_mcp::McpError {
             | RelativePath
             | Nul
             | Environment
+            | ReservedEnvironment { .. }
             | Capability { .. }
             | WriteWithoutRead
             | ProjectRequired
@@ -137,7 +138,7 @@ impl Classified for a206_mcp::McpError {
             // Absent and unreadable paths need different recovery; the I/O cause decides.
             Missing { .. } => return None,
             Setup(_) | ProcessId => ErrorKind::Internal,
-            Unsupported | Spawn(_) | NotConnected => ErrorKind::Unavailable,
+            Unsupported | Spawn(_) | NotConnected | Exited => ErrorKind::Unavailable,
             Initialize(_)
             | Service(_)
             | Schema(_)
@@ -145,9 +146,12 @@ impl Classified for a206_mcp::McpError {
             | ListingTooLarge { .. }
             | OutputTooLarge { .. } => ErrorKind::Protocol,
             Timeout(_) => ErrorKind::Timeout,
-            Disabled | ToolDenied | ApprovalRequired | Denied { .. } | ProjectMismatch => {
-                ErrorKind::PermissionDenied
-            }
+            Disabled
+            | ToolDenied
+            | ApprovalRequired
+            | Denied { .. }
+            | ProjectMismatch
+            | Revoked => ErrorKind::PermissionDenied,
         })
     }
 }

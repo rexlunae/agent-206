@@ -167,12 +167,14 @@ fn launch(
         .args(&server.args)
         .env_clear()
         .current_dir(&cwd)
+        // Entry variables first, so the fixed ones below always win; `validate`
+        // also refuses entries that try to set them.
+        .envs(&server.env)
         .env("HOME", &home)
         .env("TMPDIR", &tmp)
         .env("PATH", format!("{bin}:/usr/bin:/bin"))
         .env("LANG", "en_US.UTF-8")
         .env("NO_COLOR", "1")
-        .envs(&server.env)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())

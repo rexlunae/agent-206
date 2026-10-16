@@ -2,20 +2,29 @@
 use crate::{Launch, Limits, McpError};
 use a206_core::McpToolInfo;
 use rmcp::{
-    RoleClient, ServiceExt,
-    model::{CallToolRequestParams, ContentBlock, PaginatedRequestParams, ResourceContents},
-    service::RunningService,
+    RoleClient, ServiceError, ServiceExt,
+    model::{
+        CallToolRequest, CallToolRequestParams, CancelledNotification, CancelledNotificationParam,
+        ClientRequest, ContentBlock, PaginatedRequestParams, RequestId, ResourceContents,
+        ServerResult,
+    },
+    service::{Peer, PeerRequestOptions, RunningService, RunningServiceCancellationToken},
     transport::IntoTransport,
 };
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
+use std::{future::Future, sync::Mutex, time::Duration};
+use tokio::sync::watch;
 
 /// Pages of tool listings followed before a server is considered abusive.
 const MAX_LISTING_PAGES: usize = 64;
 
 /// A connected server. Dropping it ends the session and stops its process.
 pub struct Session {
-    service: RunningService<RoleClient, ()>,
+    peer: Peer<RoleClient>,
+    /// Ends the session loop; the first stop takes it.
+    cancel: Mutex<Option<RunningServiceCancellationToken>>,
+    /// Becomes true when the session loop ends, for any reason.
+    closed: watch::Receiver<bool>,
     /// Owns the server's process group.
     process: Option<Launch>,
     server: Option<String>,
@@ -86,8 +95,24 @@ impl Session {
             .peer_info()
             .and_then(|info| info.server_info.clone())
             .map(|server| format!("{} {}", server.name, server.version));
+        let peer = service.peer().clone();
+        let cancel = Mutex::new(Some(service.cancellation_token()));
+        let (closed_tx, closed) = watch::channel(false);
+        // Detached on purpose: the task ends with the session loop, which ends
+        // when the server exits, its pipe closes, or `stop` (also run on drop).
+        tokio::spawn(async move {
+            if let Err(error) = service.waiting().await {
+                tracing::warn!(
+                    error = &error as &dyn std::error::Error,
+                    "MCP session task failed"
+                );
+            }
+            closed_tx.send_replace(true);
+        });
         Ok(Self {
-            service,
+            peer,
+            cancel,
+            closed,
             process,
             server,
             tools,
@@ -101,6 +126,18 @@ impl Session {
     pub fn tools(&self) -> &[McpToolInfo] {
         &self.tools
     }
+    /// The session has ended: the server exited, its pipe closed or it was stopped.
+    pub fn is_closed(&self) -> bool {
+        *self.closed.borrow()
+    }
+    /// Resolves once the session has ended.
+    pub fn closed(&self) -> impl Future<Output = ()> + Send + 'static {
+        let mut closed = self.closed.clone();
+        async move {
+            // An error means the watcher is gone, which also means the loop ended.
+            let _ended = closed.wait_for(|closed| *closed).await.is_ok();
+        }
+    }
     /// Call a tool the server advertised. Authorization happens before this,
     /// in [`crate::authorize`]; this only bounds time and output.
     pub async fn call(
@@ -109,17 +146,52 @@ impl Session {
         arguments: serde_json::Map<String, serde_json::Value>,
         timeout: Option<Duration>,
     ) -> Result<ToolOutput, McpError> {
+        self.call_until(tool, arguments, timeout, std::future::pending())
+            .await
+    }
+    /// [`Self::call`], cancelled with [`McpError::Revoked`] if `revoked`
+    /// resolves first. A cancelled or timed-out call is also cancelled at the
+    /// server. Dropping the returned future abandons the call without telling
+    /// the server; the result, if any, is discarded.
+    pub async fn call_until(
+        &self,
+        tool: &str,
+        arguments: serde_json::Map<String, serde_json::Value>,
+        timeout: Option<Duration>,
+        revoked: impl Future<Output = ()>,
+    ) -> Result<ToolOutput, McpError> {
         if !self.tools.iter().any(|t| t.name == tool) {
             return Err(McpError::UnknownTool);
         }
         let params = CallToolRequestParams::new(tool.to_owned()).with_arguments(arguments);
-        let result = tokio::time::timeout(
-            timeout.unwrap_or(self.limits.call_timeout),
-            self.service.peer().call_tool(params),
-        )
-        .await
-        .map_err(McpError::Timeout)?
-        .map_err(McpError::Service)?;
+        let request = self
+            .peer
+            .send_cancellable_request(
+                ClientRequest::CallToolRequest(CallToolRequest::new(params)),
+                PeerRequestOptions::no_options(),
+            )
+            .await
+            .map_err(McpError::Service)?;
+        let id = request.id.clone();
+        let limit = timeout.unwrap_or(self.limits.call_timeout);
+        let response = tokio::select! {
+            response = tokio::time::timeout(limit, request.await_response()) => match response {
+                Ok(response) => response.map_err(McpError::Service)?,
+                Err(elapsed) => {
+                    self.cancel_request(id, "timed out").await;
+                    return Err(McpError::Timeout(elapsed));
+                }
+            },
+            () = revoked => {
+                self.cancel_request(id, "permission revoked").await;
+                return Err(McpError::Revoked);
+            }
+        };
+        // Follow-up rounds and server-side tasks need client features this
+        // client does not offer, so a conforming server never sends them.
+        let ServerResult::CallToolResult(result) = response else {
+            return Err(McpError::Service(ServiceError::UnexpectedResponse));
+        };
         let size = serde_json::to_vec(&result.content)
             .map_err(McpError::Schema)?
             .len()
@@ -141,9 +213,26 @@ impl Session {
             structured: result.structured_content,
         })
     }
+    /// Tell the server to stop work on an abandoned request.
+    async fn cancel_request(&self, id: RequestId, reason: &str) {
+        let notification = CancelledNotification::new(CancelledNotificationParam::new(
+            Some(id),
+            Some(reason.to_owned()),
+        ));
+        if let Err(error) = self.peer.send_notification(notification.into()).await {
+            // The call already failed for its caller; a server that cannot hear
+            // the cancellation has exited or broken its pipe.
+            tracing::warn!(
+                error = &error as &dyn std::error::Error,
+                "MCP cancellation not delivered"
+            );
+        }
+    }
     /// End the session now, stopping the server and failing in-flight calls.
     pub fn stop(&self) {
-        self.service.cancellation_token().cancel();
+        if let Some(cancel) = self.cancel.lock().ok().and_then(|mut cancel| cancel.take()) {
+            cancel.cancel();
+        }
         if let Some(process) = &self.process {
             process.kill();
         }

@@ -6,6 +6,10 @@ use std::{collections::BTreeSet, path::Path};
 /// Longest per-call timeout a server entry may request, in seconds.
 pub const MAX_TIMEOUT_SECONDS: u64 = 1800;
 
+/// Variables the sandbox sets for every server; an entry cannot replace them,
+/// so a server's home and temporary directory stay inside its private scratch.
+pub const RESERVED_ENV: [&str; 5] = ["HOME", "TMPDIR", "PATH", "LANG", "NO_COLOR"];
+
 /// Check every entry, and that names are unique. Paths are checked again,
 /// against the filesystem, when a server starts.
 pub fn validate(servers: &[McpServerConfig]) -> Result<(), McpError> {
@@ -44,6 +48,13 @@ fn validate_one(server: &McpServerConfig) -> Result<(), McpError> {
         .any(|key| key.is_empty() || key.contains('='))
     {
         return Err(McpError::Environment);
+    }
+    if let Some(key) = server
+        .env
+        .keys()
+        .find(|key| RESERVED_ENV.contains(&key.as_str()))
+    {
+        return Err(McpError::ReservedEnvironment { key: key.clone() });
     }
     if let Some(&capability) = server
         .capabilities
@@ -170,6 +181,14 @@ mod tests {
         let mut entry = server("a");
         entry.env.insert("A=B".into(), "c".into());
         assert!(matches!(validate(&[entry]), Err(McpError::Environment)));
+        for key in RESERVED_ENV {
+            let mut entry = server("a");
+            entry.env.insert(key.into(), "/".into());
+            assert!(
+                matches!(validate(&[entry]), Err(McpError::ReservedEnvironment { key: k }) if k == key),
+                "{key}"
+            );
+        }
         let mut entry = server("a");
         entry.timeout_seconds = Some(0);
         assert!(matches!(

@@ -38,6 +38,14 @@ impl Fixture {
     async fn flood(&self, params: Parameters<Size>) -> String {
         "x".repeat(params.0.bytes)
     }
+    #[tool(description = "Never return.")]
+    async fn wait(&self) -> String {
+        std::future::pending().await
+    }
+    #[tool(description = "Exit the server process.")]
+    async fn exit(&self) -> String {
+        std::process::exit(0)
+    }
 }
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for Fixture {

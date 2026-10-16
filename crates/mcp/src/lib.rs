@@ -59,6 +59,8 @@ pub enum McpError {
     Nul,
     #[error("environment variable names must be non-empty and must not contain '='")]
     Environment,
+    #[error("the sandbox sets {key} for every MCP server; an entry cannot replace it")]
+    ReservedEnvironment { key: String },
     #[error("MCP servers cannot hold {capability:?} authority")]
     Capability { capability: Capability },
     #[error("workspace write access for an MCP server also requires read access")]
@@ -107,6 +109,8 @@ pub enum McpError {
     Disabled,
     #[error("MCP server is not connected")]
     NotConnected,
+    #[error("MCP server exited or closed its connection")]
+    Exited,
     #[error("MCP server does not offer this tool")]
     UnknownTool,
     #[error("this MCP tool is denied by policy")]
@@ -117,6 +121,10 @@ pub enum McpError {
     Denied { capability: Capability },
     #[error("this MCP server is bound to a different project")]
     ProjectMismatch,
+    #[error(
+        "the thread lost permission to use this MCP tool while the call ran; the call was cancelled"
+    )]
+    Revoked,
 }
 
 /// The authority an MCP server process may hold. Anything else (secrets, git,

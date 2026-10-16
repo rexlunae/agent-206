@@ -4,21 +4,36 @@
 //! leaves every server disconnected until it is used or connected again.
 use super::{Gateway, GatewayError, Result, poisoned};
 use crate::error::check;
+use crate::store::Store;
 use a206_core::*;
 use a206_mcp::{Approval, McpError, Session, ToolOutput};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, Weak},
     time::Duration,
 };
+use tokio::sync::watch;
 
-#[derive(Default)]
 pub(super) struct McpServers {
     sessions: Mutex<BTreeMap<String, Arc<Session>>>,
-    /// Servers starting now; a second start of the same server is refused.
-    starting: Mutex<BTreeSet<String>>,
+    /// Servers starting now. Each start holds the sender, so waiters learn
+    /// when it ends, whether it succeeded or not.
+    starting: Mutex<BTreeMap<String, watch::Receiver<()>>>,
     /// Servers the user disconnected; they start again only on request.
     stopped: Mutex<BTreeSet<String>>,
+    /// Signalled after every state change, so in-flight calls re-check
+    /// whether their thread may still make them.
+    changes: watch::Sender<()>,
+}
+impl Default for McpServers {
+    fn default() -> Self {
+        Self {
+            sessions: Default::default(),
+            starting: Default::default(),
+            stopped: Default::default(),
+            changes: watch::Sender::new(()),
+        }
+    }
 }
 impl McpServers {
     fn remove(&self, name: &str) -> Result<()> {
@@ -40,12 +55,44 @@ impl McpServers {
         }
         Ok(())
     }
+    /// Grants, settings or threads may have changed.
+    pub(super) fn state_changed(&self) {
+        self.changes.send_replace(());
+    }
+    fn is_stopped(&self, name: &str) -> Result<bool> {
+        Ok(self
+            .stopped
+            .lock()
+            .map_err(poisoned("MCP sessions"))?
+            .contains(name))
+    }
+    /// Claim the right to start `name`, or learn of the start under way.
+    fn claim(&self, name: &str) -> Result<Claim<'_>> {
+        let mut starting = self.starting.lock().map_err(poisoned("MCP sessions"))?;
+        if let Some(done) = starting.get(name) {
+            return Ok(Claim::Wait(done.clone()));
+        }
+        let (sender, done) = watch::channel(());
+        starting.insert(name.to_owned(), done);
+        Ok(Claim::Start(Starting {
+            servers: self,
+            name: name.to_owned(),
+            _done: sender,
+        }))
+    }
+}
+
+enum Claim<'a> {
+    Start(Starting<'a>),
+    /// Changes (by closing) when the other start ends.
+    Wait(watch::Receiver<()>),
 }
 
 /// Releases a server's start claim however the start ends.
 struct Starting<'a> {
     servers: &'a McpServers,
     name: String,
+    _done: watch::Sender<()>,
 }
 impl Drop for Starting<'_> {
     fn drop(&mut self) {
@@ -124,13 +171,7 @@ impl Gateway {
     }
 
     fn set_mcp_status(&self, name: &str, update: impl FnOnce(&mut McpServerStatus)) -> Result<()> {
-        let mut store = self.lock()?;
-        let Some(status) = store.state.mcp_servers.iter_mut().find(|s| s.name == name) else {
-            return Err(GatewayError::NotFound("MCP server is not configured"));
-        };
-        update(status);
-        store.persist(Some(EventKind::McpServerChanged { name: name.into() }))?;
-        Ok(())
+        set_status(&self.store, name, update)
     }
 
     fn mcp_config(&self, name: &str) -> Result<McpServerConfig> {
@@ -144,29 +185,28 @@ impl Gateway {
             .ok_or(GatewayError::NotFound("MCP server is not configured"))
     }
 
-    /// Start an enabled server in its sandbox and record its tools.
+    /// Start an enabled server in its sandbox at the user's request.
     pub(super) async fn connect_mcp(&self, name: &str) -> Result<()> {
-        let config = self.mcp_config(name)?;
-        check(config.enabled, McpError::Disabled)?;
-        let project_root = config.project.map(|id| self.project_root(id)).transpose()?;
-        let state_root = self.lock()?.root.clone();
-        check(
-            self.mcp
-                .starting
-                .lock()
-                .map_err(poisoned("MCP sessions"))?
-                .insert(name.to_owned()),
-            GatewayError::Conflict("this MCP server is already starting"),
-        )?;
-        let _starting = Starting {
-            servers: &self.mcp,
-            name: name.to_owned(),
+        self.mcp_config(name)?;
+        let Claim::Start(claim) = self.mcp.claim(name)? else {
+            return Err(GatewayError::Conflict(
+                "this MCP server is already starting",
+            ));
         };
         self.mcp
             .stopped
             .lock()
             .map_err(poisoned("MCP sessions"))?
             .remove(name);
+        self.start_mcp(name, claim).await
+    }
+
+    /// Start a claimed server and record its tools.
+    async fn start_mcp(&self, name: &str, _claim: Starting<'_>) -> Result<()> {
+        let config = self.mcp_config(name)?;
+        check(config.enabled, McpError::Disabled)?;
+        let project_root = config.project.map(|id| self.project_root(id)).transpose()?;
+        let state_root = self.lock()?.root.clone();
         self.mcp.remove(name)?;
         self.set_mcp_status(name, |status| {
             *status = McpServerStatus {
@@ -196,13 +236,7 @@ impl Gateway {
         };
         // The user may have changed or disconnected the server while it started.
         let current = self.mcp_config(name).ok();
-        let stopped = self
-            .mcp
-            .stopped
-            .lock()
-            .map_err(poisoned("MCP sessions"))?
-            .contains(name);
-        if stopped || current.as_ref() != Some(&config) {
+        if self.mcp.is_stopped(name)? || current.as_ref() != Some(&config) {
             drop(session);
             self.set_mcp_status(name, |status| status.state = McpServerState::Disconnected)
                 .ignore_missing()?;
@@ -212,17 +246,65 @@ impl Gateway {
         }
         let server = session.server().map(str::to_owned);
         let tools = session.tools().to_vec();
+        let session = Arc::new(session);
         self.mcp
             .sessions
             .lock()
             .map_err(poisoned("MCP sessions"))?
-            .insert(name.to_owned(), Arc::new(session));
+            .insert(name.to_owned(), session.clone());
         self.set_mcp_status(name, |status| {
             status.state = McpServerState::Connected;
             status.server = server;
             status.tools = tools;
             status.failure = None;
-        })
+        })?;
+        self.watch_session(name, &session);
+        Ok(())
+    }
+
+    /// Mark the server failed if its session ends without the gateway
+    /// stopping it: the process exited or closed its pipe.
+    fn watch_session(&self, name: &str, session: &Arc<Session>) {
+        let closed = session.closed();
+        let session = Arc::downgrade(session);
+        // Weak, so a dropped gateway does not stay alive for its sessions.
+        let servers = Arc::downgrade(&self.mcp);
+        let store = self.store.clone();
+        let name = name.to_owned();
+        // Detached on purpose: it ends when the session does, and every
+        // session ends when stopped, replaced or dropped with the gateway.
+        tokio::spawn(async move {
+            closed.await;
+            if let Err(error) = session_ended(&servers, &store, &name, &session) {
+                crate::error::handle("mcp_session_ended", &error);
+            }
+        });
+    }
+
+    /// A live session for an enabled server, starting it if needed. Concurrent callers share one start. `None` means the user
+    /// disconnected the server.
+    async fn ensure_session(&self, name: &str) -> Result<Option<Arc<Session>>> {
+        let mut attempted = false;
+        loop {
+            if let Some(session) = self.session(name)? {
+                return Ok(Some(session));
+            }
+            if self.mcp.is_stopped(name)? {
+                return Ok(None);
+            }
+            match self.mcp.claim(name)? {
+                Claim::Wait(mut done) => {
+                    // The sender closes when that start ends; either way, look again.
+                    let _ended = done.changed().await.is_err();
+                }
+                // Started, but the session was gone by the time we looked.
+                Claim::Start(_) if attempted => return Err(McpError::Exited.into()),
+                Claim::Start(claim) => {
+                    attempted = true;
+                    self.start_mcp(name, claim).await?;
+                }
+            }
+        }
     }
 
     /// Stop a server; it stays stopped until the user connects it again.
@@ -256,27 +338,14 @@ impl Gateway {
             if a206_mcp::server_callable(&server, &caller).is_err() {
                 continue;
             }
-            let session = self.session(&server.name)?;
-            let stopped = self
-                .mcp
-                .stopped
-                .lock()
-                .map_err(poisoned("MCP sessions"))?
-                .contains(&server.name);
-            let session = match session {
-                Some(session) => session,
-                None if stopped => continue,
-                None => match self.connect_mcp(&server.name).await {
-                    Ok(()) => match self.session(&server.name)? {
-                        Some(session) => session,
-                        None => continue,
-                    },
-                    Err(error) => {
-                        let report = crate::error::handle("connect_mcp_server", &error);
-                        offers.unavailable.push((server.name.clone(), report));
-                        continue;
-                    }
-                },
+            let session = match self.ensure_session(&server.name).await {
+                Ok(Some(session)) => session,
+                Ok(None) => continue,
+                Err(error) => {
+                    let report = crate::error::handle("connect_mcp_server", &error);
+                    offers.unavailable.push((server.name.clone(), report));
+                    continue;
+                }
             };
             offers.tools.extend(
                 session
@@ -293,16 +362,15 @@ impl Gateway {
         Ok(offers)
     }
 
-    /// Call one MCP tool for `thread`. Authorization uses the thread's current
-    /// grant and the server's current entry, never what was offered earlier.
-    pub async fn call_mcp_tool(
+    /// Whether `thread` may call `tool` now, under its current grant and the
+    /// server's current entry; returns the entry.
+    fn authorize_mcp(
         &self,
         thread: Id,
         server: &str,
         tool: &str,
-        arguments: serde_json::Map<String, serde_json::Value>,
         approval: Approval,
-    ) -> Result<ToolOutput> {
+    ) -> Result<McpServerConfig> {
         let (caller, config) = {
             let store = self.lock()?;
             let config = store
@@ -316,9 +384,44 @@ impl Gateway {
             (store.thread(thread)?.clone(), config)
         };
         a206_mcp::authorize(&config, &caller, tool, approval)?;
+        Ok(config)
+    }
+
+    /// Call one MCP tool for `thread`. Authorization uses the thread's current
+    /// grant and the server's current entry, never what was offered earlier,
+    /// and is checked again after every state change while the call runs: a
+    /// call the thread may no longer make is cancelled with
+    /// [`McpError::Revoked`].
+    pub async fn call_mcp_tool(
+        &self,
+        thread: Id,
+        server: &str,
+        tool: &str,
+        arguments: serde_json::Map<String, serde_json::Value>,
+        approval: Approval,
+    ) -> Result<ToolOutput> {
+        // Subscribe first, so no change between the check and the call is missed.
+        let mut changes = self.mcp.changes.subscribe();
+        let config = self.authorize_mcp(thread, server, tool, approval)?;
         let session = self.session(server)?.ok_or(McpError::NotConnected)?;
         let timeout = config.timeout_seconds.map(Duration::from_secs);
-        match session.call(tool, arguments, timeout).await {
+        let revoked = async {
+            while changes.changed().await.is_ok() {
+                if let Err(error) = self.authorize_mcp(thread, server, tool, approval) {
+                    tracing::info!(
+                        error = &error as &dyn std::error::Error,
+                        %thread,
+                        server,
+                        tool,
+                        "cancelling MCP call"
+                    );
+                    return;
+                }
+            }
+            // The gateway is gone; its sessions end with it.
+            std::future::pending().await
+        };
+        match session.call_until(tool, arguments, timeout, revoked).await {
             Err(McpError::Service(
                 error
                 @ (rmcp::ServiceError::TransportClosed | rmcp::ServiceError::TransportSend(_)),
@@ -338,15 +441,71 @@ impl Gateway {
         }
     }
 
+    /// The server's live session. A session that ended is dropped here too,
+    /// in case its watcher has not run yet.
     fn session(&self, name: &str) -> Result<Option<Arc<Session>>> {
-        Ok(self
+        let session = self
             .mcp
             .sessions
             .lock()
             .map_err(poisoned("MCP sessions"))?
             .get(name)
-            .cloned())
+            .cloned();
+        match session {
+            Some(session) if session.is_closed() => {
+                session_ended(
+                    &Arc::downgrade(&self.mcp),
+                    &self.store,
+                    name,
+                    &Arc::downgrade(&session),
+                )?;
+                Ok(None)
+            }
+            session => Ok(session),
+        }
     }
+}
+
+fn set_status(
+    store: &Mutex<Store>,
+    name: &str,
+    update: impl FnOnce(&mut McpServerStatus),
+) -> Result<()> {
+    let mut store = store.lock().map_err(poisoned("state"))?;
+    let Some(status) = store.state.mcp_servers.iter_mut().find(|s| s.name == name) else {
+        return Err(GatewayError::NotFound("MCP server is not configured"));
+    };
+    update(status);
+    store.persist(Some(EventKind::McpServerChanged { name: name.into() }))?;
+    Ok(())
+}
+
+/// Forget `session` and mark its server failed, unless the gateway already
+/// stopped or replaced it.
+fn session_ended(
+    servers: &Weak<McpServers>,
+    store: &Mutex<Store>,
+    name: &str,
+    session: &Weak<Session>,
+) -> Result<()> {
+    let Some(servers) = servers.upgrade() else {
+        return Ok(());
+    };
+    {
+        let mut sessions = servers.sessions.lock().map_err(poisoned("MCP sessions"))?;
+        match sessions.get(name) {
+            Some(current) if std::ptr::eq(Arc::as_ptr(current), session.as_ptr()) => {
+                sessions.remove(name);
+            }
+            _ => return Ok(()),
+        }
+    }
+    let report = crate::error::report(&GatewayError::from(McpError::Exited));
+    set_status(store, name, |status| {
+        status.state = McpServerState::Failed;
+        status.failure = Some(report);
+    })
+    .ignore_missing()
 }
 
 trait IgnoreMissing {
@@ -517,5 +676,208 @@ mod tests {
             call(Approval::Approved).await,
             Err(GatewayError::Mcp(McpError::ToolDenied))
         ));
+    }
+
+    /// A minimal in-memory MCP server offering one tool, `wait`, that never
+    /// answers. Cancellations it receives are forwarded; dropping `close`
+    /// ends the connection as if the server exited.
+    async fn fake_session() -> (
+        Session,
+        tokio::sync::mpsc::UnboundedReceiver<serde_json::Value>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        let (client, server) = tokio::io::duplex(1 << 16);
+        let (cancelled_tx, cancelled) = tokio::sync::mpsc::unbounded_channel();
+        let (close, closed) = tokio::sync::oneshot::channel::<()>();
+        // Ends when the test drops `close` or the client hangs up.
+        tokio::spawn(async move {
+            let (read, mut write) = tokio::io::split(server);
+            let mut lines = tokio::io::BufReader::new(read).lines();
+            let serve = async {
+                while let Ok(Some(line)) = lines.next_line().await {
+                    let message: serde_json::Value = serde_json::from_str(&line).unwrap();
+                    let result = match message["method"].as_str() {
+                        Some("initialize") => serde_json::json!({
+                            "protocolVersion": message["params"]["protocolVersion"],
+                            "capabilities": { "tools": {} },
+                            "serverInfo": { "name": "fake", "version": "1" },
+                        }),
+                        Some("tools/list") => serde_json::json!({
+                            "tools": [{ "name": "wait", "inputSchema": { "type": "object" } }],
+                        }),
+                        Some("notifications/cancelled") => {
+                            cancelled_tx.send(message["params"].clone()).unwrap();
+                            continue;
+                        }
+                        _ => continue,
+                    };
+                    let reply = serde_json::json!({
+                        "jsonrpc": "2.0", "id": message["id"], "result": result,
+                    });
+                    write
+                        .write_all(format!("{reply}\n").as_bytes())
+                        .await
+                        .unwrap();
+                }
+            };
+            tokio::select! { () = serve => {}, _closed = closed => {} }
+        });
+        let (read, write) = tokio::io::split(client);
+        let session = Session::start((read, write), None, a206_mcp::Limits::default())
+            .await
+            .unwrap();
+        (session, cancelled, close)
+    }
+
+    /// A gateway with an enabled `tools` server connected to [`fake_session`]
+    /// and a thread allowed to call its `wait` tool.
+    async fn connected() -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        Gateway,
+        Thread,
+        tokio::sync::mpsc::UnboundedReceiver<serde_json::Value>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let state = tempfile::tempdir().unwrap();
+        let install = tempfile::tempdir().unwrap();
+        let g = Gateway::open(state.path()).unwrap();
+        let mut server = entry(install.path());
+        server.enabled = true;
+        server.capabilities = [Capability::Network].into();
+        server.default_policy = ToolPolicy::Allow;
+        assert_eq!(save(&g, vec![server]).await, Reply::Ok);
+        let Reply::Thread(thread) = send(
+            &g,
+            Command::CreateThread {
+                title: "Research".into(),
+                mode: Mode::Research,
+            },
+        )
+        .await
+        else {
+            panic!("thread created");
+        };
+        g.lock()
+            .unwrap()
+            .thread_mut(thread.id)
+            .unwrap()
+            .grant
+            .capabilities = [Capability::Network].into();
+        let (session, cancelled, close) = fake_session().await;
+        let claim = match g.mcp.claim("tools").unwrap() {
+            Claim::Start(claim) => claim,
+            Claim::Wait(_) => panic!("nothing else is starting"),
+        };
+        let session = Arc::new(session);
+        g.mcp
+            .sessions
+            .lock()
+            .unwrap()
+            .insert("tools".into(), session.clone());
+        g.set_mcp_status("tools", |status| status.state = McpServerState::Connected)
+            .unwrap();
+        g.watch_session("tools", &session);
+        drop(claim);
+        (state, install, g, thread, cancelled, close)
+    }
+
+    #[tokio::test]
+    async fn revoking_a_grant_cancels_a_running_call() {
+        let (_state, _install, g, thread, mut cancelled, _close) = connected().await;
+        let call = g.call_mcp_tool(
+            thread.id,
+            "tools",
+            "wait",
+            Default::default(),
+            Approval::NotRequested,
+        );
+        let revoke = async {
+            // Unrelated changes leave the call running.
+            let renamed = send(
+                &g,
+                Command::RenameThread {
+                    id: thread.id,
+                    title: "Renamed".into(),
+                },
+            )
+            .await;
+            assert!(!matches!(renamed, Reply::Error(_)), "{renamed:?}");
+            // Chat mode cannot hold Network, so the thread loses it.
+            send(
+                &g,
+                Command::ConfigureThread {
+                    id: thread.id,
+                    mode: Mode::Chat,
+                    model: None,
+                    subagent_models: Default::default(),
+                },
+            )
+            .await
+        };
+        let (result, configured) = tokio::join!(call, revoke);
+        assert!(matches!(configured, Reply::Thread(_)), "{configured:?}");
+        assert!(matches!(result, Err(GatewayError::Mcp(McpError::Revoked))));
+        // The server is told to stop, and its session stays up for others.
+        let notice = cancelled.recv().await.unwrap();
+        assert_eq!(notice["reason"], "permission revoked");
+        assert_eq!(
+            g.snapshot().unwrap().mcp_servers[0].state,
+            McpServerState::Connected
+        );
+    }
+
+    #[tokio::test]
+    async fn a_server_that_exits_is_marked_failed() {
+        let (_state, _install, g, thread, _cancelled, close) = connected().await;
+        let session = g.session("tools").unwrap().unwrap();
+        drop(close);
+        session.closed().await;
+        drop(session);
+        // Offers do not use the dead session, whether or not its watcher ran.
+        let offers = g.mcp_offers(thread.id).await.unwrap();
+        assert!(offers.tools.is_empty());
+        assert!(g.mcp.sessions.lock().unwrap().is_empty());
+        let status = g.snapshot().unwrap().mcp_servers.remove(0);
+        assert_eq!(status.state, McpServerState::Failed);
+        assert!(status.failure.is_some());
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[tokio::test]
+    async fn concurrent_discovery_shares_one_start() {
+        let state = tempfile::tempdir().unwrap();
+        let install = tempfile::tempdir().unwrap();
+        let g = Gateway::open(state.path()).unwrap();
+        let mut server = entry(install.path());
+        server.enabled = true;
+        assert_eq!(save(&g, vec![server]).await, Reply::Ok);
+        let Reply::Thread(thread) = send(
+            &g,
+            Command::CreateThread {
+                title: "Chat".into(),
+                mode: Mode::Chat,
+            },
+        )
+        .await
+        else {
+            panic!("thread created");
+        };
+        // Hold a start open so both callers must wait for it.
+        let Claim::Start(claim) = g.mcp.claim("tools").unwrap() else {
+            panic!("nothing else is starting");
+        };
+        let release = async {
+            tokio::task::yield_now().await;
+            drop(claim);
+        };
+        let (first, second, ()) =
+            tokio::join!(g.mcp_offers(thread.id), g.mcp_offers(thread.id), release);
+        // Each caller reports the real failure, never a start conflict.
+        for offers in [first.unwrap(), second.unwrap()] {
+            assert_eq!(offers.unavailable.len(), 1);
+            assert_eq!(offers.unavailable[0].1.kind, ErrorKind::Unavailable);
+        }
     }
 }
