@@ -528,3 +528,59 @@ async fn lock_cancels_in_flight_sends_and_body_limits_are_structured() {
         .unwrap();
     assert_eq!(denied(result), BrokerError::Locked);
 }
+
+/// Stands in for a version-1 broker: it refuses everything before a v1
+/// `Hello`, and records whether a greeted `Shutdown` arrived.
+#[tokio::test(flavor = "multi_thread")]
+async fn stop_reaches_an_older_broker_through_its_own_greeting() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_owned();
+    std::fs::create_dir_all(root.join("vault")).unwrap();
+    let listener = tokio::net::UnixListener::bind(socket_path(&root)).unwrap();
+    let stopped = Arc::new(Mutex::new(false));
+    let seen = stopped.clone();
+    tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let seen = seen.clone();
+            tokio::spawn(async move {
+                let mut decoder = a206_protocol::Decoder::default();
+                let mut greeted = false;
+                let mut bytes = vec![0; 8192];
+                loop {
+                    let count = stream.read(&mut bytes).await.unwrap();
+                    if count == 0 {
+                        return;
+                    }
+                    let requests: Vec<a206_protocol::Request<Request>> =
+                        decoder.feed(&bytes[..count]).unwrap();
+                    for request in requests {
+                        let body = match request.body {
+                            Request::Hello { version: 1, .. } if !greeted => {
+                                greeted = true;
+                                Reply::Ok
+                            }
+                            Request::Hello { .. } => Reply::Error(BrokerError::Invalid(
+                                InvalidRequest::UnsupportedVersion,
+                            )),
+                            Request::Shutdown if greeted => {
+                                *seen.lock().unwrap() = true;
+                                Reply::Ok
+                            }
+                            _ => Reply::Error(BrokerError::Forbidden),
+                        };
+                        let frame = a206_protocol::encode(&a206_protocol::Response {
+                            id: request.id,
+                            body,
+                        })
+                        .unwrap();
+                        stream.write_all(&frame).await.unwrap();
+                    }
+                }
+            });
+        }
+    });
+    Client::shutdown(&root).await.unwrap();
+    assert!(*stopped.lock().unwrap());
+}

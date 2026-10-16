@@ -38,15 +38,31 @@ impl Client {
     }
 
     /// Stop whichever broker serves `root`, even one from another protocol
-    /// version: `Shutdown` is accepted before `Hello`.
+    /// version: current brokers accept `Shutdown` before `Hello`, and older
+    /// ones (which refuse it as `Forbidden`) are greeted with their version.
     pub async fn shutdown(root: &Path) -> Result<(), ClientError> {
-        let stream = tokio::net::UnixStream::connect(crate::socket_path(root)).await?;
-        let mut client = Self {
-            stream,
+        match Self::raw(root).await?.call(Request::Shutdown).await {
+            Err(ClientError::Broker(BrokerError::Forbidden)) => {}
+            result => return result.map(drop),
+        }
+        for version in (1..BROKER_VERSION).rev() {
+            let mut client = Self::raw(root).await?;
+            let hello = Request::Hello {
+                role: Role::User,
+                version,
+            };
+            if client.call(hello).await.is_ok() {
+                return client.call(Request::Shutdown).await.map(drop);
+            }
+        }
+        Err(BrokerError::Invalid(InvalidRequest::UnsupportedVersion).into())
+    }
+
+    async fn raw(root: &Path) -> Result<Self, ClientError> {
+        Ok(Self {
+            stream: tokio::net::UnixStream::connect(crate::socket_path(root)).await?,
             decoder: Decoder::default(),
-        };
-        client.call(Request::Shutdown).await?;
-        Ok(())
+        })
     }
 
     /// Send one request. A broker error reply becomes `ClientError::Broker`.
