@@ -546,6 +546,34 @@ async fn lock_cancels_in_flight_sends_and_body_limits_are_structured() {
         .expect("lock must abandon the in-flight request")
         .unwrap();
     assert_eq!(denied(result), BrokerError::Locked);
+
+    // Revoking the pairing (a replacement, or its anchor closing) abandons
+    // in-flight sends just as a lock does.
+    a.call(unlock(&password, None, false)).await.unwrap();
+    for revoke in ["replace", "close anchor"] {
+        let token = pairing(&mut a).await;
+        let (anchor, claimed) = present(&root, &token).await;
+        claimed.unwrap();
+        let (mut gateway, result) = present(&root, &token).await;
+        result.unwrap();
+        let request = call("/slow", None);
+        let slow = tokio::spawn(async move { gateway.call(request).await });
+        tokio::time::timeout(Duration::from_secs(10), entered_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let _replacement = if revoke == "replace" {
+            Some(pairing(&mut a).await)
+        } else {
+            None
+        };
+        drop(anchor);
+        let result = tokio::time::timeout(Duration::from_secs(10), slow)
+            .await
+            .unwrap_or_else(|_| panic!("{revoke} must abandon the in-flight request"))
+            .unwrap();
+        assert_eq!(denied(result), BrokerError::GatewayNotPaired);
+    }
 }
 
 /// Stands in for a version-1 broker: it refuses everything before a v1

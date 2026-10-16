@@ -393,6 +393,21 @@ async fn gateway_needs_a_verified_pairing_and_never_persists_it() {
     let catalogs = gateway.snapshot().unwrap().catalogs;
     assert_eq!(catalogs.len(), 1);
     assert_eq!(catalogs[0].models[0].key.model, api.id);
+    // A retried delivery of the same pairing must not drop the connection
+    // that anchors it at the broker.
+    assert_eq!(
+        run(Command::PairBroker {
+            pairing: pairing.clone()
+        })
+        .await,
+        Reply::Ok
+    );
+    // A dropped anchor is noticed by the broker asynchronously; keep using the
+    // pairing for a while to make sure it stays valid.
+    for _ in 0..20 {
+        assert!(matches!(run(refresh()).await, Reply::Catalog(_)));
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
     let Reply::Catalog(catalog) = run(refresh()).await else {
         panic!("paired refresh failed");
     };
