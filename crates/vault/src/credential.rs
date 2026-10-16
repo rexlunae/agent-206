@@ -234,7 +234,12 @@ impl Vault {
     /// Convert a raw entry written before typed credentials existed into a
     /// single-value typed credential, in one atomic write. The raw entry is
     /// removed; a typed credential of the same name must not already exist.
-    pub fn adopt_raw(&mut self, name: &str, meta: &CredentialMeta) -> Result<(), Error> {
+    pub fn adopt_raw(
+        &mut self,
+        legacy: &str,
+        name: &str,
+        meta: &CredentialMeta,
+    ) -> Result<(), Error> {
         if reserved_credential_name(name) {
             return Err(Error::InvalidName);
         }
@@ -248,8 +253,8 @@ impl Vault {
         ) {
             return Err(Error::KindMismatch);
         }
-        let value = self.raw(name)?.ok_or(Error::NotFound)?;
-        if self.has_raw(&meta_key(name))? {
+        let value = self.raw(legacy)?.ok_or(Error::NotFound)?;
+        if self.has_raw(&meta_key(name))? || (name != legacy && self.has_raw(name)?) {
             return Err(Error::InvalidName);
         }
         let meta_json = serde_json::to_string(meta).map_err(|_| Error::Corrupted)?;
@@ -258,7 +263,7 @@ impl Vault {
             self.commit(|inner| {
                 inner.set(&meta_k, meta_json.as_str());
                 inner.set(&val_k, v);
-                let _ = inner.remove(name);
+                let _ = inner.remove(legacy);
             })
         })
     }
@@ -583,22 +588,31 @@ mod tests {
         let (_dir, mut vault, _) = unlocked();
         let (name, value) = (format!("messenger/{}", random()), random());
         vault.put(&name, Secret::new(value.clone())).unwrap();
-        // `messenger/` stays reserved for typed names (RustyClaw service records).
-        let adopted = random();
+        // `messenger/` stays reserved for typed names (RustyClaw service records),
+        // so such an entry is adopted under a new name.
+        let (adopted, renamed) = (random(), random());
         vault.put(&adopted, Secret::new(value.clone())).unwrap();
         let mut target = meta(CredentialKind::ApiKey, AccessPolicy::WithApproval);
         assert!(matches!(
-            vault.adopt_raw(&name, &target),
+            vault.adopt_raw(&name, &name, &target),
+            Err(Error::InvalidName)
+        ));
+        // A rename may not shadow another untyped entry.
+        assert!(matches!(
+            vault.adopt_raw(&name, &adopted, &target),
             Err(Error::InvalidName)
         ));
         target.kind = CredentialKind::UsernamePassword;
         assert!(matches!(
-            vault.adopt_raw(&adopted, &target),
+            vault.adopt_raw(&adopted, &adopted, &target),
             Err(Error::KindMismatch)
         ));
         target.kind = CredentialKind::Token;
-        vault.adopt_raw(&adopted, &target).unwrap();
-        assert_eq!(vault.names().unwrap(), [name]);
+        vault.adopt_raw(&adopted, &adopted, &target).unwrap();
+        assert_eq!(vault.names().unwrap(), std::slice::from_ref(&name));
+        vault.adopt_raw(&name, &renamed, &target).unwrap();
+        assert!(vault.names().unwrap().is_empty());
+        assert!(vault.credential(&renamed).is_ok());
         let mut step = StepUpWindow::default();
         step.grant(Instant::now(), vault.generation());
         let got = vault
@@ -609,7 +623,7 @@ mod tests {
             .unwrap();
         assert_eq!(got, value);
         assert!(matches!(
-            vault.adopt_raw(&adopted, &target),
+            vault.adopt_raw(&adopted, &adopted, &target),
             Err(Error::NotFound)
         ));
     }

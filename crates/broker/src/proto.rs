@@ -212,8 +212,10 @@ pub enum Request {
         code: String,
     },
     Credentials,
-    /// Convert a raw entry from before typed credentials into a typed one.
+    /// Convert a raw entry from before typed credentials into a typed one
+    /// named `name`, which may differ from the legacy key.
     AdoptLegacy {
+        legacy: String,
         name: String,
         meta: CredentialMeta,
     },

@@ -42,6 +42,10 @@ pub enum VaultAction {
     /// Turn an untyped entry from an older vault into a typed credential.
     Adopt {
         name: String,
+        /// Store it under a different name (required when the old name
+        /// contains `:` or starts with `messenger/`).
+        #[arg(long = "as")]
+        rename: Option<String>,
         #[arg(long, value_enum, default_value = "api-key")]
         kind: Kind,
         #[arg(long, value_enum, default_value = "ask")]
@@ -421,7 +425,8 @@ pub fn run(root: &Path, action: VaultAction) -> Result<()> {
                 println!("Credential stored");
             }
             VaultAction::Adopt {
-                name,
+                name: legacy,
+                rename,
                 kind,
                 policy: chosen,
                 skills,
@@ -438,9 +443,11 @@ pub fn run(root: &Path, action: VaultAction) -> Result<()> {
                         bail!("an untyped entry holds one value; choose a single-value kind")
                     }
                 };
+                let name = rename.unwrap_or_else(|| legacy.clone());
                 step_up(&mut client).await?;
                 client
                     .call(Request::AdoptLegacy {
+                        legacy,
                         meta: CredentialMeta {
                             label: name.clone(),
                             kind,

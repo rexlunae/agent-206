@@ -50,7 +50,8 @@ impl Shared {
 struct Session {
     role: Option<Role>,
     step_up: StepUpWindow,
-    pending: Option<PendingTotp>,
+    /// A pending enrollment and the vault generation it was started under.
+    pending: Option<(PendingTotp, u64)>,
 }
 
 struct Outbound {
@@ -305,12 +306,14 @@ fn handle(shared: &Shared, session: &mut Session, request: Request) -> Handled {
             ok()
         }
         Request::BeginTotp { account } => {
-            require_step_up(session, shared.vault().generation())?;
             check_name(&account)?;
-            let pending = shared
-                .vault()
+            let vault = shared.vault();
+            let generation = vault.generation();
+            require_step_up(session, generation)?;
+            let pending = vault
                 .begin_totp_enrollment(&account, unix_now())
                 .map_err(vault_error)?;
+            drop(vault);
             let reply = Reply::TotpEnrollment {
                 otpauth_url: WireSecret::new(
                     pending
@@ -321,7 +324,7 @@ fn handle(shared: &Shared, session: &mut Session, request: Request) -> Handled {
                 manual_key: WireSecret::new(pending.manual_key().expose(str::to_owned)),
                 expires_at: pending.expires_at(),
             };
-            session.pending = Some(pending);
+            session.pending = Some((pending, generation));
             Ok(Outcome::Reply(reply))
         }
         Request::ConfirmTotp { code } => {
@@ -331,14 +334,19 @@ fn handle(shared: &Shared, session: &mut Session, request: Request) -> Handled {
                 .map_err(|l| BrokerError::LockedOut {
                     retry_after_secs: l.retry_after.as_secs().max(1),
                 })?;
-            let pending = session
+            let mut vault = shared.vault();
+            // A lock since enrollment began discards it.
+            let Some((pending, _)) = session
                 .pending
                 .as_ref()
-                .ok_or(BrokerError::NoPendingEnrollment)?;
-            match shared
-                .vault()
-                .confirm_totp_enrollment(pending, &code, unix_now())
-            {
+                .filter(|(_, generation)| *generation == vault.generation())
+            else {
+                session.pending = None;
+                return Err(BrokerError::NoPendingEnrollment);
+            };
+            let confirmed = vault.confirm_totp_enrollment(pending, &code, unix_now());
+            drop(vault);
+            match confirmed {
                 Ok(()) => {
                     session.pending = None;
                     shared.throttle.success(&());
@@ -386,12 +394,17 @@ fn handle(shared: &Shared, session: &mut Session, request: Request) -> Handled {
                 legacy: vault.names().map_err(vault_error)?,
             }))
         }
-        Request::AdoptLegacy { name, mut meta } => {
-            require_step_up(session, shared.vault().generation())?;
+        Request::AdoptLegacy {
+            legacy,
+            name,
+            mut meta,
+        } => {
+            check_name(&name)?;
             meta.destinations = origins(meta.destinations)?;
-            shared
-                .vault()
-                .adopt_raw(&name, &meta)
+            let mut vault = shared.vault();
+            require_step_up(session, vault.generation())?;
+            vault
+                .adopt_raw(&legacy, &name, &meta)
                 .map_err(vault_error)?;
             ok()
         }
@@ -415,10 +428,10 @@ fn handle(shared: &Shared, session: &mut Session, request: Request) -> Handled {
             disabled,
             destinations,
         } => {
-            require_step_up(session, shared.vault().generation())?;
             let destinations = destinations.map(origins).transpose()?;
-            shared
-                .vault()
+            let mut vault = shared.vault();
+            require_step_up(session, vault.generation())?;
+            vault
                 .update_credential(&name, |meta: &mut CredentialMeta| {
                     if let Some(policy) = policy {
                         meta.policy = policy;
@@ -434,25 +447,21 @@ fn handle(shared: &Shared, session: &mut Session, request: Request) -> Handled {
             ok()
         }
         Request::DeleteCredential { name } => {
-            require_step_up(session, shared.vault().generation())?;
-            shared
-                .vault()
-                .delete_credential(&name)
-                .map_err(vault_error)?;
+            let mut vault = shared.vault();
+            require_step_up(session, vault.generation())?;
+            vault.delete_credential(&name).map_err(vault_error)?;
             ok()
         }
         Request::SetAgentAccess { enabled } => {
-            require_step_up(session, shared.vault().generation())?;
-            shared
-                .vault()
-                .set_agent_access(enabled)
-                .map_err(vault_error)?;
+            let mut vault = shared.vault();
+            require_step_up(session, vault.generation())?;
+            vault.set_agent_access(enabled).map_err(vault_error)?;
             ok()
         }
         Request::Reveal { name } => {
-            require_step_up(session, shared.vault().generation())?;
-            let value = shared
-                .vault()
+            let vault = shared.vault();
+            require_step_up(session, vault.generation())?;
+            let value = vault
                 .reveal_credential(&name, &session.step_up, now, |v| WireValue::from(v))
                 .map_err(vault_error)?;
             Ok(Outcome::Reply(Reply::Value(value)))
