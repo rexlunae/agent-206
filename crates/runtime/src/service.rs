@@ -25,10 +25,38 @@ pub(crate) fn stop_if_offline(root: &Path) -> Result<bool> {
         Err(error) => Err(error.into()),
     }
 }
+pub(crate) async fn is_ready(root: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        tokio::net::UnixStream::connect(root.join("gateway.sock"))
+            .await
+            .is_ok()
+    }
+    #[cfg(not(unix))]
+    {
+        let _root = root;
+        false
+    }
+}
+/// Startup and user stop share a short-lived cross-process gate. Unlike the
+/// store lock, this can be held by a controller while a legacy daemon exits.
+pub(crate) async fn lifecycle_guard(root: &Path) -> Result<std::fs::File> {
+    let lock = crate::store::lock_file(root, "gateway.lifecycle.lock")?;
+    loop {
+        match fs2::FileExt::try_lock_exclusive(&lock) {
+            Ok(()) => return Ok(lock),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
 #[cfg(unix)]
 pub async fn daemon(root: &Path, explicit: bool) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     use tokio::net::UnixListener;
+    let lifecycle = lifecycle_guard(root).await?;
     anyhow::ensure!(
         explicit || !is_stopped(root),
         "gateway was deliberately stopped; use gateway start"
@@ -49,6 +77,7 @@ pub async fn daemon(root: &Path, explicit: bool) -> Result<()> {
     if is_stopped(root) {
         std::fs::remove_file(root.join("gateway.stopped"))?;
     }
+    drop(lifecycle);
     let mut connections = tokio::task::JoinSet::new();
     let stop = gateway.stop_signal();
     loop {
@@ -260,5 +289,37 @@ mod tests {
         assert!(stop_if_offline(&root).unwrap());
         assert!(is_stopped(&root));
         assert!(stop_if_offline(&root).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn automatic_start_waits_for_legacy_stop_handoff() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("profile");
+        let handoff = lifecycle_guard(&root).await.unwrap();
+        let entered = std::sync::Arc::new(tokio::sync::Notify::new());
+        let starter = tokio::spawn({
+            let entered = entered.clone();
+            let root = root.clone();
+            async move {
+                entered.notify_one();
+                daemon(&root, false).await
+            }
+        });
+        // On this current-thread runtime the starter has reached its first
+        // suspension. It must wait at the handoff gate, before claiming a store
+        // or publishing a socket, even though the legacy store lock is now free.
+        entered.notified().await;
+        assert!(!root.join("gateway.sock").exists());
+        assert!(!root.join("state.sqlite3").exists());
+        assert!(stop_if_offline(&root).unwrap());
+        drop(handoff);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(3), starter)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(result.is_err());
+        assert!(is_stopped(&root));
+        assert!(!root.join("gateway.sock").exists());
     }
 }

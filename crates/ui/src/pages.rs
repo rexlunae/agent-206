@@ -15,6 +15,7 @@ pub fn Overview() -> Element {
                 div { class: "a206-row",
                     Button { variant: ButtonVariant::Primary, onclick: move |_| dispatch(state, Command::CreateThread { title: "New conversation".into(), mode: Mode::Chat }), "Start a conversation" }
                     LinkButton { variant: ButtonVariant::Secondary, href: Route::Projects {}.to_string(), "Open a project" }
+                    LinkButton { variant: ButtonVariant::Secondary, href: Route::Gateway {}.to_string(), "Manage gateway" }
                 }
             }
             Badge { tone: BadgeTone::Accent, "{snapshot.threads.iter().filter(|t| t.state == a206_core::RunState::Running).count()} active responses" }

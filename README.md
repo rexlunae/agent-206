@@ -62,8 +62,9 @@ Don't edit `state.sqlite3` while it is running.
 ./target/debug/agent206 gateway reconnect
 ```
 
-The shared Gateway page (`/gateway`) has start/stop/restart/reconnect controls,
-verified process/version/uptime and active-work details. It is available on desktop,
+The shared Gateway page (`/gateway`) has start/stop/restart/reconnect controls and
+verified process/version/uptime and active-work details. Reach it from the header,
+sidebar or the workspace's Manage gateway action. It is available on desktop,
 web and terminal. Closing a client leaves the service running. A deliberate stop
 persists across other clients' polling and new clients; use Start or Restart to
 resume. A fresh profile starts automatically from the desktop or web bridge.
@@ -80,6 +81,9 @@ The CLI is a supported headless interface alongside the GUI; see its
 
 Build release assets so Dioxus development overlays are not shipped to a static
 server. The web bridge uses the same gateway commands and MessagePack frames.
+Restart the web bridge after updating the native binary as well as the web assets;
+an older running bridge cannot serve newly added control endpoints. Reopen its
+authorization URL after restarting so the browser uses the new session.
 
 ```sh
 rustup target add wasm32-unknown-unknown

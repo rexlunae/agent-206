@@ -61,6 +61,12 @@ queued behind held API I/O all receive success, with accepted replies drained be
 daemon exit. Native startup uses safe asynchronous stdin readiness so closing the
 gateway does not strand a blocking
 stdio reader. Live browser checks cover start/stop/reload/restart on a private profile.
+The header and workspace home expose gateway navigation. A mismatched older web
+bridge reports an actionable restart/authorization message. Legacy gateways that
+close on unknown status requests can still be stopped through their existing
+Shutdown command; current clients persist stop intent under the released lock.
+An independent lifecycle gate excludes automatic startup throughout the legacy
+stop handoff. Failed shutdown releases the gate without persisting stop intent.
 
 The workspace has behavioral tests for permission attenuation, empty startup
 catalogs, fragmented/malformed frames, vault encryption/locking/wrong passwords,
