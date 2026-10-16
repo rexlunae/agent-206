@@ -1,0 +1,21 @@
+[package]
+name = "a206-extensions"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+build = "build.rs"
+[dependencies]
+a206-core.workspace = true
+a206-protocol.workspace = true
+serde.workspace = true
+rmp-serde.workspace = true
+toml.workspace = true
+anyhow.workspace = true
+wasmi = "2.0"
+[build-dependencies]
+wat = "1"
+rmp-serde.workspace = true
+serde.workspace = true
+[lints]
+workspace = true

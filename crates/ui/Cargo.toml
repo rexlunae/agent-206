@@ -1,0 +1,30 @@
+[package]
+name = "a206-ui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+[features]
+default = []
+web = ["dioxus/web", "fc-dioxus/web"]
+[dependencies]
+a206-core.workspace = true
+a206-protocol.workspace = true
+dioxus.workspace = true
+fc-dioxus.workspace = true
+uuid.workspace = true
+serde.workspace = true
+toml.workspace = true
+futures-util.workspace = true
+futures-timer = { version = "3", features = ["wasm-bindgen"] }
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+a206-runtime.workspace = true
+tokio.workspace = true
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
+web-sys = { version = "0.3", features = ["Window", "Location", "Storage", "History"] }
+reqwest = { version = "0.12", default-features = false }
+[dev-dependencies]
+dioxus-ssr.workspace = true
+[lints]
+workspace = true
