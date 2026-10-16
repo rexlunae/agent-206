@@ -38,8 +38,11 @@ implemented structure for finished agent execution or security parity.
 
 ## Current scope
 
-Gateway work targets the desktop and TUI clients first, over RustyClaw's SSH-based
-gateway protocol. Web client gateway support is deferred: there is no
+Gateway work targets the desktop and TUI clients first. Like RustyClaw, remote
+gateways are reached by SSH process transport; the wire format is Agent 206's own
+versioned MessagePack protocol, not RustyClaw's codec (see docs/upstream.md). The
+web client controls a local gateway through the authenticated local web bridge.
+Remote gateway access from the web client is deferred: there is no
 SSH-over-WebSocket bridge, and the web client must not be described as reaching
 remote gateways until one exists.
 
