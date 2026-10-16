@@ -17,11 +17,18 @@ request. Only a stepped-up user connection can mint one (`agent206 vault unlock`
 does so when the gateway is running, `agent206 vault pair` does so explicitly).
 The trusted client hands it straight to the local gateway over the gateway
 socket; the gateway verifies it with the broker, keeps it only in memory and
-never journals, logs or returns it. A new pairing replaces the old one, and any
-lock voids it, so after a relock or a gateway restart the user pairs again.
+never journals, logs or returns it. The broker binds a pairing to the first
+process that proves it, identified by the kernel's socket credentials, so a
+copied token is refused to every other process; a pairing whose holder the
+kernel cannot identify is refused rather than trusted. If another process wins
+that race the gateway's verification fails and `vault pair` reports it. A new
+pairing replaces the old one, and any lock voids it, so after a relock or a
+gateway restart the user pairs again. Both the broker and gateway sockets also
+refuse connections whose kernel-reported user differs from their own, behind
+the 0600 socket modes.
 
 Limits of today's boundary: any process running as the same OS user can open the
-socket and claim either role. Step-up (password, or a TOTP code when enrolled)
+socket and claim either role (only the first claimant can use a pairing). Step-up (password, or a TOTP code when enrolled)
 guards adding, revealing, overwriting and deleting credentials and policy,
 destination and agent-access changes, but a same-user attacker that already
 holds the password is not stopped. Pairing stops such a process from choosing

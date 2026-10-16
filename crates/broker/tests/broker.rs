@@ -711,3 +711,81 @@ async fn only_a_paired_gateway_spends_credentials_and_lock_voids_pairing() {
     let mut repaired = paired_gateway(&mut a, &root).await;
     assert!(paired(repaired.call(call()).await));
 }
+
+/// Child-process half of `a_pairing_belongs_to_the_first_process_to_prove_it`;
+/// it does nothing unless that test spawned it.
+#[tokio::test]
+async fn pairing_helper_process() {
+    let (Ok(root), Ok(token), Ok(expect)) = (
+        std::env::var("A206_PAIR_ROOT"),
+        std::env::var("A206_PAIR_TOKEN"),
+        std::env::var("A206_PAIR_EXPECT"),
+    ) else {
+        return;
+    };
+    let mut gateway = Client::connect(Path::new(&root), Role::Gateway)
+        .await
+        .unwrap();
+    let result = gateway
+        .call(Request::GatewayAuth {
+            token: WireSecret::new(token),
+        })
+        .await;
+    if expect == "accepted" {
+        result.unwrap();
+    } else {
+        assert_eq!(denied(result), BrokerError::GatewayNotPaired);
+    }
+}
+
+/// Present `token` from a separate process, which has its own pid.
+async fn from_another_process(root: &Path, token: &WireSecret, expect: &str) {
+    let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
+    command
+        .args(["--exact", "pairing_helper_process", "--test-threads=1"])
+        .env("A206_PAIR_ROOT", root)
+        .env("A206_PAIR_TOKEN", token.expose())
+        .env("A206_PAIR_EXPECT", expect);
+    let output = command.output().await.unwrap();
+    assert!(
+        output.status.success(),
+        "helper expecting {expect} failed: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+async fn present(root: &Path, token: &WireSecret) -> Result<Reply, ClientError> {
+    let mut gateway = Client::connect(root, Role::Gateway).await.unwrap();
+    gateway
+        .call(Request::GatewayAuth {
+            token: WireSecret::new(token.expose().to_owned()),
+        })
+        .await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pairing_belongs_to_the_first_process_to_prove_it() {
+    let (_dir, root, task) = start().await;
+    let mut user = user(&root).await;
+    user.call(unlock(&random(), None, true)).await.unwrap();
+
+    // Another process claims the pairing first; a copy is then useless here.
+    let first = pairing(&mut user).await;
+    from_another_process(&root, &first, "accepted").await;
+    assert_eq!(
+        denied(present(&root, &first).await),
+        BrokerError::GatewayNotPaired
+    );
+
+    // A fresh pairing claimed here survives reconnects from this process,
+    // and is refused to any other.
+    let second = pairing(&mut user).await;
+    present(&root, &second).await.unwrap();
+    present(&root, &second).await.unwrap();
+    from_another_process(&root, &second, "refused").await;
+    assert_eq!(
+        denied(present(&root, &first).await),
+        BrokerError::GatewayNotPaired
+    );
+    task.abort();
+}

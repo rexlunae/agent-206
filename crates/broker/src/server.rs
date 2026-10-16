@@ -27,8 +27,16 @@ struct Shared {
     http: reqwest::Client,
     /// Cancels provider requests started under an earlier vault generation.
     in_flight: Mutex<(u64, CancellationToken)>,
-    /// The current gateway pairing and the vault generation it belongs to.
-    pairing: Mutex<Option<(Zeroizing<String>, u64)>>,
+    pairing: Mutex<Option<Pairing>>,
+}
+
+/// The current gateway pairing. The first process to prove it becomes its
+/// holder; a copied token is useless to any other process afterwards.
+struct Pairing {
+    token: Zeroizing<String>,
+    /// The vault generation it was minted under; any lock or unlock voids it.
+    generation: u64,
+    holder: Option<i32>,
 }
 
 impl Shared {
@@ -36,7 +44,7 @@ impl Shared {
         self.vault.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn pairing(&self) -> MutexGuard<'_, Option<(Zeroizing<String>, u64)>> {
+    fn pairing(&self) -> MutexGuard<'_, Option<Pairing>> {
         self.pairing.lock().unwrap_or_else(|e| e.into_inner())
     }
 
@@ -61,6 +69,8 @@ struct Session {
     pending: Option<(PendingTotp, u64)>,
     /// The vault generation this gateway connection proved pairing for.
     paired: Option<u64>,
+    /// The connected process, from the kernel's socket credentials.
+    peer: Option<i32>,
 }
 
 struct Outbound {
@@ -123,6 +133,19 @@ fn upstream(error: reqwest::Error) -> BrokerError {
 }
 
 /// Compare without an early exit on the first differing byte.
+/// Bind a pairing to the first process that proves it. A caller the kernel
+/// cannot identify is refused rather than trusted.
+fn claim(holder: &mut Option<i32>, peer: Option<i32>) -> bool {
+    match (*holder, peer) {
+        (_, None) => false,
+        (None, Some(pid)) => {
+            *holder = Some(pid);
+            true
+        }
+        (Some(holder), Some(pid)) => holder == pid,
+    }
+}
+
 fn same_secret(expected: &str, given: &str) -> bool {
     expected.len() == given.len()
         && expected
@@ -519,16 +542,24 @@ fn handle(shared: &Shared, session: &mut Session, request: Request) -> Handled {
             let reply = Reply::GatewayPairing {
                 token: WireSecret::new(token.clone()),
             };
-            *shared.pairing() = Some((Zeroizing::new(token), generation));
+            *shared.pairing() = Some(Pairing {
+                token: Zeroizing::new(token),
+                generation,
+                holder: None,
+            });
             Ok(Outcome::Reply(reply))
         }
         Request::GatewayAuth { token } => {
             let vault = shared.vault();
             let generation = vault.generation();
-            let valid = shared.pairing().as_ref().is_some_and(|(expected, paired)| {
-                *paired == generation && same_secret(expected, token.expose())
-            });
-            if !valid || vault.is_locked() {
+            let mut pairing = shared.pairing();
+            let valid = !vault.is_locked()
+                && pairing.as_mut().is_some_and(|pairing| {
+                    pairing.generation == generation
+                        && same_secret(&pairing.token, token.expose())
+                        && claim(&mut pairing.holder, session.peer)
+                });
+            if !valid {
                 return Err(BrokerError::GatewayNotPaired);
             }
             session.paired = Some(generation);
@@ -638,9 +669,21 @@ async fn transmit(http: &reqwest::Client, out: Outbound) -> Result<Reply, Broker
 }
 
 async fn connection(shared: Arc<Shared>, stream: tokio::net::UnixStream) -> std::io::Result<()> {
+    // The socket is mode 0600 in a 0700 directory; check the kernel's view too.
+    let credentials = stream.peer_cred()?;
+    if credentials.uid() != nix::unistd::geteuid().as_raw() {
+        tracing::warn!(
+            uid = credentials.uid(),
+            "refused a vault broker connection from another user"
+        );
+        return Ok(());
+    }
     let (mut reader, mut writer) = stream.into_split();
     let mut decoder = Decoder::default();
-    let mut session = Session::default();
+    let mut session = Session {
+        peer: credentials.pid(),
+        ..Session::default()
+    };
     let mut bytes = vec![0; 8192];
     loop {
         let count = tokio::select! {
