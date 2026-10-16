@@ -17,7 +17,6 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
 use zeroize::Zeroizing;
 
-const MAX_RESPONSE: usize = 4 * 1024 * 1024;
 const MAX_NAME: usize = 256;
 const MAX_DESTINATIONS: usize = 16;
 
@@ -26,11 +25,24 @@ struct Shared {
     throttle: AuthThrottle<()>,
     stop: CancellationToken,
     http: reqwest::Client,
+    /// Cancels provider requests started under an earlier vault generation.
+    in_flight: Mutex<(u64, CancellationToken)>,
 }
 
 impl Shared {
     fn vault(&self) -> MutexGuard<'_, Vault> {
         self.vault.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The token for requests sent under `generation`. Moving to a new
+    /// generation (any lock or unlock) cancels every older request.
+    fn in_flight(&self, generation: u64) -> CancellationToken {
+        let mut current = self.in_flight.lock().unwrap_or_else(|e| e.into_inner());
+        if current.0 != generation {
+            current.1.cancel();
+            *current = (generation, CancellationToken::new());
+        }
+        current.1.clone()
     }
 }
 
@@ -48,6 +60,7 @@ struct Outbound {
     value: Zeroizing<String>,
     anthropic_version: Option<String>,
     body: Option<Vec<u8>>,
+    cancel: CancellationToken,
 }
 
 enum Outcome {
@@ -390,11 +403,7 @@ fn handle(shared: &Shared, session: &mut Session, request: Request) -> Handled {
             check_name(&name)?;
             meta.destinations = origins(meta.destinations)?;
             let mut vault = shared.vault();
-            match vault.credential(&name) {
-                Ok(_) => require_step_up(session, vault.generation())?,
-                Err(VaultError::NotFound) => {}
-                Err(error) => return Err(vault_error(error)),
-            }
+            require_step_up(session, vault.generation())?;
             vault
                 .put_credential(&name, &meta, (&value).into())
                 .map_err(vault_error)?;
@@ -455,9 +464,18 @@ fn handle(shared: &Shared, session: &mut Session, request: Request) -> Handled {
             if url.fragment().is_some() {
                 return Err(BrokerError::Invalid(InvalidRequest::ProviderUrl));
             }
+            if call
+                .body
+                .as_ref()
+                .is_some_and(|b| b.len() > MAX_PROVIDER_BODY)
+            {
+                return Err(BrokerError::Invalid(InvalidRequest::ProviderBody));
+            }
             let origin = url.origin().ascii_serialization();
-            let value = shared
-                .vault()
+            let vault = shared.vault();
+            // Taken under the vault mutex, so a later lock always cancels it.
+            let cancel = shared.in_flight(vault.generation());
+            let value = vault
                 .use_for_destination(&call.credential, &origin, |s| {
                     Zeroizing::new(match call.auth {
                         AuthScheme::Bearer => format!("Bearer {}", s.expose(str::to_owned)),
@@ -465,6 +483,7 @@ fn handle(shared: &Shared, session: &mut Session, request: Request) -> Handled {
                     })
                 })
                 .map_err(vault_error)?;
+            drop(vault);
             let header = match call.auth {
                 AuthScheme::Bearer => "authorization",
                 AuthScheme::ApiKeyHeader => "x-api-key",
@@ -477,12 +496,26 @@ fn handle(shared: &Shared, session: &mut Session, request: Request) -> Handled {
                 value,
                 anthropic_version: call.anthropic_version,
                 body: call.body,
+                cancel,
             })))
         }
     }
 }
 
+/// Send a prepared request unless the vault is locked first; a lock while it
+/// is in flight abandons it.
 async fn send(http: &reqwest::Client, out: Outbound) -> Result<Reply, BrokerError> {
+    let cancel = out.cancel.clone();
+    if cancel.is_cancelled() {
+        return Err(BrokerError::Locked);
+    }
+    tokio::select! {
+        reply = transmit(http, out) => reply,
+        _ = cancel.cancelled() => Err(BrokerError::Locked),
+    }
+}
+
+async fn transmit(http: &reqwest::Client, out: Outbound) -> Result<Reply, BrokerError> {
     let mut header = reqwest::header::HeaderValue::from_str(&out.value)
         .map_err(|_| BrokerError::Upstream(UpstreamFailure::InvalidHeader))?;
     header.set_sensitive(true);
@@ -512,7 +545,7 @@ async fn send(http: &reqwest::Client, out: Outbound) -> Result<Reply, BrokerErro
     let mut body = vec![];
     while let Some(part) = stream.next().await {
         let part = part.map_err(upstream)?;
-        if body.len() + part.len() > MAX_RESPONSE {
+        if body.len() + part.len() > MAX_PROVIDER_BODY {
             return Err(BrokerError::Upstream(UpstreamFailure::TooLarge));
         }
         body.extend_from_slice(&part);
@@ -546,6 +579,9 @@ async fn connection(shared: Arc<Shared>, stream: tokio::net::UnixStream) -> std:
             .await
             .map_err(std::io::Error::other)?;
             session = returned;
+            // Any lock or unlock during this request cancels older sends.
+            let generation = shared.vault().generation();
+            shared.in_flight(generation);
             let body = match outcome {
                 Ok(Outcome::Reply(reply)) => reply,
                 Ok(Outcome::Send(out)) => {
@@ -559,10 +595,16 @@ async fn connection(shared: Arc<Shared>, stream: tokio::net::UnixStream) -> std:
                     Reply::Error(error)
                 }
             };
-            let frame = encode(&Response {
+            let frame = match encode(&Response {
                 id: request.id,
                 body,
-            })
+            }) {
+                Err(a206_protocol::Error::TooLarge) => encode(&Response {
+                    id: request.id,
+                    body: Reply::Error(BrokerError::Upstream(UpstreamFailure::TooLarge)),
+                }),
+                frame => frame,
+            }
             .map_err(std::io::Error::other)?;
             writer.write_all(&frame).await?;
         }
@@ -599,6 +641,7 @@ pub async fn serve(root: &Path) -> std::io::Result<()> {
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(std::io::Error::other)?,
+        in_flight: Mutex::new((0, CancellationToken::new())),
     });
     let mut connections = tokio::task::JoinSet::new();
     loop {

@@ -7,6 +7,10 @@ use std::collections::BTreeMap;
 use zeroize::Zeroizing;
 
 pub const BROKER_VERSION: u16 = 1;
+/// Largest provider request or response body the broker carries. The rest of
+/// the 4 MiB frame is reserved for the envelope, so a body at this limit still
+/// fits in one frame.
+pub const MAX_PROVIDER_BODY: usize = a206_protocol::MAX_FRAME - 64 * 1024;
 
 pub struct WireSecret(Zeroizing<String>);
 impl WireSecret {
@@ -170,6 +174,7 @@ pub struct ProviderCall {
     /// The only extra header the broker forwards (Anthropic's API version).
     pub anthropic_version: Option<String>,
     /// JSON request body, sent with `content-type: application/json`.
+    #[serde(with = "serde_bytes")]
     pub body: Option<Vec<u8>>,
 }
 
@@ -297,6 +302,8 @@ pub enum InvalidRequest {
     TooManyDestinations,
     #[error("provider URLs must be HTTPS (or loopback HTTP) without credentials or fragments")]
     ProviderUrl,
+    #[error("the provider request body is too large for the vault broker")]
+    ProviderBody,
     #[error("the vault password is required")]
     PasswordRequired,
     #[error("two-factor authentication is already enrolled")]
@@ -325,7 +332,7 @@ pub enum UpstreamFailure {
     Connect,
     #[error("the provider connection failed during transfer")]
     Transfer,
-    #[error("the provider response exceeds 4 MiB")]
+    #[error("the provider response is too large for the vault broker")]
     TooLarge,
     #[error("the stored credential is not a valid header value")]
     InvalidHeader,
@@ -349,6 +356,7 @@ pub enum Reply {
     Value(WireValue),
     Provider {
         status: u16,
+        #[serde(with = "serde_bytes")]
         body: Vec<u8>,
     },
     Error(BrokerError),

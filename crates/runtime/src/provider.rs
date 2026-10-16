@@ -155,7 +155,7 @@ async fn brokered(
             auth,
             anthropic_version: (config.api == ProviderApi::Anthropic)
                 .then(|| ANTHROPIC_VERSION.to_owned()),
-            body: body.map(serde_json::to_vec).transpose()?,
+            body: body.map(bounded_json).transpose()?,
         }))
         .await?;
     let Reply::Provider { status, body } = reply else {
@@ -167,6 +167,32 @@ async fn brokered(
     );
     ensure!(body.len() <= MAX_RESPONSE, "provider response is too large");
     Ok(serde_json::from_slice(&body)?)
+}
+/// Serialize a request body, stopping as soon as it exceeds what one broker
+/// frame can carry instead of building an oversized copy first.
+#[cfg(unix)]
+fn bounded_json(body: &Value) -> Result<Vec<u8>> {
+    struct Bounded(Vec<u8>);
+    impl std::io::Write for Bounded {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if self.0.len() + bytes.len() > a206_broker::MAX_PROVIDER_BODY {
+                return Err(std::io::Error::other("provider request too large"));
+            }
+            self.0.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut out = Bounded(vec![]);
+    if serde_json::to_writer(&mut out, body).is_err() {
+        bail!(
+            "the provider request exceeds the vault broker's {} byte limit; shorten the conversation",
+            a206_broker::MAX_PROVIDER_BODY
+        );
+    }
+    Ok(out.0)
 }
 #[cfg(not(unix))]
 async fn brokered(

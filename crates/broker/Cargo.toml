@@ -8,6 +8,7 @@ license.workspace = true
 a206-protocol.workspace = true
 a206-vault.workspace = true
 serde.workspace = true
+serde_bytes = "0.11"
 thiserror.workspace = true
 tokio.workspace = true
 tokio-util = { version = "0.7", features = ["rt"] }

@@ -104,15 +104,15 @@ async fn roles_creation_step_up_reveal_and_lock_revocation() {
 
     let name = random();
     let value = random();
-    let mut b = user(&root).await;
-    b.call(Request::PutCredential {
+    let put = || Request::PutCredential {
         name: name.clone(),
         meta: meta(vec![]),
         value: WireValue::Single(WireSecret::new(value.clone())),
-    })
-    .await
-    .unwrap();
-    // A fresh connection must step up before revealing or changing policy.
+    };
+    a.call(put()).await.unwrap();
+    // A fresh connection must step up before adding, revealing or changing policy.
+    let mut b = user(&root).await;
+    assert_eq!(denied(b.call(put()).await), BrokerError::StepUpRequired);
     assert_eq!(
         denied(b.call(Request::Reveal { name: name.clone() }).await),
         BrokerError::StepUpRequired
@@ -400,4 +400,84 @@ async fn provider_calls_are_destination_bound_and_value_free() {
         denied(gateway.call(call(&bound, "/ok")).await),
         BrokerError::Locked
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn lock_cancels_in_flight_sends_and_body_limits_are_structured() {
+    use axum::{Router, routing::get};
+    let (entered, mut entered_rx) = tokio::sync::mpsc::channel::<()>(1);
+    let app = Router::new()
+        .route(
+            "/slow",
+            get(move || {
+                let entered = entered.clone();
+                async move {
+                    entered.send(()).await.unwrap();
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    "late"
+                }
+            }),
+        )
+        // Non-ASCII bytes at the limit must still fit one frame.
+        .route("/full", get(|| async { vec![0xffu8; MAX_PROVIDER_BODY] }))
+        .route("/over", get(|| async { vec![b'x'; MAX_PROVIDER_BODY + 1] }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let (_dir, root, _task) = start().await;
+    let password = random();
+    let mut a = user(&root).await;
+    a.call(unlock(&password, None, true)).await.unwrap();
+    let name = random();
+    a.call(Request::PutCredential {
+        name: name.clone(),
+        meta: meta(vec![origin.clone()]),
+        value: WireValue::Single(WireSecret::new(random())),
+    })
+    .await
+    .unwrap();
+    let call = |path: &str, body: Option<Vec<u8>>| {
+        Request::Provider(ProviderCall {
+            credential: name.clone(),
+            method: HttpMethod::Get,
+            url: format!("{origin}{path}"),
+            auth: AuthScheme::Bearer,
+            anthropic_version: None,
+            body,
+        })
+    };
+    let mut gateway = Client::connect(&root, Role::Gateway).await.unwrap();
+    match gateway.call(call("/full", None)).await.unwrap() {
+        Reply::Provider { status, body } => {
+            assert_eq!(status, 200);
+            assert_eq!(body.len(), MAX_PROVIDER_BODY);
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+    assert_eq!(
+        denied(gateway.call(call("/over", None)).await),
+        BrokerError::Upstream(UpstreamFailure::TooLarge)
+    );
+    assert_eq!(
+        denied(
+            gateway
+                .call(call("/full", Some(vec![b'x'; MAX_PROVIDER_BODY + 1])))
+                .await
+        ),
+        BrokerError::Invalid(InvalidRequest::ProviderBody)
+    );
+
+    let request = call("/slow", None);
+    let slow = tokio::spawn(async move { gateway.call(request).await });
+    tokio::time::timeout(Duration::from_secs(10), entered_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    a.call(Request::Lock).await.unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(10), slow)
+        .await
+        .expect("lock must abandon the in-flight request")
+        .unwrap();
+    assert_eq!(denied(result), BrokerError::Locked);
 }

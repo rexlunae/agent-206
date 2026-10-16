@@ -228,19 +228,34 @@ async fn step_up(client: &mut Client) -> Result<()> {
     if !state.unlocked {
         bail!("the vault is locked; run `agent206 vault unlock`");
     }
-    let request = if state.totp_enrolled == Some(true) {
-        Request::StepUp {
-            password: None,
-            totp: Some(rpassword::prompt_password("Authenticator code: ")?),
+    if state.totp_enrolled != Some(true) {
+        client
+            .call(Request::StepUp {
+                password: Some(hidden("Vault password: ")?),
+                totp: None,
+            })
+            .await?;
+        return Ok(());
+    }
+    loop {
+        let code = rpassword::prompt_password("Authenticator code: ")?;
+        match client
+            .call(Request::StepUp {
+                password: None,
+                totp: Some(code),
+            })
+            .await
+        {
+            // Each code works once, so one just used to unlock is refused here.
+            Err(ClientError::Broker(BrokerError::TotpReplayed)) => {
+                eprintln!("That code was already used; enter the next one from your app.");
+            }
+            result => {
+                result?;
+                return Ok(());
+            }
         }
-    } else {
-        Request::StepUp {
-            password: Some(hidden("Vault password: ")?),
-            totp: None,
-        }
-    };
-    client.call(request).await?;
-    Ok(())
+    }
 }
 
 fn print_value(value: &WireValue) {
@@ -365,6 +380,14 @@ pub fn run(root: &Path, action: VaultAction) -> Result<()> {
                 triggers,
                 destinations,
             } => {
+                let Reply::Credentials { typed, .. } = client.call(Request::Credentials).await?
+                else {
+                    bail!("unexpected broker reply");
+                };
+                if typed.iter().any(|(existing, _)| *existing == name) {
+                    bail!("{name} already exists; delete it first or use policy/bind");
+                }
+                step_up(&mut client).await?;
                 let (kind, value) = match kind {
                     Kind::Login => (
                         CredentialKind::UsernamePassword,
@@ -392,19 +415,9 @@ pub fn run(root: &Path, action: VaultAction) -> Result<()> {
                     disabled: false,
                     destinations,
                 };
-                let put = |value| Request::PutCredential {
-                    name: name.clone(),
-                    meta: meta.clone(),
-                    value,
-                };
-                match client.call(put(value)).await {
-                    Err(ClientError::Broker(BrokerError::StepUpRequired)) => {
-                        bail!("{name} already exists; delete it first or use policy/bind")
-                    }
-                    result => {
-                        result?;
-                    }
-                }
+                client
+                    .call(Request::PutCredential { name, meta, value })
+                    .await?;
                 println!("Credential stored");
             }
             VaultAction::Adopt {

@@ -13,9 +13,14 @@ origin the user bound to that credential; it never receives the value. The CLI
 is the first trusted surface. GUI enrollment and agent approvals are the next gate.
 
 Limits of today's boundary: any process running as the same OS user can open the
-socket and claim the user role. Step-up (password, or a TOTP code when enrolled)
-guards reveal, policy, destination, deletion, overwrite and agent-access changes,
-but a same-user attacker that already holds the password is not stopped. Agent
+socket and claim either role. Step-up (password, or a TOTP code when enrolled)
+guards adding, revealing, overwriting and deleting credentials and policy,
+destination and agent-access changes, but a same-user attacker that already
+holds the password is not stopped. The gateway role is not yet authenticated:
+while the vault is unlocked, a same-user process claiming it can send requests
+to origins the user bound and read the responses, though never the value.
+Gateway pairing is the planned fix. Locking the vault cancels provider requests
+already in flight. Agent
 execution must therefore keep the profile directory outside its OS sandbox, as
 the macOS backend isolation already does. Remote vault access over SSH is not
 wired yet; the broker is local to the gateway host.
