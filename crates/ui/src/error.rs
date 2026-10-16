@@ -5,7 +5,13 @@ use fc_dioxus::prelude::*;
 /// Record a failure the client is about to show, keeping its cause chain.
 pub(crate) fn record(operation: &'static str, report: &ErrorReport) {
     let error: &(dyn std::error::Error + 'static) = report;
-    tracing::warn!(operation, kind = ?report.kind, error, "request failed");
+    tracing::warn!(
+        operation,
+        kind = ?report.kind,
+        correlation = report.correlation.map(tracing::field::display),
+        error,
+        "request failed"
+    );
 }
 
 /// A failure with its kind and causes; causes stay collapsed until asked for.
@@ -24,12 +30,17 @@ pub(crate) fn ErrorNotice(
             class: "a206-error",
             title: rsx! { "{title}" },
             dismiss: dismiss.map(|ondismiss| Dismiss { label: name!("Dismiss error"), ondismiss }),
-            actions: if causes.is_empty() { None } else { Some(rsx! {
+            actions: if causes.is_empty() && report.correlation.is_none() { None } else { Some(rsx! {
                 Disclosure { summary: rsx! { "Details" },
-                    ol { class: "a206-error-causes",
-                        for (index, cause) in causes.iter().enumerate() {
-                            li { key: "{index}", "{cause}" }
+                    if !causes.is_empty() {
+                        ol { class: "a206-error-causes",
+                            for (index, cause) in causes.iter().enumerate() {
+                                li { key: "{index}", "{cause}" }
+                            }
                         }
+                    }
+                    if let Some(id) = report.correlation {
+                        p { class: "a206-muted", "Reference {id} (matches the log entry)" }
                     }
                 }
             }) },
@@ -64,6 +75,13 @@ mod tests {
         assert!(html.contains(&message), "{html}");
         assert!(html.contains(&cause), "{html}");
         assert!(html.contains("<details"), "{html}");
+    }
+
+    #[test]
+    fn shows_the_reference_that_matches_the_logs() {
+        let id = uuid::Uuid::new_v4();
+        let html = render(ErrorReport::new(ErrorKind::Other, "x").with_correlation(id));
+        assert!(html.contains(&id.to_string()), "{html}");
     }
 
     #[test]

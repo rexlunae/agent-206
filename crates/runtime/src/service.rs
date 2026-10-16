@@ -161,12 +161,14 @@ pub async fn connect(root: &Path, start: bool, explicit: bool) -> Result<tokio::
     for _ in 0..100 {
         if let Ok(stream) = tokio::net::UnixStream::connect(&path).await {
             tokio::spawn(async move {
+                // Reaps the detached daemon; its exit is reported through its own log.
                 child.wait().await.ignore();
             });
             return Ok(stream);
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
+    // The readiness failure below is the error reported; the kill is cleanup.
     child.kill().await.ignore();
     anyhow::bail!(
         "gateway did not become ready; inspect {}",
@@ -201,6 +203,7 @@ pub async fn stdio(root: &Path, start: bool, explicit: bool) -> Result<()> {
         tokio::spawn(async move { tokio::io::copy(&mut reader, &mut tokio::io::stdout()).await });
     tokio::select! {
         result = &mut input => { result??; output.await??; },
+        // The aborted input task's cancellation is expected; the output result is what matters.
         result = &mut output => { input.abort(); input.await.ignore(); result??; }
     }
     Ok(())
@@ -235,6 +238,7 @@ impl std::os::fd::AsFd for NonblockingInput {
 #[cfg(unix)]
 impl Drop for NonblockingInput {
     fn drop(&mut self) {
+        // Restoring stdin flags on exit is best effort; Drop has no caller to tell.
         nix::fcntl::fcntl(&self.file, nix::fcntl::FcntlArg::F_SETFL(self.flags)).ignore();
     }
 }

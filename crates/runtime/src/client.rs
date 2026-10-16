@@ -71,6 +71,7 @@ async fn run(
                 }
             }
             Err(error) => {
+                // The caller stopped waiting; there is no one left to tell.
                 first
                     .1
                     .send(Err(anyhow::Error::from(error)
@@ -113,6 +114,7 @@ async fn connection(
             crate::transport::read_frame::<Response<Reply>>(&mut stdout).await?
         {
             if let Some(sender) = reads.lock().await.remove(&response.id) {
+                // The caller stopped waiting; there is no one left to tell.
                 sender.send(Ok(response.body)).ignore();
             }
         }
@@ -125,6 +127,7 @@ async fn connection(
             let mut outstanding = pending.lock().await;
             outstanding.retain(|_, sender| !sender.is_closed());
             if outstanding.len() >= 32 {
+                // The caller stopped waiting; there is no one left to tell.
                 sender
                     .send(Err(ErrorReport::new(
                         ErrorKind::Unavailable,
@@ -138,6 +141,7 @@ async fn connection(
             {
                 entry.insert(sender);
             } else {
+                // The caller stopped waiting; there is no one left to tell.
                 sender
                     .send(Err(ErrorReport::new(
                         ErrorKind::Conflict,
@@ -166,6 +170,7 @@ async fn connection(
         }
     }
     reader.abort();
+    // The connection already failed; a child that already exited needs no kill.
     child.kill().await.ignore();
     let detail = tokio::time::timeout(std::time::Duration::from_secs(1), &mut diagnostics)
         .await
@@ -184,6 +189,7 @@ async fn connection(
         lost.caused_by(ErrorReport::new(ErrorKind::Other, detail))
     };
     for (_, sender) in pending.lock().await.drain() {
+        // The caller stopped waiting; there is no one left to tell.
         sender.send(Err(lost.clone().into())).ignore();
     }
     Ok(stopped)

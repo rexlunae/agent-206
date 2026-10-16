@@ -113,12 +113,14 @@ pub async fn run(
                                     .data("Backend message exceeds the conversation limit"));
                             }
                             output.text.push_str(&text.text);
+                            // Progress is advisory: a full or closed channel only drops an update.
                             progress
                                 .try_send(Progress::Text(output.text.clone()))
                                 .ignore();
                         }
                     }
                     SessionUpdate::ToolCall(tool) => {
+                        // Progress is advisory: a full or closed channel only drops an update.
                         progress
                             .try_send(Progress::Activity(format!("Claude Agent: {:?}", tool.kind)))
                             .ignore();

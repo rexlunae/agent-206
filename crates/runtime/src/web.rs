@@ -168,7 +168,9 @@ async fn command(State(state): State<Web>, headers: HeaderMap, bytes: Bytes) -> 
         .client
         .call_with_id(request.id, request.body)
         .await
-        .unwrap_or_else(|error| Reply::Error(crate::error::handle(operation, &error)));
+        .unwrap_or_else(|error| {
+            Reply::Error(crate::error::correlated(operation, request.id, &error))
+        });
     match a206_protocol::encode(&a206_protocol::Response {
         id: request.id,
         body,

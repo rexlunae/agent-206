@@ -69,6 +69,9 @@ pub struct ErrorReport {
     pub kind: ErrorKind,
     pub message: String,
     pub source: Option<Box<ErrorReport>>,
+    /// The request, run or transfer the failure belongs to; logs record the
+    /// same id, so a displayed error can be matched to its log entries.
+    pub correlation: Option<uuid::Uuid>,
 }
 
 impl ErrorReport {
@@ -77,7 +80,13 @@ impl ErrorReport {
             kind,
             message: bounded(message.into()),
             source: None,
+            correlation: None,
         }
+    }
+    /// Tie this report to the operation it belongs to.
+    pub fn with_correlation(mut self, id: uuid::Uuid) -> Self {
+        self.correlation = Some(id);
+        self
     }
     /// Attach a cause below the innermost link of this report.
     pub fn caused_by(mut self, cause: ErrorReport) -> Self {
@@ -189,6 +198,8 @@ impl<'de> Deserialize<'de> for ErrorReport {
                 message: String,
                 #[serde(default)]
                 source: Option<Box<ErrorReport>>,
+                #[serde(default)]
+                correlation: Option<uuid::Uuid>,
             },
         }
         let mut report = match Wire::deserialize(deserializer)? {
@@ -197,10 +208,12 @@ impl<'de> Deserialize<'de> for ErrorReport {
                 kind,
                 message,
                 source,
+                correlation,
             } => Self {
                 kind,
                 message: bounded(message),
                 source,
+                correlation,
             },
         };
         report.truncate();
@@ -305,7 +318,8 @@ mod tests {
     #[test]
     fn decodes_reports_legacy_strings_and_unknown_kinds() {
         let report = ErrorReport::new(ErrorKind::Conflict, uuid::Uuid::new_v4().to_string())
-            .caused_by(ErrorReport::new(ErrorKind::Storage, "disk"));
+            .caused_by(ErrorReport::new(ErrorKind::Storage, "disk"))
+            .with_correlation(uuid::Uuid::new_v4());
         let bytes = rmp_serde::to_vec_named(&report).unwrap();
         assert_eq!(
             rmp_serde::from_slice::<ErrorReport>(&bytes).unwrap(),

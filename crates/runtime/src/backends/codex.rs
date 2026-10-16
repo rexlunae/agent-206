@@ -28,6 +28,7 @@ impl Turn {
                     json!({"id": id, "error": {"code": -32601, "message": "Unsupported backend request"}})
                 };
                 rpc.send(response).await?;
+                // Progress is advisory: a full or closed channel only drops an update.
                 self.progress
                     .try_send(Progress::Activity(
                         "Backend permission request denied".into(),
@@ -106,6 +107,7 @@ impl Turn {
                     .and_then(Value::as_str)
                     .filter(|s| s.len() <= 128 && !s.chars().any(char::is_control))
                 {
+                    // Progress is advisory: a full or closed channel only drops an update.
                     self.progress
                         .try_send(Progress::Activity(format!("Codex: {kind}")))
                         .ignore();
@@ -142,6 +144,7 @@ impl Turn {
             text.len() <= 128 * 1024,
             "backend message exceeds the conversation limit"
         );
+        // Progress is advisory: a full or closed channel only drops an update.
         self.progress.try_send(Progress::Text(text)).ignore();
         Ok(())
     }

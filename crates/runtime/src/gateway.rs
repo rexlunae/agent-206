@@ -133,7 +133,7 @@ impl Gateway {
         let (body, stop) = tracing::Instrument::instrument(self.execute(request), span).await;
         let body = match body {
             Ok(reply) => reply,
-            Err(error) => Reply::Error(crate::error::handle(operation, &error)),
+            Err(error) => Reply::Error(crate::error::correlated(operation, id, &error)),
         };
         (Response { id, body }, stop)
     }
@@ -186,7 +186,7 @@ impl Gateway {
                 // A failed command is a reply: persist its report as the receipt.
                 let reply = match self.handle(request.body).await {
                     Ok(reply) => reply,
-                    Err(error) => Reply::Error(crate::error::handle(operation, &error)),
+                    Err(error) => Reply::Error(crate::error::correlated(operation, id, &error)),
                 };
                 let stop = is_shutdown && matches!(reply, Reply::Ok);
                 if mutation && let Err(error) = self.lock().and_then(|s| s.finish(id, &reply)) {
@@ -743,7 +743,7 @@ impl Gateway {
                         thread.state = RunState::Complete;
                     }
                     Some(Err(e)) => {
-                        let report = crate::error::handle("run", &e);
+                        let report = crate::error::correlated("run", id, &e);
                         thread.state = RunState::Failed;
                         thread.messages.push(Message {
                             id: Id::new_v4(),
@@ -1083,7 +1083,7 @@ impl Gateway {
         tokio::spawn(async move {
             let result = tokio::select! { result = gateway.transfer(&job, &target, &url) => result, _ = token.cancelled() => Err(ErrorReport::new(ErrorKind::Cancelled, "download cancelled").into()) };
             if let Err(error) = result {
-                let report = crate::error::report(&error);
+                let report = crate::error::report(&error).with_correlation(job.id);
                 let update = gateway.update_download(job.id, |d| {
                     if d.state != DownloadState::Cancelled {
                         d.state = DownloadState::Failed;
@@ -1355,15 +1355,19 @@ mod tests {
                 "remove" => settings.providers.clear(),
                 _ => unreachable!(),
             }
+            let request = Id::new_v4();
             let reply = gateway
                 .request(Request {
-                    id: Id::new_v4(),
+                    id: request,
                     body: Command::SaveSettings(settings),
                 })
                 .await
                 .body;
+            // The rejection reaches the client intact and names its request.
             assert!(
-                matches!(reply, Reply::Error(ref report) if report.message.contains("stop managed Joshua")),
+                matches!(reply, Reply::Error(ref report)
+                    if report.message.contains("stop managed Joshua")
+                        && report.correlation == Some(request)),
                 "{reply:?}"
             );
             assert_eq!(gateway.snapshot().unwrap(), before);

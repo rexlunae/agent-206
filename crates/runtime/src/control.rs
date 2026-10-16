@@ -52,10 +52,12 @@ impl GatewayController {
                     let mutation = matches!(action, GatewayAction::Start | GatewayAction::Stop | GatewayAction::Restart);
                     if mutation {
                         if let Some((previous, report)) = receipts.get(&id) {
+                            // The caller stopped waiting; there is no one left to tell.
                             response.send(if *previous == action { Ok(report.clone()) } else { Err(ErrorReport::new(ErrorKind::Conflict, "control request ID reused with a different operation").into()) }).ignore();
                             continue;
                         }
                         if receipts.len() >= 4096 {
+                            // The caller stopped waiting; there is no one left to tell.
                             response.send(Err(ErrorReport::new(ErrorKind::Unavailable, "control receipt limit reached; reopen the controller before submitting more lifecycle changes").into())).ignore();
                             continue;
                         }
@@ -104,6 +106,7 @@ impl GatewayController {
                         }
                     };
                     if mutation { receipts.insert(id, (action, report.clone())); }
+                    // The caller stopped waiting; there is no one left to tell.
                     response.send(Ok(report)).ignore();
                 }
             });

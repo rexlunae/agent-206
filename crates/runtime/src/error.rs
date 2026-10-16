@@ -24,12 +24,14 @@ pub fn record(operation: &'static str, report: &ErrorReport) {
         ErrorKind::Internal | ErrorKind::Storage => tracing::error!(
             operation,
             kind = ?report.kind,
+            correlation = report.correlation.map(tracing::field::display),
             error,
             "operation failed"
         ),
         _ => tracing::warn!(
             operation,
             kind = ?report.kind,
+            correlation = report.correlation.map(tracing::field::display),
             error,
             "operation failed"
         ),
@@ -39,6 +41,18 @@ pub fn record(operation: &'static str, report: &ErrorReport) {
 /// Capture and record in one step, for failures handled where they occur.
 pub fn handle(operation: &'static str, error: &anyhow::Error) -> ErrorReport {
     let report = report(error);
+    record(operation, &report);
+    report
+}
+
+/// Capture and record a failure that belongs to a request, run or transfer,
+/// tagging the report and the log event with that id.
+pub fn correlated(
+    operation: &'static str,
+    correlation: uuid::Uuid,
+    error: &anyhow::Error,
+) -> ErrorReport {
+    let report = report(error).with_correlation(correlation);
     record(operation, &report);
     report
 }
