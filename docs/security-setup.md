@@ -64,15 +64,15 @@ protection on a renderer or platform that cannot enforce it.
 | --- | --- | --- |
 | Vault encryption | Password or owner-only key file, atomic encrypted writes | Legacy password-based library tested; key-file import, modern envelope and broker pending |
 | Process/channel separation | Secrets outside agent context | Worker/agent boundaries exist; isolated encrypted vault IPC pending |
-| TOTP | Vault-held seed is authoritative; 6 digits, 30-second steps, ±1 step | Enrollment, connect challenge, replay/expiry and recovery tests pending |
-| Authentication throttling | Shared 3-failure / 30-second lockout over a 60-second failure window | Broker-wide limits must survive reconnects; tests pending |
-| Per-credential policy | Always, WithApproval, WithAuth, SkillOnly, TriggerOnly | Preserve all variants and scopes; broker-enforced approvals/step-up pending |
-| Disabled credentials | Disabled entry cannot be used | Import/enforcement pending; never map to an enabled default |
-| Global agent switch | User access distinct from agent access | Current agent secret access disabled; user-controlled broker switch pending |
-| Credential kinds | API/token, login, SSH key, passkey, form, payment and secure note | Typed metadata/value migration pending; unsupported kinds stay encrypted and unavailable |
+| TOTP | Vault-held seed is authoritative; 6 digits, 30-second steps, ±1 step | Library: seed generated in memory and committed only after a valid code, enrollment expiry, ±1 step, persisted replay protection, drift diagnosis, code-gated removal; seed stored under RustyClaw's key so imported vaults stay enrolled; tested. Standalone CLI challenges enrolled vaults. Broker connect challenge, GUI enrollment and recovery codes pending |
+| Authentication throttling | Shared 3-failure / 30-second lockout over a 60-second failure window | Library throttle keyed by principal, not connection, tested; failures during lockout neither shorten nor extend it. Broker-wide wiring pending (the standalone CLI is one attempt per process) |
+| Per-credential policy | Always, WithApproval, WithAuth, SkillOnly, TriggerOnly | All variants, RustyClaw JSON shape, unknown variants rejected; evaluated deny-by-default and tested. Approval/step-up facts must come from the broker's trusted surface, pending |
+| Disabled credentials | Disabled entry cannot be used | Enforced for agent use and tested; missing flag reads as RustyClaw's default; owner reveal still allowed |
+| Global agent switch | User access distinct from agent access | Held in the encrypted vault, off by default. Deliberate tightening: it is a precondition and never satisfies WithApproval (RustyClaw let it). Broker control surface pending |
+| Credential kinds | API/token, login, SSH key, passkey, form, payment and secure note | All kinds stored in RustyClaw's `cred:`/`val:` layout with kind/value checks and stale-value removal, tested; unknown kinds fail to parse and stay unavailable |
 | Protected namespaces/paths | Internal/provider/service records cannot be read through generic bypasses | Private state and backend isolation tested; all tool/extension/import paths require explicit vault exclusion |
 | Scoped use | Skill/trigger and destination restrictions, explicit approvals | Existing narrowed tool/model grants; credential-use binding pending |
-| Reveal authentication | Per-connection short step-up window (120 seconds upstream) | Separate reveal capability, expiry/lock/reconnect revocation pending |
+| Reveal authentication | Per-connection short step-up window (120 seconds upstream) | 120-second window gates owner reveal, separate from agent use, expiry/revoke tested; lock/reconnect revocation wiring in the broker pending |
 | Prompt and leak defenses | Prompt-injection validation and outbound secret leak detection | Full boundary scanning/attack corpus pending |
 | OS sandbox | Strongest supported OS boundary, vault path excluded | macOS external backend isolation tested; other platforms and full RustyClaw tool parity pending |
 | Audit and redaction | Log decisions without secret material | Redacted secret type exists; broker audit and adversarial no-secret leakage tests pending |

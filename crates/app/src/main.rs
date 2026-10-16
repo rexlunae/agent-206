@@ -248,11 +248,31 @@ mod native {
                     a206_vault::Secret::new(rpassword::prompt_password("Vault password: ")?);
                 let mut vault = a206_vault::Vault::locked(root.join("vault").join("secrets.json"));
                 vault.unlock(&password)?;
+                // Two-factor state comes from the encrypted vault, so an
+                // enrolled (including imported RustyClaw) vault always challenges.
+                if vault.totp_enrolled()? {
+                    let code = rpassword::prompt_password("Authenticator code: ")?;
+                    let outcome = vault.verify_totp(&code, a206_vault::unix_now())?;
+                    if outcome != a206_vault::TotpOutcome::Valid {
+                        vault.lock();
+                        if let a206_vault::TotpOutcome::ClockDrift { steps } = outcome {
+                            anyhow::bail!(
+                                "authenticator code rejected: clocks differ by about {} seconds",
+                                steps.unsigned_abs() * 30
+                            );
+                        }
+                        anyhow::bail!("authenticator code rejected");
+                    }
+                }
                 match command {
                     VaultAction::Init => println!("Vault ready"),
                     VaultAction::List => {
                         for name in vault.names()? {
                             println!("{name}");
+                        }
+                        for (name, meta) in vault.credentials()? {
+                            let state = if meta.disabled { " disabled" } else { "" };
+                            println!("{name}\t{:?}\t{:?}{state}", meta.kind, meta.policy);
                         }
                     }
                     VaultAction::Put { name } => {
