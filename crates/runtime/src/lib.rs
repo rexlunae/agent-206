@@ -14,4 +14,5 @@ pub mod provider;
 pub mod service;
 pub mod store;
 pub mod transport;
+pub mod vault;
 pub mod web;

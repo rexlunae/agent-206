@@ -97,6 +97,7 @@ pub(crate) fn classify(error: &(dyn Error + 'static)) -> Option<ErrorKind> {
         crate::transport::FrameError,
         crate::transport::LaunchError,
         crate::transport::SshEndpointError,
+        crate::vault::VaultError,
         a206_broker::BrokerError,
         a206_broker::ClientError,
         a206_extensions::ExtensionError,

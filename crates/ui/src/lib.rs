@@ -9,6 +9,8 @@ mod settings;
 use a206_core::Ignore;
 #[cfg(not(target_arch = "wasm32"))]
 mod setup;
+#[cfg(not(target_arch = "wasm32"))]
+mod vault;
 use a206_core::{
     Command, ErrorKind, ErrorReport, GatewayAction, GatewayPhase, GatewayReport, Mode, Reply,
     Settings, Snapshot,

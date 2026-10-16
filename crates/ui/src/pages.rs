@@ -209,9 +209,24 @@ pub fn Security() -> Element {
             Card { CardHeader { CardTitle { "Encrypted vault" } } CardBody { p { "SecureStore-compatible encrypted storage with explicit locking, redacted secret types and atomic private writes." } } }
             Card { CardHeader { CardTitle { "Verified SSH" } } CardBody { p { "Remote connections use your OpenSSH configuration and verified host keys. Gateway setup shows an unknown host's fingerprint and trusts it only after you confirm it." } } }
         }
+        VaultControls {}
         GatewayControls {}
-        Alert { title: rsx! { "Security implementation status" }, "Provider API keys are used only inside the separate vault broker, for the exact origins you bind them to. Unlock, two-factor enrollment and credential management currently run from `agent206 vault`; the desktop controls and agent approval flow are not built yet, so agents still cannot use credentials and privileged extension imports remain unavailable." }
+        Alert { title: rsx! { "Security implementation status" }, "Provider API keys are used only inside the separate vault broker, for the exact origins you bind them to. Adding and changing credentials and their policies, and removing two-factor authentication, still run from `agent206 vault`. The agent approval flow is not built yet, so agents still cannot use credentials and privileged extension imports remain unavailable." }
     } }
+}
+/// Vault setup talks to this computer's broker, so only native clients have it.
+#[component]
+fn VaultControls() -> Element {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        rsx! { crate::vault::VaultSection {} }
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        rsx! { Card { variant: CardVariant::Subtle, CardHeader { CardTitle { "Vault" } }
+            CardBody { p { "Unlock the vault and enroll two-factor authentication from the desktop or terminal app, or with `agent206 vault` on the gateway host. The browser never handles the vault password." } }
+        } }
+    }
 }
 #[component]
 pub fn Joshua() -> Element {
@@ -273,8 +288,8 @@ pub fn Gateway() -> Element {
             }
         }
         Card { variant: CardVariant::Subtle, CardHeader { CardTitle { "Security setup" } }
-            CardBody { p { "The separate vault broker holds API keys and performs authenticated provider requests, so the gateway never sees them. Set it up with `agent206 vault init`, `vault add` and `vault unlock`; desktop enrollment controls are not built yet, and a running gateway is not proof that the vault is set up." } }
-            CardFooter { LinkButton { href: Route::Security {}.to_string(), variant: ButtonVariant::Secondary, "Review security requirements" } }
+            CardBody { p { "The separate vault broker holds API keys and performs authenticated provider requests, so the gateway never sees them. Create, unlock and pair it, and enroll two-factor authentication, from the Security page of the desktop or terminal app or with `agent206 vault`; add credentials with `agent206 vault add`. A running gateway is not proof that the vault is set up." } }
+            CardFooter { LinkButton { href: Route::Security {}.to_string(), variant: ButtonVariant::Secondary, "Open vault and security" } }
         }
         Alert { title: rsx! { "Shared service" }, "Stop and restart interrupt work for every connected client. Owned agent runs, downloads and the local Joshua child are cleaned up before stop is acknowledged. Start is always an explicit action after a stop; reconnect only attaches to an existing gateway." }
     } }
