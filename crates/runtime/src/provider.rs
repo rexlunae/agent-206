@@ -8,18 +8,7 @@ const MAX_MODELS: usize = 4096;
 const MAX_PAGES: usize = 64;
 const MAX_RESPONSE: usize = 4 * 1024 * 1024;
 
-/// A provider endpoint the gateway refuses to call.
-#[derive(Debug, thiserror::Error)]
-pub enum EndpointError {
-    #[error("provider endpoint is not a valid URL")]
-    Url(#[from] url::ParseError),
-    #[error("endpoint must not contain credentials, query or fragment")]
-    Shape,
-    #[error("use HTTPS or an SSH-forwarded loopback endpoint")]
-    Insecure,
-    #[error("API path escaped the configured endpoint")]
-    Escaped,
-}
+pub use a206_core::providers::EndpointError;
 /// A provider preset library that cannot be saved.
 #[derive(Debug, thiserror::Error)]
 pub enum PresetError {
@@ -149,21 +138,7 @@ pub fn client() -> Result<reqwest::Client> {
         .map_err(ProviderError::Client)
 }
 pub fn endpoint(config: &ProviderConfig, relative: &str) -> Result<Url, EndpointError> {
-    let url = Url::parse(&format!("{}/", config.base_url.trim_end_matches('/')))?;
-    check(
-        url.username().is_empty()
-            && url.password().is_none()
-            && url.query().is_none()
-            && url.fragment().is_none(),
-        EndpointError::Shape,
-    )?;
-    let local = url
-        .host_str()
-        .is_some_and(|h| matches!(h, "localhost" | "127.0.0.1" | "[::1]" | "::1"));
-    check(
-        url.scheme() == "https" || (url.scheme() == "http" && local),
-        EndpointError::Insecure,
-    )?;
+    let url = a206_core::providers::base_url(&config.base_url)?;
     let result = url.join(relative)?;
     check(
         result.origin() == url.origin() && result.path().starts_with(url.path()),

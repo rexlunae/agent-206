@@ -130,7 +130,7 @@ impl Classified for a206_broker::BrokerError {
             | B::StepUpRequired
             | B::Forbidden
             | B::Denied(_) => ErrorKind::PermissionDenied,
-            B::NoPendingEnrollment | B::AlreadyExists => ErrorKind::Conflict,
+            B::NoPendingEnrollment | B::AlreadyExists | B::VaultExists => ErrorKind::Conflict,
             B::NotFound => ErrorKind::NotFound,
             B::Invalid(_) => ErrorKind::InvalidRequest,
             B::Vault(_) => ErrorKind::Storage,

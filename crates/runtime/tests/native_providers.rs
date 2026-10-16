@@ -1200,15 +1200,12 @@ async fn an_older_broker_is_used_without_streaming() {
     assert_eq!(next_delta(&mut deltas).await, text);
     assert_eq!(usage.input_tokens, Some(input));
     let seen = older.await.unwrap();
-    // The newest greeting is refused, the older one accepted; no stream request.
-    let (newest, oldest) = (a206_broker::BROKER_VERSION, a206_broker::MIN_BROKER_VERSION);
-    assert_eq!(
-        seen,
-        [
-            format!("hello {newest}"),
-            format!("hello {oldest}"),
-            "pair".into(),
-            "provider".into()
-        ]
-    );
+    // Each newer greeting is refused down to the oldest, which is accepted;
+    // no stream request follows.
+    let mut expected: Vec<String> = (a206_broker::MIN_BROKER_VERSION..=a206_broker::BROKER_VERSION)
+        .rev()
+        .map(|version| format!("hello {version}"))
+        .collect();
+    expected.extend(["pair".into(), "provider".into()]);
+    assert_eq!(seen, expected);
 }
