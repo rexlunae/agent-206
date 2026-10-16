@@ -15,6 +15,8 @@ use std::{
     sync::{Arc, Mutex, MutexGuard},
 };
 use tokio::io::AsyncWriteExt;
+mod run;
+pub use run::{RunError, ToolError};
 /// Streamed reply text that is not final yet. It is published as the
 /// thread's assistant message at most every [`PartialReply::INTERVAL`], so a
 /// fast stream does not rewrite the journal for every delta, and the newest
@@ -64,6 +66,7 @@ impl PartialReply {
                 attachments: vec![],
                 at: now(),
                 backend: thread.backend,
+                tool_calls: vec![],
             });
         }
     }
@@ -74,8 +77,9 @@ impl PartialReply {
         self.published = Some(tokio::time::Instant::now());
         Ok(())
     }
-    /// Replace streamed text with the final reply, which always gets a message.
-    fn finish(mut self, thread: &mut Thread, text: String) {
+    /// Replace streamed text with the final reply, which always gets a
+    /// message; returns that message's ID.
+    fn finish(mut self, thread: &mut Thread, text: String) -> Id {
         self.text = text;
         let id = *self.message.get_or_insert_with(Id::new_v4);
         if !thread.messages.iter().any(|m| m.id == id) {
@@ -86,9 +90,11 @@ impl PartialReply {
                 attachments: vec![],
                 at: now(),
                 backend: thread.backend,
+                tool_calls: vec![],
             });
         }
         self.apply(thread);
+        id
     }
 }
 /// Why a gateway command failed. Validation reasons are static so clients can
@@ -137,6 +143,8 @@ pub enum GatewayError {
     Extension(#[from] crate::extension_host::ExtensionError),
     #[error(transparent)]
     Frame(#[from] transport::FrameError),
+    #[error(transparent)]
+    Run(#[from] run::RunError),
     #[error("state could not be encoded")]
     Encode(#[from] rmp_serde::encode::Error),
     #[error("settings could not be encoded")]
@@ -207,6 +215,7 @@ impl crate::error::Classified for GatewayError {
             Self::Download(error) => return classify(error),
             Self::Extension(error) => return classify(error),
             Self::Frame(error) => return classify(error),
+            Self::Run(error) => return classify(error),
             // The cause's own kind (missing, denied, invalid data) is the useful one.
             Self::Receipt(_)
             | Self::Workspace(_)
@@ -289,6 +298,9 @@ pub struct Gateway {
     /// Last automatic catalog attempt per provider, reset by a new pairing.
     refreshed: Arc<Mutex<BTreeMap<Id, u64>>>,
     paired: Arc<tokio::sync::Notify>,
+    tool_hosts: Arc<Vec<Arc<dyn crate::tools::ToolHost>>>,
+    /// Runs waiting for the user, by approval ID. Only `ResolveApproval` answers them.
+    approvals: Arc<Mutex<BTreeMap<Id, run::Waiter>>>,
 }
 /// The broker pairing this gateway holds, with the connection that anchors it.
 struct Paired {
@@ -315,6 +327,8 @@ impl Gateway {
             pair_requests: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             refreshed: Arc::new(Mutex::new(BTreeMap::new())),
             paired: Arc::new(tokio::sync::Notify::new()),
+            tool_hosts: Arc::new(vec![]),
+            approvals: Arc::new(Mutex::new(BTreeMap::new())),
         })
     }
     fn pairing(&self) -> Result<Option<BrokerPairing>> {
@@ -451,6 +465,7 @@ impl Gateway {
                 // never persisted in the request journal.
                 | Command::OpenPanel { .. }
                 | Command::CallTool { .. }
+                | Command::ListTools { .. }
                 // Never journal a pairing: request bodies are persisted.
                 | Command::PairBroker { .. }
         );
@@ -732,7 +747,7 @@ impl Gateway {
                 let mut store = self.lock()?;
                 store.state.threads.push(thread.clone());
                 store.persist(Some(EventKind::ThreadChanged { id: thread.id }))?;
-                Ok(Reply::Thread(thread))
+                Ok(Reply::Thread(Box::new(thread)))
             }
             Command::SetSubagentModel { id, model, allowed } => {
                 let mut store = self.lock()?;
@@ -808,7 +823,7 @@ impl Gateway {
                     .collect();
                 let thread = thread.clone();
                 store.persist(Some(EventKind::ThreadChanged { id }))?;
-                Ok(Reply::Thread(thread))
+                Ok(Reply::Thread(Box::new(thread)))
             }
             Command::SetEffort { thread: id, effort } => {
                 let mut store = self.lock()?;
@@ -984,6 +999,7 @@ impl Gateway {
                         attachments,
                         at: now(),
                         backend: thread.backend,
+                        tool_calls: vec![],
                     });
                     thread.state = RunState::Running;
                     thread.backend_activity = None;
@@ -996,36 +1012,50 @@ impl Gateway {
                     store.persist(Some(EventKind::ThreadChanged { id }))?;
                     (config, copy, prompt, info, backend, workspace, root)
                 };
+                let Some(backend) = backend else {
+                    let ended = self
+                        .native_run(&run::Native {
+                            thread: id,
+                            config,
+                            info,
+                            prompt,
+                            root,
+                            cancel: token.clone(),
+                        })
+                        .await;
+                    self.running.lock().map_err(poisoned("run"))?.remove(&id);
+                    self.expire_approvals(id)?;
+                    let mut store = self.lock()?;
+                    let thread = store.thread_mut(id)?;
+                    run::settle_unfinished(thread);
+                    match ended {
+                        run::Ended::Complete(usage) => {
+                            thread.usage = Some(usage);
+                            thread.state = RunState::Complete;
+                        }
+                        run::Ended::Failed(error) => fail_run(thread, id, &error),
+                        run::Ended::Cancelled => thread.state = RunState::Cancelled,
+                    }
+                    let thread = thread.clone();
+                    store.persist(Some(EventKind::ThreadChanged { id }))?;
+                    return Ok(Reply::Thread(Box::new(thread)));
+                };
                 let (sender, mut progress) = tokio::sync::mpsc::channel(32);
-                let pairing = self.pairing()?;
                 let operation = async {
-                    Ok::<_, GatewayError>(if let Some(backend) = &backend {
+                    Ok::<_, GatewayError>(
                         crate::backends::complete(crate::backends::Run {
                             config: &config,
                             thread: &thread,
                             prompt: &prompt,
                             info: &info,
-                            backend,
+                            backend: &backend,
                             workspace: workspace.as_deref(),
                             state_root: &root,
                             progress: sender,
                             cancel: token.clone(),
                         })
-                        .await?
-                    } else {
-                        provider::complete(
-                            &config,
-                            provider::Broker {
-                                root: &root,
-                                pairing: pairing.as_ref(),
-                            },
-                            &thread,
-                            &prompt,
-                            &info,
-                            &sender,
-                        )
-                        .await?
-                    })
+                        .await?,
+                    )
                 };
                 let mut operation = Box::pin(operation);
                 let mut progress_open = true;
@@ -1035,7 +1065,6 @@ impl Gateway {
                     let due = partial.due();
                     tokio::select! {
                         result = &mut operation => break (!token.is_cancelled()).then_some(result),
-                        _ = token.cancelled(), if backend.is_none() => break None,
                         _ = tokio::time::sleep_until(due.unwrap_or_else(tokio::time::Instant::now)), if due.is_some() => {
                             let mut store = self.lock()?;
                             partial.publish(&mut store, id)?;
@@ -1076,17 +1105,7 @@ impl Gateway {
                         // Partial text stays visible, followed by the failure;
                         // the run is Failed, never Complete.
                         partial.apply(thread);
-                        let report = crate::error::correlated("run", id, &e);
-                        thread.state = RunState::Failed;
-                        thread.messages.push(Message {
-                            id: Id::new_v4(),
-                            role: Role::System,
-                            attachments: vec![],
-                            text: report.detail(),
-                            at: now(),
-                            backend: thread.backend,
-                        });
-                        thread.error = Some(report);
+                        fail_run(thread, id, &e);
                     }
                     None => {
                         partial.apply(thread);
@@ -1095,8 +1114,21 @@ impl Gateway {
                 }
                 let thread = thread.clone();
                 store.persist(Some(EventKind::ThreadChanged { id }))?;
-                Ok(Reply::Thread(thread))
+                Ok(Reply::Thread(Box::new(thread)))
             }
+            Command::ListTools { thread } => self.list_tools(thread).await,
+            Command::SetToolPermission {
+                thread,
+                tool,
+                permission,
+            } => self.set_tool_permission(thread, tool, permission),
+            Command::SetToolBudget { thread, budget } => self.set_tool_budget(thread, budget),
+            Command::ResolveApproval {
+                thread,
+                approval,
+                digest,
+                decision,
+            } => self.resolve_approval(thread, approval, &digest, decision),
             Command::CancelRun { thread } => {
                 let running = self.running.lock().map_err(poisoned("run"))?;
                 let token = running
@@ -1158,7 +1190,7 @@ impl Gateway {
                 );
                 store.state.threads.push(thread.clone());
                 store.persist(Some(EventKind::ThreadChanged { id: thread.id }))?;
-                Ok(Reply::Thread(thread))
+                Ok(Reply::Thread(Box::new(thread)))
             }
             Command::Download {
                 url,
@@ -1585,6 +1617,18 @@ pub fn scoped_path(root: &Path, path: &str) -> Result<PathBuf> {
         GatewayError::Denied("document escapes the project"),
     )?;
     Ok(target)
+}
+/// Mark a run Failed with its structured report, shown after any partial text.
+fn fail_run(thread: &mut Thread, id: Id, error: &(dyn std::error::Error + 'static)) {
+    let report = crate::error::correlated("run", id, error);
+    thread.state = RunState::Failed;
+    thread.messages.push(Message::new(
+        Role::System,
+        report.detail(),
+        now(),
+        thread.backend,
+    ));
+    thread.error = Some(report);
 }
 fn validate_model(snapshot: &Snapshot, key: &ModelKey) -> Result<()> {
     check(

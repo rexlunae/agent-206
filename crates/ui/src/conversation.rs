@@ -243,10 +243,12 @@ fn Conversation(thread: Thread) -> Element {
                         author: rsx! { match message.role { Role::User => "You", Role::Assistant => message.backend.label(), Role::System => "System", Role::Tool => "Tool" } },
                         p { class: "a206-message-text", "{message.text}" }
                         for file in &message.attachments { Badge { Icon { name: IconName::File, size: IconSize::Sm } "{file.name} · {file.text.len()} B" } }
+                        for call in &message.tool_calls { crate::tools::ToolTrace { key: "{call.id}", call: call.clone() } }
                     }
                 }
             } }
             }
+            for request in &thread.approvals { crate::tools::PendingApproval { key: "{request.id}", thread: id, request: request.clone() } }
             if running { AgentStatus { state: Lifecycle::Running, label: rsx! { {thread.backend_activity.clone().unwrap_or_else(|| format!("{} is working…", thread.backend.label()))} } } }
             if let Some(report) = thread.error.clone().filter(|_| !running && thread.state == RunState::Failed) {
                 crate::error::ErrorNotice { report, title: "Run failed".to_string() }
@@ -367,6 +369,10 @@ fn Inspector(thread: Thread) -> Element {
         h3 { "Conversation details" }
         ThreadFacts { thread: thread.clone() }
         BackendControls { thread: thread.clone() }
+        if thread.backend == CodingBackend::Native {
+            Divider {}
+            crate::tools::ToolPermissions { thread: id }
+        }
         Divider {}
         h3 { "Subagent models" }
         p { class: "a206-muted", "Choose which models this conversation may delegate to." }

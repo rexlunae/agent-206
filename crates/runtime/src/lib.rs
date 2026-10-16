@@ -16,6 +16,8 @@ pub mod provider;
 pub mod service;
 pub mod sse;
 pub mod store;
+pub mod tool_calls;
+pub mod tools;
 pub mod transport;
 pub mod vault;
 pub mod web;

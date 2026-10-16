@@ -14,7 +14,8 @@ mod vault_cli;
 #[cfg(not(target_arch = "wasm32"))]
 mod native {
     use a206_core::{
-        BackendConfig, Capability, CodingBackend, Command, Mode, ProviderPreset, Reply,
+        ApprovalDecision, ApprovalRequest, BackendConfig, Capability, CodingBackend, Command, Mode,
+        ProviderPreset, Reply, ToolBudget, ToolPermission,
     };
     use clap::{Parser, Subcommand};
     use std::path::PathBuf;
@@ -121,6 +122,16 @@ mod native {
         Cancel {
             thread: uuid::Uuid,
         },
+        /// Inspect and set a conversation's tool permissions and budget.
+        Tools {
+            #[command(subcommand)]
+            command: ToolAction,
+        },
+        /// Answer tool calls waiting for approval.
+        Approvals {
+            #[command(subcommand)]
+            command: ApprovalAction,
+        },
         /// Export settings as TOML, or apply a reviewed TOML configuration.
         Settings {
             #[arg(long)]
@@ -175,6 +186,52 @@ mod native {
         Render {
             output: PathBuf,
         },
+    }
+    #[derive(Subcommand)]
+    enum ToolAction {
+        /// List the tools a conversation could use and how each is permitted.
+        List { thread: uuid::Uuid },
+        /// Set one tool to allow, ask or deny; `unset` returns it to deny.
+        Permit {
+            thread: uuid::Uuid,
+            tool: String,
+            permission: String,
+        },
+        /// Limit model rounds and tool calls per run.
+        Budget {
+            thread: uuid::Uuid,
+            #[arg(long)]
+            rounds: u32,
+            #[arg(long)]
+            tool_calls: u32,
+        },
+    }
+    #[derive(Subcommand)]
+    enum ApprovalAction {
+        /// Show the tool calls waiting for this conversation's user.
+        List { thread: uuid::Uuid },
+        /// Run one pending call; DIGEST must be the one `approvals list` showed.
+        Approve {
+            thread: uuid::Uuid,
+            approval: uuid::Uuid,
+            digest: String,
+        },
+        /// Refuse one pending call.
+        Deny {
+            thread: uuid::Uuid,
+            approval: uuid::Uuid,
+            digest: String,
+        },
+    }
+    fn permission(value: &str) -> anyhow::Result<Option<ToolPermission>> {
+        if value.eq_ignore_ascii_case("unset") {
+            return Ok(None);
+        }
+        ToolPermission::ALL
+            .into_iter()
+            .find(|p| p.label().eq_ignore_ascii_case(value))
+            .map(Some)
+            .ok_or_else(|| anyhow::anyhow!("permission must be allow, ask, deny or unset"))
     }
     #[derive(Subcommand)]
     enum GatewayAction {
@@ -647,6 +704,70 @@ mod native {
                         attachments: vec![],
                     },
                     Action::Cancel { thread } => Command::CancelRun { thread },
+                    Action::Tools { command } => match command {
+                        ToolAction::List { thread } => Command::ListTools { thread },
+                        ToolAction::Permit {
+                            thread,
+                            tool,
+                            permission: value,
+                        } => Command::SetToolPermission {
+                            thread,
+                            tool,
+                            permission: permission(&value)?,
+                        },
+                        ToolAction::Budget {
+                            thread,
+                            rounds,
+                            tool_calls,
+                        } => Command::SetToolBudget {
+                            thread,
+                            budget: ToolBudget { rounds, tool_calls },
+                        },
+                    },
+                    Action::Approvals { command } => match command {
+                        ApprovalAction::List { thread } => {
+                            let Reply::Snapshot(snapshot) = client.call(Command::Snapshot).await?
+                            else {
+                                anyhow::bail!("failed to read the conversation");
+                            };
+                            let thread = snapshot
+                                .threads
+                                .into_iter()
+                                .find(|t| t.id == thread)
+                                .ok_or_else(|| anyhow::anyhow!("conversation not found"))?;
+                            #[derive(serde::Serialize)]
+                            struct Pending {
+                                approvals: Vec<ApprovalRequest>,
+                            }
+                            print!(
+                                "{}",
+                                toml::to_string_pretty(&Pending {
+                                    approvals: thread.approvals
+                                })?
+                            );
+                            return Ok(());
+                        }
+                        ApprovalAction::Approve {
+                            thread,
+                            approval,
+                            digest,
+                        } => Command::ResolveApproval {
+                            thread,
+                            approval,
+                            digest,
+                            decision: ApprovalDecision::Approve,
+                        },
+                        ApprovalAction::Deny {
+                            thread,
+                            approval,
+                            digest,
+                        } => Command::ResolveApproval {
+                            thread,
+                            approval,
+                            digest,
+                            decision: ApprovalDecision::Deny,
+                        },
+                    },
                     Action::Settings { apply: Some(path) } => {
                         Command::SaveSettings(toml::from_str(&std::fs::read_to_string(path)?)?)
                     }

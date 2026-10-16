@@ -1,0 +1,220 @@
+//! Tool traces, pending approvals and per-tool permissions in a conversation.
+use crate::{State, dispatch, error::ErrorNotice};
+use a206_core::{
+    ApprovalDecision, ApprovalRequest, Command, ErrorKind, ErrorReport, Reply, ToolCall,
+    ToolCallState, ToolPermission,
+};
+use fc_dioxus::prelude::*;
+use uuid::Uuid;
+
+fn capability_list(capabilities: &std::collections::BTreeSet<a206_core::Capability>) -> String {
+    capabilities
+        .iter()
+        .map(|c| format!("{c:?}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+fn lifecycle(state: ToolCallState) -> Lifecycle {
+    match state {
+        ToolCallState::Requested => Lifecycle::Queued,
+        ToolCallState::AwaitingApproval => Lifecycle::Pending,
+        ToolCallState::Running => Lifecycle::Running,
+        ToolCallState::Succeeded => Lifecycle::Complete,
+        ToolCallState::Failed => Lifecycle::Error,
+        ToolCallState::Denied => Lifecycle::Denied,
+        ToolCallState::Cancelled | ToolCallState::Skipped => Lifecycle::Aborted,
+    }
+}
+
+/// One tool call: its arguments, then its result or why it did not run.
+#[component]
+pub(crate) fn ToolTrace(call: ToolCall) -> Element {
+    let state = lifecycle(call.state);
+    let failed = call.state.is_final() && call.state != ToolCallState::Succeeded;
+    rsx! {
+        ToolCall { name: call.tool.clone(), state,
+            progress: (call.state == ToolCallState::Running).then_some(ToolProgress::Indeterminate),
+            payload_label: rsx! { if call.healed { "Arguments (repaired)" } else { "Arguments" } },
+            payload: Clipped::chars(call.arguments.clone(), 240),
+            error: if failed { call.error.clone().map(|report| rsx! { ErrorNotice { report } }) } else { None },
+        }
+        if call.state == ToolCallState::Succeeded && let Some(output) = call.output.clone() {
+            Disclosure { summary: rsx! { "Result from {call.tool}" },
+                pre { class: "a206-tool-output", "{output}" }
+            }
+        }
+    }
+}
+
+/// A call waiting for the user. Only this trusted surface can answer it; the
+/// decision is bound to the digest of the arguments shown here.
+#[component]
+pub(crate) fn PendingApproval(thread: Uuid, request: ApprovalRequest) -> Element {
+    let state = use_context::<State>();
+    let mut deciding = use_signal(|| false);
+    let availability = if deciding() {
+        Availability::Disabled
+    } else {
+        Availability::Enabled
+    };
+    let (approval, digest) = (request.id, request.digest.clone());
+    let capabilities = capability_list(&request.capabilities);
+    let decide = move |decision| {
+        let digest = digest.clone();
+        move |_| {
+            let mut state = state;
+            let digest = digest.clone();
+            deciding.set(true);
+            spawn(async move {
+                let command = Command::ResolveApproval {
+                    thread,
+                    approval,
+                    digest,
+                    decision,
+                };
+                match crate::call(command).await {
+                    Ok(_) => state.error.set(None),
+                    // The request stays until the gateway removes it; let the
+                    // user try again after seeing why this answer failed.
+                    Err(report) => {
+                        deciding.set(false);
+                        state.error.set(Some(report));
+                    }
+                }
+            });
+        }
+    };
+    rsx! {
+        Approval { label: name!("Tool call waiting for approval"), region: true,
+            record: Record { state: Some(Lifecycle::Pending), ..Record::default() },
+            title: rsx! { "Allow {request.tool} to run once?" },
+            meta: rsx! { if capabilities.is_empty() { "Uses no granted capabilities." } else { "Uses: {capabilities}" } },
+            actions: rsx! {
+                Button { variant: ButtonVariant::Secondary, availability: availability.clone(), onclick: decide(ApprovalDecision::Deny), "Deny" }
+                Button { variant: ButtonVariant::Primary, availability, onclick: decide(ApprovalDecision::Approve), "Allow once" }
+            },
+            p { "The model asked to run this tool with exactly these arguments:" }
+            pre { class: "a206-tool-output", "{request.arguments}" }
+        }
+    }
+}
+
+/// The tools this conversation could use, with the user's Allow/Ask/Deny for each.
+#[component]
+pub(crate) fn ToolPermissions(thread: Uuid) -> Element {
+    let state = use_context::<State>();
+    // Reload when the conversation's permissions or grants change.
+    let revision = use_memo(move || {
+        state
+            .data
+            .read()
+            .threads
+            .iter()
+            .find(|t| t.id == thread)
+            .map(|t| (t.tool_permissions.clone(), t.grant.clone(), t.mode))
+    });
+    let listing = use_resource(move || async move {
+        // Reading subscribes this listing to the conversation's changes.
+        revision.read();
+        match crate::call(Command::ListTools { thread }).await {
+            Ok(Reply::Tools(list)) => Ok(list),
+            Ok(_) => Err(ErrorReport::new(
+                ErrorKind::Protocol,
+                "Unexpected tool listing response",
+            )),
+            Err(report) => Err(report),
+        }
+    });
+    let current = listing.read().clone();
+    rsx! {
+        h3 { "Tools" }
+        p { class: "a206-muted", "Unset tools are denied. Ask waits for your approval of each call." }
+        match current {
+            None => rsx! { AgentStatus { state: Lifecycle::Running, label: rsx! { "Loading tools…" } } },
+            Some(Err(report)) => rsx! { ErrorNotice { report, title: "Tools unavailable".to_string() } },
+            Some(Ok(list)) => rsx! {
+                if list.tools.is_empty() { p { class: "a206-number", "No tool sources are connected to this gateway." } }
+                for offer in list.tools {
+                    div { key: "{offer.name}", class: "a206-stack",
+                        div { class: "a206-row a206-between",
+                            strong { "{offer.name}" }
+                            Badge { tone: match offer.effective { ToolPermission::Allow => BadgeTone::Success, ToolPermission::Ask => BadgeTone::Warning, ToolPermission::Deny => BadgeTone::Neutral }, "{offer.effective.label()}" }
+                        }
+                        if !offer.description.is_empty() { p { class: "a206-muted", "{offer.description}" } }
+                        if !offer.missing.is_empty() { p { class: "a206-muted", "Needs a grant for: {capability_list(&offer.missing)}" } }
+                        NativeSelect { size: InputSize::Sm, aria_label: "Permission for {offer.name}",
+                            value: offer.permission.map(|p| p.label().to_owned()).unwrap_or_default(),
+                            onchange: move |value: String| {
+                                let permission = ToolPermission::ALL.into_iter().find(|p| p.label() == value);
+                                dispatch(state, Command::SetToolPermission { thread, tool: offer.name.clone(), permission });
+                            },
+                            option { value: "", selected: offer.permission.is_none(), "Not set (deny)" }
+                            for permission in ToolPermission::ALL {
+                                option { value: "{permission.label()}", selected: offer.permission == Some(permission), "{permission.label()}" }
+                            }
+                        }
+                    }
+                }
+                for unavailable in list.unavailable {
+                    ErrorNotice { report: unavailable.error, title: format!("{} could not list its tools", unavailable.source) }
+                }
+            },
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn render(call: ToolCall) -> String {
+        fn root(call: ToolCall) -> Element {
+            rsx! { ToolTrace { call } }
+        }
+        let mut dom = VirtualDom::new_with_props(root, call);
+        dom.rebuild_in_place();
+        dioxus_ssr::render(&dom)
+    }
+    fn call(state: ToolCallState) -> ToolCall {
+        let id = Uuid::new_v4().simple().to_string();
+        ToolCall {
+            id: id.clone(),
+            generated_id: false,
+            tool: Uuid::new_v4().simple().to_string(),
+            arguments: format!("{{\"value\":\"{id}\"}}"),
+            digest: Uuid::new_v4().to_string(),
+            healed: false,
+            state,
+            output: None,
+            error: None,
+            signature: None,
+        }
+    }
+    #[test]
+    fn a_trace_shows_the_tool_its_arguments_and_its_result() {
+        let mut done = call(ToolCallState::Succeeded);
+        let output = Uuid::new_v4().to_string();
+        done.output = Some(output.clone());
+        let html = render(done.clone());
+        assert!(
+            html.contains(&done.tool) && html.contains(&done.id),
+            "{html}"
+        );
+        assert!(html.contains(&output), "{html}");
+        assert!(html.contains(Lifecycle::Complete.as_str()), "{html}");
+    }
+    #[test]
+    fn a_refused_call_shows_its_structured_reason_not_its_output() {
+        let mut denied = call(ToolCallState::Denied);
+        let reason = Uuid::new_v4().to_string();
+        denied.error = Some(ErrorReport::new(
+            ErrorKind::PermissionDenied,
+            reason.clone(),
+        ));
+        denied.output = Some(reason.clone());
+        let html = render(denied);
+        assert!(html.contains(Lifecycle::Denied.as_str()), "{html}");
+        assert!(html.contains(ErrorKind::PermissionDenied.label()), "{html}");
+        assert!(html.contains(&reason), "{html}");
+        assert!(!html.contains("Result from"), "{html}");
+    }
+}
