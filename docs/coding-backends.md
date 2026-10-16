@@ -1,7 +1,7 @@
 # Provider connections and coding backends
 
 Agent 206 ships provider setup presets, not preauthorized accounts or model lists.
-Open Connections for grouped global, Chinese and local provider presets, including
+Open Connections for hosted, local and custom provider presets, including
 DeepSeek, Moonshot/Kimi, Alibaba Cloud Model Studio, Z.ai, MiniMax, SiliconFlow,
 StepFun, Tencent Hunyuan, Volcengine/Doubao and Baidu Qianfan. Review the protocol and base URL before saving. Refresh models to
 fetch the API catalog. Prices, limits, effort choices and balances appear only when

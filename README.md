@@ -81,7 +81,7 @@ sessions are not implemented.
   conversations, new branding and future-css theme selection.
 - Persisted conversations and projects, editable mode prompts, API-only model
   discovery, explicit per-thread subagent model allowlists and delegated threads.
-- A configurable, grouped provider library covering global, Chinese and local
+- A configurable, grouped provider library covering hosted and local
   services; TOML additions/overrides and shared GUI editing; native Anthropic/Gemini
   and compatible text chat,
   bounded model pagination, cancellation, reported token usage/cost when present,

@@ -111,8 +111,8 @@ catalog fixtures. Test APIs generate their identifiers and limits at runtime.
 
 ## Provider presets and optional coding backends
 
-The shared Connections page and CLI ship a broad provider library spanning global,
-Chinese and local services, including DeepSeek, Moonshot, Alibaba Cloud, Z.ai,
+The shared Connections page and CLI ship a broad provider library spanning hosted
+and local services, including DeepSeek, Moonshot, Alibaba Cloud, Z.ai,
 MiniMax, SiliconFlow, StepFun, Hunyuan, Volcengine and Qianfan. Names, protocols, endpoint
 defaults and setup instructions ship with the app; no accounts are activated and
 no models selected implicitly. TOML `provider_presets` stores user additions and

@@ -36,7 +36,8 @@ attribution. Prefer a small replacement over carrying historical architecture.
 - Bundle well-known provider connectors and setup presets: provider identity,
   protocol, official endpoint defaults and authentication instructions are allowed.
   Presets do not enable an account or grant access without user configuration.
-  Maintain broad global, Chinese and local coverage. Users can extend, override,
+  Maintain broad hosted and local provider coverage. Group services by how they
+  connect, not by nationality or geography. Users can extend, override,
   group and hide presets through TOML and shared GUI controls; preserve those
   choices across upgrades without changing existing accounts.
 - **No hardcoded model names/catalogs, limits, capabilities, prices or balances,
