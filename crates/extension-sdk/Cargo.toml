@@ -1,0 +1,22 @@
+[package]
+name = "a206-extension-sdk"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Guest-side SDK for Agent 206 WASM extensions (ABI v2)."
+[dependencies]
+a206-extension-abi.workspace = true
+serde.workspace = true
+rmp-serde.workspace = true
+serde_bytes = "0.11"
+# The SDK is the guest's FFI edge: its exports need `#[unsafe(no_mangle)]` and
+# its imports an `unsafe extern` block. Both are confined to `ffi` and the
+# `export!` macro; no unsafe operation is performed. Everything else in the
+# workspace keeps `unsafe_code = "forbid"`.
+[lints.rust]
+unsafe_code = "deny"
+[lints.clippy]
+dbg_macro = "deny"
+todo = "deny"
+let_underscore_must_use = "deny"

@@ -5,6 +5,7 @@ use std::collections::BTreeSet;
 use uuid::Uuid;
 
 pub mod error;
+pub mod extension;
 pub mod ignore;
 pub use error::{ErrorKind, ErrorReport};
 pub use ignore::Ignore;
@@ -26,6 +27,24 @@ pub enum Capability {
     UseSecret,
     SpawnAgent,
     ReadHarness,
+}
+impl Capability {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ReadWorkspace => "Read project files",
+            Self::WriteWorkspace => "Edit project files",
+            Self::Execute => "Run project commands",
+            Self::Network => "Use the network",
+            Self::GitRead => "Read git history",
+            Self::GitWrite => "Change git history",
+            Self::ReviewPullRequests => "Review pull requests",
+            Self::Download => "Download files",
+            Self::Browser => "Use the browser",
+            Self::UseSecret => "Use vault credentials",
+            Self::SpawnAgent => "Start subagents",
+            Self::ReadHarness => "Read harness state",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -380,8 +399,18 @@ pub struct PluginSummary {
     pub id: String,
     pub name: String,
     pub description: String,
+    /// Capabilities the manifest requests. Requesting grants nothing.
     pub capabilities: BTreeSet<Capability>,
     pub enabled: bool,
+    #[serde(default)]
+    pub version: String,
+    /// Capabilities the user granted; always a subset of `capabilities`.
+    #[serde(default)]
+    pub granted: BTreeSet<Capability>,
+    #[serde(default)]
+    pub tools: Vec<extension::ToolSpec>,
+    #[serde(default)]
+    pub panels: Vec<extension::PanelSpec>,
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Snapshot {
@@ -434,6 +463,7 @@ pub enum EventKind {
     SettingsChanged,
     BackendActivity { thread: Id, title: String },
     ProjectChanged { id: Id },
+    ExtensionChanged { id: String },
 }
 
 /// A capability the vault broker issues to the gateway for one unlock, so the
@@ -540,9 +570,30 @@ pub enum Command {
         project: Id,
         path: String,
     },
-    RunExtension {
-        id: String,
-        input: String,
+    /// Render an extension panel, optionally after a press on one of its
+    /// elements. Workspace capabilities need `project`.
+    OpenPanel {
+        extension: String,
+        panel: String,
+        project: Option<Id>,
+        event: Option<extension::UiEvent>,
+    },
+    /// Run an extension tool as the user, within the extension's grant.
+    CallTool {
+        extension: String,
+        tool: String,
+        args: extension::Args,
+        project: Option<Id>,
+    },
+    /// Replace the capabilities the user grants an extension. Only
+    /// capabilities its manifest requests can be granted.
+    GrantExtension {
+        extension: String,
+        capabilities: BTreeSet<Capability>,
+    },
+    EnableExtension {
+        extension: String,
+        enabled: bool,
     },
     Shutdown,
     GatewayStatus,
@@ -576,7 +627,10 @@ impl Command {
             Self::CancelDownload { .. } => "cancel_download",
             Self::GitStatus { .. } => "git_status",
             Self::ReadDocument { .. } => "read_document",
-            Self::RunExtension { .. } => "run_extension",
+            Self::OpenPanel { .. } => "open_panel",
+            Self::CallTool { .. } => "call_tool",
+            Self::GrantExtension { .. } => "grant_extension",
+            Self::EnableExtension { .. } => "enable_extension",
             Self::Shutdown => "shutdown",
             Self::GatewayStatus => "gateway_status",
             Self::PairBroker { .. } => "pair_broker",
@@ -592,6 +646,7 @@ pub enum Reply {
     Events(Vec<Event>),
     Download(Download),
     Text(String),
+    Panel(extension::View),
     Ok,
     /// Wire-compatible with the earlier `Error { message }` variant.
     Error(ErrorReport),

@@ -4,7 +4,8 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use uuid::Uuid;
 pub const VERSION: u16 = 1;
 pub const MAX_FRAME: usize = 4 * 1024 * 1024;
-const HEADER: usize = 10;
+/// Bytes before each payload: magic, version and payload length.
+pub const HEADER: usize = 10;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Request<T> {

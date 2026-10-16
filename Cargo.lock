@@ -31,6 +31,7 @@ dependencies = [
 name = "a206-core"
 version = "0.1.0"
 dependencies = [
+ "a206-extension-abi",
  "rmp-serde",
  "serde",
  "thiserror 2.0.21",
@@ -40,17 +41,38 @@ dependencies = [
 ]
 
 [[package]]
+name = "a206-extension-abi"
+version = "0.1.0"
+dependencies = [
+ "rmp-serde",
+ "serde",
+ "serde_bytes",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "a206-extension-sdk"
+version = "0.1.0"
+dependencies = [
+ "a206-extension-abi",
+ "rmp-serde",
+ "serde",
+ "serde_bytes",
+]
+
+[[package]]
 name = "a206-extensions"
 version = "0.1.0"
 dependencies = [
  "a206-core",
+ "a206-extension-abi",
  "a206-protocol",
  "rmp-serde",
  "serde",
+ "serde_bytes",
  "thiserror 2.0.21",
  "toml 0.9.12+spec-1.1.0",
  "wasmi",
- "wat",
 ]
 
 [[package]]
@@ -66,6 +88,13 @@ dependencies = [
  "toml 0.9.12+spec-1.1.0",
  "url",
  "uuid",
+]
+
+[[package]]
+name = "a206-plugin-workspace"
+version = "0.1.0"
+dependencies = [
+ "a206-extension-sdk",
 ]
 
 [[package]]
@@ -8809,7 +8838,6 @@ checksum = "974d643b125b272607e2fff8012ea14a8328acd7621e4bafa7afb32500052b1b"
 dependencies = [
  "bitflags 2.13.2",
  "indexmap 2.14.2",
- "semver",
 ]
 
 [[package]]
