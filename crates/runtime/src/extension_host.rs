@@ -396,19 +396,20 @@ impl HostCalls {
         }
     }
     async fn execute(&mut self, request: HostRequest) -> Result<HostReply, HostFailure> {
-        if let Some(capability) = a206_extensions::required_capability(&request) {
-            // The grant is read again for every call, so revoking or
-            // disabling takes effect inside an invocation already running.
-            let live =
-                self.lock()?.state.plugins.iter().any(|p| {
-                    p.id == self.extension && p.enabled && p.granted.contains(&capability)
-                });
-            if !live || !self.effective.contains(&capability) {
-                return Err(failure(
-                    HostErrorCode::Denied,
-                    &format!("this call is not granted \"{}\"", capability.label()),
-                ));
-            }
+        // The stored plugin is read again for every call, so disabling or
+        // revoking takes effect inside an invocation already running.
+        let required = a206_extensions::required_capability(&request);
+        let allowed = self.lock()?.state.plugins.iter().any(|p| {
+            p.id == self.extension
+                && p.enabled
+                && required.is_none_or(|c| p.granted.contains(&c) && self.effective.contains(&c))
+        });
+        if !allowed {
+            let message = match required {
+                Some(capability) => format!("this call is not granted \"{}\"", capability.label()),
+                None => "this extension is not enabled".into(),
+            };
+            return Err(failure(HostErrorCode::Denied, &message));
         }
         match request {
             HostRequest::ReadFile { path } => {

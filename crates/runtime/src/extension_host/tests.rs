@@ -7,18 +7,17 @@ fn store() -> (tempfile::TempDir, Arc<Mutex<Store>>) {
     let store = Store::open(&dir.path().join("data")).unwrap();
     (dir, Arc::new(Mutex::new(store)))
 }
-/// Host calls for a fresh extension id that the store does not know.
+/// Host calls for a freshly installed, enabled extension with no grants.
 fn host_calls(
     store: &Arc<Mutex<Store>>,
     workspace: Option<PathBuf>,
     effective: &[Capability],
 ) -> HostCalls {
-    calls_for(
-        &uuid::Uuid::new_v4().to_string(),
-        store,
-        workspace,
-        effective,
-    )
+    let id = uuid::Uuid::new_v4().to_string();
+    let mut plugin = workspace_extension().summary(true, &BTreeSet::new());
+    plugin.id = id.clone();
+    store.lock().unwrap().state.plugins.push(plugin);
+    calls_for(&id, store, workspace, effective)
 }
 /// Host calls for the bundled workspace extension, with the same grant
 /// stored for it as the invocation's effective set.
@@ -173,6 +172,9 @@ async fn revoking_stops_calls_already_running() {
         code(host.handle(read("note.txt")).await),
         Some(HostErrorCode::Denied)
     );
+    // Disabling also stops calls that need no capability.
+    let state = HostRequest::StateGet { key: "k".into() };
+    assert_eq!(code(host.handle(state).await), Some(HostErrorCode::Denied));
     // A grant stored for an id is not authority for an invocation that was
     // never given it.
     store

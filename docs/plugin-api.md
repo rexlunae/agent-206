@@ -63,8 +63,9 @@ panel declares. The effective grant is the intersection of:
 3. what the tool or panel declares.
 
 The gateway then checks each relayed host call against that set again, and
-against the stored grant at the moment of the call, so revoking or disabling
-stops an invocation that is already running. A grant
+against the stored grant at the moment of the call. Revoking stops an
+invocation already running, and disabling refuses every host call, state and
+logs included. A grant
 is always a subset of what the current manifest requests, so an updated
 extension never inherits a newly requested capability. Disabling an extension
 stops all of its calls. Agents cannot grant, enable or approve anything.
