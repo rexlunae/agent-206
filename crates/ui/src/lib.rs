@@ -2,6 +2,8 @@
 #![forbid(unsafe_code)]
 mod conversation;
 mod error;
+#[cfg(not(target_arch = "wasm32"))]
+mod health;
 mod mcp;
 mod pages;
 mod route;

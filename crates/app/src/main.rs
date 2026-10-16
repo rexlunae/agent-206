@@ -3,6 +3,10 @@
 fn main() {
     dioxus::launch(a206_ui::App);
 }
+#[cfg(not(target_arch = "wasm32"))]
+mod doctor_cli;
+#[cfg(all(unix, not(target_arch = "wasm32")))]
+mod setup_cli;
 #[cfg(all(unix, not(target_arch = "wasm32")))]
 mod vault_cli;
 #[cfg(not(target_arch = "wasm32"))]
@@ -71,6 +75,36 @@ mod native {
             no_start: bool,
             #[arg(long, hide = true)]
             start: bool,
+        },
+        /// Walk through first-run setup: the gateway, then this computer's
+        /// vault, two-factor enrollment and gateway pairing. Rerun to resume.
+        #[cfg(unix)]
+        Setup {
+            /// Use a gateway on this computer.
+            #[arg(long, conflicts_with = "ssh")]
+            local: bool,
+            /// Use an installed agent206 reached by OpenSSH: ssh://[user@]host[:port].
+            #[arg(long)]
+            ssh: Option<String>,
+            /// Trust this SSH host key fingerprint after verifying it out of band.
+            #[arg(long, requires = "ssh")]
+            trust: Vec<String>,
+            /// Do not offer authenticator enrollment.
+            #[arg(long)]
+            skip_totp: bool,
+        },
+        /// Check the profile, gateway, vault broker and provider accounts
+        /// without starting or changing anything.
+        Doctor {
+            /// Print the report as TOML.
+            #[arg(long)]
+            toml: bool,
+        },
+        /// Preview, then apply with --apply, a reviewed import from another tool.
+        #[cfg(unix)]
+        Import {
+            #[command(subcommand)]
+            source: crate::setup_cli::ImportSource,
         },
         /// Show gateway and workspace status without starting a service.
         Status,
@@ -379,6 +413,32 @@ mod native {
                 } = &action
                 {
                     return setup(&root, *local, ssh.clone(), trust).await;
+                }
+                if let Action::Doctor { toml } = action {
+                    return crate::doctor_cli::run(&root, args.remote.clone(), toml).await;
+                }
+                #[cfg(unix)]
+                if let Action::Setup {
+                    local,
+                    ssh,
+                    trust,
+                    skip_totp,
+                } = action
+                {
+                    if local || ssh.is_some() {
+                        setup(&root, local, ssh, &trust).await?;
+                    }
+                    crate::setup_cli::secure(&root, skip_totp).await?;
+                    // Setup succeeded; the report shows what is still open
+                    // (such as provider accounts) without failing setup.
+                    println!();
+                    println!("Health checks:");
+                    crate::doctor_cli::print(&crate::doctor_cli::report(&root, None).await?);
+                    return Ok(());
+                }
+                #[cfg(unix)]
+                if let Action::Import { source } = action {
+                    return crate::setup_cli::import(&root, args.remote.clone(), source).await;
                 }
                 if matches!(action, Action::Status | Action::StopGateway) {
                     use a206_core::{GatewayAction as Control, GatewayPhase};

@@ -3,8 +3,9 @@ Copyright (c) 2026 Erica Stith
 
 Portions of the SSH transport design, atomic SecureStore persistence, vault
 credential layout, access policies, TOTP handling, authentication limits, the
-`Ignore` result-discard convention and the MCP client's configuration, connection
-and tool-result model are adapted from RustyClaw,
+`Ignore` result-discard convention, the MCP client's configuration, connection
+and tool-result model, and the provider identifiers and credential names the
+RustyClaw import adapter maps, are adapted from RustyClaw,
 https://github.com/rexlunae/RustyClaw,
 Copyright (c) 2026 Erica Stith, MIT License (included in LICENSE).
 

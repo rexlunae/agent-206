@@ -18,3 +18,8 @@ pub use server::serve;
 pub fn socket_path(root: &std::path::Path) -> std::path::PathBuf {
     root.join("vault").join("broker.sock")
 }
+
+/// The encrypted vault file the broker serves for a profile.
+pub fn vault_path(root: &std::path::Path) -> std::path::PathBuf {
+    root.join("vault").join("secrets.json")
+}

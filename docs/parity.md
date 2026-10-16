@@ -142,10 +142,10 @@ one tool, `rename_thread` (`a206/crates/runtime/src/mcp.rs`); the `Command` enum
 
 | RustyClaw command | Agent 206 status (`a206/crates/app/src/main.rs` Action) | Notes |
 | --- | --- | --- |
-| `setup`, `onboard`, `configure` | missing | Same enrollment state machine as GUI (`docs/cli.md`) |
-| `import` (OpenClaw), `refresh-token` | missing | Adapters per `docs/imports.md` |
+| `setup`, `onboard`, `configure` | partial: `setup [--local\|--ssh]` resumes gateway, vault, TOTP and pairing on the shared flows, then runs doctor (`a206/crates/app/src/setup_cli.rs`); no `onboard`/`configure` aliases (their provider-key flags do not match) | Desktop/TUI wizard on the same steps; provider step |
+| `import` (OpenClaw), `refresh-token` | partial: `import rustyclaw [PATH] [--apply]` with preview, broker-only vault copy and receipts (`a206/crates/import`); OpenClaw and `refresh-token` missing | More adapters per `docs/imports.md`; OAuth import through the broker |
 | `config get/set/unset` | partial: `settings [--apply FILE]` TOML | Field-level commands |
-| `doctor [--repair]` | missing | Read-only by default |
+| `doctor [--repair]` | partial: read-only `doctor [--toml]` over profile, gateway, broker, pairing and providers (`a206/crates/runtime/src/doctor.rs`), also on the desktop/TUI Gateway page; no `--repair` | Explicit, reviewed repairs |
 | `tui`, `desktop` | present | TUI interaction QA pending |
 | `command`, `ask` | partial: `new`, `chat THREAD TEXT`, `cancel` | Streaming, stdin/file prompts |
 | `status`, `gateway start/stop/restart/status/reload/run` | present (no `reload`; adds `reconnect`, `--stdio`) | — |
@@ -157,7 +157,7 @@ one tool, `rename_thread` (`a206/crates/runtime/src/mcp.rs`); the `Command` enum
 
 | RustyClaw capability | Agent 206 status | How it should land |
 | --- | --- | --- |
-| Onboard wizard: provider, key, vault, workspace, messaging, skills (`rustyclaw-onboard/src/*`) | missing | GUI-first wizard; CLI uses same API |
+| Onboard wizard: provider, key, vault, workspace, messaging, skills (`rustyclaw-onboard/src/*`) | partial: CLI `setup` walkthrough (gateway, vault, TOTP, pairing); the desktop/TUI have the gateway setup screen and Security page but no single wizard | GUI-first wizard; CLI uses same API |
 | First-run "hatching" SOUL personality (desktop `components/hatching.rs`) | missing | Optional mode-prompt step |
 | Panels: secrets, vault unlock, credential request, approvals, cron, memory, MCP (on the extensions page), channels, messengers, skills, services, engines, logs, analytics, system info, swarm, tool perms (desktop `components/*`, TUI `components/*_dialog.rs`) | partial: workspace, conversations, projects, connections, downloads, extensions, browser, documents, appearance, modes, security (vault create/unlock/lock, gateway pairing and TOTP enrollment for local profiles; `ui/src/vault.rs`), Joshua, gateway (`ui/src/route.rs`); secrets, credential request and approvals panels are not built | Each lands as routes when backing feature exists; no placeholder controls |
 | TUI slash commands + tab completion (`rustyclaw-tui/src/components/command_menu.rs`) | partial: shared Dioxus TUI renders, untested interaction | Command palette in shared fc-dioxus |

@@ -638,6 +638,10 @@ pub struct GatewayInfo {
     pub active_downloads: usize,
     #[serde(default)]
     pub accepting_work: Option<bool>,
+    /// Whether the gateway holds a vault pairing. It is void once the vault
+    /// locks, which only the broker knows; `None` from older gateways.
+    #[serde(default)]
+    pub vault_paired: Option<bool>,
 }
 
 /// User control operations live outside the agent command/tool surface.
