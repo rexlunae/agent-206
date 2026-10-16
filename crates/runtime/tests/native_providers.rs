@@ -854,6 +854,47 @@ async fn malformed_failed_and_truncated_streams_are_typed_errors() {
     }
 }
 #[tokio::test]
+async fn openai_needs_a_finish_reason_and_done_and_text_survives_a_bad_read() {
+    use provider::ProviderError as P;
+    let api = ProviderApi::OpenAi;
+    let mut rig = Rig::new(api, false).await;
+    let info = model_info(api, rig.config.id);
+    let finish = event(
+        None,
+        json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}),
+    );
+    // A connection dropped after the finish chunk, and a bare `[DONE]`, are
+    // both unfinished replies.
+    for tail in [finish, "data: [DONE]\n\n".to_owned()] {
+        let (task, mut deltas) = spawn_complete(&rig, &info);
+        let opened = rig.requests.recv().await.unwrap();
+        let delta = Id::new_v4().to_string();
+        send_split(&opened.feed, &text_event(api, &delta)).await;
+        assert_eq!(next_delta(&mut deltas).await, delta);
+        opened.feed.send(tail.into_bytes()).await.unwrap();
+        drop(opened.feed);
+        let error = task.await.unwrap().unwrap_err();
+        assert!(matches!(error, P::Incomplete), "{error:?}");
+    }
+    // Text completed in the same read as a decoding error is still published.
+    let (task, mut deltas) = spawn_complete(&rig, &info);
+    let opened = rig.requests.recv().await.unwrap();
+    let delta = Id::new_v4().to_string();
+    let read = [
+        text_event(api, &delta).into_bytes(),
+        b"data: \xff\n".to_vec(),
+    ]
+    .concat();
+    opened.feed.send(read).await.unwrap();
+    drop(opened.feed);
+    let error = task.await.unwrap().unwrap_err();
+    assert!(
+        matches!(error, P::Sse(a206_runtime::sse::SseError::Utf8)),
+        "{error:?}"
+    );
+    assert_eq!(next_delta(&mut deltas).await, delta);
+}
+#[tokio::test]
 async fn cancellation_and_vault_lock_stop_a_streaming_request() {
     for api in PROTOCOLS {
         let mut rig = Rig::new(api, true).await;

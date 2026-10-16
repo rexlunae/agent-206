@@ -41,8 +41,16 @@ pub struct Decoder {
 impl Decoder {
     /// Feed the next bytes and return every event they complete, in order.
     pub fn feed(&mut self, bytes: &[u8]) -> Result<Vec<Event>, SseError> {
-        const BOM: &[u8] = b"\xEF\xBB\xBF";
         let mut events = vec![];
+        self.feed_into(bytes, &mut events)?;
+        Ok(events)
+    }
+
+    /// Feed the next bytes, appending every event they complete to `events`.
+    /// Events completed before a decoding error stay in `events`, so a caller
+    /// can keep what arrived intact before the stream went bad.
+    pub fn feed_into(&mut self, bytes: &[u8], events: &mut Vec<Event>) -> Result<(), SseError> {
+        const BOM: &[u8] = b"\xEF\xBB\xBF";
         for &byte in bytes {
             if !self.started {
                 // A leading byte-order mark is skipped, even when split.
@@ -53,12 +61,12 @@ impl Decoder {
                 }
                 self.started = true;
                 for &held in &BOM[..self.bom] {
-                    self.byte(held, &mut events)?;
+                    self.byte(held, events)?;
                 }
             }
-            self.byte(byte, &mut events)?;
+            self.byte(byte, events)?;
         }
-        Ok(events)
+        Ok(())
     }
 
     fn byte(&mut self, byte: u8, events: &mut Vec<Event>) -> Result<(), SseError> {
@@ -121,6 +129,26 @@ mod tests {
 
     fn random() -> String {
         uuid::Uuid::new_v4().to_string()
+    }
+
+    #[test]
+    fn events_before_a_decoding_error_are_kept() {
+        let text = random();
+        let mut decoder = Decoder::default();
+        let mut events = vec![];
+        let bytes = [
+            format!("data: {text}\n\n").into_bytes(),
+            b"data: \xff\n".to_vec(),
+        ]
+        .concat();
+        assert_eq!(decoder.feed_into(&bytes, &mut events), Err(SseError::Utf8));
+        assert_eq!(
+            events,
+            [Event {
+                name: None,
+                data: text
+            }]
+        );
     }
 
     #[test]

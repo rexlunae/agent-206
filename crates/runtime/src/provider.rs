@@ -701,7 +701,11 @@ struct Sink<'a> {
 }
 impl Sink<'_> {
     async fn feed(&mut self, bytes: &[u8]) -> Result<()> {
-        for event in self.decoder.feed(bytes).map_err(ProviderError::Sse)? {
+        let mut events = vec![];
+        // Text completed before a decoding error is still forwarded, so what
+        // survives a failure does not depend on network read boundaries.
+        let decoded = self.decoder.feed_into(bytes, &mut events);
+        for event in events {
             if let Some(delta) = self.reply.event(&event)? {
                 // A closed receiver means nobody is watching this run any
                 // more; the reply is still returned to whoever awaits it.
@@ -711,7 +715,7 @@ impl Sink<'_> {
                     .ignore();
             }
         }
-        Ok(())
+        decoded.map_err(ProviderError::Sse)
     }
 }
 /// A provider without a credential (a local or SSH-forwarded endpoint).
@@ -925,7 +929,9 @@ impl StreamedReply {
     fn finish(self) -> Result<(String, Usage)> {
         let complete = match self.api {
             ProviderApi::Anthropic => self.ended,
-            ProviderApi::OpenAi => self.ended || self.finished,
+            // `[DONE]` closes the stream; a finish reason alone may be followed
+            // by a dropped connection, and `[DONE]` alone ended no choice.
+            ProviderApi::OpenAi => self.ended && self.finished,
             ProviderApi::Gemini => self.finished,
         };
         check(complete, ProviderError::Incomplete)?;

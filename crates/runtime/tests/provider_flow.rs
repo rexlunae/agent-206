@@ -27,7 +27,7 @@ async fn chat(State(api): State<Api>, Json(request): Json<Value>) -> String {
     assert_eq!(request["stream"], true);
     *api.request.lock().unwrap() = Some(request.clone());
     let content = &request["messages"].as_array().unwrap().last().unwrap()["content"];
-    let delta = json!({"choices":[{"delta":{"content": content}}]});
+    let delta = json!({"choices":[{"delta":{"content": content}, "finish_reason": "stop"}]});
     format!("data: {delta}\n\ndata: [DONE]\n\n")
 }
 async fn run(gateway: &Gateway, command: Command) -> Reply {
