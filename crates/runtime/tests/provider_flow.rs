@@ -20,13 +20,15 @@ async fn models(State(api): State<Api>) -> Json<Value> {
         json!({"data":[{"id":api.model,"context_length":api.context, "supported_reasoning_efforts":[api.effort], "pricing":{"prompt": 1.0 / api.context as f64}}], "balance": api.context as f64 / 1000.0, "token_balance": api.context}),
     )
 }
-async fn chat(State(api): State<Api>, Json(request): Json<Value>) -> Json<Value> {
+/// Streams the last message back as the reply, then ends the stream.
+async fn chat(State(api): State<Api>, Json(request): Json<Value>) -> String {
     assert_eq!(request["model"].as_str(), Some(api.model.as_str()));
     assert_eq!(request["messages"][0]["role"], "system");
+    assert_eq!(request["stream"], true);
     *api.request.lock().unwrap() = Some(request.clone());
-    Json(
-        json!({"choices":[{"message":{"content": request["messages"].as_array().unwrap().last().unwrap()["content"]}}]}),
-    )
+    let content = &request["messages"].as_array().unwrap().last().unwrap()["content"];
+    let delta = json!({"choices":[{"delta":{"content": content}}]});
+    format!("data: {delta}\n\ndata: [DONE]\n\n")
 }
 async fn run(gateway: &Gateway, command: Command) -> Reply {
     gateway

@@ -127,7 +127,10 @@ impl crate::error::Classified for BackendError {
 }
 type Result<T, E = BackendError> = std::result::Result<T, E>;
 pub enum Progress {
+    /// The whole reply text so far (external backends).
     Text(String),
+    /// Text appended to the reply (native provider streams).
+    Delta(String),
     Activity(String),
 }
 pub fn validate_config(config: &BackendConfig) -> Result<()> {

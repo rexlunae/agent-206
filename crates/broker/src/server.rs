@@ -9,11 +9,13 @@ use a206_vault::{
 };
 use futures_util::StreamExt;
 use std::{
+    collections::VecDeque,
     path::Path,
     sync::{Arc, Mutex, MutexGuard},
     time::{Duration, Instant},
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio_util::sync::CancellationToken;
 use zeroize::Zeroizing;
 
@@ -107,6 +109,8 @@ struct Outbound {
     anthropic_version: Option<String>,
     body: Option<Vec<u8>>,
     cancel: CancellationToken,
+    /// Relay the body as it arrives (`Request::ProviderStream`).
+    stream: bool,
 }
 
 enum Outcome {
@@ -247,7 +251,9 @@ fn handle(shared: &Shared, session: &mut Session, request: Request) -> Handled {
     let now = Instant::now();
     let Some(role) = session.role else {
         return match request {
-            Request::Hello { role, version } if version == BROKER_VERSION => {
+            Request::Hello { role, version }
+                if (MIN_BROKER_VERSION..=BROKER_VERSION).contains(&version) =>
+            {
                 session.role = Some(role);
                 ok()
             }
@@ -267,8 +273,15 @@ fn handle(shared: &Shared, session: &mut Session, request: Request) -> Handled {
             return Err(BrokerError::Invalid(InvalidRequest::AlreadyGreeted));
         }
         (_, Request::Status)
-        | (Role::Gateway, Request::GatewayAuth { .. } | Request::Provider(_)) => {}
-        (Role::Gateway, _) | (Role::User, Request::GatewayAuth { .. } | Request::Provider(_)) => {
+        | (
+            Role::Gateway,
+            Request::GatewayAuth { .. } | Request::Provider(_) | Request::ProviderStream(_),
+        ) => {}
+        (Role::Gateway, _)
+        | (
+            Role::User,
+            Request::GatewayAuth { .. } | Request::Provider(_) | Request::ProviderStream(_),
+        ) => {
             return Err(BrokerError::Forbidden);
         }
         _ => {}
@@ -606,63 +619,78 @@ fn handle(shared: &Shared, session: &mut Session, request: Request) -> Handled {
             }
             ok()
         }
-        Request::Provider(call) => {
-            // Unpaired callers learn nothing, not even whether a URL is valid.
-            let vault = shared.vault();
-            if vault.is_locked() {
-                return Err(BrokerError::Locked);
-            }
-            let (current, epoch) = {
-                let pairing = shared.pairing();
-                let current = pairing.as_ref().and_then(|pairing| {
-                    (pairing.generation == vault.generation()).then_some(pairing.serial)
-                });
-                (current, shared.epoch(vault.generation()))
-            };
-            if current.is_none() || session.paired != current {
-                return Err(BrokerError::GatewayNotPaired);
-            }
-            let url = url::Url::parse(&call.url)
-                .map_err(|_| BrokerError::Invalid(InvalidRequest::ProviderUrl))?;
-            allowed_scheme(&url)?;
-            if url.fragment().is_some() {
-                return Err(BrokerError::Invalid(InvalidRequest::ProviderUrl));
-            }
-            if call
-                .body
-                .as_ref()
-                .is_some_and(|b| b.len() > MAX_PROVIDER_BODY)
-            {
-                return Err(BrokerError::Invalid(InvalidRequest::ProviderBody));
-            }
-            let origin = url.origin().ascii_serialization();
-            // The epoch was read with the pairing check, so a later lock,
-            // replacement or void always cancels this send.
-            let cancel = shared.in_flight(epoch);
-            let value = vault
-                .use_for_destination(&call.credential, &origin, |s| {
-                    Zeroizing::new(match call.auth {
-                        AuthScheme::Bearer => format!("Bearer {}", s.expose(str::to_owned)),
-                        _ => s.expose(str::to_owned),
-                    })
-                })
-                .map_err(vault_error)?;
-            drop(vault);
-            let header = match call.auth {
-                AuthScheme::Bearer => "authorization",
-                AuthScheme::ApiKeyHeader => "x-api-key",
-                AuthScheme::GoogleApiKey => "x-goog-api-key",
-            };
-            Ok(Outcome::Send(Box::new(Outbound {
-                method: call.method,
-                url,
-                header,
-                value,
-                anthropic_version: call.anthropic_version,
-                body: call.body,
-                cancel,
-            })))
-        }
+        Request::Provider(call) => provider(shared, session, call, false),
+        Request::ProviderStream(call) => provider(shared, session, call, true),
+    }
+}
+
+/// Validate a provider call and attach its credential for the exact origin.
+fn provider(shared: &Shared, session: &Session, call: ProviderCall, stream: bool) -> Handled {
+    // Unpaired callers learn nothing, not even whether a URL is valid.
+    let vault = shared.vault();
+    if vault.is_locked() {
+        return Err(BrokerError::Locked);
+    }
+    let (current, epoch) = {
+        let pairing = shared.pairing();
+        let current = pairing.as_ref().and_then(|pairing| {
+            (pairing.generation == vault.generation()).then_some(pairing.serial)
+        });
+        (current, shared.epoch(vault.generation()))
+    };
+    if current.is_none() || session.paired != current {
+        return Err(BrokerError::GatewayNotPaired);
+    }
+    let url = url::Url::parse(&call.url)
+        .map_err(|_| BrokerError::Invalid(InvalidRequest::ProviderUrl))?;
+    allowed_scheme(&url)?;
+    if url.fragment().is_some() {
+        return Err(BrokerError::Invalid(InvalidRequest::ProviderUrl));
+    }
+    if call
+        .body
+        .as_ref()
+        .is_some_and(|b| b.len() > MAX_PROVIDER_BODY)
+    {
+        return Err(BrokerError::Invalid(InvalidRequest::ProviderBody));
+    }
+    let origin = url.origin().ascii_serialization();
+    // The epoch was read with the pairing check, so a later lock,
+    // replacement or void always cancels this send.
+    let cancel = shared.in_flight(epoch);
+    let value = vault
+        .use_for_destination(&call.credential, &origin, |s| {
+            Zeroizing::new(match call.auth {
+                AuthScheme::Bearer => format!("Bearer {}", s.expose(str::to_owned)),
+                _ => s.expose(str::to_owned),
+            })
+        })
+        .map_err(vault_error)?;
+    drop(vault);
+    let header = match call.auth {
+        AuthScheme::Bearer => "authorization",
+        AuthScheme::ApiKeyHeader => "x-api-key",
+        AuthScheme::GoogleApiKey => "x-goog-api-key",
+    };
+    Ok(Outcome::Send(Box::new(Outbound {
+        method: call.method,
+        url,
+        header,
+        value,
+        anthropic_version: call.anthropic_version,
+        body: call.body,
+        cancel,
+        stream,
+    })))
+}
+
+/// Why a send was abandoned: the vault locked, or the pairing it was sent
+/// under was replaced or voided.
+fn revoked(shared: &Shared) -> BrokerError {
+    if shared.vault().is_locked() {
+        BrokerError::Locked
+    } else {
+        BrokerError::GatewayNotPaired
     }
 }
 
@@ -676,14 +704,11 @@ async fn send(shared: &Shared, out: Outbound) -> Result<Reply, BrokerError> {
             _ = cancel.cancelled() => {}
         }
     }
-    Err(if shared.vault().is_locked() {
-        BrokerError::Locked
-    } else {
-        BrokerError::GatewayNotPaired
-    })
+    Err(revoked(shared))
 }
 
-async fn transmit(http: &reqwest::Client, out: Outbound) -> Result<Reply, BrokerError> {
+/// Attach the credential and send; resolves once the upstream status arrives.
+async fn request(http: &reqwest::Client, out: Outbound) -> Result<reqwest::Response, BrokerError> {
     let mut header = reqwest::header::HeaderValue::from_str(&out.value)
         .map_err(|_| BrokerError::Upstream(UpstreamFailure::InvalidHeader))?;
     header.set_sensitive(true);
@@ -700,7 +725,11 @@ async fn transmit(http: &reqwest::Client, out: Outbound) -> Result<Reply, Broker
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .body(body);
     }
-    let response = request.send().await.map_err(upstream)?;
+    request.send().await.map_err(upstream)
+}
+
+async fn transmit(http: &reqwest::Client, out: Outbound) -> Result<Reply, BrokerError> {
+    let response = request(http, out).await?;
     let status = response.status().as_u16();
     // Never relay upstream error bodies: they can echo credentials or prompts.
     if !response.status().is_success() {
@@ -719,6 +748,149 @@ async fn transmit(http: &reqwest::Client, out: Outbound) -> Result<Reply, Broker
         body.extend_from_slice(&part);
     }
     Ok(Reply::Provider { status, body })
+}
+
+/// Relay a streamed provider call as `ProviderHead`, `ProviderChunk`s and a
+/// final `ProviderEnd` or `Error`. Returns `false` when the connection must
+/// close: the peer went away (which abandons the upstream request), the
+/// broker is stopping, or a revocation interrupted a frame mid-write.
+async fn relay(
+    shared: &Shared,
+    out: Outbound,
+    id: uuid::Uuid,
+    writer: &mut OwnedWriteHalf,
+    inbox: &mut Inbox,
+) -> std::io::Result<bool> {
+    let cancel = out.cancel.clone();
+    let response = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => Err(revoked(shared)),
+        _ = shared.stop.cancelled() => return Ok(false),
+        closed = inbox.closed() => return closed.map(|()| false),
+        response = request(&shared.http, out) => response,
+    };
+    let response = match response {
+        Ok(response) => response,
+        Err(error) => return write(writer, id, Reply::Error(error)).await.map(|()| true),
+    };
+    let status = response.status();
+    write(
+        writer,
+        id,
+        Reply::ProviderHead {
+            status: status.as_u16(),
+        },
+    )
+    .await?;
+    // Never relay upstream error bodies: they can echo credentials or prompts.
+    if !status.is_success() {
+        let end = Reply::ProviderEnd {
+            chunks: 0,
+            bytes: 0,
+        };
+        return write(writer, id, end).await.map(|()| true);
+    }
+    let mut body = response.bytes_stream();
+    let (mut chunks, mut total) = (0u64, 0usize);
+    let error = loop {
+        let part = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => break revoked(shared),
+            _ = shared.stop.cancelled() => return Ok(false),
+            closed = inbox.closed() => return closed.map(|()| false),
+            part = body.next() => part,
+        };
+        let part = match part {
+            None => {
+                let end = Reply::ProviderEnd {
+                    chunks,
+                    bytes: total as u64,
+                };
+                return write(writer, id, end).await.map(|()| true);
+            }
+            Some(Err(error)) => break upstream(error),
+            Some(Ok(part)) => part,
+        };
+        total += part.len();
+        if total > MAX_PROVIDER_BODY {
+            break BrokerError::Upstream(UpstreamFailure::TooLarge);
+        }
+        for piece in part.chunks(MAX_STREAM_CHUNK) {
+            let frame = Reply::ProviderChunk {
+                seq: chunks,
+                bytes: piece.to_vec(),
+            };
+            // A peer that stops reading must not keep a revoked send alive.
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Ok(false),
+                written = write(writer, id, frame) => written?,
+            }
+            chunks += 1;
+        }
+    };
+    tracing::info!(
+        error = &error as &dyn std::error::Error,
+        "vault broker ended a provider stream early"
+    );
+    write(writer, id, Reply::Error(error)).await.map(|()| true)
+}
+
+/// Encode one reply frame; a reply too large for a frame becomes an error.
+async fn write(writer: &mut OwnedWriteHalf, id: uuid::Uuid, body: Reply) -> std::io::Result<()> {
+    let frame = match encode(&Response { id, body }) {
+        Err(a206_protocol::Error::TooLarge) => encode(&Response {
+            id,
+            body: Reply::Error(BrokerError::Upstream(UpstreamFailure::TooLarge)),
+        }),
+        frame => frame,
+    }
+    .map_err(std::io::Error::other)?;
+    writer.write_all(&frame).await
+}
+
+/// Requests read from one connection, decoded in order.
+struct Inbox {
+    reader: OwnedReadHalf,
+    decoder: Decoder,
+    queue: VecDeque<a206_protocol::Request<Request>>,
+    bytes: Vec<u8>,
+}
+
+impl Inbox {
+    /// The next request, or `None` once the peer closed. Cancel-safe.
+    async fn next(&mut self) -> std::io::Result<Option<a206_protocol::Request<Request>>> {
+        loop {
+            if let Some(request) = self.queue.pop_front() {
+                return Ok(Some(request));
+            }
+            if !self.read().await? {
+                return Ok(None);
+            }
+        }
+    }
+
+    /// Read once and queue what decodes; `false` once the peer closed.
+    /// Cancel-safe: a dropped read consumed nothing.
+    async fn read(&mut self) -> std::io::Result<bool> {
+        let count = self.reader.read(&mut self.bytes).await?;
+        if count == 0 {
+            return Ok(false);
+        }
+        let requests = self
+            .decoder
+            .feed(&self.bytes[..count])
+            .map_err(std::io::Error::other)?;
+        self.queue.extend(requests);
+        Ok(true)
+    }
+
+    /// Resolves when the peer closes, queueing whatever it sends meanwhile.
+    /// Clients never half-close, so end of input means the peer is gone.
+    async fn closed(&mut self) -> std::io::Result<()> {
+        while self.read().await? {}
+        Ok(())
+    }
 }
 
 async fn connection(shared: Arc<Shared>, stream: tokio::net::UnixStream) -> std::io::Result<()> {
@@ -751,65 +923,59 @@ async fn session(
         );
         return Ok(());
     }
-    let (mut reader, mut writer) = stream.into_split();
-    let mut decoder = Decoder::default();
+    let (reader, mut writer) = stream.into_split();
+    let mut inbox = Inbox {
+        reader,
+        decoder: Decoder::default(),
+        queue: VecDeque::new(),
+        bytes: vec![0; 8192],
+    };
     let mut session = Session {
         peer: credentials.pid(),
         ..Session::default()
     };
-    let mut bytes = vec![0; 8192];
     loop {
-        let count = tokio::select! {
-            read = reader.read(&mut bytes) => read?,
+        let next = tokio::select! {
+            next = inbox.next() => next?,
             _ = shared.stop.cancelled() => return Ok(()),
         };
-        if count == 0 {
+        let Some(request) = next else {
             return Ok(());
+        };
+        let shared_for_task = shared.clone();
+        // Password derivation is deliberately slow; keep it off the reactor.
+        let (returned, outcome) = tokio::task::spawn_blocking(move || {
+            let outcome = handle(&shared_for_task, &mut session, request.body);
+            (session, outcome)
+        })
+        .await
+        .map_err(std::io::Error::other)?;
+        session = returned;
+        *anchor = anchor.or(session.anchor);
+        // Any lock or unlock during this request cancels older sends.
+        {
+            let vault = shared.vault();
+            let _pairing = shared.pairing();
+            shared.in_flight(shared.epoch(vault.generation()));
         }
-        let requests: Vec<a206_protocol::Request<Request>> = decoder
-            .feed(&bytes[..count])
-            .map_err(std::io::Error::other)?;
-        for request in requests {
-            let shared_for_task = shared.clone();
-            // Password derivation is deliberately slow; keep it off the reactor.
-            let (returned, outcome) = tokio::task::spawn_blocking(move || {
-                let outcome = handle(&shared_for_task, &mut session, request.body);
-                (session, outcome)
-            })
-            .await
-            .map_err(std::io::Error::other)?;
-            session = returned;
-            *anchor = anchor.or(session.anchor);
-            // Any lock or unlock during this request cancels older sends.
-            {
-                let vault = shared.vault();
-                let _pairing = shared.pairing();
-                shared.in_flight(shared.epoch(vault.generation()));
-            }
-            let body = match outcome {
-                Ok(Outcome::Reply(reply)) => reply,
-                Ok(Outcome::Send(out)) => send(shared, *out).await.unwrap_or_else(Reply::Error),
-                Err(error) => {
-                    tracing::info!(
-                        error = &error as &dyn std::error::Error,
-                        "vault broker refused a request"
-                    );
-                    Reply::Error(error)
+        let body = match outcome {
+            Ok(Outcome::Reply(reply)) => reply,
+            Ok(Outcome::Send(out)) if out.stream => {
+                if relay(shared, *out, request.id, &mut writer, &mut inbox).await? {
+                    continue;
                 }
-            };
-            let frame = match encode(&Response {
-                id: request.id,
-                body,
-            }) {
-                Err(a206_protocol::Error::TooLarge) => encode(&Response {
-                    id: request.id,
-                    body: Reply::Error(BrokerError::Upstream(UpstreamFailure::TooLarge)),
-                }),
-                frame => frame,
+                return Ok(());
             }
-            .map_err(std::io::Error::other)?;
-            writer.write_all(&frame).await?;
-        }
+            Ok(Outcome::Send(out)) => send(shared, *out).await.unwrap_or_else(Reply::Error),
+            Err(error) => {
+                tracing::info!(
+                    error = &error as &dyn std::error::Error,
+                    "vault broker refused a request"
+                );
+                Reply::Error(error)
+            }
+        };
+        write(&mut writer, request.id, body).await?;
     }
 }
 
