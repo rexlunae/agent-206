@@ -173,10 +173,13 @@ impl Store {
             return Ok(Some(if let Some(reply) = reply {
                 rmp_serde::from_slice(&reply)?
             } else {
-                Reply::Error(a206_core::ErrorReport::new(
+                let report = a206_core::ErrorReport::new(
                     a206_core::ErrorKind::Conflict,
                     "request was already accepted; outcome is pending or unknown; refresh state before retrying",
-                ))
+                )
+                .with_correlation(id);
+                crate::error::record("replay", &report);
+                Reply::Error(report)
             }));
         }
         self.db.execute(
@@ -231,6 +234,18 @@ mod tests {
         assert_eq!(restored.state.settings.providers, vec![user]);
         assert!(restored.state.managed_joshua_provider.is_none());
         assert_eq!(restored.state.settings.revision, 1);
+    }
+    #[test]
+    fn pending_replays_reference_their_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(dir.path()).unwrap();
+        let id = Id::new_v4();
+        assert!(store.begin(id, &Command::Shutdown).unwrap().is_none());
+        let Some(Reply::Error(report)) = store.begin(id, &Command::Shutdown).unwrap() else {
+            panic!("a pending request must replay as an error");
+        };
+        assert_eq!(report.kind, a206_core::ErrorKind::Conflict);
+        assert_eq!(report.correlation, Some(id));
     }
     #[test]
     fn journal_and_dedup_survive_restart() {
