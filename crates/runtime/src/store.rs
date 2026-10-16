@@ -7,6 +7,10 @@ use std::path::{Path, PathBuf};
 
 /// Open the single profile lock used by both startup and offline stop intent.
 pub(crate) fn profile_lock(root: &Path) -> Result<std::fs::File> {
+    lock_file(root, "gateway.lock")
+}
+/// Internal fixed lock filenames only; these never come from a command or plugin.
+pub(crate) fn lock_file(root: &Path, name: &str) -> Result<std::fs::File> {
     std::fs::create_dir_all(root)?;
     #[cfg(unix)]
     {
@@ -18,7 +22,7 @@ pub(crate) fn profile_lock(root: &Path) -> Result<std::fs::File> {
         .truncate(false)
         .read(true)
         .write(true)
-        .open(root.join("gateway.lock"))?)
+        .open(root.join(name))?)
 }
 pub struct Store {
     _lock: std::fs::File,

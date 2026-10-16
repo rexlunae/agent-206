@@ -156,6 +156,11 @@ async fn stop(
     root: &std::path::Path,
     remote: &Option<String>,
 ) -> Result<()> {
+    let _lifecycle = if remote.is_none() {
+        Some(crate::service::lifecycle_guard(root).await?)
+    } else {
+        None
+    };
     if remote.is_none() {
         loop {
             if crate::service::stop_if_offline(root)? {

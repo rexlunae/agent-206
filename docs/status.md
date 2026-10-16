@@ -65,6 +65,8 @@ The header and workspace home expose gateway navigation. A mismatched older web
 bridge reports an actionable restart/authorization message. Legacy gateways that
 close on unknown status requests can still be stopped through their existing
 Shutdown command; current clients persist stop intent under the released lock.
+An independent lifecycle gate excludes automatic startup throughout the legacy
+stop handoff. Failed shutdown releases the gate without persisting stop intent.
 
 The workspace has behavioral tests for permission attenuation, empty startup
 catalogs, fragmented/malformed frames, vault encryption/locking/wrong passwords,
