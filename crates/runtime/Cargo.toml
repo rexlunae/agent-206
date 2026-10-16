@@ -37,6 +37,7 @@ tempfile.workspace = true
 async-io = "2"
 nix = { version = "0.31", features = ["signal", "process", "fs"] }
 [dev-dependencies]
+tracing-subscriber.workspace = true
 tempfile.workspace = true
 [lints]
 workspace = true

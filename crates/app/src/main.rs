@@ -348,7 +348,7 @@ mod native {
                     } else {
                         print!("{}", toml::to_string_pretty(&gateway)?);
                     }
-                    if let Some(error) = gateway.error {
+                    if let Some(error) = gateway.failure_report() {
                         return Err(error.into());
                     }
                     return Ok(());
@@ -379,7 +379,7 @@ mod native {
                         };
                         let report = controller.control(action).await?;
                         print!("{}", toml::to_string_pretty(&report)?);
-                        if let Some(error) = report.error {
+                        if let Some(error) = report.failure_report() {
                             return Err(error.into());
                         }
                         if report.phase == GatewayPhase::Offline {

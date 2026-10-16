@@ -1051,6 +1051,7 @@ impl Gateway {
             state: DownloadState::Queued,
             error: None,
             sha256,
+            failure: None,
         };
         let target = {
             let mut store = self.lock()?;
@@ -1088,7 +1089,7 @@ impl Gateway {
                     if d.state != DownloadState::Cancelled {
                         d.state = DownloadState::Failed;
                         crate::error::record("download", &report);
-                        d.error = Some(report);
+                        d.fail(report);
                     }
                 });
                 if let Err(error) = update {
@@ -1440,6 +1441,7 @@ mod tests {
                 state: DownloadState::Queued,
                 error: None,
                 sha256: (scenario == "integrity").then(|| "0".repeat(64)),
+                failure: None,
             };
             gateway.lock().unwrap().state.downloads.push(job.clone());
             if scenario == "collision" {

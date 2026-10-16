@@ -175,7 +175,7 @@ pub async fn run(
         .context("Claude Agent ACP session failed")?;
     let output = output
         .lock()
-        .map_err(|_| anyhow::anyhow!("backend output lock poisoned"))?;
+        .map_err(|_| crate::error::poisoned("backend output"))?;
     ensure!(
         !output.text.is_empty(),
         "Claude Agent completed without a text response"

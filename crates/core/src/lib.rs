@@ -358,8 +358,22 @@ pub struct Download {
     pub received: u64,
     pub total: Option<u64>,
     pub state: DownloadState,
-    pub error: Option<ErrorReport>,
+    /// Flattened failure text, kept for clients that predate `failure`.
+    pub error: Option<String>,
     pub sha256: Option<String>,
+    #[serde(default)]
+    pub failure: Option<ErrorReport>,
+}
+impl Download {
+    /// Record a failure in both the structured and the legacy text field.
+    pub fn fail(&mut self, report: ErrorReport) {
+        self.error = Some(report.detail());
+        self.failure = Some(report);
+    }
+    /// The structured failure, or one recovered from legacy text.
+    pub fn failure_report(&self) -> Option<ErrorReport> {
+        legacy_failure(&self.failure, &self.error)
+    }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PluginSummary {
@@ -617,7 +631,36 @@ pub struct GatewayReport {
     pub target: String,
     pub phase: GatewayPhase,
     pub info: Option<GatewayInfo>,
-    pub error: Option<ErrorReport>,
+    /// Flattened failure text, kept for clients that predate `failure`.
+    pub error: Option<String>,
+    #[serde(default)]
+    pub failure: Option<ErrorReport>,
+}
+impl GatewayReport {
+    pub fn new(
+        target: String,
+        phase: GatewayPhase,
+        info: Option<GatewayInfo>,
+        failure: Option<ErrorReport>,
+    ) -> Self {
+        Self {
+            target,
+            phase,
+            info,
+            error: failure.as_ref().map(ErrorReport::detail),
+            failure,
+        }
+    }
+    /// The structured failure, or one recovered from legacy text.
+    pub fn failure_report(&self) -> Option<ErrorReport> {
+        legacy_failure(&self.failure, &self.error)
+    }
+}
+fn legacy_failure(failure: &Option<ErrorReport>, text: &Option<String>) -> Option<ErrorReport> {
+    failure.clone().or_else(|| {
+        text.as_ref()
+            .map(|message| ErrorReport::new(ErrorKind::Other, message.clone()))
+    })
 }
 
 #[cfg(test)]
@@ -670,6 +713,45 @@ mod tests {
         };
         assert_eq!(message, report.message);
         assert_eq!(rmp_serde::from_slice::<Reply>(&bytes).unwrap(), current);
+    }
+    #[test]
+    fn failed_downloads_stay_readable_by_message_only_clients() {
+        #[derive(Serialize, Deserialize)]
+        struct LegacyDownload {
+            id: Id,
+            name: String,
+            source: String,
+            received: u64,
+            total: Option<u64>,
+            state: DownloadState,
+            error: Option<String>,
+            sha256: Option<String>,
+        }
+        let mut download = Download {
+            id: Id::new_v4(),
+            name: Uuid::new_v4().to_string(),
+            source: Uuid::new_v4().to_string(),
+            received: 0,
+            total: None,
+            state: DownloadState::Failed,
+            error: None,
+            sha256: None,
+            failure: None,
+        };
+        let report = ErrorReport::new(ErrorKind::Provider, Uuid::new_v4().to_string()).caused_by(
+            ErrorReport::new(ErrorKind::Other, Uuid::new_v4().to_string()),
+        );
+        download.fail(report.clone());
+        let bytes = rmp_serde::to_vec_named(&download).unwrap();
+        let legacy: LegacyDownload = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(legacy.error, Some(report.detail()));
+
+        let old = rmp_serde::to_vec_named(&legacy).unwrap();
+        let current: Download = rmp_serde::from_slice(&old).unwrap();
+        let recovered = current.failure_report().unwrap();
+        assert_eq!(recovered.message, report.detail());
+        assert_eq!(rmp_serde::from_slice::<Download>(&bytes).unwrap(), download);
+        assert_eq!(download.failure_report(), Some(report));
     }
     #[test]
     fn startup_has_no_provider_facts_or_implicit_grants() {

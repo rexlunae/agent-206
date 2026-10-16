@@ -139,6 +139,59 @@ mod tests {
         assert_eq!(super::report(&poisoned("state")).kind, ErrorKind::Internal);
     }
 
+    #[test]
+    fn recorded_events_keep_the_cause_chain() {
+        use std::sync::{Arc, Mutex};
+        #[derive(Clone, Default)]
+        struct Buffer(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Buffer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buffer = Buffer::default();
+        let writer = buffer.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let cause = uuid::Uuid::new_v4().to_string();
+        let correlation = uuid::Uuid::new_v4();
+        let error = Err::<(), _>(std::io::Error::other(cause.clone()))
+            .context("could not write the settings file")
+            .unwrap_err();
+        tracing::subscriber::with_default(subscriber, || {
+            correlated("save_settings", correlation, &error);
+        });
+        let logged = String::from_utf8(buffer.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            logged.contains("could not write the settings file"),
+            "{logged}"
+        );
+        assert!(logged.contains(&cause), "{logged}");
+        assert!(logged.contains(&correlation.to_string()), "{logged}");
+    }
+
+    #[tokio::test]
+    async fn rejected_download_urls_do_not_reveal_their_query() {
+        let secret = uuid::Uuid::new_v4().simple().to_string();
+        for source in [
+            format!("https://exa mple.com/model?token={secret}"),
+            format!("https://[::1/model?token={secret}"),
+            format!("http://example.com/model?token={secret}"),
+            format!("https://user@example.com/model?token={secret}"),
+            format!("https://example.com:8443/model?token={secret}"),
+        ] {
+            let error = crate::network::public_get(&source).await.unwrap_err();
+            let report = report(&error);
+            assert!(!report.detail().contains(&secret), "{}", report.detail());
+        }
+    }
+
     #[tokio::test]
     async fn transport_errors_do_not_reveal_urls() {
         let secret = uuid::Uuid::new_v4().simple().to_string();

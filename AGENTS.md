@@ -48,8 +48,11 @@ attribution. Prefer a small replacement over carrying historical architecture.
   thiserror enums next to the code that fails; no crate-wide catch-all or
   Box<dyn Error>, and anyhow only at binary top level. Add context with typed
   variants that keep the cause in source(); do not map_err to strings or format!
-  an error into another error. Flatten to text only where it is rendered: UI,
-  CLI output or a model-facing tool result.
+  an error into another error.
+- Only display code turns an error into a string: UI rendering, CLI output or a
+  model-facing tool result. While an error is still propagating through the app,
+  every field and cause stays directly inspectable, including across the wire,
+  in stored state and in log events.
 - Errors crossing the gateway or extension boundary are versioned MessagePack
   values: stable kind/code, human message, cause chain and correlation id, so a
   client can display, match and examine them without parsing prose.

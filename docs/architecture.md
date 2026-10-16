@@ -156,11 +156,17 @@ The same capture is recorded through `tracing` as a structured event
 logs to `gateway.log`, the terminal client to `tui.log` and other commands to
 stderr.
 
-`Reply::Error`, `GatewayReport.error`, `Download.error` and `Thread.error` carry
-reports. A report encodes as `{kind, message, source, correlation}` and is wire-compatible
-with the earlier `Error { message }` reply: older payloads and persisted plain
-strings decode with kind `Other`, and older clients read the message and ignore
-the rest. Clients keep the report, record it, and render it with `ErrorNotice`
+`Reply::Error`, `GatewayReport.failure`, `Download.failure` and `Thread.error`
+carry reports. A report encodes as `{kind, message, source, correlation}` and is
+wire-compatible with the earlier `Error { message }` reply: older clients read the
+message and ignore the rest. Gateway reports and downloads also keep their earlier
+`error` text field, filled with the rendered chain, because older clients display
+it; new code reads `failure_report()`, which falls back to that text (kind
+`Other`) only for payloads written by an older gateway.
+
+Only display code turns a report into text: UI rendering, CLI output, chat
+transcript entries and model-facing tool results. Everywhere else the report
+travels as a value. Clients keep the report, record it, and render it with `ErrorNotice`
 (kind, message, collapsible causes and the correlation id to find in logs). The CLI returns it as its error, so the
 exit message shows the whole chain.
 

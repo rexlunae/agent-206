@@ -201,6 +201,7 @@ mod tests {
             gateway_generation: use_signal(|| 0),
             status: use_signal(String::new),
             error: use_signal(|| None),
+            outage: use_signal(|| None),
             theme: use_signal(|| ThemeChoice::from_design(Design::Helix)),
             navigator: navigator(),
         };

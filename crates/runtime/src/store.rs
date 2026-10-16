@@ -89,7 +89,7 @@ impl Store {
                 DownloadState::Running | DownloadState::Queued
             ) {
                 download.state = DownloadState::Failed;
-                download.error = Some(a206_core::ErrorReport::new(
+                download.fail(a206_core::ErrorReport::new(
                     a206_core::ErrorKind::Cancelled,
                     "Gateway restarted; partial file retained. Start a new transfer to retry.",
                 ));

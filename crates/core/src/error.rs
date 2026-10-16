@@ -185,36 +185,25 @@ impl From<crate::PolicyError> for ErrorReport {
     }
 }
 
-/// Accepts reports and the plain-string errors written by earlier versions.
+/// Bounds decoded reports: they arrive from peers and persisted state.
 impl<'de> Deserialize<'de> for ErrorReport {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         #[derive(Deserialize)]
-        #[serde(untagged)]
-        enum Wire {
-            Legacy(String),
-            Report {
-                #[serde(default)]
-                kind: ErrorKind,
-                message: String,
-                #[serde(default)]
-                source: Option<Box<ErrorReport>>,
-                #[serde(default)]
-                correlation: Option<uuid::Uuid>,
-            },
+        struct Wire {
+            #[serde(default)]
+            kind: ErrorKind,
+            message: String,
+            #[serde(default)]
+            source: Option<Box<ErrorReport>>,
+            #[serde(default)]
+            correlation: Option<uuid::Uuid>,
         }
-        let mut report = match Wire::deserialize(deserializer)? {
-            Wire::Legacy(message) => Self::new(ErrorKind::Other, message),
-            Wire::Report {
-                kind,
-                message,
-                source,
-                correlation,
-            } => Self {
-                kind,
-                message: bounded(message),
-                source,
-                correlation,
-            },
+        let wire = Wire::deserialize(deserializer)?;
+        let mut report = Self {
+            kind: wire.kind,
+            message: bounded(wire.message),
+            source: wire.source,
+            correlation: wire.correlation,
         };
         report.truncate();
         Ok(report)
@@ -316,7 +305,7 @@ mod tests {
     }
 
     #[test]
-    fn decodes_reports_legacy_strings_and_unknown_kinds() {
+    fn decodes_reports_and_unknown_kinds() {
         let report = ErrorReport::new(ErrorKind::Conflict, uuid::Uuid::new_v4().to_string())
             .caused_by(ErrorReport::new(ErrorKind::Storage, "disk"))
             .with_correlation(uuid::Uuid::new_v4());
@@ -325,11 +314,6 @@ mod tests {
             rmp_serde::from_slice::<ErrorReport>(&bytes).unwrap(),
             report
         );
-
-        let legacy = uuid::Uuid::new_v4().to_string();
-        let bytes = rmp_serde::to_vec_named(&legacy).unwrap();
-        let decoded: ErrorReport = rmp_serde::from_slice(&bytes).unwrap();
-        assert_eq!((decoded.kind, decoded.message), (ErrorKind::Other, legacy));
 
         #[derive(Serialize)]
         struct Future {

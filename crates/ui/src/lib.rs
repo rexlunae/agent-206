@@ -34,6 +34,7 @@ pub(crate) struct State {
     pub loaded: Signal<bool>,
     pub status: Signal<String>,
     pub error: Signal<Option<ErrorReport>>,
+    pub outage: Signal<Option<ErrorReport>>,
     pub connected: Signal<bool>,
     pub gateway: Signal<Option<GatewayReport>>,
     pub gateway_busy: Signal<Option<GatewayAction>>,
@@ -184,7 +185,7 @@ pub(crate) fn control_gateway(mut state: State, action: GatewayAction) {
         match control(action).await {
             Ok(report) => {
                 state.connected.set(report.phase == GatewayPhase::Running);
-                state.error.set(report.error.clone());
+                state.error.set(report.failure_report());
                 state.gateway.set(Some(report));
             }
             Err(error) => {
@@ -295,16 +296,8 @@ async fn refresh(mut state: State) {
     match report {
         Ok(report) => {
             let running = report.phase == GatewayPhase::Running;
-            // A recovered connection retires the outage it replaced.
-            if running
-                && state
-                    .error
-                    .peek()
-                    .as_ref()
-                    .is_some_and(|error| error.kind == ErrorKind::Unavailable)
-            {
-                state.error.set(None);
-            }
+            // A successful probe retires the outage; command errors stay until dismissed.
+            set_outage(state, None);
             state.connected.set(running);
             state.gateway.set(Some(report));
             if !running {
@@ -313,7 +306,7 @@ async fn refresh(mut state: State) {
         }
         Err(error) => {
             state.connected.set(false);
-            state.error.set(Some(error));
+            set_outage(state, Some(error));
             return;
         }
     }
@@ -334,9 +327,16 @@ async fn refresh(mut state: State) {
         }
         Err(error) => {
             state.connected.set(false);
-            state.error.set(Some(error));
+            set_outage(state, Some(error));
         }
         _ => {}
+    }
+}
+/// Connection failures found by polling, kept apart from command failures so a
+/// later successful poll clears only what polling reported.
+fn set_outage(mut state: State, outage: Option<ErrorReport>) {
+    if *state.outage.peek() != outage {
+        state.outage.set(outage);
     }
 }
 fn theme_from(settings: &Settings) -> ThemeChoice {
@@ -400,6 +400,7 @@ fn Shell() -> Element {
     let data = use_signal(empty_snapshot);
     let status = use_signal(String::new);
     let error = use_signal(|| None);
+    let outage = use_signal(|| None);
     let connected = use_signal(|| false);
     let loaded = use_signal(|| false);
     let gateway = use_signal(|| None);
@@ -410,6 +411,7 @@ fn Shell() -> Element {
         data,
         status,
         error,
+        outage,
         connected,
         gateway,
         gateway_busy,
@@ -431,6 +433,9 @@ fn Shell() -> Element {
         div { class: "a206-shell a206-app",
             Header {}
             if !status().is_empty() { div { class: "a206-status", role: "status", "{status}" } }
+            if let Some(report) = state.outage.read().clone() {
+                div { class: "a206-status", ErrorNotice { report, title: "Gateway unreachable".to_string() } }
+            }
             if let Some(report) = state.error.read().clone() {
                 div { class: "a206-status", ErrorNotice { report, dismiss: move |_| { let mut error = state.error; error.set(None); } } }
             }

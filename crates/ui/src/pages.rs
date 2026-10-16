@@ -130,7 +130,7 @@ pub fn Downloads() -> Element {
                   progress: download.total.filter(|t| *t > 0).map(|total| ProgressValue::Of { value: download.received as f64, max: total as f64 }),
                   status: rsx! { Badge { "{download.state:?}" } },
                   actions: rsx! { if running { Button { variant: ButtonVariant::Ghost, onclick: move |_| dispatch(state, Command::CancelDownload { id }), "Cancel" } } },
-                  if let Some(error) = &download.error { ErrorNotice { report: error.clone(), title: "Download failed".to_string() } }
+                  if let Some(error) = download.failure_report() { ErrorNotice { report: error, title: "Download failed".to_string() } }
               } }
             }
         }
@@ -263,7 +263,7 @@ pub fn Gateway() -> Element {
                         dt { "Accepting work" } dd { match info.accepting_work { Some(true) => "Yes", Some(false) => "No · shutdown cleanup", None => "Not reported" } }
                     }
                 }
-                if let Some(error) = report.as_ref().and_then(|report| report.error.clone()) {
+                if let Some(error) = report.as_ref().and_then(|report| report.failure_report()) {
                     ErrorNotice { report: error, title: "Connection needs attention".to_string() }
                 }
             }

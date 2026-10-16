@@ -62,7 +62,7 @@ fn Conversation(thread: Thread) -> Element {
     let mut state = use_context::<State>();
     let mut draft = use_signal(String::new);
     let mut attachments = use_signal(Vec::<TextAttachment>::new);
-    let mut attachment_error = use_signal(String::new);
+    let mut attachment_error = use_signal(|| None::<ErrorReport>);
     let mut reading_files = use_signal(|| false);
     let mut file_input_version = use_signal(|| 0_u64);
     let mut submitting = use_signal(|| false);
@@ -101,7 +101,7 @@ fn Conversation(thread: Thread) -> Element {
         {
             let files = attachments();
             if text.len() + files.iter().map(|a| a.text.len()).sum::<usize>() > 128 * 1024 {
-                attachment_error.set("Message and attachments exceed 128 KiB".into());
+                attachment_error.set(Some(rejected("Message and attachments exceed 128 KiB")));
                 return;
             }
             submitting.set(true);
@@ -248,6 +248,9 @@ fn Conversation(thread: Thread) -> Element {
             } }
             }
             if running { AgentStatus { state: Lifecycle::Running, label: rsx! { {thread.backend_activity.clone().unwrap_or_else(|| format!("{} is working…", thread.backend.label()))} } } }
+            if let Some(report) = thread.error.clone().filter(|_| !running && thread.state == RunState::Failed) {
+                crate::error::ErrorNotice { report, title: "Run failed".to_string() }
+            }
         }
         div { class: "a206-composer",
             Card { as_: CardTag::Div, variant: CardVariant::Elevated, class: "a206-compose-surface", role: "group", aria_label: "Message composer",
@@ -270,7 +273,7 @@ fn Conversation(thread: Thread) -> Element {
                         }
                     }
                 }
-                if !attachment_error().is_empty() { p { class: "a206-attachment-error", role: "alert", "{attachment_error}" } }
+                if let Some(report) = attachment_error() { crate::error::ErrorNotice { report, title: "Attachment not added".to_string(), dismiss: move |_| attachment_error.set(None) } }
 
                 div { class: "a206-compose-toolbar",
                     div { class: "a206-compose-selectors",
@@ -284,11 +287,11 @@ fn Conversation(thread: Thread) -> Element {
                                     let files = event.files();
                                     if files.is_empty() { return; }
                                     reading_files.set(true);
-                                    attachment_error.set(String::new());
+                                    attachment_error.set(None);
                                     spawn(async move {
                                         let mut pending = attachments();
                                         let result = async {
-                                            if pending.len() + files.len() > 8 { return Err("Attach at most eight text documents".to_owned()); }
+                                            if pending.len() + files.len() > 8 { return Err(rejected("Attach at most eight text documents")); }
                                             let mut total = pending.iter().map(|f| f.text.len()).sum::<usize>();
                                             for file in files {
                                                 let text = read_attachment(&file, 128 * 1024 - total).await?;
@@ -297,7 +300,7 @@ fn Conversation(thread: Thread) -> Element {
                                             }
                                             Ok(())
                                         }.await;
-                                        match result { Ok(()) => attachments.set(pending), Err(error) => attachment_error.set(error) }
+                                        match result { Ok(()) => attachments.set(pending), Err(report) => { crate::error::record("attach", &report); attachment_error.set(Some(report)) } }
                                         reading_files.set(false);
                                         file_input_version.set(file_input_version().wrapping_add(1));
                                     });
@@ -579,38 +582,44 @@ fn RenameTitle(id: Uuid, initial: String) -> Element {
 async fn read_attachment(
     file: &dioxus::html::FileData,
     remaining: usize,
-) -> Result<String, String> {
+) -> Result<String, ErrorReport> {
     if file.size() > remaining as u64 {
-        return Err("Attachments exceed 128 KiB".into());
+        return Err(rejected("Attachments exceed 128 KiB"));
     }
     #[cfg(target_arch = "wasm32")]
-    let bytes = file
-        .read_bytes()
-        .await
-        .map_err(|_| "Could not read the attachment".to_owned())?
-        .to_vec();
+    let bytes = file.read_bytes().await.map_err(unreadable)?.to_vec();
     #[cfg(not(target_arch = "wasm32"))]
     let bytes = {
         let mut stream = file.byte_stream();
         let mut bytes = Vec::new();
         while let Some(part) = stream.next().await {
-            let part = part.map_err(|_| "Could not read the attachment".to_owned())?;
+            let part = part.map_err(unreadable)?;
             if bytes.len() + part.len() > remaining {
-                return Err("Attachments exceed 128 KiB".into());
+                return Err(rejected("Attachments exceed 128 KiB"));
             }
             bytes.extend_from_slice(&part);
         }
         bytes
     };
     if bytes.len() > remaining {
-        return Err("Attachments exceed 128 KiB".into());
+        return Err(rejected("Attachments exceed 128 KiB"));
     }
-    let text = String::from_utf8(bytes).map_err(|_| {
-        "Use UTF-8 text documents; image, PDF and audio attachments are not supported yet"
-            .to_owned()
+    let text = String::from_utf8(bytes).map_err(|error| {
+        rejected("Use UTF-8 text documents; image, PDF and audio attachments are not supported yet")
+            .caused_by(ErrorReport::capture(&error, |_| None))
     })?;
     if text.contains('\0') {
-        return Err("Use UTF-8 text documents totaling at most 128 KiB".into());
+        return Err(rejected(
+            "Use UTF-8 text documents totaling at most 128 KiB",
+        ));
     }
     Ok(text)
+}
+fn rejected(message: &str) -> ErrorReport {
+    ErrorReport::new(ErrorKind::InvalidRequest, message)
+}
+/// Keep the browser or file system's own reason as the cause.
+fn unreadable(error: dioxus::CapturedError) -> ErrorReport {
+    ErrorReport::new(ErrorKind::Other, "Could not read the attachment")
+        .caused_by(ErrorReport::capture(&**error, |_| None))
 }

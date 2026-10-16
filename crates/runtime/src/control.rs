@@ -75,34 +75,34 @@ impl GatewayController {
                         .into())
                     });
                     let report = match result {
-                        Ok(info) => GatewayReport {
-                            target: target(&root, &remote),
-                            phase: if info.is_some() {
+                        Ok(info) => GatewayReport::new(
+                            target(&root, &remote),
+                            if info.is_some() {
                                 GatewayPhase::Running
                             } else {
                                 GatewayPhase::Stopped
                             },
                             info,
-                            error: None,
-                        },
+                            None,
+                        ),
                         Err(error) => {
                             // A persisted local stop is authoritative even for another client's stop.
                             let known_stopped =
                                 stopped || (remote.is_none() && crate::service::is_stopped(&root));
-                            GatewayReport {
-                                target: target(&root, &remote),
-                                phase: if known_stopped {
+                            GatewayReport::new(
+                                target(&root, &remote),
+                                if known_stopped {
                                     GatewayPhase::Stopped
                                 } else {
                                     GatewayPhase::Offline
                                 },
-                                info: None,
-                                error: if action == GatewayAction::Status && known_stopped {
+                                None,
+                                if action == GatewayAction::Status && known_stopped {
                                     None
                                 } else {
-                                    Some(crate::error::handle(action.name(), &error))
+                                    Some(crate::error::correlated(action.name(), id, &error))
                                 },
-                            }
+                            )
                         }
                     };
                     if mutation { receipts.insert(id, (action, report.clone())); }
