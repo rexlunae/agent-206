@@ -69,6 +69,9 @@ to model readiness: readiness is established by a successful catalog API fetch.
 Managed provider identity is persisted separately from user connections. Stop,
 observed process exit and gateway restart retire that identity, its catalog and
 associated model selections/grants; retiring an active provider also cancels its runs.
+An owned connection can be relabeled while running. Stop Joshua before removing
+it or changing its endpoint, protocol or credential reference; settings updates
+cannot silently repoint an identity that will later be retired by the manager.
 
 ## Permission model
 

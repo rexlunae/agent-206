@@ -69,6 +69,19 @@ http.server.HTTPServer((host, int(port)), Api).serve_forever()
             else:
                 raise AssertionError('Mock Joshua API never became ready')
             assert len(result['Catalog']['models']) == 1
+            owned = next(provider for provider in current['settings']['providers'] if provider['id'] == managed)
+            exported = cli('settings')
+            edited = exported.replace(owned['base_url'], 'http://127.0.0.1:9876/v1')
+            assert edited != exported
+            settings_file = root / 'edited.toml'
+            settings_file.write_text(edited)
+            try:
+                cli('settings', '--apply', str(settings_file))
+            except subprocess.CalledProcessError as error:
+                assert 'stop managed Joshua' in error.output, error.output
+            else:
+                raise AssertionError('A managed connection was repointed while its child was running')
+            assert snapshot()['settings']['providers'] == current['settings']['providers']
             cli('joshua', 'stop')
             stopped = snapshot()
             assert stopped['settings']['providers'] == [user], stopped

@@ -192,6 +192,20 @@ impl Gateway {
                     settings.revision == store.state.settings.revision,
                     "settings changed in another operation; refresh and retry your change"
                 );
+                if let Some(id) = store.state.managed_joshua_provider {
+                    let owned = store.state.settings.providers.iter().find(|provider| provider.id == id)
+                        .context("managed Joshua connection is missing; stop Joshua before applying settings")?;
+                    ensure!(
+                        settings
+                            .providers
+                            .iter()
+                            .find(|provider| provider.id == id)
+                            .is_some_and(|provider| provider.base_url == owned.base_url
+                                && provider.api == owned.api
+                                && provider.credential == owned.credential),
+                        "stop managed Joshua before removing its connection or changing its endpoint, protocol or credentials"
+                    );
+                }
                 // Revocation also stops already-running inference and coding backends.
                 let running = self
                     .running
@@ -1093,6 +1107,53 @@ fn validate_effort(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn managed_joshua_connection_cannot_be_repointed_or_removed() {
+        let directory = tempfile::tempdir().unwrap();
+        let gateway = Gateway::open(directory.path()).unwrap();
+        let provider = ProviderPreset::builtins()[0].configure("http://127.0.0.1:9876/v1".into());
+        {
+            let mut store = gateway.lock().unwrap();
+            store.state.settings.providers.push(provider.clone());
+            store.state.managed_joshua_provider = Some(provider.id);
+            store.persist(None).unwrap();
+        }
+        let mut rename = gateway.snapshot().unwrap().settings;
+        rename.providers[0].label = Id::new_v4().to_string();
+        assert_eq!(
+            gateway
+                .request(Request {
+                    id: Id::new_v4(),
+                    body: Command::SaveSettings(rename)
+                })
+                .await
+                .body,
+            Reply::Ok
+        );
+        let before = gateway.snapshot().unwrap();
+        for edit in ["endpoint", "protocol", "credentials", "remove"] {
+            let mut settings = before.settings.clone();
+            match edit {
+                "endpoint" => settings.providers[0].base_url = "http://127.0.0.1:9877/v1".into(),
+                "protocol" => settings.providers[0].api = ProviderApi::Anthropic,
+                "credentials" => settings.providers[0].credential = Some(Id::new_v4().to_string()),
+                "remove" => settings.providers.clear(),
+                _ => unreachable!(),
+            }
+            let reply = gateway
+                .request(Request {
+                    id: Id::new_v4(),
+                    body: Command::SaveSettings(settings),
+                })
+                .await
+                .body;
+            assert!(
+                matches!(reply, Reply::Error { ref message } if message.contains("stop managed Joshua")),
+                "{reply:?}"
+            );
+            assert_eq!(gateway.snapshot().unwrap(), before);
+        }
+    }
     #[tokio::test]
     async fn partial_downloads_are_cleaned_on_errors_cancellation_and_publication() {
         use axum::{Router, body::Body, routing::get};
