@@ -1,0 +1,323 @@
+//! Real executable tests: shared gateway, WASM worker, ACP/MCP and managed Joshua.
+//! Unix-only until the application's Windows gateway transport is implemented.
+#![cfg(unix)]
+#![forbid(unsafe_code)]
+mod support;
+// Include the standalone fixture for Cargo's formatting, lint and compile checks.
+#[path = "fixtures/joshua.rs"]
+#[allow(dead_code)]
+mod joshua_fixture;
+use a206_core::Reply;
+use anyhow::{Context, Result, ensure};
+use serde_json::{Value, json};
+use std::{collections::BTreeMap, ffi::OsString, path::Path, process::Stdio, time::Duration};
+use support::{App, TIMEOUT, capture, checked};
+use tokio::{
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+    process::{Child, ChildStdin, ChildStdout, Command},
+};
+
+struct Peer {
+    child: Child,
+    input: ChildStdin,
+    output: BufReader<ChildStdout>,
+    next_id: u64,
+}
+impl Peer {
+    fn start(app: &App, args: &[&str]) -> Result<Self> {
+        let mut child = app
+            .command(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()?;
+        let input = child.stdin.take().context("protocol stdin missing")?;
+        let output = BufReader::new(child.stdout.take().context("protocol stdout missing")?);
+        Ok(Self {
+            child,
+            input,
+            output,
+            next_id: 0,
+        })
+    }
+    async fn send(&mut self, message: Value) -> Result<()> {
+        let mut bytes = serde_json::to_vec(&message)?;
+        bytes.push(b'\n');
+        self.input.write_all(&bytes).await?;
+        self.input.flush().await?;
+        Ok(())
+    }
+    async fn request(&mut self, method: &str, params: Value) -> Result<Value> {
+        self.next_id += 1;
+        let id = self.next_id;
+        tokio::time::timeout(TIMEOUT, async {
+            self.send(json!({"jsonrpc":"2.0", "id":id, "method":method, "params":params}))
+                .await?;
+            let mut total = 0;
+            for _ in 0..256 {
+                let mut bytes = Vec::new();
+                let count = (&mut self.output)
+                    .take(2 * 1024 * 1024 + 1)
+                    .read_until(b'\n', &mut bytes)
+                    .await?;
+                ensure!(count > 0, "protocol peer closed its output");
+                total += count;
+                ensure!(
+                    count <= 2 * 1024 * 1024 && total <= 4 * 1024 * 1024,
+                    "protocol response exceeds its limit"
+                );
+                let reply: Value = serde_json::from_slice(&bytes)?;
+                if reply.get("id") == Some(&json!(id)) {
+                    return Ok(reply);
+                }
+            }
+            anyhow::bail!("too many unrelated protocol messages")
+        })
+        .await
+        .context("protocol response timed out")?
+    }
+    async fn stop(&mut self) -> Result<()> {
+        self.child.start_kill()?;
+        tokio::time::timeout(TIMEOUT, self.child.wait()).await??;
+        Ok(())
+    }
+}
+fn result(reply: Value) -> Result<Value> {
+    ensure!(reply.get("error").is_none(), "protocol error: {reply}");
+    reply
+        .get("result")
+        .cloned()
+        .context("protocol result missing")
+}
+
+#[tokio::test]
+async fn protocol_smoke() -> Result<()> {
+    let directory = tempfile::Builder::new().prefix("a206-").tempdir()?;
+    let mut app = App::start(directory, BTreeMap::new()).await?;
+    let Reply::Thread(thread) = toml::from_str(&app.cli(&["new", "Protocol verification"]).await?)?
+    else {
+        anyhow::bail!("expected thread");
+    };
+    let thread_id = thread.id.to_string();
+    ensure!(
+        app.cli(&["extension", "agent206.inspector"])
+            .await?
+            .contains("Workspace inspector"),
+        "compiled WASM extension did not run"
+    );
+    let mut acp = Peer::start(&app, &["acp", &thread_id])?;
+    let init = result(
+        acp.request(
+            "initialize",
+            json!({"protocolVersion":1, "clientCapabilities":{}}),
+        )
+        .await?,
+    )?;
+    assert_eq!(init["protocolVersion"], 1);
+    let session = result(
+        acp.request(
+            "session/new",
+            json!({"cwd":std::env::current_dir()?, "mcpServers":[]}),
+        )
+        .await?,
+    )?;
+    assert_eq!(session["sessionId"], thread_id);
+    acp.stop().await?;
+    for allow_title_edit in [false, true] {
+        let mut args = vec!["mcp", &thread_id];
+        if allow_title_edit {
+            args.push("--allow-title-edit");
+        }
+        let mut mcp = Peer::start(&app, &args)?;
+        result(mcp.request("initialize", json!({"protocolVersion":"2025-06-18", "capabilities":{}, "clientInfo":{"name":"Agent 206 Rust smoke", "version":"0.1"}})).await?)?;
+        mcp.send(json!({"jsonrpc":"2.0", "method":"notifications/initialized"}))
+            .await?;
+        let tools = result(mcp.request("tools/list", json!({})).await?)?;
+        let names: std::collections::BTreeSet<_> = tools["tools"]
+            .as_array()
+            .context("missing tools")?
+            .iter()
+            .map(|tool| tool["name"].as_str().context("tool name missing"))
+            .collect::<Result<_>>()?;
+        let mut expected = std::collections::BTreeSet::from(["thread_state", "harness_contract"]);
+        if allow_title_edit {
+            expected.insert("rename_thread");
+        }
+        assert_eq!(names, expected);
+        let state = result(
+            mcp.request("tools/call", json!({"name":"thread_state", "arguments":{}}))
+                .await?,
+        )?;
+        ensure!(
+            state["content"][0]["text"]
+                .as_str()
+                .context("missing thread state")?
+                .contains(&thread_id),
+            "MCP inspected the wrong conversation"
+        );
+        let renamed = mcp
+            .request(
+                "tools/call",
+                json!({"name":"rename_thread", "arguments":{"title":"Verified by MCP"}}),
+            )
+            .await?;
+        let denied = renamed.get("error").is_some()
+            || renamed
+                .pointer("/result/isError")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+        assert_ne!(denied, allow_title_edit, "{renamed}");
+        if allow_title_edit {
+            let _result = result(renamed)?;
+        }
+        let snapshot = app.snapshot().await?;
+        assert_eq!(
+            snapshot.threads[0].title,
+            if allow_title_edit {
+                "Verified by MCP"
+            } else {
+                "Protocol verification"
+            }
+        );
+        mcp.stop().await?;
+    }
+    app.shutdown().await
+}
+
+async fn compile_joshua(directory: &Path) -> Result<()> {
+    let executable = directory.join("joshua");
+    let mut command = Command::new(std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into()));
+    command
+        .args(["--edition=2024", "-D", "warnings", "-o"])
+        .arg(&executable)
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/joshua.rs"));
+    checked(capture(command).await?).context("compile independent Rust Joshua fixture")?;
+    Ok(())
+}
+fn available_port() -> Result<u16> {
+    Ok(std::net::TcpListener::bind("127.0.0.1:0")?
+        .local_addr()?
+        .port())
+}
+
+#[tokio::test]
+async fn joshua_lifecycle_smoke() -> Result<()> {
+    let directory = tempfile::Builder::new().prefix("a206-").tempdir()?;
+    let home = directory.path().join("home");
+    let models = home.join("models");
+    std::fs::create_dir_all(&models)?;
+    let filename = uuid::Uuid::new_v4().to_string();
+    std::fs::write(models.join(&filename), [])?;
+    let runtime = directory.path().join("bin");
+    std::fs::create_dir(&runtime)?;
+    compile_joshua(&runtime).await?;
+    // The fixture also exits if an assertion unwinds and drops this private profile.
+    let lifetime = directory.path().join("test-running");
+    std::fs::write(&lifetime, [])?;
+    let mut path = vec![runtime];
+    if let Some(current) = std::env::var_os("PATH") {
+        path.extend(std::env::split_paths(&current));
+    }
+    let environment = BTreeMap::from([
+        (OsString::from("HOME"), home.into_os_string()),
+        (OsString::from("PATH"), std::env::join_paths(path)?),
+        (
+            OsString::from("A206_SMOKE_LIFETIME"),
+            lifetime.into_os_string(),
+        ),
+    ]);
+    let mut app = App::start(directory, environment).await?;
+    // Keep this endpoint reserved so the managed listener cannot reuse its port.
+    let independent_endpoint = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let independent_url = format!("http://{}/v1", independent_endpoint.local_addr()?);
+    app.cli(&[
+        "providers",
+        "add",
+        "custom",
+        "--label",
+        "User configured",
+        "--endpoint",
+        &independent_url,
+    ])
+    .await?;
+    let user = app.snapshot().await?.settings.providers.remove(0);
+    let mut previous_model = None;
+    for _ in 0..2 {
+        app.cli(&[
+            "joshua",
+            "start",
+            &uuid::Uuid::new_v4().to_string(),
+            &filename,
+            "--port",
+            &available_port()?.to_string(),
+        ])
+        .await?;
+        let current = app.snapshot().await?;
+        let managed = current
+            .managed_joshua_provider
+            .context("owned provider identity missing")?;
+        assert_eq!(current.settings.providers.len(), 2);
+        let catalog = tokio::time::timeout(TIMEOUT, async {
+            loop {
+                let output =
+                    capture(app.command(&["refresh-models", &managed.to_string()])).await?;
+                if output.status.success() {
+                    let Reply::Catalog(catalog) = toml::from_str(&checked(output)?)? else {
+                        anyhow::bail!("expected discovered catalog");
+                    };
+                    break Ok::<_, anyhow::Error>(catalog);
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .context("mock Joshua API did not become ready")??;
+        assert_eq!(catalog.models.len(), 1);
+        assert_eq!(catalog.provider, managed);
+        let model = &catalog.models[0];
+        ensure!(
+            model.context_limit.is_some_and(|limit| limit > 0),
+            "API context was not discovered"
+        );
+        assert_ne!(previous_model.as_ref(), Some(&model.key.model));
+        previous_model = Some(model.key.model.clone());
+        let mut edited = current.settings.clone();
+        edited
+            .providers
+            .iter_mut()
+            .find(|provider| provider.id == managed)
+            .context("managed connection missing")?
+            .base_url
+            .clone_from(&independent_url);
+        let settings_file = app.root.join("edited.toml");
+        std::fs::write(&settings_file, toml::to_string_pretty(&edited)?)?;
+        let mut command = app.command(&["settings", "--apply"]);
+        command.arg(&settings_file);
+        let output = capture(command).await?;
+        ensure!(
+            !output.status.success(),
+            "managed connection was repointed while its process was running"
+        );
+        ensure!(
+            String::from_utf8_lossy(&output.stderr).contains("stop managed Joshua"),
+            "unexpected settings rejection"
+        );
+        assert_eq!(
+            app.snapshot().await?.settings.providers,
+            current.settings.providers
+        );
+        app.cli(&["joshua", "stop"]).await?;
+        let stopped = app.snapshot().await?;
+        assert_eq!(stopped.settings.providers, vec![user.clone()]);
+        ensure!(
+            !stopped
+                .catalogs
+                .iter()
+                .any(|catalog| catalog.provider == managed),
+            "managed catalog survived stop"
+        );
+        assert!(stopped.managed_joshua_provider.is_none());
+    }
+    app.shutdown().await
+}

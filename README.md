@@ -118,8 +118,19 @@ cargo clippy --workspace --all-targets --no-default-features -- -D warnings
 cargo check -p agent206 --features tui
 cargo check -p agent206 --no-default-features --features web --target wasm32-unknown-unknown
 cargo build -p agent206 --no-default-features
-python3 scripts/protocol-smoke.py target/debug/agent206
-python3 scripts/joshua-smoke.py target/debug/agent206
+cargo test -p agent206 --no-default-features --test smoke --locked
+```
+
+The Rust smoke tests launch Cargo's actual `agent206` executable and an independent
+Rust Joshua mock. They also run with the workspace tests; CI checks the desktop
+and headless binaries. Each test owns a private gateway and profile. Unix gateway
+transport is required; Windows coverage awaits named-pipe support.
+
+To exercise an existing packaged executable instead:
+
+```sh
+A206_TEST_BINARY="$PWD/dist/Agent206.app/Contents/MacOS/agent206" \
+  cargo test -p agent206 --no-default-features --test smoke --locked
 ```
 
 Read [AGENTS.md](AGENTS.md), [architecture](docs/architecture.md),
