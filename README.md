@@ -16,24 +16,29 @@ On macOS the desktop build uses the system webview. Linux desktop additionally
 needs Dioxus's WebKitGTK development dependencies.
 
 ```sh
-# Primary desktop experience, with the gateway started automatically.
+# Primary desktop experience; first launch asks which gateway to use.
 dx serve --platform desktop -p agent206
 
 # Headless CLI and local gateway; no GUI system dependencies.
 cargo build -p agent206 --no-default-features
+./target/debug/agent206 gateway setup --local   # once per profile
 ./target/debug/agent206 new 'A new idea'
 ./target/debug/agent206 snapshot
 
 # Same component tree in the Dioxus terminal renderer.
 cargo run -p agent206 --no-default-features --features tui -- tui
 
-# Remote gateway using your existing SSH identities and verified known_hosts.
+# Remote gateway using your existing SSH identities and verified host keys:
+# save it as the profile's gateway, or override per command with --remote.
+./target/debug/agent206 gateway setup --ssh ssh://user@host
 ./target/debug/agent206 --remote ssh://user@host snapshot
 ```
 
 The remote host needs an installed `agent206` executable. Automatic remote
-installation/updating is not implemented. Unknown SSH host keys are refused;
-verify them using your ordinary SSH workflow first.
+installation/updating is not implemented. Setup shows an unknown host's key
+fingerprints (after applying your ssh_config aliases) and trusts only one you
+confirm; hosts behind a ProxyJump/ProxyCommand must first be verified with
+`ssh` itself. Changed host keys are refused.
 
 State is stored under `~/.agent206`; pass `--data-dir /absolute/path` to use an
 isolated profile. Settings are exported as TOML; apply edits through the shared

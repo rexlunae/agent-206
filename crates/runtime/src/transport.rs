@@ -65,16 +65,23 @@ pub fn parse_ssh_endpoint(endpoint: &str) -> Result<SshEndpoint> {
     })
 }
 pub fn ssh_command(endpoint: &str) -> Result<Command> {
-    ssh_base(endpoint, None)
+    ssh_base(endpoint, None, false)
+}
+/// `ssh -G`: print the configuration OpenSSH would use for an endpoint, without connecting.
+pub fn ssh_config_command(endpoint: &str) -> Result<Command> {
+    ssh_base(endpoint, None, true)
 }
 /// Gateway SSH also trusts host keys the user confirmed during setup, kept in
 /// the profile's own known_hosts after the user's `~/.ssh/known_hosts`.
 pub fn gateway_ssh_command(root: &Path, endpoint: &str) -> Result<Command> {
-    ssh_base(endpoint, Some(&crate::connection::known_hosts(root)))
+    ssh_base(endpoint, Some(&crate::connection::known_hosts(root)), false)
 }
-fn ssh_base(endpoint: &str, known_hosts: Option<&Path>) -> Result<Command> {
+fn ssh_base(endpoint: &str, known_hosts: Option<&Path>, print_config: bool) -> Result<Command> {
     let endpoint = parse_ssh_endpoint(endpoint)?;
     let mut command = Command::new("ssh");
+    if print_config {
+        command.arg("-G");
+    }
     command.args([
         "-T",
         "-o",

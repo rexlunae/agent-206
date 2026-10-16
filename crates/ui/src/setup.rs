@@ -81,7 +81,13 @@ fn finish(mut state: State, root: PathBuf, target: GatewayTarget) -> Result<(), 
     if let Ok(mut slot) = SETUP_ERROR.lock() {
         *slot = None;
     }
+    // Drop everything the previous gateway reported, and invalidate its
+    // in-flight refreshes, before the new one answers (or fails to).
+    let generation = state.gateway_generation.peek().wrapping_add(1);
+    state.gateway_generation.set(generation);
     crate::connect(root, &target);
+    state.data.set(crate::empty_snapshot());
+    state.loaded.set(false);
     state.gateway.set(None);
     state.connected.set(false);
     state.status.set(String::new());
@@ -155,7 +161,26 @@ pub(crate) fn GatewaySetup() -> Element {
                             p { "This host is not in your known hosts. Compare a fingerprint with one obtained from the server's administrator or console (for example `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub`). Trust it only if they match." }
                             dl { class: "a206-fact-grid",
                                 for key in keys.iter() {
-                                    dt { key: "{key.fingerprint}", "{key.algorithm}" } dd { code { "{key.fingerprint}" } }
+                                    dt { key: "{key.fingerprint}", "{key.algorithm}" }
+                                    dd { code { "{key.fingerprint}" }
+                                        // Trust only the key the user verified, never the whole scan.
+                                        {
+                                            let (root, key) = (trust_root.clone(), key.clone());
+                                            rsx! { Button { size: ButtonSize::Sm, variant: ButtonVariant::Secondary, availability: availability.clone(),
+                                                onclick: move |_| {
+                                                    let (root, endpoint, key) = (root.clone(), endpoint(), key.clone());
+                                                    step.set(Step::Checking);
+                                                    spawn(async move {
+                                                        if let Err(error) = connection::trust_host_keys(&root, std::slice::from_ref(&key)) {
+                                                            step.set(Step::Failed(Arc::new(error)));
+                                                            return;
+                                                        }
+                                                        step.set(check(root, endpoint).await);
+                                                    });
+                                                },
+                                                "This fingerprint matches" } }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -164,20 +189,8 @@ pub(crate) fn GatewaySetup() -> Element {
             }
             CardFooter {
                 if ssh {
-                    if let Step::ReviewKeys(keys) = step() {
-                        Button { variant: ButtonVariant::Primary, availability: availability.clone(),
-                            onclick: move |_| {
-                                let (root, endpoint, keys) = (trust_root.clone(), endpoint(), keys.clone());
-                                step.set(Step::Checking);
-                                spawn(async move {
-                                    if let Err(error) = connection::trust_host_keys(&root, &keys) {
-                                        step.set(Step::Failed(Arc::new(error)));
-                                        return;
-                                    }
-                                    step.set(check(root, endpoint).await);
-                                });
-                            },
-                            "The fingerprint matches — trust this host" }
+                    if let Step::ReviewKeys(_) = step() {
+                        Button { variant: ButtonVariant::Ghost, availability: availability.clone(), onclick: move |_| step.set(Step::Choosing), "None match" }
                     } else if let Step::Ready(_) = step() {
                         Button { variant: ButtonVariant::Primary, availability: availability.clone(),
                             onclick: move |_| {

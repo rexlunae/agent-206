@@ -121,10 +121,11 @@ async fn web_request<T: serde::Serialize, R: serde::de::DeserializeOwned>(
         .location()
         .origin()
         .map_err(|_| "browser origin unavailable")?;
+    let bearer = web_session()?;
     let response = reqwest::Client::new()
         .post(format!("{origin}{path}"))
         .header("Content-Type", "application/msgpack")
-        .bearer_auth(web_session()?)
+        .bearer_auth(&bearer)
         .body(a206_protocol::encode(&request).map_err(|e| e.to_string())?)
         .send()
         .await
@@ -136,7 +137,7 @@ async fn web_request<T: serde::Serialize, R: serde::de::DeserializeOwned>(
         if matches!(response.status().as_u16(), 401 | 403) {
             // A restarted bridge issues a new bearer; drop the stale one so the
             // next authorization link is not shadowed by it.
-            forget_web_session();
+            forget_web_session(&bearer);
             return Err("This browser is not authorized for the running web bridge. Open the authorization URL printed by `agent206 web`; restart it for a new link if that one was already used.".into());
         }
         return Err(format!("web gateway returned {}", response.status()));
@@ -206,9 +207,12 @@ fn web_storage() -> Result<web_sys::Storage, String> {
         .map_err(|_| "browser storage unavailable")?
         .ok_or_else(|| "browser storage unavailable".into())
 }
+/// Forget a rejected bearer, unless another tab has already stored a newer one.
 #[cfg(target_arch = "wasm32")]
-fn forget_web_session() {
-    if let Ok(storage) = web_storage() {
+fn forget_web_session(rejected: &str) {
+    if let Ok(storage) = web_storage()
+        && storage.get_item("a206.session").ok().flatten().as_deref() == Some(rejected)
+    {
         let _ = storage.remove_item("a206.session");
     }
 }
@@ -418,10 +422,13 @@ fn Shell() -> Element {
             // Never poll (or launch) a gateway before the user has chosen one.
             if !*state.setup.peek() {
                 refresh(state).await;
-                if !themed && *state.loaded.peek() {
-                    themed = true;
+                // Apply each gateway's theme once its first snapshot arrives
+                // (switching gateways resets `loaded`).
+                let loaded = *state.loaded.peek();
+                if loaded && !themed {
                     theme.set(theme_from(&state.data.peek().settings));
                 }
+                themed = loaded;
             }
             futures_timer::Delay::new(std::time::Duration::from_secs(2)).await;
         }

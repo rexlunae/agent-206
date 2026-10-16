@@ -72,6 +72,11 @@ pub enum ConnectionError {
     },
     #[error("{host} offered no SSH host keys")]
     NoHostKeys { host: String },
+    #[error(
+        "{host} is reached through a proxy, so its host key cannot be scanned here; \
+         connect once with `ssh {host}` to verify and record it, then retry"
+    )]
+    ProxiedHost { host: String },
     #[error("the host key entry does not match its fingerprint")]
     HostKeyMismatch,
 }
@@ -102,6 +107,17 @@ fn io(path: &Path) -> impl FnOnce(std::io::Error) -> ConnectionError + '_ {
     }
 }
 
+/// The profile holds the gateway target and trusted host keys: owner-only, like
+/// the gateway's own state.
+fn private_root(root: &Path) -> Result<()> {
+    std::fs::create_dir_all(root).map_err(io(root))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700)).map_err(io(root))?;
+    }
+    Ok(())
+}
 pub fn known_hosts(root: &Path) -> PathBuf {
     root.join("known_hosts")
 }
@@ -130,7 +146,8 @@ pub fn save(root: &Path, connection: &GatewayConnection) -> Result<()> {
             source: source.into(),
         })
     })?;
-    std::fs::create_dir_all(root).map_err(io(root))?;
+    private_root(root)?;
+    // NamedTempFile is created owner-only (0600) before it is renamed into place.
     let mut file = tempfile::NamedTempFile::new_in(root).map_err(io(root))?;
     file.write_all(text.as_bytes()).map_err(io(&path))?;
     file.as_file().sync_all().map_err(io(&path))?;
@@ -224,40 +241,110 @@ fn tail(text: &str) -> String {
         .unwrap_or(text.len());
     text[start..].to_owned()
 }
-/// Fetch the keys a host offers so the user can compare fingerprints out of band.
-pub async fn scan_host_keys(endpoint: &str) -> Result<Vec<HostKey>> {
-    let endpoint = endpoint_of(endpoint)?;
-    let mut command = tokio::process::Command::new("ssh-keyscan");
-    command.args(["-T", "10"]);
-    if let Some(port) = endpoint.port {
-        command.arg("-p").arg(port.to_string());
+/// Where OpenSSH will really connect for an endpoint, and the name it looks up
+/// in known_hosts, after applying the user's ssh_config (`Host` aliases,
+/// `HostName`, `Port`, `HostKeyAlias`).
+#[derive(Debug, PartialEq, Eq)]
+struct Resolved {
+    hostname: String,
+    port: u16,
+    known_hosts_name: String,
+}
+fn resolve_ssh_config(host: &str, config: &str) -> Result<Resolved> {
+    let mut hostname = None;
+    let mut port = 22;
+    let mut alias = None;
+    for line in config.lines() {
+        let Some((key, value)) = line.split_once(' ') else {
+            continue;
+        };
+        let value = value.trim();
+        match key {
+            "hostname" => hostname = Some(value.to_owned()),
+            "port" => port = value.parse().unwrap_or(22),
+            "hostkeyalias" => alias = Some(value.to_owned()),
+            "proxycommand" | "proxyjump" if value != "none" => {
+                return Err(traced(ConnectionError::ProxiedHost {
+                    host: host.to_owned(),
+                }));
+            }
+            _ => {}
+        }
     }
+    let hostname = hostname.unwrap_or_else(|| host.to_owned());
+    let known_hosts_name = alias.unwrap_or_else(|| {
+        if port == 22 {
+            hostname.clone()
+        } else {
+            format!("[{hostname}]:{port}")
+        }
+    });
+    Ok(Resolved {
+        hostname,
+        port,
+        known_hosts_name,
+    })
+}
+/// Fetch the keys the endpoint's real host offers so the user can compare
+/// fingerprints out of band. Entries are named for that host only: the name in
+/// ssh-keyscan's output is ignored, so a scan cannot vouch for another host.
+pub async fn scan_host_keys(endpoint: &str) -> Result<Vec<HostKey>> {
+    let parsed = endpoint_of(endpoint)?;
+    let mut config = crate::transport::ssh_config_command(endpoint).map_err(|source| {
+        traced(ConnectionError::InvalidEndpoint {
+            endpoint: endpoint.to_owned(),
+            source: source.into(),
+        })
+    })?;
+    config.stdin(Stdio::null()).kill_on_drop(true);
+    let output = run(config, "ssh", "SSH configuration", &parsed.host).await?;
+    if !output.status.success() {
+        return Err(traced(ConnectionError::Ssh {
+            host: parsed.host,
+            exit_code: output.status.code(),
+            detail: tail(&String::from_utf8_lossy(&output.stderr)),
+        }));
+    }
+    let resolved = resolve_ssh_config(&parsed.host, &String::from_utf8_lossy(&output.stdout))?;
+    let mut command = tokio::process::Command::new("ssh-keyscan");
     command
+        .args(["-T", "10", "-p"])
+        .arg(resolved.port.to_string())
         .arg("--")
-        .arg(&endpoint.host)
+        .arg(&resolved.hostname)
         .stdin(Stdio::null())
         .kill_on_drop(true);
-    let output = tokio::time::timeout(PROBE_TIMEOUT, command.output())
+    let output = run(command, "ssh-keyscan", "host key scan", &parsed.host).await?;
+    let keys = parse_host_keys(&String::from_utf8_lossy(&output.stdout))
+        .into_iter()
+        .filter_map(|key| {
+            let blob = key.entry.split_whitespace().nth(2)?;
+            Some(HostKey {
+                entry: format!("{} {} {blob}", resolved.known_hosts_name, key.algorithm),
+                ..key
+            })
+        })
+        .collect::<Vec<_>>();
+    if keys.is_empty() {
+        return Err(traced(ConnectionError::NoHostKeys { host: parsed.host }));
+    }
+    Ok(keys)
+}
+async fn run(
+    mut command: tokio::process::Command,
+    program: &'static str,
+    operation: &'static str,
+    host: &str,
+) -> Result<std::process::Output> {
+    tokio::time::timeout(PROBE_TIMEOUT, command.output())
         .await
         .map_err(|_| {
             traced(ConnectionError::TimedOut {
-                operation: "host key scan",
-                host: endpoint.host.clone(),
+                operation,
+                host: host.to_owned(),
             })
         })?
-        .map_err(|source| {
-            traced(ConnectionError::MissingTool {
-                program: "ssh-keyscan",
-                source,
-            })
-        })?;
-    let keys = parse_host_keys(&String::from_utf8_lossy(&output.stdout));
-    if keys.is_empty() {
-        return Err(traced(ConnectionError::NoHostKeys {
-            host: endpoint.host,
-        }));
-    }
-    Ok(keys)
+        .map_err(|source| traced(ConnectionError::MissingTool { program, source }))
 }
 fn parse_host_keys(text: &str) -> Vec<HostKey> {
     text.lines()
@@ -296,12 +383,15 @@ pub fn trust_host_keys(root: &Path, keys: &[HostKey]) -> Result<()> {
         return Err(traced(ConnectionError::HostKeyMismatch));
     }
     let path = known_hosts(root);
-    std::fs::create_dir_all(root).map_err(io(root))?;
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .map_err(io(&path))?;
+    private_root(root)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&path).map_err(io(&path))?;
     file.write_all(lines.as_bytes()).map_err(io(&path))?;
     file.sync_all().map_err(io(&path))?;
     Ok(())
@@ -352,6 +442,54 @@ mod tests {
         )
         .unwrap();
         assert!(load(root.path()).is_err());
+    }
+    #[test]
+    fn host_key_names_follow_the_effective_ssh_configuration() {
+        let alias = format!("lab{}", uuid::Uuid::new_v4().simple());
+        let real = format!("{alias}.internal.test");
+        let config = format!("user u\nhostname {real}\nport 2222\nproxycommand none\n");
+        assert_eq!(
+            resolve_ssh_config(&alias, &config).unwrap(),
+            Resolved {
+                hostname: real.clone(),
+                port: 2222,
+                known_hosts_name: format!("[{real}]:2222"),
+            }
+        );
+        let config = format!("hostname {real}\nport 22\nhostkeyalias {alias}\n");
+        assert_eq!(
+            resolve_ssh_config(&alias, &config)
+                .unwrap()
+                .known_hosts_name,
+            alias
+        );
+        for proxy in ["proxyjump bastion", "proxycommand nc %h %p"] {
+            assert!(matches!(
+                resolve_ssh_config(&alias, &format!("hostname {real}\n{proxy}\n")),
+                Err(ConnectionError::ProxiedHost { .. })
+            ));
+        }
+    }
+    #[cfg(unix)]
+    #[test]
+    fn setup_files_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("profile");
+        save(
+            &root,
+            &GatewayConnection {
+                target: GatewayTarget::Local,
+            },
+        )
+        .unwrap();
+        let key = uuid::Uuid::new_v4().into_bytes();
+        let keys = parse_host_keys(&format!("gateway.test ssh-ed25519 {}", blob(&key)));
+        trust_host_keys(&root, &keys).unwrap();
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&root), 0o700);
+        assert_eq!(mode(&root.join(FILE)), 0o600);
+        assert_eq!(mode(&known_hosts(&root)), 0o600);
     }
     #[test]
     fn host_keys_are_fingerprinted_and_only_exact_scans_are_trusted() {
