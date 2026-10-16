@@ -73,6 +73,7 @@ body { max-inline-size: none; inline-size: 100%; padding: 0; background: var(--f
 .a206-status { padding: var(--fc-space-2) var(--fc-space-4); background: var(--fc-color-bg-muted); font-size: .8rem; }
 .a206-document { white-space: pre-wrap; overflow-wrap: anywhere; font-family: var(--fc-font-family-mono, monospace); font-size: .85rem; line-height: 1.7; }
 .a206-grow { flex: 1; }
+.a206-gateway-copy { color: var(--fc-theme-feature-fg, var(--fc-color-text-default)); }
 .a206-browser { min-block-size: 55vh; }
 .a206-browser iframe { min-block-size: 55vh; }
 .a206-kicker { border-inline-start: 2px solid var(--fc-color-accent-text); padding-inline-start: var(--fc-space-3); }

@@ -75,11 +75,22 @@ pub fn ssh_command(endpoint: &str) -> Result<Command> {
     command.arg("--").arg(host);
     Ok(command)
 }
-pub fn gateway_command(root: &Path, remote: Option<&str>) -> Result<Command> {
+pub fn gateway_command(
+    root: &Path,
+    remote: Option<&str>,
+    start: bool,
+    explicit: bool,
+) -> Result<Command> {
     let mut command = if let Some(remote) = remote {
         let mut command = ssh_command(remote)?;
         // Fixed command text: OpenSSH executes remote arguments through a shell.
-        command.arg("agent206 gateway --stdio");
+        command.arg(if explicit {
+            "agent206 gateway --stdio --start"
+        } else if start {
+            "agent206 gateway --stdio"
+        } else {
+            "agent206 gateway --stdio --no-start"
+        });
         command
     } else {
         let mut command = Command::new(std::env::current_exe()?);
@@ -87,12 +98,17 @@ pub fn gateway_command(root: &Path, remote: Option<&str>) -> Result<Command> {
             .arg("--data-dir")
             .arg(root)
             .args(["gateway", "--stdio"]);
+        if explicit {
+            command.arg("--start");
+        } else if !start {
+            command.arg("--no-start");
+        }
         command
     };
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
+        .stderr(Stdio::piped())
         .kill_on_drop(true);
     Ok(command)
 }

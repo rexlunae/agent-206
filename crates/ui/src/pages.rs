@@ -233,18 +233,87 @@ pub fn Joshua() -> Element {
 }
 
 #[component]
-fn GatewayControls() -> Element {
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        let state = use_context::<State>();
-        rsx! { Card { CardHeader { CardTitle { "Gateway lifecycle" } } CardBody { p { "Stop the shared gateway or reconnect to start it again. Stopping interrupts active work for all connected clients." } }
-            CardFooter { Button { variant: ButtonVariant::Secondary, onclick: move |_| dispatch(state, Command::Shutdown), "Stop gateway" }
-                Button { variant: ButtonVariant::Secondary, onclick: move |_| { crate::reconnect(); dispatch(state, Command::Snapshot); }, "Start / reconnect" }
+pub fn Gateway() -> Element {
+    let state = use_context::<State>();
+    let report = state.gateway.read();
+    let info = report.as_ref().and_then(|report| report.info.as_ref());
+    rsx! { PageFrame { kicker: "Gateway", title: "Your agents' home base.", description: "Manage the gateway shared by your clients. Starting a process and completing its security setup are separate steps.",
+        GatewayControls {}
+        Card { variant: CardVariant::Elevated,
+            CardHeader { CardTitle { "Connection details" } }
+            CardBody {
+                p { class: "a206-muted", {report.as_ref().map(|report| report.target.clone()).unwrap_or_else(|| "Checking configured connection…".into())} }
+                if let Some(info) = info {
+                    dl { class: "a206-fact-grid",
+                        dt { "Process" } dd { "{info.pid}" }
+                        dt { "Version / protocol" } dd { "{info.version} / {info.protocol}" }
+                        dt { "Uptime" } dd { "{info.uptime_seconds} seconds" }
+                        dt { "Data directory" } dd { "{info.data_dir}" }
+                        dt { "Active work" } dd { "{info.active_runs} agent runs · {info.active_downloads} downloads" }
+                        dt { "Accepting work" } dd { match info.accepting_work { Some(true) => "Yes", Some(false) => "No · shutdown cleanup", None => "Not reported" } }
+                    }
+                }
+                if let Some(error) = report.as_ref().and_then(|report| report.error.as_ref()) {
+                    Alert { title: rsx! { "Connection needs attention" }, "{error}" }
+                }
             }
-        } }
-    }
-    #[cfg(target_arch = "wasm32")]
-    {
-        rsx! {}
-    }
+        }
+        Card { variant: CardVariant::Subtle, CardHeader { CardTitle { "Security setup" } }
+            CardBody { p { "Encrypted vault compatibility exists, but gateway enrollment, TOTP authentication and the isolated credential broker are not connected yet. Authenticated providers and vault use remain disabled." } }
+            CardFooter { LinkButton { href: Route::Security {}.to_string(), variant: ButtonVariant::Secondary, "Review security requirements" } }
+        }
+        Alert { title: rsx! { "Shared service" }, "Stop and restart interrupt work for every connected client. Owned agent runs, downloads and the local Joshua child are cleaned up before stop is acknowledged. Start is always an explicit action after a stop; reconnect only attaches to an existing gateway." }
+    } }
+}
+#[component]
+fn GatewayControls() -> Element {
+    use a206_core::{GatewayAction, GatewayPhase};
+    let state = use_context::<State>();
+    let busy = (state.gateway_busy)();
+    let running = state
+        .gateway
+        .read()
+        .as_ref()
+        .is_some_and(|report| report.phase == GatewayPhase::Running);
+    let mut confirm = use_signal(|| None::<GatewayAction>);
+    let stopped = state
+        .gateway
+        .read()
+        .as_ref()
+        .is_some_and(|report| report.phase == GatewayPhase::Stopped);
+    let label = match state.gateway.read().as_ref().map(|report| report.phase) {
+        Some(GatewayPhase::Running) => "Running",
+        Some(GatewayPhase::Stopped) => "Stopped",
+        Some(GatewayPhase::Offline) => "Offline",
+        None => "Checking connection",
+    };
+    let availability = if busy.is_none() {
+        Availability::Enabled
+    } else {
+        Availability::Disabled
+    };
+    rsx! { Card { variant: CardVariant::Feature,
+        CardHeader { CardTitle { "Gateway controls" }
+            Badge { tone: if running { BadgeTone::Success } else { BadgeTone::Warning }, dot: true,
+                if let Some(action) = busy { "{action:?} in progress" } else { "{label}" }
+            }
+        }
+        CardBody { p { class: "a206-gateway-copy", if running { "Connected to the configured gateway." } else { "Start the gateway, or reconnect if another client has started it." } } }
+        CardFooter {
+            Button { variant: ButtonVariant::Primary, availability: if !running { availability.clone() } else { Availability::Disabled }, busy: busy == Some(GatewayAction::Start),
+                onclick: move |_| crate::control_gateway(state, GatewayAction::Start), "Start gateway" }
+            Button { variant: ButtonVariant::Secondary, availability: if !stopped { availability.clone() } else { Availability::Disabled },
+                onclick: move |_| confirm.set(Some(GatewayAction::Stop)), "Stop gateway" }
+            Button { variant: ButtonVariant::Secondary, availability: if !stopped { availability.clone() } else { Availability::Disabled },
+                onclick: move |_| confirm.set(Some(GatewayAction::Restart)), "Restart gateway" }
+            Button { variant: ButtonVariant::Secondary, availability,
+                onclick: move |_| crate::control_gateway(state, GatewayAction::Reconnect), "Reconnect" }
+        }
+        if let Some(action) = confirm() {
+            CardBody { Alert { title: rsx! { "Interrupt shared work?" }, "This affects all clients, active agent runs, downloads and managed local inference.",
+                Button { variant: ButtonVariant::Danger, onclick: move |_| { confirm.set(None); crate::control_gateway(state, action); }, if action == GatewayAction::Stop { "Confirm stop" } else { "Confirm restart" } }
+                Button { variant: ButtonVariant::Ghost, onclick: move |_| confirm.set(None), "Keep running" }
+            } }
+        }
+    } }
 }

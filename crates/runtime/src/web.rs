@@ -1,6 +1,6 @@
 //! Loopback web bridge. Origin-scoped bearer sessions avoid leaking cookies to preview servers.
-use crate::client::Client;
-use a206_core::{Command, Reply};
+use crate::control::GatewayController;
+use a206_core::{Command, GatewayAction, Reply};
 use a206_protocol::{Decoder, Request};
 use axum::{
     Router,
@@ -21,7 +21,7 @@ use tower::ServiceExt;
 use tower_http::services::{ServeDir, ServeFile};
 #[derive(Clone)]
 struct Web {
-    client: Client,
+    client: GatewayController,
     token: Arc<String>,
     bootstrap: Arc<String>,
     claimed: Arc<AtomicBool>,
@@ -33,7 +33,7 @@ pub async fn serve(root: PathBuf, static_dir: PathBuf, port: u16) -> anyhow::Res
     let port = listener.local_addr()?.port();
     let token = uuid::Uuid::new_v4().simple().to_string();
     let state = Web {
-        client: Client::start(root, None),
+        client: GatewayController::new(root, None),
         token: Arc::new(uuid::Uuid::new_v4().simple().to_string()),
         bootstrap: Arc::new(token.clone()),
         claimed: Arc::new(AtomicBool::new(false)),
@@ -43,6 +43,7 @@ pub async fn serve(root: PathBuf, static_dir: PathBuf, port: u16) -> anyhow::Res
     let app = Router::new()
         .route("/connect/{token}", get(connect))
         .route("/api/command", post(command))
+        .route("/api/gateway", post(control))
         .layer(DefaultBodyLimit::max(a206_protocol::MAX_FRAME + 10))
         .fallback_service(static_files(static_dir))
         .layer(tower_http::set_header::SetResponseHeaderLayer::overriding(
@@ -158,7 +159,7 @@ async fn command(State(state): State<Web>, headers: HeaderMap, bytes: Bytes) -> 
         return StatusCode::BAD_REQUEST.into_response();
     }
     let request = requests.remove(0);
-    // Web sessions cannot terminate the shared service.
+    // Lifecycle changes must use the serialized, deduplicated user controller.
     if matches!(request.body, Command::Shutdown) {
         return StatusCode::FORBIDDEN.into_response();
     }
@@ -182,6 +183,37 @@ async fn command(State(state): State<Web>, headers: HeaderMap, bytes: Bytes) -> 
         )
             .into_response(),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+async fn control(State(state): State<Web>, headers: HeaderMap, bytes: Bytes) -> Response {
+    if !authorized(&state, &headers) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let mut decoder = Decoder::default();
+    let Ok(mut requests) = decoder.feed::<Request<GatewayAction>>(&bytes) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    if requests.len() != 1 || decoder.finish().is_err() {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let request = requests.remove(0);
+    match state.client.control_with_id(request.id, request.body).await {
+        Ok(report) => match a206_protocol::encode(&a206_protocol::Response {
+            id: request.id,
+            body: report,
+        }) {
+            Ok(bytes) => (
+                [
+                    (header::CONTENT_TYPE, "application/msgpack"),
+                    (header::CACHE_CONTROL, "no-store"),
+                ],
+                bytes,
+            )
+                .into_response(),
+            Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        },
+        Err(_) => StatusCode::CONFLICT.into_response(),
     }
 }
 
@@ -296,7 +328,7 @@ mod tests {
         let root = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
         let token = uuid::Uuid::new_v4().simple().to_string();
         let state = Web {
-            client: Client::start(root, None),
+            client: GatewayController::attach(root, None),
             token: Arc::new(token.clone()),
             bootstrap: Arc::new(uuid::Uuid::new_v4().to_string()),
             claimed: Arc::new(AtomicBool::new(false)),

@@ -4,28 +4,21 @@ mod conversation;
 mod pages;
 mod route;
 mod settings;
-use a206_core::{Command, Mode, Reply, Settings, Snapshot};
+use a206_core::{
+    Command, GatewayAction, GatewayPhase, GatewayReport, Mode, Reply, Settings, Snapshot,
+};
 use dioxus::router::Navigator;
 use fc_dioxus::prelude::*;
 use route::Route;
 #[cfg(target_arch = "wasm32")]
 use uuid::Uuid;
 #[cfg(not(target_arch = "wasm32"))]
-static CLIENT: std::sync::Mutex<Option<a206_runtime::client::Client>> = std::sync::Mutex::new(None);
-#[cfg(not(target_arch = "wasm32"))]
-static CONNECTION: std::sync::OnceLock<(std::path::PathBuf, Option<String>)> =
-    std::sync::OnceLock::new();
+static CLIENT: std::sync::Mutex<Option<a206_runtime::control::GatewayController>> =
+    std::sync::Mutex::new(None);
 #[cfg(not(target_arch = "wasm32"))]
 pub fn configure(root: std::path::PathBuf, remote: Option<String>) {
-    let _existing = CONNECTION.set((root.clone(), remote.clone()));
     if let Ok(mut client) = CLIENT.lock() {
-        *client = Some(a206_runtime::client::Client::start(root, remote));
-    }
-}
-#[cfg(not(target_arch = "wasm32"))]
-pub(crate) fn reconnect() {
-    if let Some((root, remote)) = CONNECTION.get() {
-        configure(root.clone(), remote.clone());
+        *client = Some(a206_runtime::control::GatewayController::new(root, remote));
     }
 }
 
@@ -36,6 +29,9 @@ pub(crate) struct State {
     pub loaded: Signal<bool>,
     pub status: Signal<String>,
     pub connected: Signal<bool>,
+    pub gateway: Signal<Option<GatewayReport>>,
+    pub gateway_busy: Signal<Option<GatewayAction>>,
+    pub gateway_generation: Signal<u64>,
     pub theme: Signal<ThemeChoice>,
 }
 fn empty_snapshot() -> Snapshot {
@@ -61,9 +57,16 @@ async fn call(command: Command) -> Result<Reply, String> {
 }
 #[cfg(target_arch = "wasm32")]
 async fn call(command: Command) -> Result<Reply, String> {
+    web_request("/api/command", command).await
+}
+#[cfg(target_arch = "wasm32")]
+async fn web_request<T: serde::Serialize, R: serde::de::DeserializeOwned>(
+    path: &str,
+    body: T,
+) -> Result<R, String> {
     let request = a206_protocol::Request {
         id: Uuid::new_v4(),
-        body: command,
+        body,
     };
     let origin = web_sys::window()
         .ok_or("browser window unavailable")?
@@ -71,7 +74,7 @@ async fn call(command: Command) -> Result<Reply, String> {
         .origin()
         .map_err(|_| "browser origin unavailable")?;
     let response = reqwest::Client::new()
-        .post(format!("{origin}/api/command"))
+        .post(format!("{origin}{path}"))
         .header("Content-Type", "application/msgpack")
         .bearer_auth(web_session()?)
         .body(a206_protocol::encode(&request).map_err(|e| e.to_string())?)
@@ -84,7 +87,7 @@ async fn call(command: Command) -> Result<Reply, String> {
     let bytes = response.bytes().await.map_err(|e| e.to_string())?;
     let mut decoder = a206_protocol::Decoder::default();
     let mut replies = decoder
-        .feed::<a206_protocol::Response<Reply>>(&bytes)
+        .feed::<a206_protocol::Response<R>>(&bytes)
         .map_err(|e| e.to_string())?;
     decoder.finish().map_err(|e| e.to_string())?;
     if replies.len() != 1 {
@@ -95,6 +98,44 @@ async fn call(command: Command) -> Result<Reply, String> {
         return Err("gateway response id mismatch".into());
     }
     Ok(response.body)
+}
+pub(crate) async fn control(action: GatewayAction) -> Result<GatewayReport, String> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        web_request("/api/gateway", action).await
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let client = CLIENT
+            .lock()
+            .map_err(|_| "connection lock poisoned")?
+            .clone()
+            .ok_or("gateway is not configured")?;
+        client.control(action).await.map_err(|e| e.to_string())
+    }
+}
+pub(crate) fn control_gateway(mut state: State, action: GatewayAction) {
+    if state.gateway_busy.peek().is_some() {
+        return;
+    }
+    state.gateway_busy.set(Some(action));
+    let generation = state.gateway_generation.peek().wrapping_add(1);
+    state.gateway_generation.set(generation);
+    spawn(async move {
+        match control(action).await {
+            Ok(report) => {
+                state.connected.set(report.phase == GatewayPhase::Running);
+                state.status.set(report.error.clone().unwrap_or_default());
+                state.gateway.set(Some(report));
+            }
+            Err(error) => {
+                state.connected.set(false);
+                state.status.set(error);
+            }
+        }
+        state.gateway_busy.set(None);
+        refresh(state).await;
+    });
 }
 #[cfg(target_arch = "wasm32")]
 fn web_session() -> Result<String, String> {
@@ -173,7 +214,37 @@ pub(crate) fn dispatch(mut state: State, command: Command) {
     });
 }
 async fn refresh(mut state: State) {
-    match call(Command::Snapshot).await {
+    if state.gateway_busy.peek().is_some() {
+        return;
+    }
+    let generation = *state.gateway_generation.peek();
+    let report = control(GatewayAction::Status).await;
+    if generation != *state.gateway_generation.peek() {
+        return;
+    }
+    match report {
+        Ok(report) => {
+            let running = report.phase == GatewayPhase::Running;
+            state.connected.set(running);
+            state.gateway.set(Some(report));
+            if !running {
+                return;
+            }
+        }
+        Err(error) => {
+            state.connected.set(false);
+            state.status.set(error);
+            return;
+        }
+    }
+    if state.gateway_busy.peek().is_some() {
+        return;
+    }
+    let snapshot = call(Command::Snapshot).await;
+    if generation != *state.gateway_generation.peek() {
+        return;
+    }
+    match snapshot {
         Ok(Reply::Snapshot(snapshot)) => {
             if *state.data.peek() != *snapshot {
                 state.data.set(*snapshot);
@@ -249,11 +320,17 @@ fn Shell() -> Element {
     let status = use_signal(String::new);
     let connected = use_signal(|| false);
     let loaded = use_signal(|| false);
+    let gateway = use_signal(|| None);
+    let gateway_busy = use_signal(|| None);
+    let gateway_generation = use_signal(|| 0);
     let mut theme = use_context::<Signal<ThemeChoice>>();
     let state = State {
         data,
         status,
         connected,
+        gateway,
+        gateway_busy,
+        gateway_generation,
         loaded,
         theme,
         navigator: navigator(),
@@ -280,7 +357,9 @@ fn Shell() -> Element {
                 }
             }
             footer { class: "a206-statusbar",
-                Badge { tone: if connected() { BadgeTone::Success } else { BadgeTone::Warning }, dot: true, if connected() { "Gateway connected" } else { "Gateway offline" } }
+                LinkButton { size: ButtonSize::Sm, variant: ButtonVariant::Ghost, href: Route::Gateway {}.to_string(),
+                    Badge { tone: if connected() { BadgeTone::Success } else { BadgeTone::Warning }, dot: true, if connected() { "Gateway connected" } else { "Gateway offline" } }
+                }
                 span { "{data.read().threads.len()} conversations · {data.read().projects.len()} projects" }
                 span { "Agent 206 / development preview" }
             }
@@ -302,7 +381,7 @@ fn Header() -> Element {
                 onclick: move |_| state.navigator.go_forward() }
             Badge { tone: BadgeTone::Accent, "{route.label()}" }
             LinkButton { size: ButtonSize::Sm, variant: ButtonVariant::Ghost, href: Route::Appearance {}.to_string(), Icon { name: IconName::Settings } "Theme" }
-            Button { size: ButtonSize::Sm, variant: ButtonVariant::Primary, onclick: move |_| dispatch(state, Command::CreateThread { title: "New conversation".into(), mode: Mode::Chat }), "+ New chat" }
+            Button { size: ButtonSize::Sm, variant: ButtonVariant::Primary, availability: if (state.connected)() && state.gateway_busy.read().is_none() { Availability::Enabled } else { Availability::Disabled }, onclick: move |_| dispatch(state, Command::CreateThread { title: "New conversation".into(), mode: Mode::Chat }), "+ New chat" }
         }
     } }
 }
@@ -339,7 +418,7 @@ fn Sidebar() -> Element {
         }
         div { class: "a206-sidebar-footer a206-nav-group",
             NavHeading { "Control center" }
-            for item in [Route::Providers {}, Route::Joshua {}, Route::Prompts {}, Route::Security {}] {
+            for item in [Route::Gateway {}, Route::Providers {}, Route::Joshua {}, Route::Prompts {}, Route::Security {}] {
                 LinkButton { size: ButtonSize::Sm, variant: ButtonVariant::Ghost, class: if route == item { "a206-nav-active" } else { "" }, href: item.to_string(), Icon { name: item.icon(), size: IconSize::Sm } "{item.label()}" }
             }
         }

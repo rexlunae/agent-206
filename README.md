@@ -52,11 +52,29 @@ Don't edit `state.sqlite3` while it is running.
 
 # Stop the shared gateway (interrupts active work).
 ./target/debug/agent206 stop-gateway
+
+# Lifecycle controls; status and reconnect never start a missing gateway.
+./target/debug/agent206 status
+./target/debug/agent206 gateway status
+./target/debug/agent206 gateway start
+./target/debug/agent206 gateway restart
+./target/debug/agent206 gateway stop
+./target/debug/agent206 gateway reconnect
 ```
 
-The desktop's Security page has stop/start/reconnect controls. Closing a client
-leaves the shared gateway available to other clients. A subsequent client starts
-it when needed. Windows named-pipe transport is not implemented yet.
+The shared Gateway page (`/gateway`) has start/stop/restart/reconnect controls,
+verified process/version/uptime and active-work details. It is available on desktop,
+web and terminal. Closing a client leaves the service running. A deliberate stop
+persists across other clients' polling and new clients; use Start or Restart to
+resume. A fresh profile starts automatically from the desktop or web bridge.
+Windows named-pipe transport and real remote lifecycle acceptance are not
+implemented yet. SSH controls target an already-installed remote executable.
+
+Running is separate from security readiness. Encrypted gateway enrollment/TOTP
+and reviewed imports are required next implementation gates; see
+[security setup/parity](docs/security-setup.md) and [import contract](docs/imports.md).
+The CLI is a supported headless interface alongside the GUI; see its
+[RustyClaw compatibility matrix](docs/cli.md).
 
 ## Web client
 

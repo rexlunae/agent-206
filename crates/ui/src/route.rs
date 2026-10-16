@@ -1,4 +1,5 @@
 //! Shared, typed navigation. Thread identity and split view have a single source of truth.
+use crate::pages::Gateway;
 use crate::{
     PageFrame, Shell,
     conversation::Workspace as Chat,
@@ -40,6 +41,8 @@ pub(crate) enum Route {
     Security {},
     #[route("/joshua")]
     Joshua {},
+    #[route("/gateway")]
+    Gateway {},
     #[route("/:..segments")]
     NotFound { segments: Vec<String> },
 }
@@ -58,7 +61,7 @@ impl Route {
             Self::Appearance {} => IconName::Settings,
             Self::Prompts {} => IconName::Edit,
             Self::Security {} => IconName::Lock,
-            Self::Joshua {} => IconName::Terminal,
+            Self::Joshua {} | Self::Gateway {} => IconName::Terminal,
         }
     }
     pub(crate) fn label(&self) -> &'static str {
@@ -76,6 +79,7 @@ impl Route {
             Self::Prompts {} => "Agent modes",
             Self::Security {} => "Security",
             Self::Joshua {} => "Joshua",
+            Self::Gateway {} => "Gateway",
             Self::NotFound { .. } => "Page not found",
         }
     }
@@ -192,6 +196,9 @@ mod tests {
             data: use_signal(|| fixture.snapshot.clone()),
             loaded: use_signal(|| true),
             connected: use_signal(|| true),
+            gateway: use_signal(|| None),
+            gateway_busy: use_signal(|| None),
+            gateway_generation: use_signal(|| 0),
             status: use_signal(String::new),
             theme: use_signal(|| ThemeChoice::from_design(Design::Helix)),
             navigator: navigator(),

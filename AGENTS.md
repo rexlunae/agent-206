@@ -11,6 +11,17 @@ attribution. Prefer a small replacement over carrying historical architecture.
   a documented, compelling integration requirement; convenience is insufficient.
 - Desktop is the primary control surface. Desktop, web and dioxus_tui share the
   same fc-dioxus components, state and command API. CLI commands use that API too.
+- Keep a fully supported Rust CLI comparable to RustyClaw for headless use and
+  automation. GUI and CLI share lifecycle, setup, authentication, vault, imports,
+  provider/model, project and extension operations; neither may bypass policy.
+  Track compatibility gaps in docs/cli.md and do not advertise placeholder commands.
+- Gateway lifecycle and secure enrollment are separate states. A running process
+  is not a security-ready gateway. Stop must persist across client polling and
+  reconnects; only an explicit user Start/Restart may override a deliberate stop.
+- Initial setup must support vault encryption/key management, verified TOTP
+  enrollment, unlock/session/step-up authentication and all RustyClaw credential
+  policies. Derive 2FA requirements from enrolled vault state, not an editable
+  config flag. Keep a source-backed parity matrix in docs/security-setup.md.
 - The gateway owns orchestration and policy, never the presentation layer. Keep
   vault, gateway and untrusted extension execution in separate process boundaries.
   An in-process sandbox is defense in depth, not a replacement for OS isolation.
@@ -48,6 +59,12 @@ attribution. Prefer a small replacement over carrying historical architecture.
   time and expiry. Tests generate identifiers and response data at runtime.
 - Each thread controls the provider/model set permitted for its subagents. Changes
   to API catalogs must not silently expand that set or fall back to another model.
+- Setup includes reviewed import adapters for RustyClaw, Cline, Claude Code,
+  Codex, DeepSeek Harness and other common tools. Follow docs/imports.md.
+  Preserve restrictions and provenance; unknown policies remain locked. Never
+  import active grants, hooks, auto-approval, MCP commands or plugins implicitly.
+  Credential migration runs only through the isolated encrypted vault broker;
+  model references remain unbound until validated against current provider APIs.
 - Downloads have one observable lifecycle, whether requested by a user or agent.
   Verify integrity, handle interruption, and publish events only after state changes.
 

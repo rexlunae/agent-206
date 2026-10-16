@@ -9,8 +9,10 @@ implemented structure for finished agent execution or security parity.
 | Area | Available now | Remaining work |
 | --- | --- | --- |
 | Rust architecture | Seven small crates, typed shared commands, forbidden application unsafe, pinned dependencies | Further extraction as capabilities grow; measured build/runtime budgets |
-| Desktop | Native macOS app bundle, shared fc-dioxus interface, automatic local gateway startup, stop/reconnect controls | Windows named pipes; Linux desktop packaging and hardware validation |
-| CLI | Chat, projects, settings, catalog refresh, downloads, text documents, Git status, gateway, vault, ACP/MCP, renderer entry points | RustyClaw CLI compatibility aliases and every legacy function; GUI vault/ACP/MCP setup |
+| Desktop | Native macOS app bundle, shared fc-dioxus interface, automatic local gateway startup, shared lifecycle controls | Windows named pipes; Linux desktop packaging and hardware validation |
+| Gateway lifecycle | Shared Gateway page and controller, status from the actual process, start/stop/restart/reconnect, durable deliberate-stop marker, cleanup before acknowledgement, bounded control receipts; web uses an authenticated user-only binary endpoint | Remote SSH acceptance, stronger cross-process lifecycle coordination, encrypted enrollment and authentication; running is not security readiness |
+| Initial setup/import | Source-backed security parity and reviewed import contracts; RustyClaw, Cline, Claude Code, Codex, DeepSeek Harness identified | Isolated encrypted vault broker, encryption/key setup, TOTP enrollment/authentication, policy migration, GUI wizard and versioned import adapters are not implemented |
+| CLI | Headless build, system status, nested gateway lifecycle/status, chat, projects, settings, catalog refresh, downloads, text documents, Git status, vault, ACP/MCP, renderer entry points and ui alias | Full RustyClaw-compatible command families in docs/cli.md; secure setup/import/auth/doctor and remaining parity |
 | SSH | Ordinary OpenSSH, strict host verification, configured identities, keepalives, remote stdio bridge | In-app host pairing, remote installers/updaters, remote acceptance test |
 | Wire protocol | Versioned bounded MessagePack, fragmented/coalesced reads, strict decode, durable request receipts | Negotiated feature sets, pushed subscriptions, full reconnect/resume UX |
 | Persistence | One gateway writer, SQLite WAL snapshots/journal, revision checks, restart recovery, explicit replay gaps | Paginated/archived history, migration tooling; current snapshot is bounded below 4 MiB |
@@ -46,6 +48,13 @@ runtimes and providers; authenticated dispatch and external delegation remain
 disabled. No subscription login is offered for Claude Agent.
 
 ## Validation evidence
+
+Gateway lifecycle tests use the real executable and independent clients: idempotent
+start, status/reconnect, stop surviving polling/new clients, stdio bridge exit,
+restart/profile persistence, authenticated web controls, rejected cross-origin
+requests, denied raw shutdown and duplicate-restart receipts. Native startup uses
+safe asynchronous stdin readiness so closing the gateway does not strand a blocking
+stdio reader. Live browser checks cover start/stop/reload/restart on a private profile.
 
 The workspace has behavioral tests for permission attenuation, empty startup
 catalogs, fragmented/malformed frames, vault encryption/locking/wrong passwords,

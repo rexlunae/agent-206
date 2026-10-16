@@ -70,6 +70,23 @@ pub struct App {
 }
 impl Drop for App {
     fn drop(&mut self) {
+        // Lifecycle tests may replace the original daemon. Stop only this private
+        // test profile through its socket before reaping the child we started.
+        use std::io::{Read, Write};
+        if let Ok(mut stream) =
+            std::os::unix::net::UnixStream::connect(self.root.join("gateway.sock"))
+        {
+            let _timeout = stream.set_read_timeout(Some(Duration::from_secs(2)));
+            let _timeout = stream.set_write_timeout(Some(Duration::from_secs(2)));
+            if let Ok(frame) = a206_protocol::encode(&a206_protocol::Request {
+                id: uuid::Uuid::new_v4(),
+                body: a206_core::Command::Shutdown,
+            }) {
+                let _write = stream.write_all(&frame);
+                let mut header = [0; 10];
+                let _reply = stream.read_exact(&mut header);
+            }
+        }
         let _kill = self.daemon.kill();
         let _reap = self.daemon.wait();
     }

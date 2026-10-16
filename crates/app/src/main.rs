@@ -34,7 +34,10 @@ mod native {
             #[command(subcommand)]
             command: BackendAction,
         },
+        /// Launch the primary desktop client.
         Desktop,
+        /// Launch the shared terminal client.
+        #[command(visible_alias = "ui")]
         Tui,
         Joshua {
             #[command(subcommand)]
@@ -49,13 +52,24 @@ mod native {
             #[arg(long)]
             allow_title_edit: bool,
         },
+        /// Manage the configured local or SSH gateway.
         Gateway {
+            #[command(subcommand)]
+            command: Option<GatewayAction>,
             #[arg(long)]
             stdio: bool,
             #[arg(long, hide = true)]
             daemon: bool,
+            #[arg(long, hide = true, conflicts_with = "start")]
+            no_start: bool,
+            #[arg(long, hide = true)]
+            start: bool,
         },
+        /// Show gateway and workspace status without starting a service.
+        Status,
+        /// Export the current workspace snapshot as TOML.
         Snapshot,
+        /// Stop the shared gateway (compatibility command).
         StopGateway,
         New {
             title: String,
@@ -69,6 +83,7 @@ mod native {
         Cancel {
             thread: uuid::Uuid,
         },
+        /// Export settings as TOML, or apply a reviewed TOML configuration.
         Settings {
             #[arg(long)]
             apply: Option<PathBuf>,
@@ -108,6 +123,7 @@ mod native {
             #[command(subcommand)]
             command: VaultAction,
         },
+        /// Serve the shared web client on an authorized loopback session.
         Web {
             #[arg(long)]
             static_dir: PathBuf,
@@ -123,6 +139,14 @@ mod native {
         Init,
         List,
         Put { name: String },
+    }
+    #[derive(Subcommand)]
+    enum GatewayAction {
+        Status,
+        Start,
+        Stop,
+        Restart,
+        Reconnect,
     }
     #[derive(Subcommand)]
     enum ProviderAction {
@@ -248,15 +272,101 @@ mod native {
                 Ok(())
             }
             action => tokio::runtime::Runtime::new()?.block_on(async move {
-                if let Action::Gateway { stdio, daemon } = action {
-                    return if daemon {
-                        a206_runtime::service::daemon(&root).await
-                    } else if stdio {
-                        a206_runtime::service::stdio(&root).await
+                if matches!(action, Action::Status | Action::StopGateway) {
+                    use a206_core::{GatewayAction as Control, GatewayPhase};
+                    let controller =
+                        a206_runtime::control::GatewayController::attach(root, args.remote);
+                    let status = matches!(action, Action::Status);
+                    let gateway = controller
+                        .control(if status {
+                            Control::Status
+                        } else {
+                            Control::Stop
+                        })
+                        .await?;
+                    #[derive(serde::Serialize)]
+                    struct SystemStatus {
+                        gateway: a206_core::GatewayReport,
+                        #[serde(skip_serializing_if = "Option::is_none")]
+                        workspace: Option<WorkspaceStatus>,
+                    }
+                    #[derive(serde::Serialize)]
+                    struct WorkspaceStatus {
+                        conversations: usize,
+                        projects: usize,
+                        providers: usize,
+                        api_catalogs: usize,
+                    }
+                    let workspace = if status && gateway.phase == GatewayPhase::Running {
+                        match controller.call(a206_core::Command::Snapshot).await? {
+                            Reply::Snapshot(snapshot) => Some(WorkspaceStatus {
+                                conversations: snapshot.threads.len(),
+                                projects: snapshot.projects.len(),
+                                providers: snapshot.settings.providers.len(),
+                                api_catalogs: snapshot.catalogs.len(),
+                            }),
+                            Reply::Error { message } => anyhow::bail!("{message}"),
+                            _ => anyhow::bail!("gateway did not return workspace status"),
+                        }
                     } else {
-                        anyhow::bail!(
-                            "select --stdio; the desktop starts the local gateway automatically"
-                        )
+                        None
+                    };
+                    if status {
+                        print!(
+                            "{}",
+                            toml::to_string_pretty(&SystemStatus {
+                                gateway: gateway.clone(),
+                                workspace
+                            })?
+                        );
+                    } else {
+                        print!("{}", toml::to_string_pretty(&gateway)?);
+                    }
+                    if let Some(error) = gateway.error {
+                        anyhow::bail!("{error}");
+                    }
+                    return Ok(());
+                }
+                if let Action::Gateway {
+                    command,
+                    stdio,
+                    daemon,
+                    no_start,
+                    start,
+                } = action
+                {
+                    if let Some(action) = command {
+                        use a206_core::{GatewayAction as Control, GatewayPhase};
+                        anyhow::ensure!(
+                            !stdio && !daemon && !no_start && !start,
+                            "choose a gateway command or a transport mode"
+                        );
+                        let controller =
+                            a206_runtime::control::GatewayController::attach(root, args.remote);
+                        // Status/reconnect/stop must not launch a missing gateway.
+                        let action = match action {
+                            GatewayAction::Status => Control::Status,
+                            GatewayAction::Start => Control::Start,
+                            GatewayAction::Stop => Control::Stop,
+                            GatewayAction::Restart => Control::Restart,
+                            GatewayAction::Reconnect => Control::Reconnect,
+                        };
+                        let report = controller.control(action).await?;
+                        print!("{}", toml::to_string_pretty(&report)?);
+                        if let Some(error) = report.error {
+                            anyhow::bail!("{error}");
+                        }
+                        if report.phase == GatewayPhase::Offline {
+                            anyhow::bail!("gateway is offline");
+                        }
+                        return Ok(());
+                    }
+                    return if daemon {
+                        a206_runtime::service::daemon(&root, start).await
+                    } else if stdio {
+                        a206_runtime::service::stdio(&root, !no_start, start).await
+                    } else {
+                        anyhow::bail!("choose gateway start, stop, restart, status or reconnect")
                     };
                 }
                 if let Action::Web { static_dir, port } = action {
@@ -388,7 +498,6 @@ mod native {
                         JoshuaAction::Status => Command::JoshuaStatus,
                     },
                     Action::Snapshot => Command::Snapshot,
-                    Action::StopGateway => Command::Shutdown,
                     Action::New { title, mode } => Command::CreateThread {
                         title,
                         mode: Mode::ALL

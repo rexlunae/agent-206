@@ -15,8 +15,23 @@ use std::{
     sync::{Arc, Mutex, MutexGuard},
 };
 use tokio::io::AsyncWriteExt;
+#[derive(Default)]
+struct Admission {
+    draining: bool,
+    active: usize,
+}
+struct ActiveRequest(Arc<Mutex<Admission>>);
+impl Drop for ActiveRequest {
+    fn drop(&mut self) {
+        if let Ok(mut admission) = self.0.lock() {
+            admission.active -= 1;
+        }
+    }
+}
 #[derive(Clone)]
 pub struct Gateway {
+    admission: Arc<Mutex<Admission>>,
+    started: std::time::Instant,
     stop: tokio_util::sync::CancellationToken,
     joshua: Arc<tokio::sync::Mutex<crate::joshua::Manager>>,
     store: Arc<Mutex<Store>>,
@@ -26,6 +41,8 @@ pub struct Gateway {
 impl Gateway {
     pub fn open(root: &Path) -> Result<Self> {
         Ok(Self {
+            admission: Arc::new(Mutex::new(Admission::default())),
+            started: std::time::Instant::now(),
             stop: tokio_util::sync::CancellationToken::new(),
             joshua: Arc::new(tokio::sync::Mutex::new(crate::joshua::Manager::default())),
             store: Arc::new(Mutex::new(Store::open(root)?)),
@@ -69,9 +86,36 @@ impl Gateway {
     }
     pub async fn request(&self, request: Request<Command>) -> Response<Reply> {
         let id = request.id;
+        let _active = if !matches!(
+            request.body,
+            Command::Snapshot | Command::GatewayStatus | Command::Shutdown | Command::Events { .. }
+        ) {
+            let Ok(mut admission) = self.admission.lock() else {
+                return Response {
+                    id,
+                    body: Reply::Error {
+                        message: "gateway admission lock poisoned".into(),
+                    },
+                };
+            };
+            if admission.draining {
+                return Response {
+                    id,
+                    body: Reply::Error {
+                        message: "gateway is stopping; start it again before submitting work"
+                            .into(),
+                    },
+                };
+            }
+            admission.active += 1;
+            Some(ActiveRequest(self.admission.clone()))
+        } else {
+            None
+        };
         let mutation = !matches!(
             request.body,
             Command::Snapshot
+                | Command::GatewayStatus
                 | Command::JoshuaStatus
                 | Command::Events { .. }
                 | Command::GitStatus { .. }
@@ -114,6 +158,30 @@ impl Gateway {
     }
     async fn handle(&self, command: Command) -> Result<Reply> {
         match command {
+            Command::GatewayStatus => Ok(Reply::Gateway(GatewayInfo {
+                pid: std::process::id(),
+                version: env!("CARGO_PKG_VERSION").into(),
+                protocol: a206_protocol::VERSION,
+                uptime_seconds: self.started.elapsed().as_secs(),
+                data_dir: self.lock()?.root.display().to_string(),
+                active_runs: self
+                    .running
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("run lock poisoned"))?
+                    .len(),
+                active_downloads: self
+                    .downloads
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("download lock poisoned"))?
+                    .len(),
+                accepting_work: Some(
+                    !self
+                        .admission
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("gateway admission lock poisoned"))?
+                        .draining,
+                ),
+            })),
             Command::Snapshot => Ok(Reply::Snapshot(Box::new(self.snapshot()?))),
             Command::JoshuaStatus => {
                 let mut manager = self.joshua.lock().await;
@@ -821,7 +889,62 @@ impl Gateway {
                         .join("\n\n"),
                 ))
             }
-            Command::Shutdown => Ok(Reply::Ok),
+            Command::Shutdown => {
+                self.admission
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("gateway admission lock poisoned"))?
+                    .draining = true;
+                tokio::time::timeout(std::time::Duration::from_secs(15), async {
+                    loop {
+                        // Admission is closed. Repeat cancellation for requests
+                        // admitted before stop that only now acquired their task token.
+                        for token in self
+                            .running
+                            .lock()
+                            .map_err(|_| anyhow::anyhow!("run lock poisoned"))?
+                            .values()
+                        {
+                            token.cancel();
+                        }
+                        for token in self
+                            .downloads
+                            .lock()
+                            .map_err(|_| anyhow::anyhow!("download lock poisoned"))?
+                            .values()
+                        {
+                            token.cancel();
+                        }
+                        let runs = self
+                            .running
+                            .lock()
+                            .map_err(|_| anyhow::anyhow!("run lock poisoned"))?
+                            .len();
+                        let downloads = self
+                            .downloads
+                            .lock()
+                            .map_err(|_| anyhow::anyhow!("download lock poisoned"))?
+                            .len();
+                        let active = self
+                            .admission
+                            .lock()
+                            .map_err(|_| anyhow::anyhow!("gateway admission lock poisoned"))?
+                            .active;
+                        if active == 0 && runs == 0 && downloads == 0 {
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                    }
+                    self.joshua.lock().await.stop().await?;
+                    self.clear_managed_joshua()?;
+                    Ok::<_, anyhow::Error>(())
+                })
+                .await
+                .context("gateway cleanup timed out; service remains running")??;
+                // Persist user intent before acknowledging stop. Ordinary
+                // clients cannot resurrect a deliberately stopped service.
+                crate::service::mark_stopped(&self.lock()?.root)?;
+                Ok(Reply::Ok)
+            }
         }
     }
     fn project_root(&self, id: Id) -> Result<PathBuf> {
@@ -1051,7 +1174,7 @@ where
     let writer = tokio::spawn(async move {
         while let Some((reply, shutdown)) = receiver.recv().await {
             transport::write_frame(&mut output, &reply).await?;
-            if shutdown {
+            if shutdown && matches!(reply.body, Reply::Ok) {
                 stop.cancel();
             }
         }
