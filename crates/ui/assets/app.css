@@ -80,11 +80,11 @@ body { max-inline-size: none; inline-size: 100%; padding: 0; background: var(--f
 
 .a206-pane-title { padding: var(--fc-space-2) var(--fc-space-4); flex: none; border-block-end: 1px solid var(--fc-color-border-subtle); font-size: .75rem; background: var(--fc-color-accent-bg-subtle); }
 
-/* The label forwards clicks to its file input, so the input only needs to stay focusable.
-   Native file inputs paint their picker button beyond their own box (WebKit), so an
-   input stretched over the label caught clicks meant for the neighboring mode select. */
+/* The input covers the label so it still takes clicks and file drops. Native file inputs
+   paint their picker beyond their own box (WebKit), so the label clips its contents;
+   otherwise the overflow caught clicks meant for the neighboring mode select. */
 .a206-attach { position: relative; flex: none; inline-size: 1.875rem; min-block-size: 1.875rem; padding: 0; cursor: pointer; overflow: hidden; }
-.a206-attach input { position: absolute; inset-block-start: 0; inset-inline-start: 0; inline-size: 1px; block-size: 1px; margin: -1px; padding: 0; border: 0; overflow: hidden; clip-path: inset(50%); white-space: nowrap; opacity: 0; }
+.a206-attach input { position: absolute; inset: 0; inline-size: 100%; block-size: 100%; margin: 0; overflow: hidden; opacity: 0; cursor: pointer; }
 .a206-attach:focus-within { outline: 2px solid var(--fc-color-focus-ring); outline-offset: 2px; }
 .a206-attachment-chips { display: flex; gap: var(--fc-space-1); flex-wrap: wrap; padding: var(--fc-space-1) var(--fc-space-2); }
 .a206-attachment-chips .fc-btn { font-size: .7rem; min-block-size: 1.5rem; max-inline-size: 100%; overflow-wrap: anywhere; }
