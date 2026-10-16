@@ -36,6 +36,13 @@ implemented structure for finished agent execution or security parity.
 | Theme/branding | New vector mark and generated PNG/ICO/ICNS bundle icons, future-css ThemePicker, designs/palettes/scheme/contrast saved as TOML | User theme import/editor after toolkit model support |
 | Standards/docs | AGENTS.md, architecture, executable plugin ABI, provenance/attribution, README, CI workflow | Keep this ledger current as each gate lands |
 
+## Current scope
+
+Gateway work targets the desktop and TUI clients first, over RustyClaw's SSH-based
+gateway protocol. Web client gateway support is deferred: there is no
+SSH-over-WebSocket bridge, and the web client must not be described as reaching
+remote gateways until one exists.
+
 ## Explicitly disabled
 
 Credential-backed provider dispatch fails with an explanatory error. The gateway
