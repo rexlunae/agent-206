@@ -100,6 +100,13 @@ impl Vault {
         self.inner = Some(inner);
         Ok(())
     }
+    pub fn exists(&self) -> bool {
+        self.path.exists()
+    }
+    /// Re-verify the vault password without changing the unlocked state.
+    pub fn verify_password(&self, password: &Secret) -> bool {
+        password.expose(|pw| SecretsManager::load(&self.path, KeySource::Password(pw)).is_ok())
+    }
     pub fn lock(&mut self) {
         self.inner = None;
     }
@@ -208,6 +215,8 @@ pub(crate) mod tests {
         );
         assert!(vault.is_locked());
         vault.unlock(&password).unwrap();
+        assert!(vault.verify_password(&password));
+        assert!(!vault.verify_password(&Secret::new(uuid::Uuid::new_v4().to_string())));
         assert_eq!(
             vault.with_secret("credential", str::to_owned).unwrap(),
             value

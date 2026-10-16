@@ -17,6 +17,7 @@ dioxus = { workspace = true, features = ["launch"] }
 a206-runtime.workspace = true
 a206-protocol.workspace = true
 a206-vault.workspace = true
+a206-broker.workspace = true
 a206-extensions.workspace = true
 anyhow.workspace = true
 clap = { version = "4", features = ["derive"] }

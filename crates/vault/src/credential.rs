@@ -231,6 +231,32 @@ impl Vault {
         Ok(use_value(&self.load_value(name, meta.kind)?))
     }
 
+    /// Broker-performed use for a user-configured service (for example a model
+    /// provider). The value never leaves the broker: the closure must attach
+    /// it to a request for `origin`. Agent policy does not apply because no
+    /// agent receives the value; the user's destination binding does.
+    pub fn use_for_destination<T>(
+        &self,
+        name: &str,
+        origin: &str,
+        use_value: impl FnOnce(&Secret) -> T,
+    ) -> Result<T, Error> {
+        let meta = self.credential(name)?;
+        if meta.disabled {
+            return Err(crate::Denial::Disabled.into());
+        }
+        if !matches!(meta.kind, CredentialKind::ApiKey | CredentialKind::Token) {
+            return Err(crate::Denial::UnsupportedKind.into());
+        }
+        if !meta.destinations.iter().any(|d| d == origin) {
+            return Err(crate::Denial::DestinationNotBound.into());
+        }
+        match self.load_value(name, meta.kind)? {
+            CredentialValue::Single(value) => Ok(use_value(&value)),
+            _ => Err(Error::Corrupted),
+        }
+    }
+
     /// User-initiated reveal from the trusted surface. Requires an active
     /// step-up window; disabled credentials remain viewable by their owner.
     pub fn reveal_credential<T>(
@@ -323,6 +349,7 @@ mod tests {
             policy,
             description: None,
             disabled: false,
+            destinations: vec![],
         }
     }
     fn single(ctx: &AccessContext, vault: &Vault, name: &str) -> Result<String, Error> {
@@ -486,6 +513,69 @@ mod tests {
         assert!(matches!(
             vault.use_credential(&name, &AccessContext::default(), |_| ()),
             Err(Error::Corrupted)
+        ));
+    }
+
+    #[test]
+    fn destination_use_requires_exact_binding_and_enabled_token() {
+        let (_dir, mut vault, _) = unlocked();
+        let name = random();
+        let value = random();
+        let origin = format!("https://{}.test", random());
+        let mut held = meta(CredentialKind::ApiKey, AccessPolicy::SkillOnly(vec![]));
+        vault
+            .put_credential(
+                &name,
+                &held,
+                CredentialValue::Single(Secret::new(value.clone())),
+            )
+            .unwrap();
+        let send = |vault: &Vault, origin: &str| {
+            vault.use_for_destination(&name, origin, |s| s.expose(str::to_owned))
+        };
+        assert!(matches!(
+            send(&vault, &origin),
+            Err(Error::Denied(Denial::DestinationNotBound))
+        ));
+        held.destinations = vec![origin.clone()];
+        vault
+            .update_credential(&name, |m| *m = held.clone())
+            .unwrap();
+        // Agent access stays off: this path never hands the value to an agent.
+        assert_eq!(send(&vault, &origin).unwrap(), value);
+        for other in [
+            format!("{origin}:8443"),
+            origin.replace("https", "http"),
+            format!("{origin}.evil"),
+        ] {
+            assert!(matches!(
+                send(&vault, &other),
+                Err(Error::Denied(Denial::DestinationNotBound))
+            ));
+        }
+        vault
+            .update_credential(&name, |m| m.disabled = true)
+            .unwrap();
+        assert!(matches!(
+            send(&vault, &origin),
+            Err(Error::Denied(Denial::Disabled))
+        ));
+        let login = random();
+        let mut login_meta = meta(CredentialKind::UsernamePassword, AccessPolicy::Always);
+        login_meta.destinations = vec![origin.clone()];
+        vault
+            .put_credential(
+                &login,
+                &login_meta,
+                CredentialValue::UserPass {
+                    username: Secret::new(random()),
+                    password: Secret::new(random()),
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            vault.use_for_destination(&login, &origin, |_| ()),
+            Err(Error::Denied(Denial::UnsupportedKind))
         ));
     }
 

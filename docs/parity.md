@@ -15,7 +15,7 @@ WASM tools, MessagePack APIs, API-only model facts, fc-dioxus shared UI). Status
 
 Key a206 facts that drive most rows: the native engine is text-only, no tool-call loop
 (`a206/crates/runtime/src/provider.rs:342` sends `"stream": false`, no `tools`); credentialed providers
-are refused (`provider.rs:103` `authenticated()` bails); the agent-facing surface is the MCP harness with
+now go through the vault broker (survey time: refused); the agent-facing surface is the MCP harness with
 one tool, `rename_thread` (`a206/crates/runtime/src/mcp.rs`); the `Command` enum
 (`a206/crates/core/src/lib.rs:418`) is the entire gateway API; WASM ABI v1 has no inputs or host calls
 (`a206/docs/plugin-api.md`).
@@ -24,12 +24,12 @@ one tool, `rename_thread` (`a206/crates/runtime/src/mcp.rs`); the `Command` enum
 
 | RustyClaw capability (source) | Agent 206 status | How it should land |
 | --- | --- | --- |
-| SecureStore vault, password or key file (`rc/crates/rustyclaw-core/src/secrets/vault.rs`) | partial: password vault library + standalone `vault init/list/put` (`a206/crates/vault/src/lib.rs`, `app/src/main.rs` VaultAction) | Separate vault-broker process with encrypted UI channel; key-file reader; modern envelope for new vaults (`a206/docs/security-setup.md`) |
-| Typed credentials: API key, login, SSH key, passkey, form, payment, note (`secrets/types.rs`) | partial: typed metadata/values in RustyClaw's key layout (`a206/crates/vault/src/credential.rs`); not yet behind the broker | Typed metadata in broker; unknown kinds stay locked |
+| SecureStore vault, password or key file (`rc/crates/rustyclaw-core/src/secrets/vault.rs`) | partial: separate broker process (`a206/crates/broker`) with CLI surface (`a206/crates/app/src/vault_cli.rs`); key file and modern envelope pending | Separate vault-broker process with encrypted UI channel; key-file reader; modern envelope for new vaults (`a206/docs/security-setup.md`) |
+| Typed credentials: API key, login, SSH key, passkey, form, payment, note (`secrets/types.rs`) | partial: typed metadata/values in RustyClaw's key layout (`a206/crates/vault/src/credential.rs`); served by the broker | Typed metadata in broker; unknown kinds stay locked |
 | Per-credential policy Always/WithApproval/WithAuth/SkillOnly/TriggerOnly, disabled flag (`secrets/types.rs`) | partial: all variants evaluated deny-by-default in the vault library (`a206/crates/vault/src/policy.rs`); approvals not yet wired to a UI | Broker-enforced; maps onto `Capability::UseSecret` + destination-bound handles |
-| TOTP 2FA, ±1 step, enrolled-state authoritative (`secrets/vault_ext.rs`) | partial: verified enrollment, replay protection, drift diagnosis in the library (`a206/crates/vault/src/totp.rs`); standalone CLI challenges enrolled vaults; GUI enrollment pending | Broker generates seed; enrollment verified in trusted UI; enforced on connect |
-| Auth rate limit/lockout 3 fails/30 s (`rc/crates/rustyclaw-gateway/src/auth.rs`) | partial: principal-keyed throttle (`a206/crates/vault/src/auth.rs`); broker-wide wiring pending | Broker-wide limits that survive reconnect |
-| Step-up reveal window (`rustyclaw-gateway/src/secrets_handler.rs`) | partial: 120 s window gates `reveal_credential`; connection/lock revocation wiring pending | Separate reveal capability, expiry on lock/reconnect |
+| TOTP 2FA, ±1 step, enrolled-state authoritative (`secrets/vault_ext.rs`) | partial: verified enrollment, replay protection, drift diagnosis in the library (`a206/crates/vault/src/totp.rs`); CLI enrollment and unlock through the broker; GUI enrollment pending | Broker generates seed; enrollment verified in trusted UI; enforced on connect |
+| Auth rate limit/lockout 3 fails/30 s (`rc/crates/rustyclaw-gateway/src/auth.rs`) | present: one broker-wide throttle shared across connections (`a206/crates/broker/src/server.rs`) | Broker-wide limits that survive reconnect |
+| Step-up reveal window (`rustyclaw-gateway/src/secrets_handler.rs`) | present: per-connection 120 s window, voided by any lock | Separate reveal capability, expiry on lock/reconnect |
 | Agent secret tools `secrets_list/get/store/set_policy/link_trigger` (`tools/secrets_tools.rs`) | missing by design (no secret-bearing agent tool, `a206/docs/status.md`) | Replace with opaque handles + brokered operations; agents may request, never read/approve |
 | PromptGuard / InputValidator / SafetyLayer (`security/prompt_guard.rs`, `validator.rs`, `safety_layer.rs`) | missing | Gateway-side scanning stage on inbound content and tool results |
 | LeakDetector on outputs/requests (`security/leak_detector.rs`) | missing | Boundary scanner at gateway egress + extension output |
@@ -131,7 +131,7 @@ one tool, `rename_thread` (`a206/crates/runtime/src/mcp.rs`); the `Command` enum
 
 | RustyClaw capability | Agent 206 status | How it should land |
 | --- | --- | --- |
-| API-key providers OpenAI/Anthropic/Google/xAI/DeepSeek/OpenRouter/custom (`providers/mod.rs`, `custom.rs`) | partial: presets + OpenAI-compat/Anthropic/Gemini protocols (`core/src/providers.rs`), but credentialed dispatch disabled (`provider.rs:103`) | Enable after broker: key never leaves broker; destination-bound request signing |
+| API-key providers OpenAI/Anthropic/Google/xAI/DeepSeek/OpenRouter/custom (`providers/mod.rs`, `custom.rs`) | partial: presets + OpenAI-compat/Anthropic/Gemini protocols (`core/src/providers.rs`), credentialed dispatch now runs through the broker for bound origins (`a206/crates/runtime/src/provider.rs`) | External backends and Copilot device flow still pending |
 | GitHub Copilot OAuth device flow + session token (`providers/device_flow.rs`, desktop `device_flow.rs`) | missing | Broker-run device flow, token stored in vault |
 | `refresh-token` / OpenClaw OAuth import (`rustyclaw-cli/src/commands/refresh_token.rs`) | missing | Import adapter via broker only |
 | Model registry/`model_*` tools, defaults (`models/registry.rs`, `defaults.rs`, `tools/model_tools.rs`) | present in a206's form: API-discovered catalog, provenance/expiry (`provider.rs` catalog) | Static defaults intentionally not ported |

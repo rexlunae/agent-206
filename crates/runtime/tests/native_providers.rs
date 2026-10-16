@@ -22,7 +22,51 @@ struct Api {
     effort: String,
     text: String,
     api: ProviderApi,
+    key: String,
     requests: Arc<Mutex<Vec<Value>>>,
+}
+/// The credential must arrive in the protocol's own header, attached by the broker.
+fn assert_key(api: &Api, headers: &HeaderMap) {
+    let header = match api.api {
+        ProviderApi::Anthropic => "x-api-key",
+        _ => "x-goog-api-key",
+    };
+    assert_eq!(headers.get(header).unwrap(), api.key.as_str());
+    assert!(headers.get("authorization").is_none());
+}
+async fn start_broker(origin: &str, key: &str) -> (tempfile::TempDir, String) {
+    use a206_broker::*;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_owned();
+    let serving = root.clone();
+    tokio::spawn(async move { serve(&serving).await.unwrap() });
+    while !socket_path(&root).exists() {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let mut user = Client::connect(&root, Role::User).await.unwrap();
+    user.call(Request::Unlock {
+        password: WireSecret::new(Id::new_v4().to_string()),
+        totp: None,
+        create: true,
+    })
+    .await
+    .unwrap();
+    let name = Id::new_v4().to_string();
+    user.call(Request::PutCredential {
+        name: name.clone(),
+        meta: a206_vault::CredentialMeta {
+            label: name.clone(),
+            kind: a206_vault::CredentialKind::ApiKey,
+            policy: a206_vault::AccessPolicy::WithApproval,
+            description: None,
+            disabled: false,
+            destinations: vec![origin.to_owned()],
+        },
+        value: WireValue::Single(WireSecret::new(key.to_owned())),
+    })
+    .await
+    .unwrap();
+    (dir, name)
 }
 async fn models(
     State(api): State<Api>,
@@ -34,6 +78,7 @@ async fn models(
     } else {
         "after_id"
     };
+    assert_key(&api, &headers);
     let second = query.get(cursor) == Some(&api.cursor);
     let id = if second { &api.next } else { &api.id };
     match api.api {
@@ -60,13 +105,19 @@ async fn messages(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Json<Value> {
+    assert_key(&api, &headers);
     assert_eq!(headers.get("anthropic-version").unwrap(), "2023-06-01");
     api.requests.lock().unwrap().push(body);
     Json(
         json!({"content": [{"type": "thinking", "thinking": Id::new_v4().to_string()}, {"type": "text", "text": api.text}], "usage": {"input_tokens": api.limit, "output_tokens": api.output}}),
     )
 }
-async fn generate(State(api): State<Api>, Json(body): Json<Value>) -> Json<Value> {
+async fn generate(
+    State(api): State<Api>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    assert_key(&api, &headers);
     api.requests.lock().unwrap().push(body);
     Json(
         json!({"candidates": [{"content": {"parts": [{"thought": true, "text": Id::new_v4().to_string()}, {"text": api.text}]}}], "usageMetadata": {"promptTokenCount": api.limit, "candidatesTokenCount": api.output}}),
@@ -85,6 +136,7 @@ async fn paginates_native_catalogs_and_dispatches_protocol_specific_text() {
             effort: Id::new_v4().to_string(),
             text: Id::new_v4().to_string(),
             api: protocol,
+            key: Id::new_v4().to_string(),
             requests: Default::default(),
         };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -98,14 +150,16 @@ async fn paginates_native_catalogs_and_dispatches_protocol_specific_text() {
             )
             .with_state(api.clone());
         let task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let (broker, credential) = start_broker(&format!("http://{address}"), &api.key).await;
         let config = ProviderConfig {
             id: identity,
             label: Id::new_v4().to_string(),
             base_url: format!("http://{address}/v1"),
-            credential: None,
+            credential: Some(credential),
             api: protocol,
         };
-        let catalog = provider::catalog(&config).await.unwrap();
+        let broker = provider::Broker(broker.path());
+        let catalog = provider::catalog(&config, broker).await.unwrap();
         assert_eq!(catalog.models.len(), 2);
         let model = &catalog.models[0];
         assert_eq!(model.context_limit, Some(api.limit));
@@ -126,7 +180,7 @@ async fn paginates_native_catalogs_and_dispatches_protocol_specific_text() {
             assert_eq!(model.reasoning_efforts, vec![api.effort.clone()]);
         }
         let prompt = Id::new_v4().to_string();
-        let (text, usage) = provider::complete(&config, &thread, &prompt, model)
+        let (text, usage) = provider::complete(&config, broker, &thread, &prompt, model)
             .await
             .unwrap();
         assert_eq!(text, api.text);
@@ -170,14 +224,17 @@ async fn repeated_pagination_is_rejected_and_credentials_never_bypass_the_broker
         credential: None,
         api: ProviderApi::Anthropic,
     };
-    assert!(provider::catalog(&config).await.is_err());
+    let absent = tempfile::tempdir().unwrap();
+    let broker = provider::Broker(absent.path());
+    assert!(provider::catalog(&config, broker).await.is_err());
+    // Without a running, unlocked broker a credential is never usable.
     config.credential = Some(Id::new_v4().to_string());
     assert!(
-        provider::catalog(&config)
+        provider::catalog(&config, broker)
             .await
             .unwrap_err()
             .to_string()
-            .contains("broker")
+            .contains("unlock the vault")
     );
     assert!(provider::endpoint(&config, "../outside").is_err());
     assert!(provider::endpoint(&config, "https://example.org/").is_err());
@@ -210,7 +267,10 @@ async fn reads_compatible_context_window_and_nested_effort_metadata_in_api_order
         credential: None,
         api: ProviderApi::OpenAi,
     };
-    let catalog = provider::catalog(&config).await.unwrap();
+    let none = tempfile::tempdir().unwrap();
+    let catalog = provider::catalog(&config, provider::Broker(none.path()))
+        .await
+        .unwrap();
     assert_eq!(catalog.models[0].key.model, model);
     assert_eq!(catalog.models[0].context_limit, Some(context));
     assert_eq!(catalog.models[0].output_limit, Some(output));

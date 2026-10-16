@@ -1,0 +1,402 @@
+#![cfg(unix)]
+//! Exercises the real broker server over its socket with independent clients.
+use a206_broker::*;
+use a206_vault::{AccessPolicy, CredentialKind, CredentialMeta};
+use std::{
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+
+fn random() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
+async fn start() -> (tempfile::TempDir, PathBuf, tokio::task::JoinHandle<()>) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_owned();
+    let serving = root.clone();
+    let task = tokio::spawn(async move { serve(&serving).await.unwrap() });
+    for _ in 0..200 {
+        if socket_path(&root).exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    (dir, root, task)
+}
+
+async fn user(root: &Path) -> Client {
+    Client::connect(root, Role::User).await.unwrap()
+}
+
+fn unlock(password: &str, totp: Option<String>, create: bool) -> Request {
+    Request::Unlock {
+        password: WireSecret::new(password.to_owned()),
+        totp,
+        create,
+    }
+}
+
+fn meta(destinations: Vec<String>) -> CredentialMeta {
+    CredentialMeta {
+        label: random(),
+        kind: CredentialKind::ApiKey,
+        policy: AccessPolicy::WithApproval,
+        description: None,
+        disabled: false,
+        destinations,
+    }
+}
+
+fn denied(result: Result<Reply, ClientError>) -> BrokerError {
+    match result {
+        Err(ClientError::Broker(error)) => error,
+        other => panic!("expected a broker error, got {other:?}"),
+    }
+}
+
+async fn status(client: &mut Client) -> BrokerStatus {
+    match client.call(Request::Status).await.unwrap() {
+        Reply::Status(status) => status,
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn roles_creation_step_up_reveal_and_lock_revocation() {
+    let (_dir, root, task) = start().await;
+    let password = random();
+    let mut a = user(&root).await;
+    assert!(!status(&mut a).await.exists);
+    assert_eq!(
+        denied(a.call(unlock(&password, None, false)).await),
+        BrokerError::NoVault
+    );
+    a.call(unlock(&password, None, true)).await.unwrap();
+    let s = status(&mut a).await;
+    assert!(s.exists && s.unlocked && s.step_up_active);
+    assert_eq!(s.totp_enrolled, Some(false));
+    assert_eq!(s.agent_access, Some(false));
+
+    // The gateway role can only use Status and Provider.
+    let mut gateway = Client::connect(&root, Role::Gateway).await.unwrap();
+    for request in [
+        Request::Credentials,
+        Request::Reveal { name: random() },
+        Request::Lock,
+        Request::SetAgentAccess { enabled: true },
+    ] {
+        assert_eq!(denied(gateway.call(request).await), BrokerError::Forbidden);
+    }
+    let call = || ProviderCall {
+        credential: random(),
+        method: HttpMethod::Get,
+        url: "https://example.invalid/".into(),
+        auth: AuthScheme::Bearer,
+        anthropic_version: None,
+        body: None,
+    };
+    assert_eq!(
+        denied(a.call(Request::Provider(call())).await),
+        BrokerError::Forbidden
+    );
+
+    let name = random();
+    let value = random();
+    let mut b = user(&root).await;
+    b.call(Request::PutCredential {
+        name: name.clone(),
+        meta: meta(vec![]),
+        value: WireValue::Single(WireSecret::new(value.clone())),
+    })
+    .await
+    .unwrap();
+    // A fresh connection must step up before revealing or changing policy.
+    assert_eq!(
+        denied(b.call(Request::Reveal { name: name.clone() }).await),
+        BrokerError::StepUpRequired
+    );
+    assert_eq!(
+        denied(
+            b.call(Request::UpdateCredential {
+                name: name.clone(),
+                policy: Some(AccessPolicy::Always),
+                disabled: None,
+                destinations: None,
+            })
+            .await
+        ),
+        BrokerError::StepUpRequired
+    );
+    assert_eq!(
+        denied(
+            b.call(Request::StepUp {
+                password: Some(WireSecret::new(random())),
+                totp: None,
+            })
+            .await
+        ),
+        BrokerError::AuthenticationFailed
+    );
+    b.call(Request::StepUp {
+        password: Some(WireSecret::new(password.clone())),
+        totp: None,
+    })
+    .await
+    .unwrap();
+    match b
+        .call(Request::Reveal { name: name.clone() })
+        .await
+        .unwrap()
+    {
+        Reply::Value(WireValue::Single(v)) => assert_eq!(v.expose(), value),
+        other => panic!("unexpected {other:?}"),
+    }
+    match b.call(Request::Credentials).await.unwrap() {
+        Reply::Credentials(list) => {
+            assert_eq!(list.len(), 1);
+            assert!(!format!("{list:?}").contains(&value));
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+
+    // Locking from any connection voids every step-up, even after re-unlock.
+    a.call(Request::Lock).await.unwrap();
+    assert_eq!(
+        denied(b.call(Request::Credentials).await),
+        BrokerError::Locked
+    );
+    a.call(unlock(&password, None, false)).await.unwrap();
+    assert_eq!(
+        denied(b.call(Request::Reveal { name }).await),
+        BrokerError::StepUpRequired
+    );
+    a.call(Request::Shutdown).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!socket_path(&root).exists());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn lockout_is_shared_across_connections_and_malformed_frames_close() {
+    let (_dir, root, _task) = start().await;
+    let password = random();
+    user(&root)
+        .await
+        .call(unlock(&password, None, true))
+        .await
+        .unwrap();
+    user(&root).await.call(Request::Lock).await.unwrap();
+    for _ in 0..2 {
+        assert_eq!(
+            denied(user(&root).await.call(unlock(&random(), None, false)).await),
+            BrokerError::AuthenticationFailed
+        );
+    }
+    assert!(matches!(
+        denied(user(&root).await.call(unlock(&random(), None, false)).await),
+        BrokerError::LockedOut { .. }
+    ));
+    // Even the right password is refused during the lockout, on a new connection.
+    assert!(matches!(
+        denied(user(&root).await.call(unlock(&password, None, false)).await),
+        BrokerError::LockedOut { .. }
+    ));
+
+    // Requests before Hello are refused; garbage frames end the connection.
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut raw = tokio::net::UnixStream::connect(socket_path(&root))
+        .await
+        .unwrap();
+    raw.write_all(b"A206\0\x01\xff\xff\xff\xff").await.unwrap();
+    let mut buf = [0; 16];
+    assert_eq!(raw.read(&mut buf).await.unwrap(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn totp_enrollment_then_unlock_requires_a_code() {
+    let (_dir, root, _task) = start().await;
+    let password = random();
+    let mut a = user(&root).await;
+    a.call(unlock(&password, None, true)).await.unwrap();
+    let mut fresh = user(&root).await;
+    assert_eq!(
+        denied(fresh.call(Request::BeginTotp { account: random() }).await),
+        BrokerError::StepUpRequired
+    );
+    assert_eq!(
+        denied(
+            fresh
+                .call(Request::ConfirmTotp {
+                    code: "000000".into()
+                })
+                .await
+        ),
+        BrokerError::NoPendingEnrollment
+    );
+    let key = match a
+        .call(Request::BeginTotp { account: random() })
+        .await
+        .unwrap()
+    {
+        Reply::TotpEnrollment {
+            otpauth_url,
+            manual_key,
+            ..
+        } => {
+            assert!(otpauth_url.expose().starts_with("otpauth://totp/"));
+            assert_eq!(format!("{manual_key:?}"), "[REDACTED]");
+            manual_key.expose().to_owned()
+        }
+        other => panic!("unexpected {other:?}"),
+    };
+    let generator = totp_rs::TOTP::new_unchecked(
+        totp_rs::Algorithm::SHA1,
+        6,
+        1,
+        30,
+        totp_rs::Secret::Encoded(key).to_bytes().unwrap(),
+        None,
+        String::new(),
+    );
+    let now = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    };
+    let code = generator.generate(now());
+    a.call(Request::ConfirmTotp { code: code.clone() })
+        .await
+        .unwrap();
+    a.call(Request::Lock).await.unwrap();
+    assert_eq!(
+        denied(a.call(unlock(&password, None, false)).await),
+        BrokerError::TotpRequired
+    );
+    assert!(!status(&mut a).await.unlocked);
+    // The confirming code cannot be replayed to unlock.
+    assert_eq!(
+        denied(a.call(unlock(&password, Some(code), false)).await),
+        BrokerError::TotpReplayed
+    );
+    // Wait for a fresh step so the next code is unused.
+    let step = now() / 30;
+    while now() / 30 == step {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    a.call(unlock(&password, Some(generator.generate(now())), false))
+        .await
+        .unwrap();
+    assert_eq!(status(&mut a).await.totp_enrolled, Some(true));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn provider_calls_are_destination_bound_and_value_free() {
+    use axum::{Router, http::HeaderMap, routing::get};
+    let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+    let body = random();
+    let app = {
+        let seen = seen.clone();
+        let body = body.clone();
+        Router::new()
+            .route(
+                "/ok",
+                get(move |headers: HeaderMap| {
+                    let seen = seen.clone();
+                    let body = body.clone();
+                    async move {
+                        let auth = headers
+                            .get("authorization")
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or_default()
+                            .to_owned();
+                        seen.lock().unwrap().push(auth);
+                        body
+                    }
+                }),
+            )
+            .route(
+                "/fail",
+                get(|headers: HeaderMap| async move {
+                    // An upstream error that echoes the credential must not be relayed.
+                    let echoed = headers
+                        .get("authorization")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or_default()
+                        .to_owned();
+                    (axum::http::StatusCode::UNAUTHORIZED, echoed)
+                }),
+            )
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let (_dir, root, _task) = start().await;
+    let password = random();
+    let mut a = user(&root).await;
+    a.call(unlock(&password, None, true)).await.unwrap();
+    let (bound, unbound, value) = (random(), random(), random());
+    for (name, destinations) in [
+        (&bound, vec![format!("{origin}/ignored/path")]),
+        (&unbound, vec![]),
+    ] {
+        a.call(Request::PutCredential {
+            name: name.clone(),
+            meta: meta(destinations),
+            value: WireValue::Single(WireSecret::new(value.clone())),
+        })
+        .await
+        .unwrap();
+    }
+    let mut gateway = Client::connect(&root, Role::Gateway).await.unwrap();
+    let call = |credential: &str, path: &str| {
+        Request::Provider(ProviderCall {
+            credential: credential.to_owned(),
+            method: HttpMethod::Get,
+            url: format!("{origin}{path}"),
+            auth: AuthScheme::Bearer,
+            anthropic_version: None,
+            body: None,
+        })
+    };
+    match gateway.call(call(&bound, "/ok")).await.unwrap() {
+        Reply::Provider { status, body: got } => {
+            assert_eq!(status, 200);
+            assert_eq!(got, body.as_bytes());
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+    assert_eq!(*seen.lock().unwrap(), [format!("Bearer {value}")]);
+    match gateway.call(call(&bound, "/fail")).await.unwrap() {
+        Reply::Provider { status, body } => {
+            assert_eq!(status, 401);
+            assert!(body.is_empty());
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+    assert_eq!(
+        denied(gateway.call(call(&unbound, "/ok")).await),
+        BrokerError::Denied(a206_vault::Denial::DestinationNotBound)
+    );
+    // A non-loopback plain-HTTP destination is refused before any lookup.
+    let mut plain = call(&bound, "/ok");
+    if let Request::Provider(c) = &mut plain {
+        c.url = "http://example.invalid/ok".into();
+    }
+    assert!(matches!(
+        denied(gateway.call(plain).await),
+        BrokerError::Invalid(InvalidRequest::ProviderUrl)
+    ));
+    assert_eq!(seen.lock().unwrap().len(), 1);
+    // Locked vault: the gateway is told so instead of silently failing.
+    a.call(Request::Lock).await.unwrap();
+    assert_eq!(
+        denied(gateway.call(call(&bound, "/ok")).await),
+        BrokerError::Locked
+    );
+}

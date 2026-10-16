@@ -3,6 +3,29 @@
 version = 4
 
 [[package]]
+name = "a206-broker"
+version = "0.1.0"
+dependencies = [
+ "a206-protocol",
+ "a206-vault",
+ "axum",
+ "fs2",
+ "futures-util",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-util",
+ "totp-rs",
+ "tracing",
+ "url",
+ "uuid",
+ "zeroize",
+]
+
+[[package]]
 name = "a206-core"
 version = "0.1.0"
 dependencies = [
@@ -41,6 +64,7 @@ dependencies = [
 name = "a206-runtime"
 version = "0.1.0"
 dependencies = [
+ "a206-broker",
  "a206-core",
  "a206-extensions",
  "a206-protocol",
@@ -176,6 +200,7 @@ dependencies = [
 name = "agent206"
 version = "0.1.0"
 dependencies = [
+ "a206-broker",
  "a206-core",
  "a206-extensions",
  "a206-protocol",

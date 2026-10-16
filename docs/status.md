@@ -24,7 +24,7 @@ implemented structure for finished agent execution or security parity.
 | Projects/subagents | Project coordinator conversations, parent-linked delegated threads, explicit model allowlists, narrowed grants, revocation checks | Autonomous project management, task assignment, scheduler/budgets, steering and hierarchical cancellation |
 | Concurrent UI | Resizable navigation/chat/inspector, two visible conversations, independently scoped controls, conversation title editing, searchable complete conversation list, compact integrated composer controls, themed raised/feature surfaces | More than two visible threads, saved layouts and comprehensive terminal interaction QA |
 | Navigation | Typed Dioxus Router routes, persistent shell, fc-dioxus links, Back/Forward controls, conversation and split-view URLs, deep-link reloads, loading/missing recovery | Cross-profile deep-link handling, draft/form preservation across route unmounts, terminal interaction acceptance |
-| Vault | SecureStore-compatible encryption, locked state, redacted nonserializable secret type, private atomic writes, interactive standalone CLI; library-level typed credentials in RustyClaw's layout, all five access policies plus disabled/agent switch, verified TOTP enrollment with replay protection, auth throttle and reveal step-up window; the CLI challenges enrolled vaults | Isolated encrypted broker IPC wiring these pieces, approval UI, GUI enrollment, recovery codes, key-file migration, credential use in providers/browser |
+| Vault | SecureStore-compatible encryption, locked state, redacted nonserializable secret type, private atomic writes, interactive standalone CLI; library-level typed credentials in RustyClaw's layout, all five access policies plus disabled/agent switch, verified TOTP enrollment with replay protection, auth throttle and reveal step-up window; the CLI challenges enrolled vaults ; a separate broker process owns the vault, serves the CLI and performs destination-bound provider requests for the gateway | Desktop/TUI unlock and enrollment, agent approval UI, recovery codes, key-file migration, remote broker over SSH, credentialed external backends and browser injection |
 | Security model | Deny-by-default grants, no secret-bearing agent tool, restricted MCP, bounded worker, SSRF-resistant public downloads, capability-scoped text reads | Full RustyClaw defense parity, OS sandbox profiles, leak/injection boundary scanning, adversarial review |
 | WASM | Genuine compiled bundled inspector, separate child, no imports/WASI, fuel/memory/output/time bounds | General SDK inputs/host calls, user/agent package creation and reviewed installation, most tools as extensions |
 | Plugin UI/API | Versioned manifest and executable v1 documented; trusted text-only extension panel | Rich validated component descriptions, panel/viewer/command contributions and subscriptions |
@@ -38,8 +38,11 @@ implemented structure for finished agent execution or security parity.
 
 ## Explicitly disabled
 
-Credential-backed provider dispatch fails with an explanatory error. The gateway
-never falls back to reading a credential into its own model context. Browser
+Credential-backed providers work only through the vault broker: the vault must be
+unlocked and the credential bound to the provider's exact origin, or the request
+fails with an explanation. The gateway never reads a credential value, and agents
+still have no credential use. External coding backends still refuse credentialed
+providers. Browser
 preview has no credential injection. Third-party extension installation and
 capability-bearing imports are unavailable. New coding conversations have no
 execution or filesystem grants. A coding mode label alone does not claim a working

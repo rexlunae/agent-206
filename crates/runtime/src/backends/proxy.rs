@@ -241,11 +241,14 @@ mod tests {
             credential: None,
             api: ProviderApi::OpenAi,
         };
-        let info = crate::provider::catalog(&config)
-            .await
-            .unwrap()
-            .models
-            .remove(0);
+        let info = crate::provider::catalog(
+            &config,
+            crate::provider::Broker(std::path::Path::new("/nonexistent")),
+        )
+        .await
+        .unwrap()
+        .models
+        .remove(0);
         let proxy = Proxy::start(config, info).await.unwrap();
         let base = format!("http://127.0.0.1:{}/v1", proxy.port());
         let client = reqwest::Client::new();

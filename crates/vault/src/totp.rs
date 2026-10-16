@@ -144,7 +144,7 @@ impl Vault {
     /// produces a current code. The confirming step cannot be replayed later.
     pub fn confirm_totp_enrollment(
         &mut self,
-        pending: PendingTotp,
+        pending: &PendingTotp,
         code: &str,
         now: u64,
     ) -> Result<(), Error> {
@@ -239,7 +239,7 @@ mod tests {
             (code_at(&pending, t).parse::<u32>().unwrap() + 1) % 1_000_000
         );
         assert!(matches!(
-            vault.confirm_totp_enrollment(pending, &wrong, t),
+            vault.confirm_totp_enrollment(&pending, &wrong, t),
             Err(Error::TotpRejected)
         ));
         assert!(!vault.totp_enrolled().unwrap());
@@ -250,11 +250,11 @@ mod tests {
         let late = vault.begin_totp_enrollment(&account, t).unwrap();
         let late_code = code_at(&late, expired_at);
         assert!(matches!(
-            vault.confirm_totp_enrollment(late, &late_code, expired_at),
+            vault.confirm_totp_enrollment(&late, &late_code, expired_at),
             Err(Error::EnrollmentExpired)
         ));
         let spaced = format!("{} {}", &code[..3], &code[3..]);
-        vault.confirm_totp_enrollment(pending, &spaced, t).unwrap();
+        vault.confirm_totp_enrollment(&pending, &spaced, t).unwrap();
         // Enrollment survives relock; the confirming code cannot be replayed.
         vault.lock();
         vault.unlock(&password).unwrap();
@@ -277,7 +277,7 @@ mod tests {
         let pending = vault.begin_totp_enrollment("a", t).unwrap();
         let generator = pending.totp().unwrap();
         vault
-            .confirm_totp_enrollment(pending, &generator.generate(t), t)
+            .confirm_totp_enrollment(&pending, &generator.generate(t), t)
             .unwrap();
         let next = t + STEP;
         // A code from the previous step is accepted once if not yet consumed.

@@ -1,10 +1,24 @@
 # Gateway enrollment and RustyClaw security parity
 
-This is the required implementation contract, not a claim that enrollment works
-today. Gateway lifecycle controls are implemented separately. The current gateway
-must not advertise security readiness, accept provider credentials or enable vault
-use merely because it is running. The encrypted broker and GUI enrollment are the
-next implementation gate; the standalone vault CLI is not a substitute for it.
+This is the required implementation contract, not a claim that enrollment is
+complete. Gateway lifecycle controls are implemented separately. The gateway must
+not advertise security readiness or enable vault use merely because it is running.
+
+Implemented now: a separate vault broker process (`a206-broker`, started by
+`agent206 vault`) owns the decrypted vault. Trusted user surfaces reach it directly
+over a mode-0600 socket in the mode-0700 `vault/` profile directory, so the
+gateway never relays passwords, codes or values. The gateway connects with the
+`Gateway` role, which can only ask the broker to send a provider request to an
+origin the user bound to that credential; it never receives the value. The CLI
+is the first trusted surface. GUI enrollment and agent approvals are the next gate.
+
+Limits of today's boundary: any process running as the same OS user can open the
+socket and claim the user role. Step-up (password, or a TOTP code when enrolled)
+guards reveal, policy, destination, deletion, overwrite and agent-access changes,
+but a same-user attacker that already holds the password is not stopped. Agent
+execution must therefore keep the profile directory outside its OS sandbox, as
+the macOS backend isolation already does. Remote vault access over SSH is not
+wired yet; the broker is local to the gateway host.
 
 ## Source baseline
 
@@ -63,7 +77,7 @@ protection on a renderer or platform that cannot enforce it.
 | Requirement | RustyClaw behavior to retain | Agent 206 status / acceptance |
 | --- | --- | --- |
 | Vault encryption | Password or owner-only key file, atomic encrypted writes | Legacy password-based library tested; key-file import, modern envelope and broker pending |
-| Process/channel separation | Secrets outside agent context | Worker/agent boundaries exist; isolated encrypted vault IPC pending |
+| Process/channel separation | Secrets outside agent context | Separate broker process with role-limited bounded MessagePack IPC, tested; gateway role is value-free. Same-user socket access and remote SSH channel are open items (see above) |
 | TOTP | Vault-held seed is authoritative; 6 digits, 30-second steps, ±1 step | Library: seed generated in memory and committed only after a valid code, enrollment expiry, ±1 step, persisted replay protection, drift diagnosis, code-gated removal; seed stored under RustyClaw's key so imported vaults stay enrolled; tested. Standalone CLI challenges enrolled vaults. Broker connect challenge, GUI enrollment and recovery codes pending |
 | Authentication throttling | Shared 3-failure / 30-second lockout over a 60-second failure window | Library throttle keyed by principal, not connection, tested; failures during lockout neither shorten nor extend it. Broker-wide wiring pending (the standalone CLI is one attempt per process) |
 | Per-credential policy | Always, WithApproval, WithAuth, SkillOnly, TriggerOnly | All variants, RustyClaw JSON shape, unknown variants rejected; evaluated deny-by-default and tested. Approval/step-up facts must come from the broker's trusted surface, pending |

@@ -41,6 +41,11 @@ pub struct CredentialMeta {
     pub description: Option<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub disabled: bool,
+    /// Exact origins (`scheme://host[:port]`) the broker may send this
+    /// credential to on the user's behalf. Agent 206 extension; empty means
+    /// no brokered destination, which is how imported RustyClaw entries start.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub destinations: Vec<String>,
 }
 
 /// Facts the broker established for one agent-initiated use. Only the trusted
@@ -54,7 +59,7 @@ pub struct AccessContext {
     pub active_trigger: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
 pub enum Denial {
     #[error("agent access to the vault is turned off")]
     AgentAccessDisabled,
@@ -68,6 +73,10 @@ pub enum Denial {
     SkillNotPermitted,
     #[error("the active trigger is not permitted")]
     TriggerNotPermitted,
+    #[error("the credential is not bound to this destination")]
+    DestinationNotBound,
+    #[error("this credential kind cannot be sent as a bearer value")]
+    UnsupportedKind,
 }
 
 impl CredentialMeta {
@@ -109,6 +118,7 @@ mod tests {
             policy,
             description: None,
             disabled: false,
+            destinations: vec![],
         }
     }
     fn name() -> String {
