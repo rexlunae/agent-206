@@ -39,6 +39,29 @@ attribution. Prefer a small replacement over carrying historical architecture.
   deduplication and explicit resynchronization when replay is unavailable. TCP/SSH
   already retransmits packets; do not invent a second unreliable packet transport.
 
+## Errors and observability
+
+- Errors propagate to the client that started the operation, which displays them
+  with recovery actions where possible. Never drop a failure, replace it with a
+  generic message, or report success after a partial failure.
+- Keep errors structured until the presentation edge. Libraries define small
+  thiserror enums next to the code that fails; no crate-wide catch-all or
+  Box<dyn Error>, and anyhow only at binary top level. Add context with typed
+  variants that keep the cause in source(); do not map_err to strings or format!
+  an error into another error. Flatten to text only where it is rendered: UI,
+  CLI output or a model-facing tool result.
+- Errors crossing the gateway or extension boundary are versioned MessagePack
+  values: stable kind/code, human message, cause chain and correlation id, so a
+  client can display, match and examine them without parsing prose.
+- Record errors with tracing as structured fields (error = &e as &dyn Error,
+  plus ids), not interpolated strings, at the point they are handled. Use spans
+  for operation context. Library code never prints; the CLI owns user output.
+- Discarding a Result is a written decision: propagate with ?, or warn! on a
+  path that must not abort, or comment why the failure is unactionable. No
+  unwrap/expect outside tests except documented invariants; panic only for
+  programmer errors, never input, I/O or network failures.
+- Error messages, Debug output and spans redact secrets like every other event.
+
 ## Data and interoperability
 
 - Human-authored configuration, prompts, plugin manifests and themes use TOML.
@@ -122,9 +145,18 @@ attribution. Prefer a small replacement over carrying historical architecture.
 
 - Check popular, maintained Rust crates and primary documentation before choosing
   major dependencies. Pin git dependencies and keep Cargo.lock committed.
-- Run cargo fmt --all -- --check, cargo test --workspace and relevant renderer
-  builds. Test policy denials, malformed frames, replay, vault failures and sandbox
-  limits. Test behavior, not an implementation's own constants.
+- Run cargo fmt --all -- --check, cargo clippy --workspace --all-targets -- -D
+  warnings, cargo test --workspace and relevant renderer builds; a change is not
+  done while it adds warnings. Test policy denials, malformed frames, replay,
+  vault failures, sandbox limits and that errors reach the client intact. Test
+  behavior, not an implementation's own constants: a test must be able to fail.
+  Tests are deterministic, with no network or wall-clock dependence, and live in
+  the owning crate so Cargo actually runs them.
+- Async code never holds a lock across .await, awaits or deliberately detaches
+  (with a comment) every spawned task, and documents futures that are not
+  cancel-safe. Prefer channels to shared mutable state.
+- Keep PRs focused; report unrelated problems separately instead of drive-by
+  refactors.
 - Keep docs/status.md accurate: distinguish implemented, tested, experimental and
   planned. Never call a scaffold a complete secure product. No bypass to make a
   check pass, and no claim of end-to-end support based solely on compilation.
