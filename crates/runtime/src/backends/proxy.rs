@@ -1,6 +1,5 @@
 //! A backend can reach only this proxy. Its selected model is an inference ceiling.
 use a206_core::*;
-use anyhow::Result;
 use axum::{
     Router,
     body::{Body, Bytes},
@@ -11,6 +10,28 @@ use axum::{
 };
 use futures_util::StreamExt;
 use serde_json::{Value, json};
+/// A proxy failure, recorded where it happens; the backend sees only a status.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ProxyError {
+    #[error("backend credential proxy stopped")]
+    Stopped(#[source] std::io::Error),
+    #[error(transparent)]
+    Provider(#[from] crate::provider::ProviderError),
+    #[error("backend stopped")]
+    Cancelled,
+    #[error("provider returned an invalid HTTP status")]
+    Status(#[source] axum::http::status::InvalidStatusCode),
+}
+impl crate::error::Classified for ProxyError {
+    fn kind(&self) -> Option<ErrorKind> {
+        match self {
+            Self::Stopped(_) => Some(ErrorKind::Unavailable),
+            Self::Provider(error) => crate::error::classify(error),
+            Self::Cancelled => Some(ErrorKind::Cancelled),
+            Self::Status(_) => Some(ErrorKind::Provider),
+        }
+    }
+}
 #[derive(Clone)]
 struct Scope {
     config: ProviderConfig,
@@ -32,7 +53,7 @@ impl Drop for Proxy {
     }
 }
 impl Proxy {
-    pub async fn start(config: ProviderConfig, model: ModelInfo) -> Result<Self> {
+    pub async fn start(config: ProviderConfig, model: ModelInfo) -> std::io::Result<Self> {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let port = listener.local_addr()?.port();
         let token = Id::new_v4().to_string();
@@ -51,10 +72,7 @@ impl Proxy {
         let task = tokio::spawn(async move {
             // A failed proxy surfaces to the backend as refused requests; record why.
             if let Err(error) = axum::serve(listener, router).await {
-                crate::error::handle(
-                    "backend_proxy",
-                    &anyhow::Error::from(error).context("backend credential proxy stopped"),
-                );
+                crate::error::handle("backend_proxy", &ProxyError::Stopped(error));
             }
         });
         Ok(Self {
@@ -157,7 +175,8 @@ async fn forward(
         body[field] = json!(budget);
     }
     let result = async {
-        let url = crate::provider::endpoint(&scope.config, path)?;
+        let url = crate::provider::endpoint(&scope.config, path)
+            .map_err(crate::provider::ProviderError::from)?;
         let mut request = crate::provider::client()?.post(url).json(&body);
         if scope.config.api == ProviderApi::Anthropic {
             request = request.header("anthropic-version", "2023-06-01");
@@ -165,12 +184,15 @@ async fn forward(
                 request = request.header("anthropic-beta", beta);
             }
         }
-        let upstream = tokio::select! { result = request.send() => result?, _ = scope.stop.cancelled() => anyhow::bail!("backend stopped") };
+        let upstream = tokio::select! {
+            result = request.send() => result.map_err(|error| crate::provider::ProviderError::Transport(error.without_url()))?,
+            _ = scope.stop.cancelled() => return Err(ProxyError::Cancelled),
+        };
         let status = upstream.status();
         if !status.is_success() {
-            return Ok::<_, anyhow::Error>(
+            return Ok::<_, ProxyError>(
                 (
-                    StatusCode::from_u16(status.as_u16())?,
+                    StatusCode::from_u16(status.as_u16()).map_err(ProxyError::Status)?,
                     "Provider rejected the backend request",
                 )
                     .into_response(),
@@ -197,8 +219,10 @@ async fn forward(
         Ok(response)
     }
     .await;
-    result
-        .unwrap_or_else(|_| (StatusCode::BAD_GATEWAY, "Provider connection failed").into_response())
+    result.unwrap_or_else(|error| {
+        crate::error::handle("backend_proxy", &error);
+        (StatusCode::BAD_GATEWAY, "Provider connection failed").into_response()
+    })
 }
 
 #[cfg(test)]

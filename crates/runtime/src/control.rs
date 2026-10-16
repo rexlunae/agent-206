@@ -5,13 +5,59 @@ use a206_core::{
     Command, ErrorKind, ErrorReport, GatewayAction, GatewayInfo, GatewayPhase, GatewayReport,
     Ignore, Reply,
 };
-use anyhow::Result;
 use std::{
     path::PathBuf,
     sync::{Arc, Mutex},
     time::Duration,
 };
 use tokio::sync::{mpsc, oneshot};
+
+/// Why a lifecycle action or gateway call failed.
+#[derive(Debug, thiserror::Error)]
+pub enum ControlError {
+    /// The gateway ran the command and reported this failure.
+    #[error(transparent)]
+    Rejected(ErrorReport),
+    #[error(transparent)]
+    Client(#[from] crate::client::ClientError),
+    #[error(transparent)]
+    Service(#[from] crate::service::ServiceError),
+    #[error("gateway did not return status; update the gateway executable")]
+    NoStatus,
+    #[error("gateway did not acknowledge shutdown")]
+    NoShutdownAck,
+    #[error("control request ID reused with a different operation")]
+    ReusedId,
+    #[error(
+        "control receipt limit reached; reopen the controller before submitting more lifecycle changes"
+    )]
+    ReceiptLimit,
+    #[error("gateway operation timed out; check status before retrying")]
+    Timeout(#[source] tokio::time::error::Elapsed),
+    #[error("gateway controller unavailable")]
+    Unavailable,
+    #[error("gateway controller disconnected")]
+    Disconnected,
+    #[error("{lock} lock poisoned")]
+    Poisoned { lock: &'static str },
+}
+impl crate::error::Classified for ControlError {
+    fn kind(&self) -> Option<ErrorKind> {
+        Some(match self {
+            // `transparent` hides these from the chain, so classify them here.
+            Self::Rejected(report) => return Some(report.kind).filter(|k| *k != ErrorKind::Other),
+            Self::Client(error) => return crate::error::classify(error),
+            Self::Service(error) => return crate::error::classify(error),
+            Self::NoStatus | Self::NoShutdownAck => ErrorKind::Protocol,
+            Self::ReusedId => ErrorKind::Conflict,
+            Self::ReceiptLimit | Self::Unavailable | Self::Disconnected => ErrorKind::Unavailable,
+            Self::Timeout(_) => ErrorKind::Timeout,
+            Self::Poisoned { .. } => ErrorKind::Internal,
+        })
+    }
+}
+type Result<T, E = ControlError> = std::result::Result<T, E>;
+const CONTROL_LOCK: &str = "gateway connection";
 
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(25);
 type ControlCall = (
@@ -43,22 +89,36 @@ impl GatewayController {
         std::thread::spawn(move || {
             let runtime = match tokio::runtime::Runtime::new() {
                 Ok(runtime) => runtime,
-                Err(_) => return,
+                Err(error) => {
+                    // Callers see the controller as unavailable; the cause is logged here.
+                    crate::error::handle("gateway_controller", &error);
+                    return;
+                }
             };
             runtime.block_on(async move {
                 let mut stopped = remote.is_none() && crate::service::is_stopped(&root);
-                let mut receipts = std::collections::BTreeMap::<uuid::Uuid, (GatewayAction, GatewayReport)>::new();
+                let mut receipts =
+                    std::collections::BTreeMap::<uuid::Uuid, (GatewayAction, GatewayReport)>::new();
                 while let Some((id, action, response)) = receiver.recv().await {
-                    let mutation = matches!(action, GatewayAction::Start | GatewayAction::Stop | GatewayAction::Restart);
+                    let mutation = matches!(
+                        action,
+                        GatewayAction::Start | GatewayAction::Stop | GatewayAction::Restart
+                    );
                     if mutation {
                         if let Some((previous, report)) = receipts.get(&id) {
                             // The caller stopped waiting; there is no one left to tell.
-                            response.send(if *previous == action { Ok(report.clone()) } else { Err(ErrorReport::new(ErrorKind::Conflict, "control request ID reused with a different operation").into()) }).ignore();
+                            response
+                                .send(if *previous == action {
+                                    Ok(report.clone())
+                                } else {
+                                    Err(ControlError::ReusedId)
+                                })
+                                .ignore();
                             continue;
                         }
                         if receipts.len() >= 4096 {
                             // The caller stopped waiting; there is no one left to tell.
-                            response.send(Err(ErrorReport::new(ErrorKind::Unavailable, "control receipt limit reached; reopen the controller before submitting more lifecycle changes").into())).ignore();
+                            response.send(Err(ControlError::ReceiptLimit)).ignore();
                             continue;
                         }
                     }
@@ -67,13 +127,8 @@ impl GatewayController {
                         manage(&shared, &root, &remote, action, &mut stopped),
                     )
                     .await;
-                    let result = outcome.unwrap_or_else(|_| {
-                        Err(ErrorReport::new(
-                            ErrorKind::Timeout,
-                            "gateway operation timed out; check status before retrying",
-                        )
-                        .into())
-                    });
+                    let result =
+                        outcome.unwrap_or_else(|elapsed| Err(ControlError::Timeout(elapsed)));
                     let report = match result {
                         Ok(info) => GatewayReport::new(
                             target(&root, &remote),
@@ -105,7 +160,9 @@ impl GatewayController {
                             )
                         }
                     };
-                    if mutation { receipts.insert(id, (action, report.clone())); }
+                    if mutation {
+                        receipts.insert(id, (action, report.clone()));
+                    }
                     // The caller stopped waiting; there is no one left to tell.
                     response.send(Ok(report)).ignore();
                 }
@@ -125,18 +182,14 @@ impl GatewayController {
         self.controls
             .send((id, action, sender))
             .await
-            .map_err(|_| {
-                ErrorReport::new(ErrorKind::Unavailable, "gateway controller unavailable")
-            })?;
-        receiver.await.map_err(|_| {
-            ErrorReport::new(ErrorKind::Unavailable, "gateway controller disconnected")
-        })?
+            .map_err(|_| ControlError::Unavailable)?;
+        receiver.await.map_err(|_| ControlError::Disconnected)?
     }
     pub async fn call(&self, command: Command) -> Result<Reply> {
-        current(&self.client)?.call(command).await
+        Ok(current(&self.client)?.call(command).await?)
     }
     pub async fn call_with_id(&self, id: uuid::Uuid, command: Command) -> Result<Reply> {
-        current(&self.client)?.call_with_id(id, command).await
+        Ok(current(&self.client)?.call_with_id(id, command).await?)
     }
 }
 fn target(root: &std::path::Path, remote: &Option<String>) -> String {
@@ -147,20 +200,20 @@ fn target(root: &std::path::Path, remote: &Option<String>) -> String {
 fn current(shared: &Mutex<Client>) -> Result<Client> {
     Ok(shared
         .lock()
-        .map_err(|_| crate::error::poisoned("gateway connection"))?
+        .map_err(|_| ControlError::Poisoned { lock: CONTROL_LOCK })?
         .clone())
 }
 fn replace(shared: &Mutex<Client>, client: Client) -> Result<()> {
     *shared
         .lock()
-        .map_err(|_| crate::error::poisoned("gateway connection"))? = client;
+        .map_err(|_| ControlError::Poisoned { lock: CONTROL_LOCK })? = client;
     Ok(())
 }
 async fn probe(client: Client) -> Result<GatewayInfo> {
     match client.call(Command::GatewayStatus).await? {
         Reply::Gateway(info) => Ok(info),
-        Reply::Error(report) => Err(report.into()),
-        _ => anyhow::bail!("gateway did not return status; update the gateway executable"),
+        Reply::Error(report) => Err(ControlError::Rejected(report)),
+        _ => Err(ControlError::NoStatus),
     }
 }
 async fn stop(
@@ -194,9 +247,9 @@ async fn stop(
     }
     let shutdown = match current(shared)?.call(Command::Shutdown).await {
         Ok(Reply::Ok) => Ok(()),
-        Ok(Reply::Error(report)) => Err(report.into()),
-        Ok(_) => Err(anyhow::anyhow!("gateway did not acknowledge shutdown")),
-        Err(error) => Err(error),
+        Ok(Reply::Error(report)) => Err(ControlError::Rejected(report)),
+        Ok(_) => Err(ControlError::NoShutdownAck),
+        Err(error) => Err(error.into()),
     };
     if let Err(error) = shutdown {
         // Another local controller can finish stop between our status probe and

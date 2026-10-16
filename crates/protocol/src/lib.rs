@@ -22,9 +22,9 @@ pub enum Error {
     Header,
     #[error("frame exceeds the 4 MiB limit")]
     TooLarge,
-    #[error("invalid MessagePack: {0}")]
+    #[error("invalid MessagePack")]
     Decode(#[from] rmp_serde::decode::Error),
-    #[error("MessagePack encoding failed: {0}")]
+    #[error("MessagePack encoding failed")]
     Encode(#[from] rmp_serde::encode::Error),
     #[error("truncated frame")]
     Truncated,

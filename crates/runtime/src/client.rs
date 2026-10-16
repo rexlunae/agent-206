@@ -1,9 +1,57 @@
 //! Dedicated gateway I/O worker. Reconnect unsent work; never repeat an accepted mutation.
-use a206_core::{Command, ErrorKind, ErrorReport, Ignore, Reply};
+use a206_core::{Command, ErrorKind, Ignore, Reply};
 use a206_protocol::{Request, Response};
-use anyhow::{Context, Result};
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 use tokio::sync::{Mutex, mpsc, oneshot};
+/// Why a gateway call did not produce a reply. A command the gateway ran and
+/// rejected is `Ok(Reply::Error(..))`, not one of these.
+#[derive(Debug, thiserror::Error)]
+pub enum ClientError {
+    #[error("gateway disconnected")]
+    Disconnected,
+    #[error("gateway reply lost; refresh before repeating an action")]
+    ReplyLost,
+    #[error("could not start the gateway connection runtime")]
+    Runtime(#[source] std::io::Error),
+    #[error(transparent)]
+    Launch(#[from] crate::transport::LaunchError),
+    #[error("could not launch the gateway connection")]
+    Spawn(#[source] std::io::Error),
+    #[error("gateway {0} pipe missing")]
+    Pipe(&'static str),
+    #[error("gateway has too many outstanding requests")]
+    Busy,
+    #[error("request id is already in flight")]
+    InFlight,
+    #[error(
+        "gateway connection was lost; the command may have completed; refresh state before retrying"
+    )]
+    Lost {
+        /// The gateway's last diagnostics, kept as a cause rather than message text.
+        #[source]
+        diagnostics: Option<Diagnostics>,
+    },
+}
+impl crate::error::Classified for ClientError {
+    fn kind(&self) -> Option<ErrorKind> {
+        Some(match self {
+            Self::Disconnected
+            | Self::ReplyLost
+            | Self::Spawn(_)
+            | Self::Busy
+            | Self::Lost { .. } => ErrorKind::Unavailable,
+            Self::InFlight => ErrorKind::Conflict,
+            Self::Runtime(_) | Self::Pipe(_) => ErrorKind::Internal,
+            // `transparent` hides the launch error from the chain.
+            Self::Launch(error) => return crate::error::classify(error),
+        })
+    }
+}
+/// The tail of the gateway's standard error, shown as received.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct Diagnostics(pub String);
+type Result<T, E = ClientError> = std::result::Result<T, E>;
 type Call = (Request<Command>, oneshot::Sender<Result<Reply>>);
 type Pending = Arc<Mutex<HashMap<uuid::Uuid, oneshot::Sender<Result<Reply>>>>>;
 #[derive(Clone)]
@@ -27,7 +75,7 @@ impl Client {
         let (sender, receiver) = mpsc::channel(32);
         std::thread::spawn(move || {
             let result = tokio::runtime::Runtime::new()
-                .map_err(anyhow::Error::from)
+                .map_err(ClientError::Runtime)
                 .and_then(|runtime| runtime.block_on(run(root, remote, receiver, start, explicit)));
             if let Err(error) = result {
                 crate::error::handle("gateway_connection", &error);
@@ -43,10 +91,8 @@ impl Client {
         self.sender
             .send((Request { id, body }, sender))
             .await
-            .map_err(|_| unavailable("gateway disconnected"))?;
-        receiver
-            .await
-            .map_err(|_| unavailable("gateway reply lost; refresh before repeating an action"))?
+            .map_err(|_| ClientError::Disconnected)?;
+        receiver.await.map_err(|_| ClientError::ReplyLost)?
     }
 }
 async fn run(
@@ -57,8 +103,9 @@ async fn run(
     mut explicit: bool,
 ) -> Result<()> {
     while let Some(first) = receiver.recv().await {
-        let child =
-            crate::transport::gateway_command(&root, remote.as_deref(), start, explicit)?.spawn();
+        let child = crate::transport::gateway_command(&root, remote.as_deref(), start, explicit)
+            .map_err(ClientError::Launch)
+            .and_then(|mut command| command.spawn().map_err(ClientError::Spawn));
         // Only initial connection or an explicit user Start may launch a service.
         start = false;
         explicit = false;
@@ -72,11 +119,7 @@ async fn run(
             }
             Err(error) => {
                 // The caller stopped waiting; there is no one left to tell.
-                first
-                    .1
-                    .send(Err(anyhow::Error::from(error)
-                        .context("could not launch the gateway connection")))
-                    .ignore();
+                first.1.send(Err(error)).ignore();
             }
         }
     }
@@ -87,9 +130,9 @@ async fn connection(
     first: Call,
     receiver: &mut mpsc::Receiver<Call>,
 ) -> Result<bool> {
-    let mut stdin = child.stdin.take().context("gateway stdin missing")?;
-    let mut stdout = child.stdout.take().context("gateway stdout missing")?;
-    let mut stderr = child.stderr.take().context("gateway stderr missing")?;
+    let mut stdin = child.stdin.take().ok_or(ClientError::Pipe("stdin"))?;
+    let mut stdout = child.stdout.take().ok_or(ClientError::Pipe("stdout"))?;
+    let mut stderr = child.stderr.take().ok_or(ClientError::Pipe("stderr"))?;
     let mut diagnostics = tokio::spawn(async move {
         use tokio::io::AsyncReadExt;
         let mut tail = std::collections::VecDeque::with_capacity(8192);
@@ -118,7 +161,7 @@ async fn connection(
                 sender.send(Ok(response.body)).ignore();
             }
         }
-        Ok::<(), anyhow::Error>(())
+        Ok::<(), crate::transport::FrameError>(())
     });
     let mut next = Some(first);
     let mut stopped = false;
@@ -128,13 +171,7 @@ async fn connection(
             outstanding.retain(|_, sender| !sender.is_closed());
             if outstanding.len() >= 32 {
                 // The caller stopped waiting; there is no one left to tell.
-                sender
-                    .send(Err(ErrorReport::new(
-                        ErrorKind::Unavailable,
-                        "gateway has too many outstanding requests",
-                    )
-                    .into()))
-                    .ignore();
+                sender.send(Err(ClientError::Busy)).ignore();
                 continue;
             }
             if let std::collections::hash_map::Entry::Vacant(entry) = outstanding.entry(request.id)
@@ -142,13 +179,7 @@ async fn connection(
                 entry.insert(sender);
             } else {
                 // The caller stopped waiting; there is no one left to tell.
-                sender
-                    .send(Err(ErrorReport::new(
-                        ErrorKind::Conflict,
-                        "request id is already in flight",
-                    )
-                    .into()))
-                    .ignore();
+                sender.send(Err(ClientError::InFlight)).ignore();
                 continue;
             }
             drop(outstanding);
@@ -178,22 +209,12 @@ async fn connection(
         .and_then(Result::ok)
         .unwrap_or_default();
     diagnostics.abort();
-    let lost = ErrorReport::new(
-        ErrorKind::Unavailable,
-        "gateway connection was lost; the command may have completed; refresh state before retrying",
-    );
-    // The gateway's last diagnostics are a cause, not part of the message.
-    let lost = if detail.is_empty() {
-        lost
-    } else {
-        lost.caused_by(ErrorReport::new(ErrorKind::Other, detail))
-    };
     for (_, sender) in pending.lock().await.drain() {
+        let lost = ClientError::Lost {
+            diagnostics: (!detail.is_empty()).then(|| Diagnostics(detail.clone())),
+        };
         // The caller stopped waiting; there is no one left to tell.
-        sender.send(Err(lost.clone().into())).ignore();
+        sender.send(Err(lost)).ignore();
     }
     Ok(stopped)
-}
-fn unavailable(message: &str) -> anyhow::Error {
-    ErrorReport::new(ErrorKind::Unavailable, message).into()
 }
