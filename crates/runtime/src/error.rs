@@ -102,6 +102,7 @@ pub(crate) fn classify(error: &(dyn Error + 'static)) -> Option<ErrorKind> {
         a206_broker::ClientError,
         a206_extensions::ExtensionError,
         a206_protocol::Error,
+        a206_sandbox::SandboxError,
         reqwest::Error,
     );
     if error.is::<tokio::time::error::Elapsed>() {
@@ -114,6 +115,12 @@ pub(crate) fn classify(error: &(dyn Error + 'static)) -> Option<ErrorKind> {
         return Some(ErrorKind::Protocol);
     }
     None
+}
+
+impl Classified for a206_sandbox::SandboxError {
+    fn kind(&self) -> Option<ErrorKind> {
+        a206_sandbox::SandboxError::kind(self)
+    }
 }
 
 impl Classified for a206_broker::BrokerError {

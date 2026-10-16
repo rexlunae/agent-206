@@ -141,7 +141,8 @@ printed authorization link first in each new browser session.
   gateway never reads them. Managed with `agent206 vault`; the desktop setup UI
   and agent approval flow are **not built yet**, so agents cannot use credentials.
 - Official ACP v1 session/prompt/cancel adapter and scoped MCP harness tools.
-- Optional Codex app-server and Claude Agent ACP backends with macOS isolation,
+- Optional Codex app-server and Claude Agent ACP backends with macOS (Seatbelt)
+  and Linux (bubblewrap + Landlock) isolation,
   per-thread project grants, restricted model proxy, streamed text and cancellation.
   Runtimes must be installed separately; authenticated dispatch and external
   delegation remain disabled;

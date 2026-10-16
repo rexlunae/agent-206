@@ -15,6 +15,7 @@ a206-core.workspace = true
 dioxus = { workspace = true, features = ["launch"] }
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 a206-runtime.workspace = true
+a206-sandbox.workspace = true
 a206-protocol.workspace = true
 a206-vault.workspace = true
 a206-broker.workspace = true

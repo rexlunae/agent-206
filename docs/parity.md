@@ -168,7 +168,7 @@ one tool, `rename_thread` (`a206/crates/runtime/src/mcp.rs`); the `Command` enum
 
 | RustyClaw capability | Agent 206 status | How it should land |
 | --- | --- | --- |
-| Landlock, Bubblewrap, Landlock+Bwrap, Docker, macOS sandbox-exec, path validation (`sandbox/*`, `runtime/docker.rs`) | partial: macOS sandbox-exec for external backends only; other platforms refuse (`runtime/src/backends/isolation.rs:300`) | Linux Landlock/bwrap profiles; fail closed, never downgrade |
+| Landlock, Bubblewrap, Landlock+Bwrap, Docker, macOS sandbox-exec, path validation (`sandbox/*`, `runtime/docker.rs`) | partial: external backends run under macOS sandbox-exec, or on Linux under bubblewrap namespaces plus Landlock applied inside, with a loopback-only proxy relay (`crates/sandbox`, `runtime/src/backends/isolation.rs`); missing bwrap or Landlock is an error, never a fallback. Docker and path-validation modes are deliberately not ported (they are downgrades); native exec and the WASM worker are not sandboxed yet | Reuse `a206-sandbox` profiles for native exec and the extension worker |
 | SSH runtime adapter for remote exec (`runtime/ssh.rs`) | missing (remote gateway via SSH exists) | Execute on remote gateway rather than per-command SSH |
 | WASM tool sandbox | present (a206 extra): fuel/memory/time-bounded worker, no WASI (`a206/crates/extensions`) | Add OS profile to worker |
 
@@ -192,8 +192,8 @@ one tool, `rename_thread` (`a206/crates/runtime/src/mcp.rs`); the `Command` enum
    Without it no tool, memory, cron or channel feature is reachable by a model.
 3. **Extension ABI v2** (MessagePack input, scoped host calls for workspace/exec/network/git, typed
    UI contributions, reviewed install). Every RustyClaw tool family is meant to ship as a WASM builtin.
-4. **OS sandbox for exec on Linux (Landlock/bwrap) and the WASM worker**, so Execute/WriteWorkspace
-   grants can be offered natively and off macOS.
+4. **OS sandbox for native exec and the WASM worker.** External backends are isolated on macOS and
+   Linux; native Execute/WriteWorkspace grants still need the same profiles (`crates/sandbox`).
 5. **Context management**: compaction keyed to API-reported limits, workspace instruction files,
    memory extension. Needed for long-running and scheduled agents.
 6. **Delegation/task lifecycle** (agent-requested spawn, steering, hierarchical cancel, budgets) →
