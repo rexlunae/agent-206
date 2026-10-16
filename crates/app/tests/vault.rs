@@ -42,5 +42,10 @@ async fn broker_autostarts_reports_locked_state_and_stops() -> Result<()> {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
     assert!(!socket.exists());
+    // Stopping again reports the absence and starts nothing.
+    let again = capture(vault(root, &["stop"])?).await?;
+    assert!(again.status.success(), "{again:?}");
+    assert!(String::from_utf8(again.stdout)?.contains("not running"));
+    assert!(!socket.exists());
     Ok(())
 }

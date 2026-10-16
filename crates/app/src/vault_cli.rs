@@ -336,7 +336,15 @@ pub fn run(root: &Path, action: VaultAction) -> Result<()> {
             // Works against a broker from any version, and never starts one.
             VaultAction::Stop => {
                 match Client::shutdown(root).await {
-                    Err(ClientError::Io(_)) => println!("Vault broker is not running"),
+                    // Only an absent or unbound socket means no broker.
+                    Err(ClientError::Io(e))
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                        ) =>
+                    {
+                        println!("Vault broker is not running")
+                    }
                     result => {
                         result?;
                         println!("Vault broker stopped");
