@@ -164,28 +164,38 @@ impl Session {
             return Err(McpError::UnknownTool);
         }
         let params = CallToolRequestParams::new(tool.to_owned()).with_arguments(arguments);
-        let request = self
-            .peer
-            .send_cancellable_request(
-                ClientRequest::CallToolRequest(CallToolRequest::new(params)),
-                PeerRequestOptions::no_options(),
-            )
-            .await
-            .map_err(McpError::Service)?;
-        let id = request.id.clone();
-        let limit = timeout.unwrap_or(self.limits.call_timeout);
-        let response = tokio::select! {
-            response = tokio::time::timeout(limit, request.await_response()) => match response {
-                Ok(response) => response.map_err(McpError::Service)?,
-                Err(elapsed) => {
-                    self.cancel_request(id, "timed out").await;
-                    return Err(McpError::Timeout(elapsed));
+        // One deadline covers sending, which blocks if the server stops
+        // reading, and waiting for the reply.
+        let deadline = tokio::time::Instant::now() + timeout.unwrap_or(self.limits.call_timeout);
+        let mut sent = None;
+        let outcome = {
+            let call = async {
+                let request = self
+                    .peer
+                    .send_cancellable_request(
+                        ClientRequest::CallToolRequest(CallToolRequest::new(params)),
+                        PeerRequestOptions::no_options(),
+                    )
+                    .await
+                    .map_err(McpError::Service)?;
+                sent = Some(request.id.clone());
+                request.await_response().await.map_err(McpError::Service)
+            };
+            tokio::select! {
+                response = tokio::time::timeout_at(deadline, call) => {
+                    response.map_err(McpError::Timeout).and_then(|response| response)
                 }
-            },
-            () = revoked => {
-                self.cancel_request(id, "permission revoked").await;
-                return Err(McpError::Revoked);
+                () = revoked => Err(McpError::Revoked),
             }
+        };
+        let response = match outcome {
+            Err(error @ (McpError::Timeout(_) | McpError::Revoked)) => {
+                if let Some(id) = sent {
+                    self.cancel_request(id, &error);
+                }
+                return Err(error);
+            }
+            outcome => outcome?,
         };
         // Follow-up rounds and server-side tasks need client features this
         // client does not offer, so a conforming server never sends them.
@@ -213,20 +223,26 @@ impl Session {
             structured: result.structured_content,
         })
     }
-    /// Tell the server to stop work on an abandoned request.
-    async fn cancel_request(&self, id: RequestId, reason: &str) {
+    /// Tell the server to stop work on an abandoned request, without waiting:
+    /// a server that stopped reading must not delay the caller's result.
+    fn cancel_request(&self, id: RequestId, reason: &McpError) {
         let notification = CancelledNotification::new(CancelledNotificationParam::new(
             Some(id),
-            Some(reason.to_owned()),
+            Some(reason.to_string()),
         ));
-        if let Err(error) = self.peer.send_notification(notification.into()).await {
-            // The call already failed for its caller; a server that cannot hear
-            // the cancellation has exited or broken its pipe.
-            tracing::warn!(
-                error = &error as &dyn std::error::Error,
-                "MCP cancellation not delivered"
-            );
-        }
+        let peer = self.peer.clone();
+        // Detached on purpose: the send ends when delivered or when the
+        // session loop ends, which `stop` (also run on drop) forces.
+        tokio::spawn(async move {
+            if let Err(error) = peer.send_notification(notification.into()).await {
+                // The call already failed for its caller; a server that cannot
+                // hear the cancellation has exited or broken its pipe.
+                tracing::warn!(
+                    error = &error as &dyn std::error::Error,
+                    "MCP cancellation not delivered"
+                );
+            }
+        });
     }
     /// End the session now, stopping the server and failing in-flight calls.
     pub fn stop(&self) {

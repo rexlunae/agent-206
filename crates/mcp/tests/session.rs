@@ -113,6 +113,60 @@ async fn a_server_that_exits_closes_its_session() {
     assert!(session.is_closed());
 }
 
+/// Answers initialization and the tool listing, then stops reading, as a
+/// wedged server would: its input pipe fills and writes to it block.
+async fn wedged() -> Session {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    let (client, server) = tokio::io::duplex(4096);
+    // Ends when the session closes its side.
+    tokio::spawn(async move {
+        let (read, mut write) = tokio::io::split(server);
+        let mut lines = tokio::io::BufReader::new(read).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            let message: serde_json::Value = serde_json::from_str(&line).unwrap();
+            let result = match message["method"].as_str() {
+                Some("initialize") => serde_json::json!({
+                    "protocolVersion": message["params"]["protocolVersion"],
+                    "capabilities": { "tools": {} },
+                    "serverInfo": { "name": "wedged", "version": "1" },
+                }),
+                Some("tools/list") => serde_json::json!({
+                    "tools": [{ "name": "echo", "inputSchema": { "type": "object" } }],
+                }),
+                _ => continue,
+            };
+            let reply =
+                serde_json::json!({ "jsonrpc": "2.0", "id": message["id"], "result": result });
+            write
+                .write_all(format!("{reply}\n").as_bytes())
+                .await
+                .unwrap();
+            if message["method"] == "tools/list" {
+                // Keep the pipe open but never read again.
+                std::future::pending::<()>().await;
+            }
+        }
+    });
+    let (read, write) = tokio::io::split(client);
+    Session::start((read, write), None, Limits::default())
+        .await
+        .unwrap()
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_call_timeout_covers_a_send_that_blocks() {
+    let session = wedged().await;
+    let text = "x".repeat(64 * 1024);
+    let result = session
+        .call(
+            "echo",
+            arguments(serde_json::json!({ "text": text })),
+            Some(std::time::Duration::from_secs(5)),
+        )
+        .await;
+    assert!(matches!(result, Err(McpError::Timeout(_))), "{result:?}");
+}
+
 #[tokio::test]
 async fn bounds_the_tool_listing() {
     let limits = Limits {

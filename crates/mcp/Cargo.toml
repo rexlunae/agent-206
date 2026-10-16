@@ -18,5 +18,6 @@ schemars = "1"
 nix = { version = "0.31", features = ["signal", "process"] }
 [dev-dependencies]
 uuid.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
 [lints]
 workspace = true
