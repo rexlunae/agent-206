@@ -87,6 +87,26 @@ async fn replayed_shutdown_does_not_stop_a_restarted_process() -> Result<()> {
 }
 
 #[tokio::test]
+async fn concurrent_cli_stops_all_acknowledge_the_stopped_profile() -> Result<()> {
+    let mut app = App::start(tempfile::tempdir()?, BTreeMap::new()).await?;
+    for _ in 0..3 {
+        let stops = tokio::join!(
+            report(&app, "stop"),
+            report(&app, "stop"),
+            report(&app, "stop"),
+            report(&app, "stop")
+        );
+        for stopped in [stops.0?, stops.1?, stops.2?, stops.3?] {
+            ensure!(stopped.phase == GatewayPhase::Stopped && stopped.error.is_none());
+        }
+        ensure!(app.root.join("gateway.stopped").exists());
+        ensure!(report(&app, "start").await?.phase == GatewayPhase::Running);
+    }
+    app.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn stop_stays_stopped_and_restart_preserves_profile() -> Result<()> {
     let mut app = App::start(tempfile::tempdir()?, BTreeMap::new()).await?;
     app.cli(&["new", "Lifecycle persistence"]).await?;
@@ -393,12 +413,46 @@ async fn web_controls_require_authority_and_deduplicate_restart() -> Result<()> 
         .await?,
         Reply::Thread(_)
     ));
+
+    // Queue stops on independent connections while catalog I/O still holds up
+    // cleanup. A following status reply proves each stop frame was accepted.
+    // Both acknowledgements must flush before the daemon releases its profile.
+    let mut stopping = Vec::new();
+    for _ in 0..2 {
+        let mut socket = tokio::net::UnixStream::connect(app.root.join("gateway.sock")).await?;
+        let shutdown_id = uuid::Uuid::new_v4();
+        let status_id = uuid::Uuid::new_v4();
+        for (id, body) in [
+            (shutdown_id, Command::Shutdown),
+            (status_id, Command::GatewayStatus),
+        ] {
+            a206_runtime::transport::write_frame(&mut socket, &a206_protocol::Request { id, body })
+                .await?;
+        }
+        let status = tokio::time::timeout(
+            TIMEOUT,
+            a206_runtime::transport::read_frame::<a206_protocol::Response<Reply>>(&mut socket),
+        )
+        .await??
+        .context("missing queued-stop status")?;
+        ensure!(status.id == status_id && matches!(status.body, Reply::Gateway(_)));
+        stopping.push((shutdown_id, socket));
+    }
     release.add_permits(1);
     let Reply::Catalog(catalog) = tokio::time::timeout(TIMEOUT, pending).await??? else {
         anyhow::bail!("pending catalog reply was lost");
     };
     ensure!(catalog.models[0].key.model == api_model);
     ensure!(catalog.models[0].context_limit == Some(api_context));
+    for (id, mut socket) in stopping {
+        let reply = tokio::time::timeout(
+            TIMEOUT,
+            a206_runtime::transport::read_frame::<a206_protocol::Response<Reply>>(&mut socket),
+        )
+        .await??
+        .context("lost concurrent stop acknowledgement")?;
+        ensure!(reply.id == id && reply.body == Reply::Ok, "{reply:?}");
+    }
 
     let raw_stop = http
         .post(format!("{origin}/api/command"))

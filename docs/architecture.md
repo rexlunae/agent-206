@@ -115,8 +115,8 @@ only user Start/Restart can resume it. Reconnect and ordinary polling attach
 without starting a service. Offline local stop persists under the same profile
 lock as startup. Replaying a shutdown receipt does not stop a later process.
 The shared lifecycle controller serializes user operations, uses bounded receipts
-for duplicate control requests and verifies
-process-reported status. The web bridge exposes this through an authenticated,
+for duplicate control requests and verifies process-reported status. The web bridge
+exposes this through an authenticated,
 exact-origin MessagePack user endpoint; raw Shutdown remains denied there and
 lifecycle controls are absent from agent MCP.
 
@@ -124,8 +124,11 @@ Stop closes admission, cancels accepted work, waits for bounded cleanup and stop
 owned local inference before acknowledging. Failed cleanup restores work admission
 and does not claim a successful shutdown; work already cancelled stays cancelled.
 Concurrent cleanup attempts are serialized. Once cleanup and stop intent commit,
-losing an acknowledgement still completes shutdown. Start reuses a running client
-connection so pending replies survive. The current UI polls snapshots; event
+later shutdown requests acknowledge the committed stop without repeating cleanup.
+The daemon drains accepted replies before exit; a local controller can reconcile
+a lost stop reply only after verifying persisted stop intent and released profile
+ownership. Losing an acknowledgement still completes shutdown. Start reuses a
+running client connection so pending replies survive. The current UI polls snapshots; event
 subscription and paged history remain follow-up work.
 
 Catalogs carry source URL, retrieval time and expiry. A background refresh fetches

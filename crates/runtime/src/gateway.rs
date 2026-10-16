@@ -67,7 +67,7 @@ impl Drop for DrainAttempt {
 #[derive(Clone)]
 pub struct Gateway {
     admission: Arc<Mutex<Admission>>,
-    shutdown: Arc<tokio::sync::Mutex<()>>,
+    shutdown_committed: Arc<tokio::sync::Mutex<bool>>,
     started: std::time::Instant,
     stop: tokio_util::sync::CancellationToken,
     joshua: Arc<tokio::sync::Mutex<crate::joshua::Manager>>,
@@ -79,7 +79,7 @@ impl Gateway {
     pub fn open(root: &Path) -> Result<Self> {
         Ok(Self {
             admission: Arc::new(Mutex::new(Admission::default())),
-            shutdown: Arc::new(tokio::sync::Mutex::new(())),
+            shutdown_committed: Arc::new(tokio::sync::Mutex::new(false)),
             started: std::time::Instant::now(),
             stop: tokio_util::sync::CancellationToken::new(),
             joshua: Arc::new(tokio::sync::Mutex::new(crate::joshua::Manager::default())),
@@ -946,7 +946,10 @@ impl Gateway {
             Command::Shutdown => {
                 // Serialize independent shutdown attempts so a failed one's
                 // rollback cannot reopen admission during another one's cleanup.
-                let _shutdown = self.shutdown.lock().await;
+                let mut committed = self.shutdown_committed.lock().await;
+                if *committed {
+                    return Ok(Reply::Ok);
+                }
                 let mut drain = DrainAttempt::begin(&self.admission)?;
                 tokio::time::timeout(std::time::Duration::from_secs(15), async {
                     loop {
@@ -998,6 +1001,7 @@ impl Gateway {
                 // clients cannot resurrect a deliberately stopped service.
                 crate::service::mark_stopped(&self.lock()?.root)?;
                 drain.committed = true;
+                *committed = true;
                 Ok(Reply::Ok)
             }
         }
@@ -1238,7 +1242,13 @@ where
     });
     let semaphore = Arc::new(tokio::sync::Semaphore::new(16));
     let mut tasks = tokio::task::JoinSet::new();
-    while let Some(request) = transport::read_frame::<Request<Command>>(&mut input).await? {
+    let stop = gateway.stop_signal();
+    loop {
+        let request = tokio::select! {
+            _ = stop.cancelled() => break,
+            request = transport::read_frame::<Request<Command>>(&mut input) => request?,
+        };
+        let Some(request) = request else { break };
         let permit = semaphore.clone().acquire_owned().await?;
         let gateway = gateway.clone();
         let sender = sender.clone();

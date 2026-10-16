@@ -39,7 +39,7 @@ pub async fn daemon(root: &Path, explicit: bool) -> Result<()> {
         explicit || !is_stopped(root),
         "gateway was deliberately stopped; use gateway start"
     );
-    tokio::spawn(refresh_catalogs(gateway.clone()));
+    let refresh = tokio::spawn(refresh_catalogs(gateway.clone()));
     let path = root.join("gateway.sock");
     if path.exists() {
         std::fs::remove_file(&path)?;
@@ -49,18 +49,43 @@ pub async fn daemon(root: &Path, explicit: bool) -> Result<()> {
     if is_stopped(root) {
         std::fs::remove_file(root.join("gateway.stopped"))?;
     }
+    let mut connections = tokio::task::JoinSet::new();
+    let stop = gateway.stop_signal();
     loop {
-        let stop = gateway.stop_signal();
-        let (stream, _) = tokio::select! { accepted = listener.accept() => accepted?, _ = stop.cancelled() => break };
+        let (stream, _) = tokio::select! {
+            accepted = listener.accept() => accepted?,
+            _ = stop.cancelled() => break,
+            Some(result) = connections.join_next(), if !connections.is_empty() => {
+                if let Err(error) = result {
+                    eprintln!("gateway connection task failed: {error}");
+                }
+                continue;
+            }
+        };
         let (read, write) = stream.into_split();
         let gateway = gateway.clone();
-        tokio::spawn(async move {
+        connections.spawn(async move {
             if let Err(error) = crate::gateway::serve_connection(gateway, read, write).await {
                 eprintln!("gateway client disconnected: {error}");
             }
         });
     }
+    drop(listener);
     std::fs::remove_file(&path)?;
+    refresh.abort();
+    // Stop accepting new clients, but flush replies for already accepted work,
+    // including independent Shutdown requests queued behind the first one.
+    // Retain profile ownership until this bounded drain finishes.
+    let _drain = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while let Some(result) = connections.join_next().await {
+            if let Err(error) = result {
+                eprintln!("gateway connection task failed: {error}");
+            }
+        }
+    })
+    .await;
+    connections.abort_all();
+    while connections.join_next().await.is_some() {}
     Ok(())
 }
 #[cfg(unix)]

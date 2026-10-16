@@ -122,15 +122,17 @@ async fn shutdown_cancels_active_inference_and_rejects_new_work() {
     })
     .await
     .unwrap();
-    assert_eq!(
-        tokio::time::timeout(
-            std::time::Duration::from_secs(3),
+    let (first, second) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        tokio::join!(
+            run(&gateway, Command::Shutdown),
             run(&gateway, Command::Shutdown)
         )
-        .await
-        .unwrap(),
-        Reply::Ok
-    );
+    })
+    .await
+    .unwrap();
+    assert_eq!(first, Reply::Ok);
+    assert_eq!(second, Reply::Ok);
+    assert_eq!(run(&gateway, Command::Shutdown).await, Reply::Ok);
     assert!(
         matches!(send.await.unwrap(), Reply::Thread(thread) if thread.state == RunState::Cancelled)
     );

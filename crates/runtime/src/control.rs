@@ -172,10 +172,29 @@ async fn stop(
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }
-    match current(shared)?.call(Command::Shutdown).await? {
-        Reply::Ok => {}
-        Reply::Error { message } => anyhow::bail!("{message}"),
-        _ => anyhow::bail!("gateway did not acknowledge shutdown"),
+    let shutdown = match current(shared)?.call(Command::Shutdown).await {
+        Ok(Reply::Ok) => Ok(()),
+        Ok(Reply::Error { message }) => Err(anyhow::anyhow!(message)),
+        Ok(_) => Err(anyhow::anyhow!("gateway did not acknowledge shutdown")),
+        Err(error) => Err(error),
+    };
+    if let Err(error) = shutdown {
+        // Another local controller can finish stop between our status probe and
+        // shutdown write. Verify both its durable intent and released ownership;
+        // a lost connection alone is never evidence of a successful stop.
+        if remote.is_some() || !crate::service::is_stopped(root) {
+            return Err(error);
+        }
+        loop {
+            if crate::service::stop_if_offline(root)? {
+                replace(shared, Client::attach(root.into(), None))?;
+                return Ok(());
+            }
+            if !crate::service::is_stopped(root) {
+                return Err(error);
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
     }
     // Do not race restart against the previous process's socket and store lock.
     loop {

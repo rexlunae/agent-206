@@ -56,8 +56,10 @@ requests, denied raw shutdown and duplicate-restart receipts. Regressions cover
 offline stop for fresh/existing profiles, profile-lock coordination, shutdown replay
 after restart, lost shutdown acknowledgements, and a real provider request held
 past the cleanup deadline: repeated Start preserves its reply and failed Stop
-restores work admission. Native startup uses
-safe asynchronous stdin readiness so closing the gateway does not strand a blocking
+restores work admission. Concurrent CLI stops and independent shutdown requests
+queued behind held API I/O all receive success, with accepted replies drained before
+daemon exit. Native startup uses safe asynchronous stdin readiness so closing the
+gateway does not strand a blocking
 stdio reader. Live browser checks cover start/stop/reload/restart on a private profile.
 
 The workspace has behavioral tests for permission attenuation, empty startup
