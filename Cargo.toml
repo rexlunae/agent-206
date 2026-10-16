@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/core", "crates/protocol", "crates/vault", "crates/extensions", "crates/runtime", "crates/ui", "crates/app"]
+members = ["crates/core", "crates/protocol", "crates/vault", "crates/broker", "crates/extensions", "crates/runtime", "crates/ui", "crates/app"]
 default-members = ["crates/app"]
 resolver = "3"
 
@@ -13,6 +13,7 @@ license = "MIT"
 a206-core = { path = "crates/core" }
 a206-protocol = { path = "crates/protocol" }
 a206-vault = { path = "crates/vault" }
+a206-broker = { path = "crates/broker" }
 a206-extensions = { path = "crates/extensions" }
 a206-runtime = { path = "crates/runtime" }
 a206-ui = { path = "crates/ui" }
@@ -27,7 +28,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 futures-util = { version = "0.3", features = ["sink"] }
 url = { version = "2", features = ["serde"] }
-zeroize = { version = "1.8", features = ["derive"] }
+zeroize = { version = "1.8", features = ["derive", "serde"] }
 sha2 = "0.10"
 tempfile = "3"
 dioxus = { version = "=0.7.9", default-features = false, features = ["lib"] }

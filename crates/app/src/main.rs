@@ -3,6 +3,8 @@
 fn main() {
     dioxus::launch(a206_ui::App);
 }
+#[cfg(all(unix, not(target_arch = "wasm32")))]
+mod vault_cli;
 #[cfg(not(target_arch = "wasm32"))]
 mod native {
     use a206_core::{
@@ -119,9 +121,11 @@ mod native {
         },
         #[command(hide = true)]
         ExtensionWorker,
+        /// Manage the encrypted vault through its isolated broker.
+        #[cfg(unix)]
         Vault {
             #[command(subcommand)]
-            command: VaultAction,
+            command: crate::vault_cli::VaultAction,
         },
         /// Serve the shared web client on an authorized loopback session.
         Web {
@@ -133,12 +137,6 @@ mod native {
         Render {
             output: PathBuf,
         },
-    }
-    #[derive(Subcommand)]
-    enum VaultAction {
-        Init,
-        List,
-        Put { name: String },
     }
     #[derive(Subcommand)]
     enum GatewayAction {
@@ -243,27 +241,8 @@ mod native {
                 std::fs::write(output, dioxus_ssr::render(&dom))?;
                 Ok(())
             }
-            Action::Vault { command } => {
-                let password =
-                    a206_vault::Secret::new(rpassword::prompt_password("Vault password: ")?);
-                let mut vault = a206_vault::Vault::locked(root.join("vault").join("secrets.json"));
-                vault.unlock(&password)?;
-                match command {
-                    VaultAction::Init => println!("Vault ready"),
-                    VaultAction::List => {
-                        for name in vault.names()? {
-                            println!("{name}");
-                        }
-                    }
-                    VaultAction::Put { name } => {
-                        let value =
-                            a206_vault::Secret::new(rpassword::prompt_password("Secret value: ")?);
-                        vault.put(&name, value)?;
-                        println!("Credential stored");
-                    }
-                }
-                Ok(())
-            }
+            #[cfg(unix)]
+            Action::Vault { command } => crate::vault_cli::run(&root, command),
             Action::ExtensionWorker => {
                 let (_, wasm) = a206_extensions::builtin()?;
                 let output = a206_extensions::execute(wasm, 1_000_000)?;

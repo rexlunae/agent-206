@@ -201,7 +201,7 @@ pub fn Security() -> Element {
             Card { CardHeader { CardTitle { "Verified SSH" } } CardBody { p { "Remote connections use your OpenSSH configuration and verified host keys. Unknown hosts must be paired through SSH first." } } }
         }
         GatewayControls {}
-        Alert { title: rsx! { "Security implementation status" }, "The vault library is tested, but the isolated credential broker, approval flow and RustyClaw TOTP migration are not connected to this preview. Credential use and privileged extension imports remain unavailable." }
+        Alert { title: rsx! { "Security implementation status" }, "Provider API keys are used only inside the separate vault broker, for the exact origins you bind them to. Unlock, two-factor enrollment and credential management currently run from `agent206 vault`; the desktop controls and agent approval flow are not built yet, so agents still cannot use credentials and privileged extension imports remain unavailable." }
     } }
 }
 #[component]
@@ -260,7 +260,7 @@ pub fn Gateway() -> Element {
             }
         }
         Card { variant: CardVariant::Subtle, CardHeader { CardTitle { "Security setup" } }
-            CardBody { p { "Encrypted vault compatibility exists, but gateway enrollment, TOTP authentication and the isolated credential broker are not connected yet. Authenticated providers and vault use remain disabled." } }
+            CardBody { p { "The separate vault broker holds API keys and performs authenticated provider requests, so the gateway never sees them. Set it up with `agent206 vault init`, `vault add` and `vault unlock`; desktop enrollment controls are not built yet, and a running gateway is not proof that the vault is set up." } }
             CardFooter { LinkButton { href: Route::Security {}.to_string(), variant: ButtonVariant::Secondary, "Review security requirements" } }
         }
         Alert { title: rsx! { "Shared service" }, "Stop and restart interrupt work for every connected client. Owned agent runs, downloads and the local Joshua child are cleaned up before stop is acknowledged. Start is always an explicit action after a stop; reconnect only attaches to an existing gateway." }

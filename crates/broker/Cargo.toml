@@ -1,0 +1,28 @@
+[package]
+name = "a206-broker"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+[dependencies]
+a206-protocol.workspace = true
+a206-vault.workspace = true
+serde.workspace = true
+serde_bytes = "0.11"
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util = { version = "0.7", features = ["rt"] }
+reqwest.workspace = true
+futures-util.workspace = true
+url.workspace = true
+uuid.workspace = true
+zeroize.workspace = true
+fs2 = "0.4"
+tracing = "0.1"
+[dev-dependencies]
+tempfile.workspace = true
+axum = "0.8"
+totp-rs = { version = "5.7", default-features = false, features = ["otpauth"] }
+serde_json.workspace = true
+[lints]
+workspace = true

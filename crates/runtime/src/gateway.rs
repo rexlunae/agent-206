@@ -386,7 +386,8 @@ impl Gateway {
                     .find(|p| p.id == provider)
                     .cloned()
                     .context("provider not configured")?;
-                let catalog = provider::catalog(&config).await?;
+                let root = self.lock()?.root.clone();
+                let catalog = provider::catalog(&config, provider::Broker(&root)).await?;
                 let mut store = self.lock()?;
                 ensure!(
                     store.state.settings.providers.contains(&config),
@@ -687,7 +688,14 @@ impl Gateway {
                         })
                         .await
                     } else {
-                        provider::complete(&config, &thread, &prompt, &info).await
+                        provider::complete(
+                            &config,
+                            provider::Broker(&root),
+                            &thread,
+                            &prompt,
+                            &info,
+                        )
+                        .await
                     }
                 };
                 let mut operation = Box::pin(operation);

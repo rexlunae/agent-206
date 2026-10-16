@@ -124,9 +124,11 @@ printed authorization link first in each new browser session.
 - Owned local/SSH Joshua process start/stop, configurable API port, and API discovery.
 - UTF-8 document previews, scoped Git status and a sandboxed browser preview.
 - A compiled bundled WASM extension in a separate limited worker process.
-- SecureStore-compatible vault library and interactive vault CLI. The complete
-  credential broker/approval flow is **not connected**; credentialed providers are
-  rejected instead of sending secrets through the chat runtime.
+- A separate vault broker process holds the SecureStore-compatible vault, with
+  RustyClaw's credential kinds and policies, TOTP two-factor and lockout. Provider
+  API keys are attached by the broker only for origins you bind them to, so the
+  gateway never reads them. Managed with `agent206 vault`; the desktop setup UI
+  and agent approval flow are **not built yet**, so agents cannot use credentials.
 - Official ACP v1 session/prompt/cancel adapter and scoped MCP harness tools.
 - Optional Codex app-server and Claude Agent ACP backends with macOS isolation,
   per-thread project grants, restricted model proxy, streamed text and cancellation.
