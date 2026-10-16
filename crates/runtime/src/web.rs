@@ -28,12 +28,18 @@ struct Web {
     origin: Arc<String>,
     host: Arc<String>,
 }
-pub async fn serve(root: PathBuf, static_dir: PathBuf, port: u16) -> anyhow::Result<()> {
+/// The bridge connects to the configured gateway, local or SSH, on the browser's behalf.
+pub async fn serve(
+    root: PathBuf,
+    remote: Option<String>,
+    static_dir: PathBuf,
+    port: u16,
+) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).await?;
     let port = listener.local_addr()?.port();
     let token = uuid::Uuid::new_v4().simple().to_string();
     let state = Web {
-        client: GatewayController::new(root, None),
+        client: GatewayController::new(root, remote),
         token: Arc::new(uuid::Uuid::new_v4().simple().to_string()),
         bootstrap: Arc::new(token.clone()),
         claimed: Arc::new(AtomicBool::new(false)),

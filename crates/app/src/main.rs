@@ -142,6 +142,18 @@ mod native {
     }
     #[derive(Subcommand)]
     enum GatewayAction {
+        /// Choose the gateway this profile connects to (required before first use).
+        Setup {
+            /// Use a gateway on this computer.
+            #[arg(long, conflicts_with = "ssh", required_unless_present = "ssh")]
+            local: bool,
+            /// Use an installed agent206 reached by OpenSSH: ssh://[user@]host[:port].
+            #[arg(long)]
+            ssh: Option<String>,
+            /// Trust this SSH host key fingerprint after verifying it out of band.
+            #[arg(long, requires = "ssh")]
+            trust: Vec<String>,
+        },
         Status,
         Start,
         Stop,
@@ -210,6 +222,47 @@ mod native {
         )
         .join(".agent206"))
     }
+    async fn setup(
+        root: &std::path::Path,
+        local: bool,
+        ssh: Option<String>,
+        trust: &[String],
+    ) -> anyhow::Result<()> {
+        use a206_core::{GatewayConnection, GatewayTarget};
+        use a206_runtime::connection::{self, ConnectionError};
+        let target = match ssh {
+            Some(endpoint) if !local => {
+                let version = match connection::check_ssh(root, &endpoint).await {
+                    Err(ConnectionError::UnknownHost { .. }) => {
+                        let offered = connection::scan_host_keys(&endpoint).await?;
+                        let accepted: Vec<_> = offered
+                            .iter()
+                            .filter(|key| trust.contains(&key.fingerprint))
+                            .cloned()
+                            .collect();
+                        if accepted.is_empty() {
+                            println!("The host offers these keys:");
+                            for key in &offered {
+                                println!("  {} {}", key.algorithm, key.fingerprint);
+                            }
+                            anyhow::bail!(
+                                "verify a fingerprint with the server's administrator, then rerun with --trust <fingerprint>"
+                            );
+                        }
+                        connection::trust_host_keys(root, &accepted)?;
+                        connection::check_ssh(root, &endpoint).await?
+                    }
+                    other => other?,
+                };
+                println!("Remote gateway: {version}");
+                GatewayTarget::Ssh { endpoint }
+            }
+            _ => GatewayTarget::Local,
+        };
+        connection::save(root, &GatewayConnection { target })?;
+        println!("Gateway configured");
+        Ok(())
+    }
     pub fn run() -> anyhow::Result<()> {
         let args = Args::parse();
         let root = args.data_dir.map(Ok).unwrap_or_else(default_root)?;
@@ -272,10 +325,22 @@ mod native {
                 Ok(())
             }
             action => tokio::runtime::Runtime::new()?.block_on(async move {
+                // Clients use --remote or the saved setup; never an implicit target.
+                let remote = || -> anyhow::Result<Option<String>> {
+                    let target = a206_runtime::connection::require(&root, args.remote.clone())?;
+                    Ok(target.remote().map(str::to_owned))
+                };
+                if let Action::Gateway {
+                    command: Some(GatewayAction::Setup { local, ssh, trust }),
+                    ..
+                } = &action
+                {
+                    return setup(&root, *local, ssh.clone(), trust).await;
+                }
                 if matches!(action, Action::Status | Action::StopGateway) {
                     use a206_core::{GatewayAction as Control, GatewayPhase};
                     let controller =
-                        a206_runtime::control::GatewayController::attach(root, args.remote);
+                        a206_runtime::control::GatewayController::attach(root.clone(), remote()?);
                     let status = matches!(action, Action::Status);
                     let gateway = controller
                         .control(if status {
@@ -341,10 +406,13 @@ mod native {
                             !stdio && !daemon && !no_start && !start,
                             "choose a gateway command or a transport mode"
                         );
-                        let controller =
-                            a206_runtime::control::GatewayController::attach(root, args.remote);
+                        let controller = a206_runtime::control::GatewayController::attach(
+                            root.clone(),
+                            remote()?,
+                        );
                         // Status/reconnect/stop must not launch a missing gateway.
                         let action = match action {
+                            GatewayAction::Setup { .. } => anyhow::bail!("setup was not handled"),
                             GatewayAction::Status => Control::Status,
                             GatewayAction::Start => Control::Start,
                             GatewayAction::Stop => Control::Stop,
@@ -370,9 +438,10 @@ mod native {
                     };
                 }
                 if let Action::Web { static_dir, port } = action {
-                    return a206_runtime::web::serve(root, static_dir, port).await;
+                    return a206_runtime::web::serve(root.clone(), remote()?, static_dir, port)
+                        .await;
                 }
-                let client = a206_runtime::client::Client::start(root, args.remote);
+                let client = a206_runtime::client::Client::start(root.clone(), remote()?);
                 if let Action::Acp { thread } = action {
                     return a206_runtime::acp::serve(client, thread).await;
                 }

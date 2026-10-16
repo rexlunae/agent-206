@@ -53,6 +53,11 @@ Don't edit `state.sqlite3` while it is running.
 # Stop the shared gateway (interrupts active work).
 ./target/debug/agent206 stop-gateway
 
+# Choose the gateway once per profile (the desktop and terminal clients ask on
+# first launch). Unknown SSH hosts print fingerprints to verify, then --trust one.
+./target/debug/agent206 gateway setup --local
+./target/debug/agent206 gateway setup --ssh ssh://user@host --trust SHA256:...
+
 # Lifecycle controls; status and reconnect never start a missing gateway.
 ./target/debug/agent206 status
 ./target/debug/agent206 gateway status
@@ -89,6 +94,7 @@ authorization URL after restarting so the browser uses the new session.
 rustup target add wasm32-unknown-unknown
 dx build --platform web -p agent206 --release --no-default-features --features web
 cargo build -p agent206 --no-default-features
+./target/debug/agent206 gateway setup --local   # or --ssh; the bridge connects for the browser
 ./target/debug/agent206 web --static-dir target/dx/agent206/release/web/public
 ```
 

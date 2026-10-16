@@ -7,14 +7,19 @@ configuration use TOML; owned wire APIs use bounded MessagePack. Keep diagnostic
 on stderr, output on stdout, meaningful exit codes and no secrets in argv/env/logs.
 
 Current headless build: `cargo build -p agent206 --no-default-features`.
-Use `--data-dir` for an isolated profile and `--remote ssh://user@host` for an
-already-installed remote gateway. With no subcommand, the app launches the desktop; `tui`
+Use `--data-dir` for an isolated profile. Before a client command connects, choose
+the profile's gateway once with `gateway setup --local` or `gateway setup --ssh
+ssh://user@host[:port]` (an unknown host prints its key fingerprints; rerun with
+`--trust SHA256:...` after verifying one out of band). `--remote ssh://user@host`
+overrides the saved choice for one invocation. Unconfigured client commands fail
+without launching a gateway. With no subcommand, the app launches the desktop; `tui`
 (alias `ui`) explicitly launches the shared terminal UI when built with that feature.
 
 | RustyClaw command family | Agent 206 now | Required follow-up |
 | --- | --- | --- |
 | desktop / tui | desktop, tui / ui | Terminal interaction and graphics acceptance |
 | status | status: process and live workspace counts; gateway status: process only | Health checks/doctor, richer API-sourced usage, profile selection UX |
+| setup / onboard (gateway target) | gateway setup --local / --ssh with fingerprint review; same saved TOML as the desktop/TUI setup screen | Gateway security enrollment (vault/TOTP) after target selection |
 | gateway start / stop / restart / status | Same nested commands, plus reconnect; stop-gateway compatibility entry point | Verified installers/updaters and real SSH acceptance |
 | setup / onboard / configure | Not implemented | Same encrypted enrollment/TOTP/security state machine as the GUI; no weaker headless path |
 | config get / set / unset | settings exports TOML; settings --apply FILE uses revision-checked shared API | Reviewed field-level commands and parity aliases |

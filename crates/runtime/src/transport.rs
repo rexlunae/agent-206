@@ -34,7 +34,13 @@ pub async fn write_frame<T: Serialize>(
     writer.flush().await?;
     Ok(())
 }
-pub fn ssh_command(endpoint: &str) -> Result<Command> {
+/// A validated `ssh://[user@]host[:port]` endpoint.
+pub struct SshEndpoint {
+    pub user: Option<String>,
+    pub host: String,
+    pub port: Option<u16>,
+}
+pub fn parse_ssh_endpoint(endpoint: &str) -> Result<SshEndpoint> {
     let url = url::Url::parse(endpoint)?;
     ensure!(
         url.scheme() == "ssh"
@@ -52,6 +58,22 @@ pub fn ssh_command(endpoint: &str) -> Result<Command> {
             .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b)),
         "invalid SSH username"
     );
+    Ok(SshEndpoint {
+        user: (!url.username().is_empty()).then(|| url.username().to_owned()),
+        host: host.to_owned(),
+        port: url.port(),
+    })
+}
+pub fn ssh_command(endpoint: &str) -> Result<Command> {
+    ssh_base(endpoint, None)
+}
+/// Gateway SSH also trusts host keys the user confirmed during setup, kept in
+/// the profile's own known_hosts after the user's `~/.ssh/known_hosts`.
+pub fn gateway_ssh_command(root: &Path, endpoint: &str) -> Result<Command> {
+    ssh_base(endpoint, Some(&crate::connection::known_hosts(root)))
+}
+fn ssh_base(endpoint: &str, known_hosts: Option<&Path>) -> Result<Command> {
+    let endpoint = parse_ssh_endpoint(endpoint)?;
     let mut command = Command::new("ssh");
     command.args([
         "-T",
@@ -66,13 +88,23 @@ pub fn ssh_command(endpoint: &str) -> Result<Command> {
         "-o",
         "ConnectTimeout=10",
     ]);
-    if let Some(port) = url.port() {
+    if let Some(file) = known_hosts {
+        let file = file.to_str().context("profile path is not valid UTF-8")?;
+        ensure!(
+            !file.contains('"') && !file.contains('\n'),
+            "profile path cannot be passed to OpenSSH"
+        );
+        command
+            .arg("-o")
+            .arg(format!("UserKnownHostsFile=~/.ssh/known_hosts \"{file}\""));
+    }
+    if let Some(port) = endpoint.port {
         command.arg("-p").arg(port.to_string());
     }
-    if !url.username().is_empty() {
-        command.arg("-l").arg(url.username());
+    if let Some(user) = endpoint.user {
+        command.arg("-l").arg(user);
     }
-    command.arg("--").arg(host);
+    command.arg("--").arg(endpoint.host);
     Ok(command)
 }
 pub fn gateway_command(
@@ -82,7 +114,7 @@ pub fn gateway_command(
     explicit: bool,
 ) -> Result<Command> {
     let mut command = if let Some(remote) = remote {
-        let mut command = ssh_command(remote)?;
+        let mut command = gateway_ssh_command(root, remote)?;
         // Fixed command text: OpenSSH executes remote arguments through a shell.
         command.arg(if explicit {
             "agent206 gateway --stdio --start"

@@ -125,7 +125,25 @@ mod tests {
         }
     }
 
+    /// Complete first-time setup once for this test process; the client stays lazy,
+    /// so rendering never launches a gateway.
+    pub(crate) fn configured() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            let root = std::env::temp_dir().join(format!("a206-ui-{}", Uuid::new_v4()));
+            a206_runtime::connection::save(
+                &root,
+                &a206_core::GatewayConnection {
+                    target: a206_core::GatewayTarget::Local,
+                },
+            )
+            .unwrap();
+            crate::configure(root, None);
+        });
+    }
+
     fn app_at(path: &str) -> (VirtualDom, Rc<dyn History>) {
+        configured();
         let history: Rc<dyn History> = Rc::new(MemoryHistory::with_initial_path(path));
         let mut dom = VirtualDom::new(crate::App);
         dom.provide_root_context(history.clone());
@@ -190,6 +208,47 @@ mod tests {
     }
 
     #[component]
+    fn SetupView() -> Element {
+        let state = crate::State {
+            data: use_signal(crate::empty_snapshot),
+            loaded: use_signal(|| false),
+            connected: use_signal(|| false),
+            gateway: use_signal(|| None),
+            gateway_busy: use_signal(|| None),
+            gateway_generation: use_signal(|| 0),
+            status: use_signal(String::new),
+            theme: use_signal(|| ThemeChoice::from_design(Design::Helix)),
+            setup: use_signal(|| true),
+            navigator: navigator(),
+        };
+        use_context_provider(|| state);
+        rsx! { crate::setup::GatewaySetup {} }
+    }
+    #[derive(Clone, Debug, PartialEq, Routable)]
+    enum SetupRoute {
+        #[route("/")]
+        SetupView {},
+    }
+    #[test]
+    fn gateway_setup_offers_local_and_verified_ssh_targets() {
+        configured();
+        fn setup_app() -> Element {
+            rsx! { Router::<SetupRoute> {} }
+        }
+        let mut dom = VirtualDom::new(setup_app);
+        dom.provide_root_context(Rc::new(MemoryHistory::default()) as Rc<dyn History>);
+        dom.rebuild_in_place();
+        let html = dioxus_ssr::render(&dom);
+        assert!(html.contains("Choose your gateway."));
+        assert!(html.contains("This computer"));
+        assert!(html.contains("A remote gateway over SSH"));
+        assert!(html.contains("value=\"local\" checked"), "{html}");
+        assert!(html.contains("Use this computer"));
+        // A configured client may leave setup without changing its gateway.
+        assert!(html.contains("Keep current gateway"));
+    }
+
+    #[component]
     fn ThreadView() -> Element {
         let fixture = use_context::<ThreadFixture>();
         let state = crate::State {
@@ -201,6 +260,7 @@ mod tests {
             gateway_generation: use_signal(|| 0),
             status: use_signal(String::new),
             theme: use_signal(|| ThemeChoice::from_design(Design::Helix)),
+            setup: use_signal(|| false),
             navigator: navigator(),
         };
         use_context_provider(|| state);
