@@ -368,6 +368,9 @@ async fn gateway_needs_a_verified_pairing_and_never_persists_it() {
         run(refresh()).await,
         Reply::Error { message } if message.contains("not paired")
     ));
+    // Automatic discovery fails too, and is throttled until something changes.
+    gateway.refresh_stale_catalogs().await.unwrap();
+    assert!(gateway.snapshot().unwrap().catalogs.is_empty());
     // A pairing the broker never issued is refused and not kept.
     let forged = BrokerPairing::new(Id::new_v4().to_string());
     assert!(matches!(
@@ -382,6 +385,11 @@ async fn gateway_needs_a_verified_pairing_and_never_persists_it() {
         .await,
         Reply::Ok
     );
+    // A verified pairing lifts the throttle, so discovery need not wait it out.
+    gateway.refresh_stale_catalogs().await.unwrap();
+    let catalogs = gateway.snapshot().unwrap().catalogs;
+    assert_eq!(catalogs.len(), 1);
+    assert_eq!(catalogs[0].models[0].key.model, api.id);
     let Reply::Catalog(catalog) = run(refresh()).await else {
         panic!("paired refresh failed");
     };

@@ -76,7 +76,12 @@ pub struct Gateway {
     running: Arc<Mutex<BTreeMap<Id, tokio_util::sync::CancellationToken>>>,
     /// Held only in memory: a restart needs a fresh pairing from the user.
     pairing: Arc<Mutex<Option<BrokerPairing>>>,
+    /// Last automatic catalog attempt per provider, reset by a new pairing.
+    refreshed: Arc<Mutex<BTreeMap<Id, u64>>>,
+    paired: Arc<tokio::sync::Notify>,
 }
+/// Minimum seconds between automatic refreshes of one stale catalog.
+const REFRESH_RETRY: u64 = 300;
 impl Gateway {
     pub fn open(root: &Path) -> Result<Self> {
         Ok(Self {
@@ -89,6 +94,8 @@ impl Gateway {
             downloads: Arc::new(Mutex::new(BTreeMap::new())),
             running: Arc::new(Mutex::new(BTreeMap::new())),
             pairing: Arc::new(Mutex::new(None)),
+            refreshed: Arc::new(Mutex::new(BTreeMap::new())),
+            paired: Arc::new(tokio::sync::Notify::new()),
         })
     }
     fn pairing(&self) -> Result<Option<BrokerPairing>> {
@@ -102,6 +109,50 @@ impl Gateway {
         self.store
             .lock()
             .map_err(|_| anyhow::anyhow!("state lock poisoned"))
+    }
+    /// Wakes the automatic catalog refresh when a new broker pairing arrives.
+    pub(crate) fn paired_signal(&self) -> Arc<tokio::sync::Notify> {
+        self.paired.clone()
+    }
+    /// Refresh each stale catalog not attempted within `REFRESH_RETRY`.
+    /// Failed refreshes keep the expired cache and are recorded, not returned.
+    pub async fn refresh_stale_catalogs(&self) -> Result<()> {
+        let snapshot = self.snapshot()?;
+        let now = provider::now();
+        for config in snapshot.settings.providers {
+            let fresh = snapshot
+                .catalogs
+                .iter()
+                .any(|c| c.provider == config.id && !c.stale(now));
+            let due = {
+                let mut refreshed = self
+                    .refreshed
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("refresh lock poisoned"))?;
+                let due = !fresh
+                    && refreshed
+                        .get(&config.id)
+                        .is_none_or(|last| now.saturating_sub(*last) >= REFRESH_RETRY);
+                if due {
+                    refreshed.insert(config.id, now);
+                }
+                due
+            };
+            if due {
+                let reply = self
+                    .request(Request {
+                        id: Id::new_v4(),
+                        body: Command::RefreshCatalog {
+                            provider: config.id,
+                        },
+                    })
+                    .await;
+                if let Reply::Error { message } = reply.body {
+                    tracing::warn!(provider = %config.id, error = %message, "catalog refresh failed");
+                }
+            }
+        }
+        Ok(())
     }
     pub fn stop_signal(&self) -> tokio_util::sync::CancellationToken {
         self.stop.clone()
@@ -260,6 +311,12 @@ impl Gateway {
                     .pairing
                     .lock()
                     .map_err(|_| anyhow::anyhow!("pairing lock poisoned"))? = Some(pairing);
+                // Discovery that failed for want of a pairing may retry now.
+                self.refreshed
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("refresh lock poisoned"))?
+                    .clear();
+                self.paired.notify_one();
                 Ok(Reply::Ok)
             }
             Command::JoshuaStatus => {
