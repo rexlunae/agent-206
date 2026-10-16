@@ -27,20 +27,9 @@ pub fn Overview() -> Element {
         Card { variant: CardVariant::Elevated,
             CardHeader { CardTitle { "Recent conversations" } }
             CardBody {
-                if snapshot.threads.is_empty() { p { class: "a206-muted", "Start a conversation to begin." } }
-                for thread in snapshot.threads.iter().rev().take(8) {
-                    { let id = thread.id;
-                      let model = thread.model.as_ref().and_then(|key| snapshot.catalogs.iter().flat_map(|c| &c.models).find(|m| &m.key == key)).map(|m| m.name.as_str()).unwrap_or("Choose a model");
-                      rsx! { Button { class: "a206-recent-thread", size: ButtonSize::Sm, variant: ButtonVariant::Ghost,
-                          onclick: move |_| { state.selected.set(Some(id)); state.page.set(Page::Chat); },
-                          Icon { name: IconName::Sparkles, size: IconSize::Sm }
-                          span { class: "a206-nav-title", strong { "{thread.title}" } span { class: "a206-muted", "{model} · {thread.messages.len()} messages" } }
-                          Badge { tone: BadgeTone::Accent, "{thread.mode.label()}" }
-                          Badge { tone: if thread.state == a206_core::RunState::Failed { BadgeTone::Danger } else { BadgeTone::Neutral }, "{thread.state:?}" }
-                      } }
-                    }
-                }
+                ConversationList { limit: 8 }
             }
+            CardFooter { Button { variant: ButtonVariant::Ghost, onclick: move |_| state.page.set(Page::Conversations), "All conversations ({snapshot.threads.len()})" } }
         }
         div { class: "a206-row a206-between", h2 { "Your workbench" } span { class: "a206-eyebrow", "Built around your workflow" } }
         div { class: "a206-grid",
@@ -57,6 +46,49 @@ pub fn Overview() -> Element {
         }
         Card { variant: CardVariant::Subtle, CardBody { div { class: "a206-row a206-between", div { strong { "Permission is part of the conversation." } p { class: "a206-muted", "Agents begin without tool grants. Modes and delegated tasks can narrow access further." } } Button { variant: ButtonVariant::Secondary, onclick: move |_| state.page.set(Page::Security), "Security details" } } } }
     } } }
+}
+#[component]
+pub fn Conversations() -> Element {
+    let mut query = use_signal(String::new);
+    rsx! { PageFrame { kicker: "Conversations", title: "Your conversations.", description: "Find and reopen any conversation, including project coordinators and delegated work.",
+        Card {
+            CardBody {
+                Field { label: rsx! { "Search conversation titles" }, Input { value: ReadSignal::from(query), oninput: move |value| query.set(value), placeholder: "Search by title" } }
+                ConversationList { query: query() }
+            }
+        }
+    } }
+}
+#[component]
+fn ConversationList(
+    #[props(default)] query: String,
+    #[props(default)] limit: Option<usize>,
+) -> Element {
+    let mut state = use_context::<State>();
+    let snapshot = state.data.read();
+    let query = query.trim().to_lowercase();
+    let threads: Vec<_> = snapshot
+        .threads
+        .iter()
+        .rev()
+        .filter(|thread| thread.title.to_lowercase().contains(&query))
+        .take(limit.unwrap_or(usize::MAX))
+        .collect();
+    rsx! { div { class: "a206-nav-group",
+        if threads.is_empty() { p { class: "a206-muted", if snapshot.threads.is_empty() { "Start a conversation to begin." } else { "No conversations match this title." } } }
+        for thread in threads {
+            { let id = thread.id;
+              let model = thread.model.as_ref().and_then(|key| snapshot.catalogs.iter().flat_map(|c| &c.models).find(|m| &m.key == key)).map(|m| m.name.as_str()).unwrap_or("Choose a model");
+              rsx! { Button { key: "{id}", class: "a206-recent-thread", size: ButtonSize::Sm, variant: ButtonVariant::Ghost,
+                  onclick: move |_| { state.selected.set(Some(id)); state.page.set(Page::Chat); },
+                  Icon { name: IconName::Sparkles, size: IconSize::Sm }
+                  span { class: "a206-nav-title", strong { "{thread.title}" } span { class: "a206-muted", "{model} · {thread.messages.len()} messages" } }
+                  Badge { tone: BadgeTone::Accent, "{thread.mode.label()}" }
+                  Badge { tone: if thread.state == a206_core::RunState::Failed { BadgeTone::Danger } else { BadgeTone::Neutral }, "{thread.state:?}" }
+              } }
+            }
+        }
+    } }
 }
 #[component]
 pub fn Projects() -> Element {

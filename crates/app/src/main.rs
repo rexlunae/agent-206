@@ -45,6 +45,9 @@ mod native {
         },
         Mcp {
             thread: uuid::Uuid,
+            /// Permit this MCP session to edit only its bound conversation's title.
+            #[arg(long)]
+            allow_title_edit: bool,
         },
         Gateway {
             #[arg(long)]
@@ -263,8 +266,12 @@ mod native {
                 if let Action::Acp { thread } = action {
                     return a206_runtime::acp::serve(client, thread).await;
                 }
-                if let Action::Mcp { thread } = action {
-                    return a206_runtime::mcp::serve(client, thread).await;
+                if let Action::Mcp {
+                    thread,
+                    allow_title_edit,
+                } = action
+                {
+                    return a206_runtime::mcp::serve(client, thread, allow_title_edit).await;
                 }
                 let command = match action {
                     Action::Providers {

@@ -175,6 +175,45 @@ async fn discovers_models_from_api_then_sends_and_persists_a_conversation() {
     assert!(sent.contains(&attached.name) && sent.contains(&attached.text));
     assert_eq!(thread.messages.last().unwrap().text, sent);
     assert!(thread.usage.unwrap().input_tokens.is_none());
+    let Reply::Thread(unchanged) = run(
+        &gateway,
+        Command::ConfigureThread {
+            id: thread.id,
+            mode: Mode::Chat,
+            model: Some(catalog.models[0].key.clone()),
+            subagent_models: Default::default(),
+        },
+    )
+    .await
+    else {
+        panic!()
+    };
+    assert!(unchanged.usage.is_some());
+    let Reply::Thread(cleared) = run(
+        &gateway,
+        Command::ConfigureThread {
+            id: thread.id,
+            mode: Mode::Chat,
+            model: None,
+            subagent_models: Default::default(),
+        },
+    )
+    .await
+    else {
+        panic!()
+    };
+    assert!(cleared.usage.is_none());
+    assert!(cleared.effort.is_none());
+    run(
+        &gateway,
+        Command::ConfigureThread {
+            id: thread.id,
+            mode: Mode::Chat,
+            model: Some(catalog.models[0].key.clone()),
+            subagent_models: Default::default(),
+        },
+    )
+    .await;
     assert_eq!(
         run(
             &gateway,
@@ -240,7 +279,7 @@ async fn discovers_models_from_api_then_sends_and_persists_a_conversation() {
     drop(gateway);
     let restored = Gateway::open(dir.path()).unwrap().snapshot().unwrap();
     assert_eq!(restored.threads[0].messages.len(), 2);
-    assert_eq!(restored.threads[0].effort.as_ref(), Some(&api.effort));
+    assert!(restored.threads[0].effort.is_none());
     assert_eq!(restored.threads[0].messages[0].attachments, vec![attached]);
     server.abort();
 }

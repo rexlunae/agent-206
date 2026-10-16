@@ -114,31 +114,41 @@ async fn forward(
     if scope.config.credential.is_some() {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
-    let budget_field = if scope.config.api == ProviderApi::Anthropic {
-        "max_tokens"
-    } else {
-        "max_output_tokens"
-    };
-    let requested = match body.get(budget_field) {
-        Some(value) => {
-            let Some(value) = value.as_u64() else {
-                return StatusCode::BAD_REQUEST.into_response();
-            };
-            value
-        }
-        None => 8192,
-    };
-    let budget = scope
-        .model
-        .output_limit
-        .unwrap_or(8192)
-        .min(8192)
-        .min(requested);
-    if budget == 0 {
-        return StatusCode::BAD_REQUEST.into_response();
-    }
     if path != "messages/count_tokens" {
-        body[budget_field] = json!(budget);
+        let fields: &[&str] = match path {
+            "chat/completions" => &["max_tokens", "max_completion_tokens"],
+            "responses" => &["max_output_tokens"],
+            "messages" => &["max_tokens"],
+            _ => return StatusCode::FORBIDDEN.into_response(),
+        };
+        let mut budget = scope.model.output_limit.unwrap_or(8192).min(8192);
+        for field in ["max_tokens", "max_completion_tokens", "max_output_tokens"] {
+            if let Some(value) = body.get(field) {
+                let Some(value) = value.as_u64().filter(|value| *value > 0) else {
+                    return StatusCode::BAD_REQUEST.into_response();
+                };
+                if !fields.contains(&field) {
+                    return StatusCode::BAD_REQUEST.into_response();
+                }
+                budget = budget.min(value);
+            }
+        }
+        if budget == 0 {
+            return StatusCode::BAD_REQUEST.into_response();
+        }
+        // Use one protocol-valid field, honoring the stricter of any supplied aliases.
+        let field = fields
+            .iter()
+            .rev()
+            .find(|field| body.get(**field).is_some())
+            .unwrap_or(&fields[0]);
+        let field = *field;
+        for alias in fields {
+            body.as_object_mut()
+                .expect("validated model requires an object")
+                .remove(*alias);
+        }
+        body[field] = json!(budget);
     }
     let result = async {
         let url = crate::provider::endpoint(&scope.config, path)?;
@@ -188,27 +198,41 @@ async fn forward(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::routing::post;
+    use axum::routing::{get, post};
     #[tokio::test]
     async fn proxy_enforces_model_auth_paths_and_revokes_on_drop() {
         let model = Id::new_v4().to_string();
+        let output_limit = (Id::new_v4().as_u128() % 16_000 + 1) as u64;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
         let received = seen.clone();
-        let router = Router::new().route(
-            "/v1/responses",
-            post(
-                move |headers: HeaderMap, axum::Json(body): axum::Json<Value>| {
-                    let received = received.clone();
-                    async move {
-                        assert!(headers.get(header::AUTHORIZATION).is_none());
-                        *received.lock().unwrap() = Some(body);
-                        axum::Json(json!({"ok": true}))
-                    }
-                },
-            ),
+        let completion = post(
+            move |headers: HeaderMap, axum::Json(body): axum::Json<Value>| {
+                let received = received.clone();
+                async move {
+                    assert!(headers.get(header::AUTHORIZATION).is_none());
+                    assert!(headers.get("x-api-key").is_none());
+                    *received.lock().unwrap() = Some(body);
+                    axum::Json(json!({"ok": true}))
+                }
+            },
         );
+        let discovered = model.clone();
+        let router = Router::new()
+            .route(
+                "/v1/models",
+                get(move || {
+                    let model = discovered.clone();
+                    async move {
+                        axum::Json(
+                            json!({"data": [{"id": model, "max_output_tokens": output_limit}]}),
+                        )
+                    }
+                }),
+            )
+            .route("/v1/responses", completion.clone())
+            .route("/v1/chat/completions", completion);
         let task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
         let config = ProviderConfig {
             id: Id::new_v4(),
@@ -217,19 +241,11 @@ mod tests {
             credential: None,
             api: ProviderApi::OpenAi,
         };
-        let info = ModelInfo {
-            key: ModelKey {
-                provider: config.id,
-                model: model.clone(),
-            },
-            name: model.clone(),
-            context_limit: None,
-            output_limit: None,
-            input_cost_per_token: None,
-            output_cost_per_token: None,
-            reasoning: None,
-            reasoning_efforts: vec![],
-        };
+        let info = crate::provider::catalog(&config)
+            .await
+            .unwrap()
+            .models
+            .remove(0);
         let proxy = Proxy::start(config, info).await.unwrap();
         let base = format!("http://127.0.0.1:{}/v1", proxy.port());
         let client = reqwest::Client::new();
@@ -277,6 +293,72 @@ mod tests {
             .unwrap();
         assert!(response.status().is_success());
         assert_eq!(seen.lock().unwrap().as_ref().unwrap()["model"], model);
+        let ceiling = output_limit.min(8192);
+        assert_eq!(
+            seen.lock().unwrap().as_ref().unwrap()["max_output_tokens"],
+            ceiling
+        );
+        for (request, field, expected) in [
+            (json!({}), "max_tokens", ceiling),
+            (json!({"max_tokens": u64::MAX}), "max_tokens", ceiling),
+            (
+                json!({"max_completion_tokens": u64::MAX}),
+                "max_completion_tokens",
+                ceiling,
+            ),
+            (
+                json!({"max_tokens": 1, "max_completion_tokens": u64::MAX}),
+                "max_completion_tokens",
+                1,
+            ),
+            (
+                json!({"max_tokens": u64::MAX, "max_completion_tokens": 1}),
+                "max_completion_tokens",
+                1,
+            ),
+        ] {
+            let mut request = request;
+            request["model"] = json!(model);
+            assert!(
+                client
+                    .post(format!("{base}/chat/completions"))
+                    .bearer_auth(proxy.token())
+                    .json(&request)
+                    .send()
+                    .await
+                    .unwrap()
+                    .status()
+                    .is_success()
+            );
+            let sent = seen.lock().unwrap().clone().unwrap();
+            assert_eq!(sent[field], expected);
+            assert!(sent.get("max_output_tokens").is_none());
+            let other = if field == "max_tokens" {
+                "max_completion_tokens"
+            } else {
+                "max_tokens"
+            };
+            assert!(sent.get(other).is_none());
+        }
+        for mut request in [
+            json!({"max_tokens": 0}),
+            json!({"max_completion_tokens": -1}),
+            json!({"max_tokens": "large"}),
+            json!({"max_output_tokens": u64::MAX}),
+        ] {
+            request["model"] = json!(model);
+            assert_eq!(
+                client
+                    .post(format!("{base}/chat/completions"))
+                    .bearer_auth(proxy.token())
+                    .json(&request)
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::BAD_REQUEST
+            );
+        }
         drop(proxy);
         tokio::task::yield_now().await;
         if let Ok(response) = client.get(format!("{base}/models")).send().await {

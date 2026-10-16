@@ -29,6 +29,7 @@ pub(crate) fn reconnect() {
 pub(crate) enum Page {
     Workspace,
     Chat,
+    Conversations,
     Projects,
     Providers,
     Downloads,
@@ -44,7 +45,7 @@ impl Page {
     fn icon(self) -> IconName {
         match self {
             Self::Workspace => IconName::Home,
-            Self::Chat => IconName::Sparkles,
+            Self::Chat | Self::Conversations => IconName::Sparkles,
             Self::Projects => IconName::Folder,
             Self::Providers => IconName::Link,
             Self::Downloads => IconName::Download,
@@ -60,7 +61,8 @@ impl Page {
     fn label(self) -> &'static str {
         match self {
             Self::Workspace => "Workspace",
-            Self::Chat => "Conversations",
+            Self::Chat => "Conversation",
+            Self::Conversations => "Conversations",
             Self::Projects => "Projects",
             Self::Providers => "Connections",
             Self::Downloads => "Downloads",
@@ -93,6 +95,7 @@ fn empty_snapshot() -> Snapshot {
         downloads: vec![],
         plugins: vec![],
         last_event: 0,
+        managed_joshua_provider: None,
     }
 }
 #[cfg(not(target_arch = "wasm32"))]
@@ -278,6 +281,7 @@ pub fn App() -> Element {
                             match page() {
                                 Page::Workspace => rsx! { pages::Overview {} },
                                 Page::Chat => rsx! { conversation::Workspace {} },
+                                Page::Conversations => rsx! { pages::Conversations {} },
                                 Page::Providers => rsx! { settings::Providers {} },
                                 Page::Appearance => rsx! { settings::Appearance {} },
                                 Page::Prompts => rsx! { settings::Prompts {} },
@@ -319,7 +323,7 @@ fn Sidebar() -> Element {
     let snapshot = state.data.read();
     rsx! { NavSidebar { class: "a206-sidebar", label: name!("Workspace navigation"), title: rsx! { "Workspace" }, collapsible: false,
         div { class: "a206-nav-group",
-            for item in [Page::Workspace, Page::Projects, Page::Chat] {
+            for item in [Page::Workspace, Page::Projects, Page::Conversations] {
                 Button { variant: ButtonVariant::Ghost, size: ButtonSize::Sm, class: if (state.page)() == item { "a206-nav-active" } else { "" }, onclick: move |_| state.page.set(item), Icon { name: item.icon(), size: IconSize::Sm } "{item.label()}" }
             }
         }
@@ -332,6 +336,9 @@ fn Sidebar() -> Element {
                         Icon { name: if thread.parent.is_some() { IconName::ArrowEnd } else { IconName::Sparkles }, size: IconSize::Sm } span { class: "a206-nav-title", "{thread.title}" } Badge { tone: BadgeTone::Accent, "{thread.mode.label()}" }
                     }
                 } }
+            }
+            if snapshot.threads.len() > 12 {
+                Button { size: ButtonSize::Sm, variant: ButtonVariant::Ghost, onclick: move |_| state.page.set(Page::Conversations), "View all {snapshot.threads.len()} conversations" }
             }
         }
         div { class: "a206-nav-group",

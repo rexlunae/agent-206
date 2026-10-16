@@ -217,8 +217,8 @@ fn sandbox_command(
 (allow system-mac-syscall (mac-policy-name "vnguard"))
 (allow system-mac-syscall (require-all (mac-policy-name "Sandbox") (mac-syscall-number 67)))
 (allow file-read* (literal "/"))
+(allow file-read-metadata (literal "/var") (literal "/tmp"))
 (allow mach-lookup (global-name "com.apple.system.logger") (global-name "com.apple.system.opendirectoryd"))
-(allow file-read-metadata)
 (allow file-map-executable file-read* (subpath "/System/Library") (subpath "/System/iOSSupport/System/Library") (subpath "/usr/lib") (subpath "/usr/share") (subpath "/Library/Apple") (subpath "/private/var/db/dyld") (literal "/dev/null") (literal "/dev/urandom") (literal "/dev/random") (subpath {}) (subpath {}))
 (allow file-write* (subpath {}) (literal "/dev/null"))
 (allow network-outbound (remote ip "localhost:{}"))
@@ -229,6 +229,28 @@ fn sandbox_command(
         quote(scratch)?,
         port
     );
+    // Runtime traversal needs metadata for exact ancestors, never arbitrary files
+    // elsewhere in the user's filesystem. Descendants stay within the read grants.
+    let mut ancestors = std::collections::BTreeSet::new();
+    for path in [
+        root,
+        scratch,
+        cwd,
+        Path::new("/System/Library"),
+        Path::new("/System/iOSSupport/System/Library"),
+        Path::new("/usr/lib"),
+        Path::new("/usr/share"),
+        Path::new("/Library/Apple"),
+        Path::new("/private/var/db/dyld"),
+    ] {
+        ancestors.extend(path.ancestors().skip(1));
+    }
+    for ancestor in ancestors {
+        policy.push_str(&format!(
+            "(allow file-read-metadata (literal {}))\n",
+            quote(ancestor)?
+        ));
+    }
     if thread
         .grant
         .capabilities

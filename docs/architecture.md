@@ -66,6 +66,9 @@ forward. We never search for or kill unrelated processes. Stopping a remote SSH
 session does not establish a verified remote-process shutdown; remote supervision
 and signed installers need additional work. The process running is not equivalent
 to model readiness: readiness is established by a successful catalog API fetch.
+Managed provider identity is persisted separately from user connections. Stop,
+observed process exit and gateway restart retire that identity, its catalog and
+associated model selections/grants; retiring an active provider also cancels its runs.
 
 ## Permission model
 
@@ -81,8 +84,10 @@ none. Agents cannot write either set. Each thread has an explicit subagent model
 allowlist; adding a model to an API catalog never adds it to that allowlist.
 Subagents get a project association and parent identity; no parent's raw secrets.
 
-The current MCP surface is intrinsic self-introspection plus editing its own
-conversation title. It has no
+The current MCP surface is read-only self-introspection by default. A user can
+explicitly authorize editing only the bound conversation’s title when launching
+MCP with `--allow-title-edit`. Other sessions do not advertise or accept that tool.
+It has no
 installation, secret, approval, arbitrary shell or global configuration tool.
 Future tools must get an authenticated actor binding from the gateway and perform
 policy checks at execution, not trust a client-supplied role or hidden button.

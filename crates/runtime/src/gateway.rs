@@ -44,6 +44,29 @@ impl Gateway {
     pub fn snapshot(&self) -> Result<Snapshot> {
         Ok(self.lock()?.state.clone())
     }
+    fn clear_managed_joshua(&self) -> Result<()> {
+        let mut store = self.lock()?;
+        let Some(provider) = store.state.managed_joshua_provider else {
+            return Ok(());
+        };
+        let running = self
+            .running
+            .lock()
+            .map_err(|_| anyhow::anyhow!("run lock poisoned"))?;
+        for thread in &store.state.threads {
+            if thread
+                .model
+                .as_ref()
+                .is_some_and(|key| key.provider == provider)
+                && let Some(token) = running.get(&thread.id)
+            {
+                token.cancel();
+            }
+        }
+        store.state.clear_managed_joshua();
+        store.persist(Some(EventKind::SettingsChanged))?;
+        Ok(())
+    }
     pub async fn request(&self, request: Request<Command>) -> Response<Reply> {
         let id = request.id;
         let mutation = !matches!(
@@ -92,7 +115,14 @@ impl Gateway {
     async fn handle(&self, command: Command) -> Result<Reply> {
         match command {
             Command::Snapshot => Ok(Reply::Snapshot(Box::new(self.snapshot()?))),
-            Command::JoshuaStatus => Ok(Reply::Text(self.joshua.lock().await.status()?)),
+            Command::JoshuaStatus => {
+                let mut manager = self.joshua.lock().await;
+                let status = manager.status()?;
+                if !manager.is_running() {
+                    self.clear_managed_joshua()?;
+                }
+                Ok(Reply::Text(status))
+            }
             Command::StartJoshua {
                 label,
                 model_file,
@@ -100,25 +130,35 @@ impl Gateway {
                 remote,
             } => {
                 let root = self.lock()?.root.clone();
-                let provider = self
-                    .joshua
-                    .lock()
-                    .await
+                let mut manager = self.joshua.lock().await;
+                manager.status()?;
+                if !manager.is_running() {
+                    self.clear_managed_joshua()?;
+                }
+                let provider = manager
                     .start(label, model_file, port, remote, &root)
                     .await?;
                 let id = provider.id;
-                {
+                let persisted = (|| -> Result<()> {
                     let mut store = self.lock()?;
                     store.state.settings.providers.push(provider);
+                    store.state.managed_joshua_provider = Some(id);
                     store.state.settings.revision += 1;
                     store.persist(Some(EventKind::SettingsChanged))?;
+                    Ok(())
+                })();
+                if let Err(error) = persisted {
+                    manager.stop().await?;
+                    return Err(error);
                 }
                 Ok(Reply::Text(format!(
                     "Joshua started. Refresh the new connection to discover its models. Provider: {id}"
                 )))
             }
             Command::StopJoshua => {
-                self.joshua.lock().await.stop().await?;
+                let mut manager = self.joshua.lock().await;
+                manager.stop().await?;
+                self.clear_managed_joshua()?;
                 Ok(Reply::Ok)
             }
             Command::Events { after } => Ok(Reply::Events(self.lock()?.events(after)?)),
@@ -291,6 +331,7 @@ impl Gateway {
                 thread.mode = mode;
                 if thread.model != model {
                     thread.effort = None;
+                    thread.usage = None;
                 }
                 thread.model = model;
                 thread.subagent_models = subagent_models;
@@ -882,6 +923,14 @@ impl Gateway {
     }
     async fn transfer(&self, download: &Download, target: &Path, source: &str) -> Result<()> {
         let response = crate::network::public_get(source).await?;
+        self.transfer_response(download, target, response).await
+    }
+    async fn transfer_response(
+        &self,
+        download: &Download,
+        target: &Path,
+        response: reqwest::Response,
+    ) -> Result<()> {
         let total = response.content_length();
         let updated = self.update_download(download.id, |d| {
             if d.state != DownloadState::Cancelled {
@@ -893,12 +942,13 @@ impl Gateway {
             updated.state != DownloadState::Cancelled,
             "download cancelled"
         );
-        let partial = target.join(format!("{}.{}.part", download.name, download.id));
-        let mut file = tokio::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&partial)
-            .await?;
+        // Create synchronously under an owning guard: cancellation must not race an
+        // unfinished asynchronous open, leaving a file with no cleanup owner.
+        let partial = tempfile::Builder::new()
+            .prefix(&format!("{}.{}.", download.name, download.id))
+            .suffix(".part")
+            .tempfile_in(target)?;
+        let mut file = tokio::fs::File::from_std(partial.reopen()?);
         let mut stream = response.bytes_stream();
         let mut hasher = Sha256::new();
         let mut received = 0;
@@ -946,8 +996,9 @@ impl Gateway {
             current.state != DownloadState::Cancelled,
             "download cancelled"
         );
-        std::fs::hard_link(&partial, target.join(&download.name))?;
-        std::fs::remove_file(partial)?;
+        partial
+            .persist_noclobber(target.join(&download.name))
+            .map_err(|error| error.error)?;
         current.received = received;
         current.sha256 = Some(digest);
         current.state = DownloadState::Complete;
@@ -1042,6 +1093,144 @@ fn validate_effort(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn partial_downloads_are_cleaned_on_errors_cancellation_and_publication() {
+        use axum::{Router, body::Body, routing::get};
+        let payload = Id::new_v4().to_string();
+        let sent = payload.clone();
+        let waiting = payload.clone();
+        let broken = payload.clone();
+        let fail = Arc::new(tokio::sync::Notify::new());
+        let release = fail.clone();
+        let router = Router::new()
+            .route(
+                "/data",
+                get(move || {
+                    let data = sent.clone();
+                    async move { data }
+                }),
+            )
+            .route(
+                "/waiting",
+                get(move || {
+                    let data = waiting.clone();
+                    async move {
+                        Body::from_stream(
+                            futures_util::stream::once(
+                                async move { Ok::<_, std::io::Error>(data) },
+                            )
+                            .chain(futures_util::stream::pending()),
+                        )
+                    }
+                }),
+            )
+            .route(
+                "/broken",
+                get(move || {
+                    let data = broken.clone();
+                    let release = release.clone();
+                    async move {
+                        Body::from_stream(
+                            futures_util::stream::once(
+                                async move { Ok::<_, std::io::Error>(data) },
+                            )
+                            .chain(futures_util::stream::once(
+                                async move {
+                                    release.notified().await;
+                                    Err::<String, _>(std::io::Error::other("interrupted transfer"))
+                                },
+                            )),
+                        )
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let root = tempfile::tempdir().unwrap();
+        let gateway = Gateway::open(root.path()).unwrap();
+        for scenario in ["integrity", "network", "cancel", "collision", "complete"] {
+            let directory = tempfile::tempdir().unwrap();
+            let job = Download {
+                id: Id::new_v4(),
+                name: Id::new_v4().to_string(),
+                source: address.to_string(),
+                received: 0,
+                total: None,
+                state: DownloadState::Queued,
+                error: None,
+                sha256: (scenario == "integrity").then(|| "0".repeat(64)),
+            };
+            gateway.lock().unwrap().state.downloads.push(job.clone());
+            if scenario == "collision" {
+                std::fs::write(directory.path().join(&job.name), "existing").unwrap();
+            }
+            let path = match scenario {
+                "network" => "broken",
+                "cancel" => "waiting",
+                _ => "data",
+            };
+            let response = reqwest::get(format!("http://{address}/{path}"))
+                .await
+                .unwrap();
+            let worker = gateway.clone();
+            let download = job.clone();
+            let target = directory.path().to_owned();
+            let task = tokio::spawn(async move {
+                worker.transfer_response(&download, &target, response).await
+            });
+            if matches!(scenario, "network" | "cancel") {
+                tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                    loop {
+                        if std::fs::read_dir(directory.path())
+                            .unwrap()
+                            .any(|entry| entry.unwrap().metadata().unwrap().len() > 0)
+                        {
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .unwrap();
+            }
+            if scenario == "cancel" {
+                task.abort();
+                assert!(task.await.unwrap_err().is_cancelled());
+            } else {
+                if scenario == "network" {
+                    fail.notify_one();
+                }
+                let result = tokio::time::timeout(std::time::Duration::from_secs(3), task)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    result.is_ok(),
+                    scenario == "complete",
+                    "{scenario}: {result:?}"
+                );
+            }
+            let files: Vec<_> = std::fs::read_dir(directory.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect();
+            if matches!(scenario, "collision" | "complete") {
+                assert_eq!(files, vec![std::ffi::OsString::from(&job.name)]);
+                assert_eq!(
+                    std::fs::read_to_string(directory.path().join(&job.name)).unwrap(),
+                    if scenario == "collision" {
+                        "existing"
+                    } else {
+                        &payload
+                    }
+                );
+            } else {
+                assert!(files.is_empty(), "{scenario}: {files:?}");
+            }
+        }
+        server.abort();
+    }
     #[tokio::test]
     async fn command_replay_creates_only_one_thread() {
         let dir = tempfile::tempdir().unwrap();

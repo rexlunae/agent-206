@@ -47,6 +47,8 @@ Don't edit `state.sqlite3` while it is running.
 # ACP and MCP adapters bind to a user-selected existing thread.
 ./target/debug/agent206 acp THREAD_UUID
 ./target/debug/agent206 mcp THREAD_UUID
+# Optional, explicit permission for this session to rename its bound thread.
+./target/debug/agent206 mcp THREAD_UUID --allow-title-edit
 
 # Stop the shared gateway (interrupts active work).
 ./target/debug/agent206 stop-gateway
@@ -117,6 +119,7 @@ cargo check -p agent206 --features tui
 cargo check -p agent206 --no-default-features --features web --target wasm32-unknown-unknown
 cargo build -p agent206 --no-default-features
 python3 scripts/protocol-smoke.py target/debug/agent206
+python3 scripts/joshua-smoke.py target/debug/agent206
 ```
 
 Read [AGENTS.md](AGENTS.md), [architecture](docs/architecture.md),

@@ -14,6 +14,7 @@ struct Rename {
 struct Harness {
     client: Client,
     thread: Uuid,
+    allow_title_edit: bool,
     tool_router: ToolRouter<Self>,
 }
 #[tool_router]
@@ -25,6 +26,9 @@ impl Harness {
         &self,
         params: rmcp::handler::server::wrapper::Parameters<Rename>,
     ) -> Result<String, String> {
+        if !self.allow_title_edit {
+            return Err("title editing was not authorized for this MCP session".into());
+        }
         match self
             .client
             .call(Command::RenameThread {
@@ -89,17 +93,25 @@ impl ServerHandler for Harness {
             config.capabilities = rmcp::model::ServerCapabilities::builder()
                 .enable_tools()
                 .build();
-            config.instructions =
-                Some("Harness introspection and title editing, bound to one conversation.".into());
+            config.instructions = Some(if self.allow_title_edit {
+                "Harness introspection and explicitly authorized title editing, bound to one conversation."
+            } else {
+                "Read-only harness introspection, bound to one conversation."
+            }.into());
             config
         }
     }
 }
-pub async fn serve(client: Client, thread: Uuid) -> anyhow::Result<()> {
+pub async fn serve(client: Client, thread: Uuid, allow_title_edit: bool) -> anyhow::Result<()> {
+    let mut tool_router = Harness::tool_router();
+    if !allow_title_edit {
+        tool_router.remove_route("rename_thread");
+    }
     let service = Harness {
         client,
         thread,
-        tool_router: Harness::tool_router(),
+        allow_title_edit,
+        tool_router,
     }
     .serve(rmcp::transport::stdio())
     .await?;

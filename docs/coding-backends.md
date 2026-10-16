@@ -108,14 +108,16 @@ scratch working directory with a new private home and cleared environment. They
 cannot inherit existing agent accounts, hooks, plugins, project settings or MCP
 servers. Granted project paths are included explicitly in the task. Common user
 credential stores and private Agent 206 state remain denied, including through
-symlinks. Runtime installation must not overlap projects or private application state.
+symlinks. Metadata access is restricted to granted paths and exact runtime-traversal
+ancestors, rather than the whole filesystem. Runtime installation must not overlap projects or private application state.
 
 An ephemeral loopback proxy accepts only selected inference paths and the current
 model. Its per-run token is an opaque capability, not an upstream credential; it is
 never forwarded upstream. Direct network access and permission expansion are
 unavailable. The proxy does not unlock or access the vault. Request budgets cap
 output at 8,192 tokens (or a lower API-reported output limit/requested budget), with
-128 authorized requests per run. These are application resource budgets, not model
+128 authorized requests per run. Chat completion requests cap both legacy and
+modern token-limit aliases and forward a single protocol-valid field. These are application resource budgets, not model
 capacity facts. Responses are bounded at 16 MiB; protocol lines at 2 MiB and total
 protocol output at 32 MiB; assistant text at 128 KiB. Runs stop after ten minutes.
 

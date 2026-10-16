@@ -52,6 +52,7 @@ impl Store {
                 downloads: vec![],
                 plugins: vec![a206_extensions::builtin()?.0.summary()],
                 last_event: 0,
+                managed_joshua_provider: None,
             }
         };
         let mut store = Self {
@@ -61,6 +62,9 @@ impl Store {
             root: root.to_owned(),
         };
         crate::provider::validate_presets(&store.state.settings.provider_presets)?;
+        // A fresh gateway has no owned child. Retire its persisted connection, not
+        // arbitrary user-configured endpoints that happen to have the same URL.
+        store.state.clear_managed_joshua();
         for thread in &mut store.state.threads {
             if thread.state == RunState::Running {
                 thread.state = RunState::Failed;
@@ -186,6 +190,28 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn restart_retires_only_the_owned_joshua_connection() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = Store::open(directory.path()).unwrap();
+        let make_provider = || ProviderConfig {
+            id: Id::new_v4(),
+            label: Id::new_v4().to_string(),
+            base_url: "http://127.0.0.1:9876/v1".into(),
+            credential: None,
+            api: Default::default(),
+        };
+        let owned = make_provider();
+        let user = make_provider();
+        store.state.settings.providers = vec![owned.clone(), user.clone()];
+        store.state.managed_joshua_provider = Some(owned.id);
+        store.persist(None).unwrap();
+        drop(store);
+        let restored = Store::open(directory.path()).unwrap();
+        assert_eq!(restored.state.settings.providers, vec![user]);
+        assert!(restored.state.managed_joshua_provider.is_none());
+        assert_eq!(restored.state.settings.revision, 1);
+    }
     #[test]
     fn journal_and_dedup_survive_restart() {
         let dir = tempfile::tempdir().unwrap();

@@ -29,3 +29,4 @@ jobs:
       - run: cargo check -p agent206 --no-default-features --features web --target wasm32-unknown-unknown --locked
       - run: cargo build -p agent206 --no-default-features --locked
       - run: python3 scripts/protocol-smoke.py target/debug/agent206
+      - run: python3 scripts/joshua-smoke.py target/debug/agent206

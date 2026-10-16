@@ -23,6 +23,9 @@ fn valid_filename(name: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
 }
 impl Manager {
+    pub fn is_running(&self) -> bool {
+        self.child.is_some()
+    }
     pub fn status(&mut self) -> Result<String> {
         if let Some(child) = &mut self.child {
             if let Some(status) = child.try_wait()? {

@@ -369,6 +369,33 @@ pub struct Snapshot {
     pub downloads: Vec<Download>,
     pub plugins: Vec<PluginSummary>,
     pub last_event: u64,
+    #[serde(default)]
+    pub managed_joshua_provider: Option<Id>,
+}
+impl Snapshot {
+    /// Retire only the connection owned by the managed process, including its model grants.
+    pub fn clear_managed_joshua(&mut self) -> Option<Id> {
+        let provider = self.managed_joshua_provider.take()?;
+        self.settings.providers.retain(|entry| entry.id != provider);
+        self.catalogs.retain(|catalog| catalog.provider != provider);
+        for thread in &mut self.threads {
+            if thread
+                .model
+                .as_ref()
+                .is_some_and(|key| key.provider == provider)
+            {
+                thread.model = None;
+                thread.effort = None;
+                thread.usage = None;
+            }
+            thread
+                .subagent_models
+                .retain(|key| key.provider != provider);
+            thread.grant.models.retain(|key| key.provider != provider);
+        }
+        self.settings.revision += 1;
+        Some(provider)
+    }
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Event {

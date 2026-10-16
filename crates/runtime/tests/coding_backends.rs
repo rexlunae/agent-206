@@ -52,8 +52,11 @@ fn main() {
     if std::env::args().any(|arg| arg == "--fixture-descendant") { loop { std::thread::sleep(std::time::Duration::from_secs(1)); } }
     assert!(std::env::var("HOME").unwrap().contains("a206-backend-"));
     assert!(std::fs::read(STATE_FILE).is_err());
+    assert!(std::fs::metadata(STATE_FILE).is_err());
     assert!(std::fs::write(STATE_FILE, "should-not-write").is_err());
     assert!(std::fs::read(OUTSIDE_FILE).is_err());
+    assert!(std::fs::metadata(OUTSIDE_FILE).is_err());
+    assert!(std::fs::symlink_metadata(OUTSIDE_FILE).is_err());
     assert!(std::fs::read(format!("/System/Volumes/Data{}", OUTSIDE_FILE)).is_err());
     assert!(std::fs::read(format!("/System/Volumes/Data{}", STATE_FILE)).is_err());
     assert!(std::net::TcpStream::connect(BLOCKED_ADDRESS).is_err());

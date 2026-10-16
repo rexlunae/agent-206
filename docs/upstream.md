@@ -16,7 +16,7 @@ Inspected on 2026-10-15:
 - [ACP official Rust SDK](https://github.com/agentclientprotocol/rust-sdk): ACP v1
   initialize, sessions, prompt updates and cancellation through SDK handlers.
 - [MCP official Rust SDK](https://github.com/modelcontextprotocol/rust-sdk): scoped
-  read-only harness tools over standard stdio.
+  harness introspection over standard stdio, with per-session opt-in title editing.
 - [Wasmi](https://github.com/wasmi-labs/wasmi): a bounded interpreter suitable for
   the initial no-WASI module ABI. Chosen over a heavyweight JIT for this stage;
   a component-model/Wasmtime migration should follow measured requirements.
