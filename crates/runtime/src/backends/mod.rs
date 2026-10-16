@@ -36,7 +36,7 @@ pub enum BackendError {
     NoModel,
     #[error("backend transcript exceeds its input limit")]
     TranscriptTooLarge,
-    #[error("{what} is missing")]
+    #[error("{what} is missing or inaccessible")]
     Missing {
         what: &'static str,
         #[source]
@@ -100,7 +100,8 @@ impl crate::error::Classified for BackendError {
             | Self::TranscriptTooLarge
             | Self::Placement(_)
             | Self::NonUtf8Path => ErrorKind::InvalidRequest,
-            Self::Missing { .. } => ErrorKind::NotFound,
+            // Absent and unreadable paths need different recovery; the I/O cause decides.
+            Self::Missing { .. } => return None,
             Self::Credentialed | Self::Delegation | Self::Unsupported | Self::Spawn(_) => {
                 ErrorKind::Unavailable
             }

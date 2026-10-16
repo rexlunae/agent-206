@@ -243,6 +243,23 @@ mod tests {
     }
 
     #[test]
+    fn missing_paths_keep_their_io_kind() {
+        use std::io::{Error, ErrorKind as Io};
+        for (io, kind) in [
+            (Io::NotFound, ErrorKind::NotFound),
+            (Io::PermissionDenied, ErrorKind::PermissionDenied),
+        ] {
+            let backend = crate::backends::BackendError::Missing {
+                what: "backend executable",
+                source: Error::from(io),
+            };
+            assert_eq!(report(&backend).kind, kind);
+            let model = crate::joshua::JoshuaError::MissingModel(Error::from(io));
+            assert_eq!(report(&model).kind, kind);
+        }
+    }
+
+    #[test]
     fn broker_failures_keep_their_kind() {
         let denied = crate::provider::ProviderError::Broker(a206_broker::ClientError::from(
             a206_broker::BrokerError::StepUpRequired,

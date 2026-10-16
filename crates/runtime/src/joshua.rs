@@ -21,7 +21,7 @@ pub enum JoshuaError {
     },
     #[error("invalid SSH destination")]
     Endpoint(#[from] crate::transport::SshEndpointError),
-    #[error("model file does not exist in ~/models")]
+    #[error("model file in ~/models is missing or unreadable")]
     MissingModel(#[source] std::io::Error),
     #[error("model file escapes ~/models")]
     ModelEscapes,
@@ -43,7 +43,8 @@ impl crate::error::Classified for JoshuaError {
             Self::InvalidRequest | Self::Endpoint(_) | Self::ModelEscapes => {
                 ErrorKind::InvalidRequest
             }
-            Self::MissingModel(_) => ErrorKind::NotFound,
+            // Absent and unreadable files need different recovery; the I/O cause decides.
+            Self::MissingModel(_) => return None,
             Self::NoHome
             | Self::ModelsDirectory(_)
             | Self::Log(_)
