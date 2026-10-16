@@ -282,12 +282,8 @@ impl Gateway {
                     })
                     .await;
                 if let Reply::Error(report) = reply.body {
-                    tracing::warn!(
-                        provider = %config.id,
-                        kind = ?report.kind,
-                        error = %report.message,
-                        "catalog refresh failed"
-                    );
+                    let _provider = tracing::warn_span!("catalog", provider = %config.id).entered();
+                    crate::error::record("refresh_catalog", &report);
                 }
             }
         }
