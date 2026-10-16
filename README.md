@@ -77,9 +77,16 @@ The browser token lives in sessionStorage and is removed from the address bar. D
 a public network: multi-user authentication, HTTPS deployment and remote web
 sessions are not implemented.
 
+Navigation uses Dioxus Router across renderers. Web pages have direct addresses
+such as `/connections`, `/projects`, and `/settings/appearance`. Conversations use
+`/conversations/<thread-uuid>`; append `?split=<second-thread-uuid>` for two panes.
+Back/forward and reload preserve the route. These addresses select content in the
+current gateway profile; they do not grant access or carry authorization. Open the
+printed authorization link first in each new browser session.
+
 ## What works
 
-- Shared fc-dioxus shell, resizable navigation/chat/inspector panes, side-by-side
+- Shared fc-dioxus shell with typed Dioxus Router navigation, resizable navigation/chat/inspector panes, side-by-side
   conversations, new branding and future-css theme selection.
 - Persisted conversations and projects, editable mode prompts, API-only model
   discovery, explicit per-thread subagent model allowlists and delegated threads.

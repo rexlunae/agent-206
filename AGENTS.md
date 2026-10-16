@@ -77,6 +77,10 @@ attribution. Prefer a small replacement over carrying historical architecture.
 
 ## UI and toolkit
 
+- Use Dioxus Router for shared application navigation, with typed routes and a
+  persistent shell layout. Conversation identity and split views belong in routes,
+  not duplicate page-selection signals. Preserve browser history and deep-link
+  reloads; missing resources must offer recovery without opening a different thread.
 - Prefer fc-dioxus components to raw HTML/basic Dioxus controls. Use its chat,
   context, tool trace, approval, transfer, git, document, progress, navigation and
   theme-picker components. Columns use accessible resizable splitters.

@@ -177,6 +177,22 @@ approvals and external subagent policy remain further work.
 
 ## UI direction
 
+Typed Dioxus Router routes render through a persistent shell layout and an Outlet.
+fc-dioxus router-aware links retain native link behavior and current-page semantics;
+buttons invoke commands. Conversation UUIDs and the optional split UUID live in the
+route, with no parallel page/selection state. The web renderer uses browser history;
+desktop uses its renderer history, with explicit in-memory history for renderers
+that do not supply one. App Back/Forward controls use the same navigator.
+
+Direct conversation links wait for the first gateway snapshot before declaring a
+thread missing. Unknown pages and unavailable threads offer recovery; no unrelated
+thread is substituted. New threads navigate after the snapshot refresh. The web
+bridge serves the SPA entry point for HTML page requests so deep links can reload,
+while reserved API/bootstrap/asset paths and non-HTML requests keep their errors.
+Consuming an authorization fragment preserves the route, query and history state.
+URLs are local to the current gateway profile and never confer authority. Drafts
+and unsaved forms are not yet preserved when their route unmounts.
+
 The workbench separates navigation, conversations and inspection into accessible
 resizable panes. The desktop is the primary entry point. Concurrent conversations
 can share a split view. Projects have a coordinator; threads own mode/model policy.

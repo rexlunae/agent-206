@@ -1,10 +1,10 @@
-use crate::{Page, PageFrame, State, call, dispatch};
+use crate::{PageFrame, State, call, dispatch, route::Route};
 use a206_core::{Command, DownloadState, Mode, Reply};
 use fc_dioxus::prelude::*;
 use uuid::Uuid;
 #[component]
 pub fn Overview() -> Element {
-    let mut state = use_context::<State>();
+    let state = use_context::<State>();
     let snapshot = state.data.read();
     rsx! { section { class: "a206-page", div { class: "a206-page-inner",
         Card { variant: CardVariant::Feature, as_: CardTag::Div, class: "a206-hero",
@@ -14,7 +14,7 @@ pub fn Overview() -> Element {
                 p { class: "a206-muted", "Conversations, projects, and local services." }
                 div { class: "a206-row",
                     Button { variant: ButtonVariant::Primary, onclick: move |_| dispatch(state, Command::CreateThread { title: "New conversation".into(), mode: Mode::Chat }), "Start a conversation" }
-                    Button { variant: ButtonVariant::Secondary, onclick: move |_| state.page.set(Page::Projects), "Open a project" }
+                    LinkButton { variant: ButtonVariant::Secondary, href: Route::Projects {}.to_string(), "Open a project" }
                 }
             }
             Badge { tone: BadgeTone::Accent, "{snapshot.threads.iter().filter(|t| t.state == a206_core::RunState::Running).count()} active responses" }
@@ -29,22 +29,22 @@ pub fn Overview() -> Element {
             CardBody {
                 ConversationList { limit: 8 }
             }
-            CardFooter { Button { variant: ButtonVariant::Ghost, onclick: move |_| state.page.set(Page::Conversations), "All conversations ({snapshot.threads.len()})" } }
+            CardFooter { LinkButton { variant: ButtonVariant::Ghost, href: Route::Conversations {}.to_string(), "All conversations ({snapshot.threads.len()})" } }
         }
         div { class: "a206-row a206-between", h2 { "Your workbench" } span { class: "a206-eyebrow", "Built around your workflow" } }
         div { class: "a206-grid",
             for (number, title, body, target) in [
-                ("01", "Connect your intelligence", "Bring an API endpoint or run locally with Joshua. Model choices come directly from your provider.", Page::Providers),
-                ("02", "Give the work a home", "Keep a project coordinator and delegated conversations together, with split views for context.", Page::Projects),
-                ("03", "Make the workspace yours", "Choose your visual theme and tune the prompts that guide each agent mode.", Page::Appearance),
+                ("01", "Connect your intelligence", "Bring an API endpoint or run locally with Joshua. Model choices come directly from your provider.", Route::Providers {}),
+                ("02", "Give the work a home", "Keep a project coordinator and delegated conversations together, with split views for context.", Route::Projects {}),
+                ("03", "Make the workspace yours", "Choose your visual theme and tune the prompts that guide each agent mode.", Route::Appearance {}),
             ] {
                 Card { variant: CardVariant::Elevated, CardHeader { Badge { tone: BadgeTone::Accent, "{number}" } CardTitle { "{title}" } }
                     CardBody { p { class: "a206-muted", "{body}" } }
-                    CardFooter { Button { variant: ButtonVariant::Ghost, onclick: move |_| state.page.set(target), "Open →" } }
+                    CardFooter { LinkButton { variant: ButtonVariant::Ghost, href: target.to_string(), "Open →" } }
                 }
             }
         }
-        Card { variant: CardVariant::Subtle, CardBody { div { class: "a206-row a206-between", div { strong { "Permission is part of the conversation." } p { class: "a206-muted", "Agents begin without tool grants. Modes and delegated tasks can narrow access further." } } Button { variant: ButtonVariant::Secondary, onclick: move |_| state.page.set(Page::Security), "Security details" } } } }
+        Card { variant: CardVariant::Subtle, CardBody { div { class: "a206-row a206-between", div { strong { "Permission is part of the conversation." } p { class: "a206-muted", "Agents begin without tool grants. Modes and delegated tasks can narrow access further." } } LinkButton { variant: ButtonVariant::Secondary, href: Route::Security {}.to_string(), "Security details" } } } }
     } } }
 }
 #[component]
@@ -64,7 +64,7 @@ fn ConversationList(
     #[props(default)] query: String,
     #[props(default)] limit: Option<usize>,
 ) -> Element {
-    let mut state = use_context::<State>();
+    let state = use_context::<State>();
     let snapshot = state.data.read();
     let query = query.trim().to_lowercase();
     let threads: Vec<_> = snapshot
@@ -79,8 +79,8 @@ fn ConversationList(
         for thread in threads {
             { let id = thread.id;
               let model = thread.model.as_ref().and_then(|key| snapshot.catalogs.iter().flat_map(|c| &c.models).find(|m| &m.key == key)).map(|m| m.name.as_str()).unwrap_or("Choose a model");
-              rsx! { Button { key: "{id}", class: "a206-recent-thread", size: ButtonSize::Sm, variant: ButtonVariant::Ghost,
-                  onclick: move |_| { state.selected.set(Some(id)); state.page.set(Page::Chat); },
+              rsx! { LinkButton { key: "{id}", class: "a206-recent-thread", size: ButtonSize::Sm, variant: ButtonVariant::Ghost,
+                  href: Route::Chat { id, split: None }.to_string(),
                   Icon { name: IconName::Sparkles, size: IconSize::Sm }
                   span { class: "a206-nav-title", strong { "{thread.title}" } span { class: "a206-muted", "{model} · {thread.messages.len()} messages" } }
                   Badge { tone: BadgeTone::Accent, "{thread.mode.label()}" }
@@ -92,7 +92,7 @@ fn ConversationList(
 }
 #[component]
 pub fn Projects() -> Element {
-    let mut state = use_context::<State>();
+    let state = use_context::<State>();
     let mut name = use_signal(String::new);
     let mut root = use_signal(String::new);
     rsx! { PageFrame { kicker: "Project spaces", title: "Give your work a home.", description: "Each project gets a coordinator conversation. Open delegated conversations alongside it as the work grows.",
@@ -103,7 +103,7 @@ pub fn Projects() -> Element {
         div { class: "a206-grid", for project in &state.data.read().projects {
             { let manager = project.manager; rsx! { Card {
                 CardHeader { CardTitle { "{project.name}" } CardSubtitle { "{project.root}" } }
-                CardFooter { Button { variant: ButtonVariant::Secondary, onclick: move |_| { state.selected.set(Some(manager)); state.page.set(Page::Chat); }, "Open coordinator" } }
+                CardFooter { LinkButton { variant: ButtonVariant::Secondary, href: Route::Chat { id: manager, split: None }.to_string(), "Open coordinator" } }
             } } }
         } }
     } }
@@ -225,8 +225,8 @@ pub fn Joshua() -> Element {
             Button { variant: ButtonVariant::Ghost, onclick: move |_| { spawn(async move { if let Ok(Reply::Text(text)) = call(Command::JoshuaStatus).await { service_status.set(text); } }); }, "Check status" }
         } }
         div { class: "a206-row",
-            Button { variant: ButtonVariant::Secondary, onclick: move |_| state.page.set(Page::Downloads), "Download a model" }
-            Button { variant: ButtonVariant::Secondary, onclick: move |_| state.page.set(Page::Providers), "Discover models" }
+            LinkButton { variant: ButtonVariant::Secondary, href: Route::Downloads {}.to_string(), "Download a model" }
+            LinkButton { variant: ButtonVariant::Secondary, href: Route::Providers {}.to_string(), "Discover models" }
         }
         Alert { title: rsx! { "Service ownership" }, "Start requires an installed joshua executable. Stop affects only the process started here. To switch models, stop it and start the selected file. Remote release installation and updating are not implemented yet." }
     } }

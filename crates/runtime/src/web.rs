@@ -17,6 +17,8 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
 };
+use tower::ServiceExt;
+use tower_http::services::{ServeDir, ServeFile};
 #[derive(Clone)]
 struct Web {
     client: Client,
@@ -42,7 +44,7 @@ pub async fn serve(root: PathBuf, static_dir: PathBuf, port: u16) -> anyhow::Res
         .route("/connect/{token}", get(connect))
         .route("/api/command", post(command))
         .layer(DefaultBodyLimit::max(a206_protocol::MAX_FRAME + 10))
-        .fallback_service(tower_http::services::ServeDir::new(static_dir))
+        .fallback_service(static_files(static_dir))
         .layer(tower_http::set_header::SetResponseHeaderLayer::overriding(
             header::REFERRER_POLICY,
             axum::http::HeaderValue::from_static("no-referrer"),
@@ -61,6 +63,42 @@ pub async fn serve(root: PathBuf, static_dir: PathBuf, port: u16) -> anyhow::Res
     println!("Open http://127.0.0.1:{port}/connect/{token} to authorize this browser session.");
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+/// Serve built assets first, then the SPA entry point for browser page requests.
+/// Reserved bridge/asset paths and non-HTML requests retain their normal 404s.
+fn static_files(static_dir: PathBuf) -> Router {
+    let index = ServeFile::new(static_dir.join("index.html"));
+    let pages = get(move |request: axum::extract::Request| {
+        let index = index.clone();
+        async move {
+            let path = request.uri().path();
+            let reserved = matches!(
+                path.split('/').nth(1),
+                Some("api" | "connect" | "assets" | ".well-known")
+            );
+            let wants_html = request
+                .headers()
+                .get(header::ACCEPT)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| {
+                    value.split(',').any(|part| {
+                        part.split(';')
+                            .next()
+                            .is_some_and(|mime| mime.trim() == "text/html")
+                    })
+                });
+            if reserved || !wants_html {
+                return StatusCode::NOT_FOUND.into_response();
+            }
+            index
+                .oneshot(request)
+                .await
+                .unwrap_or_else(|never| match never {})
+                .into_response()
+        }
+    });
+    Router::new().fallback_service(ServeDir::new(static_dir).fallback(pages))
 }
 async fn connect(
     State(state): State<Web>,
@@ -150,6 +188,109 @@ async fn command(State(state): State<Web>, headers: HeaderMap, bytes: Bytes) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn browser_deep_links_reload_without_masking_api_or_asset_errors() {
+        let directory = tempfile::tempdir().unwrap();
+        let html = "<!doctype html><title>Navigation test</title>";
+        tokio::fs::write(directory.path().join("index.html"), html)
+            .await
+            .unwrap();
+        tokio::fs::create_dir(directory.path().join("assets"))
+            .await
+            .unwrap();
+        tokio::fs::write(directory.path().join("assets/app.css"), "body {}")
+            .await
+            .unwrap();
+        let app = static_files(directory.path().into());
+        let id = uuid::Uuid::new_v4();
+        for path in [
+            "/connections".into(),
+            format!("/conversations/{id}?split={}", uuid::Uuid::new_v4()),
+            "/unknown/page".into(),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri(&path)
+                        .header(header::ACCEPT, "text/html,application/xhtml+xml")
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+            assert!(
+                response.headers()[header::CONTENT_TYPE]
+                    .to_str()
+                    .unwrap()
+                    .starts_with("text/html")
+            );
+            assert_eq!(
+                axum::body::to_bytes(response.into_body(), 1024)
+                    .await
+                    .unwrap(),
+                html
+            );
+        }
+        for (method, path, accept, status) in [
+            (
+                "GET",
+                "/assets/missing.js",
+                "text/javascript",
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                "GET",
+                "/assets/missing.js",
+                "text/html",
+                StatusCode::NOT_FOUND,
+            ),
+            ("GET", "/api/missing", "text/html", StatusCode::NOT_FOUND),
+            (
+                "GET",
+                "/connect/missing/path",
+                "text/html",
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                "GET",
+                "/connections",
+                "application/msgpack",
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                "POST",
+                "/connections",
+                "text/html",
+                StatusCode::METHOD_NOT_ALLOWED,
+            ),
+            ("GET", "/assets/app.css", "text/css", StatusCode::OK),
+            ("HEAD", "/settings/appearance", "text/html", StatusCode::OK),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method(method)
+                        .uri(path)
+                        .header(header::ACCEPT, accept)
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status, "{method} {path}");
+            if method == "HEAD" {
+                assert!(
+                    axum::body::to_bytes(response.into_body(), 1024)
+                        .await
+                        .unwrap()
+                        .is_empty()
+                );
+            }
+        }
+    }
     #[test]
     fn auth_requires_an_explicit_origin_bound_bearer() {
         let root = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
