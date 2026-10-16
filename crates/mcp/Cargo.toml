@@ -1,0 +1,22 @@
+[package]
+name = "a206-mcp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+[dependencies]
+a206-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tokio.workspace = true
+tempfile.workspace = true
+rmcp = { version = "3.5", features = ["client", "transport-async-rw"] }
+schemars = "1"
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.31", features = ["signal", "process"] }
+[dev-dependencies]
+uuid.workspace = true
+[lints]
+workspace = true

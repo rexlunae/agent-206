@@ -124,7 +124,7 @@ one tool, `rename_thread` (`a206/crates/runtime/src/mcp.rs`); the `Command` enum
 | ClawHub registry install/search (`skills/clawhub.rs`, CLI `clawhub`) | missing | Reviewed install with manifest validation + audit |
 | Agent-created skills/curator (`tools/skill_curator.rs`, `skill_create`) | missing | Agent prepares package; user enables |
 | Plugin UI panels + state (`plugins/mod.rs`, `tools/plugin.rs`) | partial: one bundled text-only WASM panel (`a206/crates/extensions`, `plugins/inspector`) | ABI v2: MessagePack inputs, host calls, typed UI |
-| MCP **client** connect/list/tools (`mcp/*`, `tools/mcp_tools.rs`) | missing (a206 has MCP **server** harness only, `runtime/src/mcp.rs`) | MCP client in isolated process; tools gated by grants; imported servers inactive |
+| MCP **client** connect/list/tools (`mcp/*`, `tools/mcp_tools.rs`) | partial (experimental): stdio servers in a macOS sandbox with declared authority, per-tool Allow/Ask/Deny, grant- and project-bound calls, bounded framing/listing/results, status in snapshot, desktop/TUI Extensions page, `mcp-servers` CLI (`a206/crates/mcp`, `runtime/src/gateway/mcp_servers.rs`, `docs/mcp.md`); not reachable by models until the run engine lands; no HTTP transport, credentials or Linux isolation | Run engine offers `mcp_offers` and calls `call_mcp_tool` with approvals; streamable HTTP with vault-brokered auth; Linux sandbox |
 | ACP | present (a206 extra): `agent206 acp`, ACP client for Claude Agent (`runtime/src/acp.rs`, `backends/claude.rs`) | — |
 
 ## Providers, models and auth
@@ -159,7 +159,7 @@ one tool, `rename_thread` (`a206/crates/runtime/src/mcp.rs`); the `Command` enum
 | --- | --- | --- |
 | Onboard wizard: provider, key, vault, workspace, messaging, skills (`rustyclaw-onboard/src/*`) | missing | GUI-first wizard; CLI uses same API |
 | First-run "hatching" SOUL personality (desktop `components/hatching.rs`) | missing | Optional mode-prompt step |
-| Panels: secrets, vault unlock, credential request, approvals, cron, memory, MCP, channels, messengers, skills, services, engines, logs, analytics, system info, swarm, tool perms (desktop `components/*`, TUI `components/*_dialog.rs`) | partial: workspace, conversations, projects, connections, downloads, extensions, browser, documents, appearance, modes, security (vault create/unlock/lock, gateway pairing and TOTP enrollment for local profiles; `ui/src/vault.rs`), Joshua, gateway (`ui/src/route.rs`); secrets, credential request and approvals panels are not built | Each lands as routes when backing feature exists; no placeholder controls |
+| Panels: secrets, vault unlock, credential request, approvals, cron, memory, MCP (on the extensions page), channels, messengers, skills, services, engines, logs, analytics, system info, swarm, tool perms (desktop `components/*`, TUI `components/*_dialog.rs`) | partial: workspace, conversations, projects, connections, downloads, extensions, browser, documents, appearance, modes, security (vault create/unlock/lock, gateway pairing and TOTP enrollment for local profiles; `ui/src/vault.rs`), Joshua, gateway (`ui/src/route.rs`); secrets, credential request and approvals panels are not built | Each lands as routes when backing feature exists; no placeholder controls |
 | TUI slash commands + tab completion (`rustyclaw-tui/src/components/command_menu.rs`) | partial: shared Dioxus TUI renders, untested interaction | Command palette in shared fc-dioxus |
 | Thread tabs, tool-call rendering (`tui/components/thread_tabs.rs`, `tool_call.rs`) | partial: split view; no tool traces (no tool loop) | fc-dioxus tool trace component |
 | Web client over WebSocket/WASM (`rustyclaw-web`) | present: authenticated loopback web (`runtime/src/web.rs`) | — |
@@ -168,7 +168,7 @@ one tool, `rename_thread` (`a206/crates/runtime/src/mcp.rs`); the `Command` enum
 
 | RustyClaw capability | Agent 206 status | How it should land |
 | --- | --- | --- |
-| Landlock, Bubblewrap, Landlock+Bwrap, Docker, macOS sandbox-exec, path validation (`sandbox/*`, `runtime/docker.rs`) | partial: macOS sandbox-exec for external backends only; other platforms refuse (`runtime/src/backends/isolation.rs:300`) | Linux Landlock/bwrap profiles; fail closed, never downgrade |
+| Landlock, Bubblewrap, Landlock+Bwrap, Docker, macOS sandbox-exec, path validation (`sandbox/*`, `runtime/docker.rs`) | partial: macOS sandbox-exec for external backends and MCP servers (`a206/crates/mcp/src/sandbox.rs`) only; other platforms refuse (`runtime/src/backends/isolation.rs:300`) | Linux Landlock/bwrap profiles; fail closed, never downgrade |
 | SSH runtime adapter for remote exec (`runtime/ssh.rs`) | missing (remote gateway via SSH exists) | Execute on remote gateway rather than per-command SSH |
 | WASM tool sandbox | present (a206 extra): fuel/memory/time-bounded worker, no WASI (`a206/crates/extensions`) | Add OS profile to worker |
 

@@ -2,6 +2,7 @@
 #![forbid(unsafe_code)]
 mod conversation;
 mod error;
+mod mcp;
 mod pages;
 mod route;
 mod settings;
@@ -101,6 +102,7 @@ fn empty_snapshot() -> Snapshot {
         plugins: vec![],
         last_event: 0,
         managed_joshua_provider: None,
+        mcp_servers: vec![],
     }
 }
 /// Send a command; a gateway-reported failure arrives as `Err` with its causes.

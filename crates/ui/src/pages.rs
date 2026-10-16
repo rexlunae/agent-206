@@ -152,6 +152,7 @@ pub fn Extensions() -> Element {
         if let Some(report) = failure() { ErrorNotice { report, title: "Extension failed".to_string() } }
         if !output().is_empty() { Card { CardBody { p { class: "a206-message-text", "{output}" } } } }
         p { class: "a206-muted", "Agent-created extension installation and capability-bearing host APIs are still under development." }
+        crate::mcp::McpServers {}
     } }
 }
 #[component]
