@@ -17,7 +17,6 @@ use std::{
 
 const FILE: &str = "connection.toml";
 const PROBE_TIMEOUT: Duration = Duration::from_secs(20);
-type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConnectionError {
@@ -30,13 +29,19 @@ pub enum ConnectionError {
     InvalidEndpoint {
         endpoint: String,
         #[source]
-        source: BoxError,
+        source: crate::transport::SshEndpointError,
     },
     #[error("invalid gateway setup in {}", path.display())]
     InvalidSetup {
         path: PathBuf,
         #[source]
-        source: BoxError,
+        source: toml::de::Error,
+    },
+    #[error("could not encode gateway setup for {}", path.display())]
+    EncodeSetup {
+        path: PathBuf,
+        #[source]
+        source: toml::ser::Error,
     },
     #[error("could not access {}", path.display())]
     Io {
@@ -79,6 +84,12 @@ pub enum ConnectionError {
     ProxiedHost { host: String },
     #[error("the host key entry does not match its fingerprint")]
     HostKeyMismatch,
+    /// A client could not run setup work off its UI thread.
+    #[error("gateway setup work stopped before finishing")]
+    SetupWorker {
+        #[source]
+        source: Option<std::io::Error>,
+    },
 }
 type Result<T, E = ConnectionError> = std::result::Result<T, E>;
 
@@ -131,7 +142,7 @@ pub fn load(root: &Path) -> Result<Option<GatewayConnection>> {
     let connection: GatewayConnection = toml::from_str(&text).map_err(|source| {
         traced(ConnectionError::InvalidSetup {
             path: path.clone(),
-            source: source.into(),
+            source,
         })
     })?;
     validate(&connection.target)?;
@@ -141,9 +152,9 @@ pub fn save(root: &Path, connection: &GatewayConnection) -> Result<()> {
     validate(&connection.target)?;
     let path = root.join(FILE);
     let text = toml::to_string_pretty(connection).map_err(|source| {
-        traced(ConnectionError::InvalidSetup {
+        traced(ConnectionError::EncodeSetup {
             path: path.clone(),
-            source: source.into(),
+            source,
         })
     })?;
     private_root(root)?;
@@ -165,7 +176,7 @@ fn endpoint_of(endpoint: &str) -> Result<crate::transport::SshEndpoint> {
     crate::transport::parse_ssh_endpoint(endpoint).map_err(|source| {
         traced(ConnectionError::InvalidEndpoint {
             endpoint: endpoint.to_owned(),
-            source: source.into(),
+            source,
         })
     })
 }
@@ -191,7 +202,7 @@ pub async fn check_ssh(root: &Path, endpoint: &str) -> Result<String> {
     let mut command = crate::transport::gateway_ssh_command(root, endpoint).map_err(|source| {
         traced(ConnectionError::InvalidEndpoint {
             endpoint: endpoint.to_owned(),
-            source: source.into(),
+            source,
         })
     })?;
     // Fixed command text: OpenSSH executes remote arguments through a shell.
@@ -293,7 +304,7 @@ pub async fn scan_host_keys(endpoint: &str) -> Result<Vec<HostKey>> {
     let mut config = crate::transport::ssh_config_command(endpoint).map_err(|source| {
         traced(ConnectionError::InvalidEndpoint {
             endpoint: endpoint.to_owned(),
-            source: source.into(),
+            source,
         })
     })?;
     config.stdin(Stdio::null()).kill_on_drop(true);

@@ -17,6 +17,8 @@ enum Step {
 }
 
 /// Run setup I/O on its own runtime: the UI executor is not necessarily Tokio.
+/// The worker thread is detached deliberately; its result (or its loss) comes
+/// back through the channel, and its processes are killed on drop.
 async fn off_ui<T: Send + 'static>(
     work: impl Future<Output = Result<T, ConnectionError>> + Send + 'static,
 ) -> Result<T, Arc<ConnectionError>> {
@@ -25,19 +27,16 @@ async fn off_ui<T: Send + 'static>(
         let result = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .map_err(|source| ConnectionError::Io {
-                path: PathBuf::new(),
-                source,
+            .map_err(|source| ConnectionError::SetupWorker {
+                source: Some(source),
             })
             .and_then(|runtime| runtime.block_on(work));
+        // The receiver is gone only if the setup screen was closed; nothing to report.
         let _delivery = sender.send(result);
     });
     match receiver.await {
         Ok(result) => result.map_err(Arc::new),
-        Err(_) => Err(Arc::new(ConnectionError::TimedOut {
-            operation: "gateway setup",
-            host: String::new(),
-        })),
+        Err(_) => Err(Arc::new(ConnectionError::SetupWorker { source: None })),
     }
 }
 /// The error and its causes, for display. The structured error was already traced.
