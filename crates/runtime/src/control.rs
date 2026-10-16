@@ -1,8 +1,11 @@
 //! User-owned gateway lifecycle, shared by desktop, web bridge and CLI.
 //! This actor runs outside the UI executor and never exposes its controls as agent tools.
 use crate::client::Client;
-use a206_core::{Command, GatewayAction, GatewayInfo, GatewayPhase, GatewayReport, Reply};
-use anyhow::{Context, Result};
+use a206_core::{
+    Command, ErrorKind, ErrorReport, GatewayAction, GatewayInfo, GatewayPhase, GatewayReport,
+    Ignore, Reply,
+};
+use anyhow::Result;
 use std::{
     path::PathBuf,
     sync::{Arc, Mutex},
@@ -49,11 +52,11 @@ impl GatewayController {
                     let mutation = matches!(action, GatewayAction::Start | GatewayAction::Stop | GatewayAction::Restart);
                     if mutation {
                         if let Some((previous, report)) = receipts.get(&id) {
-                            let _delivery = response.send(if *previous == action { Ok(report.clone()) } else { Err(anyhow::anyhow!("control request ID reused with a different operation")) });
+                            response.send(if *previous == action { Ok(report.clone()) } else { Err(ErrorReport::new(ErrorKind::Conflict, "control request ID reused with a different operation").into()) }).ignore();
                             continue;
                         }
                         if receipts.len() >= 4096 {
-                            let _delivery = response.send(Err(anyhow::anyhow!("control receipt limit reached; reopen the controller before submitting more lifecycle changes")));
+                            response.send(Err(ErrorReport::new(ErrorKind::Unavailable, "control receipt limit reached; reopen the controller before submitting more lifecycle changes").into())).ignore();
                             continue;
                         }
                     }
@@ -63,9 +66,11 @@ impl GatewayController {
                     )
                     .await;
                     let result = outcome.unwrap_or_else(|_| {
-                        Err(anyhow::anyhow!(
-                            "gateway operation timed out; check status before retrying"
-                        ))
+                        Err(ErrorReport::new(
+                            ErrorKind::Timeout,
+                            "gateway operation timed out; check status before retrying",
+                        )
+                        .into())
                     });
                     let report = match result {
                         Ok(info) => GatewayReport {
@@ -93,13 +98,13 @@ impl GatewayController {
                                 error: if action == GatewayAction::Status && known_stopped {
                                     None
                                 } else {
-                                    Some(format!("{error:#}"))
+                                    Some(crate::error::handle(action.name(), &error))
                                 },
                             }
                         }
                     };
                     if mutation { receipts.insert(id, (action, report.clone())); }
-                    let _delivery = response.send(Ok(report));
+                    response.send(Ok(report)).ignore();
                 }
             });
         });
@@ -117,8 +122,12 @@ impl GatewayController {
         self.controls
             .send((id, action, sender))
             .await
-            .context("gateway controller unavailable")?;
-        receiver.await.context("gateway controller disconnected")?
+            .map_err(|_| {
+                ErrorReport::new(ErrorKind::Unavailable, "gateway controller unavailable")
+            })?;
+        receiver.await.map_err(|_| {
+            ErrorReport::new(ErrorKind::Unavailable, "gateway controller disconnected")
+        })?
     }
     pub async fn call(&self, command: Command) -> Result<Reply> {
         current(&self.client)?.call(command).await
@@ -135,19 +144,19 @@ fn target(root: &std::path::Path, remote: &Option<String>) -> String {
 fn current(shared: &Mutex<Client>) -> Result<Client> {
     Ok(shared
         .lock()
-        .map_err(|_| anyhow::anyhow!("gateway connection lock poisoned"))?
+        .map_err(|_| crate::error::poisoned("gateway connection"))?
         .clone())
 }
 fn replace(shared: &Mutex<Client>, client: Client) -> Result<()> {
     *shared
         .lock()
-        .map_err(|_| anyhow::anyhow!("gateway connection lock poisoned"))? = client;
+        .map_err(|_| crate::error::poisoned("gateway connection"))? = client;
     Ok(())
 }
 async fn probe(client: Client) -> Result<GatewayInfo> {
     match client.call(Command::GatewayStatus).await? {
         Reply::Gateway(info) => Ok(info),
-        Reply::Error { message } => anyhow::bail!("{message}"),
+        Reply::Error(report) => Err(report.into()),
         _ => anyhow::bail!("gateway did not return status; update the gateway executable"),
     }
 }
@@ -182,7 +191,7 @@ async fn stop(
     }
     let shutdown = match current(shared)?.call(Command::Shutdown).await {
         Ok(Reply::Ok) => Ok(()),
-        Ok(Reply::Error { message }) => Err(anyhow::anyhow!(message)),
+        Ok(Reply::Error(report)) => Err(report.into()),
         Ok(_) => Err(anyhow::anyhow!("gateway did not acknowledge shutdown")),
         Err(error) => Err(error),
     };

@@ -39,7 +39,7 @@ impl Harness {
             .map_err(|e| e.to_string())?
         {
             Reply::Ok => Ok("Conversation renamed".into()),
-            Reply::Error { message } => Err(message),
+            Reply::Error(report) => Err(report.message),
             _ => Err("unexpected gateway response".into()),
         }
     }

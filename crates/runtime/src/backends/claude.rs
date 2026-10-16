@@ -113,12 +113,15 @@ pub async fn run(
                                     .data("Backend message exceeds the conversation limit"));
                             }
                             output.text.push_str(&text.text);
-                            let _result = progress.try_send(Progress::Text(output.text.clone()));
+                            progress
+                                .try_send(Progress::Text(output.text.clone()))
+                                .ignore();
                         }
                     }
                     SessionUpdate::ToolCall(tool) => {
-                        let _result = progress
-                            .try_send(Progress::Activity(format!("Claude Agent: {:?}", tool.kind)));
+                        progress
+                            .try_send(Progress::Activity(format!("Claude Agent: {:?}", tool.kind)))
+                            .ignore();
                     }
                     SessionUpdate::UsageUpdate(usage) => {
                         // ACP context-used is not request input usage. Preserve that distinction.

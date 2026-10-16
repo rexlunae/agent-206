@@ -438,8 +438,11 @@ async fn web_controls_require_authority_and_deduplicate_restart() -> Result<()> 
         failed_stop
             .body
             .error
-            .as_deref()
-            .is_some_and(|error| error.contains("cleanup timed out"))
+            .as_ref()
+            .is_some_and(|error| error.kind == a206_core::ErrorKind::Timeout
+                && error.detail().contains("cleanup timed out")),
+        "{:?}",
+        failed_stop.body.error
     );
     ensure!(!app.root.join("gateway.stopped").exists());
     let status = report(&app, "status")

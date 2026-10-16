@@ -19,7 +19,7 @@ impl Drop for Process {
         #[cfg(unix)]
         {
             if let Some(group) = self.group.take() {
-                let _result = nix::sys::signal::killpg(group, nix::sys::signal::Signal::SIGKILL);
+                nix::sys::signal::killpg(group, nix::sys::signal::Signal::SIGKILL).ignore();
             }
         }
     }
@@ -185,11 +185,11 @@ impl Process {
         #[cfg(unix)]
         {
             if let Some(group) = self.group.take() {
-                let _result = nix::sys::signal::killpg(group, nix::sys::signal::Signal::SIGKILL);
+                nix::sys::signal::killpg(group, nix::sys::signal::Signal::SIGKILL).ignore();
             }
         }
-        let _result = self.child.kill().await;
-        let _result = self.child.wait().await;
+        self.child.kill().await.ignore();
+        self.child.wait().await.ignore();
     }
 }
 #[cfg(target_os = "macos")]

@@ -49,7 +49,13 @@ impl Proxy {
             .layer(axum::extract::DefaultBodyLimit::max(4 * 1024 * 1024))
             .with_state(scope);
         let task = tokio::spawn(async move {
-            let _result = axum::serve(listener, router).await;
+            // A failed proxy surfaces to the backend as refused requests; record why.
+            if let Err(error) = axum::serve(listener, router).await {
+                crate::error::handle(
+                    "backend_proxy",
+                    &anyhow::Error::from(error).context("backend credential proxy stopped"),
+                );
+            }
         });
         Ok(Self {
             task,

@@ -19,6 +19,8 @@ a206-protocol.workspace = true
 a206-vault.workspace = true
 a206-extensions.workspace = true
 anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
 clap = { version = "4", features = ["derive"] }
 tokio.workspace = true
 toml.workspace = true

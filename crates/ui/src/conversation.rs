@@ -1,7 +1,7 @@
 use crate::{State, dispatch, route::Route};
 use a206_core::{
-    Capability, CodingBackend, Command, Mode, ModelKey, Reply, Role, RunState, TextAttachment,
-    Thread,
+    Capability, CodingBackend, Command, ErrorKind, ErrorReport, Mode, ModelKey, Reply, Role,
+    RunState, TextAttachment, Thread,
 };
 use fc_dioxus::prelude::*;
 #[cfg(not(target_arch = "wasm32"))]
@@ -115,15 +115,17 @@ fn Conversation(thread: Thread) -> Element {
                 })
                 .await;
                 match result {
-                    Ok(Reply::Thread(_)) => state.status.set(String::new()),
+                    Ok(Reply::Thread(_)) => {
+                        state.status.set(String::new());
+                        state.error.set(None);
+                    }
                     other => {
                         draft.set(text);
                         attachments.set(files);
-                        state.status.set(match other {
-                            Ok(Reply::Error { message }) => message,
+                        state.error.set(Some(match other {
                             Err(error) => error,
-                            _ => "Unexpected send response".into(),
-                        });
+                            _ => ErrorReport::new(ErrorKind::Protocol, "Unexpected send response"),
+                        }));
                     }
                 }
                 submitting.set(false);

@@ -1,5 +1,5 @@
 //! Dedicated gateway I/O worker. Reconnect unsent work; never repeat an accepted mutation.
-use a206_core::{Command, Reply};
+use a206_core::{Command, ErrorKind, ErrorReport, Ignore, Reply};
 use a206_protocol::{Request, Response};
 use anyhow::{Context, Result};
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
@@ -26,13 +26,11 @@ impl Client {
     fn connect(root: PathBuf, remote: Option<String>, start: bool, explicit: bool) -> Self {
         let (sender, receiver) = mpsc::channel(32);
         std::thread::spawn(move || {
-            let result = tokio::runtime::Runtime::new().and_then(|runtime| {
-                runtime
-                    .block_on(run(root, remote, receiver, start, explicit))
-                    .map_err(std::io::Error::other)
-            });
+            let result = tokio::runtime::Runtime::new()
+                .map_err(anyhow::Error::from)
+                .and_then(|runtime| runtime.block_on(run(root, remote, receiver, start, explicit)));
             if let Err(error) = result {
-                eprintln!("gateway connection ended: {error}");
+                crate::error::handle("gateway_connection", &error);
             }
         });
         Self { sender }
@@ -45,10 +43,10 @@ impl Client {
         self.sender
             .send((Request { id, body }, sender))
             .await
-            .context("gateway disconnected")?;
+            .map_err(|_| unavailable("gateway disconnected"))?;
         receiver
             .await
-            .context("gateway reply lost; refresh before repeating an action")?
+            .map_err(|_| unavailable("gateway reply lost; refresh before repeating an action"))?
     }
 }
 async fn run(
@@ -73,7 +71,11 @@ async fn run(
                 }
             }
             Err(error) => {
-                let _delivery = first.1.send(Err(error.into()));
+                first
+                    .1
+                    .send(Err(anyhow::Error::from(error)
+                        .context("could not launch the gateway connection")))
+                    .ignore();
             }
         }
     }
@@ -111,7 +113,7 @@ async fn connection(
             crate::transport::read_frame::<Response<Reply>>(&mut stdout).await?
         {
             if let Some(sender) = reads.lock().await.remove(&response.id) {
-                let _delivery = sender.send(Ok(response.body));
+                sender.send(Ok(response.body)).ignore();
             }
         }
         Ok::<(), anyhow::Error>(())
@@ -123,17 +125,26 @@ async fn connection(
             let mut outstanding = pending.lock().await;
             outstanding.retain(|_, sender| !sender.is_closed());
             if outstanding.len() >= 32 {
-                let _delivery = sender.send(Err(anyhow::anyhow!(
-                    "gateway has too many outstanding requests"
-                )));
+                sender
+                    .send(Err(ErrorReport::new(
+                        ErrorKind::Unavailable,
+                        "gateway has too many outstanding requests",
+                    )
+                    .into()))
+                    .ignore();
                 continue;
             }
             if let std::collections::hash_map::Entry::Vacant(entry) = outstanding.entry(request.id)
             {
                 entry.insert(sender);
             } else {
-                let _delivery =
-                    sender.send(Err(anyhow::anyhow!("request id is already in flight")));
+                sender
+                    .send(Err(ErrorReport::new(
+                        ErrorKind::Conflict,
+                        "request id is already in flight",
+                    )
+                    .into()))
+                    .ignore();
                 continue;
             }
             drop(outstanding);
@@ -155,16 +166,28 @@ async fn connection(
         }
     }
     reader.abort();
-    let _kill_result = child.kill().await;
+    child.kill().await.ignore();
     let detail = tokio::time::timeout(std::time::Duration::from_secs(1), &mut diagnostics)
         .await
         .ok()
         .and_then(Result::ok)
         .unwrap_or_default();
     diagnostics.abort();
+    let lost = ErrorReport::new(
+        ErrorKind::Unavailable,
+        "gateway connection was lost; the command may have completed; refresh state before retrying",
+    );
+    // The gateway's last diagnostics are a cause, not part of the message.
+    let lost = if detail.is_empty() {
+        lost
+    } else {
+        lost.caused_by(ErrorReport::new(ErrorKind::Other, detail))
+    };
     for (_, sender) in pending.lock().await.drain() {
-        let _delivery = sender.send(Err(anyhow::anyhow!("gateway connection was lost; the command may have completed; refresh state before retrying{}",
-            if detail.is_empty() { String::new() } else { format!(": {detail}") })));
+        sender.send(Err(lost.clone().into())).ignore();
     }
     Ok(stopped)
+}
+fn unavailable(message: &str) -> anyhow::Error {
+    ErrorReport::new(ErrorKind::Unavailable, message).into()
 }

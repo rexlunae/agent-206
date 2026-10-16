@@ -46,7 +46,7 @@ impl DrainAttempt {
     fn begin(admission: &Arc<Mutex<Admission>>) -> Result<Self> {
         let mut state = admission
             .lock()
-            .map_err(|_| anyhow::anyhow!("gateway admission lock poisoned"))?;
+            .map_err(|_| crate::error::poisoned("gateway admission"))?;
         ensure!(!state.draining, "gateway shutdown is already complete");
         state.draining = true;
         Ok(Self {
@@ -91,7 +91,7 @@ impl Gateway {
     fn lock(&self) -> Result<MutexGuard<'_, Store>> {
         self.store
             .lock()
-            .map_err(|_| anyhow::anyhow!("state lock poisoned"))
+            .map_err(|_| crate::error::poisoned("state"))
     }
     pub fn stop_signal(&self) -> tokio_util::sync::CancellationToken {
         self.stop.clone()
@@ -107,7 +107,7 @@ impl Gateway {
         let running = self
             .running
             .lock()
-            .map_err(|_| anyhow::anyhow!("run lock poisoned"))?;
+            .map_err(|_| crate::error::poisoned("run"))?;
         for thread in &store.state.threads {
             if thread
                 .model
@@ -128,31 +128,33 @@ impl Gateway {
     /// The stop effect belongs only to fresh execution, never a durable replay.
     async fn request_with_effect(&self, request: Request<Command>) -> (Response<Reply>, bool) {
         let id = request.id;
+        let operation = request.body.name();
+        let span = tracing::info_span!("request", %id, operation);
+        let (body, stop) = tracing::Instrument::instrument(self.execute(request), span).await;
+        let body = match body {
+            Ok(reply) => reply,
+            Err(error) => Reply::Error(crate::error::handle(operation, &error)),
+        };
+        (Response { id, body }, stop)
+    }
+    async fn execute(&self, request: Request<Command>) -> (Result<Reply>, bool) {
+        let id = request.id;
+        let operation = request.body.name();
         let is_shutdown = matches!(request.body, Command::Shutdown);
         let _active = if !matches!(
             request.body,
             Command::Snapshot | Command::GatewayStatus | Command::Shutdown | Command::Events { .. }
         ) {
             let Ok(mut admission) = self.admission.lock() else {
-                return (
-                    Response {
-                        id,
-                        body: Reply::Error {
-                            message: "gateway admission lock poisoned".into(),
-                        },
-                    },
-                    false,
-                );
+                return (Err(crate::error::poisoned("gateway admission")), false);
             };
             if admission.draining {
                 return (
-                    Response {
-                        id,
-                        body: Reply::Error {
-                            message: "gateway is stopping; start it again before submitting work"
-                                .into(),
-                        },
-                    },
+                    Err(ErrorReport::new(
+                        ErrorKind::Unavailable,
+                        "gateway is stopping; start it again before submitting work",
+                    )
+                    .into()),
                     false,
                 );
             }
@@ -171,44 +173,32 @@ impl Gateway {
                 | Command::ReadDocument { .. }
                 | Command::RunExtension { .. }
         );
-        let begin = (|| -> Result<Option<Reply>> {
-            if mutation {
-                self.lock()?.begin(id, &request.body)
-            } else {
-                Ok(None)
-            }
-        })();
-        let mut stop = false;
-        let body = match begin {
-            Ok(Some(reply)) => reply,
-            Err(error) => Reply::Error {
-                message: error.to_string(),
-            },
+        let begin = if mutation {
+            self.lock()
+                .and_then(|mut store| store.begin(id, &request.body))
+        } else {
+            Ok(None)
+        };
+        match begin {
+            Ok(Some(reply)) => (Ok(reply), false),
+            Err(error) => (Err(error), false),
             Ok(None) => {
-                let reply = self
-                    .handle(request.body)
-                    .await
-                    .unwrap_or_else(|e| Reply::Error {
-                        message: e.to_string(),
-                    });
-                stop = is_shutdown && matches!(reply, Reply::Ok);
-                if mutation && let Err(e) = self.lock().and_then(|s| s.finish(id, &reply)) {
+                // A failed command is a reply: persist its report as the receipt.
+                let reply = match self.handle(request.body).await {
+                    Ok(reply) => reply,
+                    Err(error) => Reply::Error(crate::error::handle(operation, &error)),
+                };
+                let stop = is_shutdown && matches!(reply, Reply::Ok);
+                if mutation && let Err(error) = self.lock().and_then(|s| s.finish(id, &reply)) {
                     return (
-                        Response {
-                            id,
-                            body: Reply::Error {
-                                message: format!(
-                                    "operation completed but its receipt could not be persisted: {e}"
-                                ),
-                            },
-                        },
+                        Err(error
+                            .context("operation completed but its receipt could not be persisted")),
                         stop,
                     );
                 }
-                reply
+                (Ok(reply), stop)
             }
-        };
-        (Response { id, body }, stop)
+        }
     }
     async fn handle(&self, command: Command) -> Result<Reply> {
         match command {
@@ -221,18 +211,18 @@ impl Gateway {
                 active_runs: self
                     .running
                     .lock()
-                    .map_err(|_| anyhow::anyhow!("run lock poisoned"))?
+                    .map_err(|_| crate::error::poisoned("run"))?
                     .len(),
                 active_downloads: self
                     .downloads
                     .lock()
-                    .map_err(|_| anyhow::anyhow!("download lock poisoned"))?
+                    .map_err(|_| crate::error::poisoned("download"))?
                     .len(),
                 accepting_work: Some(
                     !self
                         .admission
                         .lock()
-                        .map_err(|_| anyhow::anyhow!("gateway admission lock poisoned"))?
+                        .map_err(|_| crate::error::poisoned("gateway admission"))?
                         .draining,
                 ),
             })),
@@ -332,7 +322,7 @@ impl Gateway {
                 let running = self
                     .running
                     .lock()
-                    .map_err(|_| anyhow::anyhow!("run lock poisoned"))?;
+                    .map_err(|_| crate::error::poisoned("run"))?;
                 for thread in &store.state.threads {
                     let provider_changed = thread.model.as_ref().is_some_and(|key| {
                         let previous = store
@@ -427,7 +417,7 @@ impl Gateway {
                     let running = self
                         .running
                         .lock()
-                        .map_err(|_| anyhow::anyhow!("run lock poisoned"))?;
+                        .map_err(|_| crate::error::poisoned("run"))?;
                     for child in store.state.threads.iter().filter(|child| {
                         child.parent == Some(id) && child.model.as_ref() == Some(&model)
                     }) {
@@ -663,10 +653,11 @@ impl Gateway {
                     });
                     thread.state = RunState::Running;
                     thread.backend_activity = None;
+                    thread.error = None;
                     let copy = thread.clone();
                     self.running
                         .lock()
-                        .map_err(|_| anyhow::anyhow!("run lock poisoned"))?
+                        .map_err(|_| crate::error::poisoned("run"))?
                         .insert(id, token.clone());
                     store.persist(Some(EventKind::ThreadChanged { id }))?;
                     (config, copy, prompt, info, backend, workspace, root)
@@ -728,7 +719,7 @@ impl Gateway {
                 drop(operation);
                 self.running
                     .lock()
-                    .map_err(|_| anyhow::anyhow!("run lock poisoned"))?
+                    .map_err(|_| crate::error::poisoned("run"))?
                     .remove(&id);
                 let mut store = self.lock()?;
                 let thread = store.thread_mut(id)?;
@@ -752,15 +743,17 @@ impl Gateway {
                         thread.state = RunState::Complete;
                     }
                     Some(Err(e)) => {
+                        let report = crate::error::handle("run", &e);
                         thread.state = RunState::Failed;
                         thread.messages.push(Message {
                             id: Id::new_v4(),
                             role: Role::System,
                             attachments: vec![],
-                            text: e.to_string(),
+                            text: report.detail(),
                             at: now(),
                             backend: thread.backend,
                         });
+                        thread.error = Some(report);
                     }
                     None => {
                         thread.state = RunState::Cancelled;
@@ -774,8 +767,10 @@ impl Gateway {
                 let running = self
                     .running
                     .lock()
-                    .map_err(|_| anyhow::anyhow!("run lock poisoned"))?;
-                let token = running.get(&thread).context("thread is not running")?;
+                    .map_err(|_| crate::error::poisoned("run"))?;
+                let token = running
+                    .get(&thread)
+                    .ok_or_else(|| crate::error::not_found("thread is not running"))?;
                 token.cancel();
                 Ok(Reply::Ok)
             }
@@ -844,7 +839,7 @@ impl Gateway {
                     .downloads
                     .iter_mut()
                     .find(|d| d.id == id)
-                    .context("download not found")?;
+                    .ok_or_else(|| crate::error::not_found("download not found"))?;
                 ensure!(
                     matches!(
                         download.state,
@@ -856,7 +851,7 @@ impl Gateway {
                 if let Some(token) = self
                     .downloads
                     .lock()
-                    .map_err(|_| anyhow::anyhow!("transfer lock poisoned"))?
+                    .map_err(|_| crate::error::poisoned("transfer"))?
                     .get(&id)
                 {
                     token.cancel();
@@ -958,7 +953,7 @@ impl Gateway {
                         for token in self
                             .running
                             .lock()
-                            .map_err(|_| anyhow::anyhow!("run lock poisoned"))?
+                            .map_err(|_| crate::error::poisoned("run"))?
                             .values()
                         {
                             token.cancel();
@@ -966,7 +961,7 @@ impl Gateway {
                         for token in self
                             .downloads
                             .lock()
-                            .map_err(|_| anyhow::anyhow!("download lock poisoned"))?
+                            .map_err(|_| crate::error::poisoned("download"))?
                             .values()
                         {
                             token.cancel();
@@ -974,17 +969,17 @@ impl Gateway {
                         let runs = self
                             .running
                             .lock()
-                            .map_err(|_| anyhow::anyhow!("run lock poisoned"))?
+                            .map_err(|_| crate::error::poisoned("run"))?
                             .len();
                         let downloads = self
                             .downloads
                             .lock()
-                            .map_err(|_| anyhow::anyhow!("download lock poisoned"))?
+                            .map_err(|_| crate::error::poisoned("download"))?
                             .len();
                         let active = self
                             .admission
                             .lock()
-                            .map_err(|_| anyhow::anyhow!("gateway admission lock poisoned"))?
+                            .map_err(|_| crate::error::poisoned("gateway admission"))?
                             .active;
                         if active == 0 && runs == 0 && downloads == 0 {
                             break;
@@ -1013,7 +1008,7 @@ impl Gateway {
             .projects
             .iter()
             .find(|p| p.id == id)
-            .context("project not found")?
+            .ok_or_else(|| crate::error::not_found("project not found"))?
             .root
             .clone()
             .into())
@@ -1081,21 +1076,26 @@ impl Gateway {
         let token = tokio_util::sync::CancellationToken::new();
         self.downloads
             .lock()
-            .map_err(|_| anyhow::anyhow!("transfer lock poisoned"))?
+            .map_err(|_| crate::error::poisoned("transfer"))?
             .insert(download.id, token.clone());
         let gateway = self.clone();
         let job = download.clone();
         tokio::spawn(async move {
-            let result = tokio::select! { result = gateway.transfer(&job, &target, &url) => result, _ = token.cancelled() => Err(anyhow::anyhow!("download cancelled")) };
+            let result = tokio::select! { result = gateway.transfer(&job, &target, &url) => result, _ = token.cancelled() => Err(ErrorReport::new(ErrorKind::Cancelled, "download cancelled").into()) };
             if let Err(error) = result {
+                let report = crate::error::report(&error);
                 let update = gateway.update_download(job.id, |d| {
                     if d.state != DownloadState::Cancelled {
                         d.state = DownloadState::Failed;
-                        d.error = Some(error.to_string());
+                        crate::error::record("download", &report);
+                        d.error = Some(report);
                     }
                 });
-                if update.is_err() {
-                    eprintln!("could not persist failed download state");
+                if let Err(error) = update {
+                    crate::error::handle(
+                        "download",
+                        &error.context("could not persist failed download state"),
+                    );
                 }
             }
             if let Ok(mut tokens) = gateway.downloads.lock() {
@@ -1111,7 +1111,7 @@ impl Gateway {
             .downloads
             .iter_mut()
             .find(|d| d.id == id)
-            .context("download disappeared")?;
+            .ok_or_else(|| crate::error::not_found("download disappeared"))?;
         update(download);
         let copy = download.clone();
         store.persist(Some(EventKind::DownloadChanged(copy.clone())))?;
@@ -1187,7 +1187,7 @@ impl Gateway {
             .downloads
             .iter_mut()
             .find(|d| d.id == download.id)
-            .context("download disappeared")?;
+            .ok_or_else(|| crate::error::not_found("download disappeared"))?;
         ensure!(
             current.state != DownloadState::Cancelled,
             "download cancelled"
@@ -1363,7 +1363,7 @@ mod tests {
                 .await
                 .body;
             assert!(
-                matches!(reply, Reply::Error { ref message } if message.contains("stop managed Joshua")),
+                matches!(reply, Reply::Error(ref report) if report.message.contains("stop managed Joshua")),
                 "{reply:?}"
             );
             assert_eq!(gateway.snapshot().unwrap(), before);
