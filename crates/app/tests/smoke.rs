@@ -228,7 +228,9 @@ async fn joshua_lifecycle_smoke() -> Result<()> {
         ),
     ]);
     let mut app = App::start(directory, environment).await?;
-    let independent_url = format!("http://127.0.0.1:{}/v1", available_port()?);
+    // Keep this endpoint reserved so the managed listener cannot reuse its port.
+    let independent_endpoint = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let independent_url = format!("http://{}/v1", independent_endpoint.local_addr()?);
     app.cli(&[
         "providers",
         "add",
