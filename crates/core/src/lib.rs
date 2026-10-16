@@ -4,6 +4,11 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use uuid::Uuid;
 
+pub mod error;
+pub mod ignore;
+pub use error::{ErrorKind, ErrorReport};
+pub use ignore::Ignore;
+
 pub type Id = Uuid;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -305,6 +310,9 @@ pub struct Thread {
     pub backend: CodingBackend,
     #[serde(default)]
     pub backend_activity: Option<String>,
+    /// Why the most recent run failed, cleared when a new run starts.
+    #[serde(default)]
+    pub error: Option<ErrorReport>,
 }
 impl Thread {
     pub fn new(title: String, mode: Mode) -> Self {
@@ -323,6 +331,7 @@ impl Thread {
             effort: None,
             backend: CodingBackend::Native,
             backend_activity: None,
+            error: None,
         }
     }
 }
@@ -349,8 +358,22 @@ pub struct Download {
     pub received: u64,
     pub total: Option<u64>,
     pub state: DownloadState,
+    /// Flattened failure text, kept for clients that predate `failure`.
     pub error: Option<String>,
     pub sha256: Option<String>,
+    #[serde(default)]
+    pub failure: Option<ErrorReport>,
+}
+impl Download {
+    /// Record a failure in both the structured and the legacy text field.
+    pub fn fail(&mut self, report: ErrorReport) {
+        self.error = Some(report.detail());
+        self.failure = Some(report);
+    }
+    /// The structured failure, or one recovered from legacy text.
+    pub fn failure_report(&self) -> Option<ErrorReport> {
+        legacy_failure(&self.failure, &self.error)
+    }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PluginSummary {
@@ -528,6 +551,38 @@ pub enum Command {
         pairing: BrokerPairing,
     },
 }
+impl Command {
+    /// A stable operation name for logs and diagnostics; never includes arguments.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::SetBackend { .. } => "set_backend",
+            Self::StartJoshua { .. } => "start_joshua",
+            Self::StopJoshua => "stop_joshua",
+            Self::JoshuaStatus => "joshua_status",
+            Self::Snapshot => "snapshot",
+            Self::SaveSettings(..) => "save_settings",
+            Self::RefreshCatalog { .. } => "refresh_catalog",
+            Self::CreateThread { .. } => "create_thread",
+            Self::SetSubagentModel { .. } => "set_subagent_model",
+            Self::RenameThread { .. } => "rename_thread",
+            Self::ConfigureThread { .. } => "configure_thread",
+            Self::SetEffort { .. } => "set_effort",
+            Self::Send { .. } => "send",
+            Self::CancelRun { .. } => "cancel_run",
+            Self::CreateProject { .. } => "create_project",
+            Self::CreateSubagent { .. } => "create_subagent",
+            Self::Events { .. } => "events",
+            Self::Download { .. } => "download",
+            Self::CancelDownload { .. } => "cancel_download",
+            Self::GitStatus { .. } => "git_status",
+            Self::ReadDocument { .. } => "read_document",
+            Self::RunExtension { .. } => "run_extension",
+            Self::Shutdown => "shutdown",
+            Self::GatewayStatus => "gateway_status",
+            Self::PairBroker { .. } => "pair_broker",
+        }
+    }
+}
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Reply {
     Snapshot(Box<Snapshot>),
@@ -538,8 +593,18 @@ pub enum Reply {
     Download(Download),
     Text(String),
     Ok,
-    Error { message: String },
+    /// Wire-compatible with the earlier `Error { message }` variant.
+    Error(ErrorReport),
     Gateway(GatewayInfo),
+}
+impl Reply {
+    /// Separate a gateway-reported failure from a successful reply.
+    pub fn into_result(self) -> Result<Reply, ErrorReport> {
+        match self {
+            Reply::Error(report) => Err(report),
+            reply => Ok(reply),
+        }
+    }
 }
 
 /// Facts reported by the gateway process itself, never inferred from a socket file.
@@ -566,6 +631,19 @@ pub enum GatewayAction {
     Reconnect,
 }
 
+impl GatewayAction {
+    /// A stable operation name for logs and diagnostics.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Status => "gateway_status",
+            Self::Start => "gateway_start",
+            Self::Stop => "gateway_stop",
+            Self::Restart => "gateway_restart",
+            Self::Reconnect => "gateway_reconnect",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GatewayPhase {
     Running,
@@ -578,7 +656,36 @@ pub struct GatewayReport {
     pub target: String,
     pub phase: GatewayPhase,
     pub info: Option<GatewayInfo>,
+    /// Flattened failure text, kept for clients that predate `failure`.
     pub error: Option<String>,
+    #[serde(default)]
+    pub failure: Option<ErrorReport>,
+}
+impl GatewayReport {
+    pub fn new(
+        target: String,
+        phase: GatewayPhase,
+        info: Option<GatewayInfo>,
+        failure: Option<ErrorReport>,
+    ) -> Self {
+        Self {
+            target,
+            phase,
+            info,
+            error: failure.as_ref().map(ErrorReport::detail),
+            failure,
+        }
+    }
+    /// The structured failure, or one recovered from legacy text.
+    pub fn failure_report(&self) -> Option<ErrorReport> {
+        legacy_failure(&self.failure, &self.error)
+    }
+}
+fn legacy_failure(failure: &Option<ErrorReport>, text: &Option<String>) -> Option<ErrorReport> {
+    failure.clone().or_else(|| {
+        text.as_ref()
+            .map(|message| ErrorReport::new(ErrorKind::Other, message.clone()))
+    })
 }
 
 /// Where a client finds its gateway. Saved by first-time setup as human-editable
@@ -637,6 +744,73 @@ mod tests {
         assert_eq!(effective.capabilities, [ReadWorkspace].into());
         assert!(effective.require(UseSecret).is_err());
         assert!(effective.models.is_empty());
+    }
+    #[test]
+    fn error_replies_interoperate_with_the_message_only_format() {
+        #[derive(Serialize, Deserialize)]
+        enum LegacyReply {
+            Error { message: String },
+        }
+        let message = Uuid::new_v4().to_string();
+        let legacy = rmp_serde::to_vec_named(&LegacyReply::Error {
+            message: message.clone(),
+        })
+        .unwrap();
+        let Reply::Error(report) = rmp_serde::from_slice(&legacy).unwrap() else {
+            panic!("legacy error reply must decode as an error");
+        };
+        assert_eq!((report.kind, report.message), (ErrorKind::Other, message));
+
+        let current = Reply::Error(
+            ErrorReport::new(ErrorKind::NotFound, Uuid::new_v4().to_string())
+                .caused_by(ErrorReport::new(ErrorKind::Storage, "cause")),
+        );
+        let bytes = rmp_serde::to_vec_named(&current).unwrap();
+        let LegacyReply::Error { message } = rmp_serde::from_slice(&bytes).unwrap();
+        let Reply::Error(report) = &current else {
+            unreachable!()
+        };
+        assert_eq!(message, report.message);
+        assert_eq!(rmp_serde::from_slice::<Reply>(&bytes).unwrap(), current);
+    }
+    #[test]
+    fn failed_downloads_stay_readable_by_message_only_clients() {
+        #[derive(Serialize, Deserialize)]
+        struct LegacyDownload {
+            id: Id,
+            name: String,
+            source: String,
+            received: u64,
+            total: Option<u64>,
+            state: DownloadState,
+            error: Option<String>,
+            sha256: Option<String>,
+        }
+        let mut download = Download {
+            id: Id::new_v4(),
+            name: Uuid::new_v4().to_string(),
+            source: Uuid::new_v4().to_string(),
+            received: 0,
+            total: None,
+            state: DownloadState::Failed,
+            error: None,
+            sha256: None,
+            failure: None,
+        };
+        let report = ErrorReport::new(ErrorKind::Provider, Uuid::new_v4().to_string()).caused_by(
+            ErrorReport::new(ErrorKind::Other, Uuid::new_v4().to_string()),
+        );
+        download.fail(report.clone());
+        let bytes = rmp_serde::to_vec_named(&download).unwrap();
+        let legacy: LegacyDownload = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(legacy.error, Some(report.detail()));
+
+        let old = rmp_serde::to_vec_named(&legacy).unwrap();
+        let current: Download = rmp_serde::from_slice(&old).unwrap();
+        let recovered = current.failure_report().unwrap();
+        assert_eq!(recovered.message, report.detail());
+        assert_eq!(rmp_serde::from_slice::<Download>(&bytes).unwrap(), download);
+        assert_eq!(download.failure_report(), Some(report));
     }
     #[test]
     fn startup_has_no_provider_facts_or_implicit_grants() {

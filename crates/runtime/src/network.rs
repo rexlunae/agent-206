@@ -1,6 +1,6 @@
 //! Public download transport. Validate every redirect and pin the checked DNS answers.
 //! RustyClaw's SSRF policy is preserved without its DNS re-check race.
-use anyhow::{Context, Result, ensure};
+use a206_core::ErrorKind;
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
     time::Duration,
@@ -35,26 +35,79 @@ fn public_v4(address: Ipv4Addr) -> bool {
         || (a == 198 && (b == 18 || b == 19 || (b == 51 && c == 100)))
         || (a == 203 && b == 0 && c == 113))
 }
-fn validate_url(url: &Url) -> Result<()> {
-    ensure!(
-        url.scheme() == "https" && url.username().is_empty() && url.password().is_none(),
-        "downloads require credential-free HTTPS URLs"
-    );
-    ensure!(
-        url.port_or_known_default() == Some(443),
-        "public downloads require the standard HTTPS port"
-    );
-    ensure!(
-        url.fragment().is_none(),
-        "download URL must not contain a fragment"
-    );
+/// Why a public download was refused or failed. URLs are never included:
+/// download links can carry signed tokens.
+#[derive(Debug, thiserror::Error)]
+pub enum DownloadError {
+    #[error("invalid download URL")]
+    InvalidUrl(#[source] url::ParseError),
+    #[error("downloads require credential-free HTTPS URLs")]
+    InsecureUrl,
+    #[error("public downloads require the standard HTTPS port")]
+    NonstandardPort,
+    #[error("download URL must not contain a fragment")]
+    Fragment,
+    #[error("download hostname missing")]
+    MissingHost,
+    #[error("could not resolve the download host")]
+    Resolve(#[source] std::io::Error),
+    #[error("resolving the download host timed out")]
+    ResolveTimeout(#[source] tokio::time::error::Elapsed),
+    #[error("download destination resolves to a private, reserved or local address")]
+    PrivateAddress,
+    #[error("download redirected too many times")]
+    TooManyRedirects,
+    #[error("download redirect has no valid destination")]
+    InvalidRedirect,
+    #[error("download redirect destination is not a valid URL")]
+    RedirectTarget(#[source] url::ParseError),
+    #[error("download returned HTTP {status}")]
+    Status { status: reqwest::StatusCode },
+    #[error("download transport failed")]
+    Transport(#[source] reqwest::Error),
+}
+impl crate::error::Classified for DownloadError {
+    fn kind(&self) -> Option<ErrorKind> {
+        Some(match self {
+            Self::InvalidUrl(_)
+            | Self::InsecureUrl
+            | Self::NonstandardPort
+            | Self::Fragment
+            | Self::MissingHost => ErrorKind::InvalidRequest,
+            Self::PrivateAddress => ErrorKind::PermissionDenied,
+            Self::Resolve(_) => ErrorKind::Unavailable,
+            Self::ResolveTimeout(_) => ErrorKind::Timeout,
+            Self::Transport(error) if error.is_timeout() => ErrorKind::Timeout,
+            Self::Transport(error) if error.is_connect() => ErrorKind::Unavailable,
+            Self::TooManyRedirects
+            | Self::InvalidRedirect
+            | Self::RedirectTarget(_)
+            | Self::Status { .. }
+            | Self::Transport(_) => ErrorKind::Provider,
+        })
+    }
+}
+fn validate_url(url: &Url) -> Result<(), DownloadError> {
+    if url.scheme() != "https" || !url.username().is_empty() || url.password().is_some() {
+        return Err(DownloadError::InsecureUrl);
+    }
+    if url.port_or_known_default() != Some(443) {
+        return Err(DownloadError::NonstandardPort);
+    }
+    if url.fragment().is_some() {
+        return Err(DownloadError::Fragment);
+    }
     Ok(())
 }
-pub async fn public_get(source: &str) -> Result<reqwest::Response> {
-    let mut url = Url::parse(source)?;
+/// The transport error without its URL, which can carry signed tokens.
+pub(crate) fn transport(error: reqwest::Error) -> DownloadError {
+    DownloadError::Transport(error.without_url())
+}
+pub async fn public_get(source: &str) -> Result<reqwest::Response, DownloadError> {
+    let mut url = Url::parse(source).map_err(DownloadError::InvalidUrl)?;
     for hop in 0..=5 {
         validate_url(&url)?;
-        let host = url.host_str().context("download hostname missing")?;
+        let host = url.host_str().ok_or(DownloadError::MissingHost)?;
         let answers: Vec<SocketAddr> = match url.host() {
             Some(url::Host::Ipv4(address)) => vec![SocketAddr::new(address.into(), 443)],
             Some(url::Host::Ipv6(address)) => vec![SocketAddr::new(address.into(), 443)],
@@ -62,14 +115,15 @@ pub async fn public_get(source: &str) -> Result<reqwest::Response> {
                 Duration::from_secs(10),
                 tokio::net::lookup_host((host, 443)),
             )
-            .await??
+            .await
+            .map_err(DownloadError::ResolveTimeout)?
+            .map_err(DownloadError::Resolve)?
             .collect(),
-            None => anyhow::bail!("download hostname missing"),
+            None => return Err(DownloadError::MissingHost),
         };
-        ensure!(
-            !answers.is_empty() && answers.iter().all(|a| public_address(a.ip())),
-            "download destination resolves to a private, reserved or local address"
-        );
+        if answers.is_empty() || !answers.iter().all(|a| public_address(a.ip())) {
+            return Err(DownloadError::PrivateAddress);
+        }
         let client = reqwest::Client::builder()
             .no_proxy()
             .https_only(true)
@@ -77,30 +131,28 @@ pub async fn public_get(source: &str) -> Result<reqwest::Response> {
             .read_timeout(Duration::from_secs(30))
             .redirect(reqwest::redirect::Policy::none())
             .resolve_to_addrs(host, &answers)
-            .build()?;
-        let response = client
-            .get(url.clone())
-            .send()
-            .await
-            .map_err(reqwest::Error::without_url)?;
+            .build()
+            .map_err(transport)?;
+        let response = client.get(url.clone()).send().await.map_err(transport)?;
         if response.status().is_redirection() {
-            ensure!(hop < 5, "download redirected too many times");
+            if hop >= 5 {
+                return Err(DownloadError::TooManyRedirects);
+            }
             let location = response
                 .headers()
                 .get(reqwest::header::LOCATION)
-                .context("download redirect has no destination")?
-                .to_str()?;
-            url = url.join(location)?;
+                .and_then(|location| location.to_str().ok())
+                .ok_or(DownloadError::InvalidRedirect)?;
+            url = url.join(location).map_err(DownloadError::RedirectTarget)?;
+        } else if !response.status().is_success() {
+            return Err(DownloadError::Status {
+                status: response.status(),
+            });
         } else {
-            ensure!(
-                response.status().is_success(),
-                "download returned HTTP {}",
-                response.status()
-            );
             return Ok(response);
         }
     }
-    anyhow::bail!("download redirected too many times")
+    Err(DownloadError::TooManyRedirects)
 }
 #[cfg(test)]
 mod tests {

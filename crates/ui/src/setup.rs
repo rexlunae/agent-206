@@ -90,6 +90,8 @@ fn finish(mut state: State, root: PathBuf, target: GatewayTarget) -> Result<(), 
     state.gateway.set(None);
     state.connected.set(false);
     state.status.set(String::new());
+    state.error.set(None);
+    crate::set_outage(state, None);
     state.setup.set(false);
     Ok(())
 }

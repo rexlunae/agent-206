@@ -220,6 +220,30 @@ mod native {
         )
         .join(".agent206"))
     }
+    /// Structured diagnostics go to stderr (the daemon's `gateway.log`), except
+    /// for the terminal client, whose screen owns the terminal. `AGENT206_LOG`
+    /// takes `tracing` filter directives; the default records warnings.
+    fn init_tracing(root: &std::path::Path, terminal_ui: bool) -> anyhow::Result<()> {
+        use tracing_subscriber::EnvFilter;
+        let filter =
+            EnvFilter::try_from_env("AGENT206_LOG").unwrap_or_else(|_| EnvFilter::new("warn"));
+        let builder = tracing_subscriber::fmt().with_env_filter(filter);
+        if terminal_ui {
+            std::fs::create_dir_all(root)?;
+            let mut options = std::fs::OpenOptions::new();
+            options.create(true).append(true);
+            #[cfg(unix)]
+            std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+            let log = options.open(root.join("tui.log"))?;
+            builder
+                .with_ansi(false)
+                .with_writer(std::sync::Mutex::new(log))
+                .try_init()
+        } else {
+            builder.with_writer(std::io::stderr).try_init()
+        }
+        .map_err(|error| anyhow::anyhow!(error))
+    }
     async fn setup(
         root: &std::path::Path,
         local: bool,
@@ -264,7 +288,9 @@ mod native {
     pub fn run() -> anyhow::Result<()> {
         let args = Args::parse();
         let root = args.data_dir.map(Ok).unwrap_or_else(default_root)?;
-        match args.command.unwrap_or(Action::Desktop) {
+        let action = args.command.unwrap_or(Action::Desktop);
+        init_tracing(&root, matches!(action, Action::Tui))?;
+        match action {
             Action::Desktop => {
                 #[cfg(feature = "desktop")]
                 {
@@ -349,7 +375,7 @@ mod native {
                                 providers: snapshot.settings.providers.len(),
                                 api_catalogs: snapshot.catalogs.len(),
                             }),
-                            Reply::Error { message } => anyhow::bail!("{message}"),
+                            Reply::Error(report) => return Err(report.into()),
                             _ => anyhow::bail!("gateway did not return workspace status"),
                         }
                     } else {
@@ -366,8 +392,8 @@ mod native {
                     } else {
                         print!("{}", toml::to_string_pretty(&gateway)?);
                     }
-                    if let Some(error) = gateway.error {
-                        anyhow::bail!("{error}");
+                    if let Some(error) = gateway.failure_report() {
+                        return Err(error.into());
                     }
                     return Ok(());
                 }
@@ -400,8 +426,8 @@ mod native {
                         };
                         let report = controller.control(action).await?;
                         print!("{}", toml::to_string_pretty(&report)?);
-                        if let Some(error) = report.error {
-                            anyhow::bail!("{error}");
+                        if let Some(error) = report.failure_report() {
+                            return Err(error.into());
                         }
                         if report.phase == GatewayPhase::Offline {
                             anyhow::bail!("gateway is offline");
@@ -409,27 +435,28 @@ mod native {
                         return Ok(());
                     }
                     return if daemon {
-                        a206_runtime::service::daemon(&root, start).await
+                        Ok(a206_runtime::service::daemon(&root, start).await?)
                     } else if stdio {
-                        a206_runtime::service::stdio(&root, !no_start, start).await
+                        Ok(a206_runtime::service::stdio(&root, !no_start, start).await?)
                     } else {
                         anyhow::bail!("choose gateway start, stop, restart, status or reconnect")
                     };
                 }
                 if let Action::Web { static_dir, port } = action {
-                    return a206_runtime::web::serve(root.clone(), remote()?, static_dir, port)
-                        .await;
+                    return Ok(
+                        a206_runtime::web::serve(root.clone(), remote()?, static_dir, port).await?,
+                    );
                 }
                 let client = a206_runtime::client::Client::start(root.clone(), remote()?);
                 if let Action::Acp { thread } = action {
-                    return a206_runtime::acp::serve(client, thread).await;
+                    return Ok(a206_runtime::acp::serve(client, thread).await?);
                 }
                 if let Action::Mcp {
                     thread,
                     allow_title_edit,
                 } = action
                 {
-                    return a206_runtime::mcp::serve(client, thread, allow_title_edit).await;
+                    return Ok(a206_runtime::mcp::serve(client, thread, allow_title_edit).await?);
                 }
                 let command = match action {
                     Action::Providers {
@@ -596,7 +623,7 @@ mod native {
                     _ => anyhow::bail!("unsupported command"),
                 };
                 match client.call(command).await? {
-                    Reply::Error { message } => anyhow::bail!(message),
+                    Reply::Error(report) => return Err(report.into()),
                     Reply::Text(text) => println!("{text}"),
                     Reply::Ok => println!("OK"),
                     reply => println!("{}", toml::to_string_pretty(&reply)?),

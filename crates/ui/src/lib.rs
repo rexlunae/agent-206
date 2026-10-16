@@ -1,15 +1,20 @@
 //! Shared desktop/web/terminal application tree, composed with fc-dioxus.
 #![forbid(unsafe_code)]
 mod conversation;
+mod error;
 mod pages;
 mod route;
 mod settings;
+#[cfg(target_arch = "wasm32")]
+use a206_core::Ignore;
 #[cfg(not(target_arch = "wasm32"))]
 mod setup;
 use a206_core::{
-    Command, GatewayAction, GatewayPhase, GatewayReport, Mode, Reply, Settings, Snapshot,
+    Command, ErrorKind, ErrorReport, GatewayAction, GatewayPhase, GatewayReport, Mode, Reply,
+    Settings, Snapshot,
 };
 use dioxus::router::Navigator;
+use error::ErrorNotice;
 use fc_dioxus::prelude::*;
 use route::Route;
 #[cfg(target_arch = "wasm32")]
@@ -74,6 +79,8 @@ pub(crate) struct State {
     pub navigator: Navigator,
     pub loaded: Signal<bool>,
     pub status: Signal<String>,
+    pub error: Signal<Option<ErrorReport>>,
+    pub outage: Signal<Option<ErrorReport>>,
     pub connected: Signal<bool>,
     pub gateway: Signal<Option<GatewayReport>>,
     pub gateway_busy: Signal<Option<GatewayAction>>,
@@ -94,83 +101,128 @@ fn empty_snapshot() -> Snapshot {
         managed_joshua_provider: None,
     }
 }
+/// Send a command; a gateway-reported failure arrives as `Err` with its causes.
+async fn call(command: Command) -> Result<Reply, ErrorReport> {
+    let operation = command.name();
+    let result = request(command).await.and_then(Reply::into_result);
+    if let Err(report) = &result {
+        error::record(operation, report);
+    }
+    result
+}
 #[cfg(not(target_arch = "wasm32"))]
-async fn call(command: Command) -> Result<Reply, String> {
-    let client = CLIENT
+fn controller() -> Result<a206_runtime::control::GatewayController, ErrorReport> {
+    CLIENT
         .lock()
-        .map_err(|_| "connection lock poisoned")?
+        .map_err(|_| ErrorReport::new(ErrorKind::Internal, "connection lock poisoned"))?
         .clone()
-        .ok_or("gateway is not connected")?;
-    client.call(command).await.map_err(|e| e.to_string())
+        .ok_or_else(|| ErrorReport::new(ErrorKind::Unavailable, "gateway is not configured"))
+}
+#[cfg(not(target_arch = "wasm32"))]
+async fn request(command: Command) -> Result<Reply, ErrorReport> {
+    controller()?
+        .call(command)
+        .await
+        .map_err(|error| a206_runtime::error::report(&error))
 }
 #[cfg(target_arch = "wasm32")]
-async fn call(command: Command) -> Result<Reply, String> {
+async fn request(command: Command) -> Result<Reply, ErrorReport> {
     web_request("/api/command", command).await
+}
+#[cfg(target_arch = "wasm32")]
+fn unavailable(message: impl Into<String>) -> ErrorReport {
+    ErrorReport::new(ErrorKind::Unavailable, message)
+}
+#[cfg(target_arch = "wasm32")]
+fn captured(kind: ErrorKind) -> impl Fn(&(dyn std::error::Error + 'static)) -> ErrorReport {
+    move |error| ErrorReport::capture(error, |_| Some(kind))
 }
 #[cfg(target_arch = "wasm32")]
 async fn web_request<T: serde::Serialize, R: serde::de::DeserializeOwned>(
     path: &str,
     body: T,
-) -> Result<R, String> {
+) -> Result<R, ErrorReport> {
     let request = a206_protocol::Request {
         id: Uuid::new_v4(),
         body,
     };
     let origin = web_sys::window()
-        .ok_or("browser window unavailable")?
+        .ok_or_else(|| unavailable("browser window unavailable"))?
         .location()
         .origin()
-        .map_err(|_| "browser origin unavailable")?;
-    let bearer = web_session()?;
+        .map_err(|_| unavailable("browser origin unavailable"))?;
+    let bearer =
+        web_session().map_err(|message| ErrorReport::new(ErrorKind::PermissionDenied, message))?;
     let response = reqwest::Client::new()
         .post(format!("{origin}{path}"))
         .header("Content-Type", "application/msgpack")
         .bearer_auth(&bearer)
-        .body(a206_protocol::encode(&request).map_err(|e| e.to_string())?)
+        .body(a206_protocol::encode(&request).map_err(|e| captured(ErrorKind::Protocol)(&e))?)
         .send()
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| captured(ErrorKind::Unavailable)(&e))?;
     if !response.status().is_success() {
         if matches!(response.status().as_u16(), 404 | 405) {
-            return Err("This web server does not provide the current app controls. Restart the Agent 206 web server from the current build, then open its authorization URL.".into());
+            return Err(ErrorReport::new(
+                ErrorKind::Protocol,
+                "This web server does not provide the current app controls. Restart the Agent 206 web server from the current build, then open its authorization URL.",
+            ));
         }
         if matches!(response.status().as_u16(), 401 | 403) {
             // A restarted bridge issues a new bearer; drop the stale one so the
             // next authorization link is not shadowed by it.
             forget_web_session(&bearer);
-            return Err("This browser is not authorized for the running web bridge. Open the authorization URL printed by `agent206 web`; restart it for a new link if that one was already used.".into());
+            return Err(ErrorReport::new(
+                ErrorKind::PermissionDenied,
+                "This browser is not authorized for the running web bridge. Open the authorization URL printed by `agent206 web`; restart it for a new link if that one was already used.",
+            ));
         }
-        return Err(format!("web gateway returned {}", response.status()));
+        return Err(unavailable(format!(
+            "web gateway returned {}",
+            response.status()
+        )));
     }
-    let bytes = response.bytes().await.map_err(|e| e.to_string())?;
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|e| captured(ErrorKind::Unavailable)(&e))?;
     let mut decoder = a206_protocol::Decoder::default();
     let mut replies = decoder
         .feed::<a206_protocol::Response<R>>(&bytes)
-        .map_err(|e| e.to_string())?;
-    decoder.finish().map_err(|e| e.to_string())?;
+        .map_err(|e| captured(ErrorKind::Protocol)(&e))?;
+    decoder
+        .finish()
+        .map_err(|e| captured(ErrorKind::Protocol)(&e))?;
     if replies.len() != 1 {
-        return Err("invalid gateway response".into());
+        return Err(ErrorReport::new(
+            ErrorKind::Protocol,
+            "invalid gateway response",
+        ));
     }
     let response = replies.remove(0);
     if response.id != request.id {
-        return Err("gateway response id mismatch".into());
+        return Err(ErrorReport::new(
+            ErrorKind::Protocol,
+            "gateway response id mismatch",
+        ));
     }
     Ok(response.body)
 }
-pub(crate) async fn control(action: GatewayAction) -> Result<GatewayReport, String> {
+pub(crate) async fn control(action: GatewayAction) -> Result<GatewayReport, ErrorReport> {
     #[cfg(target_arch = "wasm32")]
-    {
-        web_request("/api/gateway", action).await
-    }
+    let result = web_request("/api/gateway", action).await;
     #[cfg(not(target_arch = "wasm32"))]
-    {
-        let client = CLIENT
-            .lock()
-            .map_err(|_| "connection lock poisoned")?
-            .clone()
-            .ok_or("gateway is not configured")?;
-        client.control(action).await.map_err(|e| e.to_string())
+    let result = match controller() {
+        Ok(client) => client
+            .control(action)
+            .await
+            .map_err(|error| a206_runtime::error::report(&error)),
+        Err(report) => Err(report),
+    };
+    if let Err(report) = &result {
+        error::record(action.name(), report);
     }
+    result
 }
 pub(crate) fn control_gateway(mut state: State, action: GatewayAction) {
     if state.gateway_busy.peek().is_some() {
@@ -183,12 +235,12 @@ pub(crate) fn control_gateway(mut state: State, action: GatewayAction) {
         match control(action).await {
             Ok(report) => {
                 state.connected.set(report.phase == GatewayPhase::Running);
-                state.status.set(report.error.clone().unwrap_or_default());
+                state.error.set(report.failure_report());
                 state.gateway.set(Some(report));
             }
             Err(error) => {
                 state.connected.set(false);
-                state.status.set(error);
+                state.error.set(Some(error));
             }
         }
         state.gateway_busy.set(None);
@@ -213,7 +265,9 @@ fn forget_web_session(rejected: &str) {
     if let Ok(storage) = web_storage()
         && storage.get_item("a206.session").ok().flatten().as_deref() == Some(rejected)
     {
-        let _ = storage.remove_item("a206.session");
+        // If storage refuses, the stale bearer is rejected again and replaced
+        // by the next authorization link; nothing more can be done here.
+        storage.remove_item("a206.session").ignore();
     }
 }
 #[cfg(target_arch = "wasm32")]
@@ -267,8 +321,8 @@ pub(crate) fn dispatch(mut state: State, command: Command) {
     );
     spawn(async move {
         let mut destination = None;
+        let unreachable = |report: &ErrorReport| report.kind == ErrorKind::Unavailable;
         match call(command).await {
-            Ok(Reply::Error { message }) => state.status.set(message),
             Ok(Reply::Thread(thread)) => {
                 if navigate {
                     destination = Some(Route::Chat {
@@ -277,12 +331,23 @@ pub(crate) fn dispatch(mut state: State, command: Command) {
                     });
                 }
                 state.status.set(String::new());
+                state.error.set(None);
             }
-            Ok(Reply::Text(text)) => state.status.set(text),
-            Ok(_) => state.status.set(String::new()),
+            Ok(Reply::Text(text)) => {
+                state.status.set(text);
+                state.error.set(None);
+            }
+            Ok(_) => {
+                state.status.set(String::new());
+                state.error.set(None);
+            }
             Err(error) => {
-                state.status.set(error);
-                state.connected.set(false);
+                // A rejected command does not mean the gateway went away.
+                if unreachable(&error) {
+                    state.connected.set(false);
+                }
+                state.status.set(String::new());
+                state.error.set(Some(error));
             }
         }
         refresh(state).await;
@@ -303,6 +368,10 @@ async fn refresh(mut state: State) {
     match report {
         Ok(report) => {
             let running = report.phase == GatewayPhase::Running;
+            // The controller answered; its probe's failure, if any, is the outage.
+            // A running gateway or a deliberate stop clears it. Command errors
+            // stay until dismissed.
+            set_outage(state, report.failure_report());
             state.connected.set(running);
             state.gateway.set(Some(report));
             if !running {
@@ -311,7 +380,7 @@ async fn refresh(mut state: State) {
         }
         Err(error) => {
             state.connected.set(false);
-            state.status.set(error);
+            set_outage(state, Some(error));
             return;
         }
     }
@@ -332,9 +401,16 @@ async fn refresh(mut state: State) {
         }
         Err(error) => {
             state.connected.set(false);
-            state.status.set(error);
+            set_outage(state, Some(error));
         }
         _ => {}
+    }
+}
+/// Connection failures found by polling, kept apart from command failures so a
+/// later successful poll clears only what polling reported.
+fn set_outage(mut state: State, outage: Option<ErrorReport>) {
+    if *state.outage.peek() != outage {
+        state.outage.set(outage);
     }
 }
 fn theme_from(settings: &Settings) -> ThemeChoice {
@@ -368,7 +444,8 @@ pub fn App() -> Element {
     // Consume the bootstrap fragment before the router sees the initial location.
     #[cfg(target_arch = "wasm32")]
     use_hook(|| {
-        let _ = web_session();
+        // Captures a fresh authorization fragment; failures surface on the first request.
+        web_session().ignore();
     });
     // Desktop supplies history itself; the terminal and SSR also need a history.
     #[cfg(not(target_arch = "wasm32"))]
@@ -396,6 +473,8 @@ pub fn App() -> Element {
 fn Shell() -> Element {
     let data = use_signal(empty_snapshot);
     let status = use_signal(String::new);
+    let error = use_signal(|| None);
+    let outage = use_signal(|| None);
     let connected = use_signal(|| false);
     let loaded = use_signal(|| false);
     let gateway = use_signal(|| None);
@@ -406,6 +485,8 @@ fn Shell() -> Element {
     let state = State {
         data,
         status,
+        error,
+        outage,
         connected,
         gateway,
         gateway_busy,
@@ -440,6 +521,12 @@ fn Shell() -> Element {
         div { class: "a206-shell a206-app",
             Header {}
             if !status().is_empty() { div { class: "a206-status", role: "status", "{status}" } }
+            if let Some(report) = state.outage.read().clone() {
+                div { class: "a206-status", ErrorNotice { report, title: "Gateway unreachable".to_string() } }
+            }
+            if let Some(report) = state.error.read().clone() {
+                div { class: "a206-status", ErrorNotice { report, dismiss: move |_| { let mut error = state.error; error.set(None); } } }
+            }
             div { class: "a206-workspace",
                 Split { label: name!("Workspace navigation width"), default_value: 18.0, min: 12.0, max: 32.0,
                     primary: rsx! { Sidebar {} },

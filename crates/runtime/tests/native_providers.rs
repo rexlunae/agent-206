@@ -175,13 +175,10 @@ async fn paginates_native_catalogs_and_dispatches_protocol_specific_text() {
             root: broker.path(),
             pairing: None,
         };
-        assert!(
-            provider::catalog(&config, unpaired)
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("not paired")
-        );
+        assert!(matches!(
+            provider::catalog(&config, unpaired).await,
+            Err(provider::ProviderError::NotPaired)
+        ));
         let forged = a206_core::BrokerPairing::new(Id::new_v4().to_string());
         let forged = provider::Broker {
             root: broker.path(),
@@ -366,7 +363,9 @@ async fn gateway_needs_a_verified_pairing_and_never_persists_it() {
     let refresh = || Command::RefreshCatalog { provider };
     assert!(matches!(
         run(refresh()).await,
-        Reply::Error { message } if message.contains("not paired")
+        Reply::Error(report)
+            if report.kind == a206_core::ErrorKind::Unavailable
+                && report.message.contains("not paired")
     ));
     // Automatic discovery fails too, and is throttled until something changes.
     gateway.refresh_stale_catalogs().await.unwrap();

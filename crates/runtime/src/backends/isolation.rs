@@ -1,6 +1,6 @@
 //! Fail closed outside supported OS isolation. Clearing environment is not a sandbox.
+use super::{BackendError, Result, check};
 use a206_core::*;
-use anyhow::{Context, Result, ensure};
 use std::{
     path::{Path, PathBuf},
     process::Stdio,
@@ -19,7 +19,8 @@ impl Drop for Process {
         #[cfg(unix)]
         {
             if let Some(group) = self.group.take() {
-                let _result = nix::sys::signal::killpg(group, nix::sys::signal::Signal::SIGKILL);
+                // Cleanup: the group may already have exited, and there is no caller to report to.
+                nix::sys::signal::killpg(group, nix::sys::signal::Signal::SIGKILL).ignore();
             }
         }
     }
@@ -33,61 +34,77 @@ impl Process {
         port: u16,
         token: &str,
     ) -> Result<Self> {
-        let scratch = tempfile::Builder::new().prefix("a206-backend-").tempdir()?;
+        let scratch = tempfile::Builder::new()
+            .prefix("a206-backend-")
+            .tempdir()
+            .map_err(BackendError::Setup)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(scratch.path(), std::fs::Permissions::from_mode(0o700))?;
+            std::fs::set_permissions(scratch.path(), std::fs::Permissions::from_mode(0o700))
+                .map_err(BackendError::Setup)?;
         }
-        let scratch_root = std::fs::canonicalize(scratch.path())?;
+        let scratch_root = std::fs::canonicalize(scratch.path()).map_err(BackendError::Setup)?;
+        let missing = |what| move |source| BackendError::Missing { what, source };
         let root = std::fs::canonicalize(&config.runtime_root)
-            .context("backend installation directory is missing")?;
+            .map_err(missing("backend installation directory"))?;
         let executable =
-            std::fs::canonicalize(&config.executable).context("backend executable is missing")?;
-        ensure!(
+            std::fs::canonicalize(&config.executable).map_err(missing("backend executable"))?;
+        check(
             executable.is_file() && executable.starts_with(&root),
-            "executable must be a file inside its installation directory"
-        );
-        let state_root = std::fs::canonicalize(state_root)?;
-        ensure!(
+            BackendError::Placement("executable must be a file inside its installation directory"),
+        )?;
+        let state_root = std::fs::canonicalize(state_root).map_err(missing("application state"))?;
+        check(
             !state_root.starts_with(&root) && !root.starts_with(&state_root),
-            "backend installation must be separate from private application state"
-        );
+            BackendError::Placement(
+                "backend installation must be separate from private application state",
+            ),
+        )?;
         if let Some(home) = std::env::var_os("HOME") {
-            ensure!(
+            check(
                 !Path::new(&home).starts_with(&root),
-                "backend installation directory must not expose the user's home directory"
-            );
+                BackendError::Placement(
+                    "backend installation directory must not expose the user's home directory",
+                ),
+            )?;
         }
         let script = config
             .adapter_script
             .as_ref()
             .map(std::fs::canonicalize)
             .transpose()
-            .context("Claude ACP adapter entry point is missing")?;
+            .map_err(missing("Claude ACP adapter entry point"))?;
         if let Some(script) = &script {
-            ensure!(
+            check(
                 script.is_file() && script.starts_with(&root),
-                "adapter script must be inside its installation directory"
-            );
+                BackendError::Placement("adapter script must be inside its installation directory"),
+            )?;
         }
-        let project = workspace.map(std::fs::canonicalize).transpose()?;
+        let project = workspace
+            .map(std::fs::canonicalize)
+            .transpose()
+            .map_err(missing("project directory"))?;
         if let Some(project) = &project {
-            ensure!(
+            check(
                 !project.starts_with(&root) && !root.starts_with(project),
-                "backend installation and project directories must not overlap"
-            );
+                BackendError::Placement(
+                    "backend installation and project directories must not overlap",
+                ),
+            )?;
         }
         let workspace = if thread
             .grant
             .capabilities
             .contains(&Capability::ReadWorkspace)
         {
-            let path = project.context("project access requires an associated project")?;
-            ensure!(
+            let path = project.ok_or(BackendError::Placement(
+                "project access requires an associated project",
+            ))?;
+            check(
                 path.is_dir() && !path.starts_with(&state_root),
-                "invalid backend workspace"
-            );
+                BackendError::Placement("invalid backend workspace"),
+            )?;
             Some(path)
         } else {
             None
@@ -95,11 +112,11 @@ impl Process {
         // Start outside the user's project so engines cannot discover ambient project
         // settings, hooks, plugins or MCP servers during their own initialization.
         let cwd = scratch_root.join("workspace");
-        std::fs::create_dir(&cwd)?;
+        std::fs::create_dir(&cwd).map_err(BackendError::Setup)?;
         let home = scratch_root.join("home");
-        std::fs::create_dir(&home)?;
+        std::fs::create_dir(&home).map_err(BackendError::Setup)?;
         let tmp = scratch_root.join("tmp");
-        std::fs::create_dir(&tmp)?;
+        std::fs::create_dir(&tmp).map_err(BackendError::Setup)?;
         let mut command = sandbox_command(
             &executable,
             &root,
@@ -120,7 +137,9 @@ impl Process {
                     "{}:/usr/bin:/bin",
                     executable
                         .parent()
-                        .context("missing executable parent")?
+                        .ok_or(BackendError::Placement(
+                            "executable must be a file inside its installation directory",
+                        ))?
                         .display()
                 ),
             )
@@ -135,7 +154,7 @@ impl Process {
             .kill_on_drop(true);
         match config.kind {
             CodingBackend::Codex => {
-                std::fs::create_dir(home.join(".codex"))?;
+                std::fs::create_dir(home.join(".codex")).map_err(BackendError::Setup)?;
                 let base_url = format!("http://127.0.0.1:{port}/v1");
                 let settings = toml::toml! {
                     model_provider = "agent206"
@@ -150,28 +169,31 @@ impl Process {
                     apps = false
                     web_search = false
                 };
-                std::fs::write(home.join(".codex/config.toml"), toml::to_string(&settings)?)?;
+                let settings = toml::to_string(&settings).map_err(BackendError::Configuration)?;
+                std::fs::write(home.join(".codex/config.toml"), settings)
+                    .map_err(BackendError::Setup)?;
                 command.args(["app-server"]).env("A206_PROXY_TOKEN", token);
             }
             CodingBackend::ClaudeAgent => {
                 command
-                    .arg(script.context("Claude ACP adapter script is required")?)
+                    .arg(script.ok_or(BackendError::Adapter)?)
                     .env("ANTHROPIC_BASE_URL", format!("http://127.0.0.1:{port}"))
                     // This is a revocable proxy capability, never the upstream API key.
                     .env("ANTHROPIC_API_KEY", token)
                     .env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1");
             }
-            CodingBackend::Native => anyhow::bail!("Agent 206 has no external runtime"),
+            CodingBackend::Native => return Err(BackendError::Native),
         }
         #[cfg(unix)]
         command.process_group(0);
-        let child = command
-            .spawn()
-            .context("could not start isolated backend")?;
+        let child = command.spawn().map_err(BackendError::Spawn)?;
         #[cfg(unix)]
-        let group = Some(nix::unistd::Pid::from_raw(i32::try_from(
-            child.id().context("backend has no process ID")?,
-        )?));
+        let group = Some(nix::unistd::Pid::from_raw(
+            child
+                .id()
+                .and_then(|id| i32::try_from(id).ok())
+                .ok_or(BackendError::ProcessId)?,
+        ));
         Ok(Self {
             child,
             cwd,
@@ -185,11 +207,13 @@ impl Process {
         #[cfg(unix)]
         {
             if let Some(group) = self.group.take() {
-                let _result = nix::sys::signal::killpg(group, nix::sys::signal::Signal::SIGKILL);
+                // Cleanup: the group may already have exited, and there is no caller to report to.
+                nix::sys::signal::killpg(group, nix::sys::signal::Signal::SIGKILL).ignore();
             }
         }
-        let _result = self.child.kill().await;
-        let _result = self.child.wait().await;
+        // Best-effort teardown of a process that may already have exited.
+        self.child.kill().await.ignore();
+        self.child.wait().await.ignore();
     }
 }
 #[cfg(target_os = "macos")]
@@ -202,10 +226,11 @@ fn sandbox_command(
     thread: &Thread,
     port: u16,
 ) -> Result<Command> {
+    // A JSON string literal is also a valid SBPL string literal.
     let quote = |path: &Path| -> Result<String> {
-        Ok(serde_json::to_string(
-            path.to_str().context("backend paths must be UTF-8")?,
-        )?)
+        path.to_str()
+            .map(|path| serde_json::Value::from(path).to_string())
+            .ok_or(BackendError::NonUtf8Path)
     };
     let mut policy = format!(
         r#"(version 1)
@@ -306,7 +331,5 @@ fn sandbox_command(
     _thread: &Thread,
     _port: u16,
 ) -> Result<Command> {
-    anyhow::bail!(
-        "external coding backends are disabled on this platform until equivalent OS filesystem and network isolation is implemented"
-    )
+    Err(BackendError::Unsupported)
 }

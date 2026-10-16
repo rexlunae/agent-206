@@ -199,8 +199,8 @@ impl Vault {
             return Err(Error::TotpRejected);
         }
         self.commit(|inner| {
-            let _ = inner.remove(SEED_KEY);
-            let _ = inner.remove(LAST_STEP_KEY);
+            crate::forget(inner, SEED_KEY);
+            crate::forget(inner, LAST_STEP_KEY);
         })
     }
 }

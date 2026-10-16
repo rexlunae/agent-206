@@ -1,6 +1,5 @@
 //! OpenSSH transport adapted from RustyClaw's gateway/ssh_connection.rs.
-use a206_protocol::{decode_payload, encode, payload_size};
-use anyhow::{Context, Result};
+use a206_core::ErrorKind;
 use serde::{Serialize, de::DeserializeOwned};
 use std::{path::Path, process::Stdio};
 use tokio::{
@@ -8,9 +7,32 @@ use tokio::{
     process::Command,
 };
 
+/// A frame that could not be read or written on a gateway channel.
+#[derive(Debug, thiserror::Error)]
+pub enum FrameError {
+    #[error("gateway channel failed")]
+    Io(#[from] std::io::Error),
+    #[error("truncated frame {part}")]
+    Truncated {
+        part: &'static str,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error(transparent)]
+    Protocol(#[from] a206_protocol::Error),
+}
+impl crate::error::Classified for FrameError {
+    fn kind(&self) -> Option<ErrorKind> {
+        Some(match self {
+            Self::Io(_) => ErrorKind::Unavailable,
+            Self::Truncated { .. } | Self::Protocol(_) => ErrorKind::Protocol,
+        })
+    }
+}
+
 pub async fn read_frame<T: DeserializeOwned>(
     reader: &mut (impl AsyncRead + Unpin),
-) -> Result<Option<T>> {
+) -> Result<Option<T>, FrameError> {
     let mut header = [0; 10];
     if reader.read(&mut header[..1]).await? == 0 {
         return Ok(None);
@@ -18,19 +40,25 @@ pub async fn read_frame<T: DeserializeOwned>(
     reader
         .read_exact(&mut header[1..])
         .await
-        .context("truncated frame header")?;
-    let mut payload = vec![0; payload_size(&header)?];
+        .map_err(|source| FrameError::Truncated {
+            part: "header",
+            source,
+        })?;
+    let mut payload = vec![0; a206_protocol::payload_size(&header)?];
     reader
         .read_exact(&mut payload)
         .await
-        .context("truncated frame body")?;
-    Ok(Some(decode_payload(&payload)?))
+        .map_err(|source| FrameError::Truncated {
+            part: "body",
+            source,
+        })?;
+    Ok(Some(a206_protocol::decode_payload(&payload)?))
 }
 pub async fn write_frame<T: Serialize>(
     writer: &mut (impl AsyncWrite + Unpin),
     value: &T,
-) -> Result<()> {
-    writer.write_all(&encode(value)?).await?;
+) -> Result<(), FrameError> {
+    writer.write_all(&a206_protocol::encode(value)?).await?;
     writer.flush().await?;
     Ok(())
 }
@@ -55,6 +83,11 @@ pub enum SshEndpointError {
     Username,
     #[error("profile path {} cannot be passed to OpenSSH", path.display())]
     ProfilePath { path: std::path::PathBuf },
+}
+impl crate::error::Classified for SshEndpointError {
+    fn kind(&self) -> Option<ErrorKind> {
+        Some(ErrorKind::InvalidRequest)
+    }
 }
 pub fn parse_ssh_endpoint(endpoint: &str) -> Result<SshEndpoint, SshEndpointError> {
     let url = url::Url::parse(endpoint)?;
@@ -138,12 +171,28 @@ fn ssh_base(
     command.arg("--").arg(endpoint.host);
     Ok(command)
 }
+/// Why the gateway command could not be built.
+#[derive(Debug, thiserror::Error)]
+pub enum LaunchError {
+    #[error(transparent)]
+    Endpoint(#[from] SshEndpointError),
+    #[error("could not locate the agent206 executable")]
+    CurrentExe(#[source] std::io::Error),
+}
+impl crate::error::Classified for LaunchError {
+    fn kind(&self) -> Option<ErrorKind> {
+        Some(match self {
+            Self::Endpoint(_) => ErrorKind::InvalidRequest,
+            Self::CurrentExe(_) => ErrorKind::Internal,
+        })
+    }
+}
 pub fn gateway_command(
     root: &Path,
     remote: Option<&str>,
     start: bool,
     explicit: bool,
-) -> Result<Command> {
+) -> Result<Command, LaunchError> {
     let mut command = if let Some(remote) = remote {
         let mut command = gateway_ssh_command(root, remote)?;
         // Fixed command text: OpenSSH executes remote arguments through a shell.
@@ -156,7 +205,7 @@ pub fn gateway_command(
         });
         command
     } else {
-        let mut command = Command::new(std::env::current_exe()?);
+        let mut command = Command::new(std::env::current_exe().map_err(LaunchError::CurrentExe)?);
         command
             .arg("--data-dir")
             .arg(root)

@@ -1,6 +1,5 @@
 //! JSON exists here only because external provider protocols require it.
 use a206_core::*;
-use anyhow::{Context, Result, bail, ensure};
 use futures_util::StreamExt;
 use serde_json::{Value, json};
 use std::{collections::BTreeSet, time::Duration};
@@ -8,6 +7,121 @@ use url::Url;
 const MAX_MODELS: usize = 4096;
 const MAX_PAGES: usize = 64;
 const MAX_RESPONSE: usize = 4 * 1024 * 1024;
+
+/// A provider endpoint the gateway refuses to call.
+#[derive(Debug, thiserror::Error)]
+pub enum EndpointError {
+    #[error("provider endpoint is not a valid URL")]
+    Url(#[from] url::ParseError),
+    #[error("endpoint must not contain credentials, query or fragment")]
+    Shape,
+    #[error("use HTTPS or an SSH-forwarded loopback endpoint")]
+    Insecure,
+    #[error("API path escaped the configured endpoint")]
+    Escaped,
+}
+/// A provider preset library that cannot be saved.
+#[derive(Debug, thiserror::Error)]
+pub enum PresetError {
+    #[error("provider preset library is too large")]
+    TooMany,
+    #[error("invalid hidden provider preset ID")]
+    HiddenId,
+    #[error("invalid or duplicate provider preset ID")]
+    Id,
+    #[error("provider preset names/groups must be 1–128 bytes without control characters")]
+    Label,
+    #[error("provider preset instructions or endpoint are too long")]
+    TooLong,
+    #[error("provider preset endpoint is invalid")]
+    Endpoint(#[source] EndpointError),
+}
+/// A failed provider call. Upstream bodies are never included: they can echo
+/// credentials or prompts.
+#[derive(Debug, thiserror::Error)]
+pub enum ProviderError {
+    #[error(transparent)]
+    Endpoint(#[from] EndpointError),
+    #[error("could not build the HTTP client")]
+    Client(#[source] reqwest::Error),
+    #[error("provider request failed")]
+    Transport(#[source] reqwest::Error),
+    #[error("provider returned HTTP {status}")]
+    Status { status: u16 },
+    #[error("provider response is too large")]
+    ResponseTooLarge,
+    #[error("provider response is not valid JSON")]
+    Json(#[source] serde_json::Error),
+    #[error("unsupported provider method {0}")]
+    Method(reqwest::Method),
+    #[error("unlock the vault to use this provider's credential")]
+    VaultUnavailable(#[source] a206_broker::ClientError),
+    #[error("the vault broker refused the provider call")]
+    Broker(#[source] a206_broker::ClientError),
+    #[error("the gateway is not paired with the unlocked vault; run `agent206 vault pair`")]
+    NotPaired,
+    #[error("vault broker returned an unexpected reply")]
+    UnexpectedReply,
+    #[error(
+        "the provider request exceeds the vault broker's {limit} byte limit; shorten the conversation"
+    )]
+    RequestTooLarge { limit: usize },
+    #[error("the vault broker is not available on this platform yet")]
+    NoBroker,
+    #[error("provider catalog refresh timed out")]
+    Timeout(#[source] tokio::time::error::Elapsed),
+    #[error("{0}")]
+    Malformed(&'static str),
+    #[error("select a model returned by the provider API")]
+    NoModel,
+    #[error("model metadata belongs to another model")]
+    ModelMismatch,
+    #[error("Gemini effort mapping is unavailable; clear the effort selection")]
+    GeminiEffort,
+    #[error("invalid Gemini model resource")]
+    GeminiResource,
+}
+impl crate::error::Classified for ProviderError {
+    fn kind(&self) -> Option<ErrorKind> {
+        Some(match self {
+            Self::Endpoint(_)
+            | Self::RequestTooLarge { .. }
+            | Self::NoModel
+            | Self::ModelMismatch
+            | Self::GeminiEffort
+            | Self::GeminiResource => ErrorKind::InvalidRequest,
+            Self::Client(_) | Self::Method(_) => ErrorKind::Internal,
+            Self::Transport(error) if error.is_timeout() => ErrorKind::Timeout,
+            Self::Transport(error) if error.is_connect() => ErrorKind::Unavailable,
+            Self::Timeout(_) => ErrorKind::Timeout,
+            Self::VaultUnavailable(_) | Self::NoBroker | Self::NotPaired => ErrorKind::Unavailable,
+            // The broker's own reply decides (denied, locked, upstream timeout).
+            Self::Broker(_) => return None,
+            Self::Transport(_)
+            | Self::Status { .. }
+            | Self::ResponseTooLarge
+            | Self::Json(_)
+            | Self::UnexpectedReply
+            | Self::Malformed(_) => ErrorKind::Provider,
+        })
+    }
+}
+impl crate::error::Classified for EndpointError {
+    fn kind(&self) -> Option<ErrorKind> {
+        Some(ErrorKind::InvalidRequest)
+    }
+}
+impl crate::error::Classified for PresetError {
+    fn kind(&self) -> Option<ErrorKind> {
+        Some(ErrorKind::InvalidRequest)
+    }
+}
+type Result<T, E = ProviderError> = std::result::Result<T, E>;
+use crate::error::check;
+/// The transport error without its URL, which can carry signed tokens.
+fn transport(error: reqwest::Error) -> ProviderError {
+    ProviderError::Transport(error.without_url())
+}
 pub fn now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -15,40 +129,41 @@ pub fn now() -> u64 {
         .as_secs()
 }
 pub fn client() -> Result<reqwest::Client> {
-    Ok(reqwest::Client::builder()
+    reqwest::Client::builder()
         .timeout(Duration::from_secs(180))
         .connect_timeout(Duration::from_secs(10))
         .redirect(reqwest::redirect::Policy::none())
-        .build()?)
+        .build()
+        .map_err(ProviderError::Client)
 }
-pub fn endpoint(config: &ProviderConfig, relative: &str) -> Result<Url> {
+pub fn endpoint(config: &ProviderConfig, relative: &str) -> Result<Url, EndpointError> {
     let url = Url::parse(&format!("{}/", config.base_url.trim_end_matches('/')))?;
-    ensure!(
+    check(
         url.username().is_empty()
             && url.password().is_none()
             && url.query().is_none()
             && url.fragment().is_none(),
-        "endpoint must not contain credentials, query or fragment"
-    );
+        EndpointError::Shape,
+    )?;
     let local = url
         .host_str()
         .is_some_and(|h| matches!(h, "localhost" | "127.0.0.1" | "[::1]" | "::1"));
-    ensure!(
+    check(
         url.scheme() == "https" || (url.scheme() == "http" && local),
-        "use HTTPS or an SSH-forwarded loopback endpoint"
-    );
+        EndpointError::Insecure,
+    )?;
     let result = url.join(relative)?;
-    ensure!(
+    check(
         result.origin() == url.origin() && result.path().starts_with(url.path()),
-        "API path escaped the configured endpoint"
-    );
+        EndpointError::Escaped,
+    )?;
     Ok(result)
 }
-pub fn validate_presets(library: &ProviderPresetList) -> Result<()> {
-    ensure!(
+pub fn validate_presets(library: &ProviderPresetList) -> Result<(), PresetError> {
+    check(
         library.entries.len() <= 256 && library.disabled.len() <= 256,
-        "provider preset library is too large"
-    );
+        PresetError::TooMany,
+    )?;
     let valid_id = |id: &str| {
         !id.is_empty()
             && id.len() <= 64
@@ -56,30 +171,31 @@ pub fn validate_presets(library: &ProviderPresetList) -> Result<()> {
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
     };
-    ensure!(
+    check(
         library.disabled.iter().all(|id| valid_id(id)),
-        "invalid hidden provider preset ID"
-    );
+        PresetError::HiddenId,
+    )?;
     let mut ids = BTreeSet::new();
     for preset in &library.entries {
-        ensure!(
+        check(
             valid_id(&preset.id) && ids.insert(&preset.id),
-            "invalid or duplicate provider preset ID"
-        );
+            PresetError::Id,
+        )?;
         for label in [&preset.name, &preset.group] {
-            ensure!(
+            check(
                 !label.trim().is_empty()
                     && label.len() <= 128
                     && !label.chars().any(char::is_control),
-                "provider preset names/groups must be 1–128 bytes without control characters"
-            );
+                PresetError::Label,
+            )?;
         }
-        ensure!(
+        check(
             preset.setup.len() <= 4096 && preset.base_url.len() <= 4096,
-            "provider preset instructions or endpoint are too long"
-        );
+            PresetError::TooLong,
+        )?;
         if !preset.base_url.is_empty() {
-            endpoint(&preset.configure(preset.base_url.clone()), "models")?;
+            endpoint(&preset.configure(preset.base_url.clone()), "models")
+                .map_err(PresetError::Endpoint)?;
         }
     }
     Ok(())
@@ -87,18 +203,23 @@ pub fn validate_presets(library: &ProviderPresetList) -> Result<()> {
 async fn response_json(response: reqwest::Response) -> Result<Value> {
     let status = response.status();
     // Do not surface upstream error bodies: they can echo credentials or prompts.
-    ensure!(status.is_success(), "provider returned HTTP {status}");
+    check(
+        status.is_success(),
+        ProviderError::Status {
+            status: status.as_u16(),
+        },
+    )?;
     let mut stream = response.bytes_stream();
     let mut bytes = vec![];
     while let Some(part) = stream.next().await {
-        let part = part?;
-        ensure!(
+        let part = part.map_err(transport)?;
+        check(
             bytes.len() + part.len() <= MAX_RESPONSE,
-            "provider response is too large"
-        );
+            ProviderError::ResponseTooLarge,
+        )?;
         bytes.extend_from_slice(&part);
     }
-    Ok(serde_json::from_slice(&bytes)?)
+    serde_json::from_slice(&bytes).map_err(ProviderError::Json)
 }
 /// Where credentialed requests go: the profile whose vault broker holds the
 /// key, and the pairing a trusted client gave the gateway for this unlock.
@@ -124,7 +245,7 @@ async fn call(
         if let Some(body) = body {
             request = request.json(body);
         }
-        return response_json(request.send().await?).await;
+        return response_json(request.send().await.map_err(transport)?).await;
     };
     brokered(config, broker, credential, method, url, body).await
 }
@@ -141,7 +262,7 @@ async fn brokered(
     let method = match method {
         reqwest::Method::GET => HttpMethod::Get,
         reqwest::Method::POST => HttpMethod::Post,
-        other => bail!("unsupported provider method {other}"),
+        other => return Err(ProviderError::Method(other)),
     };
     let auth = match config.api {
         ProviderApi::OpenAi => AuthScheme::Bearer,
@@ -159,33 +280,35 @@ async fn brokered(
                 .then(|| ANTHROPIC_VERSION.to_owned()),
             body: body.map(bounded_json).transpose()?,
         }))
-        .await?;
+        .await
+        .map_err(ProviderError::Broker)?;
     let Reply::Provider { status, body } = reply else {
-        bail!("vault broker returned an unexpected reply");
+        return Err(ProviderError::UnexpectedReply);
     };
-    ensure!(
+    check(
         (200..300).contains(&status),
-        "provider returned HTTP {status}"
-    );
-    ensure!(body.len() <= MAX_RESPONSE, "provider response is too large");
-    Ok(serde_json::from_slice(&body)?)
+        ProviderError::Status { status },
+    )?;
+    check(body.len() <= MAX_RESPONSE, ProviderError::ResponseTooLarge)?;
+    serde_json::from_slice(&body).map_err(ProviderError::Json)
 }
 /// Open a gateway-role broker connection and prove this unlock's pairing.
 #[cfg(unix)]
 async fn paired_client(
     root: &std::path::Path,
     pairing: Option<&a206_core::BrokerPairing>,
-) -> Result<a206_broker::Client> {
-    use a206_broker::{BrokerError, Request, Role, WireSecret};
+) -> Result<a206_broker::Client, ProviderError> {
+    use a206_broker::{Request, Role, WireSecret};
     let mut client = a206_broker::Client::connect(root, Role::Gateway)
         .await
-        .context("unlock the vault to use this provider's credential")?;
-    let pairing = pairing.ok_or(BrokerError::GatewayNotPaired)?;
+        .map_err(ProviderError::VaultUnavailable)?;
+    let pairing = pairing.ok_or(ProviderError::NotPaired)?;
     client
         .call(Request::GatewayAuth {
             token: WireSecret::new(pairing.expose().to_owned()),
         })
-        .await?;
+        .await
+        .map_err(ProviderError::Broker)?;
     Ok(client)
 }
 /// Check a pairing against the broker before the gateway keeps it.
@@ -193,12 +316,15 @@ async fn paired_client(
 pub async fn verify_pairing(
     root: &std::path::Path,
     pairing: &a206_core::BrokerPairing,
-) -> Result<()> {
+) -> Result<(), ProviderError> {
     paired_client(root, Some(pairing)).await.map(drop)
 }
 #[cfg(not(unix))]
-pub async fn verify_pairing(_: &std::path::Path, _: &a206_core::BrokerPairing) -> Result<()> {
-    bail!("the vault broker is not available on this platform yet")
+pub async fn verify_pairing(
+    _: &std::path::Path,
+    _: &a206_core::BrokerPairing,
+) -> Result<(), ProviderError> {
+    Err(ProviderError::NoBroker)
 }
 /// Serialize a request body, stopping as soon as it exceeds what one broker
 /// frame can carry instead of building an oversized copy first.
@@ -218,11 +344,11 @@ fn bounded_json(body: &Value) -> Result<Vec<u8>> {
         }
     }
     let mut out = Bounded(vec![]);
+    // Serializing a `Value` fails only when the bounded writer refuses more bytes.
     if serde_json::to_writer(&mut out, body).is_err() {
-        bail!(
-            "the provider request exceeds the vault broker's {} byte limit; shorten the conversation",
-            a206_broker::MAX_PROVIDER_BODY
-        );
+        return Err(ProviderError::RequestTooLarge {
+            limit: a206_broker::MAX_PROVIDER_BODY,
+        });
     }
     Ok(out.0)
 }
@@ -235,14 +361,14 @@ async fn brokered(
     _: Url,
     _: Option<&Value>,
 ) -> Result<Value> {
-    bail!("the vault broker is not available on this platform yet")
+    Err(ProviderError::NoBroker)
 }
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 /// Follow provider cursors, never provider-supplied URLs; publication is all-or-nothing.
 pub async fn catalog(config: &ProviderConfig, broker: Broker<'_>) -> Result<Catalog> {
     tokio::time::timeout(Duration::from_secs(180), catalog_pages(config, broker))
         .await
-        .context("provider catalog refresh timed out")?
+        .map_err(ProviderError::Timeout)?
 }
 async fn catalog_pages(config: &ProviderConfig, broker: Broker<'_>) -> Result<Catalog> {
     let source = endpoint(config, "models")?;
@@ -254,8 +380,13 @@ async fn catalog_pages(config: &ProviderConfig, broker: Broker<'_>) -> Result<Ca
     let mut account = None;
     for page in 0..MAX_PAGES {
         let value = call(config, broker, reqwest::Method::GET, url, None).await?;
-        bytes += serde_json::to_vec(&value)?.len();
-        ensure!(bytes <= MAX_RESPONSE, "model catalog is too large");
+        bytes += serde_json::to_vec(&value)
+            .map_err(ProviderError::Json)?
+            .len();
+        check(
+            bytes <= MAX_RESPONSE,
+            ProviderError::Malformed("model catalog is too large"),
+        )?;
         if page == 0 {
             account = Some(value.clone());
         }
@@ -267,7 +398,9 @@ async fn catalog_pages(config: &ProviderConfig, broker: Broker<'_>) -> Result<Ca
         let items = value
             .get(array)
             .and_then(Value::as_array)
-            .context("models API omitted its model array")?;
+            .ok_or(ProviderError::Malformed(
+                "models API omitted its model array",
+            ))?;
         for item in items {
             if config.api == ProviderApi::Gemini
                 && !item
@@ -278,12 +411,15 @@ async fn catalog_pages(config: &ProviderConfig, broker: Broker<'_>) -> Result<Ca
                 continue;
             }
             let model = parse_model(config, item)?;
-            ensure!(
+            check(
                 seen_models.insert(model.key.clone()),
-                "models API repeated a model identifier"
-            );
+                ProviderError::Malformed("models API repeated a model identifier"),
+            )?;
             models.push(model);
-            ensure!(models.len() <= MAX_MODELS, "model catalog is too large");
+            check(
+                models.len() <= MAX_MODELS,
+                ProviderError::Malformed("model catalog is too large"),
+            )?;
         }
         let cursor = match config.api {
             ProviderApi::Gemini => value
@@ -295,13 +431,15 @@ async fn catalog_pages(config: &ProviderConfig, broker: Broker<'_>) -> Result<Ca
                     .get("last_id")
                     .and_then(Value::as_str)
                     .filter(|s| !s.is_empty())
-                    .context("models API omitted its pagination cursor")?,
+                    .ok_or(ProviderError::Malformed(
+                        "models API omitted its pagination cursor",
+                    ))?,
             ),
             _ => None,
         };
         let Some(cursor) = cursor else {
             let at = now();
-            let account = account.context("models API returned no page")?;
+            let account = account.ok_or(ProviderError::Malformed("models API returned no page"))?;
             return Ok(Catalog {
                 provider: config.id,
                 source: source.to_string(),
@@ -316,10 +454,10 @@ async fn catalog_pages(config: &ProviderConfig, broker: Broker<'_>) -> Result<Ca
                 token_balance: account.get("token_balance").and_then(Value::as_u64),
             });
         };
-        ensure!(
+        check(
             cursor.len() <= 4096 && seen_cursors.insert(cursor.to_owned()),
-            "models API returned an invalid or repeated cursor"
-        );
+            ProviderError::Malformed("models API returned an invalid or repeated cursor"),
+        )?;
         url = source.clone();
         url.query_pairs_mut().append_pair(
             if config.api == ProviderApi::Gemini {
@@ -330,7 +468,9 @@ async fn catalog_pages(config: &ProviderConfig, broker: Broker<'_>) -> Result<Ca
             cursor,
         );
     }
-    bail!("models API exceeded the pagination limit")
+    Err(ProviderError::Malformed(
+        "models API exceeded the pagination limit",
+    ))
 }
 fn parse_model(config: &ProviderConfig, item: &Value) -> Result<ModelInfo> {
     let id_field = if config.api == ProviderApi::Gemini {
@@ -341,11 +481,13 @@ fn parse_model(config: &ProviderConfig, item: &Value) -> Result<ModelInfo> {
     let model = item
         .get(id_field)
         .and_then(Value::as_str)
-        .context("models API returned an item without an identifier")?;
-    ensure!(
+        .ok_or(ProviderError::Malformed(
+            "models API returned an item without an identifier",
+        ))?;
+    check(
         !model.is_empty() && model.len() <= 512 && !model.chars().any(char::is_control),
-        "invalid model identifier"
-    );
+        ProviderError::Malformed("invalid model identifier"),
+    )?;
     let (name, context, output, reasoning) = match config.api {
         ProviderApi::OpenAi => (
             "name",
@@ -443,14 +585,8 @@ pub async fn complete(
     prompt: &str,
     info: &ModelInfo,
 ) -> Result<(String, Usage)> {
-    let model = thread
-        .model
-        .as_ref()
-        .context("select a model returned by the provider API")?;
-    ensure!(
-        model == &info.key,
-        "model metadata belongs to another model"
-    );
+    let model = thread.model.as_ref().ok_or(ProviderError::NoModel)?;
+    check(model == &info.key, ProviderError::ModelMismatch)?;
     let (url, body) = match config.api {
         ProviderApi::OpenAi => {
             let mut messages = vec![json!({"role": "system", "content": prompt})];
@@ -472,24 +608,22 @@ pub async fn complete(
             (endpoint(config, "messages")?, body)
         }
         ProviderApi::Gemini => {
-            ensure!(
-                thread.effort.is_none(),
-                "Gemini effort mapping is unavailable; clear the effort selection"
-            );
+            check(thread.effort.is_none(), ProviderError::GeminiEffort)?;
             let resource = model
                 .model
                 .strip_prefix("models/")
-                .context("Gemini API returned an invalid model resource")?;
-            ensure!(
+                .ok_or(ProviderError::GeminiResource)?;
+            check(
                 !resource.is_empty()
                     && resource != "."
                     && resource != ".."
                     && !resource.contains('/'),
-                "invalid Gemini model resource"
-            );
+                ProviderError::GeminiResource,
+            )?;
             let mut url = endpoint(config, "models/")?;
+            // An http(s) endpoint always has path segments.
             url.path_segments_mut()
-                .map_err(|_| anyhow::anyhow!("invalid Gemini endpoint"))?
+                .map_err(|()| ProviderError::Endpoint(EndpointError::Shape))?
                 .pop_if_empty()
                 .push(&format!("{resource}:generateContent"));
             let body = json!({"systemInstruction": {"parts": [{"text": prompt}]},
@@ -518,11 +652,13 @@ pub async fn complete(
             "/usageMetadata/candidatesTokenCount",
         ),
     };
-    let text = text.context("provider returned no text response")?;
-    ensure!(
+    let text = text.ok_or(ProviderError::Malformed(
+        "provider returned no text response",
+    ))?;
+    check(
         text.len() <= 128 * 1024,
-        "provider message exceeds the conversation limit"
-    );
+        ProviderError::Malformed("provider message exceeds the conversation limit"),
+    )?;
     let usage = Usage {
         input_tokens: result.pointer(input).and_then(Value::as_u64),
         output_tokens: result.pointer(output).and_then(Value::as_u64),

@@ -1,12 +1,12 @@
 //! Gateway owns state. Trusted UI commands and untrusted agent tools are separate APIs.
 use crate::{
+    error::check,
     provider::{self, now},
-    store::Store,
+    store::{Store, StoreError},
     transport,
 };
 use a206_core::*;
 use a206_protocol::{Request, Response};
-use anyhow::{Context, Result, ensure};
 use futures_util::StreamExt;
 use sha2::{Digest, Sha256};
 use std::{
@@ -15,6 +15,148 @@ use std::{
     sync::{Arc, Mutex, MutexGuard},
 };
 use tokio::io::AsyncWriteExt;
+/// Why a gateway command failed. Validation reasons are static so clients can
+/// match the variant; every wrapped failure keeps its cause in `source()`.
+#[derive(Debug, thiserror::Error)]
+pub enum GatewayError {
+    /// The command failed validation.
+    #[error("{0}")]
+    Invalid(&'static str),
+    /// A referenced thread, project, provider or transfer does not exist.
+    #[error("{0}")]
+    NotFound(&'static str),
+    /// The command conflicts with current state; refresh and retry.
+    #[error("{0}")]
+    Conflict(&'static str),
+    /// Policy or the thread's grants forbid the command.
+    #[error("{0}")]
+    Denied(&'static str),
+    #[error("gateway is stopping; start it again before submitting work")]
+    Draining,
+    #[error(
+        "this preview reached its history capacity; export the state directory before continuing in a new profile"
+    )]
+    HistoryFull,
+    #[error("{lock} lock poisoned")]
+    Poisoned { lock: &'static str },
+    #[error("operation completed but its receipt could not be persisted")]
+    Receipt(#[source] StoreError),
+    #[error(transparent)]
+    Store(#[from] StoreError),
+    #[error(transparent)]
+    Joshua(#[from] crate::joshua::JoshuaError),
+    #[error(transparent)]
+    Provider(#[from] provider::ProviderError),
+    #[error(transparent)]
+    Endpoint(#[from] provider::EndpointError),
+    #[error(transparent)]
+    Presets(#[from] provider::PresetError),
+    #[error(transparent)]
+    Backend(#[from] crate::backends::BackendError),
+    #[error(transparent)]
+    Process(#[from] crate::process::ProcessError),
+    #[error(transparent)]
+    Download(#[from] crate::network::DownloadError),
+    #[error(transparent)]
+    Extension(#[from] a206_extensions::ExtensionError),
+    #[error(transparent)]
+    Frame(#[from] transport::FrameError),
+    #[error("state could not be encoded")]
+    Encode(#[from] rmp_serde::encode::Error),
+    #[error("settings could not be encoded")]
+    EncodeSettings(#[source] toml::ser::Error),
+    #[error("could not write settings.toml")]
+    WriteSettings(#[source] std::io::Error),
+    #[error("could not record the stop request")]
+    MarkStopped(#[source] std::io::Error),
+    #[error("gateway cleanup timed out; service remains running")]
+    ShutdownTimeout(#[source] tokio::time::error::Elapsed),
+    #[error("workspace is missing or unreadable")]
+    Workspace(#[source] std::io::Error),
+    #[error("document is missing or outside the project")]
+    Document(#[source] std::io::Error),
+    #[error("this viewer supports UTF-8 text and Markdown")]
+    NotText(#[source] std::io::Error),
+    #[error("could not locate the agent206 executable")]
+    CurrentExe(#[source] std::io::Error),
+    #[error("could not run the extension worker")]
+    Worker(#[source] std::io::Error),
+    #[error("extension worker timed out")]
+    WorkerTimeout(#[source] tokio::time::error::Elapsed),
+    #[error("extension worker failed with {status}")]
+    WorkerFailed { status: std::process::ExitStatus },
+    #[error("extension worker output is invalid")]
+    WorkerOutput(#[source] a206_protocol::Error),
+    #[error("invalid download URL")]
+    DownloadUrl(#[source] url::ParseError),
+    #[error("could not prepare the download directory")]
+    DownloadDirectory(#[source] std::io::Error),
+    #[error("could not write the partial download")]
+    Partial(#[source] std::io::Error),
+    #[error("could not publish the download")]
+    Publish(#[source] std::io::Error),
+    #[error("download cancelled")]
+    DownloadCancelled,
+    #[error("download integrity check failed")]
+    Integrity,
+    #[error("download length mismatch: expected {expected} bytes, received {received}")]
+    Length { expected: u64, received: u64 },
+    #[error("gateway task failed")]
+    Task(#[from] tokio::task::JoinError),
+    #[error("gateway request limiter closed")]
+    Limiter(#[source] tokio::sync::AcquireError),
+    #[error("reply channel closed")]
+    ReplyChannel,
+}
+impl crate::error::Classified for GatewayError {
+    fn kind(&self) -> Option<ErrorKind> {
+        use crate::error::classify;
+        Some(match self {
+            Self::Invalid(_) | Self::DownloadUrl(_) => ErrorKind::InvalidRequest,
+            Self::NotFound(_) => ErrorKind::NotFound,
+            Self::Conflict(_) => ErrorKind::Conflict,
+            Self::Denied(_) => ErrorKind::PermissionDenied,
+            Self::Draining | Self::Worker(_) | Self::ReplyChannel => ErrorKind::Unavailable,
+            Self::HistoryFull
+            | Self::WriteSettings(_)
+            | Self::MarkStopped(_)
+            | Self::DownloadDirectory(_)
+            | Self::Partial(_) => ErrorKind::Storage,
+            Self::Poisoned { .. }
+            | Self::Encode(_)
+            | Self::EncodeSettings(_)
+            | Self::CurrentExe(_)
+            | Self::WorkerFailed { .. }
+            | Self::Task(_)
+            | Self::Limiter(_) => ErrorKind::Internal,
+            Self::ShutdownTimeout(_) | Self::WorkerTimeout(_) => ErrorKind::Timeout,
+            Self::WorkerOutput(_) => ErrorKind::Protocol,
+            Self::DownloadCancelled => ErrorKind::Cancelled,
+            Self::Integrity | Self::Length { .. } => ErrorKind::Provider,
+            // `transparent` hides these from the chain, so classify them here.
+            Self::Store(error) => return classify(error),
+            Self::Joshua(error) => return classify(error),
+            Self::Provider(error) => return classify(error),
+            Self::Endpoint(error) => return classify(error),
+            Self::Presets(error) => return classify(error),
+            Self::Backend(error) => return classify(error),
+            Self::Process(error) => return classify(error),
+            Self::Download(error) => return classify(error),
+            Self::Extension(error) => return classify(error),
+            Self::Frame(error) => return classify(error),
+            // The cause's own kind (missing, denied, invalid data) is the useful one.
+            Self::Receipt(_)
+            | Self::Workspace(_)
+            | Self::Document(_)
+            | Self::NotText(_)
+            | Self::Publish(_) => return None,
+        })
+    }
+}
+type Result<T, E = GatewayError> = std::result::Result<T, E>;
+fn poisoned<T>(lock: &'static str) -> impl FnOnce(T) -> GatewayError {
+    move |_| GatewayError::Poisoned { lock }
+}
 #[derive(Default)]
 struct Admission {
     draining: bool,
@@ -44,10 +186,11 @@ impl Drop for StopAfterReply {
 }
 impl DrainAttempt {
     fn begin(admission: &Arc<Mutex<Admission>>) -> Result<Self> {
-        let mut state = admission
-            .lock()
-            .map_err(|_| anyhow::anyhow!("gateway admission lock poisoned"))?;
-        ensure!(!state.draining, "gateway shutdown is already complete");
+        let mut state = admission.lock().map_err(poisoned("gateway admission"))?;
+        check(
+            !state.draining,
+            GatewayError::Conflict("gateway shutdown is already complete"),
+        )?;
         state.draining = true;
         Ok(Self {
             admission: admission.clone(),
@@ -83,7 +226,7 @@ pub struct Gateway {
 /// Minimum seconds between automatic refreshes of one stale catalog.
 const REFRESH_RETRY: u64 = 300;
 impl Gateway {
-    pub fn open(root: &Path) -> Result<Self> {
+    pub fn open(root: &Path) -> Result<Self, StoreError> {
         Ok(Self {
             admission: Arc::new(Mutex::new(Admission::default())),
             shutdown_committed: Arc::new(tokio::sync::Mutex::new(false)),
@@ -99,16 +242,10 @@ impl Gateway {
         })
     }
     fn pairing(&self) -> Result<Option<BrokerPairing>> {
-        Ok(self
-            .pairing
-            .lock()
-            .map_err(|_| anyhow::anyhow!("pairing lock poisoned"))?
-            .clone())
+        Ok(self.pairing.lock().map_err(poisoned("pairing"))?.clone())
     }
     fn lock(&self) -> Result<MutexGuard<'_, Store>> {
-        self.store
-            .lock()
-            .map_err(|_| anyhow::anyhow!("state lock poisoned"))
+        self.store.lock().map_err(poisoned("state"))
     }
     /// Wakes the automatic catalog refresh when a new broker pairing arrives.
     pub(crate) fn paired_signal(&self) -> Arc<tokio::sync::Notify> {
@@ -125,10 +262,7 @@ impl Gateway {
                 .iter()
                 .any(|c| c.provider == config.id && !c.stale(now));
             let due = {
-                let mut refreshed = self
-                    .refreshed
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("refresh lock poisoned"))?;
+                let mut refreshed = self.refreshed.lock().map_err(poisoned("catalog refresh"))?;
                 let due = !fresh
                     && refreshed
                         .get(&config.id)
@@ -147,8 +281,13 @@ impl Gateway {
                         },
                     })
                     .await;
-                if let Reply::Error { message } = reply.body {
-                    tracing::warn!(provider = %config.id, error = %message, "catalog refresh failed");
+                if let Reply::Error(report) = reply.body {
+                    tracing::warn!(
+                        provider = %config.id,
+                        kind = ?report.kind,
+                        error = %report.message,
+                        "catalog refresh failed"
+                    );
                 }
             }
         }
@@ -165,10 +304,7 @@ impl Gateway {
         let Some(provider) = store.state.managed_joshua_provider else {
             return Ok(());
         };
-        let running = self
-            .running
-            .lock()
-            .map_err(|_| anyhow::anyhow!("run lock poisoned"))?;
+        let running = self.running.lock().map_err(poisoned("run"))?;
         for thread in &store.state.threads {
             if thread
                 .model
@@ -189,6 +325,18 @@ impl Gateway {
     /// The stop effect belongs only to fresh execution, never a durable replay.
     async fn request_with_effect(&self, request: Request<Command>) -> (Response<Reply>, bool) {
         let id = request.id;
+        let operation = request.body.name();
+        let span = tracing::info_span!("request", %id, operation);
+        let (body, stop) = tracing::Instrument::instrument(self.execute(request), span).await;
+        let body = match body {
+            Ok(reply) => reply,
+            Err(error) => Reply::Error(crate::error::correlated(operation, id, &error)),
+        };
+        (Response { id, body }, stop)
+    }
+    async fn execute(&self, request: Request<Command>) -> (Result<Reply>, bool) {
+        let id = request.id;
+        let operation = request.body.name();
         let is_shutdown = matches!(request.body, Command::Shutdown);
         let _active = if !matches!(
             request.body,
@@ -200,26 +348,14 @@ impl Gateway {
         ) {
             let Ok(mut admission) = self.admission.lock() else {
                 return (
-                    Response {
-                        id,
-                        body: Reply::Error {
-                            message: "gateway admission lock poisoned".into(),
-                        },
-                    },
+                    Err(GatewayError::Poisoned {
+                        lock: "gateway admission",
+                    }),
                     false,
                 );
             };
             if admission.draining {
-                return (
-                    Response {
-                        id,
-                        body: Reply::Error {
-                            message: "gateway is stopping; start it again before submitting work"
-                                .into(),
-                        },
-                    },
-                    false,
-                );
+                return (Err(GatewayError::Draining), false);
             }
             admission.active += 1;
             Some(ActiveRequest(self.admission.clone()))
@@ -238,44 +374,32 @@ impl Gateway {
                 // Never journal a pairing: request bodies are persisted.
                 | Command::PairBroker { .. }
         );
-        let begin = (|| -> Result<Option<Reply>> {
-            if mutation {
-                self.lock()?.begin(id, &request.body)
-            } else {
-                Ok(None)
-            }
-        })();
-        let mut stop = false;
-        let body = match begin {
-            Ok(Some(reply)) => reply,
-            Err(error) => Reply::Error {
-                message: error.to_string(),
-            },
-            Ok(None) => {
-                let reply = self
-                    .handle(request.body)
-                    .await
-                    .unwrap_or_else(|e| Reply::Error {
-                        message: e.to_string(),
-                    });
-                stop = is_shutdown && matches!(reply, Reply::Ok);
-                if mutation && let Err(e) = self.lock().and_then(|s| s.finish(id, &reply)) {
-                    return (
-                        Response {
-                            id,
-                            body: Reply::Error {
-                                message: format!(
-                                    "operation completed but its receipt could not be persisted: {e}"
-                                ),
-                            },
-                        },
-                        stop,
-                    );
-                }
-                reply
-            }
+        let begin = if mutation {
+            self.lock()
+                .and_then(|mut store| Ok(store.begin(id, &request.body)?))
+        } else {
+            Ok(None)
         };
-        (Response { id, body }, stop)
+        match begin {
+            Ok(Some(reply)) => (Ok(reply), false),
+            Err(error) => (Err(error), false),
+            Ok(None) => {
+                // A failed command is a reply: persist its report as the receipt.
+                let reply = match self.handle(request.body).await {
+                    Ok(reply) => reply,
+                    Err(error) => Reply::Error(crate::error::correlated(operation, id, &error)),
+                };
+                let stop = is_shutdown && matches!(reply, Reply::Ok);
+                if mutation
+                    && let Err(error) = self
+                        .lock()
+                        .and_then(|s| s.finish(id, &reply).map_err(GatewayError::Receipt))
+                {
+                    return (Err(error), stop);
+                }
+                (Ok(reply), stop)
+            }
+        }
     }
     async fn handle(&self, command: Command) -> Result<Reply> {
         match command {
@@ -285,21 +409,13 @@ impl Gateway {
                 protocol: a206_protocol::VERSION,
                 uptime_seconds: self.started.elapsed().as_secs(),
                 data_dir: self.lock()?.root.display().to_string(),
-                active_runs: self
-                    .running
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("run lock poisoned"))?
-                    .len(),
-                active_downloads: self
-                    .downloads
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("download lock poisoned"))?
-                    .len(),
+                active_runs: self.running.lock().map_err(poisoned("run"))?.len(),
+                active_downloads: self.downloads.lock().map_err(poisoned("download"))?.len(),
                 accepting_work: Some(
                     !self
                         .admission
                         .lock()
-                        .map_err(|_| anyhow::anyhow!("gateway admission lock poisoned"))?
+                        .map_err(poisoned("gateway admission"))?
                         .draining,
                 ),
             })),
@@ -307,14 +423,11 @@ impl Gateway {
             Command::PairBroker { pairing } => {
                 let root = self.lock()?.root.clone();
                 provider::verify_pairing(&root, &pairing).await?;
-                *self
-                    .pairing
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("pairing lock poisoned"))? = Some(pairing);
+                *self.pairing.lock().map_err(poisoned("pairing"))? = Some(pairing);
                 // Discovery that failed for want of a pairing may retry now.
                 self.refreshed
                     .lock()
-                    .map_err(|_| anyhow::anyhow!("refresh lock poisoned"))?
+                    .map_err(poisoned("catalog refresh"))?
                     .clear();
                 self.paired.notify_one();
                 Ok(Reply::Ok)
@@ -352,7 +465,11 @@ impl Gateway {
                     Ok(())
                 })();
                 if let Err(error) = persisted {
-                    manager.stop().await?;
+                    // The persistence failure is the one reported; a failed
+                    // rollback is recorded rather than replacing it.
+                    if let Err(stop) = manager.stop().await {
+                        crate::error::handle("stop_joshua", &stop);
+                    }
                     return Err(error);
                 }
                 Ok(Reply::Text(format!(
@@ -371,50 +488,56 @@ impl Gateway {
                 let mut backend_kinds = BTreeSet::new();
                 for backend in &settings.backends {
                     crate::backends::validate_config(backend)?;
-                    ensure!(
+                    check(
                         backend_kinds.insert(backend.kind.label()),
-                        "duplicate coding backend configuration"
-                    );
+                        GatewayError::Invalid("duplicate coding backend configuration"),
+                    )?;
                 }
                 let mut ids = BTreeSet::new();
                 for config in &settings.providers {
-                    ensure!(ids.insert(config.id), "duplicate provider id");
+                    check(
+                        ids.insert(config.id),
+                        GatewayError::Invalid("duplicate provider id"),
+                    )?;
                     provider::endpoint(config, "models")?;
-                    ensure!(
+                    check(
                         !config.label.trim().is_empty(),
-                        "provider label is required"
-                    );
+                        GatewayError::Invalid("provider label is required"),
+                    )?;
                 }
                 for mode in Mode::ALL {
-                    ensure!(
+                    check(
                         settings.prompts.iter().filter(|p| p.mode == mode).count() == 1,
-                        "each mode needs exactly one prompt"
-                    );
+                        GatewayError::Invalid("each mode needs exactly one prompt"),
+                    )?;
                 }
                 let mut store = self.lock()?;
-                ensure!(
+                check(
                     settings.revision == store.state.settings.revision,
-                    "settings changed in another operation; refresh and retry your change"
-                );
+                    GatewayError::Conflict(
+                        "settings changed in another operation; refresh and retry your change",
+                    ),
+                )?;
                 if let Some(id) = store.state.managed_joshua_provider {
                     let owned = store.state.settings.providers.iter().find(|provider| provider.id == id)
-                        .context("managed Joshua connection is missing; stop Joshua before applying settings")?;
-                    ensure!(
+                        .ok_or(GatewayError::Conflict("managed Joshua connection is missing; stop Joshua before applying settings"))?;
+                    check(
                         settings
                             .providers
                             .iter()
                             .find(|provider| provider.id == id)
-                            .is_some_and(|provider| provider.base_url == owned.base_url
-                                && provider.api == owned.api
-                                && provider.credential == owned.credential),
-                        "stop managed Joshua before removing its connection or changing its endpoint, protocol or credentials"
-                    );
+                            .is_some_and(|provider| {
+                                provider.base_url == owned.base_url
+                                    && provider.api == owned.api
+                                    && provider.credential == owned.credential
+                            }),
+                        GatewayError::Conflict(
+                            "stop managed Joshua before removing its connection or changing its endpoint, protocol or credentials",
+                        ),
+                    )?;
                 }
                 // Revocation also stops already-running inference and coding backends.
-                let running = self
-                    .running
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("run lock poisoned"))?;
+                let running = self.running.lock().map_err(poisoned("run"))?;
                 for thread in &store.state.threads {
                     let provider_changed = thread.model.as_ref().is_some_and(|key| {
                         let previous = store
@@ -441,11 +564,13 @@ impl Gateway {
                 }
                 drop(running);
                 settings.revision += 1;
-                let text = toml::to_string_pretty(&settings)?;
+                let text =
+                    toml::to_string_pretty(&settings).map_err(GatewayError::EncodeSettings)?;
                 let temporary = store.root.join("settings.toml.new");
-                std::fs::write(&temporary, text)?;
-                std::fs::File::open(&temporary)?.sync_all()?;
-                std::fs::rename(&temporary, store.root.join("settings.toml"))?;
+                std::fs::write(&temporary, text)
+                    .and_then(|()| std::fs::File::open(&temporary)?.sync_all())
+                    .and_then(|()| std::fs::rename(&temporary, store.root.join("settings.toml")))
+                    .map_err(GatewayError::WriteSettings)?;
                 // Endpoint/credential changes invalidate any facts from the previous source.
                 let old = store.state.settings.providers.clone();
                 store.state.catalogs.retain(|c| {
@@ -467,7 +592,7 @@ impl Gateway {
                     .iter()
                     .find(|p| p.id == provider)
                     .cloned()
-                    .context("provider not configured")?;
+                    .ok_or(GatewayError::NotFound("provider not configured"))?;
                 let root = self.lock()?.root.clone();
                 let pairing = self.pairing()?;
                 let broker = provider::Broker {
@@ -476,20 +601,20 @@ impl Gateway {
                 };
                 let catalog = provider::catalog(&config, broker).await?;
                 let mut store = self.lock()?;
-                ensure!(
+                check(
                     store.state.settings.providers.contains(&config),
-                    "provider configuration changed during refresh"
-                );
+                    GatewayError::Conflict("provider configuration changed during refresh"),
+                )?;
                 store.state.catalogs.retain(|c| c.provider != provider);
                 store.state.catalogs.push(catalog.clone());
                 store.persist(Some(EventKind::CatalogChanged { provider }))?;
                 Ok(Reply::Catalog(catalog))
             }
             Command::CreateThread { title, mode } => {
-                ensure!(
+                check(
                     !title.trim().is_empty() && title.len() <= 512,
-                    "thread title must be 1–512 bytes"
-                );
+                    GatewayError::Invalid("thread title must be 1–512 bytes"),
+                )?;
                 let thread = Thread::new(title, mode);
                 let mut store = self.lock()?;
                 store.state.threads.push(thread.clone());
@@ -512,10 +637,7 @@ impl Gateway {
                     }
                 }
                 if !allowed {
-                    let running = self
-                        .running
-                        .lock()
-                        .map_err(|_| anyhow::anyhow!("run lock poisoned"))?;
+                    let running = self.running.lock().map_err(poisoned("run"))?;
                     for child in store.state.threads.iter().filter(|child| {
                         child.parent == Some(id) && child.model.as_ref() == Some(&model)
                     }) {
@@ -528,10 +650,10 @@ impl Gateway {
                 Ok(Reply::Ok)
             }
             Command::RenameThread { id, title } => {
-                ensure!(
+                check(
                     !title.trim().is_empty() && title.len() <= 512,
-                    "thread title must be 1–512 bytes"
-                );
+                    GatewayError::Invalid("thread title must be 1–512 bytes"),
+                )?;
                 let mut store = self.lock()?;
                 store.thread_mut(id)?.title = title;
                 store.persist(Some(EventKind::ThreadChanged { id }))?;
@@ -548,10 +670,12 @@ impl Gateway {
                     validate_model(&store.state, key)?;
                 }
                 let thread = store.thread_mut(id)?;
-                ensure!(
+                check(
                     thread.state != RunState::Running,
-                    "wait for the current response before changing its configuration"
-                );
+                    GatewayError::Conflict(
+                        "wait for the current response before changing its configuration",
+                    ),
+                )?;
                 thread.mode = mode;
                 if thread.model != model {
                     thread.effort = None;
@@ -576,10 +700,10 @@ impl Gateway {
             Command::SetEffort { thread: id, effort } => {
                 let mut store = self.lock()?;
                 let thread = store.thread(id)?;
-                ensure!(
+                check(
                     thread.state != RunState::Running,
-                    "wait for the response before changing effort"
-                );
+                    GatewayError::Conflict("wait for the response before changing effort"),
+                )?;
                 validate_effort(&store.state, thread.model.as_ref(), effort.as_deref())?;
                 store.thread_mut(id)?.effort = effort;
                 store.persist(Some(EventKind::ThreadChanged { id }))?;
@@ -592,44 +716,44 @@ impl Gateway {
             } => {
                 let mut store = self.lock()?;
                 let thread = store.thread(id)?;
-                ensure!(
+                check(
                     thread.state != RunState::Running,
-                    "stop the run before changing backend permissions"
-                );
-                ensure!(
+                    GatewayError::Conflict("stop the run before changing backend permissions"),
+                )?;
+                check(
                     thread.parent.is_none(),
-                    "delegated threads cannot change backend grants"
-                );
+                    GatewayError::Denied("delegated threads cannot change backend grants"),
+                )?;
                 let supported: BTreeSet<_> = [
                     Capability::ReadWorkspace,
                     Capability::WriteWorkspace,
                     Capability::Execute,
                 ]
                 .into();
-                ensure!(
+                check(
                     capabilities.is_subset(&supported)
                         && capabilities.is_subset(&thread.mode.ceiling()),
-                    "backend capability is unavailable in this mode"
-                );
-                ensure!(
+                    GatewayError::Denied("backend capability is unavailable in this mode"),
+                )?;
+                check(
                     !capabilities.contains(&Capability::WriteWorkspace)
                         || capabilities.contains(&Capability::ReadWorkspace),
-                    "write access also requires read access"
-                );
-                ensure!(
+                    GatewayError::Invalid("write access also requires read access"),
+                )?;
+                check(
                     capabilities.is_empty() || thread.project.is_some(),
-                    "associate a project before granting workspace tools"
-                );
+                    GatewayError::Invalid("associate a project before granting workspace tools"),
+                )?;
                 if backend != CodingBackend::Native {
-                    ensure!(
+                    check(
                         store
                             .state
                             .settings
                             .backends
                             .iter()
                             .any(|b| b.kind == backend),
-                        "configure the coding backend in Connections first"
-                    );
+                        GatewayError::Invalid("configure the coding backend in Connections first"),
+                    )?;
                 }
                 let thread = store.thread_mut(id)?;
                 thread.backend = backend;
@@ -643,52 +767,51 @@ impl Gateway {
                 text,
                 attachments,
             } => {
-                ensure!(
+                check(
                     attachments.len() <= 8,
-                    "attach at most eight text documents"
-                );
+                    GatewayError::Invalid("attach at most eight text documents"),
+                )?;
                 let attachment_size: usize = attachments.iter().map(|a| a.text.len()).sum();
-                ensure!(
+                check(
                     text.len() + attachment_size <= 128 * 1024,
-                    "message and attachments exceed 128 KiB"
-                );
+                    GatewayError::Invalid("message and attachments exceed 128 KiB"),
+                )?;
                 for attachment in &attachments {
-                    ensure!(
+                    check(
                         !attachment.name.is_empty()
                             && attachment.name.len() <= 255
                             && !attachment.name.chars().any(char::is_control),
-                        "invalid attachment name"
-                    );
-                    ensure!(
+                        GatewayError::Invalid("invalid attachment name"),
+                    )?;
+                    check(
                         !attachment.text.contains('\0'),
-                        "only UTF-8 text attachments are supported"
-                    );
+                        GatewayError::Invalid("only UTF-8 text attachments are supported"),
+                    )?;
                 }
-                ensure!(
+                check(
                     (!text.trim().is_empty() || !attachments.is_empty())
                         && text.len() <= 128 * 1024,
-                    "message must be 1–131072 bytes"
-                );
+                    GatewayError::Invalid("message must be 1–131072 bytes"),
+                )?;
                 let token = tokio_util::sync::CancellationToken::new();
                 let (config, thread, prompt, info, backend, workspace, root) = {
                     let mut store = self.lock()?;
-                    anyhow::ensure!(
+                    check(
                         rmp_serde::to_vec_named(&store.state)?.len()
                             + text.len()
                             + attachment_size
                             + 262_144
                             < a206_protocol::MAX_FRAME,
-                        "this preview reached its history capacity; export the state directory before continuing in a new profile"
-                    );
+                        GatewayError::HistoryFull,
+                    )?;
                     let current = store.thread(id)?;
-                    ensure!(
+                    check(
                         current.state != RunState::Running,
-                        "thread is already running"
-                    );
-                    let key = current
-                        .model
-                        .as_ref()
-                        .context("connect a provider and select a model first")?;
+                        GatewayError::Conflict("thread is already running"),
+                    )?;
+                    let key = current.model.as_ref().ok_or(GatewayError::Invalid(
+                        "connect a provider and select a model first",
+                    ))?;
                     validate_model(&store.state, key)?;
                     validate_effort(&store.state, Some(key), current.effort.as_deref())?;
                     let info = store
@@ -698,12 +821,12 @@ impl Gateway {
                         .flat_map(|c| &c.models)
                         .find(|m| &m.key == key)
                         .cloned()
-                        .context("model metadata missing")?;
+                        .ok_or(GatewayError::Conflict("model metadata missing"))?;
                     if let Some(parent) = current.parent {
-                        ensure!(
+                        check(
                             store.thread(parent)?.subagent_models.contains(key),
-                            "parent revoked this subagent model"
-                        );
+                            GatewayError::Denied("parent revoked this subagent model"),
+                        )?;
                     }
                     let config = store
                         .state
@@ -712,7 +835,7 @@ impl Gateway {
                         .iter()
                         .find(|p| p.id == key.provider)
                         .cloned()
-                        .context("provider not configured")?;
+                        .ok_or(GatewayError::NotFound("provider not configured"))?;
                     let prompt = store
                         .state
                         .settings
@@ -720,7 +843,7 @@ impl Gateway {
                         .iter()
                         .find(|p| p.mode == current.mode)
                         .map(|p| p.prompt.clone())
-                        .context("mode prompt missing")?;
+                        .ok_or(GatewayError::Invalid("mode prompt missing"))?;
                     let backend = if current.backend == CodingBackend::Native {
                         None
                     } else {
@@ -731,7 +854,7 @@ impl Gateway {
                             .iter()
                             .find(|b| b.kind == current.backend)
                             .cloned()
-                            .context("coding backend is not configured")?;
+                            .ok_or(GatewayError::Invalid("coding backend is not configured"))?;
                         crate::backends::validate_selection(&config, current, &backend)?;
                         Some(backend)
                     };
@@ -751,10 +874,11 @@ impl Gateway {
                     });
                     thread.state = RunState::Running;
                     thread.backend_activity = None;
+                    thread.error = None;
                     let copy = thread.clone();
                     self.running
                         .lock()
-                        .map_err(|_| anyhow::anyhow!("run lock poisoned"))?
+                        .map_err(poisoned("run"))?
                         .insert(id, token.clone());
                     store.persist(Some(EventKind::ThreadChanged { id }))?;
                     (config, copy, prompt, info, backend, workspace, root)
@@ -762,7 +886,7 @@ impl Gateway {
                 let (sender, mut progress) = tokio::sync::mpsc::channel(32);
                 let pairing = self.pairing()?;
                 let operation = async {
-                    if let Some(backend) = &backend {
+                    Ok::<_, GatewayError>(if let Some(backend) = &backend {
                         crate::backends::complete(crate::backends::Run {
                             config: &config,
                             thread: &thread,
@@ -774,7 +898,7 @@ impl Gateway {
                             progress: sender,
                             cancel: token.clone(),
                         })
-                        .await
+                        .await?
                     } else {
                         provider::complete(
                             &config,
@@ -786,8 +910,8 @@ impl Gateway {
                             &prompt,
                             &info,
                         )
-                        .await
-                    }
+                        .await?
+                    })
                 };
                 let mut operation = Box::pin(operation);
                 let mut progress_open = true;
@@ -825,10 +949,7 @@ impl Gateway {
                 // External cancellation returns only after the proxy closes and
                 // the isolated process group is killed and its root reaped.
                 drop(operation);
-                self.running
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("run lock poisoned"))?
-                    .remove(&id);
+                self.running.lock().map_err(poisoned("run"))?.remove(&id);
                 let mut store = self.lock()?;
                 let thread = store.thread_mut(id)?;
                 match result {
@@ -851,15 +972,17 @@ impl Gateway {
                         thread.state = RunState::Complete;
                     }
                     Some(Err(e)) => {
+                        let report = crate::error::correlated("run", id, &e);
                         thread.state = RunState::Failed;
                         thread.messages.push(Message {
                             id: Id::new_v4(),
                             role: Role::System,
                             attachments: vec![],
-                            text: e.to_string(),
+                            text: report.detail(),
                             at: now(),
                             backend: thread.backend,
                         });
+                        thread.error = Some(report);
                     }
                     None => {
                         thread.state = RunState::Cancelled;
@@ -870,18 +993,23 @@ impl Gateway {
                 Ok(Reply::Thread(thread))
             }
             Command::CancelRun { thread } => {
-                let running = self
-                    .running
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("run lock poisoned"))?;
-                let token = running.get(&thread).context("thread is not running")?;
+                let running = self.running.lock().map_err(poisoned("run"))?;
+                let token = running
+                    .get(&thread)
+                    .ok_or(GatewayError::NotFound("thread is not running"))?;
                 token.cancel();
                 Ok(Reply::Ok)
             }
             Command::CreateProject { name, root } => {
-                ensure!(!name.trim().is_empty(), "project name is required");
-                let root = std::fs::canonicalize(root)?;
-                ensure!(root.is_dir(), "workspace must be a directory");
+                check(
+                    !name.trim().is_empty(),
+                    GatewayError::Invalid("project name is required"),
+                )?;
+                let root = std::fs::canonicalize(root).map_err(GatewayError::Workspace)?;
+                check(
+                    root.is_dir(),
+                    GatewayError::Invalid("workspace must be a directory"),
+                )?;
                 let id = Id::new_v4();
                 let mut manager = Thread::new(format!("{name} · coordinator"), Mode::Plan);
                 manager.project = Some(id);
@@ -907,10 +1035,10 @@ impl Gateway {
                 let mut store = self.lock()?;
                 validate_model(&store.state, &model)?;
                 let parent_thread = store.thread(parent)?.clone();
-                ensure!(
+                check(
                     parent_thread.subagent_models.contains(&model),
-                    "model is not permitted for this thread's subagents"
-                );
+                    GatewayError::Denied("model is not permitted for this thread's subagents"),
+                )?;
                 let mut thread = Thread::new(title, mode);
                 thread.project = parent_thread.project;
                 thread.parent = Some(parent);
@@ -943,19 +1071,19 @@ impl Gateway {
                     .downloads
                     .iter_mut()
                     .find(|d| d.id == id)
-                    .context("download not found")?;
-                ensure!(
+                    .ok_or(GatewayError::NotFound("download not found"))?;
+                check(
                     matches!(
                         download.state,
                         DownloadState::Running | DownloadState::Queued
                     ),
-                    "download is no longer running"
-                );
+                    GatewayError::Conflict("download is no longer running"),
+                )?;
                 download.state = DownloadState::Cancelled;
                 if let Some(token) = self
                     .downloads
                     .lock()
-                    .map_err(|_| anyhow::anyhow!("transfer lock poisoned"))?
+                    .map_err(poisoned("transfer"))?
                     .get(&id)
                 {
                     token.cancel();
@@ -992,48 +1120,61 @@ impl Gateway {
                 let text = tokio::task::spawn_blocking(move || -> Result<String> {
                     use std::io::Read;
                     let directory =
-                        cap_std::fs::Dir::open_ambient_dir(root, cap_std::ambient_authority())?;
-                    let file = directory
-                        .open(path)
-                        .context("document is missing or outside the project")?;
+                        cap_std::fs::Dir::open_ambient_dir(root, cap_std::ambient_authority())
+                            .map_err(GatewayError::Workspace)?;
+                    let file = directory.open(path).map_err(GatewayError::Document)?;
                     let mut text = String::new();
                     file.take(512 * 1024 + 1)
                         .read_to_string(&mut text)
-                        .context("this viewer supports UTF-8 text and Markdown")?;
-                    ensure!(
+                        .map_err(GatewayError::NotText)?;
+                    check(
                         text.len() <= 512 * 1024,
-                        "text preview is limited to 512 KiB"
-                    );
+                        GatewayError::Invalid("text preview is limited to 512 KiB"),
+                    )?;
                     Ok(text)
                 })
                 .await??;
                 Ok(Reply::Text(text))
             }
             Command::RunExtension { id, input } => {
-                ensure!(input.is_empty(), "ABI v1 does not accept input yet");
+                check(
+                    input.is_empty(),
+                    GatewayError::Invalid("ABI v1 does not accept input yet"),
+                )?;
                 let (manifest, wasm) = a206_extensions::builtin()?;
-                ensure!(
+                check(
                     manifest.id == id && manifest.capabilities.is_empty(),
-                    "extension is not enabled"
-                );
+                    GatewayError::Denied("extension is not enabled"),
+                )?;
                 let _validated_wasm = wasm;
-                let child = tokio::process::Command::new(std::env::current_exe()?)
-                    .arg("--data-dir")
-                    .arg(self.lock()?.root.clone())
-                    .arg("extension-worker")
-                    .env_clear()
-                    .stdin(std::process::Stdio::null())
-                    .stdout(std::process::Stdio::piped())
-                    .stderr(std::process::Stdio::null())
-                    .kill_on_drop(true)
-                    .spawn()?;
+                let child = tokio::process::Command::new(
+                    std::env::current_exe().map_err(GatewayError::CurrentExe)?,
+                )
+                .arg("--data-dir")
+                .arg(self.lock()?.root.clone())
+                .arg("extension-worker")
+                .env_clear()
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .kill_on_drop(true)
+                .spawn()
+                .map_err(GatewayError::Worker)?;
                 let result = tokio::time::timeout(
                     std::time::Duration::from_secs(5),
                     child.wait_with_output(),
                 )
-                .await??;
-                ensure!(result.status.success(), "extension worker failed");
-                let output: Vec<(String, String)> = a206_protocol::decode_payload(&result.stdout)?;
+                .await
+                .map_err(GatewayError::WorkerTimeout)?
+                .map_err(GatewayError::Worker)?;
+                check(
+                    result.status.success(),
+                    GatewayError::WorkerFailed {
+                        status: result.status,
+                    },
+                )?;
+                let output: Vec<(String, String)> = a206_protocol::decode_payload(&result.stdout)
+                    .map_err(GatewayError::WorkerOutput)?;
                 Ok(Reply::Text(
                     output
                         .into_iter()
@@ -1054,36 +1195,23 @@ impl Gateway {
                     loop {
                         // Admission is closed. Repeat cancellation for requests
                         // admitted before stop that only now acquired their task token.
-                        for token in self
-                            .running
-                            .lock()
-                            .map_err(|_| anyhow::anyhow!("run lock poisoned"))?
-                            .values()
-                        {
+                        for token in self.running.lock().map_err(poisoned("run"))?.values() {
                             token.cancel();
                         }
                         for token in self
                             .downloads
                             .lock()
-                            .map_err(|_| anyhow::anyhow!("download lock poisoned"))?
+                            .map_err(poisoned("download"))?
                             .values()
                         {
                             token.cancel();
                         }
-                        let runs = self
-                            .running
-                            .lock()
-                            .map_err(|_| anyhow::anyhow!("run lock poisoned"))?
-                            .len();
-                        let downloads = self
-                            .downloads
-                            .lock()
-                            .map_err(|_| anyhow::anyhow!("download lock poisoned"))?
-                            .len();
+                        let runs = self.running.lock().map_err(poisoned("run"))?.len();
+                        let downloads = self.downloads.lock().map_err(poisoned("download"))?.len();
                         let active = self
                             .admission
                             .lock()
-                            .map_err(|_| anyhow::anyhow!("gateway admission lock poisoned"))?
+                            .map_err(poisoned("gateway admission"))?
                             .active;
                         if active == 0 && runs == 0 && downloads == 0 {
                             break;
@@ -1092,13 +1220,14 @@ impl Gateway {
                     }
                     self.joshua.lock().await.stop().await?;
                     self.clear_managed_joshua()?;
-                    Ok::<_, anyhow::Error>(())
+                    Ok::<_, GatewayError>(())
                 })
                 .await
-                .context("gateway cleanup timed out; service remains running")??;
+                .map_err(GatewayError::ShutdownTimeout)??;
                 // Persist user intent before acknowledging stop. Ordinary
                 // clients cannot resurrect a deliberately stopped service.
-                crate::service::mark_stopped(&self.lock()?.root)?;
+                crate::service::mark_stopped(&self.lock()?.root)
+                    .map_err(GatewayError::MarkStopped)?;
                 drain.committed = true;
                 *committed = true;
                 Ok(Reply::Ok)
@@ -1112,7 +1241,7 @@ impl Gateway {
             .projects
             .iter()
             .find(|p| p.id == id)
-            .context("project not found")?
+            .ok_or(GatewayError::NotFound("project not found"))?
             .root
             .clone()
             .into())
@@ -1124,27 +1253,27 @@ impl Gateway {
         sha256: Option<String>,
         models_directory: bool,
     ) -> Result<Reply> {
-        let parsed = url::Url::parse(&url)?;
-        ensure!(
+        let parsed = url::Url::parse(&url).map_err(GatewayError::DownloadUrl)?;
+        check(
             parsed.scheme() == "https"
                 && parsed.username().is_empty()
                 && parsed.password().is_none(),
-            "downloads require credential-free HTTPS URLs"
-        );
-        ensure!(
+            GatewayError::Invalid("downloads require credential-free HTTPS URLs"),
+        )?;
+        check(
             !name.is_empty()
                 && name.len() < 200
                 && !name.starts_with('.')
                 && name
                     .bytes()
                     .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b)),
-            "use a simple filename without directories"
-        );
+            GatewayError::Invalid("use a simple filename without directories"),
+        )?;
         if let Some(hash) = &sha256 {
-            ensure!(
+            check(
                 hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()),
-                "SHA-256 must contain 64 hexadecimal characters"
-            );
+                GatewayError::Invalid("SHA-256 must contain 64 hexadecimal characters"),
+            )?;
         }
         let download = Download {
             id: Id::new_v4(),
@@ -1155,6 +1284,7 @@ impl Gateway {
             state: DownloadState::Queued,
             error: None,
             sha256,
+            failure: None,
         };
         let target = {
             let mut store = self.lock()?;
@@ -1163,16 +1293,18 @@ impl Gateway {
             } else {
                 store.root.join("downloads")
             };
-            std::fs::create_dir_all(&target)?;
-            ensure!(
+            std::fs::create_dir_all(&target).map_err(GatewayError::DownloadDirectory)?;
+            check(
                 !target.join(&download.name).exists(),
-                "destination already exists"
-            );
-            ensure!(
-                !store.state.downloads.iter().any(|d| d.name == download.name
-                    && matches!(d.state, DownloadState::Running | DownloadState::Queued)),
-                "filename already has an active transfer"
-            );
+                GatewayError::Conflict("destination already exists"),
+            )?;
+            check(
+                !store.state.downloads.iter().any(|d| {
+                    d.name == download.name
+                        && matches!(d.state, DownloadState::Running | DownloadState::Queued)
+                }),
+                GatewayError::Conflict("filename already has an active transfer"),
+            )?;
             store.state.downloads.push(download.clone());
             store.persist(Some(EventKind::DownloadChanged(download.clone())))?;
             target
@@ -1180,21 +1312,23 @@ impl Gateway {
         let token = tokio_util::sync::CancellationToken::new();
         self.downloads
             .lock()
-            .map_err(|_| anyhow::anyhow!("transfer lock poisoned"))?
+            .map_err(poisoned("transfer"))?
             .insert(download.id, token.clone());
         let gateway = self.clone();
         let job = download.clone();
         tokio::spawn(async move {
-            let result = tokio::select! { result = gateway.transfer(&job, &target, &url) => result, _ = token.cancelled() => Err(anyhow::anyhow!("download cancelled")) };
+            let result = tokio::select! { result = gateway.transfer(&job, &target, &url) => result, _ = token.cancelled() => Err(GatewayError::DownloadCancelled) };
             if let Err(error) = result {
+                let report = crate::error::report(&error).with_correlation(job.id);
                 let update = gateway.update_download(job.id, |d| {
                     if d.state != DownloadState::Cancelled {
                         d.state = DownloadState::Failed;
-                        d.error = Some(error.to_string());
+                        crate::error::record("download", &report);
+                        d.fail(report);
                     }
                 });
-                if update.is_err() {
-                    eprintln!("could not persist failed download state");
+                if let Err(error) = update {
+                    crate::error::handle("persist_download_failure", &error);
                 }
             }
             if let Ok(mut tokens) = gateway.downloads.lock() {
@@ -1210,7 +1344,7 @@ impl Gateway {
             .downloads
             .iter_mut()
             .find(|d| d.id == id)
-            .context("download disappeared")?;
+            .ok_or(GatewayError::NotFound("download disappeared"))?;
         update(download);
         let copy = download.clone();
         store.persist(Some(EventKind::DownloadChanged(copy.clone())))?;
@@ -1233,31 +1367,34 @@ impl Gateway {
                 d.total = total;
             }
         })?;
-        ensure!(
+        check(
             updated.state != DownloadState::Cancelled,
-            "download cancelled"
-        );
+            GatewayError::DownloadCancelled,
+        )?;
         // Create synchronously under an owning guard: cancellation must not race an
         // unfinished asynchronous open, leaving a file with no cleanup owner.
         let partial = tempfile::Builder::new()
             .prefix(&format!("{}.{}.", download.name, download.id))
             .suffix(".part")
-            .tempfile_in(target)?;
-        let mut file = tokio::fs::File::from_std(partial.reopen()?);
+            .tempfile_in(target)
+            .map_err(GatewayError::Partial)?;
+        let mut file = tokio::fs::File::from_std(partial.reopen().map_err(GatewayError::Partial)?);
         let mut stream = response.bytes_stream();
         let mut hasher = Sha256::new();
         let mut received = 0;
         let mut last_event = std::time::Instant::now();
         while let Some(bytes) = stream.next().await {
-            let bytes = bytes.map_err(reqwest::Error::without_url)?;
+            let bytes = bytes.map_err(crate::network::transport)?;
             let cancelled = self
                 .lock()?
                 .state
                 .downloads
                 .iter()
                 .any(|d| d.id == download.id && d.state == DownloadState::Cancelled);
-            ensure!(!cancelled, "download cancelled");
-            file.write_all(&bytes).await?;
+            check(!cancelled, GatewayError::DownloadCancelled)?;
+            file.write_all(&bytes)
+                .await
+                .map_err(GatewayError::Partial)?;
             hasher.update(&bytes);
             received += bytes.len() as u64;
             if last_event.elapsed() >= std::time::Duration::from_millis(250) {
@@ -1265,20 +1402,22 @@ impl Gateway {
                 last_event = std::time::Instant::now();
             }
         }
-        file.sync_all().await?;
+        file.sync_all().await.map_err(GatewayError::Partial)?;
         drop(file);
         let digest = format!("{:x}", hasher.finalize());
-        ensure!(
+        check(
             download
                 .sha256
                 .as_ref()
                 .is_none_or(|expected| expected.eq_ignore_ascii_case(&digest)),
-            "download integrity check failed"
-        );
-        ensure!(
-            total.is_none_or(|total| total == received),
-            "download length mismatch"
-        );
+            GatewayError::Integrity,
+        )?;
+        if let Some(expected) = total {
+            check(
+                expected == received,
+                GatewayError::Length { expected, received },
+            )?;
+        }
         // Publication is serialized with cancellation. hard_link refuses to replace an existing target.
         let mut store = self.lock()?;
         let current = store
@@ -1286,14 +1425,14 @@ impl Gateway {
             .downloads
             .iter_mut()
             .find(|d| d.id == download.id)
-            .context("download disappeared")?;
-        ensure!(
+            .ok_or(GatewayError::NotFound("download disappeared"))?;
+        check(
             current.state != DownloadState::Cancelled,
-            "download cancelled"
-        );
+            GatewayError::DownloadCancelled,
+        )?;
         partial
             .persist_noclobber(target.join(&download.name))
-            .map_err(|error| error.error)?;
+            .map_err(|error| GatewayError::Publish(error.error))?;
         current.received = received;
         current.sha256 = Some(digest);
         current.state = DownloadState::Complete;
@@ -1303,23 +1442,31 @@ impl Gateway {
     }
 }
 pub fn scoped_path(root: &Path, path: &str) -> Result<PathBuf> {
-    ensure!(
+    check(
         !Path::new(path).is_absolute(),
-        "document path must be relative to the project"
-    );
-    let root = root.canonicalize()?;
-    let target = root.join(path).canonicalize()?;
-    ensure!(target.starts_with(&root), "document escapes the project");
+        GatewayError::Invalid("document path must be relative to the project"),
+    )?;
+    let root = root.canonicalize().map_err(GatewayError::Workspace)?;
+    let target = root
+        .join(path)
+        .canonicalize()
+        .map_err(GatewayError::Document)?;
+    check(
+        target.starts_with(&root),
+        GatewayError::Denied("document escapes the project"),
+    )?;
     Ok(target)
 }
 fn validate_model(snapshot: &Snapshot, key: &ModelKey) -> Result<()> {
-    ensure!(
+    check(
         snapshot
             .catalogs
             .iter()
             .any(|c| !c.stale(now()) && c.models.iter().any(|m| &m.key == key)),
-        "model is unavailable or its API catalog has expired; refresh the provider"
-    );
+        GatewayError::Conflict(
+            "model is unavailable or its API catalog has expired; refresh the provider",
+        ),
+    )?;
     Ok(())
 }
 pub async fn serve_connection<R, W>(gateway: Gateway, mut input: R, mut output: W) -> Result<()>
@@ -1337,7 +1484,7 @@ where
             drop(stop);
             delivered?;
         }
-        Ok::<(), anyhow::Error>(())
+        Ok::<(), transport::FrameError>(())
     });
     let semaphore = Arc::new(tokio::sync::Semaphore::new(16));
     let mut tasks = tokio::task::JoinSet::new();
@@ -1348,7 +1495,11 @@ where
             request = transport::read_frame::<Request<Command>>(&mut input) => request?,
         };
         let Some(request) = request else { break };
-        let permit = semaphore.clone().acquire_owned().await?;
+        let permit = semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(GatewayError::Limiter)?;
         let gateway = gateway.clone();
         let sender = sender.clone();
         tasks.spawn(async move {
@@ -1358,7 +1509,7 @@ where
             sender
                 .send((reply, stop))
                 .await
-                .context("reply channel closed")
+                .map_err(|_| GatewayError::ReplyChannel)
         });
         while let Some(result) = tasks.try_join_next() {
             result??;
@@ -1385,10 +1536,10 @@ fn validate_effort(
                 .flat_map(|c| &c.models)
                 .find(|m| &m.key == key)
         });
-        ensure!(
+        check(
             supported.is_some_and(|m| m.reasoning_efforts.iter().any(|v| v == effort)),
-            "effort is not advertised by the selected model API"
-        );
+            GatewayError::Invalid("effort is not advertised by the selected model API"),
+        )?;
     }
     Ok(())
 }
@@ -1454,15 +1605,19 @@ mod tests {
                 "remove" => settings.providers.clear(),
                 _ => unreachable!(),
             }
+            let request = Id::new_v4();
             let reply = gateway
                 .request(Request {
-                    id: Id::new_v4(),
+                    id: request,
                     body: Command::SaveSettings(settings),
                 })
                 .await
                 .body;
+            // The rejection reaches the client intact and names its request.
             assert!(
-                matches!(reply, Reply::Error { ref message } if message.contains("stop managed Joshua")),
+                matches!(reply, Reply::Error(ref report)
+                    if report.message.contains("stop managed Joshua")
+                        && report.correlation == Some(request)),
                 "{reply:?}"
             );
             assert_eq!(gateway.snapshot().unwrap(), before);
@@ -1535,6 +1690,7 @@ mod tests {
                 state: DownloadState::Queued,
                 error: None,
                 sha256: (scenario == "integrity").then(|| "0".repeat(64)),
+                failure: None,
             };
             gateway.lock().unwrap().state.downloads.push(job.clone());
             if scenario == "collision" {
@@ -1624,6 +1780,41 @@ mod tests {
         let b = g.request(Request { id, body }).await;
         assert_eq!(a.body, b.body);
         assert_eq!(g.snapshot().unwrap().threads.len(), 1);
+    }
+    #[tokio::test]
+    async fn rejected_commands_reach_the_client_with_their_kind() {
+        let dir = tempfile::tempdir().unwrap();
+        let g = Gateway::open(dir.path()).unwrap();
+        for (body, kind) in [
+            (
+                Command::CreateThread {
+                    title: " ".into(),
+                    mode: Mode::Code,
+                },
+                ErrorKind::InvalidRequest,
+            ),
+            (
+                Command::RenameThread {
+                    id: Id::new_v4(),
+                    title: "Work".into(),
+                },
+                ErrorKind::NotFound,
+            ),
+            (
+                Command::CancelRun {
+                    thread: Id::new_v4(),
+                },
+                ErrorKind::NotFound,
+            ),
+        ] {
+            let id = Id::new_v4();
+            let response = g.request(Request { id, body }).await;
+            let Reply::Error(report) = response.body else {
+                panic!("an invalid command must be rejected");
+            };
+            assert_eq!(report.kind, kind, "{report:#}");
+            assert_eq!(report.correlation, Some(id));
+        }
     }
     #[test]
     fn document_scope_rejects_escape() {

@@ -3,6 +3,7 @@
 use a206_broker::{
     BrokerError, Client, ClientError, InvalidRequest, Reply, Request, Role, WireSecret, WireValue,
 };
+use a206_core::Ignore;
 use a206_vault::{AccessPolicy, CredentialKind, CredentialMeta};
 use anyhow::{Context, Result, bail};
 use clap::{Subcommand, ValueEnum};
@@ -190,19 +191,28 @@ async fn connect(root: &Path) -> Result<Client> {
         .stderr(log)
         .spawn()
         .context("start the vault broker")?;
+    let mut last = None;
     for _ in 0..100 {
-        if let Ok(client) = Client::connect(root, Role::User).await {
-            // The broker outlives this command; reap it if it exits first.
-            std::thread::spawn(move || child.wait());
-            return Ok(client);
+        match Client::connect(root, Role::User).await {
+            Ok(client) => {
+                // The broker outlives this command; reap it if it exits first.
+                std::thread::spawn(move || child.wait());
+                return Ok(client);
+            }
+            Err(error) => last = Some(error),
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
-    let _ = child.kill();
-    bail!(
+    // Killing fails only if the broker already exited, which is the goal.
+    child.kill().ignore();
+    let message = format!(
         "vault broker did not start; inspect {}",
         dir.join("broker.log").display()
-    )
+    );
+    Err(match last {
+        Some(error) => anyhow::Error::from(error).context(message),
+        None => anyhow::anyhow!(message),
+    })
 }
 
 async fn status(client: &mut Client) -> Result<a206_broker::BrokerStatus> {
@@ -295,7 +305,9 @@ async fn pair_gateway(client: &mut Client, root: &Path) -> Result<()> {
         .await?
     {
         a206_core::Reply::Ok => Ok(()),
-        a206_core::Reply::Error { message } => bail!("the gateway refused the pairing: {message}"),
+        a206_core::Reply::Error(report) => {
+            Err(anyhow::Error::from(report).context("the gateway refused the pairing"))
+        }
         _ => bail!("unexpected gateway reply"),
     }
 }

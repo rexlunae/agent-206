@@ -139,6 +139,49 @@ expired catalogs, with a five-minute delay after failed attempts. Missing limits
 prices, balances and capabilities remain unknown. There are no model/provider
 catalog fixtures. Test APIs generate their identifiers and limits at runtime.
 
+## Errors and diagnostics
+
+Errors stay typed inside a process: each runtime module returns its own
+`thiserror` enum (`GatewayError`, `StoreError`, `ProviderError`,
+`BackendError`, `ClientError` and so on) whose variants keep the cause in
+`source()` and add context instead of formatting the cause into a new string;
+`anyhow` appears only at the binary's top level. Where a failure is handled (a command
+reply, a failed run or download, a lifecycle report) the runtime captures it
+once as an `a206_core::ErrorReport`: a client-actionable `ErrorKind`, the
+outermost message, the bounded cause chain and a correlation id (the request,
+run or transfer it belongs to). Kinds come from the error's types: each
+runtime enum implements `error::Classified` (validation is `InvalidRequest`,
+stale state `Conflict`, missing resources `NotFound` and so on), and core
+types, I/O, protocol, storage, HTTP and timeouts are classified directly. Kinds
+are never parsed from text; unclassified failures are `Other`.
+URLs in transport errors are redacted before a report leaves the runtime.
+
+The same capture is recorded through `tracing` as a structured event
+(`operation`, `kind`, `correlation` and the report as an error value whose
+`source()` walks the chain), so log subscribers see the chain rather than a flattened string.
+`AGENT206_LOG` takes `tracing` filter directives (default `warn`); the daemon
+logs to `gateway.log`, the terminal client to `tui.log` and other commands to
+stderr.
+
+`Reply::Error`, `GatewayReport.failure`, `Download.failure` and `Thread.error`
+carry reports. A report encodes as `{kind, message, source, correlation}` and is
+wire-compatible with the earlier `Error { message }` reply: older clients read the
+message and ignore the rest. Gateway reports and downloads also keep their earlier
+`error` text field, filled with the rendered chain, because older clients display
+it; new code reads `failure_report()`, which falls back to that text (kind
+`Other`) only for payloads written by an older gateway.
+
+Only display code turns a report into text: UI rendering, CLI output, chat
+transcript entries and model-facing tool results. Everywhere else the report
+travels as a value. Clients keep the report, record it, and render it with `ErrorNotice`
+(kind, message, collapsible causes and the correlation id to find in logs). The CLI returns it as its error, so the
+exit message shows the whole chain.
+
+A deliberately discarded `Result` is written `.ignore()` (`a206_core::Ignore`)
+with a comment saying why its failure is unactionable;
+`clippy::let_underscore_must_use` denies `let _ =`. Anything with a failure
+someone could act on is propagated or recorded instead.
+
 ## Provider presets and optional coding backends
 
 The shared Connections page and CLI ship a broad provider library spanning hosted

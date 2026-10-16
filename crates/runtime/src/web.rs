@@ -28,15 +28,32 @@ struct Web {
     origin: Arc<String>,
     host: Arc<String>,
 }
+/// Why the loopback web bridge could not run.
+#[derive(Debug, thiserror::Error)]
+pub enum WebError {
+    #[error("could not listen on 127.0.0.1:{port}")]
+    Bind {
+        port: u16,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("web bridge stopped")]
+    Serve(#[source] std::io::Error),
+}
 /// The bridge connects to the configured gateway, local or SSH, on the browser's behalf.
 pub async fn serve(
     root: PathBuf,
     remote: Option<String>,
     static_dir: PathBuf,
     port: u16,
-) -> anyhow::Result<()> {
-    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).await?;
-    let port = listener.local_addr()?.port();
+) -> Result<(), WebError> {
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
+        .await
+        .map_err(|source| WebError::Bind { port, source })?;
+    let port = listener
+        .local_addr()
+        .map_err(|source| WebError::Bind { port, source })?
+        .port();
     let token = uuid::Uuid::new_v4().simple().to_string();
     let state = Web {
         client: GatewayController::new(root, remote),
@@ -47,7 +64,9 @@ pub async fn serve(
         host: Arc::new(format!("127.0.0.1:{port}")),
     };
     println!("Open http://127.0.0.1:{port}/connect/{token} to authorize this browser.");
-    axum::serve(listener, app(state, static_dir)).await?;
+    axum::serve(listener, app(state, static_dir))
+        .await
+        .map_err(WebError::Serve)?;
     Ok(())
 }
 fn app(state: Web, static_dir: PathBuf) -> Router {
@@ -216,12 +235,13 @@ async fn command(State(state): State<Web>, headers: HeaderMap, bytes: Bytes) -> 
     if matches!(request.body, Command::Shutdown) {
         return StatusCode::FORBIDDEN.into_response();
     }
+    let operation = request.body.name();
     let body = state
         .client
         .call_with_id(request.id, request.body)
         .await
-        .unwrap_or_else(|e| Reply::Error {
-            message: e.to_string(),
+        .unwrap_or_else(|error| {
+            Reply::Error(crate::error::correlated(operation, request.id, &error))
         });
     match a206_protocol::encode(&a206_protocol::Response {
         id: request.id,

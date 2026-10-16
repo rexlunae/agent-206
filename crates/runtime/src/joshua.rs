@@ -1,18 +1,67 @@
 //! Explicit process ownership for local/SSH Joshua servers. No pkill, no fixed model catalog.
-use a206_core::{Id, ProviderConfig};
-use anyhow::{Context, Result, ensure};
+use a206_core::{ErrorKind, Id, ProviderConfig};
 use std::{
     path::{Path, PathBuf},
     process::Stdio,
 };
 use tokio::process::{Child, Command};
+#[derive(Debug, thiserror::Error)]
+pub enum JoshuaError {
+    #[error("HOME is unavailable")]
+    NoHome,
+    #[error("stop the current managed process before switching models")]
+    AlreadyRunning,
+    #[error("provide a connection name, simple model filename and unprivileged port")]
+    InvalidRequest,
+    #[error("API port {port} is already in use")]
+    PortInUse {
+        port: u16,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("invalid SSH destination")]
+    Endpoint(#[from] crate::transport::SshEndpointError),
+    #[error("model file in ~/models is missing or unreadable")]
+    MissingModel(#[source] std::io::Error),
+    #[error("model file escapes ~/models")]
+    ModelEscapes,
+    #[error("could not open ~/models")]
+    ModelsDirectory(#[source] std::io::Error),
+    #[error("could not open joshua.log")]
+    Log(#[source] std::io::Error),
+    #[error("could not start Joshua")]
+    Spawn(#[source] std::io::Error),
+    #[error("could not check the managed process")]
+    Wait(#[source] std::io::Error),
+    #[error("could not stop the managed process")]
+    Stop(#[source] std::io::Error),
+}
+impl crate::error::Classified for JoshuaError {
+    fn kind(&self) -> Option<ErrorKind> {
+        Some(match self {
+            Self::AlreadyRunning | Self::PortInUse { .. } => ErrorKind::Conflict,
+            Self::InvalidRequest | Self::Endpoint(_) | Self::ModelEscapes => {
+                ErrorKind::InvalidRequest
+            }
+            // Absent and unreadable files need different recovery; the I/O cause decides.
+            Self::MissingModel(_) => return None,
+            Self::NoHome
+            | Self::ModelsDirectory(_)
+            | Self::Log(_)
+            | Self::Spawn(_)
+            | Self::Wait(_)
+            | Self::Stop(_) => ErrorKind::Unavailable,
+        })
+    }
+}
+type Result<T, E = JoshuaError> = std::result::Result<T, E>;
 #[derive(Default)]
 pub struct Manager {
     child: Option<Child>,
     label: Option<String>,
 }
 pub fn models_directory() -> Result<PathBuf> {
-    Ok(PathBuf::from(std::env::var_os("HOME").context("HOME is unavailable")?).join("models"))
+    Ok(PathBuf::from(std::env::var_os("HOME").ok_or(JoshuaError::NoHome)?).join("models"))
 }
 fn valid_filename(name: &str) -> bool {
     !name.is_empty()
@@ -28,7 +77,7 @@ impl Manager {
     }
     pub fn status(&mut self) -> Result<String> {
         if let Some(child) = &mut self.child {
-            if let Some(status) = child.try_wait()? {
+            if let Some(status) = child.try_wait().map_err(JoshuaError::Wait)? {
                 self.child = None;
                 return Ok(format!("Managed process exited: {status}"));
             }
@@ -49,17 +98,15 @@ impl Manager {
         root: &Path,
     ) -> Result<ProviderConfig> {
         self.status()?;
-        ensure!(
-            self.child.is_none(),
-            "stop the current managed process before switching models"
-        );
-        ensure!(
-            !label.trim().is_empty() && valid_filename(&model_file) && port > 1024,
-            "provide a connection name, simple model filename and unprivileged port"
-        );
+        if self.child.is_some() {
+            return Err(JoshuaError::AlreadyRunning);
+        }
+        if label.trim().is_empty() || !valid_filename(&model_file) || port <= 1024 {
+            return Err(JoshuaError::InvalidRequest);
+        }
         // Reserve-check the local endpoint so we never claim an unrelated running service.
         let probe = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
-            .context("API port is already in use")?;
+            .map_err(|source| JoshuaError::PortInUse { port, source })?;
         let mut command = if let Some(remote) = remote {
             let mut command = crate::transport::ssh_command(&remote)?;
             // Options must precede the destination. Build the known forwarding option there.
@@ -83,11 +130,13 @@ impl Manager {
             let model = models
                 .join(model_file)
                 .canonicalize()
-                .context("model file does not exist in ~/models")?;
-            ensure!(
-                model.starts_with(models.canonicalize()?) && model.is_file(),
-                "model file escapes ~/models"
-            );
+                .map_err(JoshuaError::MissingModel)?;
+            let models = models
+                .canonicalize()
+                .map_err(JoshuaError::ModelsDirectory)?;
+            if !model.starts_with(models) || !model.is_file() {
+                return Err(JoshuaError::ModelEscapes);
+            }
             let mut command = Command::new("joshua");
             command
                 .arg("serve")
@@ -100,15 +149,16 @@ impl Manager {
         let log = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(root.join("joshua.log"))?;
+            .open(root.join("joshua.log"))
+            .map_err(JoshuaError::Log)?;
         drop(probe);
         let child = command
             .stdin(Stdio::null())
-            .stdout(log.try_clone()?)
+            .stdout(log.try_clone().map_err(JoshuaError::Log)?)
             .stderr(log)
             .kill_on_drop(true)
             .spawn()
-            .context("could not start Joshua")?;
+            .map_err(JoshuaError::Spawn)?;
         self.child = Some(child);
         self.label = Some(label.clone());
         Ok(ProviderConfig {
@@ -121,8 +171,8 @@ impl Manager {
     }
     pub async fn stop(&mut self) -> Result<()> {
         if let Some(mut child) = self.child.take() {
-            child.kill().await?;
-            child.wait().await?;
+            child.kill().await.map_err(JoshuaError::Stop)?;
+            child.wait().await.map_err(JoshuaError::Wait)?;
         }
         self.label = None;
         Ok(())

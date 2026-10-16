@@ -2,34 +2,149 @@
 mod claude;
 mod codex;
 mod isolation;
-mod proxy;
+pub(crate) mod proxy;
 mod rpc;
+use crate::error::check;
 use a206_core::*;
-use anyhow::{Context, Result, ensure};
 use std::path::Path;
 use tokio::sync::mpsc;
+
+/// Why an external coding backend could not be configured, launched or run.
+#[derive(Debug, thiserror::Error)]
+pub enum BackendError {
+    #[error("Agent 206 does not need an external runtime")]
+    Native,
+    #[error("backend paths must be absolute and contain no control characters")]
+    Path,
+    #[error("Claude Agent needs a JavaScript ACP adapter entry point; Codex does not")]
+    Adapter,
+    #[error("wrong coding backend configuration")]
+    WrongBackend,
+    #[error(
+        "coding backends require the isolated credential broker for authenticated providers; it is not connected yet"
+    )]
+    Credentialed,
+    #[error("selected provider protocol is incompatible with this coding backend")]
+    Protocol,
+    #[error(
+        "external backend delegation is unavailable until per-child backend policy is implemented"
+    )]
+    Delegation,
+    #[error("backend model metadata does not match its provider selection")]
+    ModelMismatch,
+    #[error("model not selected")]
+    NoModel,
+    #[error("backend transcript exceeds its input limit")]
+    TranscriptTooLarge,
+    #[error("{what} is missing or inaccessible")]
+    Missing {
+        what: &'static str,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("{0}")]
+    Placement(&'static str),
+    #[error("could not prepare the backend sandbox")]
+    Setup(#[source] std::io::Error),
+    #[error("could not write the backend configuration")]
+    Configuration(#[source] toml::ser::Error),
+    #[error("backend paths must be UTF-8")]
+    NonUtf8Path,
+    #[error(
+        "external coding backends are disabled on this platform until equivalent OS filesystem and network isolation is implemented"
+    )]
+    Unsupported,
+    #[error("could not start isolated backend")]
+    Spawn(#[source] std::io::Error),
+    #[error("backend has no usable process ID")]
+    ProcessId,
+    #[error("could not start the backend's credential proxy")]
+    Proxy(#[source] std::io::Error),
+    #[error("backend protocol connection failed")]
+    Io(#[source] std::io::Error),
+    #[error("backend closed its protocol connection")]
+    Closed,
+    #[error("backend exceeded its protocol output limit")]
+    OutputLimit,
+    #[error("backend sent invalid JSON")]
+    Json(#[source] serde_json::Error),
+    #[error("{0}")]
+    Malformed(&'static str),
+    #[error("Codex rejected {method}")]
+    Rejected { method: &'static str },
+    #[error("{backend} did not complete this turn; inspect the backend activity")]
+    Incomplete { backend: &'static str },
+    #[error("{backend} completed without a text response")]
+    Empty { backend: &'static str },
+    #[error("backend message exceeds the conversation limit")]
+    MessageTooLarge,
+    #[error("Claude Agent ACP session failed")]
+    Acp(#[source] agent_client_protocol::Error),
+    #[error("coding backend exceeded its ten-minute run limit")]
+    Timeout(#[source] tokio::time::error::Elapsed),
+    #[error("coding backend cancelled")]
+    Cancelled,
+    #[error("backend output lock poisoned")]
+    Poisoned,
+}
+impl crate::error::Classified for BackendError {
+    fn kind(&self) -> Option<ErrorKind> {
+        Some(match self {
+            Self::Native
+            | Self::Path
+            | Self::Adapter
+            | Self::WrongBackend
+            | Self::Protocol
+            | Self::ModelMismatch
+            | Self::NoModel
+            | Self::TranscriptTooLarge
+            | Self::Placement(_)
+            | Self::NonUtf8Path => ErrorKind::InvalidRequest,
+            // Absent and unreadable paths need different recovery; the I/O cause decides.
+            Self::Missing { .. } => return None,
+            Self::Credentialed | Self::Delegation | Self::Unsupported | Self::Spawn(_) => {
+                ErrorKind::Unavailable
+            }
+            Self::Setup(_)
+            | Self::Configuration(_)
+            | Self::ProcessId
+            | Self::Proxy(_)
+            | Self::Poisoned => ErrorKind::Internal,
+            Self::Io(_)
+            | Self::Closed
+            | Self::OutputLimit
+            | Self::Json(_)
+            | Self::Malformed(_)
+            | Self::Rejected { .. }
+            | Self::Acp(_) => ErrorKind::Protocol,
+            Self::Incomplete { .. } | Self::Empty { .. } | Self::MessageTooLarge => {
+                ErrorKind::Provider
+            }
+            Self::Timeout(_) => ErrorKind::Timeout,
+            Self::Cancelled => ErrorKind::Cancelled,
+        })
+    }
+}
+type Result<T, E = BackendError> = std::result::Result<T, E>;
 pub enum Progress {
     Text(String),
     Activity(String),
 }
 pub fn validate_config(config: &BackendConfig) -> Result<()> {
-    ensure!(
-        config.kind != CodingBackend::Native,
-        "Agent 206 does not need an external runtime"
-    );
+    check(config.kind != CodingBackend::Native, BackendError::Native)?;
     for path in [&config.executable, &config.runtime_root]
         .into_iter()
         .chain(config.adapter_script.iter())
     {
-        ensure!(
+        check(
             Path::new(path).is_absolute() && !path.chars().any(char::is_control),
-            "backend paths must be absolute and contain no control characters"
-        );
+            BackendError::Path,
+        )?;
     }
-    ensure!(
+    check(
         (config.kind == CodingBackend::ClaudeAgent) == config.adapter_script.is_some(),
-        "Claude Agent needs a JavaScript ACP adapter entry point; Codex does not"
-    );
+        BackendError::Adapter,
+    )?;
     Ok(())
 }
 pub fn validate_selection(
@@ -38,26 +153,17 @@ pub fn validate_selection(
     backend: &BackendConfig,
 ) -> Result<()> {
     validate_config(backend)?;
-    ensure!(
-        backend.kind == thread.backend,
-        "wrong coding backend configuration"
-    );
-    ensure!(
-        config.credential.is_none(),
-        "coding backends require the isolated credential broker for authenticated providers; it is not connected yet"
-    );
-    ensure!(
+    check(backend.kind == thread.backend, BackendError::WrongBackend)?;
+    check(config.credential.is_none(), BackendError::Credentialed)?;
+    check(
         match thread.backend {
             CodingBackend::Codex => config.api == ProviderApi::OpenAi,
             CodingBackend::ClaudeAgent => config.api == ProviderApi::Anthropic,
             CodingBackend::Native => false,
         },
-        "selected provider protocol is incompatible with this coding backend"
-    );
-    ensure!(
-        thread.parent.is_none(),
-        "external backend delegation is unavailable until per-child backend policy is implemented"
-    );
+        BackendError::Protocol,
+    )?;
+    check(thread.parent.is_none(), BackendError::Delegation)?;
     Ok(())
 }
 pub struct Run<'a> {
@@ -84,12 +190,14 @@ pub async fn complete(run: Run<'_>) -> Result<(String, Usage)> {
         cancel,
     } = run;
     validate_selection(config, thread, backend)?;
-    ensure!(
+    check(
         thread.model.as_ref() == Some(&info.key) && info.key.provider == config.id,
-        "backend model metadata does not match its provider selection"
-    );
+        BackendError::ModelMismatch,
+    )?;
     let mut input = transcript(thread)?;
-    let proxy = proxy::Proxy::start(config.clone(), info.clone()).await?;
+    let proxy = proxy::Proxy::start(config.clone(), info.clone())
+        .await
+        .map_err(BackendError::Proxy)?;
     let mut process = isolation::Process::launch(
         backend,
         thread,
@@ -116,12 +224,12 @@ pub async fn complete(run: Run<'_>) -> Result<(String, Usage)> {
                 CodingBackend::ClaudeAgent => {
                     claude::run(&mut process, thread, prompt, &input, progress).await
                 }
-                CodingBackend::Native => anyhow::bail!("native agent is not an external backend"),
+                CodingBackend::Native => Err(BackendError::Native),
             }
         };
         tokio::select! {
-            result = tokio::time::timeout(std::time::Duration::from_secs(600), operation) => result.context("coding backend exceeded its ten-minute run limit").and_then(|result| result),
-            _ = cancel.cancelled() => Err(anyhow::anyhow!("coding backend cancelled")),
+            result = tokio::time::timeout(std::time::Duration::from_secs(600), operation) => result.map_err(BackendError::Timeout).and_then(|result| result),
+            _ = cancel.cancelled() => Err(BackendError::Cancelled),
         }
     };
     drop(proxy);
@@ -138,10 +246,10 @@ fn transcript(thread: &Thread) -> Result<String> {
                 "\nASSISTANT:\n"
             });
             text.push_str(&crate::provider::message_content(message));
-            ensure!(
+            check(
                 text.len() <= 2 * 1024 * 1024,
-                "backend transcript exceeds its input limit"
-            );
+                BackendError::TranscriptTooLarge,
+            )?;
         }
     }
     Ok(text)
