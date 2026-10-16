@@ -36,6 +36,16 @@ implemented structure for finished agent execution or security parity.
 | Theme/branding | New vector mark and generated PNG/ICO/ICNS bundle icons, future-css ThemePicker, designs/palettes/scheme/contrast saved as TOML | User theme import/editor after toolkit model support |
 | Standards/docs | AGENTS.md, architecture, executable plugin ABI, provenance/attribution, README, CI workflow, RustyClaw parity gap list (docs/parity.md) | Keep this ledger current as each gate lands |
 
+## Current scope
+
+Gateway work targets the desktop and TUI clients first. Like RustyClaw, remote
+gateways are reached by SSH process transport; the wire format is Agent 206's own
+versioned MessagePack protocol, not RustyClaw's codec (see docs/upstream.md). The
+web client controls a local gateway through the authenticated local web bridge.
+Remote gateway access from the web client is deferred: there is no
+SSH-over-WebSocket bridge, and the web client must not be described as reaching
+remote gateways until one exists.
+
 ## Explicitly disabled
 
 Credential-backed providers work only through the vault broker: the vault must be
