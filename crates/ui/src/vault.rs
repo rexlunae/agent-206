@@ -90,7 +90,7 @@ struct Enrollment {
 }
 
 /// A failure to show, with a title naming what went wrong for the user.
-#[derive(Clone, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 struct Failure {
     title: String,
     report: ErrorReport,
@@ -120,6 +120,15 @@ fn failure(operation: &'static str, title: &str, error: &VaultError) -> Failure 
         report,
     }
 }
+/// Show a status failure without hiding the action failure that preceded it.
+fn keep_both(primary: &mut Option<Failure>, secondary: &mut Option<Failure>, status: Failure) {
+    if primary.is_none() {
+        *primary = Some(status);
+    } else if secondary.is_none() {
+        *secondary = Some(status);
+    }
+    // Both slots taken: the status failure is already recorded by `failure`.
+}
 impl Panel {
     fn session(&self) -> Session {
         self.session.peek().clone()
@@ -147,7 +156,9 @@ impl Panel {
             Ok(status) => self.status.set(Some(status)),
             Err(error) => {
                 self.status.set(None);
-                self.fail("vault_status", "Could not read the vault state", &error);
+                let status = failure("vault_status", "Could not read the vault state", &error);
+                let (mut primary, mut secondary) = (self.failure.write(), self.warning.write());
+                keep_both(&mut primary, &mut secondary, status);
             }
         }
     }
@@ -573,6 +584,22 @@ mod tests {
             agent_access: unlocked.then_some(false),
             step_up_active: false,
         }
+    }
+
+    #[test]
+    fn a_status_failure_never_hides_the_action_failure() {
+        let shown = |title: &str| Failure {
+            title: title.to_owned(),
+            report: a206_runtime::error::report(&VaultError::GatewayClosed),
+        };
+        let (mut primary, mut secondary) = (Some(shown("action")), None);
+        keep_both(&mut primary, &mut secondary, shown("status"));
+        assert_eq!(primary, Some(shown("action")));
+        assert_eq!(secondary, Some(shown("status")));
+        let (mut primary, mut secondary) = (None, None);
+        keep_both(&mut primary, &mut secondary, shown("status"));
+        assert_eq!(primary, Some(shown("status")));
+        assert_eq!(secondary, None);
     }
 
     #[test]
