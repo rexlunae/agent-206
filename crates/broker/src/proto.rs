@@ -275,6 +275,10 @@ pub struct BrokerStatus {
     pub totp_enrolled: Option<bool>,
     pub agent_access: Option<bool>,
     pub step_up_active: bool,
+    /// Whether a gateway pairing is current for this unlock; unknown while
+    /// locked or from an older broker. Locking voids every pairing.
+    #[serde(default)]
+    pub gateway_paired: Option<bool>,
 }
 
 /// Structured broker failures. Clients render these with `Display`; nothing

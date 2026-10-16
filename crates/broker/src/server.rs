@@ -139,7 +139,9 @@ fn vault_error(error: VaultError) -> BrokerError {
         VaultError::TotpRejected => BrokerError::AuthenticationFailed,
         VaultError::Corrupted => BrokerError::Vault(VaultFailure::Corrupted),
         VaultError::Crypto => BrokerError::Vault(VaultFailure::Crypto),
-        VaultError::Io(_) => BrokerError::Vault(VaultFailure::Storage),
+        VaultError::Io(_) | VaultError::ImportLeftInPlace(_) => {
+            BrokerError::Vault(VaultFailure::Storage)
+        }
         VaultError::Exists => BrokerError::VaultExists,
         VaultError::ImportSource(_) => BrokerError::Invalid(I::ImportSource),
     }
@@ -288,12 +290,19 @@ fn handle(shared: &Shared, session: &mut Session, request: Request) -> Handled {
         Request::Status => {
             let vault = shared.vault();
             let unlocked = !vault.is_locked();
+            let gateway_paired = unlocked.then(|| {
+                shared
+                    .pairing()
+                    .as_ref()
+                    .is_some_and(|pairing| pairing.generation == vault.generation())
+            });
             Ok(Outcome::Reply(Reply::Status(BrokerStatus {
                 exists: vault.exists(),
                 unlocked,
                 totp_enrolled: vault.totp_enrolled().ok(),
                 agent_access: vault.agent_access().ok(),
                 step_up_active: unlocked && session.step_up.is_active(now, vault.generation()),
+                gateway_paired,
             })))
         }
         Request::Unlock {

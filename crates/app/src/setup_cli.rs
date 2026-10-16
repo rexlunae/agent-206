@@ -3,7 +3,7 @@
 //! terminal clients. Every security decision stays with the broker.
 use crate::vault_cli;
 use a206_broker::{BrokerError, ClientError, Reply as BrokerReply, Request, WireSecret};
-use a206_core::{Command, GatewayTarget, Reply};
+use a206_core::{Command, GatewayAction, GatewayPhase, GatewayTarget, Reply};
 use a206_import::{
     InactiveCategory, Preview, ProviderAction, Receipt, Unsupported, UnsupportedProvider,
     VaultPlan, VaultProtection,
@@ -151,12 +151,22 @@ fn print_preview(preview: &Preview) {
                     "skipped: device sign-in is not supported yet".to_owned()
                 }
                 UnsupportedProvider::NoEndpoint => "skipped: no endpoint configured".to_owned(),
+                UnsupportedProvider::InvalidEndpoint => {
+                    "skipped: endpoint must be HTTPS or loopback HTTP without credentials"
+                        .to_owned()
+                }
             },
         };
         println!(
             "  provider {} ({}) {} {action}",
             provider.label, provider.source_id, provider.base_url
         );
+        if let Some(credential) = &provider.credential {
+            println!(
+                "    uses vault credential {credential}, only while it is bound to {}",
+                provider.origin().as_deref().unwrap_or("this endpoint")
+            );
+        }
         if let Some(model) = &provider.model_reference {
             println!("    previous default model {model} is kept as a note, not selected");
         }
@@ -216,9 +226,24 @@ pub async fn import(root: &Path, remote: Option<String>, source: ImportSource) -
             &std::env::var_os("HOME").context("HOME is not set; pass the RustyClaw directory")?,
         )),
     };
+    // The broker accepts only absolute paths; resolve once so the preview
+    // shows the paths the import will use.
+    let path = std::path::absolute(&path)?;
     let target = a206_runtime::connection::require(root, remote)?;
-    let client =
-        a206_runtime::client::Client::start(root.to_owned(), target.remote().map(str::to_owned));
+    // Importing never starts or restarts a gateway, so a preview changes
+    // nothing and a deliberate stop stays in force.
+    let client = a206_runtime::control::GatewayController::attach(
+        root.to_owned(),
+        target.remote().map(str::to_owned),
+    );
+    let report = client.control(GatewayAction::Status).await?;
+    if report.phase != GatewayPhase::Running {
+        let stopped = "the gateway is not running; start it with `agent206 gateway start`, then rerun the import";
+        return Err(match report.failure_report() {
+            Some(failure) => anyhow::Error::new(failure).context(stopped),
+            None => anyhow::anyhow!(stopped),
+        });
+    }
     let Reply::Snapshot(snapshot) = client.call(Command::Snapshot).await?.into_result()? else {
         bail!("gateway did not return its settings");
     };
@@ -236,7 +261,9 @@ pub async fn import(root: &Path, remote: Option<String>, source: ImportSource) -
         print_preview(&preview);
     }
     if !apply {
-        println!("Nothing was changed. Rerun with --apply to import what is listed above.");
+        if !toml {
+            println!("Nothing was changed. Rerun with --apply to import what is listed above.");
+        }
         return Ok(());
     }
     let mut receipt = Receipt {

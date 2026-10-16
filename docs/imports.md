@@ -15,7 +15,7 @@ secrets or commands are counted, never stored, so they cannot reach the preview.
 
 | Source | Result |
 | --- | --- |
-| `[model]` provider and `[[custom_providers]]` | Provider account from the matching preset (endpoint from the source, else the preset), added only when no account has the same API and endpoint. The credential name RustyClaw used (for example `OPENAI_API_KEY`) is referenced, and the broker refuses it until the user types and binds it (`vault adopt … --destination`). The old default model is shown as a note and never selected. Copilot device-flow and unknown providers are reported and skipped |
+| `[model]` provider and `[[custom_providers]]` | Provider account from the matching preset (endpoint from the source, else the preset), added only when no account has the same API and endpoint. The credential name RustyClaw used (for example `OPENAI_API_KEY`) is referenced and shown in the preview with the origin it must be bound to. The broker spends it only for that exact origin: an untyped or unbound entry is refused until the user types and binds it (`vault adopt … --destination`), and a credential the user already bound to that origin is used as bound. Endpoints the gateway would refuse (not HTTPS or loopback HTTP, or carrying credentials, a query or a fragment) are skipped. The old default model is shown as a note and never selected. Copilot device-flow and unknown providers are reported and skipped |
 | `credentials/secrets.json`, password-protected | `--apply` asks for its password (and TOTP code when enrolled) and sends `ImportVault` to the broker, which copies the encrypted file, opens only the copy, verifies both factors there and links it in only if this profile has no vault. Policies, kinds, disabled flags, agent access and TOTP enrollment travel inside the vault unchanged; the source is never written. Key-file vaults are reported as unsupported |
 | Messengers, MCP servers, tool permissions, disabled tool groups, services, engines, sandbox, skills, plaintext registry token | Counted and left inactive. Denies in tool permissions cannot be represented yet, so nothing is granted in their place |
 | SOUL.md/AGENTS.md, conversations, memory, messenger system prompt | Reported as not imported yet |
@@ -23,9 +23,16 @@ secrets or commands are counted, never stored, so they cannot reach the preview.
 
 Applying writes an owner-only receipt (`imports/<id>.toml`) with the source
 digest, accounts added and whether the vault was copied, which is the rollback
-record; a rollback command does not exist yet. A repeated import adds nothing.
-Readers run in the CLI process; the isolated reader process described below is
-still to be built.
+record. A repeated import adds nothing. Import only attaches to a running
+gateway and never starts one, so a preview changes nothing.
+
+Remaining gates of the flow below, not yet met by this adapter:
+
+- Readers run in the CLI process, not the isolated reader process.
+- Selection is per category (`--skip-vault`, `--skip-providers`), not per item.
+- Apply is ordered, not atomic: the vault is copied before accounts are saved,
+  and a failure after the copy is reported as that partial result.
+- There is no rollback command; the receipt is the record to undo by hand.
 
 ## Sources and evidence
 

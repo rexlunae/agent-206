@@ -4,7 +4,7 @@
 #[allow(dead_code)]
 mod support;
 use a206_runtime::doctor::{DoctorReport, Finding};
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use std::path::Path;
 use support::{App, binary, capture};
 
@@ -41,6 +41,8 @@ token = "{token}"
         ),
     )?;
     std::fs::write(root.join("workspace").join("SOUL.md"), random())?;
+    std::fs::create_dir_all(root.join("credentials"))?;
+    std::fs::write(root.join("credentials").join("secrets.json"), "{}")?;
     Ok(root)
 }
 
@@ -85,6 +87,14 @@ async fn doctor_and_import_against_a_running_gateway() -> Result<()> {
     let source = rustyclaw(source_dir.path())?;
     let source_arg = source.to_str().unwrap_or_default();
     let config = std::fs::read(source.join("config.toml"))?;
+    // A relative source resolves to the absolute paths the broker accepts.
+    let mut relative = app.command(&["import", "rustyclaw", "rustyclaw", "--toml"]);
+    relative.current_dir(source_dir.path());
+    let listed: a206_import::Preview =
+        toml::from_str(&support::checked(capture(relative).await?)?)?;
+    let vault = listed.vault.context("vault not found")?;
+    ensure!(vault.path.is_absolute(), "{vault:?}");
+    ensure!(vault.plan == a206_import::VaultPlan::Import, "{vault:?}");
     let preview = app.cli(&["import", "rustyclaw", source_arg]).await?;
     ensure!(preview.contains("will be added"), "{preview}");
     ensure!(
@@ -141,6 +151,32 @@ async fn setup_without_answers_pauses_before_creating_a_vault() -> Result<()> {
     ensure!(stdout.contains("Setup paused before the vault"), "{stdout}");
     ensure!(stdout.contains("no vault has been created"), "{stdout}");
     ensure!(!a206_broker::vault_path(&root).exists());
+    // Import never starts the configured but stopped gateway, even to preview.
+    let source_dir = tempfile::tempdir()?;
+    let source = rustyclaw(source_dir.path())?;
+    let mut import = tokio::process::Command::new(binary()?);
+    import
+        .arg("--data-dir")
+        .arg(&root)
+        .args(["import", "rustyclaw"])
+        .arg(&source);
+    let output = capture(import).await?;
+    ensure!(!output.status.success(), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    ensure!(stderr.contains("gateway is not running"), "{stderr}");
+    let mut doctor = tokio::process::Command::new(binary()?);
+    doctor
+        .arg("--data-dir")
+        .arg(&root)
+        .args(["doctor", "--toml"]);
+    let report: DoctorReport = toml::from_str(&String::from_utf8(capture(doctor).await?.stdout)?)?;
+    ensure!(
+        !report
+            .checks
+            .iter()
+            .any(|c| matches!(c.finding, Finding::GatewayRunning { .. })),
+        "import started the gateway"
+    );
     let mut stop = tokio::process::Command::new(binary()?);
     stop.arg("--data-dir").arg(&root).args(["vault", "stop"]);
     support::checked(capture(stop).await?)?;

@@ -684,7 +684,9 @@ async fn only_a_paired_gateway_spends_credentials_and_lock_voids_pairing() {
         denied(fresh.call(Request::PairGateway).await),
         BrokerError::StepUpRequired
     );
+    assert_eq!(status(&mut a).await.gateway_paired, Some(false));
     let token = pairing(&mut a).await;
+    assert_eq!(status(&mut a).await.gateway_paired, Some(true));
     assert_eq!(
         denied(
             fresh
@@ -720,7 +722,9 @@ async fn only_a_paired_gateway_spends_credentials_and_lock_voids_pairing() {
 
     // Locking voids the pairing, even after the vault is unlocked again.
     a.call(Request::Lock).await.unwrap();
+    assert_eq!(status(&mut a).await.gateway_paired, None);
     a.call(unlock(&password, None, false)).await.unwrap();
+    assert_eq!(status(&mut a).await.gateway_paired, Some(false));
     assert_eq!(
         denied(gateway.call(call()).await),
         BrokerError::GatewayNotPaired

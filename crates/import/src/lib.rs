@@ -151,6 +151,9 @@ pub enum UnsupportedProvider {
     DeviceFlow,
     /// Neither the source nor the preset names an endpoint.
     NoEndpoint,
+    /// The endpoint is not HTTPS or loopback HTTP, or carries credentials,
+    /// a query or a fragment; the gateway would refuse to call it.
+    InvalidEndpoint,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

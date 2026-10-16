@@ -91,7 +91,15 @@ impl Vault {
         })?;
         drop(staging);
         #[cfg(unix)]
-        std::fs::File::open(parent)?.sync_all()?;
+        if let Err(sync) = std::fs::File::open(parent).and_then(|dir| dir.sync_all()) {
+            // Undo the link so a retry starts from no vault. If even that
+            // fails, the link is a verified copy that unlocks with the
+            // source's password, which the error says instead.
+            return Err(match std::fs::remove_file(&self.path) {
+                Ok(()) => Error::Io(sync),
+                Err(_) => Error::ImportLeftInPlace(sync),
+            });
+        }
         self.lock();
         self.inner = copy.inner.take();
         Ok(ImportCheck::Imported)
@@ -238,7 +246,8 @@ mod tests {
         let (_src, path, _) = source(&password);
         let mut original = Vault::locked(path.clone());
         original.unlock(&password).unwrap();
-        let now = unix_now();
+        // Mid-step and fixed, so no code window depends on when this runs.
+        let now = 1_800_000_015;
         let pending = original.begin_totp_enrollment(&random(), now).unwrap();
         // Enroll with the code of an earlier step so a current one stays fresh.
         let earlier = now - 30;

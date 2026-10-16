@@ -144,6 +144,10 @@ fn plan(presets: &[ProviderPreset], settings: &Settings, source: Source) -> Prov
         ProviderAction::Unsupported {
             reason: UnsupportedProvider::NoEndpoint,
         }
+    } else if a206_core::providers::base_url(&base_url).is_err() {
+        ProviderAction::Unsupported {
+            reason: UnsupportedProvider::InvalidEndpoint,
+        }
     } else if let Some(existing) = crate::existing(settings, api, &base_url) {
         ProviderAction::AlreadyConfigured { existing }
     } else {
@@ -528,6 +532,33 @@ execute_command = "Deny"
                 reason: UnsupportedProvider::UnknownProvider
             }
         );
+    }
+
+    #[test]
+    fn endpoints_the_gateway_would_refuse_are_not_offered() {
+        let host = random();
+        for base_url in [
+            format!("http://{host}.example/v1"),
+            format!("https://user:{host}@{host}.example/v1"),
+            format!("https://{host}.example/v1?key={host}"),
+            host.clone(),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            write(
+                &dir.path().join("config.toml"),
+                &format!("[[custom_providers]]\nid = \"lab\"\nbase_url = \"{base_url}\"\n"),
+            );
+            let preview = preview(dir.path(), &Settings::default(), None).unwrap();
+            assert_eq!(
+                preview.providers[0].action,
+                ProviderAction::Unsupported {
+                    reason: UnsupportedProvider::InvalidEndpoint
+                },
+                "{base_url}"
+            );
+            let mut settings = Settings::default();
+            assert!(preview.apply_providers(&mut settings).is_empty());
+        }
     }
 
     #[test]

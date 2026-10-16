@@ -66,6 +66,10 @@ pub enum Error {
     Exists,
     #[error("the vault to import could not be read")]
     ImportSource(#[source] std::io::Error),
+    #[error(
+        "the imported vault is in place but may not survive a crash; unlock it with the source vault's password"
+    )]
+    ImportLeftInPlace(#[source] std::io::Error),
 }
 
 /// Raw keys an ordinary caller may never write or read, because they hold

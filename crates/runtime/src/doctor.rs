@@ -355,10 +355,13 @@ fn check(finding: Finding) -> Check {
         error: None,
     }
 }
+/// A check whose facts could not be read failed, whatever it would otherwise
+/// have found, so it always counts as a problem.
 fn failed(finding: Finding, error: ErrorReport) -> Check {
     Check {
+        health: Health::Problem,
         error: Some(error),
-        ..check(finding)
+        finding,
     }
 }
 
@@ -461,18 +464,19 @@ fn vault_checks(facts: &Facts, gateway_running: bool, checks: &mut Vec<Check>) {
                     None => Finding::TotpUnknown,
                 }));
             }
-            // A pairing only matters while the vault is unlocked; the broker
-            // voids it on lock, so the gateway's own claim is not enough.
+            // A pairing only matters while the vault is unlocked. The broker
+            // voids it on lock, so a token the gateway still holds is active
+            // only while the broker also has a pairing for this unlock.
             if status.unlocked && gateway_running {
-                let paired = facts
+                let held = facts
                     .gateway
                     .as_ref()
                     .and_then(|r| r.info.as_ref())
                     .and_then(|info| info.vault_paired);
-                checks.push(check(match paired {
-                    Some(true) => Finding::PairingActive,
-                    Some(false) => Finding::PairingMissing,
-                    None => Finding::PairingUnknown,
+                checks.push(check(match (held, status.gateway_paired) {
+                    (Some(false), _) | (_, Some(false)) => Finding::PairingMissing,
+                    (Some(true), Some(true)) => Finding::PairingActive,
+                    _ => Finding::PairingUnknown,
                 }));
             }
             *vault_mode
@@ -741,6 +745,7 @@ mod tests {
                 totp_enrolled: Some(true),
                 agent_access: Some(false),
                 step_up_active: false,
+                gateway_paired: Some(true),
             },
             vault_mode: Some(0o600),
             credentials: Some(Credentials {
@@ -909,6 +914,7 @@ mod tests {
                 totp_enrolled: None,
                 agent_access: None,
                 step_up_active: false,
+                gateway_paired: None,
             },
             vault_mode: Some(0o644),
             credentials: None,
@@ -952,6 +958,47 @@ mod tests {
         let found = findings(&report);
         assert!(found.contains(&&Finding::NoProviders));
         assert!(found.contains(&&Finding::PairingUnknown));
+    }
+
+    #[test]
+    fn a_token_the_broker_voided_and_a_failed_status_are_problems() {
+        let snap = || snapshot(vec![], vec![]);
+        let BrokerFacts::Running {
+            mut status,
+            vault_mode,
+            credentials,
+        } = unlocked(vec![], vec![])
+        else {
+            unreachable!("unlocked() builds a running broker")
+        };
+        // The gateway still holds a token from before a lock and unlock.
+        status.gateway_paired = Some(false);
+        let relocked = BrokerFacts::Running {
+            status,
+            vault_mode,
+            credentials,
+        };
+        let report = evaluate(&facts(Some(snap()), relocked, Some(true)));
+        let found = findings(&report);
+        assert!(found.contains(&&Finding::PairingMissing));
+        assert!(!found.contains(&&Finding::PairingActive));
+
+        let mut facts = facts(None, BrokerFacts::Remote, None);
+        facts.gateway = Some(GatewayReport::new(
+            "local".into(),
+            GatewayPhase::Stopped,
+            None,
+            Some(ErrorReport::new(a206_core::ErrorKind::Internal, random())),
+        ));
+        let report = evaluate(&facts);
+        let stopped = report
+            .checks
+            .iter()
+            .find(|c| matches!(c.finding, Finding::GatewayStopped { .. }))
+            .unwrap();
+        assert_eq!(stopped.health, Health::Problem);
+        assert!(stopped.error.is_some());
+        assert_eq!(report.health(), Health::Problem);
     }
 
     #[test]
