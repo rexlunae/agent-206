@@ -448,17 +448,9 @@ impl Gateway {
                 if retry {
                     // The extra connection is not the anchor, so dropping it
                     // leaves the pairing intact.
-                    if let Err(error) = verified {
-                        let mut current = self.pairing.lock().map_err(poisoned("pairing"))?;
-                        if current
-                            .as_ref()
-                            .is_some_and(|paired| paired.pairing == pairing)
-                        {
-                            // The broker no longer honours it, so neither do we.
-                            *current = None;
-                        }
-                        return Err(error.into());
-                    }
+                    // A failed check is reported, but only the broker voids a
+                    // pairing: a transient failure must not drop a good anchor.
+                    verified?;
                     return Ok(Reply::Ok);
                 }
                 let anchor = verified?;

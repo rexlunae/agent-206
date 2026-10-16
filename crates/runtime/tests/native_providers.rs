@@ -412,6 +412,19 @@ async fn gateway_needs_a_verified_pairing_and_never_persists_it() {
         panic!("paired refresh failed");
     };
     assert_eq!(catalog.models[0].key.model, api.id);
+    // A retry that cannot reach the broker is reported but keeps the pairing.
+    let socket = a206_broker::socket_path(dir.path());
+    let aside = socket.with_extension("aside");
+    std::fs::rename(&socket, &aside).unwrap();
+    assert!(matches!(
+        run(Command::PairBroker {
+            pairing: pairing.clone()
+        })
+        .await,
+        Reply::Error { .. }
+    ));
+    std::fs::rename(&aside, &socket).unwrap();
+    assert!(matches!(run(refresh()).await, Reply::Catalog(_)));
     // Once the broker voids the pairing, a retry is no longer acknowledged.
     let mut user = a206_broker::Client::connect(dir.path(), a206_broker::Role::User)
         .await
