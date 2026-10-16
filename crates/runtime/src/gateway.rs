@@ -218,7 +218,7 @@ pub struct Gateway {
     downloads: Arc<Mutex<BTreeMap<Id, tokio_util::sync::CancellationToken>>>,
     running: Arc<Mutex<BTreeMap<Id, tokio_util::sync::CancellationToken>>>,
     /// Held only in memory: a restart needs a fresh pairing from the user.
-    pairing: Arc<Mutex<Option<BrokerPairing>>>,
+    pairing: Arc<Mutex<Option<(BrokerPairing, provider::PairingAnchor)>>>,
     /// Last automatic catalog attempt per provider, reset by a new pairing.
     refreshed: Arc<Mutex<BTreeMap<Id, u64>>>,
     paired: Arc<tokio::sync::Notify>,
@@ -242,7 +242,12 @@ impl Gateway {
         })
     }
     fn pairing(&self) -> Result<Option<BrokerPairing>> {
-        Ok(self.pairing.lock().map_err(poisoned("pairing"))?.clone())
+        Ok(self
+            .pairing
+            .lock()
+            .map_err(poisoned("pairing"))?
+            .as_ref()
+            .map(|(pairing, _)| pairing.clone()))
     }
     fn lock(&self) -> Result<MutexGuard<'_, Store>> {
         self.store.lock().map_err(poisoned("state"))
@@ -418,8 +423,9 @@ impl Gateway {
             Command::Snapshot => Ok(Reply::Snapshot(Box::new(self.snapshot()?))),
             Command::PairBroker { pairing } => {
                 let root = self.lock()?.root.clone();
-                provider::verify_pairing(&root, &pairing).await?;
-                *self.pairing.lock().map_err(poisoned("pairing"))? = Some(pairing);
+                let anchor = provider::verify_pairing(&root, &pairing).await?;
+                // Replacing the old anchor closes it; its pairing is already superseded.
+                *self.pairing.lock().map_err(poisoned("pairing"))? = Some((pairing, anchor));
                 // Discovery that failed for want of a pairing may retry now.
                 self.refreshed
                     .lock()

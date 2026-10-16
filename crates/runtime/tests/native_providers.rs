@@ -185,6 +185,10 @@ async fn paginates_native_catalogs_and_dispatches_protocol_specific_text() {
             pairing: Some(&forged),
         };
         assert!(provider::catalog(&config, forged).await.is_err());
+        // As the gateway does, keep the connection that claims the pairing open.
+        let _anchor = provider::verify_pairing(broker.path(), &pairing)
+            .await
+            .unwrap();
         let broker = provider::Broker {
             root: broker.path(),
             pairing: Some(&pairing),

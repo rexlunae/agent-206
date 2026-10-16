@@ -754,13 +754,32 @@ async fn from_another_process(root: &Path, token: &WireSecret, expect: &str) {
     );
 }
 
-async fn present(root: &Path, token: &WireSecret) -> Result<Reply, ClientError> {
+async fn present(root: &Path, token: &WireSecret) -> (Client, Result<Reply, ClientError>) {
     let mut gateway = Client::connect(root, Role::Gateway).await.unwrap();
-    gateway
+    let result = gateway
         .call(Request::GatewayAuth {
             token: WireSecret::new(token.expose().to_owned()),
         })
-        .await
+        .await;
+    (gateway, result)
+}
+
+/// Whether this gateway connection may currently spend credentials: a paired
+/// session gets as far as looking up the (unknown) credential.
+async fn spends(gateway: &mut Client) -> bool {
+    let call = Request::Provider(ProviderCall {
+        credential: random(),
+        method: HttpMethod::Get,
+        url: "https://example.invalid/".into(),
+        auth: AuthScheme::Bearer,
+        anthropic_version: None,
+        body: None,
+    });
+    match denied(gateway.call(call).await) {
+        BrokerError::GatewayNotPaired => false,
+        BrokerError::NotFound => true,
+        other => panic!("unexpected {other:?}"),
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -769,23 +788,51 @@ async fn a_pairing_belongs_to_the_first_process_to_prove_it() {
     let mut user = user(&root).await;
     user.call(unlock(&random(), None, true)).await.unwrap();
 
-    // Another process claims the pairing first; a copy is then useless here.
+    // Another process claims the pairing first, then exits: a copy is useless
+    // here, both because this pid is not the holder and because it is void.
     let first = pairing(&mut user).await;
     from_another_process(&root, &first, "accepted").await;
     assert_eq!(
-        denied(present(&root, &first).await),
+        denied(present(&root, &first).await.1),
         BrokerError::GatewayNotPaired
     );
 
-    // A fresh pairing claimed here survives reconnects from this process,
-    // and is refused to any other.
+    // A fresh pairing claimed here works on further connections from this
+    // process while its anchor stays open, and is refused to any other.
     let second = pairing(&mut user).await;
-    present(&root, &second).await.unwrap();
-    present(&root, &second).await.unwrap();
+    let (mut anchor, claimed) = present(&root, &second).await;
+    claimed.unwrap();
+    let (mut again, result) = present(&root, &second).await;
+    result.unwrap();
+    assert!(spends(&mut anchor).await && spends(&mut again).await);
     from_another_process(&root, &second, "refused").await;
+
+    // Replacing the pairing stops sessions that proved the old one.
+    let third = pairing(&mut user).await;
+    assert!(!spends(&mut again).await);
+    let (mut holder, claimed) = present(&root, &third).await;
+    claimed.unwrap();
+    let (mut other, result) = present(&root, &third).await;
+    result.unwrap();
+    assert!(spends(&mut other).await);
+
+    // Closing the anchor (the gateway exiting) voids the pairing, so a pid
+    // reused by another process later finds nothing to claim.
+    assert!(spends(&mut holder).await);
+    drop(holder);
+    let mut gone = false;
+    for _ in 0..200 {
+        if !spends(&mut other).await {
+            gone = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(gone, "the pairing outlived its anchor connection");
     assert_eq!(
-        denied(present(&root, &first).await),
+        denied(present(&root, &third).await.1),
         BrokerError::GatewayNotPaired
     );
+    drop(anchor);
     task.abort();
 }

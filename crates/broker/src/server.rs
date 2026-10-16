@@ -28,11 +28,16 @@ struct Shared {
     /// Cancels provider requests started under an earlier vault generation.
     in_flight: Mutex<(u64, CancellationToken)>,
     pairing: Mutex<Option<Pairing>>,
+    /// Numbers pairings so a replaced one stops working for sessions that proved it.
+    serials: std::sync::atomic::AtomicU64,
 }
 
 /// The current gateway pairing. The first process to prove it becomes its
-/// holder; a copied token is useless to any other process afterwards.
+/// holder; a copied token is useless to any other process afterwards. The
+/// holder's first connection anchors it: when that connection closes (the
+/// gateway exited), the pairing is void, so a reused pid finds nothing.
 struct Pairing {
+    serial: u64,
     token: Zeroizing<String>,
     /// The vault generation it was minted under; any lock or unlock voids it.
     generation: u64,
@@ -67,8 +72,10 @@ struct Session {
     step_up: StepUpWindow,
     /// A pending enrollment and the vault generation it was started under.
     pending: Option<(PendingTotp, u64)>,
-    /// The vault generation this gateway connection proved pairing for.
+    /// The serial of the pairing this gateway connection proved.
     paired: Option<u64>,
+    /// This connection is the holder's anchor for that pairing.
+    anchor: Option<u64>,
     /// The connected process, from the kernel's socket credentials.
     peer: Option<i32>,
 }
@@ -132,20 +139,21 @@ fn upstream(error: reqwest::Error) -> BrokerError {
     })
 }
 
-/// Compare without an early exit on the first differing byte.
-/// Bind a pairing to the first process that proves it. A caller the kernel
-/// cannot identify is refused rather than trusted.
-fn claim(holder: &mut Option<i32>, peer: Option<i32>) -> bool {
+/// Bind a pairing to the first process that proves it: `Some(true)` for that
+/// first claim, `Some(false)` for its holder again, `None` for anyone else. A
+/// caller the kernel cannot identify is refused rather than trusted.
+fn claim(holder: &mut Option<i32>, peer: Option<i32>) -> Option<bool> {
     match (*holder, peer) {
-        (_, None) => false,
+        (_, None) => None,
         (None, Some(pid)) => {
             *holder = Some(pid);
-            true
+            Some(true)
         }
-        (Some(holder), Some(pid)) => holder == pid,
+        (Some(holder), Some(pid)) => (holder == pid).then_some(false),
     }
 }
 
+/// Compare without an early exit on the first differing byte.
 fn same_secret(expected: &str, given: &str) -> bool {
     expected.len() == given.len()
         && expected
@@ -543,6 +551,9 @@ fn handle(shared: &Shared, session: &mut Session, request: Request) -> Handled {
                 token: WireSecret::new(token.clone()),
             };
             *shared.pairing() = Some(Pairing {
+                serial: shared
+                    .serials
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
                 token: Zeroizing::new(token),
                 generation,
                 holder: None,
@@ -553,16 +564,23 @@ fn handle(shared: &Shared, session: &mut Session, request: Request) -> Handled {
             let vault = shared.vault();
             let generation = vault.generation();
             let mut pairing = shared.pairing();
-            let valid = !vault.is_locked()
-                && pairing.as_mut().is_some_and(|pairing| {
-                    pairing.generation == generation
-                        && same_secret(&pairing.token, token.expose())
-                        && claim(&mut pairing.holder, session.peer)
-                });
-            if !valid {
+            let claimed = match pairing.as_mut() {
+                Some(pairing)
+                    if !vault.is_locked()
+                        && pairing.generation == generation
+                        && same_secret(&pairing.token, token.expose()) =>
+                {
+                    claim(&mut pairing.holder, session.peer).map(|first| (pairing.serial, first))
+                }
+                _ => None,
+            };
+            let Some((serial, first)) = claimed else {
                 return Err(BrokerError::GatewayNotPaired);
+            };
+            session.paired = Some(serial);
+            if first {
+                session.anchor = Some(serial);
             }
-            session.paired = Some(generation);
             ok()
         }
         Request::Provider(call) => {
@@ -571,7 +589,10 @@ fn handle(shared: &Shared, session: &mut Session, request: Request) -> Handled {
             if vault.is_locked() {
                 return Err(BrokerError::Locked);
             }
-            if session.paired != Some(vault.generation()) {
+            let current = shared.pairing().as_ref().and_then(|pairing| {
+                (pairing.generation == vault.generation()).then_some(pairing.serial)
+            });
+            if current.is_none() || session.paired != current {
                 return Err(BrokerError::GatewayNotPaired);
             }
             let url = url::Url::parse(&call.url)
@@ -669,6 +690,23 @@ async fn transmit(http: &reqwest::Client, out: Outbound) -> Result<Reply, Broker
 }
 
 async fn connection(shared: Arc<Shared>, stream: tokio::net::UnixStream) -> std::io::Result<()> {
+    let mut anchor = None;
+    let result = session(&shared, stream, &mut anchor).await;
+    if let Some(serial) = anchor {
+        let mut pairing = shared.pairing();
+        if pairing.as_ref().is_some_and(|p| p.serial == serial) {
+            // The holding gateway went away; its pid may be reused.
+            *pairing = None;
+        }
+    }
+    result
+}
+
+async fn session(
+    shared: &Arc<Shared>,
+    stream: tokio::net::UnixStream,
+    anchor: &mut Option<u64>,
+) -> std::io::Result<()> {
     // The socket is mode 0600 in a 0700 directory; check the kernel's view too.
     let credentials = stream.peer_cred()?;
     if credentials.uid() != nix::unistd::geteuid().as_raw() {
@@ -706,6 +744,7 @@ async fn connection(shared: Arc<Shared>, stream: tokio::net::UnixStream) -> std:
             .await
             .map_err(std::io::Error::other)?;
             session = returned;
+            *anchor = anchor.or(session.anchor);
             // Any lock or unlock during this request cancels older sends.
             {
                 let vault = shared.vault();
@@ -772,6 +811,7 @@ pub async fn serve(root: &Path) -> std::io::Result<()> {
             .map_err(std::io::Error::other)?,
         in_flight: Mutex::new((0, CancellationToken::new())),
         pairing: Mutex::new(None),
+        serials: std::sync::atomic::AtomicU64::new(0),
     });
     let mut connections = tokio::task::JoinSet::new();
     loop {
