@@ -465,32 +465,46 @@ mod linux {
             };
             // `Child::wait` closes stdin, which the runtime still needs.
             let stdin = child.stdin.take();
-            let result = tokio::time::timeout(READY_TIMEOUT, async {
+            // The deadline covers only waiting; an exit is then explained in full.
+            let first = tokio::time::timeout(READY_TIMEOUT, async {
                 tokio::select! {
                     biased;
-                    status = &mut report => decide(status),
-                    status = child.wait() => {
-                        let status = status.map_err(BackendError::Spawn)?;
-                        // A helper that reported its failure and then exited has
-                        // that report queued; it explains more than the exit.
-                        if let Ok(report) = tokio::time::timeout(EXIT_GRACE, &mut report).await {
-                            return decide(report);
-                        }
-                        let mut diagnostic = Vec::new();
-                        if let Some(stderr) = child.stderr.take() {
-                            // Whatever arrived is the diagnostic; a read error leaves it partial.
-                            stderr.take(MAX_DIAGNOSTIC).read_to_end(&mut diagnostic).await.ignore();
-                        }
-                        Err(BackendError::SandboxExited {
-                            status,
-                            diagnostic: String::from_utf8_lossy(&diagnostic).trim().to_owned(),
-                        })
-                    }
+                    status = &mut report => Ok(status),
+                    exit = child.wait() => Err(exit),
                 }
             })
-            .await
-            .map_err(BackendError::SandboxTimeout)
-            .and_then(|result| result);
+            .await;
+            let result = match first {
+                Err(elapsed) => Err(BackendError::SandboxTimeout(elapsed)),
+                Ok(Ok(status)) => decide(status),
+                Ok(Err(exit)) => match exit.map_err(BackendError::Spawn) {
+                    Err(error) => Err(error),
+                    Ok(status) => {
+                        // A helper that reported its failure and then exited has
+                        // that report queued; it explains more than the exit.
+                        match tokio::time::timeout(EXIT_GRACE, &mut report).await {
+                            Ok(report) => decide(report),
+                            Err(_) => {
+                                let mut diagnostic = Vec::new();
+                                if let Some(stderr) = child.stderr.take() {
+                                    // Whatever arrived is the diagnostic; a read error leaves it partial.
+                                    stderr
+                                        .take(MAX_DIAGNOSTIC)
+                                        .read_to_end(&mut diagnostic)
+                                        .await
+                                        .ignore();
+                                }
+                                Err(BackendError::SandboxExited {
+                                    status,
+                                    diagnostic: String::from_utf8_lossy(&diagnostic)
+                                        .trim()
+                                        .to_owned(),
+                                })
+                            }
+                        }
+                    }
+                },
+            };
             child.stdin = stdin;
             result
         }
