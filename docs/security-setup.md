@@ -39,8 +39,8 @@ holds the password is not stopped. Pairing stops such a process from choosing
 its own credential and URL at the broker, but the gateway socket itself is not
 yet authenticated: a same-user process can still ask the gateway for ordinary
 model work (catalogs and completions for configured providers), which the
-gateway then performs with the paired broker. Locking the vault cancels
-provider requests already in flight. Agent
+gateway then performs with the paired broker. Locking the vault, replacing
+the pairing or closing its anchor cancels provider requests already in flight. Agent
 execution must therefore keep the profile directory outside its OS sandbox, as
 the macOS backend isolation already does. Remote vault access over SSH is not
 wired yet; the broker is local to the gateway host.
