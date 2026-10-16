@@ -27,11 +27,17 @@ struct Shared {
     http: reqwest::Client,
     /// Cancels provider requests started under an earlier vault generation.
     in_flight: Mutex<(u64, CancellationToken)>,
+    /// The current gateway pairing and the vault generation it belongs to.
+    pairing: Mutex<Option<(Zeroizing<String>, u64)>>,
 }
 
 impl Shared {
     fn vault(&self) -> MutexGuard<'_, Vault> {
         self.vault.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn pairing(&self) -> MutexGuard<'_, Option<(Zeroizing<String>, u64)>> {
+        self.pairing.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// The token for requests sent under `generation`. Moving to a new
@@ -53,6 +59,8 @@ struct Session {
     step_up: StepUpWindow,
     /// A pending enrollment and the vault generation it was started under.
     pending: Option<(PendingTotp, u64)>,
+    /// The vault generation this gateway connection proved pairing for.
+    paired: Option<u64>,
 }
 
 struct Outbound {
@@ -112,6 +120,16 @@ fn upstream(error: reqwest::Error) -> BrokerError {
     } else {
         UpstreamFailure::Transfer
     })
+}
+
+/// Compare without an early exit on the first differing byte.
+fn same_secret(expected: &str, given: &str) -> bool {
+    expected.len() == given.len()
+        && expected
+            .bytes()
+            .zip(given.bytes())
+            .fold(0u8, |diff, (a, b)| diff | (a ^ b))
+            == 0
 }
 
 fn ok() -> Handled {
@@ -198,8 +216,9 @@ fn handle(shared: &Shared, session: &mut Session, request: Request) -> Handled {
         (_, Request::Hello { .. }) => {
             return Err(BrokerError::Invalid(InvalidRequest::AlreadyGreeted));
         }
-        (_, Request::Status) | (Role::Gateway, Request::Provider(_)) => {}
-        (Role::Gateway, _) | (Role::User, Request::Provider(_)) => {
+        (_, Request::Status)
+        | (Role::Gateway, Request::GatewayAuth { .. } | Request::Provider(_)) => {}
+        (Role::Gateway, _) | (Role::User, Request::GatewayAuth { .. } | Request::Provider(_)) => {
             return Err(BrokerError::Forbidden);
         }
         _ => {}
@@ -484,7 +503,46 @@ fn handle(shared: &Shared, session: &mut Session, request: Request) -> Handled {
                 .map_err(vault_error)?;
             Ok(Outcome::Reply(Reply::Value(value)))
         }
+        Request::PairGateway => {
+            let vault = shared.vault();
+            let generation = vault.generation();
+            require_step_up(session, generation)?;
+            if vault.is_locked() {
+                return Err(BrokerError::Locked);
+            }
+            // Two v4 UUIDs: 244 bits from the OS CSPRNG.
+            let token = format!(
+                "{}{}",
+                uuid::Uuid::new_v4().simple(),
+                uuid::Uuid::new_v4().simple()
+            );
+            let reply = Reply::GatewayPairing {
+                token: WireSecret::new(token.clone()),
+            };
+            *shared.pairing() = Some((Zeroizing::new(token), generation));
+            Ok(Outcome::Reply(reply))
+        }
+        Request::GatewayAuth { token } => {
+            let vault = shared.vault();
+            let generation = vault.generation();
+            let valid = shared.pairing().as_ref().is_some_and(|(expected, paired)| {
+                *paired == generation && same_secret(expected, token.expose())
+            });
+            if !valid || vault.is_locked() {
+                return Err(BrokerError::GatewayNotPaired);
+            }
+            session.paired = Some(generation);
+            ok()
+        }
         Request::Provider(call) => {
+            // Unpaired callers learn nothing, not even whether a URL is valid.
+            let vault = shared.vault();
+            if vault.is_locked() {
+                return Err(BrokerError::Locked);
+            }
+            if session.paired != Some(vault.generation()) {
+                return Err(BrokerError::GatewayNotPaired);
+            }
             let url = url::Url::parse(&call.url)
                 .map_err(|_| BrokerError::Invalid(InvalidRequest::ProviderUrl))?;
             allowed_scheme(&url)?;
@@ -499,7 +557,6 @@ fn handle(shared: &Shared, session: &mut Session, request: Request) -> Handled {
                 return Err(BrokerError::Invalid(InvalidRequest::ProviderBody));
             }
             let origin = url.origin().ascii_serialization();
-            let vault = shared.vault();
             // Taken under the vault mutex, so a later lock always cancels it.
             let cancel = shared.in_flight(vault.generation());
             let value = vault
@@ -671,6 +728,7 @@ pub async fn serve(root: &Path) -> std::io::Result<()> {
             .build()
             .map_err(std::io::Error::other)?,
         in_flight: Mutex::new((0, CancellationToken::new())),
+        pairing: Mutex::new(None),
     });
     let mut connections = tokio::task::JoinSet::new();
     loop {

@@ -9,6 +9,7 @@ serde.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
 url.workspace = true
+zeroize.workspace = true
 [dev-dependencies]
 rmp-serde.workspace = true
 [lints]

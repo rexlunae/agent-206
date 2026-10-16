@@ -326,33 +326,18 @@ pub async fn stdio(_root: &Path, _start: bool, _explicit: bool) -> Result<()> {
 
 /// Refresh cached facts from provider APIs. Failed refreshes retain the expired cache.
 pub async fn refresh_catalogs(gateway: crate::gateway::Gateway) {
-    let mut attempted = std::collections::HashMap::<a206_core::Id, u64>::new();
+    let paired = gateway.paired_signal();
     loop {
-        if let Ok(snapshot) = gateway.snapshot() {
-            let now = crate::provider::now();
-            for provider in snapshot.settings.providers {
-                let fresh = snapshot
-                    .catalogs
-                    .iter()
-                    .any(|c| c.provider == provider.id && !c.stale(now));
-                if !fresh
-                    && attempted
-                        .get(&provider.id)
-                        .is_none_or(|last| now.saturating_sub(*last) >= 300)
-                {
-                    attempted.insert(provider.id, now);
-                    gateway
-                        .request(a206_protocol::Request {
-                            id: a206_core::Id::new_v4(),
-                            body: a206_core::Command::RefreshCatalog {
-                                provider: provider.id,
-                            },
-                        })
-                        .await;
-                }
-            }
+        if let Err(error) = gateway.refresh_stale_catalogs().await {
+            tracing::warn!(
+                error = &error as &dyn std::error::Error,
+                "catalog refresh pass failed"
+            );
         }
-        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        tokio::select! {
+            _ = tokio::time::sleep(std::time::Duration::from_secs(60)) => {}
+            _ = paired.notified() => {}
+        }
     }
 }
 

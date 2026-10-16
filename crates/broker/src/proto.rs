@@ -11,7 +11,7 @@ use zeroize::Zeroizing;
 /// `Request::Hello`, `Request::Shutdown` (accepted before `Hello`) and
 /// `Reply::Ok`/`Reply::Error` must stay compatible across versions; variants
 /// are encoded by name.
-pub const BROKER_VERSION: u16 = 2;
+pub const BROKER_VERSION: u16 = 3;
 /// Largest provider request or response body the broker carries. The rest of
 /// the 4 MiB frame is reserved for the envelope, so a body at this limit still
 /// fits in one frame.
@@ -49,7 +49,8 @@ impl<'de> Deserialize<'de> for WireSecret {
 }
 
 /// Who a connection acts for. The gateway role can only ask the broker to
-/// perform destination-bound requests; it never receives a value.
+/// perform destination-bound requests, after presenting a pairing a trusted
+/// user client minted for the current unlock; it never receives a value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Role {
     User,
@@ -246,6 +247,13 @@ pub enum Request {
     Reveal {
         name: String,
     },
+    /// Mint the gateway pairing for this unlock (user role, step-up). It
+    /// replaces any earlier pairing; locking the vault voids it.
+    PairGateway,
+    /// Gateway role: present the pairing before any `Provider` call.
+    GatewayAuth {
+        token: WireSecret,
+    },
     Provider(ProviderCall),
 }
 
@@ -281,6 +289,8 @@ pub enum BrokerError {
     StepUpRequired,
     #[error("this connection's role cannot make that request")]
     Forbidden,
+    #[error("the gateway is not paired with the unlocked vault; run `agent206 vault pair`")]
+    GatewayNotPaired,
     #[error("no two-factor enrollment is pending on this connection")]
     NoPendingEnrollment,
     #[error("credential use denied")]
@@ -365,6 +375,9 @@ pub enum Reply {
         legacy: Vec<String>,
     },
     Value(WireValue),
+    GatewayPairing {
+        token: WireSecret,
+    },
     Provider {
         status: u16,
         #[serde(with = "serde_bytes")]

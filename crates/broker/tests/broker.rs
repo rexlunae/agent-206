@@ -56,6 +56,25 @@ fn denied(result: Result<Reply, ClientError>) -> BrokerError {
     }
 }
 
+/// Mint a pairing on a stepped-up user connection and present it.
+async fn paired_gateway(user: &mut Client, root: &Path) -> Client {
+    let mut gateway = Client::connect(root, Role::Gateway).await.unwrap();
+    gateway
+        .call(Request::GatewayAuth {
+            token: pairing(user).await,
+        })
+        .await
+        .unwrap();
+    gateway
+}
+
+async fn pairing(user: &mut Client) -> WireSecret {
+    match user.call(Request::PairGateway).await.unwrap() {
+        Reply::GatewayPairing { token } => token,
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
 async fn status(client: &mut Client) -> BrokerStatus {
     match client.call(Request::Status).await.unwrap() {
         Reply::Status(status) => status,
@@ -400,7 +419,7 @@ async fn provider_calls_are_destination_bound_and_value_free() {
         .await
         .unwrap();
     }
-    let mut gateway = Client::connect(&root, Role::Gateway).await.unwrap();
+    let mut gateway = paired_gateway(&mut a, &root).await;
     let call = |credential: &str, path: &str| {
         Request::Provider(ProviderCall {
             credential: credential.to_owned(),
@@ -494,7 +513,7 @@ async fn lock_cancels_in_flight_sends_and_body_limits_are_structured() {
             body,
         })
     };
-    let mut gateway = Client::connect(&root, Role::Gateway).await.unwrap();
+    let mut gateway = paired_gateway(&mut a, &root).await;
     match gateway.call(call("/full", None)).await.unwrap() {
         Reply::Provider { status, body } => {
             assert_eq!(status, 200);
@@ -583,4 +602,112 @@ async fn stop_reaches_an_older_broker_through_its_own_greeting() {
     });
     Client::shutdown(&root).await.unwrap();
     assert!(*stopped.lock().unwrap());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn only_a_paired_gateway_spends_credentials_and_lock_voids_pairing() {
+    let (_dir, root, _task) = start().await;
+    let password = random();
+    let mut a = user(&root).await;
+    a.call(unlock(&password, None, true)).await.unwrap();
+    let name = random();
+    a.call(Request::PutCredential {
+        name: name.clone(),
+        meta: meta(vec!["https://example.invalid".into()]),
+        value: WireValue::Single(WireSecret::new(random())),
+        replace: false,
+    })
+    .await
+    .unwrap();
+    // A fragment is refused before any network use, so a paired gateway
+    // reaches validation while an unpaired one never does.
+    let call = || {
+        Request::Provider(ProviderCall {
+            credential: name.clone(),
+            method: HttpMethod::Get,
+            url: "https://example.invalid/#x".into(),
+            auth: AuthScheme::Bearer,
+            anthropic_version: None,
+            body: None,
+        })
+    };
+    let paired = |r: Result<Reply, ClientError>| {
+        matches!(denied(r), BrokerError::Invalid(InvalidRequest::ProviderUrl))
+    };
+
+    let mut claimed = Client::connect(&root, Role::Gateway).await.unwrap();
+    assert_eq!(
+        denied(claimed.call(call()).await),
+        BrokerError::GatewayNotPaired
+    );
+    assert_eq!(
+        denied(
+            claimed
+                .call(Request::GatewayAuth {
+                    token: WireSecret::new(random()),
+                })
+                .await
+        ),
+        BrokerError::GatewayNotPaired
+    );
+    // Minting needs step-up; presenting is gateway-only.
+    let mut fresh = user(&root).await;
+    assert_eq!(
+        denied(fresh.call(Request::PairGateway).await),
+        BrokerError::StepUpRequired
+    );
+    let token = pairing(&mut a).await;
+    assert_eq!(
+        denied(
+            fresh
+                .call(Request::GatewayAuth {
+                    token: WireSecret::new(token.expose().to_owned()),
+                })
+                .await
+        ),
+        BrokerError::Forbidden
+    );
+    let mut gateway = Client::connect(&root, Role::Gateway).await.unwrap();
+    gateway
+        .call(Request::GatewayAuth {
+            token: WireSecret::new(token.expose().to_owned()),
+        })
+        .await
+        .unwrap();
+    assert!(paired(gateway.call(call()).await));
+
+    // A new pairing replaces the old token for new connections.
+    let replacement = pairing(&mut a).await;
+    let mut stale = Client::connect(&root, Role::Gateway).await.unwrap();
+    assert_eq!(
+        denied(
+            stale
+                .call(Request::GatewayAuth {
+                    token: WireSecret::new(token.expose().to_owned()),
+                })
+                .await
+        ),
+        BrokerError::GatewayNotPaired
+    );
+
+    // Locking voids the pairing, even after the vault is unlocked again.
+    a.call(Request::Lock).await.unwrap();
+    a.call(unlock(&password, None, false)).await.unwrap();
+    assert_eq!(
+        denied(gateway.call(call()).await),
+        BrokerError::GatewayNotPaired
+    );
+    let mut after = Client::connect(&root, Role::Gateway).await.unwrap();
+    assert_eq!(
+        denied(
+            after
+                .call(Request::GatewayAuth {
+                    token: WireSecret::new(replacement.expose().to_owned()),
+                })
+                .await
+        ),
+        BrokerError::GatewayNotPaired
+    );
+    let mut repaired = paired_gateway(&mut a, &root).await;
+    assert!(paired(repaired.call(call()).await));
 }

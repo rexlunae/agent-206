@@ -17,6 +17,9 @@ pub enum VaultAction {
     Unlock,
     /// Lock the vault and revoke every step-up.
     Lock,
+    /// Let the running gateway use credentials for this unlock (`unlock`
+    /// does this automatically when the gateway is already running).
+    Pair,
     /// Show whether the vault exists, is unlocked and has two-factor enrolled.
     Status,
     /// Lock the vault and stop the broker process.
@@ -282,6 +285,48 @@ async fn step_up(client: &mut Client) -> Result<()> {
     }
 }
 
+async fn gateway_running(root: &Path) -> bool {
+    a206_runtime::service::connect(root, false, false)
+        .await
+        .is_ok()
+}
+
+/// Mint this unlock's gateway pairing (the connection already holds a
+/// step-up) and hand it straight to the local gateway, never to disk.
+async fn pair_gateway(client: &mut Client, root: &Path) -> Result<()> {
+    let Reply::GatewayPairing { token } = client.call(Request::PairGateway).await? else {
+        bail!("unexpected broker reply");
+    };
+    let pairing = a206_core::BrokerPairing::new(token.expose().to_owned());
+    drop(token);
+    let gateway = a206_runtime::client::Client::attach(root.to_owned(), None);
+    match gateway
+        .call(a206_core::Command::PairBroker { pairing })
+        .await?
+    {
+        a206_core::Reply::Ok => Ok(()),
+        a206_core::Reply::Error(report) => {
+            Err(anyhow::Error::from(report).context("the gateway refused the pairing"))
+        }
+        _ => bail!("unexpected gateway reply"),
+    }
+}
+
+async fn pair_if_running(client: &mut Client, root: &Path) -> Result<()> {
+    if gateway_running(root).await {
+        // The unlock itself succeeded; a failed pairing is reported, not fatal.
+        match pair_gateway(client, root).await {
+            Ok(()) => println!("Gateway paired with the vault"),
+            Err(error) => {
+                eprintln!("Could not pair the gateway ({error:#}); run `agent206 vault pair`")
+            }
+        }
+    } else {
+        println!("After starting the gateway, run `agent206 vault pair` so it can use credentials");
+    }
+    Ok(())
+}
+
 fn print_value(value: &WireValue) {
     match value {
         WireValue::Single(v) => println!("{}", v.expose()),
@@ -373,10 +418,20 @@ pub fn run(root: &Path, action: VaultAction) -> Result<()> {
                 }
                 unlock(&mut client, true).await?;
                 println!("Vault created and unlocked");
+                pair_if_running(&mut client, root).await?;
             }
             VaultAction::Unlock => {
                 unlock(&mut client, false).await?;
                 println!("Vault unlocked");
+                pair_if_running(&mut client, root).await?;
+            }
+            VaultAction::Pair => {
+                if !gateway_running(root).await {
+                    bail!("the gateway is not running; start it with `agent206 gateway start`");
+                }
+                step_up(&mut client).await?;
+                pair_gateway(&mut client, root).await?;
+                println!("Gateway paired with the vault");
             }
             VaultAction::Lock => {
                 client.call(Request::Lock).await?;

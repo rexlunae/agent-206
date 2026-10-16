@@ -58,6 +58,8 @@ pub enum ProviderError {
     VaultUnavailable(#[source] a206_broker::ClientError),
     #[error("the vault broker refused the provider call")]
     Broker(#[source] a206_broker::ClientError),
+    #[error("the gateway is not paired with the unlocked vault; run `agent206 vault pair`")]
+    NotPaired,
     #[error("vault broker returned an unexpected reply")]
     UnexpectedReply,
     #[error(
@@ -92,7 +94,7 @@ impl crate::error::Classified for ProviderError {
             Self::Transport(error) if error.is_timeout() => ErrorKind::Timeout,
             Self::Transport(error) if error.is_connect() => ErrorKind::Unavailable,
             Self::Timeout(_) => ErrorKind::Timeout,
-            Self::VaultUnavailable(_) | Self::NoBroker => ErrorKind::Unavailable,
+            Self::VaultUnavailable(_) | Self::NoBroker | Self::NotPaired => ErrorKind::Unavailable,
             // The broker's own reply decides (denied, locked, upstream timeout).
             Self::Broker(_) => return None,
             Self::Transport(_)
@@ -220,10 +222,14 @@ async fn response_json(response: reqwest::Response) -> Result<Value> {
     serde_json::from_slice(&bytes).map_err(ProviderError::Json)
 }
 /// Where credentialed requests go: the profile whose vault broker holds the
-/// key. The gateway never reads a credential value; the broker attaches it
-/// for the exact destination the user bound it to.
+/// key, and the pairing a trusted client gave the gateway for this unlock.
+/// The gateway never reads a credential value; the broker attaches it for
+/// the exact destination the user bound it to.
 #[derive(Clone, Copy)]
-pub struct Broker<'a>(pub &'a std::path::Path);
+pub struct Broker<'a> {
+    pub root: &'a std::path::Path,
+    pub pairing: Option<&'a a206_core::BrokerPairing>,
+}
 async fn call(
     config: &ProviderConfig,
     broker: Broker<'_>,
@@ -252,7 +258,7 @@ async fn brokered(
     url: Url,
     body: Option<&Value>,
 ) -> Result<Value> {
-    use a206_broker::{AuthScheme, HttpMethod, ProviderCall, Reply, Request, Role};
+    use a206_broker::{AuthScheme, HttpMethod, ProviderCall, Reply, Request};
     let method = match method {
         reqwest::Method::GET => HttpMethod::Get,
         reqwest::Method::POST => HttpMethod::Post,
@@ -263,9 +269,7 @@ async fn brokered(
         ProviderApi::Anthropic => AuthScheme::ApiKeyHeader,
         ProviderApi::Gemini => AuthScheme::GoogleApiKey,
     };
-    let mut client = a206_broker::Client::connect(broker.0, Role::Gateway)
-        .await
-        .map_err(ProviderError::VaultUnavailable)?;
+    let mut client = paired_client(broker.root, broker.pairing).await?;
     let reply = client
         .call(Request::Provider(ProviderCall {
             credential: credential.to_owned(),
@@ -287,6 +291,40 @@ async fn brokered(
     )?;
     check(body.len() <= MAX_RESPONSE, ProviderError::ResponseTooLarge)?;
     serde_json::from_slice(&body).map_err(ProviderError::Json)
+}
+/// Open a gateway-role broker connection and prove this unlock's pairing.
+#[cfg(unix)]
+async fn paired_client(
+    root: &std::path::Path,
+    pairing: Option<&a206_core::BrokerPairing>,
+) -> Result<a206_broker::Client, ProviderError> {
+    use a206_broker::{Request, Role, WireSecret};
+    let mut client = a206_broker::Client::connect(root, Role::Gateway)
+        .await
+        .map_err(ProviderError::VaultUnavailable)?;
+    let pairing = pairing.ok_or(ProviderError::NotPaired)?;
+    client
+        .call(Request::GatewayAuth {
+            token: WireSecret::new(pairing.expose().to_owned()),
+        })
+        .await
+        .map_err(ProviderError::Broker)?;
+    Ok(client)
+}
+/// Check a pairing against the broker before the gateway keeps it.
+#[cfg(unix)]
+pub async fn verify_pairing(
+    root: &std::path::Path,
+    pairing: &a206_core::BrokerPairing,
+) -> Result<(), ProviderError> {
+    paired_client(root, Some(pairing)).await.map(drop)
+}
+#[cfg(not(unix))]
+pub async fn verify_pairing(
+    _: &std::path::Path,
+    _: &a206_core::BrokerPairing,
+) -> Result<(), ProviderError> {
+    Err(ProviderError::NoBroker)
 }
 /// Serialize a request body, stopping as soon as it exceeds what one broker
 /// frame can carry instead of building an oversized copy first.

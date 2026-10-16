@@ -217,7 +217,14 @@ pub struct Gateway {
     store: Arc<Mutex<Store>>,
     downloads: Arc<Mutex<BTreeMap<Id, tokio_util::sync::CancellationToken>>>,
     running: Arc<Mutex<BTreeMap<Id, tokio_util::sync::CancellationToken>>>,
+    /// Held only in memory: a restart needs a fresh pairing from the user.
+    pairing: Arc<Mutex<Option<BrokerPairing>>>,
+    /// Last automatic catalog attempt per provider, reset by a new pairing.
+    refreshed: Arc<Mutex<BTreeMap<Id, u64>>>,
+    paired: Arc<tokio::sync::Notify>,
 }
+/// Minimum seconds between automatic refreshes of one stale catalog.
+const REFRESH_RETRY: u64 = 300;
 impl Gateway {
     pub fn open(root: &Path) -> Result<Self, StoreError> {
         Ok(Self {
@@ -229,10 +236,58 @@ impl Gateway {
             store: Arc::new(Mutex::new(Store::open(root)?)),
             downloads: Arc::new(Mutex::new(BTreeMap::new())),
             running: Arc::new(Mutex::new(BTreeMap::new())),
+            pairing: Arc::new(Mutex::new(None)),
+            refreshed: Arc::new(Mutex::new(BTreeMap::new())),
+            paired: Arc::new(tokio::sync::Notify::new()),
         })
+    }
+    fn pairing(&self) -> Result<Option<BrokerPairing>> {
+        Ok(self.pairing.lock().map_err(poisoned("pairing"))?.clone())
     }
     fn lock(&self) -> Result<MutexGuard<'_, Store>> {
         self.store.lock().map_err(poisoned("state"))
+    }
+    /// Wakes the automatic catalog refresh when a new broker pairing arrives.
+    pub(crate) fn paired_signal(&self) -> Arc<tokio::sync::Notify> {
+        self.paired.clone()
+    }
+    /// Refresh each stale catalog not attempted within `REFRESH_RETRY`.
+    /// Failed refreshes keep the expired cache and are recorded, not returned.
+    pub async fn refresh_stale_catalogs(&self) -> Result<()> {
+        let snapshot = self.snapshot()?;
+        let now = provider::now();
+        for config in snapshot.settings.providers {
+            let fresh = snapshot
+                .catalogs
+                .iter()
+                .any(|c| c.provider == config.id && !c.stale(now));
+            let due = {
+                let mut refreshed = self.refreshed.lock().map_err(poisoned("catalog refresh"))?;
+                let due = !fresh
+                    && refreshed
+                        .get(&config.id)
+                        .is_none_or(|last| now.saturating_sub(*last) >= REFRESH_RETRY);
+                if due {
+                    refreshed.insert(config.id, now);
+                }
+                due
+            };
+            if due {
+                let reply = self
+                    .request(Request {
+                        id: Id::new_v4(),
+                        body: Command::RefreshCatalog {
+                            provider: config.id,
+                        },
+                    })
+                    .await;
+                if let Reply::Error(report) = reply.body {
+                    let _provider = tracing::warn_span!("catalog", provider = %config.id).entered();
+                    crate::error::record("refresh_catalog", &report);
+                }
+            }
+        }
+        Ok(())
     }
     pub fn stop_signal(&self) -> tokio_util::sync::CancellationToken {
         self.stop.clone()
@@ -281,7 +336,11 @@ impl Gateway {
         let is_shutdown = matches!(request.body, Command::Shutdown);
         let _active = if !matches!(
             request.body,
-            Command::Snapshot | Command::GatewayStatus | Command::Shutdown | Command::Events { .. }
+            Command::Snapshot
+                | Command::GatewayStatus
+                | Command::Shutdown
+                | Command::Events { .. }
+                | Command::PairBroker { .. }
         ) {
             let Ok(mut admission) = self.admission.lock() else {
                 return (
@@ -308,6 +367,8 @@ impl Gateway {
                 | Command::GitStatus { .. }
                 | Command::ReadDocument { .. }
                 | Command::RunExtension { .. }
+                // Never journal a pairing: request bodies are persisted.
+                | Command::PairBroker { .. }
         );
         let begin = if mutation {
             self.lock()
@@ -355,6 +416,18 @@ impl Gateway {
                 ),
             })),
             Command::Snapshot => Ok(Reply::Snapshot(Box::new(self.snapshot()?))),
+            Command::PairBroker { pairing } => {
+                let root = self.lock()?.root.clone();
+                provider::verify_pairing(&root, &pairing).await?;
+                *self.pairing.lock().map_err(poisoned("pairing"))? = Some(pairing);
+                // Discovery that failed for want of a pairing may retry now.
+                self.refreshed
+                    .lock()
+                    .map_err(poisoned("catalog refresh"))?
+                    .clear();
+                self.paired.notify_one();
+                Ok(Reply::Ok)
+            }
             Command::JoshuaStatus => {
                 let mut manager = self.joshua.lock().await;
                 let status = manager.status()?;
@@ -517,7 +590,12 @@ impl Gateway {
                     .cloned()
                     .ok_or(GatewayError::NotFound("provider not configured"))?;
                 let root = self.lock()?.root.clone();
-                let catalog = provider::catalog(&config, provider::Broker(&root)).await?;
+                let pairing = self.pairing()?;
+                let broker = provider::Broker {
+                    root: &root,
+                    pairing: pairing.as_ref(),
+                };
+                let catalog = provider::catalog(&config, broker).await?;
                 let mut store = self.lock()?;
                 check(
                     store.state.settings.providers.contains(&config),
@@ -802,6 +880,7 @@ impl Gateway {
                     (config, copy, prompt, info, backend, workspace, root)
                 };
                 let (sender, mut progress) = tokio::sync::mpsc::channel(32);
+                let pairing = self.pairing()?;
                 let operation = async {
                     Ok::<_, GatewayError>(if let Some(backend) = &backend {
                         crate::backends::complete(crate::backends::Run {
@@ -819,7 +898,10 @@ impl Gateway {
                     } else {
                         provider::complete(
                             &config,
-                            provider::Broker(&root),
+                            provider::Broker {
+                                root: &root,
+                                pairing: pairing.as_ref(),
+                            },
                             &thread,
                             &prompt,
                             &info,

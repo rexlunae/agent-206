@@ -12,15 +12,24 @@ gateway never relays passwords, codes or values. The gateway connects with the
 origin the user bound to that credential; it never receives the value. The CLI
 is the first trusted surface. GUI enrollment and agent approvals are the next gate.
 
+Gateway pairing: the `Gateway` role must present a pairing before any provider
+request. Only a stepped-up user connection can mint one (`agent206 vault unlock`
+does so when the gateway is running, `agent206 vault pair` does so explicitly).
+The trusted client hands it straight to the local gateway over the gateway
+socket; the gateway verifies it with the broker, keeps it only in memory and
+never journals, logs or returns it. A new pairing replaces the old one, and any
+lock voids it, so after a relock or a gateway restart the user pairs again.
+
 Limits of today's boundary: any process running as the same OS user can open the
 socket and claim either role. Step-up (password, or a TOTP code when enrolled)
 guards adding, revealing, overwriting and deleting credentials and policy,
 destination and agent-access changes, but a same-user attacker that already
-holds the password is not stopped. The gateway role is not yet authenticated:
-while the vault is unlocked, a same-user process claiming it can send requests
-to origins the user bound and read the responses, though never the value.
-Gateway pairing is the planned fix. Locking the vault cancels provider requests
-already in flight. Agent
+holds the password is not stopped. Pairing stops such a process from choosing
+its own credential and URL at the broker, but the gateway socket itself is not
+yet authenticated: a same-user process can still ask the gateway for ordinary
+model work (catalogs and completions for configured providers), which the
+gateway then performs with the paired broker. Locking the vault cancels
+provider requests already in flight. Agent
 execution must therefore keep the profile directory outside its OS sandbox, as
 the macOS backend isolation already does. Remote vault access over SSH is not
 wired yet; the broker is local to the gateway host.

@@ -436,6 +436,26 @@ pub enum EventKind {
     ProjectChanged { id: Id },
 }
 
+/// A capability the vault broker issues to the gateway for one unlock, so the
+/// gateway (and nothing else) can ask the broker to spend bound credentials.
+/// It is never journaled, logged or exposed back to clients.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct BrokerPairing(zeroize::Zeroizing<String>);
+impl BrokerPairing {
+    pub fn new(token: String) -> Self {
+        Self(zeroize::Zeroizing::new(token))
+    }
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+impl std::fmt::Debug for BrokerPairing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("[REDACTED]")
+    }
+}
+
 /// CLI/GUI requests. Agent access must go through the narrower harness interface.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Command {
@@ -526,6 +546,10 @@ pub enum Command {
     },
     Shutdown,
     GatewayStatus,
+    /// Hand the gateway a vault broker pairing minted by a trusted client.
+    PairBroker {
+        pairing: BrokerPairing,
+    },
 }
 impl Command {
     /// A stable operation name for logs and diagnostics; never includes arguments.
@@ -555,6 +579,7 @@ impl Command {
             Self::RunExtension { .. } => "run_extension",
             Self::Shutdown => "shutdown",
             Self::GatewayStatus => "gateway_status",
+            Self::PairBroker { .. } => "pair_broker",
         }
     }
 }
