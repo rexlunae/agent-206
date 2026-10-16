@@ -154,9 +154,10 @@ async fn roles_creation_step_up_reveal_and_lock_revocation() {
         other => panic!("unexpected {other:?}"),
     }
     match b.call(Request::Credentials).await.unwrap() {
-        Reply::Credentials(list) => {
-            assert_eq!(list.len(), 1);
-            assert!(!format!("{list:?}").contains(&value));
+        Reply::Credentials { typed, legacy } => {
+            assert_eq!(typed.len(), 1);
+            assert!(legacy.is_empty());
+            assert!(!format!("{typed:?}").contains(&value));
         }
         other => panic!("unexpected {other:?}"),
     }

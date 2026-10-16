@@ -207,6 +207,11 @@ pub enum Request {
         code: String,
     },
     Credentials,
+    /// Convert a raw entry from before typed credentials into a typed one.
+    AdoptLegacy {
+        name: String,
+        meta: CredentialMeta,
+    },
     PutCredential {
         name: String,
         meta: CredentialMeta,
@@ -335,7 +340,12 @@ pub enum Reply {
         manual_key: WireSecret,
         expires_at: u64,
     },
-    Credentials(Vec<(String, CredentialMeta)>),
+    /// Typed credential metadata, plus names of raw entries written before
+    /// typed credentials existed (adoptable with `AdoptLegacy`). No values.
+    Credentials {
+        typed: Vec<(String, CredentialMeta)>,
+        legacy: Vec<String>,
+    },
     Value(WireValue),
     Provider {
         status: u16,

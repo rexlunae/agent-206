@@ -62,22 +62,41 @@ pub enum Error {
     TotpRejected,
 }
 
-/// Raw keys an ordinary caller may never write, because they hold typed
-/// credential metadata/values, vault-internal state or gateway service records.
-const RESERVED_PREFIXES: &[&str] = &["__", "service:", "messenger/", "cred:", "val:"];
+/// Raw keys an ordinary caller may never write or read, because they hold
+/// vault-internal state (`__`, `service:`, reserved before typed credentials)
+/// or the typed credential layout (`cred:`, `val:`). Any raw entry with
+/// another name, including one written before typed credentials existed,
+/// stays listable and can be adopted as a typed credential.
+const RESERVED_PREFIXES: &[&str] = &["__", "service:", "cred:", "val:"];
 
 fn reserved(name: &str) -> bool {
     name.is_empty() || RESERVED_PREFIXES.iter().any(|p| name.starts_with(p))
+}
+
+/// Typed credential names additionally exclude RustyClaw's gateway-provisioned
+/// `messenger/` namespace and the `:` used by value-key suffixes.
+fn reserved_credential_name(name: &str) -> bool {
+    reserved(name) || name.starts_with("messenger/") || name.contains(':')
 }
 
 /// This type belongs exclusively to the vault broker process.
 pub struct Vault {
     path: PathBuf,
     inner: Option<SecretsManager>,
+    /// Changes on every lock and unlock, so authorizations granted against an
+    /// earlier unlocked session (step-up windows) cannot outlive it.
+    generation: u64,
 }
 impl Vault {
     pub fn locked(path: PathBuf) -> Self {
-        Self { path, inner: None }
+        Self {
+            path,
+            inner: None,
+            generation: 0,
+        }
+    }
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
     pub fn is_locked(&self) -> bool {
         self.inner.is_none()
@@ -98,6 +117,7 @@ impl Vault {
             save_atomic(&inner, &self.path)?;
         }
         self.inner = Some(inner);
+        self.generation += 1;
         Ok(())
     }
     pub fn exists(&self) -> bool {
@@ -109,6 +129,7 @@ impl Vault {
     }
     pub fn lock(&mut self) {
         self.inner = None;
+        self.generation += 1;
     }
     /// Names of ordinary (untyped) entries. Typed credentials and internal
     /// records are listed through [`Vault::credentials`] or not at all.
@@ -238,7 +259,6 @@ pub(crate) mod tests {
             "__rustyclaw_totp_secret",
             "cred:forged",
             "val:forged",
-            "messenger/bot",
             "service:x",
         ] {
             assert!(matches!(
@@ -251,6 +271,13 @@ pub(crate) mod tests {
             ));
         }
         vault.put("plain", Secret::new("v".into())).unwrap();
-        assert_eq!(vault.names().unwrap(), ["plain"]);
+        // Names outside the reserved set, such as a pre-existing raw
+        // `messenger/…` entry, stay readable.
+        vault.put("messenger/bot", Secret::new("m".into())).unwrap();
+        assert_eq!(vault.names().unwrap(), ["messenger/bot", "plain"]);
+        assert_eq!(
+            vault.with_secret("messenger/bot", str::to_owned).unwrap(),
+            "m"
+        );
     }
 }

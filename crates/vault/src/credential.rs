@@ -1,7 +1,8 @@
 //! Typed credentials stored with RustyClaw's key layout: metadata under
 //! `cred:<name>`, values under `val:<name>` plus kind-specific suffixes.
 use crate::{
-    AccessContext, CredentialKind, CredentialMeta, Error, Secret, StepUpWindow, Vault, reserved,
+    AccessContext, CredentialKind, CredentialMeta, Error, Secret, StepUpWindow, Vault,
+    reserved_credential_name,
 };
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, time::Instant};
@@ -75,8 +76,14 @@ fn exposed_map(map: &BTreeMap<String, Secret>) -> Zeroizing<String> {
 }
 
 fn secret_map(json: &Secret) -> Result<BTreeMap<String, Secret>, Error> {
-    json.expose(|j| serde_json::from_str::<BTreeMap<String, String>>(j))
-        .map(|m| m.into_iter().map(|(k, v)| (k, Secret::new(v))).collect())
+    // Values deserialize straight into zeroizing buffers and are moved, not
+    // copied, into `Secret`s, so no plaintext copy outlives this call.
+    json.expose(|j| serde_json::from_str::<BTreeMap<String, Zeroizing<String>>>(j))
+        .map(|m| {
+            m.into_iter()
+                .map(|(k, mut v)| (k, Secret::new(std::mem::take(&mut *v))))
+                .collect()
+        })
         .map_err(|_| Error::Corrupted)
 }
 
@@ -113,7 +120,7 @@ impl Vault {
         meta: &CredentialMeta,
         value: CredentialValue,
     ) -> Result<(), Error> {
-        if reserved(name) || name.contains(':') {
+        if reserved_credential_name(name) {
             return Err(Error::InvalidName);
         }
         if !value.fits(meta.kind) {
@@ -201,7 +208,13 @@ impl Vault {
         change: impl FnOnce(&mut CredentialMeta),
     ) -> Result<(), Error> {
         let mut meta = self.credential(name)?;
+        let kind = meta.kind;
         change(&mut meta);
+        // Each kind has its own value layout; changing it here would strand the
+        // stored value. A new kind needs a new value through `put_credential`.
+        if meta.kind != kind {
+            return Err(Error::KindMismatch);
+        }
         let json = serde_json::to_string(&meta).map_err(|_| Error::Corrupted)?;
         let key = meta_key(name);
         self.commit(|inner| inner.set(&key, json.as_str()))
@@ -215,6 +228,38 @@ impl Vault {
             for key in keys {
                 let _ = inner.remove(&key);
             }
+        })
+    }
+
+    /// Convert a raw entry written before typed credentials existed into a
+    /// single-value typed credential, in one atomic write. The raw entry is
+    /// removed; a typed credential of the same name must not already exist.
+    pub fn adopt_raw(&mut self, name: &str, meta: &CredentialMeta) -> Result<(), Error> {
+        if reserved_credential_name(name) {
+            return Err(Error::InvalidName);
+        }
+        if !matches!(
+            meta.kind,
+            CredentialKind::ApiKey
+                | CredentialKind::HttpPasskey
+                | CredentialKind::Token
+                | CredentialKind::SecureNote
+                | CredentialKind::Other
+        ) {
+            return Err(Error::KindMismatch);
+        }
+        let value = self.raw(name)?.ok_or(Error::NotFound)?;
+        if self.has_raw(&meta_key(name))? {
+            return Err(Error::InvalidName);
+        }
+        let meta_json = serde_json::to_string(meta).map_err(|_| Error::Corrupted)?;
+        let (meta_k, val_k) = (meta_key(name), val_key(name));
+        value.expose(|v| {
+            self.commit(|inner| {
+                inner.set(&meta_k, meta_json.as_str());
+                inner.set(&val_k, v);
+                let _ = inner.remove(name);
+            })
         })
     }
 
@@ -266,7 +311,7 @@ impl Vault {
         now: Instant,
         use_value: impl FnOnce(&CredentialValue) -> T,
     ) -> Result<T, Error> {
-        if !step_up.is_active(now) {
+        if !step_up.is_active(now, self.generation()) {
             return Err(crate::Denial::AuthenticationRequired.into());
         }
         let meta = self.credential(name)?;
@@ -291,10 +336,9 @@ impl Vault {
 
     fn load_value(&self, name: &str, kind: CredentialKind) -> Result<CredentialValue, Error> {
         let val = val_key(name);
+        // Metadata without its value is a damaged record, never an empty secret.
         let get = |suffix: &str| -> Result<Secret, Error> {
-            Ok(self
-                .raw(&format!("{val}{suffix}"))?
-                .unwrap_or_else(|| Secret::new(String::new())))
+            self.raw(&format!("{val}{suffix}"))?.ok_or(Error::Corrupted)
         };
         Ok(match kind {
             CredentialKind::UsernamePassword => CredentialValue::UserPass {
@@ -303,18 +347,18 @@ impl Vault {
             },
             CredentialKind::SshKey => CredentialValue::SshKeyPair {
                 private_key: get("")?,
-                public_key: get(":pub")?,
+                // RustyClaw's generic store wrote SSH keys without `:pub`; the
+                // public half is not secret and may legitimately be absent.
+                public_key: self
+                    .raw(&format!("{val}:pub"))?
+                    .unwrap_or_else(|| Secret::new(String::new())),
             },
             CredentialKind::FormAutofill => {
-                let json = self.raw(&format!("{val}:fields"))?;
-                CredentialValue::FormFields(match json {
-                    Some(json) => secret_map(&json)?,
-                    None => BTreeMap::new(),
-                })
+                CredentialValue::FormFields(secret_map(&get(":fields")?)?)
             }
             CredentialKind::PaymentMethod => {
                 let mut card: Card = get(":card")?
-                    .expose(|j| serde_json::from_str(if j.is_empty() { "{}" } else { j }))
+                    .expose(|j| serde_json::from_str::<Card>(j))
                     .map_err(|_| Error::Corrupted)?;
                 let extra = match self.raw(&format!("{val}:card_extra"))? {
                     Some(json) => secret_map(&json)?,
@@ -483,6 +527,94 @@ mod tests {
     }
 
     #[test]
+    fn missing_values_are_corruption_and_kinds_cannot_change_in_place() {
+        let (_dir, mut vault, _) = unlocked();
+        vault.set_agent_access(true).unwrap();
+        let name = random();
+        vault
+            .put_credential(
+                &name,
+                &meta(CredentialKind::ApiKey, AccessPolicy::Always),
+                CredentialValue::Single(Secret::new(random())),
+            )
+            .unwrap();
+        assert!(matches!(
+            vault.update_credential(&name, |m| m.kind = CredentialKind::UsernamePassword),
+            Err(Error::KindMismatch)
+        ));
+        assert_eq!(
+            vault.credential(&name).unwrap().kind,
+            CredentialKind::ApiKey
+        );
+        // An imported record whose value key is missing must not read as "".
+        vault
+            .commit(|inner| {
+                let _ = inner.remove(&format!("val:{name}"));
+            })
+            .unwrap();
+        assert!(matches!(
+            vault.use_credential(&name, &AccessContext::default(), |_| ()),
+            Err(Error::Corrupted)
+        ));
+        let login = random();
+        vault
+            .put_credential(
+                &login,
+                &meta(CredentialKind::UsernamePassword, AccessPolicy::Always),
+                CredentialValue::UserPass {
+                    username: Secret::new(random()),
+                    password: Secret::new(random()),
+                },
+            )
+            .unwrap();
+        vault
+            .commit(|inner| {
+                let _ = inner.remove(&format!("val:{login}:user"));
+            })
+            .unwrap();
+        assert!(matches!(
+            vault.use_credential(&login, &AccessContext::default(), |_| ()),
+            Err(Error::Corrupted)
+        ));
+    }
+
+    #[test]
+    fn legacy_raw_entries_can_be_adopted_once() {
+        let (_dir, mut vault, _) = unlocked();
+        let (name, value) = (format!("messenger/{}", random()), random());
+        vault.put(&name, Secret::new(value.clone())).unwrap();
+        // `messenger/` stays reserved for typed names (RustyClaw service records).
+        let adopted = random();
+        vault.put(&adopted, Secret::new(value.clone())).unwrap();
+        let mut target = meta(CredentialKind::ApiKey, AccessPolicy::WithApproval);
+        assert!(matches!(
+            vault.adopt_raw(&name, &target),
+            Err(Error::InvalidName)
+        ));
+        target.kind = CredentialKind::UsernamePassword;
+        assert!(matches!(
+            vault.adopt_raw(&adopted, &target),
+            Err(Error::KindMismatch)
+        ));
+        target.kind = CredentialKind::Token;
+        vault.adopt_raw(&adopted, &target).unwrap();
+        assert_eq!(vault.names().unwrap(), [name]);
+        let mut step = StepUpWindow::default();
+        step.grant(Instant::now(), vault.generation());
+        let got = vault
+            .reveal_credential(&adopted, &step, Instant::now(), |v| match v {
+                CredentialValue::Single(s) => s.expose(str::to_owned),
+                _ => panic!("wrong shape"),
+            })
+            .unwrap();
+        assert_eq!(got, value);
+        assert!(matches!(
+            vault.adopt_raw(&adopted, &target),
+            Err(Error::NotFound)
+        ));
+    }
+
+    #[test]
     fn rejects_mismatched_kinds_names_and_corrupted_metadata() {
         let (_dir, mut vault, _) = unlocked();
         let value = || CredentialValue::Single(Secret::new(random()));
@@ -581,7 +713,7 @@ mod tests {
 
     #[test]
     fn reveal_needs_an_active_step_up_window() {
-        let (_dir, mut vault, _) = unlocked();
+        let (_dir, mut vault, password) = unlocked();
         let name = random();
         let value = random();
         let mut held = meta(CredentialKind::Token, AccessPolicy::Always);
@@ -595,18 +727,26 @@ mod tests {
             .unwrap();
         let start = Instant::now();
         let mut window = StepUpWindow::default();
-        let reveal = |w: &StepUpWindow, at| {
+        let reveal = |vault: &Vault, w: &StepUpWindow, at| {
             vault.reveal_credential(&name, w, at, |v| match v {
                 CredentialValue::Single(s) => s.expose(str::to_owned),
                 _ => panic!("wrong shape"),
             })
         };
-        assert!(reveal(&window, start).is_err());
-        window.grant(start);
-        assert_eq!(reveal(&window, start).unwrap(), value);
-        assert!(reveal(&window, start + StepUpWindow::DURATION).is_err());
-        window.grant(start);
+        assert!(reveal(&vault, &window, start).is_err());
+        window.grant(start, vault.generation());
+        assert_eq!(reveal(&vault, &window, start).unwrap(), value);
+        assert!(reveal(&vault, &window, start + StepUpWindow::DURATION).is_err());
+        window.grant(start, vault.generation());
         window.revoke();
-        assert!(reveal(&window, start).is_err());
+        assert!(reveal(&vault, &window, start).is_err());
+        // A step-up granted before a lock does not survive the next unlock.
+        window.grant(start, vault.generation());
+        vault.lock();
+        vault.unlock(&password).unwrap();
+        assert!(matches!(
+            reveal(&vault, &window, start),
+            Err(Error::Denied(Denial::AuthenticationRequired))
+        ));
     }
 }

@@ -20,7 +20,7 @@ already-installed remote gateway. With no subcommand, the app launches the deskt
 | config get / set / unset | settings exports TOML; settings --apply FILE uses revision-checked shared API | Reviewed field-level commands and parity aliases |
 | command / ask / chat | new TITLE, chat THREAD TEXT, cancel THREAD | Streaming, interactive/headless sessions, stdin/file prompts and clear compatibility options |
 | model / providers | providers presets/add, refresh-models; API-only catalogs | Model/account inspection and selection commands with no static model defaults |
-| secrets | vault init/unlock/lock/status/stop, list, add, policy, bind, enable/disable, delete, agent-access, reveal (step-up), totp enroll/remove, all through the vault broker | SSH key, form and payment entry; recovery codes; key-file import; remote broker over SSH; GUI parity |
+| secrets | vault init/unlock/lock/status/stop, list, add, adopt (untyped legacy entries), policy, bind, enable/disable, delete, agent-access, reveal (step-up), totp enroll/remove, all through the vault broker | SSH key, form and payment entry; recovery codes; key-file import; remote broker over SSH; GUI parity |
 | import | Not implemented | RustyClaw, Cline, Claude Code, Codex, DeepSeek Harness and extensible adapters in imports.md |
 | skills / registries | extension ID executes the bounded bundled WASM tool | Reviewed install/update/list/export and separate instruction/skill management |
 | swarm / projects | project NAME ROOT creates a coordinator; snapshots retain linked threads | Delegation/task/project orchestration and scoped steering/control commands |

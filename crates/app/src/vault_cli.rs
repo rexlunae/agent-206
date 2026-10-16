@@ -39,6 +39,20 @@ pub enum VaultAction {
         #[arg(long = "destination")]
         destinations: Vec<String>,
     },
+    /// Turn an untyped entry from an older vault into a typed credential.
+    Adopt {
+        name: String,
+        #[arg(long, value_enum, default_value = "api-key")]
+        kind: Kind,
+        #[arg(long, value_enum, default_value = "ask")]
+        policy: Policy,
+        #[arg(long = "skill")]
+        skills: Vec<String>,
+        #[arg(long = "trigger")]
+        triggers: Vec<String>,
+        #[arg(long = "destination")]
+        destinations: Vec<String>,
+    },
     /// Change who may use a credential.
     Policy {
         name: String,
@@ -326,8 +340,11 @@ pub fn run(root: &Path, action: VaultAction) -> Result<()> {
                 println!("agent access\t{}", known(s.agent_access));
             }
             VaultAction::List => match client.call(Request::Credentials).await? {
-                Reply::Credentials(list) => {
-                    for (name, meta) in list {
+                Reply::Credentials { typed, legacy } => {
+                    for name in legacy {
+                        println!("{name}\tuntyped (convert with `agent206 vault adopt`)");
+                    }
+                    for (name, meta) in typed {
                         let state = if meta.disabled { "\tdisabled" } else { "" };
                         println!(
                             "{name}\t{:?}\t{:?}\t{}{state}",
@@ -389,6 +406,40 @@ pub fn run(root: &Path, action: VaultAction) -> Result<()> {
                     }
                 }
                 println!("Credential stored");
+            }
+            VaultAction::Adopt {
+                name,
+                kind,
+                policy: chosen,
+                skills,
+                triggers,
+                destinations,
+            } => {
+                let kind = match kind {
+                    Kind::ApiKey => CredentialKind::ApiKey,
+                    Kind::Token => CredentialKind::Token,
+                    Kind::Passkey => CredentialKind::HttpPasskey,
+                    Kind::Note => CredentialKind::SecureNote,
+                    Kind::Other => CredentialKind::Other,
+                    Kind::Login => {
+                        bail!("an untyped entry holds one value; choose a single-value kind")
+                    }
+                };
+                step_up(&mut client).await?;
+                client
+                    .call(Request::AdoptLegacy {
+                        meta: CredentialMeta {
+                            label: name.clone(),
+                            kind,
+                            policy: policy(chosen, skills, triggers),
+                            description: None,
+                            disabled: false,
+                            destinations,
+                        },
+                        name,
+                    })
+                    .await?;
+                println!("Credential converted");
             }
             VaultAction::Policy {
                 name,

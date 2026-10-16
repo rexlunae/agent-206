@@ -38,6 +38,7 @@ impl<K: Hash + Eq + Clone> AuthThrottle<K> {
     pub const MAX_FAILURES: u32 = 3;
     pub const WINDOW: Duration = Duration::from_secs(60);
     pub const LOCKOUT: Duration = Duration::from_secs(30);
+    const EVICT_ABOVE: usize = 1024;
 
     fn table(&self) -> std::sync::MutexGuard<'_, HashMap<K, Attempts>> {
         // A panic while holding the lock cannot leave a weaker state than the
@@ -89,39 +90,50 @@ impl<K: Hash + Eq + Clone> AuthThrottle<K> {
             entry.first_failure = now;
         }
         entry.failures += 1;
-        (entry.failures >= Self::MAX_FAILURES).then(|| {
+        let locked = entry.failures >= Self::MAX_FAILURES;
+        if locked {
             entry.locked_until = Some(now + Self::LOCKOUT);
-            Lockout {
-                retry_after: Self::LOCKOUT,
-            }
+        }
+        // Forget principals whose window and lockout have both lapsed, so
+        // one-off principals cannot accumulate without bound.
+        if table.len() > Self::EVICT_ABOVE {
+            table.retain(|_, a| {
+                a.locked_until.is_some_and(|until| now < until)
+                    || now.saturating_duration_since(a.first_failure) <= Self::WINDOW
+            });
+        }
+        locked.then_some(Lockout {
+            retry_after: Self::LOCKOUT,
         })
     }
-
     pub fn success(&self, key: &K) {
         self.table().remove(key);
     }
 }
 
-/// A short-lived reveal authorization for one connection. Lock, reconnect and
-/// expiry each end it; it never authorizes agent use.
+/// A short-lived reveal authorization for one connection. Expiry, revocation
+/// and any vault lock (a new [`crate::Vault::generation`]) each end it; it
+/// never authorizes agent use.
 #[derive(Debug, Default)]
 pub struct StepUpWindow {
-    granted_at: Option<Instant>,
+    granted: Option<(Instant, u64)>,
 }
 
 impl StepUpWindow {
     pub const DURATION: Duration = Duration::from_secs(120);
 
-    /// Call only after a fresh password/TOTP verification succeeded.
-    pub fn grant(&mut self, now: Instant) {
-        self.granted_at = Some(now);
+    /// Call only after a fresh password/TOTP verification succeeded, with the
+    /// generation of the vault session it was verified against.
+    pub fn grant(&mut self, now: Instant, generation: u64) {
+        self.granted = Some((now, generation));
     }
     pub fn revoke(&mut self) {
-        self.granted_at = None;
+        self.granted = None;
     }
-    pub fn is_active(&self, now: Instant) -> bool {
-        self.granted_at
-            .is_some_and(|at| now >= at && now.duration_since(at) < Self::DURATION)
+    pub fn is_active(&self, now: Instant, generation: u64) -> bool {
+        self.granted.is_some_and(|(at, granted)| {
+            granted == generation && now >= at && now.duration_since(at) < Self::DURATION
+        })
     }
 }
 
@@ -191,9 +203,23 @@ mod tests {
     fn step_up_expires() {
         let mut window = StepUpWindow::default();
         let t0 = Instant::now();
-        assert!(!window.is_active(t0));
-        window.grant(t0);
-        assert!(window.is_active(t0 + StepUpWindow::DURATION - Duration::from_millis(1)));
-        assert!(!window.is_active(t0 + StepUpWindow::DURATION));
+        assert!(!window.is_active(t0, 1));
+        window.grant(t0, 1);
+        assert!(window.is_active(t0 + StepUpWindow::DURATION - Duration::from_millis(1), 1));
+        assert!(!window.is_active(t0 + StepUpWindow::DURATION, 1));
+        // A later vault session (lock, then unlock) voids the window.
+        assert!(!window.is_active(t0, 2));
+    }
+
+    #[test]
+    fn lapsed_principals_are_evicted() {
+        let throttle = AuthThrottle::<u32>::default();
+        let t0 = Instant::now();
+        for key in 0..=AuthThrottle::<u32>::EVICT_ABOVE as u32 {
+            throttle.failure(&key, t0);
+        }
+        let later = t0 + AuthThrottle::<u32>::WINDOW + Duration::from_secs(1);
+        throttle.failure(&u32::MAX, later);
+        assert_eq!(throttle.table().len(), 1);
     }
 }

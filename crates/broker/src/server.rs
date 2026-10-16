@@ -10,10 +10,7 @@ use a206_vault::{
 use futures_util::StreamExt;
 use std::{
     path::Path,
-    sync::{
-        Arc, Mutex, MutexGuard,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::{Arc, Mutex, MutexGuard},
     time::{Duration, Instant},
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -27,9 +24,6 @@ const MAX_DESTINATIONS: usize = 16;
 struct Shared {
     vault: Mutex<Vault>,
     throttle: AuthThrottle<()>,
-    /// Bumped on every lock/unlock transition; step-ups from an earlier epoch
-    /// are void, so locking revokes every connection's reveal window.
-    epoch: AtomicU64,
     stop: CancellationToken,
     http: reqwest::Client,
 }
@@ -38,27 +32,13 @@ impl Shared {
     fn vault(&self) -> MutexGuard<'_, Vault> {
         self.vault.lock().unwrap_or_else(|e| e.into_inner())
     }
-    fn bump(&self) -> u64 {
-        self.epoch.fetch_add(1, Ordering::SeqCst) + 1
-    }
 }
 
 #[derive(Default)]
 struct Session {
     role: Option<Role>,
     step_up: StepUpWindow,
-    step_up_epoch: u64,
     pending: Option<PendingTotp>,
-}
-
-impl Session {
-    fn stepped_up(&self, shared: &Shared, now: Instant) -> bool {
-        self.step_up.is_active(now) && self.step_up_epoch == shared.epoch.load(Ordering::SeqCst)
-    }
-    fn grant(&mut self, shared: &Shared, now: Instant) {
-        self.step_up.grant(now);
-        self.step_up_epoch = shared.epoch.load(Ordering::SeqCst);
-    }
 }
 
 struct Outbound {
@@ -202,8 +182,9 @@ fn handle(shared: &Shared, session: &mut Session, request: Request) -> Handled {
         }
         _ => {}
     }
-    let require_step_up = |session: &Session| {
-        if session.stepped_up(shared, now) {
+    // Step-ups are bound to the vault generation, so any lock voids them.
+    let require_step_up = |session: &Session, generation: u64| {
+        if session.step_up.is_active(now, generation) {
             Ok(())
         } else {
             Err(BrokerError::StepUpRequired)
@@ -219,7 +200,7 @@ fn handle(shared: &Shared, session: &mut Session, request: Request) -> Handled {
                 unlocked,
                 totp_enrolled: vault.totp_enrolled().ok(),
                 agent_access: vault.agent_access().ok(),
-                step_up_active: unlocked && session.stepped_up(shared, now),
+                step_up_active: unlocked && session.step_up.is_active(now, vault.generation()),
             })))
         }
         Request::Unlock {
@@ -263,24 +244,20 @@ fn handle(shared: &Shared, session: &mut Session, request: Request) -> Handled {
                     return Err(failed(shared, now, totp_error(outcome)));
                 }
             }
+            let generation = vault.generation();
             drop(vault);
             shared.throttle.success(&());
-            if was_locked {
-                shared.bump();
-            }
-            session.grant(shared, now);
+            session.step_up.grant(now, generation);
             ok()
         }
         Request::Lock => {
             shared.vault().lock();
-            shared.bump();
             session.step_up.revoke();
             session.pending = None;
             ok()
         }
         Request::Shutdown => {
             shared.vault().lock();
-            shared.bump();
             shared.stop.cancel();
             ok()
         }
@@ -308,13 +285,14 @@ fn handle(shared: &Shared, session: &mut Session, request: Request) -> Handled {
                     return Err(failed(shared, now, BrokerError::AuthenticationFailed));
                 }
             }
+            let generation = vault.generation();
             drop(vault);
             shared.throttle.success(&());
-            session.grant(shared, now);
+            session.step_up.grant(now, generation);
             ok()
         }
         Request::BeginTotp { account } => {
-            require_step_up(session)?;
+            require_step_up(session, shared.vault().generation())?;
             check_name(&account)?;
             let pending = shared
                 .vault()
@@ -388,9 +366,22 @@ fn handle(shared: &Shared, session: &mut Session, request: Request) -> Handled {
                 Err(error) => Err(vault_error(error)),
             }
         }
-        Request::Credentials => Ok(Outcome::Reply(Reply::Credentials(
-            shared.vault().credentials().map_err(vault_error)?,
-        ))),
+        Request::Credentials => {
+            let vault = shared.vault();
+            Ok(Outcome::Reply(Reply::Credentials {
+                typed: vault.credentials().map_err(vault_error)?,
+                legacy: vault.names().map_err(vault_error)?,
+            }))
+        }
+        Request::AdoptLegacy { name, mut meta } => {
+            require_step_up(session, shared.vault().generation())?;
+            meta.destinations = origins(meta.destinations)?;
+            shared
+                .vault()
+                .adopt_raw(&name, &meta)
+                .map_err(vault_error)?;
+            ok()
+        }
         Request::PutCredential {
             name,
             mut meta,
@@ -400,7 +391,7 @@ fn handle(shared: &Shared, session: &mut Session, request: Request) -> Handled {
             meta.destinations = origins(meta.destinations)?;
             let mut vault = shared.vault();
             match vault.credential(&name) {
-                Ok(_) => require_step_up(session)?,
+                Ok(_) => require_step_up(session, vault.generation())?,
                 Err(VaultError::NotFound) => {}
                 Err(error) => return Err(vault_error(error)),
             }
@@ -415,7 +406,7 @@ fn handle(shared: &Shared, session: &mut Session, request: Request) -> Handled {
             disabled,
             destinations,
         } => {
-            require_step_up(session)?;
+            require_step_up(session, shared.vault().generation())?;
             let destinations = destinations.map(origins).transpose()?;
             shared
                 .vault()
@@ -434,7 +425,7 @@ fn handle(shared: &Shared, session: &mut Session, request: Request) -> Handled {
             ok()
         }
         Request::DeleteCredential { name } => {
-            require_step_up(session)?;
+            require_step_up(session, shared.vault().generation())?;
             shared
                 .vault()
                 .delete_credential(&name)
@@ -442,7 +433,7 @@ fn handle(shared: &Shared, session: &mut Session, request: Request) -> Handled {
             ok()
         }
         Request::SetAgentAccess { enabled } => {
-            require_step_up(session)?;
+            require_step_up(session, shared.vault().generation())?;
             shared
                 .vault()
                 .set_agent_access(enabled)
@@ -450,7 +441,7 @@ fn handle(shared: &Shared, session: &mut Session, request: Request) -> Handled {
             ok()
         }
         Request::Reveal { name } => {
-            require_step_up(session)?;
+            require_step_up(session, shared.vault().generation())?;
             let value = shared
                 .vault()
                 .reveal_credential(&name, &session.step_up, now, |v| WireValue::from(v))
@@ -601,7 +592,6 @@ pub async fn serve(root: &Path) -> std::io::Result<()> {
     let shared = Arc::new(Shared {
         vault: Mutex::new(Vault::locked(dir.join("secrets.json"))),
         throttle: AuthThrottle::default(),
-        epoch: AtomicU64::new(0),
         stop: CancellationToken::new(),
         http: reqwest::Client::builder()
             .timeout(Duration::from_secs(180))
