@@ -107,7 +107,7 @@ impl Vault {
             if enabled {
                 inner.set(AGENT_ACCESS_KEY, "enabled");
             } else {
-                let _ = inner.remove(AGENT_ACCESS_KEY);
+                crate::forget(inner, AGENT_ACCESS_KEY);
             }
         })
     }
@@ -175,7 +175,7 @@ impl Vault {
         let stale = self.value_keys(name)?;
         self.commit(|inner| {
             for key in stale {
-                let _ = inner.remove(&key);
+                crate::forget(inner, &key);
             }
             for (key, value) in &entries {
                 inner.set(key, value.as_str());
@@ -226,7 +226,7 @@ impl Vault {
         keys.push(meta_key(name));
         self.commit(|inner| {
             for key in keys {
-                let _ = inner.remove(&key);
+                crate::forget(inner, &key);
             }
         })
     }
@@ -265,7 +265,7 @@ impl Vault {
             self.commit(|inner| {
                 inner.set(&meta_k, meta_json.as_str());
                 inner.set(&val_k, v);
-                let _ = inner.remove(legacy);
+                crate::forget(inner, legacy);
             })
         })
     }
@@ -556,7 +556,7 @@ mod tests {
         // An imported record whose value key is missing must not read as "".
         vault
             .commit(|inner| {
-                let _ = inner.remove(&format!("val:{name}"));
+                crate::forget(inner, &format!("val:{name}"));
             })
             .unwrap();
         assert!(matches!(
@@ -576,7 +576,7 @@ mod tests {
             .unwrap();
         vault
             .commit(|inner| {
-                let _ = inner.remove(&format!("val:{login}:user"));
+                crate::forget(inner, &format!("val:{login}:user"));
             })
             .unwrap();
         assert!(matches!(

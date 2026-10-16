@@ -1,4 +1,5 @@
 //! One user-private gateway process per state directory, shared by all clients.
+use a206_core::Ignore;
 use anyhow::{Context, Result};
 use std::{path::Path, process::Stdio};
 pub fn is_stopped(root: &Path) -> bool {
@@ -86,7 +87,7 @@ pub async fn daemon(root: &Path, explicit: bool) -> Result<()> {
             _ = stop.cancelled() => break,
             Some(result) = connections.join_next(), if !connections.is_empty() => {
                 if let Err(error) = result {
-                    eprintln!("gateway connection task failed: {error}");
+                    crate::error::handle("gateway_connection", &error.into());
                 }
                 continue;
             }
@@ -95,7 +96,10 @@ pub async fn daemon(root: &Path, explicit: bool) -> Result<()> {
         let gateway = gateway.clone();
         connections.spawn(async move {
             if let Err(error) = crate::gateway::serve_connection(gateway, read, write).await {
-                eprintln!("gateway client disconnected: {error}");
+                crate::error::handle(
+                    "gateway_connection",
+                    &error.context("gateway client disconnected"),
+                );
             }
         });
     }
@@ -105,14 +109,16 @@ pub async fn daemon(root: &Path, explicit: bool) -> Result<()> {
     // Stop accepting new clients, but flush replies for already accepted work,
     // including independent Shutdown requests queued behind the first one.
     // Retain profile ownership until this bounded drain finishes.
-    let _drain = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
         while let Some(result) = connections.join_next().await {
             if let Err(error) = result {
-                eprintln!("gateway connection task failed: {error}");
+                crate::error::handle("gateway_connection", &error.into());
             }
         }
     })
-    .await;
+    .await
+    // Connections still open after the bounded drain are aborted below.
+    .ignore();
     connections.abort_all();
     while connections.join_next().await.is_some() {}
     Ok(())
@@ -155,13 +161,15 @@ pub async fn connect(root: &Path, start: bool, explicit: bool) -> Result<tokio::
     for _ in 0..100 {
         if let Ok(stream) = tokio::net::UnixStream::connect(&path).await {
             tokio::spawn(async move {
-                let _exit_status = child.wait().await;
+                // Reaps the detached daemon; its exit is reported through its own log.
+                child.wait().await.ignore();
             });
             return Ok(stream);
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
-    let _kill = child.kill().await;
+    // The readiness failure below is the error reported; the kill is cleanup.
+    child.kill().await.ignore();
     anyhow::bail!(
         "gateway did not become ready; inspect {}",
         root.join("gateway.log").display()
@@ -195,7 +203,8 @@ pub async fn stdio(root: &Path, start: bool, explicit: bool) -> Result<()> {
         tokio::spawn(async move { tokio::io::copy(&mut reader, &mut tokio::io::stdout()).await });
     tokio::select! {
         result = &mut input => { result??; output.await??; },
-        result = &mut output => { input.abort(); let _cancelled = input.await; result??; }
+        // The aborted input task's cancellation is expected; the output result is what matters.
+        result = &mut output => { input.abort(); input.await.ignore(); result??; }
     }
     Ok(())
 }
@@ -229,7 +238,8 @@ impl std::os::fd::AsFd for NonblockingInput {
 #[cfg(unix)]
 impl Drop for NonblockingInput {
     fn drop(&mut self) {
-        let _restore = nix::fcntl::fcntl(&self.file, nix::fcntl::FcntlArg::F_SETFL(self.flags));
+        // Restoring stdin flags on exit is best effort; Drop has no caller to tell.
+        nix::fcntl::fcntl(&self.file, nix::fcntl::FcntlArg::F_SETFL(self.flags)).ignore();
     }
 }
 #[cfg(not(unix))]

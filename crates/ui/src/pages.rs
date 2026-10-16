@@ -1,5 +1,5 @@
-use crate::{PageFrame, State, call, dispatch, route::Route};
-use a206_core::{Command, DownloadState, Mode, Reply};
+use crate::{PageFrame, State, call, dispatch, error::ErrorNotice, route::Route};
+use a206_core::{Command, DownloadState, ErrorReport, Mode, Reply};
 use fc_dioxus::prelude::*;
 use uuid::Uuid;
 #[component]
@@ -130,7 +130,7 @@ pub fn Downloads() -> Element {
                   progress: download.total.filter(|t| *t > 0).map(|total| ProgressValue::Of { value: download.received as f64, max: total as f64 }),
                   status: rsx! { Badge { "{download.state:?}" } },
                   actions: rsx! { if running { Button { variant: ButtonVariant::Ghost, onclick: move |_| dispatch(state, Command::CancelDownload { id }), "Cancel" } } },
-                  if let Some(error) = &download.error { p { "{error}" } }
+                  if let Some(error) = download.failure_report() { ErrorNotice { report: error, title: "Download failed".to_string() } }
               } }
             }
         }
@@ -140,14 +140,16 @@ pub fn Downloads() -> Element {
 pub fn Extensions() -> Element {
     let state = use_context::<State>();
     let mut output = use_signal(String::new);
+    let mut failure = use_signal(|| None::<ErrorReport>);
     rsx! { PageFrame { kicker: "Extend your workspace", title: "Small tools. New possibilities.", description: "Compiled WASM extensions share a bounded runtime and explicit permissions.",
         div { class: "a206-grid", for plugin in &state.data.read().plugins {
             { let id = plugin.id.clone(); rsx! { Card {
                 CardHeader { CardTitle { "{plugin.name}" } CardSubtitle { "{plugin.description}" } }
                 CardBody { Badge { "Bundled WASM" } p { class: "a206-muted", "Requested capabilities: {plugin.capabilities.len()}" } }
-                CardFooter { Button { variant: ButtonVariant::Secondary, onclick: move |_| { let id = id.clone(); spawn(async move { match call(Command::RunExtension { id, input: String::new() }).await { Ok(Reply::Text(text)) => output.set(text), Ok(Reply::Error { message }) => output.set(message), Err(e) => output.set(e), _ => {} } }); }, "Open extension" } }
+                CardFooter { Button { variant: ButtonVariant::Secondary, onclick: move |_| { let id = id.clone(); spawn(async move { match call(Command::RunExtension { id, input: String::new() }).await { Ok(Reply::Text(text)) => { failure.set(None); output.set(text) } Err(e) => { output.set(String::new()); failure.set(Some(e)) } _ => {} } }); }, "Open extension" } }
             } } }
         } }
+        if let Some(report) = failure() { ErrorNotice { report, title: "Extension failed".to_string() } }
         if !output().is_empty() { Card { CardBody { p { class: "a206-message-text", "{output}" } } } }
         p { class: "a206-muted", "Agent-created extension installation and capability-bearing host APIs are still under development." }
     } }
@@ -170,12 +172,18 @@ pub fn Documents() -> Element {
     let mut project = use_signal(String::new);
     let mut path = use_signal(String::new);
     let mut output = use_signal(String::new);
+    let mut failure = use_signal(|| None::<ErrorReport>);
     let read = move |command| {
         spawn(async move {
             match call(command).await {
-                Ok(Reply::Text(text)) => output.set(text),
-                Ok(Reply::Error { message }) => output.set(message),
-                Err(e) => output.set(e),
+                Ok(Reply::Text(text)) => {
+                    failure.set(None);
+                    output.set(text);
+                }
+                Err(e) => {
+                    output.set(String::new());
+                    failure.set(Some(e));
+                }
                 _ => {}
             }
         });
@@ -189,6 +197,7 @@ pub fn Documents() -> Element {
             Button { variant: ButtonVariant::Primary, onclick: move |_| if let Ok(project) = Uuid::parse_str(&project()) { read(Command::ReadDocument { project, path: path() }); }, "Read document" }
             Button { variant: ButtonVariant::Secondary, onclick: move |_| if let Ok(project) = Uuid::parse_str(&project()) { read(Command::GitStatus { project }); }, "Git status" }
         }
+        if let Some(report) = failure() { ErrorNotice { report } }
         Card { CardBody { if output().is_empty() { EmptyState { compact: true, title: rsx! { "A closer look" }, body: rsx! { "Select a project, then read a document or inspect its Git status." } } } else { pre { class: "a206-document", "{output}" } } } }
     } }
 }
@@ -254,8 +263,8 @@ pub fn Gateway() -> Element {
                         dt { "Accepting work" } dd { match info.accepting_work { Some(true) => "Yes", Some(false) => "No · shutdown cleanup", None => "Not reported" } }
                     }
                 }
-                if let Some(error) = report.as_ref().and_then(|report| report.error.as_ref()) {
-                    Alert { title: rsx! { "Connection needs attention" }, "{error}" }
+                if let Some(error) = report.as_ref().and_then(|report| report.failure_report()) {
+                    ErrorNotice { report: error, title: "Connection needs attention".to_string() }
                 }
             }
             // The web bridge's gateway is chosen on its server with `agent206 gateway setup`.

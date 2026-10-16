@@ -77,6 +77,10 @@ impl Store {
         for thread in &mut store.state.threads {
             if thread.state == RunState::Running {
                 thread.state = RunState::Failed;
+                thread.error = Some(a206_core::ErrorReport::new(
+                    a206_core::ErrorKind::Unavailable,
+                    "The gateway restarted while this run was in progress.",
+                ));
             }
         }
         for download in &mut store.state.downloads {
@@ -85,10 +89,10 @@ impl Store {
                 DownloadState::Running | DownloadState::Queued
             ) {
                 download.state = DownloadState::Failed;
-                download.error = Some(
-                    "Gateway restarted; partial file retained. Start a new transfer to retry."
-                        .into(),
-                );
+                download.fail(a206_core::ErrorReport::new(
+                    a206_core::ErrorKind::Cancelled,
+                    "Gateway restarted; partial file retained. Start a new transfer to retry.",
+                ));
             }
         }
         store.persist(None)?;
@@ -160,12 +164,22 @@ impl Store {
             .optional()?;
         if let Some((request, reply)) = previous {
             if request != body {
-                bail!("request id reused with a different command");
+                return Err(a206_core::ErrorReport::new(
+                    a206_core::ErrorKind::Conflict,
+                    "request id reused with a different command",
+                )
+                .into());
             }
             return Ok(Some(if let Some(reply) = reply {
                 rmp_serde::from_slice(&reply)?
             } else {
-                Reply::Error { message: "request was already accepted; outcome is pending or unknown; refresh state before retrying".into() }
+                let report = a206_core::ErrorReport::new(
+                    a206_core::ErrorKind::Conflict,
+                    "request was already accepted; outcome is pending or unknown; refresh state before retrying",
+                )
+                .with_correlation(id);
+                crate::error::record("replay", &report);
+                Reply::Error(report)
             }));
         }
         self.db.execute(
@@ -186,14 +200,14 @@ impl Store {
             .threads
             .iter()
             .find(|t| t.id == id)
-            .context("thread not found")
+            .ok_or_else(|| crate::error::not_found("thread not found"))
     }
     pub fn thread_mut(&mut self, id: Id) -> Result<&mut Thread> {
         self.state
             .threads
             .iter_mut()
             .find(|t| t.id == id)
-            .context("thread not found")
+            .ok_or_else(|| crate::error::not_found("thread not found"))
     }
 }
 #[cfg(test)]
@@ -220,6 +234,18 @@ mod tests {
         assert_eq!(restored.state.settings.providers, vec![user]);
         assert!(restored.state.managed_joshua_provider.is_none());
         assert_eq!(restored.state.settings.revision, 1);
+    }
+    #[test]
+    fn pending_replays_reference_their_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(dir.path()).unwrap();
+        let id = Id::new_v4();
+        assert!(store.begin(id, &Command::Shutdown).unwrap().is_none());
+        let Some(Reply::Error(report)) = store.begin(id, &Command::Shutdown).unwrap() else {
+            panic!("a pending request must replay as an error");
+        };
+        assert_eq!(report.kind, a206_core::ErrorKind::Conflict);
+        assert_eq!(report.correlation, Some(id));
     }
     #[test]
     fn journal_and_dedup_survive_restart() {

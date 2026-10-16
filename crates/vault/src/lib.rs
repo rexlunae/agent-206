@@ -188,6 +188,13 @@ impl Vault {
         Ok(())
     }
 }
+/// Remove a secret if present. SecureStore's `remove` fails only with
+/// `SecretNotFound`, which is already the state the caller wants.
+pub(crate) fn forget(inner: &mut SecretsManager, name: &str) {
+    if let Err(error) = inner.remove(name) {
+        debug_assert_eq!(error.kind(), securestore::ErrorKind::SecretNotFound);
+    }
+}
 fn save_atomic(inner: &SecretsManager, path: &Path) -> Result<(), Error> {
     let parent = path
         .parent()

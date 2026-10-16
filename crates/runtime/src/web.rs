@@ -216,12 +216,13 @@ async fn command(State(state): State<Web>, headers: HeaderMap, bytes: Bytes) -> 
     if matches!(request.body, Command::Shutdown) {
         return StatusCode::FORBIDDEN.into_response();
     }
+    let operation = request.body.name();
     let body = state
         .client
         .call_with_id(request.id, request.body)
         .await
-        .unwrap_or_else(|e| Reply::Error {
-            message: e.to_string(),
+        .unwrap_or_else(|error| {
+            Reply::Error(crate::error::correlated(operation, request.id, &error))
         });
     match a206_protocol::encode(&a206_protocol::Response {
         id: request.id,

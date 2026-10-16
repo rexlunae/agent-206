@@ -36,10 +36,11 @@ impl Harness {
                 title: params.0.title,
             })
             .await
-            .map_err(|e| e.to_string())?
+            .map_err(|e| shown("rename_thread", &e))?
         {
             Reply::Ok => Ok("Conversation renamed".into()),
-            Reply::Error { message } => Err(message),
+            // The gateway already recorded this failure; render its whole chain.
+            Reply::Error(report) => Err(report.detail()),
             _ => Err("unexpected gateway response".into()),
         }
     }
@@ -52,7 +53,7 @@ impl Harness {
             .client
             .call(Command::Snapshot)
             .await
-            .map_err(|e| e.to_string())?
+            .map_err(|e| shown("thread_state", &e))?
         else {
             return Err("gateway unavailable".into());
         };
@@ -76,7 +77,7 @@ impl Harness {
             capabilities: &thread.grant.capabilities,
             subagent_models: &thread.subagent_models,
         })
-        .map_err(|e| e.to_string())
+        .map_err(|e| shown("thread_state", &e.into()))
     }
     #[tool(
         description = "Read the harness extension and permission contract. This tool cannot approve privileges, change settings, execute commands or read secret values."
@@ -84,6 +85,11 @@ impl Harness {
     async fn harness_contract(&self) -> String {
         "Agent 206: only the user can approve permission changes. Extension ABI v1 accepts no imports and returns bounded MessagePack display fields. Mode and parent grants cap task authority. Provider/model choices are API-discovered; do not invent model IDs. Ask the user through the conversation when additional access is needed.".into()
     }
+}
+/// A tool result is the model-facing display edge: record the failure with its
+/// chain, then render it as the text the tool returns.
+fn shown(operation: &'static str, error: &anyhow::Error) -> String {
+    crate::error::handle(operation, error).detail()
 }
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for Harness {

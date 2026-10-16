@@ -19,7 +19,8 @@ impl Drop for Process {
         #[cfg(unix)]
         {
             if let Some(group) = self.group.take() {
-                let _result = nix::sys::signal::killpg(group, nix::sys::signal::Signal::SIGKILL);
+                // Cleanup: the group may already have exited, and there is no caller to report to.
+                nix::sys::signal::killpg(group, nix::sys::signal::Signal::SIGKILL).ignore();
             }
         }
     }
@@ -185,11 +186,13 @@ impl Process {
         #[cfg(unix)]
         {
             if let Some(group) = self.group.take() {
-                let _result = nix::sys::signal::killpg(group, nix::sys::signal::Signal::SIGKILL);
+                // Cleanup: the group may already have exited, and there is no caller to report to.
+                nix::sys::signal::killpg(group, nix::sys::signal::Signal::SIGKILL).ignore();
             }
         }
-        let _result = self.child.kill().await;
-        let _result = self.child.wait().await;
+        // Best-effort teardown of a process that may already have exited.
+        self.child.kill().await.ignore();
+        self.child.wait().await.ignore();
     }
 }
 #[cfg(target_os = "macos")]

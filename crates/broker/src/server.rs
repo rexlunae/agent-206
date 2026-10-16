@@ -684,11 +684,20 @@ pub async fn serve(root: &Path) -> std::io::Result<()> {
         }
     }
     drop(listener);
-    let _ = std::fs::remove_file(&path);
-    let _ = tokio::time::timeout(Duration::from_secs(2), async {
+    if let Err(error) = std::fs::remove_file(&path)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        // A stale socket is replaced on the next start; shutdown still completes.
+        let error: &(dyn std::error::Error + 'static) = &error;
+        tracing::warn!(error, "could not remove the broker socket");
+    }
+    let drained = tokio::time::timeout(Duration::from_secs(2), async {
         while connections.join_next().await.is_some() {}
     })
     .await;
+    if drained.is_err() {
+        tracing::debug!("aborting broker connections that outlived shutdown");
+    }
     connections.abort_all();
     drop(lock);
     Ok(())

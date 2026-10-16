@@ -71,6 +71,7 @@ body { max-inline-size: none; inline-size: 100%; padding: 0; background: var(--f
 .a206-inspector p { margin-block: var(--fc-space-1); }
 .a206-statusbar { display: flex; justify-content: space-between; padding: var(--fc-space-2) var(--fc-space-5); font-size: .7rem; color: var(--fc-color-text-muted); border-block-start: 1px solid var(--fc-color-border-subtle); gap: var(--fc-space-3); align-items: center; padding-block: var(--fc-space-1); background: var(--fc-color-bg-surface); }
 .a206-status { padding: var(--fc-space-2) var(--fc-space-4); background: var(--fc-color-bg-muted); font-size: .8rem; }
+.a206-error-causes { margin-block: var(--fc-space-1) 0; padding-inline-start: var(--fc-space-4); }
 .a206-document { white-space: pre-wrap; overflow-wrap: anywhere; font-family: var(--fc-font-family-mono, monospace); font-size: .85rem; line-height: 1.7; }
 .a206-grow { flex: 1; }
 .a206-gateway-copy { color: var(--fc-theme-feature-fg, var(--fc-color-text-default)); }

@@ -113,12 +113,17 @@ pub async fn run(
                                     .data("Backend message exceeds the conversation limit"));
                             }
                             output.text.push_str(&text.text);
-                            let _result = progress.try_send(Progress::Text(output.text.clone()));
+                            // Progress is advisory: a full or closed channel only drops an update.
+                            progress
+                                .try_send(Progress::Text(output.text.clone()))
+                                .ignore();
                         }
                     }
                     SessionUpdate::ToolCall(tool) => {
-                        let _result = progress
-                            .try_send(Progress::Activity(format!("Claude Agent: {:?}", tool.kind)));
+                        // Progress is advisory: a full or closed channel only drops an update.
+                        progress
+                            .try_send(Progress::Activity(format!("Claude Agent: {:?}", tool.kind)))
+                            .ignore();
                     }
                     SessionUpdate::UsageUpdate(usage) => {
                         // ACP context-used is not request input usage. Preserve that distinction.
@@ -170,7 +175,7 @@ pub async fn run(
         .context("Claude Agent ACP session failed")?;
     let output = output
         .lock()
-        .map_err(|_| anyhow::anyhow!("backend output lock poisoned"))?;
+        .map_err(|_| crate::error::poisoned("backend output"))?;
     ensure!(
         !output.text.is_empty(),
         "Claude Agent completed without a text response"

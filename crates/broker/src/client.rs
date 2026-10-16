@@ -6,13 +6,13 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ClientError {
-    #[error("vault broker is not running or unreachable: {0}")]
+    #[error("vault broker is not running or unreachable")]
     Io(#[from] std::io::Error),
-    #[error("vault broker protocol error: {0}")]
+    #[error("vault broker protocol error")]
     Protocol(#[from] a206_protocol::Error),
     #[error("vault broker closed the connection")]
     Closed,
-    #[error("{0}")]
+    #[error(transparent)]
     Broker(#[from] BrokerError),
 }
 
