@@ -412,6 +412,19 @@ async fn gateway_needs_a_verified_pairing_and_never_persists_it() {
         panic!("paired refresh failed");
     };
     assert_eq!(catalog.models[0].key.model, api.id);
+    // Once the broker voids the pairing, a retry is no longer acknowledged.
+    let mut user = a206_broker::Client::connect(dir.path(), a206_broker::Role::User)
+        .await
+        .unwrap();
+    user.call(a206_broker::Request::Lock).await.unwrap();
+    assert!(matches!(
+        run(Command::PairBroker {
+            pairing: pairing.clone()
+        })
+        .await,
+        Reply::Error { .. }
+    ));
+    assert!(matches!(run(refresh()).await, Reply::Error { .. }));
     assert_eq!(format!("{pairing:?}"), "[REDACTED]");
     // The request journal and every other profile file stay free of it.
     let mut pending = vec![dir.path().to_owned()];

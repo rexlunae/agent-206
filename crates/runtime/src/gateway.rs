@@ -435,19 +435,33 @@ impl Gateway {
                 let order = self
                     .pair_requests
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                {
-                    let current = self.pairing.lock().map_err(poisoned("pairing"))?;
-                    // A retried delivery must keep the anchor the broker voids
-                    // the pairing without.
-                    if current
-                        .as_ref()
-                        .is_some_and(|paired| paired.pairing == pairing)
-                    {
-                        return Ok(Reply::Ok);
-                    }
-                }
+                // A retried delivery must keep the anchor the broker voids the
+                // pairing without, but is still checked against the broker.
+                let retry = self
+                    .pairing
+                    .lock()
+                    .map_err(poisoned("pairing"))?
+                    .as_ref()
+                    .is_some_and(|paired| paired.pairing == pairing);
                 let root = self.lock()?.root.clone();
-                let anchor = provider::verify_pairing(&root, &pairing).await?;
+                let verified = provider::verify_pairing(&root, &pairing).await;
+                if retry {
+                    // The extra connection is not the anchor, so dropping it
+                    // leaves the pairing intact.
+                    if let Err(error) = verified {
+                        let mut current = self.pairing.lock().map_err(poisoned("pairing"))?;
+                        if current
+                            .as_ref()
+                            .is_some_and(|paired| paired.pairing == pairing)
+                        {
+                            // The broker no longer honours it, so neither do we.
+                            *current = None;
+                        }
+                        return Err(error.into());
+                    }
+                    return Ok(Reply::Ok);
+                }
+                let anchor = verified?;
                 {
                     let mut current = self.pairing.lock().map_err(poisoned("pairing"))?;
                     if current.as_ref().is_some_and(|paired| paired.order > order) {
