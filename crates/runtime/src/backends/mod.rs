@@ -227,15 +227,18 @@ pub async fn complete(run: Run<'_>) -> Result<(String, Usage)> {
     let proxy = proxy::Proxy::start(config.clone(), info.clone())
         .await
         .map_err(BackendError::Proxy)?;
-    let mut process = isolation::Process::launch(
-        backend,
-        thread,
-        workspace,
-        state_root,
-        proxy.port(),
-        proxy.token(),
-    )
-    .await?;
+    // Dropping an unfinished launch tears down whatever it started.
+    let mut process = tokio::select! {
+        process = isolation::Process::launch(
+            backend,
+            thread,
+            workspace,
+            state_root,
+            proxy.port(),
+            proxy.token(),
+        ) => process?,
+        _ = cancel.cancelled() => return Err(BackendError::Cancelled),
+    };
     if let Some(workspace) = &process.workspace {
         input.insert_str(
             0,

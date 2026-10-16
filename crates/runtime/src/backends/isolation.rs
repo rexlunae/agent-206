@@ -413,6 +413,8 @@ mod linux {
     };
     /// How long the helper may take to report that the runtime started.
     const READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+    /// How long a report may trail the helper's exit.
+    const EXIT_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
     /// Most bubblewrap diagnostics kept when the sandbox fails to start.
     const MAX_DIAGNOSTIC: u64 = 4096;
     pub struct Control {
@@ -455,29 +457,40 @@ mod linux {
                     .map_err(BackendError::SandboxReport)?;
                 rmp_serde::from_slice::<Status>(&bytes).map_err(BackendError::SandboxMalformed)
             };
+            let mut report = std::pin::pin!(report);
+            let decide = |status: Result<Status>| match status? {
+                Status::Ready { version } if version == SPEC_VERSION => Ok(()),
+                Status::Ready { version } => Err(BackendError::SandboxVersion { version }),
+                Status::Failed(report) => Err(BackendError::SandboxFailed(report)),
+            };
             // `Child::wait` closes stdin, which the runtime still needs.
             let stdin = child.stdin.take();
-            let result = tokio::select! {
-                status = tokio::time::timeout(READY_TIMEOUT, report) => {
-                    match status.map_err(BackendError::SandboxTimeout)?? {
-                        Status::Ready { version } if version == SPEC_VERSION => Ok(()),
-                        Status::Ready { version } => Err(BackendError::SandboxVersion { version }),
-                        Status::Failed(report) => Err(BackendError::SandboxFailed(report)),
+            let result = tokio::time::timeout(READY_TIMEOUT, async {
+                tokio::select! {
+                    biased;
+                    status = &mut report => decide(status),
+                    status = child.wait() => {
+                        let status = status.map_err(BackendError::Spawn)?;
+                        // A helper that reported its failure and then exited has
+                        // that report queued; it explains more than the exit.
+                        if let Ok(report) = tokio::time::timeout(EXIT_GRACE, &mut report).await {
+                            return decide(report);
+                        }
+                        let mut diagnostic = Vec::new();
+                        if let Some(stderr) = child.stderr.take() {
+                            // Whatever arrived is the diagnostic; a read error leaves it partial.
+                            stderr.take(MAX_DIAGNOSTIC).read_to_end(&mut diagnostic).await.ignore();
+                        }
+                        Err(BackendError::SandboxExited {
+                            status,
+                            diagnostic: String::from_utf8_lossy(&diagnostic).trim().to_owned(),
+                        })
                     }
                 }
-                status = child.wait() => {
-                    let status = status.map_err(BackendError::Spawn)?;
-                    let mut diagnostic = Vec::new();
-                    if let Some(stderr) = child.stderr.take() {
-                        // Whatever arrived is the diagnostic; a read error leaves it partial.
-                        stderr.take(MAX_DIAGNOSTIC).read_to_end(&mut diagnostic).await.ignore();
-                    }
-                    Err(BackendError::SandboxExited {
-                        status,
-                        diagnostic: String::from_utf8_lossy(&diagnostic).trim().to_owned(),
-                    })
-                }
-            };
+            })
+            .await
+            .map_err(BackendError::SandboxTimeout)
+            .and_then(|result| result);
             child.stdin = stdin;
             result
         }
@@ -583,6 +596,25 @@ mod tests {
         assert_eq!(report.causes().next().unwrap().message, sent.message);
         assert!(child.stdin.is_some());
         control.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_report_sent_before_exiting_wins_over_the_exit() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("control");
+        let control = Control::bind(&path, 1).unwrap();
+        let sent = SandboxError::NotEnforced.report();
+        send(&path, &Status::Failed(sent.clone())).await;
+        let mut child = shell("exit 1");
+        let stdin = child.stdin.take();
+        child.wait().await.unwrap();
+        child.stdin = stdin;
+        // Both the report and the exit are ready before readiness is polled.
+        let error = control.ready(&mut child).await.unwrap_err();
+        let BackendError::SandboxFailed(received) = &error else {
+            panic!("{error:?}");
+        };
+        assert_eq!(*received, sent);
     }
 
     #[tokio::test]
