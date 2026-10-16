@@ -1,11 +1,10 @@
 //! Official ACP client SDK, with no client filesystem or terminal capabilities.
-use super::{Progress, isolation::Process, rpc};
+use super::{BackendError, Progress, Result, check, isolation::Process, rpc};
 use a206_core::*;
 use agent_client_protocol::{
     Client, Lines,
     schema::{ProtocolVersion, v1::*},
 };
-use anyhow::{Context, Result, ensure};
 use serde_json::json;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
@@ -22,18 +21,11 @@ pub async fn run(
     input: &str,
     progress: mpsc::Sender<Progress>,
 ) -> Result<(String, Usage)> {
-    let writer = process
-        .child
-        .stdin
-        .take()
-        .context("Claude Agent input missing")?;
-    let reader = tokio::io::BufReader::new(
-        process
-            .child
-            .stdout
-            .take()
-            .context("Claude Agent output missing")?,
-    );
+    let (Some(writer), Some(reader)) = (process.child.stdin.take(), process.child.stdout.take())
+    else {
+        return Err(BackendError::Closed);
+    };
+    let reader = tokio::io::BufReader::new(reader);
     let incoming =
         futures_util::stream::try_unfold((reader, 0usize), async |(mut reader, mut count)| {
             let line = rpc::read(&mut reader).await?;
@@ -73,17 +65,15 @@ pub async fn run(
     if thread.grant.capabilities.contains(&Capability::Execute) {
         tools.push("Bash");
     }
-    let mut options = json!({"model": thread.model.as_ref().context("model not selected")?.model, "systemPrompt": prompt,
+    let mut options = json!({"model": thread.model.as_ref().ok_or(BackendError::NoModel)?.model, "systemPrompt": prompt,
         "settingSources": [], "plugins": [], "strictMcpConfig": true, "mcpServers": {}, "persistSession": false,
         "maxTurns": 32, "tools": tools, "allowedTools": tools, "disallowedTools": ["Agent", "Task", "WebFetch", "WebSearch"],
         "extraArgs": {"bare": null} });
     if let Some(effort) = &thread.effort {
         options["effort"] = json!(effort);
     }
-    let meta = json!({"claudeCode": {"options": options}})
-        .as_object()
-        .context("invalid Claude options")?
-        .clone();
+    let mut meta = serde_json::Map::new();
+    meta.insert("claudeCode".into(), json!({"options": options}));
     let cwd = process.cwd.clone();
     let input = input.to_owned();
     Client
@@ -172,14 +162,14 @@ pub async fn run(
             },
         )
         .await
-        .context("Claude Agent ACP session failed")?;
-    let output = output
-        .lock()
-        .map_err(|_| crate::error::poisoned("backend output"))?;
-    ensure!(
+        .map_err(BackendError::Acp)?;
+    let output = output.lock().map_err(|_| BackendError::Poisoned)?;
+    check(
         !output.text.is_empty(),
-        "Claude Agent completed without a text response"
-    );
+        BackendError::Empty {
+            backend: "Claude Agent",
+        },
+    )?;
     Ok((
         output.text.clone(),
         Usage {

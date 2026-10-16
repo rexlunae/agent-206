@@ -91,6 +91,23 @@ pub enum ConnectionError {
         source: Option<std::io::Error>,
     },
 }
+impl crate::error::Classified for ConnectionError {
+    fn kind(&self) -> Option<a206_core::ErrorKind> {
+        use a206_core::ErrorKind as K;
+        Some(match self {
+            Self::NotConfigured | Self::NotInstalled { .. } => K::Unavailable,
+            Self::InvalidEndpoint { .. } | Self::InvalidSetup { .. } => K::InvalidRequest,
+            Self::UnknownHost { .. }
+            | Self::HostKeyChanged { .. }
+            | Self::ProxiedHost { .. }
+            | Self::HostKeyMismatch => K::PermissionDenied,
+            Self::TimedOut { .. } => K::Timeout,
+            Self::Ssh { .. } | Self::NoHostKeys { .. } => K::Unavailable,
+            Self::EncodeSetup { .. } => K::Internal,
+            Self::Io { .. } | Self::MissingTool { .. } | Self::SetupWorker { .. } => return None,
+        })
+    }
+}
 type Result<T, E = ConnectionError> = std::result::Result<T, E>;
 
 /// Record a failure where it happens, keeping the structured error for the caller.

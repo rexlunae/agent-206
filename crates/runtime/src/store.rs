@@ -1,28 +1,74 @@
 //! SQLite WAL snapshot, event journal and durable request deduplication.
 use crate::provider::now;
 use a206_core::*;
-use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::path::{Path, PathBuf};
 
+/// Why durable gateway state could not be opened, read or written.
+#[derive(Debug, thiserror::Error)]
+pub enum StoreError {
+    #[error("could not prepare the data directory")]
+    Directory(#[source] std::io::Error),
+    #[error("a gateway already owns this data directory")]
+    Owned(#[source] std::io::Error),
+    #[error("state database failed")]
+    Database(#[from] rusqlite::Error),
+    #[error("stored state is unreadable")]
+    Decode(#[from] rmp_serde::decode::Error),
+    #[error("state could not be encoded")]
+    Encode(#[from] rmp_serde::encode::Error),
+    #[error("could not read settings.toml")]
+    ReadSettings(#[source] std::io::Error),
+    #[error("settings.toml is invalid")]
+    Settings(#[source] toml::de::Error),
+    #[error("the bundled extension is invalid")]
+    Builtin(#[source] a206_extensions::ExtensionError),
+    #[error("stored provider presets are invalid")]
+    Presets(#[source] crate::provider::PresetError),
+    #[error("snapshot capacity reached; paged history is not implemented yet")]
+    Full,
+    #[error("event cursor unavailable; request a fresh snapshot")]
+    Cursor,
+    #[error("request id reused with a different command")]
+    ReusedId,
+    #[error("thread not found")]
+    ThreadNotFound,
+}
+impl crate::error::Classified for StoreError {
+    fn kind(&self) -> Option<ErrorKind> {
+        Some(match self {
+            Self::Owned(_) | Self::ReusedId | Self::Cursor => ErrorKind::Conflict,
+            Self::Settings(_) | Self::Presets(_) => ErrorKind::InvalidRequest,
+            Self::Encode(_) | Self::Builtin(_) => ErrorKind::Internal,
+            Self::ThreadNotFound => ErrorKind::NotFound,
+            Self::Directory(_)
+            | Self::Database(_)
+            | Self::Decode(_)
+            | Self::ReadSettings(_)
+            | Self::Full => ErrorKind::Storage,
+        })
+    }
+}
+type Result<T, E = StoreError> = std::result::Result<T, E>;
+
 /// Open the single profile lock used by both startup and offline stop intent.
-pub(crate) fn profile_lock(root: &Path) -> Result<std::fs::File> {
+pub(crate) fn profile_lock(root: &Path) -> std::io::Result<std::fs::File> {
     lock_file(root, "gateway.lock")
 }
 /// Internal fixed lock filenames only; these never come from a command or plugin.
-pub(crate) fn lock_file(root: &Path, name: &str) -> Result<std::fs::File> {
+pub(crate) fn lock_file(root: &Path, name: &str) -> std::io::Result<std::fs::File> {
     std::fs::create_dir_all(root)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700))?;
     }
-    Ok(std::fs::OpenOptions::new()
+    std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .read(true)
         .write(true)
-        .open(root.join(name))?)
+        .open(root.join(name))
 }
 pub struct Store {
     _lock: std::fs::File,
@@ -32,9 +78,8 @@ pub struct Store {
 }
 impl Store {
     pub fn open(root: &Path) -> Result<Self> {
-        let lock = profile_lock(root)?;
-        fs2::FileExt::try_lock_exclusive(&lock)
-            .context("a gateway already owns this data directory")?;
+        let lock = profile_lock(root).map_err(StoreError::Directory)?;
+        fs2::FileExt::try_lock_exclusive(&lock).map_err(StoreError::Owned)?;
         let db = Connection::open(root.join("state.sqlite3"))?;
         db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
             CREATE TABLE IF NOT EXISTS snapshot(id INTEGER PRIMARY KEY CHECK(id=1), payload BLOB NOT NULL);
@@ -49,7 +94,11 @@ impl Store {
             rmp_serde::from_slice(&data)?
         } else {
             let settings = if root.join("settings.toml").exists() {
-                toml::from_str(&std::fs::read_to_string(root.join("settings.toml"))?)?
+                toml::from_str(
+                    &std::fs::read_to_string(root.join("settings.toml"))
+                        .map_err(StoreError::ReadSettings)?,
+                )
+                .map_err(StoreError::Settings)?
             } else {
                 Settings::default()
             };
@@ -59,7 +108,12 @@ impl Store {
                 projects: vec![],
                 catalogs: vec![],
                 downloads: vec![],
-                plugins: vec![a206_extensions::builtin()?.0.summary()],
+                plugins: vec![
+                    a206_extensions::builtin()
+                        .map_err(StoreError::Builtin)?
+                        .0
+                        .summary(),
+                ],
                 last_event: 0,
                 managed_joshua_provider: None,
             }
@@ -70,7 +124,8 @@ impl Store {
             state,
             root: root.to_owned(),
         };
-        crate::provider::validate_presets(&store.state.settings.provider_presets)?;
+        crate::provider::validate_presets(&store.state.settings.provider_presets)
+            .map_err(StoreError::Presets)?;
         // A fresh gateway has no owned child. Retire its persisted connection, not
         // arbitrary user-configured endpoints that happen to have the same URL.
         store.state.clear_managed_joshua();
@@ -115,10 +170,9 @@ impl Store {
         result
     }
     fn persist_inner(&mut self, kind: Option<EventKind>) -> Result<()> {
-        anyhow::ensure!(
-            rmp_serde::to_vec_named(&self.state)?.len() < a206_protocol::MAX_FRAME - 65_536,
-            "snapshot capacity reached; paged history is not implemented yet"
-        );
+        if rmp_serde::to_vec_named(&self.state)?.len() >= a206_protocol::MAX_FRAME - 65_536 {
+            return Err(StoreError::Full);
+        }
         let tx = self.db.transaction()?;
         if let Some(kind) = kind {
             let seq = self.state.last_event + 1;
@@ -143,7 +197,7 @@ impl Store {
     }
     pub fn events(&self, after: u64) -> Result<Vec<Event>> {
         if after > self.state.last_event || self.state.last_event.saturating_sub(after) > 10_000 {
-            bail!("event cursor unavailable; request a fresh snapshot");
+            return Err(StoreError::Cursor);
         }
         let mut stmt = self
             .db
@@ -164,11 +218,7 @@ impl Store {
             .optional()?;
         if let Some((request, reply)) = previous {
             if request != body {
-                return Err(a206_core::ErrorReport::new(
-                    a206_core::ErrorKind::Conflict,
-                    "request id reused with a different command",
-                )
-                .into());
+                return Err(StoreError::ReusedId);
             }
             return Ok(Some(if let Some(reply) = reply {
                 rmp_serde::from_slice(&reply)?
@@ -200,14 +250,14 @@ impl Store {
             .threads
             .iter()
             .find(|t| t.id == id)
-            .ok_or_else(|| crate::error::not_found("thread not found"))
+            .ok_or(StoreError::ThreadNotFound)
     }
     pub fn thread_mut(&mut self, id: Id) -> Result<&mut Thread> {
         self.state
             .threads
             .iter_mut()
             .find(|t| t.id == id)
-            .ok_or_else(|| crate::error::not_found("thread not found"))
+            .ok_or(StoreError::ThreadNotFound)
     }
 }
 #[cfg(test)]

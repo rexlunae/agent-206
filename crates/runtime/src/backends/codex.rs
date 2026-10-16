@@ -1,6 +1,5 @@
-use super::{Progress, isolation::Process, rpc::Rpc};
+use super::{BackendError, Progress, Result, check, isolation::Process, rpc::Rpc};
 use a206_core::*;
-use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use tokio::sync::mpsc;
@@ -62,18 +61,21 @@ impl Turn {
         }
         match method {
             "item/agentMessage/delta" => {
-                let id = params
-                    .get("itemId")
-                    .and_then(Value::as_str)
-                    .context("backend text omitted its item identifier")?;
+                let id =
+                    params
+                        .get("itemId")
+                        .and_then(Value::as_str)
+                        .ok_or(BackendError::Malformed(
+                            "backend text omitted its item identifier",
+                        ))?;
                 let delta = params
                     .get("delta")
                     .and_then(Value::as_str)
-                    .context("backend text omitted its delta")?;
-                ensure!(
+                    .ok_or(BackendError::Malformed("backend text omitted its delta"))?;
+                check(
                     self.messages.len() < 256 || self.messages.contains_key(id),
-                    "too many backend messages"
-                );
+                    BackendError::Malformed("too many backend messages"),
+                )?;
                 if !self.messages.contains_key(id) {
                     self.order.push(id.into());
                 }
@@ -83,18 +85,17 @@ impl Turn {
             "item/completed"
                 if params.pointer("/item/type").and_then(Value::as_str) == Some("agentMessage") =>
             {
-                let id = params
-                    .pointer("/item/id")
-                    .and_then(Value::as_str)
-                    .context("backend item omitted its identifier")?;
+                let id = params.pointer("/item/id").and_then(Value::as_str).ok_or(
+                    BackendError::Malformed("backend item omitted its identifier"),
+                )?;
                 let text = params
                     .pointer("/item/text")
                     .and_then(Value::as_str)
-                    .context("backend item omitted its text")?;
-                ensure!(
+                    .ok_or(BackendError::Malformed("backend item omitted its text"))?;
+                check(
                     self.messages.len() < 256 || self.messages.contains_key(id),
-                    "too many backend messages"
-                );
+                    BackendError::Malformed("too many backend messages"),
+                )?;
                 if !self.messages.contains_key(id) {
                     self.order.push(id.into());
                 }
@@ -140,10 +141,7 @@ impl Turn {
     }
     fn publish(&self) -> Result<()> {
         let text = self.text();
-        ensure!(
-            text.len() <= 128 * 1024,
-            "backend message exceeds the conversation limit"
-        );
+        check(text.len() <= 128 * 1024, BackendError::MessageTooLarge)?;
         // Progress is advisory: a full or closed channel only drops an update.
         self.progress.try_send(Progress::Text(text)).ignore();
         Ok(())
@@ -152,7 +150,7 @@ impl Turn {
         &mut self,
         rpc: &mut Rpc,
         id: u64,
-        method: &str,
+        method: &'static str,
         params: Value,
     ) -> Result<Value> {
         rpc.send(json!({"id": id, "method": method, "params": params}))
@@ -161,11 +159,14 @@ impl Turn {
             let value = self.receive(rpc).await?;
             if value.get("id").and_then(Value::as_u64) == Some(id) && value.get("method").is_none()
             {
-                ensure!(value.get("error").is_none(), "Codex rejected {method}");
+                check(
+                    value.get("error").is_none(),
+                    BackendError::Rejected { method },
+                )?;
                 return value
                     .get("result")
                     .cloned()
-                    .context("Codex response omitted its result");
+                    .ok_or(BackendError::Malformed("Codex response omitted its result"));
             }
         }
     }
@@ -194,13 +195,15 @@ pub async fn run(
     turn.request(&mut rpc, 1, "initialize", json!({"clientInfo": {"name": "agent206", "title": "Agent 206", "version": env!("CARGO_PKG_VERSION")}})).await?;
     rpc.send(json!({"method": "initialized", "params": {}}))
         .await?;
-    let model = &thread.model.as_ref().context("model not selected")?.model;
+    let model = &thread.model.as_ref().ok_or(BackendError::NoModel)?.model;
     let started = turn.request(&mut rpc, 2, "thread/start", json!({"model": model, "modelProvider": "agent206", "cwd": process.cwd,
         "approvalPolicy": "never", "sandbox": "read-only", "baseInstructions": prompt, "ephemeral": true})).await?;
     turn.thread = started
         .pointer("/thread/id")
         .and_then(Value::as_str)
-        .context("Codex omitted its thread identifier")?
+        .ok_or(BackendError::Malformed(
+            "Codex omitted its thread identifier",
+        ))?
         .to_owned();
     let mut params = json!({"threadId": turn.thread, "model": model, "cwd": process.cwd,
         "approvalPolicy": "never", "sandboxPolicy": {"type": "externalSandbox", "networkAccess": "restricted"},
@@ -213,16 +216,16 @@ pub async fn run(
         started
             .pointer("/turn/id")
             .and_then(Value::as_str)
-            .context("Codex omitted its turn identifier")?
+            .ok_or(BackendError::Malformed("Codex omitted its turn identifier"))?
             .into(),
     );
     while turn.complete.is_none() {
         turn.receive(&mut rpc).await?;
     }
     if turn.complete != Some(true) {
-        bail!("Codex did not complete this turn; inspect the backend activity");
+        return Err(BackendError::Incomplete { backend: "Codex" });
     }
     let text = turn.text();
-    ensure!(!text.is_empty(), "Codex completed without a text response");
+    check(!text.is_empty(), BackendError::Empty { backend: "Codex" })?;
     Ok((text, turn.usage))
 }

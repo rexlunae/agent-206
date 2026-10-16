@@ -1,14 +1,78 @@
 //! One user-private gateway process per state directory, shared by all clients.
-use a206_core::Ignore;
-use anyhow::{Context, Result};
-use std::{path::Path, process::Stdio};
+use a206_core::{ErrorKind, Ignore};
+use std::{
+    path::{Path, PathBuf},
+    process::Stdio,
+};
+/// Why the gateway service could not be started, reached or stopped.
+#[derive(Debug, thiserror::Error)]
+pub enum ServiceError {
+    #[error("could not lock the gateway profile")]
+    Lock(#[source] std::io::Error),
+    #[error("could not record the stop request")]
+    MarkStopped(#[source] std::io::Error),
+    #[error("gateway was deliberately stopped; use gateway start")]
+    Stopped,
+    #[error("gateway is stopped or unavailable; use gateway start")]
+    NotRunning,
+    #[error(transparent)]
+    Store(#[from] crate::store::StoreError),
+    #[error("could not publish the gateway socket")]
+    Socket(#[source] std::io::Error),
+    #[error("could not accept a gateway client")]
+    Accept(#[source] std::io::Error),
+    #[error("could not prepare the gateway log")]
+    Log(#[source] std::io::Error),
+    #[error("could not locate the agent206 executable")]
+    CurrentExe(#[source] std::io::Error),
+    #[error("could not start the gateway service")]
+    Spawn(#[source] std::io::Error),
+    #[error("gateway did not become ready; inspect {}", log.display())]
+    NotReady { log: PathBuf },
+    #[error("could not open standard input")]
+    Stdin(#[source] std::io::Error),
+    #[cfg(unix)]
+    #[error("could not configure standard input")]
+    StdinMode(#[source] nix::errno::Errno),
+    #[error("gateway stdio bridge failed")]
+    Bridge(#[source] std::io::Error),
+    #[error("gateway stdio bridge task failed")]
+    Task(#[from] tokio::task::JoinError),
+    #[error("Windows named-pipe gateway transport is not implemented")]
+    Unsupported,
+}
+impl crate::error::Classified for ServiceError {
+    fn kind(&self) -> Option<ErrorKind> {
+        Some(match self {
+            Self::Stopped | Self::NotRunning | Self::NotReady { .. } | Self::Unsupported => {
+                ErrorKind::Unavailable
+            }
+            Self::MarkStopped(_) => ErrorKind::Storage,
+            Self::CurrentExe(_) | Self::Task(_) => ErrorKind::Internal,
+            // `transparent` hides the store error from the chain.
+            Self::Store(error) => return crate::error::classify(error),
+            #[cfg(unix)]
+            Self::StdinMode(_) => ErrorKind::Internal,
+            Self::Lock(_)
+            | Self::Socket(_)
+            | Self::Accept(_)
+            | Self::Log(_)
+            | Self::Spawn(_)
+            | Self::Stdin(_)
+            | Self::Bridge(_) => return None,
+        })
+    }
+}
+type Result<T, E = ServiceError> = std::result::Result<T, E>;
 pub fn is_stopped(root: &Path) -> bool {
     root.join("gateway.stopped").exists()
 }
-pub fn mark_stopped(root: &Path) -> Result<()> {
+pub fn mark_stopped(root: &Path) -> std::io::Result<()> {
     let marker = tempfile::NamedTempFile::new_in(root)?;
     marker.as_file().sync_all()?;
-    marker.persist(root.join("gateway.stopped"))?;
+    marker
+        .persist(root.join("gateway.stopped"))
+        .map_err(|error| error.error)?;
     #[cfg(unix)]
     std::fs::File::open(root)?.sync_all()?;
     Ok(())
@@ -16,14 +80,14 @@ pub fn mark_stopped(root: &Path) -> Result<()> {
 /// Persist stop for an absent service, serialized with startup by its store lock.
 /// A locked profile must instead acknowledge cleanup through the live gateway.
 pub(crate) fn stop_if_offline(root: &Path) -> Result<bool> {
-    let lock = crate::store::profile_lock(root)?;
+    let lock = crate::store::profile_lock(root).map_err(ServiceError::Lock)?;
     match fs2::FileExt::try_lock_exclusive(&lock) {
         Ok(()) => {
-            mark_stopped(root)?;
+            mark_stopped(root).map_err(ServiceError::MarkStopped)?;
             Ok(true)
         }
         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(false),
-        Err(error) => Err(error.into()),
+        Err(error) => Err(ServiceError::Lock(error)),
     }
 }
 pub(crate) async fn is_ready(root: &Path) -> bool {
@@ -42,14 +106,15 @@ pub(crate) async fn is_ready(root: &Path) -> bool {
 /// Startup and user stop share a short-lived cross-process gate. Unlike the
 /// store lock, this can be held by a controller while a legacy daemon exits.
 pub(crate) async fn lifecycle_guard(root: &Path) -> Result<std::fs::File> {
-    let lock = crate::store::lock_file(root, "gateway.lifecycle.lock")?;
+    let lock =
+        crate::store::lock_file(root, "gateway.lifecycle.lock").map_err(ServiceError::Lock)?;
     loop {
         match fs2::FileExt::try_lock_exclusive(&lock) {
             Ok(()) => return Ok(lock),
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 tokio::time::sleep(std::time::Duration::from_millis(25)).await;
             }
-            Err(error) => return Err(error.into()),
+            Err(error) => return Err(ServiceError::Lock(error)),
         }
     }
 }
@@ -58,36 +123,31 @@ pub async fn daemon(root: &Path, explicit: bool) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     use tokio::net::UnixListener;
     let lifecycle = lifecycle_guard(root).await?;
-    anyhow::ensure!(
-        explicit || !is_stopped(root),
-        "gateway was deliberately stopped; use gateway start"
-    );
+    crate::error::check(explicit || !is_stopped(root), ServiceError::Stopped)?;
     let gateway = crate::gateway::Gateway::open(root)?;
     // Repeat under the acquired store lock: an automatic starter can race stop.
-    anyhow::ensure!(
-        explicit || !is_stopped(root),
-        "gateway was deliberately stopped; use gateway start"
-    );
+    crate::error::check(explicit || !is_stopped(root), ServiceError::Stopped)?;
     let refresh = tokio::spawn(refresh_catalogs(gateway.clone()));
     let path = root.join("gateway.sock");
     if path.exists() {
-        std::fs::remove_file(&path)?;
+        std::fs::remove_file(&path).map_err(ServiceError::Socket)?;
     }
-    let listener = UnixListener::bind(&path)?;
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    let listener = UnixListener::bind(&path).map_err(ServiceError::Socket)?;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+        .map_err(ServiceError::Socket)?;
     if is_stopped(root) {
-        std::fs::remove_file(root.join("gateway.stopped"))?;
+        std::fs::remove_file(root.join("gateway.stopped")).map_err(ServiceError::MarkStopped)?;
     }
     drop(lifecycle);
     let mut connections = tokio::task::JoinSet::new();
     let stop = gateway.stop_signal();
     loop {
         let (stream, _) = tokio::select! {
-            accepted = listener.accept() => accepted?,
+            accepted = listener.accept() => accepted.map_err(ServiceError::Accept)?,
             _ = stop.cancelled() => break,
             Some(result) = connections.join_next(), if !connections.is_empty() => {
                 if let Err(error) = result {
-                    crate::error::handle("gateway_connection", &error.into());
+                    crate::error::handle("gateway_connection", &error);
                 }
                 continue;
             }
@@ -96,15 +156,12 @@ pub async fn daemon(root: &Path, explicit: bool) -> Result<()> {
         let gateway = gateway.clone();
         connections.spawn(async move {
             if let Err(error) = crate::gateway::serve_connection(gateway, read, write).await {
-                crate::error::handle(
-                    "gateway_connection",
-                    &error.context("gateway client disconnected"),
-                );
+                crate::error::handle("gateway_connection", &error);
             }
         });
     }
     drop(listener);
-    std::fs::remove_file(&path)?;
+    std::fs::remove_file(&path).map_err(ServiceError::Socket)?;
     refresh.abort();
     // Stop accepting new clients, but flush replies for already accepted work,
     // including independent Shutdown requests queued behind the first one.
@@ -112,7 +169,7 @@ pub async fn daemon(root: &Path, explicit: bool) -> Result<()> {
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         while let Some(result) = connections.join_next().await {
             if let Err(error) = result {
-                crate::error::handle("gateway_connection", &error.into());
+                crate::error::handle("gateway_connection", &error);
             }
         }
     })
@@ -129,22 +186,29 @@ pub async fn connect(root: &Path, start: bool, explicit: bool) -> Result<tokio::
     if let Ok(stream) = tokio::net::UnixStream::connect(&path).await {
         return Ok(stream);
     }
-    anyhow::ensure!(
+    crate::error::check(
         start && (explicit || !is_stopped(root)),
-        "gateway is stopped or unavailable; use gateway start"
-    );
+        ServiceError::NotRunning,
+    )?;
     // Concurrent starters are serialized by the store's advisory lock.
     let log_dir = root.to_owned();
-    std::fs::create_dir_all(&log_dir)?;
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-    std::fs::set_permissions(&log_dir, std::fs::Permissions::from_mode(0o700))?;
-    let log = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(0o600)
-        .open(log_dir.join("gateway.log"))?;
-    log.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-    let mut command = tokio::process::Command::new(std::env::current_exe()?);
+    let log = std::fs::create_dir_all(&log_dir)
+        .and_then(|()| std::fs::set_permissions(&log_dir, std::fs::Permissions::from_mode(0o700)))
+        .and_then(|()| {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .mode(0o600)
+                .open(log_dir.join("gateway.log"))
+        })
+        .and_then(|log| {
+            log.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            Ok(log)
+        })
+        .map_err(ServiceError::Log)?;
+    let mut command =
+        tokio::process::Command::new(std::env::current_exe().map_err(ServiceError::CurrentExe)?);
     command
         .arg("--data-dir")
         .arg(root)
@@ -157,7 +221,7 @@ pub async fn connect(root: &Path, start: bool, explicit: bool) -> Result<tokio::
         .stdout(Stdio::null())
         .stderr(log)
         .spawn()
-        .context("start gateway service")?;
+        .map_err(ServiceError::Spawn)?;
     for _ in 0..100 {
         if let Ok(stream) = tokio::net::UnixStream::connect(&path).await {
             tokio::spawn(async move {
@@ -170,10 +234,9 @@ pub async fn connect(root: &Path, start: bool, explicit: bool) -> Result<tokio::
     }
     // The readiness failure below is the error reported; the kill is cleanup.
     child.kill().await.ignore();
-    anyhow::bail!(
-        "gateway did not become ready; inspect {}",
-        root.join("gateway.log").display()
-    )
+    Err(ServiceError::NotReady {
+        log: root.join("gateway.log"),
+    })
 }
 #[cfg(unix)]
 pub async fn stdio(root: &Path, start: bool, explicit: bool) -> Result<()> {
@@ -185,22 +248,29 @@ pub async fn stdio(root: &Path, start: bool, explicit: bool) -> Result<()> {
     let mut input = tokio::spawn(async move {
         use std::io::Read;
         use tokio::io::AsyncWriteExt;
-        let input = async_io::Async::new_nonblocking(stdin)?;
+        let input = async_io::Async::new_nonblocking(stdin).map_err(ServiceError::Stdin)?;
         let mut bytes = [0; 8192];
         loop {
             let count = input
                 .read_with(|input| (&input.file).read(&mut bytes))
-                .await?;
+                .await
+                .map_err(ServiceError::Stdin)?;
             if count == 0 {
-                writer.shutdown().await?;
+                writer.shutdown().await.map_err(ServiceError::Bridge)?;
                 break;
             }
-            writer.write_all(&bytes[..count]).await?;
+            writer
+                .write_all(&bytes[..count])
+                .await
+                .map_err(ServiceError::Bridge)?;
         }
-        Ok::<_, std::io::Error>(())
+        Ok::<_, ServiceError>(())
     });
-    let mut output =
-        tokio::spawn(async move { tokio::io::copy(&mut reader, &mut tokio::io::stdout()).await });
+    let mut output = tokio::spawn(async move {
+        tokio::io::copy(&mut reader, &mut tokio::io::stdout())
+            .await
+            .map_err(ServiceError::Bridge)
+    });
     tokio::select! {
         result = &mut input => { result??; output.await??; },
         // The aborted input task's cancellation is expected; the output result is what matters.
@@ -217,9 +287,12 @@ struct NonblockingInput {
 impl NonblockingInput {
     fn open() -> Result<Self> {
         use nix::fcntl::{FcntlArg, OFlag, fcntl};
-        let file = std::fs::File::open("/dev/stdin")?;
-        let flags = OFlag::from_bits_truncate(fcntl(&file, FcntlArg::F_GETFL)?);
-        fcntl(&file, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK))?;
+        let file = std::fs::File::open("/dev/stdin").map_err(ServiceError::Stdin)?;
+        let flags = OFlag::from_bits_truncate(
+            fcntl(&file, FcntlArg::F_GETFL).map_err(ServiceError::StdinMode)?,
+        );
+        fcntl(&file, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK))
+            .map_err(ServiceError::StdinMode)?;
         Ok(Self { file, flags })
     }
 }
@@ -244,11 +317,11 @@ impl Drop for NonblockingInput {
 }
 #[cfg(not(unix))]
 pub async fn daemon(_root: &Path, _explicit: bool) -> Result<()> {
-    anyhow::bail!("Windows named-pipe gateway transport is not implemented")
+    Err(ServiceError::Unsupported)
 }
 #[cfg(not(unix))]
 pub async fn stdio(_root: &Path, _start: bool, _explicit: bool) -> Result<()> {
-    anyhow::bail!("Windows named-pipe gateway transport is not implemented")
+    Err(ServiceError::Unsupported)
 }
 
 /// Refresh cached facts from provider APIs. Failed refreshes retain the expired cache.

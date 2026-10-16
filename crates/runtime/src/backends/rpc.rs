@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, ensure};
+use super::{BackendError, Result};
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{ChildStdin, ChildStdout};
@@ -10,36 +10,30 @@ pub struct Rpc {
 }
 impl Rpc {
     pub fn new(process: &mut super::isolation::Process) -> Result<Self> {
+        let (Some(input), Some(output)) = (process.child.stdin.take(), process.child.stdout.take())
+        else {
+            return Err(BackendError::Closed);
+        };
         Ok(Self {
-            input: process
-                .child
-                .stdin
-                .take()
-                .context("backend input missing")?,
-            output: BufReader::new(
-                process
-                    .child
-                    .stdout
-                    .take()
-                    .context("backend output missing")?,
-            ),
+            input,
+            output: BufReader::new(output),
             received: 0,
         })
     }
     pub async fn send(&mut self, value: Value) -> Result<()> {
-        write(&mut self.input, serde_json::to_string(&value)?).await?;
-        Ok(())
+        let line = serde_json::to_string(&value).map_err(BackendError::Json)?;
+        write(&mut self.input, line).await.map_err(BackendError::Io)
     }
     pub async fn receive(&mut self) -> Result<Value> {
         let line = read(&mut self.output)
-            .await?
-            .context("backend closed its protocol connection")?;
+            .await
+            .map_err(BackendError::Io)?
+            .ok_or(BackendError::Closed)?;
         self.received += line.len();
-        ensure!(
-            self.received <= 32 * 1024 * 1024,
-            "backend exceeded its protocol output limit"
-        );
-        Ok(serde_json::from_str(&line)?)
+        if self.received > 32 * 1024 * 1024 {
+            return Err(BackendError::OutputLimit);
+        }
+        serde_json::from_str(&line).map_err(BackendError::Json)
     }
 }
 pub async fn write(input: &mut ChildStdin, line: String) -> std::io::Result<()> {

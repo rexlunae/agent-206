@@ -141,15 +141,19 @@ catalog fixtures. Test APIs generate their identifiers and limits at runtime.
 
 ## Errors and diagnostics
 
-Errors stay typed inside a process: runtime code returns `anyhow::Error` (or a
-crate's `thiserror` type) with its source chain and adds context instead of
-formatting the cause into a new string. Where a failure is handled (a command
+Errors stay typed inside a process: each runtime module returns its own
+`thiserror` enum (`GatewayError`, `StoreError`, `ProviderError`,
+`BackendError`, `ClientError` and so on) whose variants keep the cause in
+`source()` and add context instead of formatting the cause into a new string;
+`anyhow` appears only at the binary's top level. Where a failure is handled (a command
 reply, a failed run or download, a lifecycle report) the runtime captures it
 once as an `a206_core::ErrorReport`: a client-actionable `ErrorKind`, the
 outermost message, the bounded cause chain and a correlation id (the request,
-run or transfer it belongs to). Kinds come from the error's
-types (`ErrorReport` links, `PolicyError`, I/O, protocol, storage, HTTP and
-timeouts), never from parsing text; unclassified failures are `Other`.
+run or transfer it belongs to). Kinds come from the error's types: each
+runtime enum implements `error::Classified` (validation is `InvalidRequest`,
+stale state `Conflict`, missing resources `NotFound` and so on), and core
+types, I/O, protocol, storage, HTTP and timeouts are classified directly. Kinds
+are never parsed from text; unclassified failures are `Other`.
 URLs in transport errors are redacted before a report leaves the runtime.
 
 The same capture is recorded through `tracing` as a structured event

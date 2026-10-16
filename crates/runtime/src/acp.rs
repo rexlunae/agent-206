@@ -5,7 +5,11 @@ use agent_client_protocol::schema::{ProtocolVersion, v1::*};
 use agent_client_protocol::{Agent, Stdio};
 use uuid::Uuid;
 
-pub async fn serve(client: Client, thread: Uuid) -> anyhow::Result<()> {
+/// The ACP connection failed or closed with an error.
+#[derive(Debug, thiserror::Error)]
+#[error("ACP connection failed")]
+pub struct AcpError(#[source] agent_client_protocol::Error);
+pub async fn serve(client: Client, thread: Uuid) -> Result<(), AcpError> {
     // The launch command binds authority to a user-selected existing thread.
     let session = SessionId::new(thread.to_string());
     let for_new = session.clone();
@@ -112,6 +116,7 @@ pub async fn serve(client: Client, thread: Uuid) -> anyhow::Result<()> {
             agent_client_protocol::on_receive_notification!(),
         )
         .connect_to(Stdio::new())
-        .await?;
+        .await
+        .map_err(AcpError)?;
     Ok(())
 }

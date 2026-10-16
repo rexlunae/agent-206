@@ -1,17 +1,30 @@
 //! Conversion of runtime failures into protocol [`ErrorReport`]s.
 //!
-//! Code inside the runtime keeps typed errors (`anyhow::Error` with its source
-//! chain). Where a failure is handled (a reply, a failed run or download) it is
-//! captured once with [`report`], recorded with [`record`] and sent as the
-//! report. Never stringify an error to carry it further.
+//! Each runtime module keeps its own `thiserror` enum whose causes stay in
+//! `source()`. Where a failure is handled (a reply, a failed run or download)
+//! it is captured once with [`report`], recorded with [`record`] and sent as
+//! the report. Never stringify an error to carry it further.
 use a206_core::{ErrorKind, ErrorReport};
 use std::error::Error;
 
+/// A runtime error type that knows the client-facing kind of its failure.
+/// `None` defers to the error's causes, for wrappers that add only context.
+/// A `#[error(transparent)]` variant hides its inner error from the source
+/// chain, so it must return [`classify`] of that inner error itself.
+pub trait Classified {
+    fn kind(&self) -> Option<ErrorKind>;
+}
+
+/// Fail with `error` unless `condition` holds.
+pub(crate) fn check<E>(condition: bool, error: E) -> Result<(), E> {
+    if condition { Ok(()) } else { Err(error) }
+}
+
 /// Capture an error and its cause chain with runtime classifications.
 /// URLs in transport errors are redacted: they can carry signed tokens.
-pub fn report(error: &anyhow::Error) -> ErrorReport {
-    let mut report = ErrorReport::capture(error.as_ref(), classify);
-    redact(&mut report, error.as_ref());
+pub fn report(error: &(dyn Error + 'static)) -> ErrorReport {
+    let mut report = ErrorReport::capture(error, classify);
+    redact(&mut report, error);
     report
 }
 
@@ -39,7 +52,7 @@ pub fn record(operation: &'static str, report: &ErrorReport) {
 }
 
 /// Capture and record in one step, for failures handled where they occur.
-pub fn handle(operation: &'static str, error: &anyhow::Error) -> ErrorReport {
+pub fn handle(operation: &'static str, error: &(dyn Error + 'static)) -> ErrorReport {
     let report = report(error);
     record(operation, &report);
     report
@@ -50,27 +63,46 @@ pub fn handle(operation: &'static str, error: &anyhow::Error) -> ErrorReport {
 pub fn correlated(
     operation: &'static str,
     correlation: uuid::Uuid,
-    error: &anyhow::Error,
+    error: &(dyn Error + 'static),
 ) -> ErrorReport {
     let report = report(error).with_correlation(correlation);
     record(operation, &report);
     report
 }
 
-/// An error for a lock whose holder panicked.
-pub fn poisoned(lock: &str) -> anyhow::Error {
-    ErrorReport::new(ErrorKind::Internal, format!("{lock} lock poisoned")).into()
-}
-
-/// An error for a missing resource.
-pub fn not_found(message: impl Into<String>) -> anyhow::Error {
-    ErrorReport::new(ErrorKind::NotFound, message).into()
-}
-
-fn classify(error: &(dyn Error + 'static)) -> Option<ErrorKind> {
-    if error.is::<a206_protocol::Error>() {
-        return Some(ErrorKind::Protocol);
+/// The kind of one link of an error chain, if the runtime knows it.
+pub(crate) fn classify(error: &(dyn Error + 'static)) -> Option<ErrorKind> {
+    macro_rules! classified {
+        ($($error:ty),* $(,)?) => {$(
+            if let Some(error) = error.downcast_ref::<$error>() {
+                return error.kind();
+            }
+        )*};
     }
+    classified!(
+        crate::backends::BackendError,
+        crate::backends::proxy::ProxyError,
+        crate::client::ClientError,
+        crate::connection::ConnectionError,
+        crate::control::ControlError,
+        crate::gateway::GatewayError,
+        crate::joshua::JoshuaError,
+        crate::network::DownloadError,
+        crate::process::ProcessError,
+        crate::provider::EndpointError,
+        crate::provider::PresetError,
+        crate::provider::ProviderError,
+        crate::service::ServiceError,
+        crate::store::StoreError,
+        crate::transport::FrameError,
+        crate::transport::LaunchError,
+        crate::transport::SshEndpointError,
+        a206_broker::BrokerError,
+        a206_broker::ClientError,
+        a206_extensions::ExtensionError,
+        a206_protocol::Error,
+        reqwest::Error,
+    );
     if error.is::<tokio::time::error::Elapsed>() {
         return Some(ErrorKind::Timeout);
     }
@@ -80,9 +112,13 @@ fn classify(error: &(dyn Error + 'static)) -> Option<ErrorKind> {
     if error.is::<rmp_serde::decode::Error>() || error.is::<rmp_serde::encode::Error>() {
         return Some(ErrorKind::Protocol);
     }
-    if let Some(error) = error.downcast_ref::<a206_broker::BrokerError>() {
-        use a206_broker::BrokerError as B;
-        return Some(match error {
+    None
+}
+
+impl Classified for a206_broker::BrokerError {
+    fn kind(&self) -> Option<ErrorKind> {
+        use a206_broker::{BrokerError as B, UpstreamFailure as U};
+        Some(match self {
             B::Locked | B::NoVault | B::LockedOut { .. } => ErrorKind::Unavailable,
             B::AuthenticationFailed
             | B::TotpRequired
@@ -95,30 +131,56 @@ fn classify(error: &(dyn Error + 'static)) -> Option<ErrorKind> {
             B::NotFound => ErrorKind::NotFound,
             B::Invalid(_) => ErrorKind::InvalidRequest,
             B::Vault(_) => ErrorKind::Storage,
-            B::Upstream(a206_broker::UpstreamFailure::Timeout) => ErrorKind::Timeout,
-            B::Upstream(a206_broker::UpstreamFailure::Connect) => ErrorKind::Unavailable,
+            B::Upstream(U::Timeout) => ErrorKind::Timeout,
+            B::Upstream(U::Connect) => ErrorKind::Unavailable,
             B::Upstream(_) => ErrorKind::Provider,
-        });
+        })
     }
-    if let Some(error) = error.downcast_ref::<a206_broker::ClientError>() {
+}
+impl Classified for a206_broker::ClientError {
+    fn kind(&self) -> Option<ErrorKind> {
         use a206_broker::ClientError as C;
-        return match error {
+        match self {
             C::Io(_) | C::Closed => Some(ErrorKind::Unavailable),
             C::Protocol(_) => Some(ErrorKind::Protocol),
             // `transparent` hides the reply from the chain, so classify it here.
-            C::Broker(reply) => classify(reply),
-        };
+            C::Broker(reply) => reply.kind(),
+        }
     }
-    if let Some(error) = error.downcast_ref::<reqwest::Error>() {
-        return Some(if error.is_timeout() {
+}
+impl Classified for a206_extensions::ExtensionError {
+    fn kind(&self) -> Option<ErrorKind> {
+        use a206_extensions::ExtensionError as X;
+        Some(match self {
+            X::Manifest(_) | X::Abi(_) | X::Id | X::Entry | X::TooLarge | X::Module(_) => {
+                ErrorKind::InvalidRequest
+            }
+            // The extension broke its ABI contract.
+            X::MissingRun(_)
+            | X::MissingMemory
+            | X::OutputBounds(_)
+            | X::OutputTooLarge
+            | X::Output(_)
+            | X::TooManyFields => ErrorKind::Protocol,
+            X::Runtime(_) => return None,
+        })
+    }
+}
+impl Classified for a206_protocol::Error {
+    fn kind(&self) -> Option<ErrorKind> {
+        Some(ErrorKind::Protocol)
+    }
+}
+impl Classified for reqwest::Error {
+    fn kind(&self) -> Option<ErrorKind> {
+        Some(if self.is_timeout() {
             ErrorKind::Timeout
-        } else if error.is_connect() {
+        } else if self.is_connect() {
             ErrorKind::Unavailable
         } else {
             ErrorKind::Provider
-        });
+        })
     }
-    None
 }
 
 fn redact(report: &mut ErrorReport, error: &(dyn Error + 'static)) {
@@ -139,41 +201,69 @@ fn redact(report: &mut ErrorReport, error: &(dyn Error + 'static)) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use anyhow::Context;
+
+    /// A caller's context around a cause, as runtime modules add it.
+    #[derive(Debug, thiserror::Error)]
+    enum Context {
+        #[error("could not write the settings file")]
+        Write(#[source] std::io::Error),
+        #[error("download failed")]
+        Download(#[source] reqwest::Error),
+    }
 
     #[test]
     fn context_chain_survives_capture() {
         let detail = uuid::Uuid::new_v4().to_string();
-        let error = Err::<(), _>(std::io::Error::new(
+        let error = Context::Write(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             detail.clone(),
-        ))
-        .context("could not write the settings file")
-        .unwrap_err();
+        ));
         let report = report(&error);
         assert_eq!(report.kind, ErrorKind::PermissionDenied);
         assert_eq!(report.message, "could not write the settings file");
         assert_eq!(report.causes().next().unwrap().message, detail);
-        assert_eq!(report.detail(), format!("{error:#}"));
+        assert_eq!(
+            report.detail(),
+            format!("could not write the settings file: {detail}")
+        );
     }
 
     #[test]
     fn explicit_kinds_survive_added_context() {
-        let error = Err::<(), _>(not_found("thread not found"))
-            .context("could not send the message")
-            .unwrap_err();
-        let report = report(&error);
-        assert_eq!(report.kind, ErrorKind::NotFound);
-        assert_eq!(report.chain().count(), 2);
-        assert_eq!(super::report(&poisoned("state")).kind, ErrorKind::Internal);
+        use crate::{gateway::GatewayError, store::StoreError};
+        let wrapped = report(&GatewayError::Receipt(StoreError::ThreadNotFound));
+        assert_eq!(wrapped.kind, ErrorKind::NotFound);
+        assert_eq!(wrapped.chain().count(), 2);
+        // A transparent wrapper is not a link of its own, but keeps the inner kind.
+        let transparent = report(&GatewayError::Store(StoreError::ThreadNotFound));
+        assert_eq!(transparent.kind, ErrorKind::NotFound);
+        assert_eq!(transparent.chain().count(), 1);
+        let poisoned = report(&GatewayError::Poisoned { lock: "state" });
+        assert_eq!(poisoned.kind, ErrorKind::Internal);
+    }
+
+    #[test]
+    fn missing_paths_keep_their_io_kind() {
+        use std::io::{Error, ErrorKind as Io};
+        for (io, kind) in [
+            (Io::NotFound, ErrorKind::NotFound),
+            (Io::PermissionDenied, ErrorKind::PermissionDenied),
+        ] {
+            let backend = crate::backends::BackendError::Missing {
+                what: "backend executable",
+                source: Error::from(io),
+            };
+            assert_eq!(report(&backend).kind, kind);
+            let model = crate::joshua::JoshuaError::MissingModel(Error::from(io));
+            assert_eq!(report(&model).kind, kind);
+        }
     }
 
     #[test]
     fn broker_failures_keep_their_kind() {
-        let denied = anyhow::Error::from(a206_broker::ClientError::from(
+        let denied = crate::provider::ProviderError::Broker(a206_broker::ClientError::from(
             a206_broker::BrokerError::StepUpRequired,
-        ))
-        .context("could not use the credential");
+        ));
         assert_eq!(report(&denied).kind, ErrorKind::PermissionDenied);
         for (failure, kind) in [
             (a206_broker::UpstreamFailure::Timeout, ErrorKind::Timeout),
@@ -183,14 +273,12 @@ mod tests {
             ),
             (a206_broker::UpstreamFailure::Transfer, ErrorKind::Provider),
         ] {
-            let upstream = anyhow::Error::from(a206_broker::ClientError::from(
-                a206_broker::BrokerError::Upstream(failure),
-            ));
+            let upstream =
+                a206_broker::ClientError::from(a206_broker::BrokerError::Upstream(failure));
             assert_eq!(report(&upstream).kind, kind);
         }
-        let offline = anyhow::Error::from(a206_broker::ClientError::from(std::io::Error::from(
-            std::io::ErrorKind::NotFound,
-        )));
+        let offline =
+            a206_broker::ClientError::from(std::io::Error::from(std::io::ErrorKind::NotFound));
         let offline = report(&offline);
         assert_eq!(offline.kind, ErrorKind::Unavailable);
         assert_eq!(offline.chain().count(), 2, "{offline:#}");
@@ -218,9 +306,7 @@ mod tests {
             .finish();
         let cause = uuid::Uuid::new_v4().to_string();
         let correlation = uuid::Uuid::new_v4();
-        let error = Err::<(), _>(std::io::Error::other(cause.clone()))
-            .context("could not write the settings file")
-            .unwrap_err();
+        let error = Context::Write(std::io::Error::other(cause.clone()));
         tracing::subscriber::with_default(subscriber, || {
             correlated("save_settings", correlation, &error);
         });
@@ -255,10 +341,11 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         drop(listener);
-        let error = reqwest::get(format!("http://{address}/download?token={secret}"))
-            .await
-            .context("download failed")
-            .unwrap_err();
+        let error = Context::Download(
+            reqwest::get(format!("http://{address}/download?token={secret}"))
+                .await
+                .unwrap_err(),
+        );
         let report = report(&error);
         assert_eq!(report.kind, ErrorKind::Unavailable);
         assert!(!report.detail().contains(&secret), "{}", report.detail());

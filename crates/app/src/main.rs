@@ -435,27 +435,28 @@ mod native {
                         return Ok(());
                     }
                     return if daemon {
-                        a206_runtime::service::daemon(&root, start).await
+                        Ok(a206_runtime::service::daemon(&root, start).await?)
                     } else if stdio {
-                        a206_runtime::service::stdio(&root, !no_start, start).await
+                        Ok(a206_runtime::service::stdio(&root, !no_start, start).await?)
                     } else {
                         anyhow::bail!("choose gateway start, stop, restart, status or reconnect")
                     };
                 }
                 if let Action::Web { static_dir, port } = action {
-                    return a206_runtime::web::serve(root.clone(), remote()?, static_dir, port)
-                        .await;
+                    return Ok(
+                        a206_runtime::web::serve(root.clone(), remote()?, static_dir, port).await?,
+                    );
                 }
                 let client = a206_runtime::client::Client::start(root.clone(), remote()?);
                 if let Action::Acp { thread } = action {
-                    return a206_runtime::acp::serve(client, thread).await;
+                    return Ok(a206_runtime::acp::serve(client, thread).await?);
                 }
                 if let Action::Mcp {
                     thread,
                     allow_title_edit,
                 } = action
                 {
-                    return a206_runtime::mcp::serve(client, thread, allow_title_edit).await;
+                    return Ok(a206_runtime::mcp::serve(client, thread, allow_title_edit).await?);
                 }
                 let command = match action {
                     Action::Providers {

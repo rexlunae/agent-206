@@ -77,7 +77,7 @@ impl Harness {
             capabilities: &thread.grant.capabilities,
             subagent_models: &thread.subagent_models,
         })
-        .map_err(|e| shown("thread_state", &e.into()))
+        .map_err(|e| shown("thread_state", &e))
     }
     #[tool(
         description = "Read the harness extension and permission contract. This tool cannot approve privileges, change settings, execute commands or read secret values."
@@ -88,7 +88,7 @@ impl Harness {
 }
 /// A tool result is the model-facing display edge: record the failure with its
 /// chain, then render it as the text the tool returns.
-fn shown(operation: &'static str, error: &anyhow::Error) -> String {
+fn shown(operation: &'static str, error: &(dyn std::error::Error + 'static)) -> String {
     crate::error::handle(operation, error).detail()
 }
 #[tool_handler(router = self.tool_router)]
@@ -108,7 +108,15 @@ impl ServerHandler for Harness {
         }
     }
 }
-pub async fn serve(client: Client, thread: Uuid, allow_title_edit: bool) -> anyhow::Result<()> {
+/// Why the MCP harness server stopped.
+#[derive(Debug, thiserror::Error)]
+pub enum McpError {
+    #[error("MCP client did not complete initialization")]
+    Initialize(#[source] Box<rmcp::service::ServerInitializeError>),
+    #[error("MCP server task failed")]
+    Task(#[source] tokio::task::JoinError),
+}
+pub async fn serve(client: Client, thread: Uuid, allow_title_edit: bool) -> Result<(), McpError> {
     let mut tool_router = Harness::tool_router();
     if !allow_title_edit {
         tool_router.remove_route("rename_thread");
@@ -120,7 +128,8 @@ pub async fn serve(client: Client, thread: Uuid, allow_title_edit: bool) -> anyh
         tool_router,
     }
     .serve(rmcp::transport::stdio())
-    .await?;
-    service.waiting().await?;
+    .await
+    .map_err(|error| McpError::Initialize(Box::new(error)))?;
+    service.waiting().await.map_err(McpError::Task)?;
     Ok(())
 }
