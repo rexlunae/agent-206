@@ -52,7 +52,9 @@ attribution. Prefer a small replacement over carrying historical architecture.
 - Only display code turns an error into a string: UI rendering, CLI output or a
   model-facing tool result. While an error is still propagating through the app,
   every field and cause stays directly inspectable, including across the wire,
-  in stored state and in log events.
+  in stored state and in log events. A legacy text field kept for older clients
+  is display text for those clients and always travels beside the structured
+  value, never instead of it.
 - Errors crossing the gateway or extension boundary are versioned MessagePack
   values: stable kind/code, human message, cause chain and correlation id, so a
   client can display, match and examine them without parsing prose.

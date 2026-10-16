@@ -95,6 +95,8 @@ fn classify(error: &(dyn Error + 'static)) -> Option<ErrorKind> {
             B::NotFound => ErrorKind::NotFound,
             B::Invalid(_) => ErrorKind::InvalidRequest,
             B::Vault(_) => ErrorKind::Storage,
+            B::Upstream(a206_broker::UpstreamFailure::Timeout) => ErrorKind::Timeout,
+            B::Upstream(a206_broker::UpstreamFailure::Connect) => ErrorKind::Unavailable,
             B::Upstream(_) => ErrorKind::Provider,
         });
     }
@@ -173,6 +175,19 @@ mod tests {
         ))
         .context("could not use the credential");
         assert_eq!(report(&denied).kind, ErrorKind::PermissionDenied);
+        for (failure, kind) in [
+            (a206_broker::UpstreamFailure::Timeout, ErrorKind::Timeout),
+            (
+                a206_broker::UpstreamFailure::Connect,
+                ErrorKind::Unavailable,
+            ),
+            (a206_broker::UpstreamFailure::Transfer, ErrorKind::Provider),
+        ] {
+            let upstream = anyhow::Error::from(a206_broker::ClientError::from(
+                a206_broker::BrokerError::Upstream(failure),
+            ));
+            assert_eq!(report(&upstream).kind, kind);
+        }
         let offline = anyhow::Error::from(a206_broker::ClientError::from(std::io::Error::from(
             std::io::ErrorKind::NotFound,
         )));

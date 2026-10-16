@@ -296,8 +296,10 @@ async fn refresh(mut state: State) {
     match report {
         Ok(report) => {
             let running = report.phase == GatewayPhase::Running;
-            // A successful probe retires the outage; command errors stay until dismissed.
-            set_outage(state, None);
+            // The controller answered; its probe's failure, if any, is the outage.
+            // A running gateway or a deliberate stop clears it. Command errors
+            // stay until dismissed.
+            set_outage(state, report.failure_report());
             state.connected.set(running);
             state.gateway.set(Some(report));
             if !running {
