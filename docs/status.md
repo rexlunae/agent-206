@@ -52,7 +52,11 @@ disabled. No subscription login is offered for Claude Agent.
 Gateway lifecycle tests use the real executable and independent clients: idempotent
 start, status/reconnect, stop surviving polling/new clients, stdio bridge exit,
 restart/profile persistence, authenticated web controls, rejected cross-origin
-requests, denied raw shutdown and duplicate-restart receipts. Native startup uses
+requests, denied raw shutdown and duplicate-restart receipts. Regressions cover
+offline stop for fresh/existing profiles, profile-lock coordination, shutdown replay
+after restart, lost shutdown acknowledgements, and a real provider request held
+past the cleanup deadline: repeated Start preserves its reply and failed Stop
+restores work admission. Native startup uses
 safe asynchronous stdin readiness so closing the gateway does not strand a blocking
 stdio reader. Live browser checks cover start/stop/reload/restart on a private profile.
 

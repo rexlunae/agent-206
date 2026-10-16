@@ -32,7 +32,10 @@ Use `agent206 --help` and subcommand help for the actual supported tree.
 
 Status/reconnect must not launch a missing or deliberately stopped gateway.
 Explicit start/restart can resume it. Stop/restart wait for bounded cleanup and
-verified acknowledgement; never kill a guessed PID. Scripts must distinguish a
+verified acknowledgement; never kill a guessed PID. Local stop also persists for
+an offline profile. Failed cleanup restores work admission while leaving already
+cancelled work cancelled. Repeated start preserves the running connection.
+Scripts must distinguish a
 running process from completed security enrollment. Missing remote capabilities,
 unknown metadata or offline workspace counts must be reported honestly.
 

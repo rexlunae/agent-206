@@ -156,6 +156,22 @@ async fn stop(
     root: &std::path::Path,
     remote: &Option<String>,
 ) -> Result<()> {
+    if remote.is_none() {
+        loop {
+            if crate::service::stop_if_offline(root)? {
+                replace(shared, Client::attach(root.into(), None))?;
+                return Ok(());
+            }
+            // A starting daemon may own the profile lock before binding its
+            // socket. Wait for it rather than mistaking that gap for an offline
+            // profile, or starting another daemon to deliver the stop request.
+            if current(shared)?.call(Command::GatewayStatus).await.is_ok() {
+                break;
+            }
+            replace(shared, Client::attach(root.into(), None))?;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
     match current(shared)?.call(Command::Shutdown).await? {
         Reply::Ok => {}
         Reply::Error { message } => anyhow::bail!("{message}"),
@@ -171,10 +187,7 @@ async fn stop(
     }
     if remote.is_none() {
         loop {
-            let lock = std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(root.join("gateway.lock"))?;
+            let lock = crate::store::profile_lock(root)?;
             if fs2::FileExt::try_lock_exclusive(&lock).is_ok() {
                 break;
             }
@@ -198,14 +211,20 @@ async fn manage(
             }
         }
         GatewayAction::Start => {
+            if let Ok(info) = probe(current(shared)?).await {
+                *stopped = false;
+                return Ok(Some(info));
+            }
             *stopped = false;
             replace(shared, Client::launch(root.into(), remote.clone()))?;
         }
         GatewayAction::Reconnect => replace(shared, Client::attach(root.into(), remote.clone()))?,
         GatewayAction::Stop | GatewayAction::Restart => {
-            replace(shared, Client::attach(root.into(), remote.clone()))?;
-            let reachable = probe(current(shared)?).await.is_ok();
-            if reachable || !(*stopped || (remote.is_none() && crate::service::is_stopped(root))) {
+            if current(shared)?.is_closed() {
+                replace(shared, Client::attach(root.into(), remote.clone()))?;
+            }
+            let reachable = remote.is_some() && probe(current(shared)?).await.is_ok();
+            if remote.is_none() || reachable || !*stopped {
                 // Older gateways can acknowledge Shutdown even if they do not
                 // implement the newer status reply. Never infer a PID to kill.
                 stop(shared, root, remote).await?;

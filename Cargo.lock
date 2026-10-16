@@ -180,6 +180,7 @@ dependencies = [
  "a206-ui",
  "a206-vault",
  "anyhow",
+ "axum",
  "clap",
  "dioxus",
  "dioxus-ssr",

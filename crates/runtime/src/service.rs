@@ -12,6 +12,19 @@ pub fn mark_stopped(root: &Path) -> Result<()> {
     std::fs::File::open(root)?.sync_all()?;
     Ok(())
 }
+/// Persist stop for an absent service, serialized with startup by its store lock.
+/// A locked profile must instead acknowledge cleanup through the live gateway.
+pub(crate) fn stop_if_offline(root: &Path) -> Result<bool> {
+    let lock = crate::store::profile_lock(root)?;
+    match fs2::FileExt::try_lock_exclusive(&lock) {
+        Ok(()) => {
+            mark_stopped(root)?;
+            Ok(true)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
 #[cfg(unix)]
 pub async fn daemon(root: &Path, explicit: bool) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
@@ -203,5 +216,24 @@ pub async fn refresh_catalogs(gateway: crate::gateway::Gateway) {
             }
         }
         tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn offline_stop_is_serialized_with_startup_ownership() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("profile");
+        let lock = crate::store::profile_lock(&root).unwrap();
+        fs2::FileExt::try_lock_exclusive(&lock).unwrap();
+        assert!(!stop_if_offline(&root).unwrap());
+        assert!(!is_stopped(&root));
+        drop(lock);
+        assert!(stop_if_offline(&root).unwrap());
+        assert!(is_stopped(&root));
+        assert!(stop_if_offline(&root).unwrap());
     }
 }

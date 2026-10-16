@@ -28,9 +28,46 @@ impl Drop for ActiveRequest {
         }
     }
 }
+struct DrainAttempt {
+    admission: Arc<Mutex<Admission>>,
+    committed: bool,
+}
+/// Dropping a freshly committed acknowledgement also completes shutdown when
+/// its client disconnects or the writer cannot deliver earlier queued replies.
+struct StopAfterReply(Option<tokio_util::sync::CancellationToken>);
+impl Drop for StopAfterReply {
+    fn drop(&mut self) {
+        if let Some(stop) = &self.0 {
+            stop.cancel();
+        }
+    }
+}
+impl DrainAttempt {
+    fn begin(admission: &Arc<Mutex<Admission>>) -> Result<Self> {
+        let mut state = admission
+            .lock()
+            .map_err(|_| anyhow::anyhow!("gateway admission lock poisoned"))?;
+        ensure!(!state.draining, "gateway shutdown is already complete");
+        state.draining = true;
+        Ok(Self {
+            admission: admission.clone(),
+            committed: false,
+        })
+    }
+}
+impl Drop for DrainAttempt {
+    fn drop(&mut self) {
+        if !self.committed
+            && let Ok(mut admission) = self.admission.lock()
+        {
+            admission.draining = false;
+        }
+    }
+}
 #[derive(Clone)]
 pub struct Gateway {
     admission: Arc<Mutex<Admission>>,
+    shutdown: Arc<tokio::sync::Mutex<()>>,
     started: std::time::Instant,
     stop: tokio_util::sync::CancellationToken,
     joshua: Arc<tokio::sync::Mutex<crate::joshua::Manager>>,
@@ -42,6 +79,7 @@ impl Gateway {
     pub fn open(root: &Path) -> Result<Self> {
         Ok(Self {
             admission: Arc::new(Mutex::new(Admission::default())),
+            shutdown: Arc::new(tokio::sync::Mutex::new(())),
             started: std::time::Instant::now(),
             stop: tokio_util::sync::CancellationToken::new(),
             joshua: Arc::new(tokio::sync::Mutex::new(crate::joshua::Manager::default())),
@@ -85,27 +123,38 @@ impl Gateway {
         Ok(())
     }
     pub async fn request(&self, request: Request<Command>) -> Response<Reply> {
+        self.request_with_effect(request).await.0
+    }
+    /// The stop effect belongs only to fresh execution, never a durable replay.
+    async fn request_with_effect(&self, request: Request<Command>) -> (Response<Reply>, bool) {
         let id = request.id;
+        let is_shutdown = matches!(request.body, Command::Shutdown);
         let _active = if !matches!(
             request.body,
             Command::Snapshot | Command::GatewayStatus | Command::Shutdown | Command::Events { .. }
         ) {
             let Ok(mut admission) = self.admission.lock() else {
-                return Response {
-                    id,
-                    body: Reply::Error {
-                        message: "gateway admission lock poisoned".into(),
+                return (
+                    Response {
+                        id,
+                        body: Reply::Error {
+                            message: "gateway admission lock poisoned".into(),
+                        },
                     },
-                };
+                    false,
+                );
             };
             if admission.draining {
-                return Response {
-                    id,
-                    body: Reply::Error {
-                        message: "gateway is stopping; start it again before submitting work"
-                            .into(),
+                return (
+                    Response {
+                        id,
+                        body: Reply::Error {
+                            message: "gateway is stopping; start it again before submitting work"
+                                .into(),
+                        },
                     },
-                };
+                    false,
+                );
             }
             admission.active += 1;
             Some(ActiveRequest(self.admission.clone()))
@@ -129,6 +178,7 @@ impl Gateway {
                 Ok(None)
             }
         })();
+        let mut stop = false;
         let body = match begin {
             Ok(Some(reply)) => reply,
             Err(error) => Reply::Error {
@@ -141,20 +191,24 @@ impl Gateway {
                     .unwrap_or_else(|e| Reply::Error {
                         message: e.to_string(),
                     });
+                stop = is_shutdown && matches!(reply, Reply::Ok);
                 if mutation && let Err(e) = self.lock().and_then(|s| s.finish(id, &reply)) {
-                    return Response {
-                        id,
-                        body: Reply::Error {
-                            message: format!(
-                                "operation completed but its receipt could not be persisted: {e}"
-                            ),
+                    return (
+                        Response {
+                            id,
+                            body: Reply::Error {
+                                message: format!(
+                                    "operation completed but its receipt could not be persisted: {e}"
+                                ),
+                            },
                         },
-                    };
+                        stop,
+                    );
                 }
                 reply
             }
         };
-        Response { id, body }
+        (Response { id, body }, stop)
     }
     async fn handle(&self, command: Command) -> Result<Reply> {
         match command {
@@ -890,10 +944,10 @@ impl Gateway {
                 ))
             }
             Command::Shutdown => {
-                self.admission
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("gateway admission lock poisoned"))?
-                    .draining = true;
+                // Serialize independent shutdown attempts so a failed one's
+                // rollback cannot reopen admission during another one's cleanup.
+                let _shutdown = self.shutdown.lock().await;
+                let mut drain = DrainAttempt::begin(&self.admission)?;
                 tokio::time::timeout(std::time::Duration::from_secs(15), async {
                     loop {
                         // Admission is closed. Repeat cancellation for requests
@@ -943,6 +997,7 @@ impl Gateway {
                 // Persist user intent before acknowledging stop. Ordinary
                 // clients cannot resurrect a deliberately stopped service.
                 crate::service::mark_stopped(&self.lock()?.root)?;
+                drain.committed = true;
                 Ok(Reply::Ok)
             }
         }
@@ -1169,28 +1224,30 @@ where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    let (sender, mut receiver) = tokio::sync::mpsc::channel::<(Response<Reply>, bool)>(32);
-    let stop = gateway.stop_signal();
+    let (sender, mut receiver) =
+        tokio::sync::mpsc::channel::<(Response<Reply>, StopAfterReply)>(32);
     let writer = tokio::spawn(async move {
-        while let Some((reply, shutdown)) = receiver.recv().await {
-            transport::write_frame(&mut output, &reply).await?;
-            if shutdown && matches!(reply.body, Reply::Ok) {
-                stop.cancel();
-            }
+        while let Some((reply, stop)) = receiver.recv().await {
+            let delivered = transport::write_frame(&mut output, &reply).await;
+            // Cleanup and current stop intent are already committed. A lost
+            // acknowledgement must not leave a live gateway stuck draining.
+            drop(stop);
+            delivered?;
         }
         Ok::<(), anyhow::Error>(())
     });
     let semaphore = Arc::new(tokio::sync::Semaphore::new(16));
     let mut tasks = tokio::task::JoinSet::new();
     while let Some(request) = transport::read_frame::<Request<Command>>(&mut input).await? {
-        let shutdown = matches!(request.body, Command::Shutdown);
         let permit = semaphore.clone().acquire_owned().await?;
         let gateway = gateway.clone();
         let sender = sender.clone();
         tasks.spawn(async move {
             let _permit = permit;
+            let (reply, stop) = gateway.request_with_effect(request).await;
+            let stop = StopAfterReply(stop.then(|| gateway.stop_signal()));
             sender
-                .send((gateway.request(request).await, shutdown))
+                .send((reply, stop))
                 .await
                 .context("reply channel closed")
         });
@@ -1230,6 +1287,31 @@ fn validate_effort(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn committed_shutdown_survives_a_lost_acknowledgement() {
+        let directory = tempfile::tempdir().unwrap();
+        let gateway = Gateway::open(directory.path()).unwrap();
+        let (mut client, server) = tokio::io::duplex(1024);
+        let (read, write) = tokio::io::split(server);
+        let worker = tokio::spawn(serve_connection(gateway.clone(), read, write));
+        transport::write_frame(
+            &mut client,
+            &Request {
+                id: Id::new_v4(),
+                body: Command::Shutdown,
+            },
+        )
+        .await
+        .unwrap();
+        drop(client);
+        tokio::time::timeout(std::time::Duration::from_secs(3), gateway.stop.cancelled())
+            .await
+            .unwrap();
+        assert!(crate::service::is_stopped(directory.path()));
+        assert!(worker.await.unwrap().is_err());
+    }
+
     #[tokio::test]
     async fn managed_joshua_connection_cannot_be_repointed_or_removed() {
         let directory = tempfile::tempdir().unwrap();

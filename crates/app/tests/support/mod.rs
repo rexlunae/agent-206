@@ -8,6 +8,14 @@ use tokio::{
 pub const TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_CAPTURE: u64 = 4 * 1024 * 1024;
 
+pub fn binary() -> Result<PathBuf> {
+    Ok(PathBuf::from(
+        std::env::var_os("A206_TEST_BINARY")
+            .unwrap_or_else(|| env!("CARGO_BIN_EXE_agent206").into()),
+    )
+    .canonicalize()?)
+}
+
 pub async fn capture(mut command: Command) -> Result<std::process::Output> {
     let mut child = command
         .stdin(Stdio::null())
@@ -96,11 +104,7 @@ impl App {
         directory: tempfile::TempDir,
         environment: BTreeMap<OsString, OsString>,
     ) -> Result<Self> {
-        let binary = PathBuf::from(
-            std::env::var_os("A206_TEST_BINARY")
-                .unwrap_or_else(|| env!("CARGO_BIN_EXE_agent206").into()),
-        )
-        .canonicalize()?;
+        let binary = binary()?;
         let root = directory.path().join("state");
         std::fs::create_dir(&root)?;
         let log = std::fs::File::create(root.join("gateway.log"))?;
