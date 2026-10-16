@@ -91,6 +91,87 @@ fn result(reply: Value) -> Result<Value> {
         .context("protocol result missing")
 }
 
+/// The bundled WASM extension through the gateway and its worker process:
+/// denied until granted, then file tools, a panel and persisted panel state.
+async fn extension_smoke(app: &App) -> Result<()> {
+    let workspace = tempfile::Builder::new().prefix("a206-ws-").tempdir()?;
+    let body = uuid::Uuid::new_v4().to_string();
+    std::fs::write(workspace.path().join("notes.txt"), &body)?;
+    std::fs::write(workspace.path().join(".hidden"), "")?;
+    let root = workspace.path().to_str().context("workspace path")?;
+    let Reply::Project(project) =
+        toml::from_str(&app.cli(&["project", "Extension smoke", root]).await?)?
+    else {
+        anyhow::bail!("expected project");
+    };
+    let project = project.id.to_string();
+    let id = "agent206.workspace";
+    let read = [
+        "extension",
+        "tool",
+        id,
+        "read_text_file",
+        "--project",
+        &project,
+        "--args",
+        "path = \"notes.txt\"",
+    ];
+    let denied = capture(app.command(&read)).await?;
+    ensure!(
+        !denied.status.success(),
+        "an ungranted extension read a file"
+    );
+    ensure!(
+        String::from_utf8_lossy(&denied.stderr).contains("permission"),
+        "denial did not reach the client: {}",
+        String::from_utf8_lossy(&denied.stderr)
+    );
+    app.cli(&["extension", "grant", id, "--capability", "read_workspace"])
+        .await?;
+    ensure!(
+        app.cli(&read).await?.trim() == body,
+        "tool output did not round-trip"
+    );
+    let escape = [
+        "extension",
+        "tool",
+        id,
+        "read_text_file",
+        "--project",
+        &project,
+        "--args",
+        "path = \"../escape\"",
+    ];
+    ensure!(
+        !capture(app.command(&escape)).await?.status.success(),
+        "a path escaped the workspace"
+    );
+    let panel = ["extension", "panel", id, "overview", "--project", &project];
+    let first = app.cli(&panel).await?;
+    ensure!(
+        first.contains("notes.txt") && !first.contains(".hidden"),
+        "unexpected panel: {first}"
+    );
+    let pressed = app
+        .cli(&[&panel[..], &["--press", "toggle-hidden"]].concat())
+        .await?;
+    ensure!(
+        pressed.contains(".hidden"),
+        "panel event was ignored: {pressed}"
+    );
+    // The preference persisted in the extension's own state.
+    ensure!(
+        app.cli(&panel).await?.contains(".hidden"),
+        "panel state was not kept"
+    );
+    app.cli(&["extension", "grant", id]).await?;
+    ensure!(
+        !capture(app.command(&panel)).await?.status.success(),
+        "revoking a grant had no effect"
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn protocol_smoke() -> Result<()> {
     let directory = tempfile::Builder::new().prefix("a206-").tempdir()?;
@@ -100,12 +181,7 @@ async fn protocol_smoke() -> Result<()> {
         anyhow::bail!("expected thread");
     };
     let thread_id = thread.id.to_string();
-    ensure!(
-        app.cli(&["extension", "agent206.inspector"])
-            .await?
-            .contains("Workspace inspector"),
-        "compiled WASM extension did not run"
-    );
+    extension_smoke(&app).await?;
     let mut acp = Peer::start(&app, &["acp", &thread_id])?;
     let init = result(
         acp.request(

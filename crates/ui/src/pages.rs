@@ -1,3 +1,4 @@
+pub use crate::extensions::Extensions;
 use crate::{PageFrame, State, call, dispatch, error::ErrorNotice, route::Route};
 use a206_core::{Command, DownloadState, ErrorReport, Mode, Reply};
 use fc_dioxus::prelude::*;
@@ -134,24 +135,6 @@ pub fn Downloads() -> Element {
               } }
             }
         }
-    } }
-}
-#[component]
-pub fn Extensions() -> Element {
-    let state = use_context::<State>();
-    let mut output = use_signal(String::new);
-    let mut failure = use_signal(|| None::<ErrorReport>);
-    rsx! { PageFrame { kicker: "Extend your workspace", title: "Small tools. New possibilities.", description: "Compiled WASM extensions share a bounded runtime and explicit permissions.",
-        div { class: "a206-grid", for plugin in &state.data.read().plugins {
-            { let id = plugin.id.clone(); rsx! { Card {
-                CardHeader { CardTitle { "{plugin.name}" } CardSubtitle { "{plugin.description}" } }
-                CardBody { Badge { "Bundled WASM" } p { class: "a206-muted", "Requested capabilities: {plugin.capabilities.len()}" } }
-                CardFooter { Button { variant: ButtonVariant::Secondary, onclick: move |_| { let id = id.clone(); spawn(async move { match call(Command::RunExtension { id, input: String::new() }).await { Ok(Reply::Text(text)) => { failure.set(None); output.set(text) } Err(e) => { output.set(String::new()); failure.set(Some(e)) } _ => {} } }); }, "Open extension" } }
-            } } }
-        } }
-        if let Some(report) = failure() { ErrorNotice { report, title: "Extension failed".to_string() } }
-        if !output().is_empty() { Card { CardBody { p { class: "a206-message-text", "{output}" } } } }
-        p { class: "a206-muted", "Agent-created extension installation and capability-bearing host APIs are still under development." }
     } }
 }
 #[component]

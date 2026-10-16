@@ -27,7 +27,7 @@ without launching a gateway. With no subcommand, the app launches the desktop; `
 | model / providers | providers presets/add, refresh-models; API-only catalogs | Model/account inspection and selection commands with no static model defaults |
 | secrets | vault init/unlock/lock/status/stop, pair (gateway pairing for this unlock), list, add, adopt (untyped legacy entries, optionally renamed with `--as`), policy, bind, enable/disable, delete, agent-access, reveal (step-up), totp enroll/remove, all through the vault broker | SSH key, form and payment entry; recovery codes; key-file import; remote broker over SSH; GUI parity |
 | import | Not implemented | RustyClaw, Cline, Claude Code, Codex, DeepSeek Harness and extensible adapters in imports.md |
-| skills / registries | extension ID executes the bounded bundled WASM tool | Reviewed install/update/list/export and separate instruction/skill management |
+| skills / registries | extension list, grant ID [--capability C…], enable/disable ID, panel ID PANEL [--project P] [--press BUTTON], tool ID TOOL [--project P] [--args TOML], all through the gateway's extension policy | Reviewed install/update/list/export and separate instruction/skill management |
 | swarm / projects | project NAME ROOT creates a coordinator; snapshots retain linked threads | Delegation/task/project orchestration and scoped steering/control commands |
 | doctor | Not implemented | Non-mutating diagnostics by default; explicit reviewed fixes |
 

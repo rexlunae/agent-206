@@ -1,0 +1,32 @@
+id = "agent206.workspace"
+name = "Workspace files"
+description = "Lists and reads files in a project workspace, and shows an overview panel."
+version = "0.2.0"
+abi = 2
+capabilities = ["read_workspace"]
+
+[[tools]]
+name = "list_directory"
+description = "List the entries of a directory in the project workspace."
+capabilities = ["read_workspace"]
+
+[[tools.params]]
+name = "path"
+type = "string"
+description = "Directory relative to the workspace root. Defaults to the root."
+
+[[tools]]
+name = "read_text_file"
+description = "Read a UTF-8 text file from the project workspace."
+capabilities = ["read_workspace"]
+
+[[tools.params]]
+name = "path"
+type = "string"
+description = "File path relative to the workspace root."
+required = true
+
+[[panels]]
+id = "overview"
+title = "Workspace overview"
+capabilities = ["read_workspace"]

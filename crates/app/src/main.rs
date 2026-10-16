@@ -3,6 +3,8 @@
 fn main() {
     dioxus::launch(a206_ui::App);
 }
+#[cfg(not(target_arch = "wasm32"))]
+mod extension_cli;
 #[cfg(all(unix, not(target_arch = "wasm32")))]
 mod vault_cli;
 #[cfg(not(target_arch = "wasm32"))]
@@ -116,8 +118,10 @@ mod native {
             #[arg(long, default_value_t = 0)]
             after: u64,
         },
+        /// Inspect, grant and run extensions.
         Extension {
-            id: String,
+            #[command(subcommand)]
+            command: crate::extension_cli::ExtensionAction,
         },
         #[command(hide = true)]
         ExtensionWorker,
@@ -323,10 +327,7 @@ mod native {
             #[cfg(unix)]
             Action::Vault { command } => crate::vault_cli::run(&root, command),
             Action::ExtensionWorker => {
-                let (_, wasm) = a206_extensions::builtin()?;
-                let output = a206_extensions::execute(wasm, 1_000_000)?;
-                use std::io::Write;
-                std::io::stdout().write_all(&rmp_serde::to_vec_named(&output)?)?;
+                a206_extensions::worker::serve(std::io::stdin(), std::io::stdout())?;
                 Ok(())
             }
             action => tokio::runtime::Runtime::new()?.block_on(async move {
@@ -616,15 +617,35 @@ mod native {
                         models_directory,
                     },
                     Action::Events { after } => Command::Events { after },
-                    Action::Extension { id } => Command::RunExtension {
-                        id,
-                        input: String::new(),
-                    },
+                    Action::Extension { command } => {
+                        match crate::extension_cli::command(command)? {
+                            Some(command) => command,
+                            None => {
+                                let Reply::Snapshot(snapshot) =
+                                    client.call(Command::Snapshot).await?
+                                else {
+                                    anyhow::bail!("could not read extensions");
+                                };
+                                #[derive(serde::Serialize)]
+                                struct Extensions {
+                                    extensions: Vec<a206_core::PluginSummary>,
+                                }
+                                print!(
+                                    "{}",
+                                    toml::to_string_pretty(&Extensions {
+                                        extensions: snapshot.plugins
+                                    })?
+                                );
+                                return Ok(());
+                            }
+                        }
+                    }
                     _ => anyhow::bail!("unsupported command"),
                 };
                 match client.call(command).await? {
                     Reply::Error(report) => return Err(report.into()),
                     Reply::Text(text) => println!("{text}"),
+                    Reply::Panel(view) => println!("{}", crate::extension_cli::render(&view)),
                     Reply::Ok => println!("OK"),
                     reply => println!("{}", toml::to_string_pretty(&reply)?),
                 }

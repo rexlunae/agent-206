@@ -3,7 +3,9 @@ Copyright (c) 2026 Erica Stith
 
 Portions of the SSH transport design, atomic SecureStore persistence, vault
 credential layout, access policies, TOTP handling, authentication limits and the
-`Ignore` result-discard convention are adapted from RustyClaw,
+`Ignore` result-discard convention, and the extension model of declared actions,
+persisted per-extension state and recorded panel interactions are adapted from
+RustyClaw,
 https://github.com/rexlunae/RustyClaw,
 Copyright (c) 2026 Erica Stith, MIT License (included in LICENSE).
 

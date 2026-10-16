@@ -2,6 +2,7 @@
 #![forbid(unsafe_code)]
 mod conversation;
 mod error;
+mod extensions;
 mod pages;
 mod route;
 mod settings;
