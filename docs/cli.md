@@ -8,7 +8,7 @@ on stderr, output on stdout, meaningful exit codes and no secrets in argv/env/lo
 
 Current headless build: `cargo build -p agent206 --no-default-features`.
 Use `--data-dir` for an isolated profile and `--remote ssh://user@host` for an
-already-installed remote gateway. No subcommand launches the desktop; `tui`
+already-installed remote gateway. With no subcommand, the app launches the desktop; `tui`
 (alias `ui`) explicitly launches the shared terminal UI when built with that feature.
 
 | RustyClaw command family | Agent 206 now | Required follow-up |
