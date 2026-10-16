@@ -37,7 +37,10 @@ the renderer or service entry point.
 
 The UI never stores a provider credential. `a206-broker` is a separate process
 that owns the decrypted vault; the gateway asks it to send credentialed provider
-requests to user-bound origins and never receives the value. The CLI is the first
+requests to user-bound origins and never receives the value. Streamed replies come
+back as bounded (64 KiB), numbered body frames ending in a length-checked end
+frame or a structured error; a lock or pairing revocation ends the stream, and a
+closed gateway connection abandons the upstream request. The CLI is the first
 trusted broker surface; desktop/TUI enrollment and agent approvals are pending, so
 this is not yet a replacement for RustyClaw's complete secret approval system.
 

@@ -937,3 +937,347 @@ async fn importing_a_vault_verifies_it_and_never_replaces_one() {
     b.call(Request::Shutdown).await.unwrap();
     task.await.unwrap();
 }
+
+/// An upstream whose response body is fed piece by piece from the test, and
+/// which reports when the broker abandons it.
+struct Upstream {
+    origin: String,
+    pieces: tokio::sync::mpsc::Receiver<tokio::sync::mpsc::Sender<Vec<u8>>>,
+}
+
+async fn upstream() -> Upstream {
+    use axum::{Router, body::Body, routing::get};
+    let (opened, pieces) = tokio::sync::mpsc::channel(4);
+    let app = Router::new()
+        .route(
+            "/stream",
+            get(move || {
+                let opened = opened.clone();
+                async move {
+                    let (sender, receiver) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
+                    opened.send(sender).await.unwrap();
+                    Body::from_stream(futures_util::stream::unfold(
+                        receiver,
+                        |mut receiver| async move {
+                            let piece = receiver.recv().await?;
+                            Some((Ok::<_, std::io::Error>(piece), receiver))
+                        },
+                    ))
+                }
+            }),
+        )
+        .route(
+            "/refused",
+            get(|| async { (axum::http::StatusCode::TOO_MANY_REQUESTS, random()) }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    Upstream { origin, pieces }
+}
+
+fn stream_call(credential: &str, url: String) -> ProviderCall {
+    ProviderCall {
+        credential: credential.to_owned(),
+        method: HttpMethod::Get,
+        url,
+        auth: AuthScheme::Bearer,
+        anthropic_version: None,
+        body: None,
+    }
+}
+
+/// An unlocked broker holding one credential bound to `origin`.
+async fn broker_with_credential(
+    origin: &str,
+) -> (tempfile::TempDir, PathBuf, Client, String, String) {
+    let (dir, root, _task) = start().await;
+    let password = random();
+    let mut a = user(&root).await;
+    a.call(unlock(&password, None, true)).await.unwrap();
+    let name = random();
+    a.call(Request::PutCredential {
+        name: name.clone(),
+        meta: meta(vec![origin.to_owned()]),
+        value: WireValue::Single(WireSecret::new(random())),
+        replace: false,
+    })
+    .await
+    .unwrap();
+    (dir, root, a, name, password)
+}
+
+/// Wait (bounded) until the upstream body is dropped, which happens only when
+/// the broker abandons the request.
+async fn abandoned(sender: &tokio::sync::mpsc::Sender<Vec<u8>>, why: &str) {
+    tokio::time::timeout(Duration::from_secs(10), sender.closed())
+        .await
+        .unwrap_or_else(|_| panic!("{why} must abandon the upstream request"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn streams_arrive_in_order_in_bounded_chunks_and_errors_are_typed() {
+    let mut up = upstream().await;
+    let (_dir, root, mut a, name, _) = broker_with_credential(&up.origin).await;
+    let mut gateway = paired_gateway(&mut a, &root).await;
+    assert_eq!(gateway.version(), BROKER_VERSION);
+    let url = format!("{}/stream", up.origin);
+    let mut stream = gateway
+        .provider_stream(stream_call(&name, url.clone()))
+        .await
+        .unwrap();
+    assert_eq!(stream.status(), 200);
+    let feed = up.pieces.recv().await.unwrap();
+    // Each piece is relayed before the next exists, so order is observable;
+    // a piece larger than a frame is split, never sent as one oversized frame.
+    let pieces = [
+        random().into_bytes(),
+        random().repeat(MAX_STREAM_CHUNK / 8).into_bytes(),
+        random().into_bytes(),
+    ];
+    for piece in &pieces {
+        feed.send(piece.clone()).await.unwrap();
+        let mut got = vec![];
+        while got.len() < piece.len() {
+            let chunk = stream.next().await.unwrap().unwrap();
+            assert!(!chunk.is_empty() && chunk.len() <= MAX_STREAM_CHUNK);
+            got.extend(chunk);
+        }
+        assert_eq!(&got, piece);
+    }
+    drop(feed);
+    assert_eq!(stream.next().await.unwrap(), None);
+    assert_eq!(stream.next().await.unwrap(), None);
+
+    // An unsuccessful status ends the stream without relaying the body.
+    let refused = format!("{}/refused", up.origin);
+    let mut stream = gateway
+        .provider_stream(stream_call(&name, refused))
+        .await
+        .unwrap();
+    assert_eq!(stream.status(), 429);
+    assert_eq!(stream.next().await.unwrap(), None);
+
+    // A body over the broker's limit ends with a structured error, and the
+    // connection stays usable afterwards.
+    let mut stream = gateway
+        .provider_stream(stream_call(&name, url.clone()))
+        .await
+        .unwrap();
+    let feed = up.pieces.recv().await.unwrap();
+    let mut sent = 0;
+    let error = loop {
+        if sent <= MAX_PROVIDER_BODY {
+            feed.send(vec![b'x'; MAX_STREAM_CHUNK]).await.unwrap();
+            sent += MAX_STREAM_CHUNK;
+        }
+        match stream.next().await {
+            Ok(Some(_)) => {}
+            Ok(None) => panic!("an oversized body must not end normally"),
+            Err(error) => break error,
+        }
+    };
+    assert!(matches!(
+        error,
+        ClientError::Broker(BrokerError::Upstream(UpstreamFailure::TooLarge))
+    ));
+    abandoned(&feed, "an oversized body").await;
+    assert!(status(&mut gateway).await.unlocked);
+
+    // A user connection cannot stream.
+    let refused = a.provider_stream(stream_call(&name, url)).await;
+    assert!(matches!(
+        refused.map(|_| ()),
+        Err(ClientError::Broker(BrokerError::Forbidden))
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn lock_and_disconnect_stop_a_stream_and_its_upstream_request() {
+    let mut up = upstream().await;
+    let (_dir, root, mut a, name, password) = broker_with_credential(&up.origin).await;
+    let url = format!("{}/stream", up.origin);
+    let mut gateway = paired_gateway(&mut a, &root).await;
+    let mut stream = gateway
+        .provider_stream(stream_call(&name, url.clone()))
+        .await
+        .unwrap();
+    let feed = up.pieces.recv().await.unwrap();
+    let piece = random().into_bytes();
+    feed.send(piece.clone()).await.unwrap();
+    assert_eq!(stream.next().await.unwrap(), Some(piece));
+    a.call(Request::Lock).await.unwrap();
+    assert!(matches!(
+        stream.next().await,
+        Err(ClientError::Broker(BrokerError::Locked))
+    ));
+    abandoned(&feed, "a lock").await;
+    drop(gateway);
+
+    // Closing a (non-anchor) connection mid-stream abandons its upstream
+    // request although the pairing stays valid.
+    a.call(unlock(&password, None, false)).await.unwrap();
+    let token = pairing(&mut a).await;
+    let (mut anchor, claimed) = present(&root, &token).await;
+    claimed.unwrap();
+    let (mut gateway, result) = present(&root, &token).await;
+    result.unwrap();
+    let mut stream = gateway
+        .provider_stream(stream_call(&name, url))
+        .await
+        .unwrap();
+    let feed = up.pieces.recv().await.unwrap();
+    feed.send(random().into_bytes()).await.unwrap();
+    stream.next().await.unwrap().unwrap();
+    drop(gateway);
+    abandoned(&feed, "a closed connection").await;
+    assert!(spends(&mut anchor).await);
+}
+
+/// A broker double that greets like `version` and answers a stream request
+/// with `frames`, to check what the client accepts.
+async fn scripted_broker(version: u16, frames: Vec<Reply>) -> tempfile::TempDir {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("vault")).unwrap();
+    let listener = tokio::net::UnixListener::bind(socket_path(dir.path())).unwrap();
+    let frames = Arc::new(Mutex::new(Some(frames)));
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut decoder = a206_protocol::Decoder::default();
+        let mut bytes = vec![0; 8192];
+        loop {
+            let count = stream.read(&mut bytes).await.unwrap();
+            if count == 0 {
+                return;
+            }
+            let requests: Vec<a206_protocol::Request<Request>> =
+                decoder.feed(&bytes[..count]).unwrap();
+            for request in requests {
+                let replies = match request.body {
+                    Request::Hello { version: v, .. } if v == version => vec![Reply::Ok],
+                    Request::Hello { .. } => vec![Reply::Error(BrokerError::Invalid(
+                        InvalidRequest::UnsupportedVersion,
+                    ))],
+                    Request::ProviderStream(_) => frames.lock().unwrap().take().unwrap(),
+                    _ => vec![Reply::Error(BrokerError::Forbidden)],
+                };
+                for body in replies {
+                    let frame = a206_protocol::encode(&a206_protocol::Response {
+                        id: request.id,
+                        body,
+                    })
+                    .unwrap();
+                    stream.write_all(&frame).await.unwrap();
+                }
+            }
+        }
+    });
+    dir
+}
+
+#[tokio::test]
+async fn clients_negotiate_down_and_refuse_malformed_stream_frames() {
+    // An older broker is greeted with its own version and never sent a
+    // request it cannot decode.
+    let older = scripted_broker(MIN_BROKER_VERSION, vec![]).await;
+    let mut client = Client::connect(older.path(), Role::Gateway).await.unwrap();
+    assert_eq!(client.version(), MIN_BROKER_VERSION);
+    let refused = tokio::time::timeout(
+        Duration::from_secs(10),
+        client.provider_stream(stream_call(&random(), random())),
+    )
+    .await
+    .expect("a stream request was sent to a broker that cannot answer it");
+    assert!(matches!(
+        refused.map(|_| ()),
+        Err(ClientError::StreamUnsupported)
+    ));
+    let piece = || random().into_bytes();
+    let head = || Reply::ProviderHead { status: 200 };
+    let chunk = |seq, bytes| Reply::ProviderChunk { seq, bytes };
+    let cases = [
+        (
+            vec![head(), chunk(0, vec![b'x'; MAX_STREAM_CHUNK + 1])],
+            StreamViolation::ChunkTooLarge,
+        ),
+        (vec![head(), chunk(1, piece())], StreamViolation::OutOfOrder),
+        (
+            vec![head(), chunk(0, piece()), chunk(0, piece())],
+            StreamViolation::OutOfOrder,
+        ),
+        (
+            vec![
+                head(),
+                chunk(0, piece()),
+                Reply::ProviderEnd {
+                    chunks: 1,
+                    bytes: 1,
+                },
+            ],
+            StreamViolation::Length,
+        ),
+        (vec![head(), Reply::Ok], StreamViolation::Unexpected),
+    ];
+    for (frames, expected) in cases {
+        let broker = scripted_broker(BROKER_VERSION, frames).await;
+        let mut client = Client::connect(broker.path(), Role::Gateway).await.unwrap();
+        let mut stream = client
+            .provider_stream(stream_call(&random(), random()))
+            .await
+            .unwrap();
+        let error = loop {
+            // The double sends nothing after its script: waiting for more
+            // means the violation was accepted.
+            let next = tokio::time::timeout(Duration::from_secs(10), stream.next())
+                .await
+                .unwrap_or_else(|_| panic!("{expected:?} was accepted"));
+            match next {
+                Ok(Some(_)) => {}
+                Ok(None) => panic!("{expected:?} was accepted"),
+                Err(error) => break error,
+            }
+        };
+        assert!(
+            matches!(error, ClientError::Stream(v) if v == expected),
+            "expected {expected:?}, got {error:?}"
+        );
+        // A refused stream stays refused.
+        assert_eq!(stream.next().await.unwrap(), None);
+    }
+}
+
+/// A current broker still serves clients that speak the previous version.
+#[tokio::test(flavor = "multi_thread")]
+async fn brokers_accept_the_previous_protocol_version() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (_dir, root, _task) = start().await;
+    for (version, accepted) in [
+        (MIN_BROKER_VERSION - 1, false),
+        (MIN_BROKER_VERSION, true),
+        (BROKER_VERSION + 1, false),
+    ] {
+        let mut stream = tokio::net::UnixStream::connect(socket_path(&root))
+            .await
+            .unwrap();
+        let id = uuid::Uuid::new_v4();
+        let hello = Request::Hello {
+            role: Role::Gateway,
+            version,
+        };
+        let frame = a206_protocol::encode(&a206_protocol::Request { id, body: hello }).unwrap();
+        stream.write_all(&frame).await.unwrap();
+        let mut decoder = a206_protocol::Decoder::default();
+        let mut bytes = vec![0; 8192];
+        let reply = loop {
+            let count = stream.read(&mut bytes).await.unwrap();
+            assert_ne!(count, 0);
+            let replies: Vec<a206_protocol::Response<Reply>> =
+                decoder.feed(&bytes[..count]).unwrap();
+            if let Some(reply) = replies.into_iter().next() {
+                break reply.body;
+            }
+        };
+        assert_eq!(matches!(reply, Reply::Ok), accepted, "version {version}");
+    }
+}

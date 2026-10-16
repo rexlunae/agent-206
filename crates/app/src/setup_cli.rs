@@ -187,6 +187,11 @@ fn print_preview(preview: &Preview) {
 /// it has two-factor enrolled, a code from its authenticator.
 async fn import_vault(root: &Path, source: &Path) -> Result<()> {
     let mut client = vault_cli::connect(root).await?;
+    if client.version() < a206_broker::IMPORT_VERSION {
+        bail!(
+            "the running vault broker predates vault import; stop it with `agent206 vault stop` and rerun the import"
+        );
+    }
     let password = vault_cli::hidden("Password of the RustyClaw vault: ")?;
     let request = |totp| Request::ImportVault {
         source: source.to_owned(),

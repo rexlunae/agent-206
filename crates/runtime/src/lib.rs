@@ -13,6 +13,7 @@ pub mod network;
 pub mod process;
 pub mod provider;
 pub mod service;
+pub mod sse;
 pub mod store;
 pub mod transport;
 pub mod vault;
