@@ -7,6 +7,8 @@ attribution. Prefer a small replacement over carrying historical architecture.
 ## Architecture and security
 
 - Use idiomatic, DRY Rust, typed errors and small crates. No application `unsafe`.
+- Use Rust for tests, fixtures and project tooling as well. Another language needs
+  a documented, compelling integration requirement; convenience is insufficient.
 - Desktop is the primary control surface. Desktop, web and dioxus_tui share the
   same fc-dioxus components, state and command API. CLI commands use that API too.
 - The gateway owns orchestration and policy, never the presentation layer. Keep
