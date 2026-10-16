@@ -38,7 +38,8 @@ impl Shared {
     /// generation (any lock or unlock) cancels every older request.
     fn in_flight(&self, generation: u64) -> CancellationToken {
         let mut current = self.in_flight.lock().unwrap_or_else(|e| e.into_inner());
-        if current.0 != generation {
+        // Generations only grow; a stale reader must not cancel newer sends.
+        if generation > current.0 {
             current.1.cancel();
             *current = (generation, CancellationToken::new());
         }
@@ -412,11 +413,21 @@ fn handle(shared: &Shared, session: &mut Session, request: Request) -> Handled {
             name,
             mut meta,
             value,
+            replace,
         } => {
             check_name(&name)?;
             meta.destinations = origins(meta.destinations)?;
             let mut vault = shared.vault();
             require_step_up(session, vault.generation())?;
+            // Checked under the same guard as the write, so two adds of one
+            // name cannot both succeed.
+            if !replace {
+                match vault.credential(&name) {
+                    Ok(_) => return Err(BrokerError::AlreadyExists),
+                    Err(VaultError::NotFound) => {}
+                    Err(error) => return Err(vault_error(error)),
+                }
+            }
             vault
                 .put_credential(&name, &meta, (&value).into())
                 .map_err(vault_error)?;
@@ -589,8 +600,10 @@ async fn connection(shared: Arc<Shared>, stream: tokio::net::UnixStream) -> std:
             .map_err(std::io::Error::other)?;
             session = returned;
             // Any lock or unlock during this request cancels older sends.
-            let generation = shared.vault().generation();
-            shared.in_flight(generation);
+            {
+                let vault = shared.vault();
+                shared.in_flight(vault.generation());
+            }
             let body = match outcome {
                 Ok(Outcome::Reply(reply)) => reply,
                 Ok(Outcome::Send(out)) => {

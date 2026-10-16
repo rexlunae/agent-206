@@ -63,6 +63,7 @@ async fn start_broker(origin: &str, key: &str) -> (tempfile::TempDir, String) {
             destinations: vec![origin.to_owned()],
         },
         value: WireValue::Single(WireSecret::new(key.to_owned())),
+        replace: false,
     })
     .await
     .unwrap();

@@ -223,6 +223,8 @@ pub enum Request {
         name: String,
         meta: CredentialMeta,
         value: WireValue,
+        /// Overwrite an existing credential of this name; otherwise refuse.
+        replace: bool,
     },
     UpdateCredential {
         name: String,
@@ -280,6 +282,8 @@ pub enum BrokerError {
     Denied(#[source] a206_vault::Denial),
     #[error("credential not found")]
     NotFound,
+    #[error("a credential with that name already exists")]
+    AlreadyExists,
     #[error("invalid request")]
     Invalid(#[source] InvalidRequest),
     #[error("vault storage failed")]

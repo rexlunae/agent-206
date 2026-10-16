@@ -420,7 +420,12 @@ pub fn run(root: &Path, action: VaultAction) -> Result<()> {
                     destinations,
                 };
                 client
-                    .call(Request::PutCredential { name, meta, value })
+                    .call(Request::PutCredential {
+                        name,
+                        meta,
+                        value,
+                        replace: false,
+                    })
                     .await?;
                 println!("Credential stored");
             }

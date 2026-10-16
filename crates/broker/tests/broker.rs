@@ -108,6 +108,7 @@ async fn roles_creation_step_up_reveal_and_lock_revocation() {
         name: name.clone(),
         meta: meta(vec![]),
         value: WireValue::Single(WireSecret::new(value.clone())),
+        replace: false,
     };
     a.call(put()).await.unwrap();
     // A fresh connection must step up before adding, revealing or changing policy.
@@ -145,6 +146,13 @@ async fn roles_creation_step_up_reveal_and_lock_revocation() {
     })
     .await
     .unwrap();
+    // Adding never silently replaces; replacing is explicit.
+    assert_eq!(denied(b.call(put()).await), BrokerError::AlreadyExists);
+    let mut replacement = put();
+    if let Request::PutCredential { replace, .. } = &mut replacement {
+        *replace = true;
+    }
+    b.call(replacement).await.unwrap();
     match b
         .call(Request::Reveal { name: name.clone() })
         .await
@@ -350,6 +358,7 @@ async fn provider_calls_are_destination_bound_and_value_free() {
             name: name.clone(),
             meta: meta(destinations),
             value: WireValue::Single(WireSecret::new(value.clone())),
+            replace: false,
         })
         .await
         .unwrap();
@@ -434,6 +443,7 @@ async fn lock_cancels_in_flight_sends_and_body_limits_are_structured() {
         name: name.clone(),
         meta: meta(vec![origin.clone()]),
         value: WireValue::Single(WireSecret::new(random())),
+        replace: false,
     })
     .await
     .unwrap();
