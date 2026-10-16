@@ -34,7 +34,10 @@ fn assert_key(api: &Api, headers: &HeaderMap) {
     assert_eq!(headers.get(header).unwrap(), api.key.as_str());
     assert!(headers.get("authorization").is_none());
 }
-async fn start_broker(origin: &str, key: &str) -> (tempfile::TempDir, String) {
+async fn start_broker(
+    origin: &str,
+    key: &str,
+) -> (tempfile::TempDir, String, a206_core::BrokerPairing) {
     use a206_broker::*;
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().to_owned();
@@ -67,7 +70,14 @@ async fn start_broker(origin: &str, key: &str) -> (tempfile::TempDir, String) {
     })
     .await
     .unwrap();
-    (dir, name)
+    let Reply::GatewayPairing { token } = user.call(Request::PairGateway).await.unwrap() else {
+        panic!("expected a pairing");
+    };
+    (
+        dir,
+        name,
+        a206_core::BrokerPairing::new(token.expose().to_owned()),
+    )
 }
 async fn models(
     State(api): State<Api>,
@@ -151,7 +161,8 @@ async fn paginates_native_catalogs_and_dispatches_protocol_specific_text() {
             )
             .with_state(api.clone());
         let task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
-        let (broker, credential) = start_broker(&format!("http://{address}"), &api.key).await;
+        let (broker, credential, pairing) =
+            start_broker(&format!("http://{address}"), &api.key).await;
         let config = ProviderConfig {
             id: identity,
             label: Id::new_v4().to_string(),
@@ -159,7 +170,28 @@ async fn paginates_native_catalogs_and_dispatches_protocol_specific_text() {
             credential: Some(credential),
             api: protocol,
         };
-        let broker = provider::Broker(broker.path());
+        // Without the pairing a trusted client minted, the gateway is refused.
+        let unpaired = provider::Broker {
+            root: broker.path(),
+            pairing: None,
+        };
+        assert!(
+            provider::catalog(&config, unpaired)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("not paired")
+        );
+        let forged = a206_core::BrokerPairing::new(Id::new_v4().to_string());
+        let forged = provider::Broker {
+            root: broker.path(),
+            pairing: Some(&forged),
+        };
+        assert!(provider::catalog(&config, forged).await.is_err());
+        let broker = provider::Broker {
+            root: broker.path(),
+            pairing: Some(&pairing),
+        };
         let catalog = provider::catalog(&config, broker).await.unwrap();
         assert_eq!(catalog.models.len(), 2);
         let model = &catalog.models[0];
@@ -226,7 +258,10 @@ async fn repeated_pagination_is_rejected_and_credentials_never_bypass_the_broker
         api: ProviderApi::Anthropic,
     };
     let absent = tempfile::tempdir().unwrap();
-    let broker = provider::Broker(absent.path());
+    let broker = provider::Broker {
+        root: absent.path(),
+        pairing: None,
+    };
     assert!(provider::catalog(&config, broker).await.is_err());
     // Without a running, unlocked broker a credential is never usable.
     config.credential = Some(Id::new_v4().to_string());
@@ -269,13 +304,107 @@ async fn reads_compatible_context_window_and_nested_effort_metadata_in_api_order
         api: ProviderApi::OpenAi,
     };
     let none = tempfile::tempdir().unwrap();
-    let catalog = provider::catalog(&config, provider::Broker(none.path()))
-        .await
-        .unwrap();
+    let broker = provider::Broker {
+        root: none.path(),
+        pairing: None,
+    };
+    let catalog = provider::catalog(&config, broker).await.unwrap();
     assert_eq!(catalog.models[0].key.model, model);
     assert_eq!(catalog.models[0].context_limit, Some(context));
     assert_eq!(catalog.models[0].output_limit, Some(output));
     assert_eq!(catalog.models[0].reasoning_efforts, efforts);
     assert!(catalog.models[0].input_cost_per_token.is_none());
+    task.abort();
+}
+/// The gateway only spends a credential after a trusted client hands it this
+/// unlock's pairing, and the pairing is never written into the profile.
+#[tokio::test]
+async fn gateway_needs_a_verified_pairing_and_never_persists_it() {
+    let identity = Id::new_v4();
+    let api = Api {
+        id: identity.to_string(),
+        next: Id::new_v4().to_string(),
+        cursor: Id::new_v4().to_string(),
+        limit: (identity.as_u128() % 100_000 + 1) as u64,
+        output: (identity.as_u128() % 20_000 + 1) as u64,
+        effort: Id::new_v4().to_string(),
+        text: Id::new_v4().to_string(),
+        api: ProviderApi::Anthropic,
+        key: Id::new_v4().to_string(),
+        requests: Default::default(),
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let router = Router::new()
+        .route("/v1/models", get(models))
+        .with_state(api.clone());
+    let task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let (dir, credential, pairing) = start_broker(&format!("http://{address}"), &api.key).await;
+    let gateway = a206_runtime::gateway::Gateway::open(dir.path()).unwrap();
+    let run = |body| {
+        let gateway = gateway.clone();
+        async move {
+            gateway
+                .request(a206_protocol::Request {
+                    id: Id::new_v4(),
+                    body,
+                })
+                .await
+                .body
+        }
+    };
+    let provider = Id::new_v4();
+    let mut settings = Settings::default();
+    settings.providers.push(ProviderConfig {
+        id: provider,
+        label: Id::new_v4().to_string(),
+        base_url: format!("http://{address}/v1"),
+        credential: Some(credential),
+        api: ProviderApi::Anthropic,
+    });
+    assert_eq!(run(Command::SaveSettings(settings)).await, Reply::Ok);
+    let refresh = || Command::RefreshCatalog { provider };
+    assert!(matches!(
+        run(refresh()).await,
+        Reply::Error { message } if message.contains("not paired")
+    ));
+    // A pairing the broker never issued is refused and not kept.
+    let forged = BrokerPairing::new(Id::new_v4().to_string());
+    assert!(matches!(
+        run(Command::PairBroker { pairing: forged }).await,
+        Reply::Error { .. }
+    ));
+    assert!(matches!(run(refresh()).await, Reply::Error { .. }));
+    assert_eq!(
+        run(Command::PairBroker {
+            pairing: pairing.clone()
+        })
+        .await,
+        Reply::Ok
+    );
+    let Reply::Catalog(catalog) = run(refresh()).await else {
+        panic!("paired refresh failed");
+    };
+    assert_eq!(catalog.models[0].key.model, api.id);
+    assert_eq!(format!("{pairing:?}"), "[REDACTED]");
+    // The request journal and every other profile file stay free of it.
+    let mut pending = vec![dir.path().to_owned()];
+    while let Some(path) = pending.pop() {
+        for entry in std::fs::read_dir(path).unwrap() {
+            let entry = entry.unwrap();
+            let kind = entry.file_type().unwrap();
+            if kind.is_dir() {
+                pending.push(entry.path());
+            } else if kind.is_file() {
+                let bytes = std::fs::read(entry.path()).unwrap();
+                let token = pairing.expose().as_bytes();
+                assert!(
+                    !bytes.windows(token.len()).any(|w| w == token),
+                    "{} holds the pairing",
+                    entry.path().display()
+                );
+            }
+        }
+    }
     task.abort();
 }

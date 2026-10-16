@@ -243,7 +243,10 @@ mod tests {
         };
         let info = crate::provider::catalog(
             &config,
-            crate::provider::Broker(std::path::Path::new("/nonexistent")),
+            crate::provider::Broker {
+                root: std::path::Path::new("/nonexistent"),
+                pairing: None,
+            },
         )
         .await
         .unwrap()

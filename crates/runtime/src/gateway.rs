@@ -74,6 +74,8 @@ pub struct Gateway {
     store: Arc<Mutex<Store>>,
     downloads: Arc<Mutex<BTreeMap<Id, tokio_util::sync::CancellationToken>>>,
     running: Arc<Mutex<BTreeMap<Id, tokio_util::sync::CancellationToken>>>,
+    /// Held only in memory: a restart needs a fresh pairing from the user.
+    pairing: Arc<Mutex<Option<BrokerPairing>>>,
 }
 impl Gateway {
     pub fn open(root: &Path) -> Result<Self> {
@@ -86,7 +88,15 @@ impl Gateway {
             store: Arc::new(Mutex::new(Store::open(root)?)),
             downloads: Arc::new(Mutex::new(BTreeMap::new())),
             running: Arc::new(Mutex::new(BTreeMap::new())),
+            pairing: Arc::new(Mutex::new(None)),
         })
+    }
+    fn pairing(&self) -> Result<Option<BrokerPairing>> {
+        Ok(self
+            .pairing
+            .lock()
+            .map_err(|_| anyhow::anyhow!("pairing lock poisoned"))?
+            .clone())
     }
     fn lock(&self) -> Result<MutexGuard<'_, Store>> {
         self.store
@@ -131,7 +141,11 @@ impl Gateway {
         let is_shutdown = matches!(request.body, Command::Shutdown);
         let _active = if !matches!(
             request.body,
-            Command::Snapshot | Command::GatewayStatus | Command::Shutdown | Command::Events { .. }
+            Command::Snapshot
+                | Command::GatewayStatus
+                | Command::Shutdown
+                | Command::Events { .. }
+                | Command::PairBroker { .. }
         ) {
             let Ok(mut admission) = self.admission.lock() else {
                 return (
@@ -170,6 +184,8 @@ impl Gateway {
                 | Command::GitStatus { .. }
                 | Command::ReadDocument { .. }
                 | Command::RunExtension { .. }
+                // Never journal a pairing: request bodies are persisted.
+                | Command::PairBroker { .. }
         );
         let begin = (|| -> Result<Option<Reply>> {
             if mutation {
@@ -237,6 +253,15 @@ impl Gateway {
                 ),
             })),
             Command::Snapshot => Ok(Reply::Snapshot(Box::new(self.snapshot()?))),
+            Command::PairBroker { pairing } => {
+                let root = self.lock()?.root.clone();
+                provider::verify_pairing(&root, &pairing).await?;
+                *self
+                    .pairing
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("pairing lock poisoned"))? = Some(pairing);
+                Ok(Reply::Ok)
+            }
             Command::JoshuaStatus => {
                 let mut manager = self.joshua.lock().await;
                 let status = manager.status()?;
@@ -387,7 +412,12 @@ impl Gateway {
                     .cloned()
                     .context("provider not configured")?;
                 let root = self.lock()?.root.clone();
-                let catalog = provider::catalog(&config, provider::Broker(&root)).await?;
+                let pairing = self.pairing()?;
+                let broker = provider::Broker {
+                    root: &root,
+                    pairing: pairing.as_ref(),
+                };
+                let catalog = provider::catalog(&config, broker).await?;
                 let mut store = self.lock()?;
                 ensure!(
                     store.state.settings.providers.contains(&config),
@@ -673,6 +703,7 @@ impl Gateway {
                     (config, copy, prompt, info, backend, workspace, root)
                 };
                 let (sender, mut progress) = tokio::sync::mpsc::channel(32);
+                let pairing = self.pairing()?;
                 let operation = async {
                     if let Some(backend) = &backend {
                         crate::backends::complete(crate::backends::Run {
@@ -690,7 +721,10 @@ impl Gateway {
                     } else {
                         provider::complete(
                             &config,
-                            provider::Broker(&root),
+                            provider::Broker {
+                                root: &root,
+                                pairing: pairing.as_ref(),
+                            },
                             &thread,
                             &prompt,
                             &info,
