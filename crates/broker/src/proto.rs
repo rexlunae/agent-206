@@ -6,7 +6,10 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::BTreeMap;
 use zeroize::Zeroizing;
 
-pub const BROKER_VERSION: u16 = 1;
+/// Bump on any change to [`Request`] or [`Reply`]: a broker outlives the CLI
+/// that started it, so an upgraded client may reach an older broker.
+/// `Hello` itself must stay compatible across versions.
+pub const BROKER_VERSION: u16 = 2;
 /// Largest provider request or response body the broker carries. The rest of
 /// the 4 MiB frame is reserved for the envelope, so a body at this limit still
 /// fits in one frame.

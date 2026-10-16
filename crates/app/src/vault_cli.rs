@@ -1,6 +1,8 @@
 //! `agent206 vault …`: a trusted terminal surface for the vault broker. It uses
 //! the same broker requests, throttling and step-up rules as the GUI.
-use a206_broker::{BrokerError, Client, ClientError, Reply, Request, Role, WireSecret, WireValue};
+use a206_broker::{
+    BrokerError, Client, ClientError, InvalidRequest, Reply, Request, Role, WireSecret, WireValue,
+};
 use a206_vault::{AccessPolicy, CredentialKind, CredentialMeta};
 use anyhow::{Context, Result, bail};
 use clap::{Subcommand, ValueEnum};
@@ -156,8 +158,16 @@ fn hidden(prompt: &str) -> Result<WireSecret> {
 }
 
 async fn connect(root: &Path) -> Result<Client> {
-    if let Ok(client) = Client::connect(root, Role::User).await {
-        return Ok(client);
+    match Client::connect(root, Role::User).await {
+        Ok(client) => return Ok(client),
+        Err(ClientError::Broker(BrokerError::Invalid(InvalidRequest::UnsupportedVersion))) => {
+            bail!(
+                "the running vault broker is from a different Agent 206 version; \
+                 stop it with `agent206 vault stop` from that version, then retry"
+            )
+        }
+        // Not running yet: start it below.
+        Err(_) => {}
     }
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     let dir = root.join("vault");

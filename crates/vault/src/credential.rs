@@ -1,7 +1,7 @@
 //! Typed credentials stored with RustyClaw's key layout: metadata under
 //! `cred:<name>`, values under `val:<name>` plus kind-specific suffixes.
 use crate::{
-    AccessContext, CredentialKind, CredentialMeta, Error, Secret, StepUpWindow, Vault,
+    AccessContext, CredentialKind, CredentialMeta, Error, Secret, StepUpWindow, Vault, reserved,
     reserved_credential_name,
 };
 use serde::{Deserialize, Serialize};
@@ -240,7 +240,9 @@ impl Vault {
         name: &str,
         meta: &CredentialMeta,
     ) -> Result<(), Error> {
-        if reserved_credential_name(name) {
+        // Only entries `names` lists are legacy; internal keys such as the
+        // TOTP seed and typed records are never adoptable.
+        if reserved(legacy) || reserved_credential_name(name) {
             return Err(Error::InvalidName);
         }
         if !matches!(
@@ -597,6 +599,13 @@ mod tests {
             vault.adopt_raw(&name, &name, &target),
             Err(Error::InvalidName)
         ));
+        // Internal and typed keys are not legacy entries.
+        for internal in ["__rustyclaw_totp_secret", "cred:x", "val:x", "service:x"] {
+            assert!(matches!(
+                vault.adopt_raw(internal, &renamed, &target),
+                Err(Error::InvalidName)
+            ));
+        }
         // A rename may not shadow another untyped entry.
         assert!(matches!(
             vault.adopt_raw(&name, &adopted, &target),

@@ -223,6 +223,36 @@ async fn lockout_is_shared_across_connections_and_malformed_frames_close() {
     raw.write_all(b"A206\0\x01\xff\xff\xff\xff").await.unwrap();
     let mut buf = [0; 16];
     assert_eq!(raw.read(&mut buf).await.unwrap(), 0);
+
+    // A client speaking another broker version is told so, not misread.
+    let mut other = tokio::net::UnixStream::connect(socket_path(&root))
+        .await
+        .unwrap();
+    let id = uuid::Uuid::new_v4();
+    let hello = a206_protocol::encode(&a206_protocol::Request {
+        id,
+        body: Request::Hello {
+            role: Role::User,
+            version: BROKER_VERSION + 1,
+        },
+    })
+    .unwrap();
+    other.write_all(&hello).await.unwrap();
+    let mut decoder = a206_protocol::Decoder::default();
+    let mut bytes = vec![0; 1024];
+    let replies: Vec<a206_protocol::Response<Reply>> = loop {
+        let count = other.read(&mut bytes).await.unwrap();
+        assert_ne!(count, 0);
+        let replies = decoder.feed(&bytes[..count]).unwrap();
+        if !replies.is_empty() {
+            break replies;
+        }
+    };
+    assert_eq!(replies[0].id, id);
+    assert!(matches!(
+        replies[0].body,
+        Reply::Error(BrokerError::Invalid(InvalidRequest::UnsupportedVersion))
+    ));
 }
 
 #[tokio::test(flavor = "multi_thread")]
