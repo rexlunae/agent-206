@@ -429,6 +429,9 @@ fn Shell() -> Element {
                     theme.set(theme_from(&state.data.peek().settings));
                 }
                 themed = loaded;
+            } else {
+                // Whatever is chosen next gets its own theme on its first snapshot.
+                themed = false;
             }
             futures_timer::Delay::new(std::time::Duration::from_secs(2)).await;
         }
