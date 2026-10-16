@@ -169,6 +169,53 @@ fn panel_events_update_extension_state() {
 }
 
 #[test]
+fn a_toggle_that_cannot_be_shown_is_not_saved() {
+    let message = unique("denied");
+    let (bridge, seen) = mock(move |request| match request {
+        HostRequest::StateGet { .. } => HostReply::State(None),
+        _ => HostReply::Failed(HostFailure {
+            code: HostErrorCode::Denied,
+            message: message.clone(),
+        }),
+    });
+    let (outcome, _) = engine::run(
+        workspace().wasm,
+        &panel(Some("toggle-hidden")),
+        Limits::default(),
+        bridge,
+    );
+    assert!(matches!(outcome, Ok(Outcome::Failed(_))), "{outcome:?}");
+    assert!(
+        !seen
+            .borrow()
+            .iter()
+            .any(|request| matches!(request, HostRequest::StatePut { .. }))
+    );
+}
+
+#[test]
+fn long_files_are_cut_to_fit_the_outcome_limit() {
+    let limits = Limits::default();
+    let line = format!("{}\n", unique("é"));
+    let body = line.repeat(limits.output_bytes / line.len() + 1);
+    let size = body.len();
+    let (bridge, _) = mock(move |_| HostReply::File(body.clone().into_bytes().into()));
+    let (outcome, _) = engine::run(
+        workspace().wasm,
+        &tool("read_text_file", &[("path", Value::Str("a".into()))]),
+        limits,
+        bridge,
+    );
+    let outcome = outcome.unwrap();
+    let Outcome::Tool(output) = outcome else {
+        panic!("expected tool output, got {outcome:?}");
+    };
+    assert!(output.text.starts_with(&line));
+    assert!(output.text.len() < size);
+    assert!(output.text.ends_with(&format!("of {size} bytes]")));
+}
+
+#[test]
 fn budgets_stop_the_guest() {
     let reply = |_: &HostRequest| HostReply::Directory(vec![]);
     let (fuel, _) = engine::run(

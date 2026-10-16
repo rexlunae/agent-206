@@ -23,9 +23,17 @@ pub fn Extensions() -> Element {
     let open = use_signal(|| None::<Open>);
     let view = use_signal(|| None::<View>);
     let failure = use_signal(|| None::<ErrorReport>);
+    // Each request bumps the generation; only the latest reply is shown, so a
+    // slow earlier reply cannot replace a newer panel.
+    let generation = use_signal(|| 0_u64);
     let show = move |target: Open, event: Option<UiEvent>| {
-        let (mut open, mut view, mut failure) = (open, view, failure);
+        let (mut open, mut view, mut failure, mut generation) = (open, view, failure, generation);
         let project = Uuid::parse_str(&project()).ok();
+        let request = generation() + 1;
+        generation.set(request);
+        // Clear the old panel so its buttons cannot be pressed for the wrong one.
+        view.set(None);
+        failure.set(None);
         open.set(Some(target.clone()));
         spawn(async move {
             let command = Command::OpenPanel {
@@ -34,16 +42,14 @@ pub fn Extensions() -> Element {
                 project,
                 event,
             };
-            match call(command).await {
-                Ok(Reply::Panel(panel)) => {
-                    failure.set(None);
-                    view.set(Some(panel));
-                }
+            let reply = call(command).await;
+            if generation() != request {
+                return;
+            }
+            match reply {
+                Ok(Reply::Panel(panel)) => view.set(Some(panel)),
                 Ok(_) => {}
-                Err(report) => {
-                    view.set(None);
-                    failure.set(Some(report));
-                }
+                Err(report) => failure.set(Some(report)),
             }
         });
     };

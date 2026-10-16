@@ -396,13 +396,19 @@ impl HostCalls {
         }
     }
     async fn execute(&mut self, request: HostRequest) -> Result<HostReply, HostFailure> {
-        if let Some(capability) = a206_extensions::required_capability(&request)
-            && !self.effective.contains(&capability)
-        {
-            return Err(failure(
-                HostErrorCode::Denied,
-                &format!("this call is not granted \"{}\"", capability.label()),
-            ));
+        if let Some(capability) = a206_extensions::required_capability(&request) {
+            // The grant is read again for every call, so revoking or
+            // disabling takes effect inside an invocation already running.
+            let live =
+                self.lock()?.state.plugins.iter().any(|p| {
+                    p.id == self.extension && p.enabled && p.granted.contains(&capability)
+                });
+            if !live || !self.effective.contains(&capability) {
+                return Err(failure(
+                    HostErrorCode::Denied,
+                    &format!("this call is not granted \"{}\"", capability.label()),
+                ));
+            }
         }
         match request {
             HostRequest::ReadFile { path } => {
@@ -524,11 +530,19 @@ fn open_workspace(root: PathBuf) -> Result<cap_std::fs::Dir, HostFailure> {
 }
 fn read_file(root: PathBuf, path: &str) -> Result<HostReply, HostFailure> {
     use std::io::Read;
+    let mut options = cap_std::fs::OpenOptions::new();
+    options.read(true);
+    // Open without blocking: opening a FIFO for reading otherwise waits for
+    // a writer forever. A regular file reads the same either way.
+    #[cfg(unix)]
+    {
+        use cap_std::fs::OpenOptionsExt;
+        options.custom_flags(nix::fcntl::OFlag::O_NONBLOCK.bits());
+    }
     let file = open_workspace(root)?
-        .open(path)
+        .open_with(path, &options)
         .map_err(|e| io_failure(&e))?;
-    let metadata = file.metadata().map_err(|e| io_failure(&e))?;
-    if !metadata.is_file() {
+    if !file.metadata().map_err(|e| io_failure(&e))?.is_file() {
         return Err(failure(HostErrorCode::Invalid, "not a regular file"));
     }
     let mut bytes = Vec::new();

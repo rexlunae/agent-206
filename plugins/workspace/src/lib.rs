@@ -12,6 +12,8 @@ a206_extension_sdk::export!(Workspace);
 const SHOW_HIDDEN: &str = "show_hidden";
 const TOGGLE_HIDDEN: &str = "toggle-hidden";
 const README_LINES: usize = 40;
+/// Text a tool returns, kept well inside the host's 256 KiB outcome limit.
+const MAX_TOOL_TEXT: usize = 192 * 1024;
 
 impl Extension for Workspace {
     fn tool(name: &str, args: &Args) -> Result<ToolOutput, GuestError> {
@@ -28,7 +30,7 @@ impl Extension for Workspace {
                 let path = string_arg(args, "path")?
                     .ok_or_else(|| GuestError::new("invalid_argument", "`path` is required"))?;
                 Ok(ToolOutput {
-                    text: text(host::read_file(path)?)?,
+                    text: excerpt(text(host::read_file(path)?)?),
                 })
             }
             _ => Err(GuestError::new("unknown_tool", format!("no tool `{name}`"))),
@@ -40,11 +42,12 @@ impl Extension for Workspace {
             return Err(GuestError::new("unknown_panel", format!("no panel `{id}`")));
         }
         let mut show_hidden = host::state_get(SHOW_HIDDEN)?.is_some();
+        // List first: a toggle is saved only when the panel can show it.
+        let mut entries = host::list_directory(".")?;
         if event.is_some_and(|event| event.element == TOGGLE_HIDDEN) {
             show_hidden = !show_hidden;
             host::state_put(SHOW_HIDDEN, show_hidden.then_some(&[1][..]))?;
         }
-        let mut entries = host::list_directory(".")?;
         let hidden = entries.iter().filter(|e| e.name.starts_with('.')).count();
         if !show_hidden {
             entries.retain(|entry| !entry.name.starts_with('.'));
@@ -124,4 +127,21 @@ fn field(label: &str, value: usize) -> Field {
 }
 fn text(bytes: Vec<u8>) -> Result<String, GuestError> {
     String::from_utf8(bytes).map_err(|_| GuestError::new("not_text", "the file is not UTF-8 text"))
+}
+/// Cut long text at a character boundary and say so, rather than fail the
+/// call by exceeding the outcome limit.
+fn excerpt(mut text: String) -> String {
+    if text.len() <= MAX_TOOL_TEXT {
+        return text;
+    }
+    let total = text.len();
+    let mut end = MAX_TOOL_TEXT;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.truncate(end);
+    text.push_str(&format!(
+        "\n\n[truncated: showing the first {end} of {total} bytes]"
+    ));
+    text
 }

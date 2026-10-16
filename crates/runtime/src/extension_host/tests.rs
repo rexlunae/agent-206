@@ -7,13 +7,38 @@ fn store() -> (tempfile::TempDir, Arc<Mutex<Store>>) {
     let store = Store::open(&dir.path().join("data")).unwrap();
     (dir, Arc::new(Mutex::new(store)))
 }
+/// Host calls for a fresh extension id that the store does not know.
 fn host_calls(
     store: &Arc<Mutex<Store>>,
     workspace: Option<PathBuf>,
     effective: &[Capability],
 ) -> HostCalls {
+    calls_for(
+        &uuid::Uuid::new_v4().to_string(),
+        store,
+        workspace,
+        effective,
+    )
+}
+/// Host calls for the bundled workspace extension, with the same grant
+/// stored for it as the invocation's effective set.
+fn workspace_calls(
+    store: &Arc<Mutex<Store>>,
+    workspace: Option<PathBuf>,
+    effective: &[Capability],
+) -> HostCalls {
+    let id = workspace_extension().id;
+    grant(store, &id, effective);
+    calls_for(&id, store, workspace, effective)
+}
+fn calls_for(
+    id: &str,
+    store: &Arc<Mutex<Store>>,
+    workspace: Option<PathBuf>,
+    effective: &[Capability],
+) -> HostCalls {
     HostCalls {
-        extension: uuid::Uuid::new_v4().to_string(),
+        extension: id.into(),
         effective: effective.iter().copied().collect(),
         workspace,
         store: Arc::clone(store),
@@ -46,7 +71,7 @@ async fn workspace_calls_need_the_effective_grant() {
         denied.last_failure.map(|f| f.code),
         Some(HostErrorCode::Denied)
     );
-    let mut granted = host_calls(
+    let mut granted = workspace_calls(
         &store,
         Some(dir.path().into()),
         &[Capability::ReadWorkspace],
@@ -55,7 +80,7 @@ async fn workspace_calls_need_the_effective_grant() {
         granted.handle(read("note.txt")).await,
         HostReply::File(body.into_bytes().into())
     );
-    let mut no_workspace = host_calls(&store, None, &[Capability::ReadWorkspace]);
+    let mut no_workspace = workspace_calls(&store, None, &[Capability::ReadWorkspace]);
     assert_eq!(
         code(no_workspace.handle(read("note.txt")).await),
         Some(HostErrorCode::NoWorkspace)
@@ -69,7 +94,7 @@ async fn workspace_calls_stay_inside_the_root() {
     std::fs::create_dir_all(root.join("sub")).unwrap();
     std::fs::write(dir.path().join("outside.txt"), "secret").unwrap();
     std::fs::write(root.join("big.bin"), vec![0; MAX_FILE as usize + 1]).unwrap();
-    let mut host = host_calls(&store, Some(root.clone()), &[Capability::ReadWorkspace]);
+    let mut host = workspace_calls(&store, Some(root.clone()), &[Capability::ReadWorkspace]);
     let outside = dir.path().join("outside.txt");
     for path in ["../outside.txt", outside.to_str().unwrap()] {
         assert_eq!(
@@ -113,6 +138,74 @@ async fn workspace_calls_stay_inside_the_root() {
             host.handle(HostRequest::ListDirectory { path: "..".into() })
                 .await
         ),
+        Some(HostErrorCode::Invalid)
+    );
+}
+
+#[tokio::test]
+async fn revoking_stops_calls_already_running() {
+    let (dir, store) = store();
+    std::fs::write(dir.path().join("note.txt"), "text").unwrap();
+    let mut host = workspace_calls(
+        &store,
+        Some(dir.path().into()),
+        &[Capability::ReadWorkspace],
+    );
+    assert!(matches!(
+        host.handle(read("note.txt")).await,
+        HostReply::File(_)
+    ));
+    let id = workspace_extension().id;
+    grant(&store, &id, &[]);
+    assert_eq!(
+        code(host.handle(read("note.txt")).await),
+        Some(HostErrorCode::Denied)
+    );
+    grant(&store, &id, &[Capability::ReadWorkspace]);
+    store
+        .lock()
+        .unwrap()
+        .state
+        .plugins
+        .iter_mut()
+        .for_each(|p| p.enabled = false);
+    assert_eq!(
+        code(host.handle(read("note.txt")).await),
+        Some(HostErrorCode::Denied)
+    );
+    // A grant stored for an id is not authority for an invocation that was
+    // never given it.
+    store
+        .lock()
+        .unwrap()
+        .state
+        .plugins
+        .iter_mut()
+        .for_each(|p| p.enabled = true);
+    let mut narrow = calls_for(&id, &store, Some(dir.path().into()), &[]);
+    assert_eq!(
+        code(narrow.handle(read("note.txt")).await),
+        Some(HostErrorCode::Denied)
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn special_files_are_refused_without_blocking() {
+    let (dir, store) = store();
+    nix::unistd::mkfifo(
+        &dir.path().join("pipe"),
+        nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+    )
+    .unwrap();
+    let mut host = workspace_calls(
+        &store,
+        Some(dir.path().into()),
+        &[Capability::ReadWorkspace],
+    );
+    // A blocking open would wait for a writer that never comes.
+    assert_eq!(
+        code(host.handle(read("pipe")).await),
         Some(HostErrorCode::Invalid)
     );
 }

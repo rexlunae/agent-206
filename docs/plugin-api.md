@@ -10,7 +10,8 @@ with a cleared environment, and every host call is authorized by the gateway.
 
 Agent 206 bundles `agent206.workspace` (`plugins/workspace`), written in Rust
 against the guest SDK and compiled to WASM by `crates/extensions/build.rs`. It
-offers the `list_directory` and `read_text_file` tools and an `overview`
+offers the `list_directory` and `read_text_file` tools (text past 192 KiB is
+cut with a notice) and an `overview`
 panel. User-installed and agent-prepared packages are not implemented yet: the
 worker only loads bundled modules.
 
@@ -61,7 +62,9 @@ panel declares. The effective grant is the intersection of:
    none for a user acting directly,
 3. what the tool or panel declares.
 
-The gateway then checks each relayed host call against that set again. A grant
+The gateway then checks each relayed host call against that set again, and
+against the stored grant at the moment of the call, so revoking or disabling
+stops an invocation that is already running. A grant
 is always a subset of what the current manifest requests, so an updated
 extension never inherits a newly requested capability. Disabling an extension
 stops all of its calls. Agents cannot grant, enable or approve anything.
@@ -104,7 +107,7 @@ unsafe operation.
 
 | Request | Needs | Reply | Bounds |
 | --- | --- | --- | --- |
-| `read_file { path }` | `read_workspace` + a project | file bytes | 512 KiB, regular files only |
+| `read_file { path }` | `read_workspace` + a project | file bytes | 512 KiB, regular files only (opened without blocking) |
 | `list_directory { path }` | `read_workspace` + a project | entries (name, kind, size if known) | 1,024 entries |
 | `state_get { key }` | nothing | the extension's own value | — |
 | `state_put { key, value }` | nothing | done (`value = None` deletes) | 64 keys, 256 KiB per extension |
@@ -162,13 +165,14 @@ extension, tool, args, project }`, `GrantExtension { extension, capabilities }`
 and `EnableExtension { extension, enabled }`. The CLI wraps them as
 `agent206 extension list|grant|enable|disable|panel|tool`.
 
-The native run engine calls tools through `Gateway::extensions()`:
-`ExtensionHost::tools()` lists enabled tools whose declared capabilities the
-user granted, and `call_tool(extension, tool, args, Scope { workspace, ceiling:
-Some(thread grant) })` runs one. Tool arguments are `a206_core::extension::Args`;
-the run engine converts provider JSON to and from these values and exposes
-`ParamSpec` lists as JSON Schema at the provider edge. Tool text is extension
-output, never instructions.
+Agents do not call extension tools yet. The interface the native run engine
+will use is in place: `Gateway::extensions()` returns the `ExtensionHost`,
+whose `tools()` lists enabled tools whose declared capabilities the user
+granted, and `call_tool(extension, tool, args, Scope { workspace, ceiling:
+Some(thread grant) })` runs one. Tool arguments are `a206_core::extension::Args`.
+The run engine will need to convert provider JSON to and from these values and
+expose `ParamSpec` lists as JSON Schema at the provider edge; no such bridge
+exists yet. Tool text is extension output, never instructions.
 
 ## Planned
 
