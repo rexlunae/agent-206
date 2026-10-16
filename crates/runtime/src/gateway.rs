@@ -15,6 +15,82 @@ use std::{
     sync::{Arc, Mutex, MutexGuard},
 };
 use tokio::io::AsyncWriteExt;
+/// Streamed reply text that is not final yet. It is published as the
+/// thread's assistant message at most every [`PartialReply::INTERVAL`], so a
+/// fast stream does not rewrite the journal for every delta, and the newest
+/// text is never left unpublished for longer than that.
+#[derive(Default)]
+struct PartialReply {
+    message: Option<Id>,
+    text: String,
+    /// Text changed since it was last written to the thread.
+    dirty: bool,
+    published: Option<tokio::time::Instant>,
+}
+impl PartialReply {
+    const INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+    /// Apply streamed text; `true` when it should be published now.
+    fn update(&mut self, update: crate::backends::Progress) -> bool {
+        match update {
+            crate::backends::Progress::Text(text) => self.text = text,
+            crate::backends::Progress::Delta(delta) => self.text.push_str(&delta),
+            crate::backends::Progress::Activity(_) => return false,
+        }
+        self.dirty = true;
+        self.due()
+            .is_some_and(|due| due <= tokio::time::Instant::now())
+    }
+    /// When unpublished text should be published.
+    fn due(&self) -> Option<tokio::time::Instant> {
+        self.dirty.then(|| {
+            self.published
+                .map_or_else(tokio::time::Instant::now, |at| at + Self::INTERVAL)
+        })
+    }
+    /// Write the text into the reply message, creating it once there is text.
+    fn apply(&mut self, thread: &mut Thread) {
+        self.dirty = false;
+        let found = self
+            .message
+            .and_then(|id| thread.messages.iter_mut().find(|m| m.id == id));
+        if let Some(existing) = found {
+            existing.text.clone_from(&self.text);
+        } else if !self.text.is_empty() {
+            let id = *self.message.get_or_insert_with(Id::new_v4);
+            thread.messages.push(Message {
+                id,
+                role: Role::Assistant,
+                text: self.text.clone(),
+                attachments: vec![],
+                at: now(),
+                backend: thread.backend,
+            });
+        }
+    }
+    /// Publish the current text as a durable thread change.
+    fn publish(&mut self, store: &mut Store, id: Id) -> Result<(), GatewayError> {
+        self.apply(store.thread_mut(id)?);
+        store.persist(Some(EventKind::ThreadChanged { id }))?;
+        self.published = Some(tokio::time::Instant::now());
+        Ok(())
+    }
+    /// Replace streamed text with the final reply, which always gets a message.
+    fn finish(mut self, thread: &mut Thread, text: String) {
+        self.text = text;
+        let id = *self.message.get_or_insert_with(Id::new_v4);
+        if !thread.messages.iter().any(|m| m.id == id) {
+            thread.messages.push(Message {
+                id,
+                role: Role::Assistant,
+                text: String::new(),
+                attachments: vec![],
+                at: now(),
+                backend: thread.backend,
+            });
+        }
+        self.apply(thread);
+    }
+}
 /// Why a gateway command failed. Validation reasons are static so clients can
 /// match the variant; every wrapped failure keeps its cause in `source()`.
 #[derive(Debug, thiserror::Error)]
@@ -952,39 +1028,36 @@ impl Gateway {
                             &thread,
                             &prompt,
                             &info,
+                            &sender,
                         )
                         .await?
                     })
                 };
                 let mut operation = Box::pin(operation);
                 let mut progress_open = true;
-                let mut partial_message = None;
+                let mut partial = PartialReply::default();
                 let mut activity_count = 0;
-                let mut last_progress =
-                    std::time::Instant::now() - std::time::Duration::from_secs(1);
                 let result = loop {
+                    let due = partial.due();
                     tokio::select! {
                         result = &mut operation => break (!token.is_cancelled()).then_some(result),
                         _ = token.cancelled(), if backend.is_none() => break None,
+                        _ = tokio::time::sleep_until(due.unwrap_or_else(tokio::time::Instant::now)), if due.is_some() => {
+                            let mut store = self.lock()?;
+                            partial.publish(&mut store, id)?;
+                        }
                         update = progress.recv(), if progress_open => {
                             let Some(update) = update else { progress_open = false; continue; };
-                            let mut store = self.lock()?;
-                            match update {
-                                crate::backends::Progress::Text(text) => {
-                                    if last_progress.elapsed() < std::time::Duration::from_millis(100) { continue; }
-                                    last_progress = std::time::Instant::now();
-                                    let thread = store.thread_mut(id)?;
-                                    let message = partial_message.get_or_insert_with(Id::new_v4);
-                                    if let Some(existing) = thread.messages.iter_mut().find(|m| m.id == *message) { existing.text = text; }
-                                    else { thread.messages.push(Message { id: *message, role: Role::Assistant, text, attachments: vec![], at: now(), backend: thread.backend }); }
-                                    store.persist(Some(EventKind::ThreadChanged { id }))?;
-                                }
-                                crate::backends::Progress::Activity(title) if activity_count < 128 => {
+                            if let crate::backends::Progress::Activity(title) = update {
+                                if activity_count < 128 {
                                     activity_count += 1;
+                                    let mut store = self.lock()?;
                                     store.thread_mut(id)?.backend_activity = Some(title.clone());
                                     store.persist(Some(EventKind::BackendActivity { thread: id, title }))?;
                                 }
-                                _ => {}
+                            } else if partial.update(update) {
+                                let mut store = self.lock()?;
+                                partial.publish(&mut store, id)?;
                             }
                         }
                     }
@@ -992,29 +1065,23 @@ impl Gateway {
                 // External cancellation returns only after the proxy closes and
                 // the isolated process group is killed and its root reaped.
                 drop(operation);
+                // Text sent before the run ended still belongs to its reply.
+                while let Ok(update) = progress.try_recv() {
+                    partial.update(update);
+                }
                 self.running.lock().map_err(poisoned("run"))?.remove(&id);
                 let mut store = self.lock()?;
                 let thread = store.thread_mut(id)?;
                 match result {
                     Some(Ok((text, usage))) => {
-                        if let Some(message) = partial_message
-                            .and_then(|id| thread.messages.iter_mut().find(|m| m.id == id))
-                        {
-                            message.text = text;
-                        } else {
-                            thread.messages.push(Message {
-                                id: Id::new_v4(),
-                                role: Role::Assistant,
-                                text,
-                                attachments: vec![],
-                                at: now(),
-                                backend: thread.backend,
-                            });
-                        }
+                        partial.finish(thread, text);
                         thread.usage = Some(usage);
                         thread.state = RunState::Complete;
                     }
                     Some(Err(e)) => {
+                        // Partial text stays visible, followed by the failure;
+                        // the run is Failed, never Complete.
+                        partial.apply(thread);
                         let report = crate::error::correlated("run", id, &e);
                         thread.state = RunState::Failed;
                         thread.messages.push(Message {
@@ -1028,6 +1095,7 @@ impl Gateway {
                         thread.error = Some(report);
                     }
                     None => {
+                        partial.apply(thread);
                         thread.state = RunState::Cancelled;
                     }
                 }

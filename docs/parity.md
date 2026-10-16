@@ -14,7 +14,7 @@ WASM tools, MessagePack APIs, API-only model facts, fc-dioxus shared UI). Status
 **present** (works end to end in a206), **partial** (structure or subset exists), **missing**.
 
 Key a206 facts that drive most rows: the native engine is text-only, no tool-call loop
-(`a206/crates/runtime/src/provider.rs:342` sends `"stream": false`, no `tools`); credentialed providers
+(`a206/crates/runtime/src/provider.rs` streams text but sends no `tools`); credentialed providers
 now go through the vault broker (survey time: refused); the agent-facing surface is the MCP harness with
 one tool, `rename_thread` (`a206/crates/runtime/src/mcp.rs`); the `Command` enum
 (`a206/crates/core/src/lib.rs:418`) is the entire gateway API; WASM ABI v1 has no inputs or host calls
@@ -47,7 +47,7 @@ one tool, `rename_thread` (`a206/crates/runtime/src/mcp.rs`); the `Command` enum
 | `ask_user` structured prompts (`user_prompt_types.rs`, desktop `user_prompt.rs`) | missing | Typed prompt event + UI response command |
 | Tool-call healing: malformed JSON, dupes, leaked markup (`tool_healing.rs`) | missing | Part of run engine's parse stage |
 | Tool-output compression rules (`rc/crates/tokenjuice`, `tool_pipeline.rs`) | missing | Reusable crate (MIT attribution); TOML rule overlays |
-| Provider SSE streaming OpenAI/Anthropic (`streaming.rs`, `gateway/providers/mod.rs`) | partial: streamed text only from external backends; native `stream:false` (`provider.rs:342`) | Stream deltas as durable events with cursors |
+| Provider SSE streaming OpenAI/Anthropic (`streaming.rs`, `gateway/providers/mod.rs`) | present for text: native OpenAI-compatible, Anthropic and Gemini replies stream; the broker relays credentialed bodies in bounded, ordered frames (protocol v4, negotiated down to v3 brokers, which answer buffered); bounded incremental SSE decoding (`a206/crates/runtime/src/sse.rs`); deltas published as journaled `ThreadChanged` events at most every 100 ms; lock, pairing revocation, cancellation and client disconnect stop the upstream request; mid-stream failures keep partial text in a Failed run with a structured report. Streamed tool calls, reasoning/thinking display and retries are not implemented | Streamed tool-call deltas with the run engine; per-delta event payloads if snapshot republishing becomes too costly |
 | Context compaction at 75% window + pre-compaction memory flush (`gateway/helpers.rs`, `memory_flush.rs`) | missing (context used/limit widget only) | Use API-reported context limit; unknown limit ⇒ no auto-compaction, user control |
 | Retry policy + model/auth-profile failover (`retry/policy.rs`, `models/failover.rs`) | missing | Retries with explicit external-effect semantics; **no silent model fallback** (thread allowlist) |
 | System prompt + workspace files SOUL/AGENTS/TOOLS/MEMORY (`soul.rs`, `workspace_context.rs`, `gateway/system_prompt.rs`) | partial: editable per-mode prompts (`ui/src/settings.rs` PromptEditor) | Project-scoped instruction files read via ReadWorkspace grant |

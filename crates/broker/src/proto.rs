@@ -11,7 +11,20 @@ use zeroize::Zeroizing;
 /// `Request::Hello`, `Request::Shutdown` (accepted before `Hello`) and
 /// `Reply::Ok`/`Reply::Error` must stay compatible across versions; variants
 /// are encoded by name.
-pub const BROKER_VERSION: u16 = 3;
+///
+/// Version 4 adds [`Request::ProviderStream`]. A broker accepts greetings from
+/// [`MIN_BROKER_VERSION`] up to this version, and a client falls back to the
+/// newest version an older broker accepts (see `Client::version`), so streams
+/// are only requested from brokers that understand them.
+pub const BROKER_VERSION: u16 = 4;
+/// The oldest protocol version this broker still serves and this client still
+/// speaks. Versions 3 and 4 differ only by the streaming request.
+pub const MIN_BROKER_VERSION: u16 = 3;
+/// The first version that serves [`Request::ProviderStream`].
+pub const STREAM_VERSION: u16 = 4;
+/// Largest response body slice carried by one [`Reply::ProviderChunk`]. Small
+/// frames keep a stream responsive and bound what either side buffers.
+pub const MAX_STREAM_CHUNK: usize = 64 * 1024;
 /// Largest provider request or response body the broker carries. The rest of
 /// the 4 MiB frame is reserved for the envelope, so a body at this limit still
 /// fits in one frame.
@@ -255,6 +268,13 @@ pub enum Request {
         token: WireSecret,
     },
     Provider(ProviderCall),
+    /// Gateway role, version 4: like `Provider`, but the successful response
+    /// body is relayed as it arrives. The broker answers with one
+    /// `ProviderHead`, then `ProviderChunk`s numbered from 0, then
+    /// `ProviderEnd`; or with an `Error` at any point, which ends the stream.
+    /// A lock, pairing replacement or pairing void ends it with an `Error`; a
+    /// closed connection abandons the upstream request.
+    ProviderStream(ProviderCall),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -382,6 +402,24 @@ pub enum Reply {
         status: u16,
         #[serde(with = "serde_bytes")]
         body: Vec<u8>,
+    },
+    /// The upstream status of a streamed call. Like `Provider`, an
+    /// unsuccessful status is followed directly by `ProviderEnd`: upstream
+    /// error bodies are never relayed.
+    ProviderHead {
+        status: u16,
+    },
+    /// At most [`MAX_STREAM_CHUNK`] bytes of a streamed body. `seq` counts
+    /// chunks from 0 without gaps.
+    ProviderChunk {
+        seq: u64,
+        #[serde(with = "serde_bytes")]
+        bytes: Vec<u8>,
+    },
+    /// A streamed body ended normally, after `chunks` chunks totalling `bytes`.
+    ProviderEnd {
+        chunks: u64,
+        bytes: u64,
     },
     Error(BrokerError),
 }
