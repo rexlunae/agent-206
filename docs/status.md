@@ -25,7 +25,7 @@ implemented structure for finished agent execution or security parity.
 | Projects/subagents | Project coordinator conversations, parent-linked delegated threads, explicit model allowlists, narrowed grants, revocation checks | Autonomous project management, task assignment, scheduler/budgets, steering and hierarchical cancellation |
 | Concurrent UI | Resizable navigation/chat/inspector, two visible conversations, independently scoped controls, conversation title editing, searchable complete conversation list, compact integrated composer controls, themed raised/feature surfaces | More than two visible threads, saved layouts and comprehensive terminal interaction QA |
 | Navigation | Typed Dioxus Router routes, persistent shell, fc-dioxus links, Back/Forward controls, conversation and split-view URLs, deep-link reloads, loading/missing recovery | Cross-profile deep-link handling, draft/form preservation across route unmounts, terminal interaction acceptance |
-| Vault | SecureStore-compatible encryption, locked state, redacted nonserializable secret type, private atomic writes, interactive standalone CLI | Isolated encrypted broker IPC, per-use approvals, TOTP, key-file and legacy metadata migration, credential use in providers/browser |
+| Vault | SecureStore-compatible encryption, locked state, redacted nonserializable secret type, private atomic writes, interactive standalone CLI; library-level typed credentials in RustyClaw's layout, all five access policies plus disabled/agent switch, verified TOTP enrollment with replay protection, auth throttle and reveal step-up window; the CLI challenges enrolled vaults ; a separate broker process owns the vault, serves the CLI and performs destination-bound provider requests for the gateway | Desktop/TUI unlock and enrollment, agent approval UI, recovery codes, key-file migration, remote broker over SSH, credentialed external backends and browser injection |
 | Security model | Deny-by-default grants, no secret-bearing agent tool, restricted MCP, bounded worker, SSRF-resistant public downloads, capability-scoped text reads | Full RustyClaw defense parity, OS sandbox profiles, leak/injection boundary scanning, adversarial review |
 | WASM | Genuine compiled bundled inspector, separate child, no imports/WASI, fuel/memory/output/time bounds | General SDK inputs/host calls, user/agent package creation and reviewed installation, most tools as extensions |
 | Plugin UI/API | Versioned manifest and executable v1 documented; trusted text-only extension panel | Rich validated component descriptions, panel/viewer/command contributions and subscriptions |
@@ -35,7 +35,7 @@ implemented structure for finished agent execution or security parity.
 | Git/PR/CI | Scoped read-only Git status with bounded output and disabled fsmonitor | Diff/stage/commit workflows, forge-neutral PR/review/check APIs, multiple CI/CD adapters |
 | Browser | fc-dioxus sandboxed preview with opaque origin, browser chrome and navigation | Isolated automation profile/driver, test tooling, downloads integration and approved vault injection |
 | Theme/branding | New vector mark and generated PNG/ICO/ICNS bundle icons, future-css ThemePicker, designs/palettes/scheme/contrast saved as TOML | User theme import/editor after toolkit model support |
-| Standards/docs | AGENTS.md, architecture, executable plugin ABI, provenance/attribution, README, CI workflow | Keep this ledger current as each gate lands |
+| Standards/docs | AGENTS.md, architecture, executable plugin ABI, provenance/attribution, README, CI workflow, RustyClaw parity gap list (docs/parity.md) | Keep this ledger current as each gate lands |
 
 ## Current scope
 
@@ -49,8 +49,11 @@ remote gateways until one exists.
 
 ## Explicitly disabled
 
-Credential-backed provider dispatch fails with an explanatory error. The gateway
-never falls back to reading a credential into its own model context. Browser
+Credential-backed providers work only through the vault broker: the vault must be
+unlocked and the credential bound to the provider's exact origin, or the request
+fails with an explanation. The gateway never reads a credential value, and agents
+still have no credential use. External coding backends still refuse credentialed
+providers. Browser
 preview has no credential injection. Third-party extension installation and
 capability-bearing imports are unavailable. New coding conversations have no
 execution or filesystem grants. A coding mode label alone does not claim a working
@@ -81,7 +84,7 @@ stop handoff. Failed shutdown releases the gate without persisting stop intent.
 
 The workspace has behavioral tests for permission attenuation, empty startup
 catalogs, fragmented/malformed frames, vault encryption/locking/wrong passwords,
-worker fuel/import restrictions, durable deduplication/replay, scoped file access,
+worker fuel/import restrictions, credential policy denials, TOTP enrollment/replay/drift, authentication lockout, reveal expiry, durable deduplication/replay, scoped file access,
 settings conflicts, model revocation and runtime API discovery/chat/persistence.
 Provider tests also check advertised effort enforcement/dispatch, attached text dispatch/persistence and size rejection, and API-sourced balances/prices.
 Preset tests cover TOML persistence, overrides, hiding/default opt-out, account

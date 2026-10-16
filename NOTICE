@@ -1,7 +1,8 @@
 Agent 206
 Copyright (c) 2026 Erica Stith
 
-Portions of the SSH transport design, atomic SecureStore persistence and the
+Portions of the SSH transport design, atomic SecureStore persistence, vault
+credential layout, access policies, TOTP handling, authentication limits and the
 `Ignore` result-discard convention are adapted from RustyClaw,
 https://github.com/rexlunae/RustyClaw,
 Copyright (c) 2026 Erica Stith, MIT License (included in LICENSE).

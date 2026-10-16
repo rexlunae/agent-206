@@ -9,6 +9,9 @@ securestore = { version = "0.100.3", default-features = false, features = ["rust
 zeroize.workspace = true
 thiserror.workspace = true
 tempfile.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+totp-rs = { version = "5.7", default-features = false, features = ["gen_secret", "otpauth"] }
 [dev-dependencies]
 uuid.workspace = true
 [lints]

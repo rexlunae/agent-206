@@ -9,6 +9,7 @@ a206-core.workspace = true
 a206-protocol.workspace = true
 a206-extensions.workspace = true
 a206-vault.workspace = true
+a206-broker.workspace = true
 serde.workspace = true
 schemars = "1"
 serde_json.workspace = true
@@ -39,5 +40,7 @@ nix = { version = "0.31", features = ["signal", "process", "fs"] }
 [dev-dependencies]
 tracing-subscriber.workspace = true
 tempfile.workspace = true
+a206-broker.workspace = true
+a206-vault.workspace = true
 [lints]
 workspace = true

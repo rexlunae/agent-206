@@ -22,7 +22,9 @@ flowchart LR
     Gateway --> Backend[Optional isolated coding backend]
     Backend --> Proxy[Model-restricted loopback proxy]
     Proxy --> Provider
-    Gateway -. brokered operation .-> Vault[Isolated vault broker: pending]
+    Gateway -. destination-bound request .-> Vault[Separate vault broker process]
+    CLI -. unlock, enrollment, credentials .-> Vault
+    Vault --> Provider
     Vault --> Storage[SecureStore encrypted vault]
 ```
 
@@ -33,10 +35,11 @@ manifests and runs WASM. `a206-vault` preserves the SecureStore format with a
 narrow API. `a206-ui` contains one fc-dioxus component tree. `agent206` selects
 the renderer or service entry point.
 
-The UI never stores a provider credential. The current build deliberately rejects
-credential-backed provider configuration because the complete isolated broker is
-not implemented. The standalone vault CLI uses a separate short-lived process.
-This is not yet a replacement for RustyClaw's complete secret approval system.
+The UI never stores a provider credential. `a206-broker` is a separate process
+that owns the decrypted vault; the gateway asks it to send credentialed provider
+requests to user-bound origins and never receives the value. The CLI is the first
+trusted broker surface; desktop/TUI enrollment and agent approvals are pending, so
+this is not yet a replacement for RustyClaw's complete secret approval system.
 
 ## Single writer and process ownership
 

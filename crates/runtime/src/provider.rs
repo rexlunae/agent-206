@@ -100,34 +100,119 @@ async fn response_json(response: reqwest::Response) -> Result<Value> {
     }
     Ok(serde_json::from_slice(&bytes)?)
 }
-fn authenticated(config: &ProviderConfig) -> Result<()> {
-    if config.credential.is_some() {
-        bail!(
-            "this provider requires the isolated credential broker; authenticated provider dispatch is not enabled yet"
-        );
-    }
-    Ok(())
-}
-fn request(
+/// Where credentialed requests go: the profile whose vault broker holds the
+/// key. The gateway never reads a credential value; the broker attaches it
+/// for the exact destination the user bound it to.
+#[derive(Clone, Copy)]
+pub struct Broker<'a>(pub &'a std::path::Path);
+async fn call(
     config: &ProviderConfig,
+    broker: Broker<'_>,
     method: reqwest::Method,
     url: Url,
-) -> Result<reqwest::RequestBuilder> {
-    authenticated(config)?;
-    let mut request = client()?.request(method, url);
-    if config.api == ProviderApi::Anthropic {
-        request = request.header("anthropic-version", "2023-06-01");
-    }
-    Ok(request)
+    body: Option<&Value>,
+) -> Result<Value> {
+    let Some(credential) = &config.credential else {
+        let mut request = client()?.request(method, url);
+        if config.api == ProviderApi::Anthropic {
+            request = request.header("anthropic-version", ANTHROPIC_VERSION);
+        }
+        if let Some(body) = body {
+            request = request.json(body);
+        }
+        return response_json(request.send().await?).await;
+    };
+    brokered(config, broker, credential, method, url, body).await
 }
+#[cfg(unix)]
+async fn brokered(
+    config: &ProviderConfig,
+    broker: Broker<'_>,
+    credential: &str,
+    method: reqwest::Method,
+    url: Url,
+    body: Option<&Value>,
+) -> Result<Value> {
+    use a206_broker::{AuthScheme, HttpMethod, ProviderCall, Reply, Request, Role};
+    let method = match method {
+        reqwest::Method::GET => HttpMethod::Get,
+        reqwest::Method::POST => HttpMethod::Post,
+        other => bail!("unsupported provider method {other}"),
+    };
+    let auth = match config.api {
+        ProviderApi::OpenAi => AuthScheme::Bearer,
+        ProviderApi::Anthropic => AuthScheme::ApiKeyHeader,
+        ProviderApi::Gemini => AuthScheme::GoogleApiKey,
+    };
+    let mut client = a206_broker::Client::connect(broker.0, Role::Gateway)
+        .await
+        .context("unlock the vault to use this provider's credential")?;
+    let reply = client
+        .call(Request::Provider(ProviderCall {
+            credential: credential.to_owned(),
+            method,
+            url: url.to_string(),
+            auth,
+            anthropic_version: (config.api == ProviderApi::Anthropic)
+                .then(|| ANTHROPIC_VERSION.to_owned()),
+            body: body.map(bounded_json).transpose()?,
+        }))
+        .await?;
+    let Reply::Provider { status, body } = reply else {
+        bail!("vault broker returned an unexpected reply");
+    };
+    ensure!(
+        (200..300).contains(&status),
+        "provider returned HTTP {status}"
+    );
+    ensure!(body.len() <= MAX_RESPONSE, "provider response is too large");
+    Ok(serde_json::from_slice(&body)?)
+}
+/// Serialize a request body, stopping as soon as it exceeds what one broker
+/// frame can carry instead of building an oversized copy first.
+#[cfg(unix)]
+fn bounded_json(body: &Value) -> Result<Vec<u8>> {
+    struct Bounded(Vec<u8>);
+    impl std::io::Write for Bounded {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if self.0.len() + bytes.len() > a206_broker::MAX_PROVIDER_BODY {
+                return Err(std::io::Error::other("provider request too large"));
+            }
+            self.0.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut out = Bounded(vec![]);
+    if serde_json::to_writer(&mut out, body).is_err() {
+        bail!(
+            "the provider request exceeds the vault broker's {} byte limit; shorten the conversation",
+            a206_broker::MAX_PROVIDER_BODY
+        );
+    }
+    Ok(out.0)
+}
+#[cfg(not(unix))]
+async fn brokered(
+    _: &ProviderConfig,
+    _: Broker<'_>,
+    _: &str,
+    _: reqwest::Method,
+    _: Url,
+    _: Option<&Value>,
+) -> Result<Value> {
+    bail!("the vault broker is not available on this platform yet")
+}
+const ANTHROPIC_VERSION: &str = "2023-06-01";
 /// Follow provider cursors, never provider-supplied URLs; publication is all-or-nothing.
-pub async fn catalog(config: &ProviderConfig) -> Result<Catalog> {
-    tokio::time::timeout(Duration::from_secs(180), catalog_pages(config))
+pub async fn catalog(config: &ProviderConfig, broker: Broker<'_>) -> Result<Catalog> {
+    tokio::time::timeout(Duration::from_secs(180), catalog_pages(config, broker))
         .await
         .context("provider catalog refresh timed out")?
 }
-async fn catalog_pages(config: &ProviderConfig) -> Result<Catalog> {
-    authenticated(config)?;
+async fn catalog_pages(config: &ProviderConfig, broker: Broker<'_>) -> Result<Catalog> {
     let source = endpoint(config, "models")?;
     let mut url = source.clone();
     let mut seen_cursors = BTreeSet::new();
@@ -136,8 +221,7 @@ async fn catalog_pages(config: &ProviderConfig) -> Result<Catalog> {
     let mut bytes = 0;
     let mut account = None;
     for page in 0..MAX_PAGES {
-        let value =
-            response_json(request(config, reqwest::Method::GET, url)?.send().await?).await?;
+        let value = call(config, broker, reqwest::Method::GET, url, None).await?;
         bytes += serde_json::to_vec(&value)?.len();
         ensure!(bytes <= MAX_RESPONSE, "model catalog is too large");
         if page == 0 {
@@ -322,11 +406,11 @@ fn price(value: Option<&Value>) -> Option<f64> {
 }
 pub async fn complete(
     config: &ProviderConfig,
+    broker: Broker<'_>,
     thread: &Thread,
     prompt: &str,
     info: &ModelInfo,
 ) -> Result<(String, Usage)> {
-    authenticated(config)?;
     let model = thread
         .model
         .as_ref()
@@ -381,13 +465,7 @@ pub async fn complete(
             (url, body)
         }
     };
-    let result = response_json(
-        request(config, reqwest::Method::POST, url)?
-            .json(&body)
-            .send()
-            .await?,
-    )
-    .await?;
+    let result = call(config, broker, reqwest::Method::POST, url, Some(&body)).await?;
     let (text, input, output) = match config.api {
         ProviderApi::OpenAi => (
             result

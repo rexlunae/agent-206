@@ -80,6 +80,33 @@ fn classify(error: &(dyn Error + 'static)) -> Option<ErrorKind> {
     if error.is::<rmp_serde::decode::Error>() || error.is::<rmp_serde::encode::Error>() {
         return Some(ErrorKind::Protocol);
     }
+    if let Some(error) = error.downcast_ref::<a206_broker::BrokerError>() {
+        use a206_broker::BrokerError as B;
+        return Some(match error {
+            B::Locked | B::NoVault | B::LockedOut { .. } => ErrorKind::Unavailable,
+            B::AuthenticationFailed
+            | B::TotpRequired
+            | B::ClockDrift { .. }
+            | B::TotpReplayed
+            | B::StepUpRequired
+            | B::Forbidden
+            | B::Denied(_) => ErrorKind::PermissionDenied,
+            B::NoPendingEnrollment | B::AlreadyExists => ErrorKind::Conflict,
+            B::NotFound => ErrorKind::NotFound,
+            B::Invalid(_) => ErrorKind::InvalidRequest,
+            B::Vault(_) => ErrorKind::Storage,
+            B::Upstream(_) => ErrorKind::Provider,
+        });
+    }
+    if let Some(error) = error.downcast_ref::<a206_broker::ClientError>() {
+        use a206_broker::ClientError as C;
+        return match error {
+            C::Io(_) | C::Closed => Some(ErrorKind::Unavailable),
+            C::Protocol(_) => Some(ErrorKind::Protocol),
+            // `transparent` hides the reply from the chain, so classify it here.
+            C::Broker(reply) => classify(reply),
+        };
+    }
     if let Some(error) = error.downcast_ref::<reqwest::Error>() {
         return Some(if error.is_timeout() {
             ErrorKind::Timeout
@@ -137,6 +164,21 @@ mod tests {
         assert_eq!(report.kind, ErrorKind::NotFound);
         assert_eq!(report.chain().count(), 2);
         assert_eq!(super::report(&poisoned("state")).kind, ErrorKind::Internal);
+    }
+
+    #[test]
+    fn broker_failures_keep_their_kind() {
+        let denied = anyhow::Error::from(a206_broker::ClientError::from(
+            a206_broker::BrokerError::StepUpRequired,
+        ))
+        .context("could not use the credential");
+        assert_eq!(report(&denied).kind, ErrorKind::PermissionDenied);
+        let offline = anyhow::Error::from(a206_broker::ClientError::from(std::io::Error::from(
+            std::io::ErrorKind::NotFound,
+        )));
+        let offline = report(&offline);
+        assert_eq!(offline.kind, ErrorKind::Unavailable);
+        assert_eq!(offline.chain().count(), 2, "{offline:#}");
     }
 
     #[test]
