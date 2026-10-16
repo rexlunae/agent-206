@@ -4,6 +4,22 @@ use a206_core::*;
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::path::{Path, PathBuf};
+
+/// Open the single profile lock used by both startup and offline stop intent.
+pub(crate) fn profile_lock(root: &Path) -> Result<std::fs::File> {
+    std::fs::create_dir_all(root)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(root.join("gateway.lock"))?)
+}
 pub struct Store {
     _lock: std::fs::File,
     db: Connection,
@@ -12,18 +28,7 @@ pub struct Store {
 }
 impl Store {
     pub fn open(root: &Path) -> Result<Self> {
-        std::fs::create_dir_all(root)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700))?;
-        }
-        let lock = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(root.join("gateway.lock"))?;
+        let lock = profile_lock(root)?;
         fs2::FileExt::try_lock_exclusive(&lock)
             .context("a gateway already owns this data directory")?;
         let db = Connection::open(root.join("state.sqlite3"))?;

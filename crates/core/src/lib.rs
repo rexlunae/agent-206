@@ -502,6 +502,7 @@ pub enum Command {
         input: String,
     },
     Shutdown,
+    GatewayStatus,
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Reply {
@@ -514,6 +515,46 @@ pub enum Reply {
     Text(String),
     Ok,
     Error { message: String },
+    Gateway(GatewayInfo),
+}
+
+/// Facts reported by the gateway process itself, never inferred from a socket file.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GatewayInfo {
+    pub pid: u32,
+    pub version: String,
+    pub protocol: u16,
+    pub uptime_seconds: u64,
+    pub data_dir: String,
+    pub active_runs: usize,
+    pub active_downloads: usize,
+    #[serde(default)]
+    pub accepting_work: Option<bool>,
+}
+
+/// User control operations live outside the agent command/tool surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GatewayAction {
+    Status,
+    Start,
+    Stop,
+    Restart,
+    Reconnect,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GatewayPhase {
+    Running,
+    Stopped,
+    Offline,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GatewayReport {
+    pub target: String,
+    pub phase: GatewayPhase,
+    pub info: Option<GatewayInfo>,
+    pub error: Option<String>,
 }
 
 #[cfg(test)]

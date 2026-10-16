@@ -2,6 +2,7 @@
 pub mod acp;
 pub mod backends;
 pub mod client;
+pub mod control;
 pub mod gateway;
 pub mod joshua;
 pub mod mcp;

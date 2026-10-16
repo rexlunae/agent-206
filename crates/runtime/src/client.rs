@@ -12,11 +12,23 @@ pub struct Client {
 }
 impl Client {
     pub fn start(root: PathBuf, remote: Option<String>) -> Self {
+        Self::connect(root, remote, true, false)
+    }
+    pub fn attach(root: PathBuf, remote: Option<String>) -> Self {
+        Self::connect(root, remote, false, false)
+    }
+    pub fn launch(root: PathBuf, remote: Option<String>) -> Self {
+        Self::connect(root, remote, true, true)
+    }
+    pub fn is_closed(&self) -> bool {
+        self.sender.is_closed()
+    }
+    fn connect(root: PathBuf, remote: Option<String>, start: bool, explicit: bool) -> Self {
         let (sender, receiver) = mpsc::channel(32);
         std::thread::spawn(move || {
             let result = tokio::runtime::Runtime::new().and_then(|runtime| {
                 runtime
-                    .block_on(run(root, remote, receiver))
+                    .block_on(run(root, remote, receiver, start, explicit))
                     .map_err(std::io::Error::other)
             });
             if let Err(error) = result {
@@ -43,9 +55,15 @@ async fn run(
     root: PathBuf,
     remote: Option<String>,
     mut receiver: mpsc::Receiver<Call>,
+    mut start: bool,
+    mut explicit: bool,
 ) -> Result<()> {
     while let Some(first) = receiver.recv().await {
-        let child = crate::transport::gateway_command(&root, remote.as_deref())?.spawn();
+        let child =
+            crate::transport::gateway_command(&root, remote.as_deref(), start, explicit)?.spawn();
+        // Only initial connection or an explicit user Start may launch a service.
+        start = false;
+        explicit = false;
         match child {
             Ok(child) => {
                 let stopped = connection(child, first, &mut receiver).await?;
@@ -68,6 +86,24 @@ async fn connection(
 ) -> Result<bool> {
     let mut stdin = child.stdin.take().context("gateway stdin missing")?;
     let mut stdout = child.stdout.take().context("gateway stdout missing")?;
+    let mut stderr = child.stderr.take().context("gateway stderr missing")?;
+    let mut diagnostics = tokio::spawn(async move {
+        use tokio::io::AsyncReadExt;
+        let mut tail = std::collections::VecDeque::with_capacity(8192);
+        let mut bytes = [0; 1024];
+        while let Ok(count) = stderr.read(&mut bytes).await {
+            if count == 0 {
+                break;
+            }
+            tail.extend(&bytes[..count]);
+            while tail.len() > 8192 {
+                tail.pop_front();
+            }
+        }
+        String::from_utf8_lossy(&tail.into_iter().collect::<Vec<_>>())
+            .trim()
+            .to_owned()
+    });
     let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
     let reads = pending.clone();
     let mut reader = tokio::spawn(async move {
@@ -85,6 +121,13 @@ async fn connection(
     loop {
         if let Some((request, sender)) = next.take() {
             let mut outstanding = pending.lock().await;
+            outstanding.retain(|_, sender| !sender.is_closed());
+            if outstanding.len() >= 32 {
+                let _delivery = sender.send(Err(anyhow::anyhow!(
+                    "gateway has too many outstanding requests"
+                )));
+                continue;
+            }
             if let std::collections::hash_map::Entry::Vacant(entry) = outstanding.entry(request.id)
             {
                 entry.insert(sender);
@@ -95,10 +138,14 @@ async fn connection(
             }
             drop(outstanding);
             stopped |= matches!(request.body, Command::Shutdown);
-            if crate::transport::write_frame(&mut stdin, &request)
-                .await
-                .is_err()
-            {
+            if !matches!(
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    crate::transport::write_frame(&mut stdin, &request)
+                )
+                .await,
+                Ok(Ok(()))
+            ) {
                 break;
             }
         }
@@ -108,9 +155,16 @@ async fn connection(
         }
     }
     reader.abort();
-    for (_, sender) in pending.lock().await.drain() {
-        let _delivery = sender.send(Err(anyhow::anyhow!("gateway connection was lost; the command may have completed; refresh state before retrying")));
-    }
     let _kill_result = child.kill().await;
+    let detail = tokio::time::timeout(std::time::Duration::from_secs(1), &mut diagnostics)
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or_default();
+    diagnostics.abort();
+    for (_, sender) in pending.lock().await.drain() {
+        let _delivery = sender.send(Err(anyhow::anyhow!("gateway connection was lost; the command may have completed; refresh state before retrying{}",
+            if detail.is_empty() { String::new() } else { format!(": {detail}") })));
+    }
     Ok(stopped)
 }

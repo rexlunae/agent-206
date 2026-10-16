@@ -30,6 +30,8 @@ rpassword = "7"
 dioxus-ssr.workspace = true
 dioxus-tui = { git = "https://github.com/JakkuSakura/dioxus-tui", rev = "35c9ea58507f3ef75b4cd93f77b8fc28e332fc76", optional = true }
 [target.'cfg(unix)'.dev-dependencies]
+axum = "0.8"
 tempfile.workspace = true
+reqwest.workspace = true
 [lints]
 workspace = true

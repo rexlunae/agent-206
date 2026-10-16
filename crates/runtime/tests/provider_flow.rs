@@ -38,6 +38,124 @@ async fn run(gateway: &Gateway, command: Command) -> Reply {
         .body
 }
 #[tokio::test]
+async fn shutdown_cancels_active_inference_and_rejects_new_work() {
+    let identity = Id::new_v4();
+    let api = Api {
+        model: identity.to_string(),
+        context: (identity.as_u128() % 100_000 + 1) as u64,
+        effort: Id::new_v4().to_string(),
+        request: Default::default(),
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let router = Router::new()
+        .route("/v1/models", get(models))
+        .route(
+            "/v1/chat/completions",
+            post(
+                |State(api): State<Api>, Json(request): Json<Value>| async move {
+                    *api.request.lock().unwrap() = Some(request);
+                    std::future::pending::<Json<Value>>().await
+                },
+            ),
+        )
+        .with_state(api.clone());
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let directory = tempfile::tempdir().unwrap();
+    let gateway = Gateway::open(directory.path()).unwrap();
+    let provider = Id::new_v4();
+    let mut settings = Settings::default();
+    settings.providers.push(ProviderConfig {
+        id: provider,
+        label: Id::new_v4().to_string(),
+        base_url: format!("http://{address}/v1"),
+        credential: None,
+        api: Default::default(),
+    });
+    assert_eq!(
+        run(&gateway, Command::SaveSettings(settings)).await,
+        Reply::Ok
+    );
+    let Reply::Catalog(catalog) = run(&gateway, Command::RefreshCatalog { provider }).await else {
+        panic!()
+    };
+    let Reply::Thread(thread) = run(
+        &gateway,
+        Command::CreateThread {
+            title: Id::new_v4().to_string(),
+            mode: Mode::Chat,
+        },
+    )
+    .await
+    else {
+        panic!()
+    };
+    assert!(matches!(
+        run(
+            &gateway,
+            Command::ConfigureThread {
+                id: thread.id,
+                mode: Mode::Chat,
+                model: Some(catalog.models[0].key.clone()),
+                subagent_models: Default::default()
+            }
+        )
+        .await,
+        Reply::Thread(_)
+    ));
+    let worker = gateway.clone();
+    let send = tokio::spawn(async move {
+        run(
+            &worker,
+            Command::Send {
+                thread: thread.id,
+                text: Id::new_v4().to_string(),
+                attachments: vec![],
+            },
+        )
+        .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while api.request.lock().unwrap().is_none() {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let (first, second) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        tokio::join!(
+            run(&gateway, Command::Shutdown),
+            run(&gateway, Command::Shutdown)
+        )
+    })
+    .await
+    .unwrap();
+    assert_eq!(first, Reply::Ok);
+    assert_eq!(second, Reply::Ok);
+    assert_eq!(run(&gateway, Command::Shutdown).await, Reply::Ok);
+    assert!(
+        matches!(send.await.unwrap(), Reply::Thread(thread) if thread.state == RunState::Cancelled)
+    );
+    assert!(directory.path().join("gateway.stopped").exists());
+    let Reply::Gateway(info) = run(&gateway, Command::GatewayStatus).await else {
+        panic!()
+    };
+    assert_eq!(info.active_runs, 0);
+    assert_eq!(info.accepting_work, Some(false));
+    assert!(matches!(
+        run(
+            &gateway,
+            Command::CreateThread {
+                title: Id::new_v4().to_string(),
+                mode: Mode::Chat
+            }
+        )
+        .await,
+        Reply::Error { .. }
+    ));
+    server.abort();
+}
+#[tokio::test]
 async fn discovers_models_from_api_then_sends_and_persists_a_conversation() {
     let identity = Id::new_v4();
     let api = Api {

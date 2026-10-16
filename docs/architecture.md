@@ -52,7 +52,9 @@ unknown hosts require explicit SSH pairing outside the application today.
 Keepalives detect dead peers. TCP/SSH retransmits lost packets; the application
 handles fragmented frames and records durable request IDs and event cursors.
 
-The service currently persists beyond the window that started it. The desktop Security page can stop the shared gateway and reconnect/start it.
+The service persists beyond the window that started it. The shared Gateway page
+controls start/stop/restart/reconnect on desktop, web and terminal; CLI lifecycle
+commands use the same controller.
 Windows named pipes remain follow-up work.
 
 WASM builtins execute in a separate `extension-worker` child with a cleared
@@ -108,9 +110,26 @@ an indeterminate outcome instead of repeating a side effect. This is not an
 exactly-once guarantee for an external API. Recovery requires inspecting state.
 Events retain a bounded replay window; old or future cursors require a new snapshot.
 Clients reconnect for unsent requests after an unexpected disconnect; they do not
-repeat an accepted command. Explicit shutdown stays stopped until reconnect is
-requested. The current UI polls snapshots; event subscription and paged history
-remain follow-up work.
+repeat an accepted command. Explicit shutdown persists a private stop marker;
+only user Start/Restart can resume it. Reconnect and ordinary polling attach
+without starting a service. Offline local stop persists under the same profile
+lock as startup. Replaying a shutdown receipt does not stop a later process.
+The shared lifecycle controller serializes user operations, uses bounded receipts
+for duplicate control requests and verifies process-reported status. The web bridge
+exposes this through an authenticated,
+exact-origin MessagePack user endpoint; raw Shutdown remains denied there and
+lifecycle controls are absent from agent MCP.
+
+Stop closes admission, cancels accepted work, waits for bounded cleanup and stops
+owned local inference before acknowledging. Failed cleanup restores work admission
+and does not claim a successful shutdown; work already cancelled stays cancelled.
+Concurrent cleanup attempts are serialized. Once cleanup and stop intent commit,
+later shutdown requests acknowledge the committed stop without repeating cleanup.
+The daemon drains accepted replies before exit; a local controller can reconcile
+a lost stop reply only after verifying persisted stop intent and released profile
+ownership. Losing an acknowledgement still completes shutdown. Start reuses a
+running client connection so pending replies survive. The current UI polls snapshots; event
+subscription and paged history remain follow-up work.
 
 Catalogs carry source URL, retrieval time and expiry. A background refresh fetches
 expired catalogs, with a five-minute delay after failed attempts. Missing limits,
