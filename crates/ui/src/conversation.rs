@@ -1,4 +1,4 @@
-use crate::{Page, State, dispatch};
+use crate::{State, dispatch, route::Route};
 use a206_core::{
     Capability, CodingBackend, Command, Mode, ModelKey, Reply, Role, RunState, TextAttachment,
     Thread,
@@ -8,26 +8,31 @@ use fc_dioxus::prelude::*;
 use futures_util::StreamExt;
 use uuid::Uuid;
 #[component]
-pub fn Workspace() -> Element {
-    let mut state = use_context::<State>();
+pub fn Workspace(id: Uuid, split: Option<Uuid>) -> Element {
+    let state = use_context::<State>();
     let snapshot = state.data.read();
-    let thread = (state.selected)()
-        .and_then(|id| snapshot.threads.iter().find(|t| t.id == id))
+    let thread = snapshot.threads.iter().find(|t| t.id == id).cloned();
+    let secondary = split
+        .filter(|second| *second != id)
+        .and_then(|second| snapshot.threads.iter().find(|t| t.id == second))
         .cloned();
-    let secondary = (state.secondary)()
-        .and_then(|id| snapshot.threads.iter().find(|t| t.id == id))
-        .cloned();
+    let visible_split = secondary.as_ref().map(|thread| thread.id);
     rsx! {
         if let Some(thread) = thread {
             div { class: "a206-chat-header a206-row a206-between",
                 strong { "Conversations" }
                 div { class: "a206-row a206-chat-actions",
-                    NativeSelect { class: "a206-split-selector", size: InputSize::Sm, aria_label: "Open a second conversation", value: (state.secondary)().map(|id| id.to_string()).unwrap_or_default(),
-                        onchange: move |value: String| state.secondary.set(Uuid::parse_str(&value).ok()),
-                        option { value: "", selected: (state.secondary)().is_none(), "Split view…" }
-                        for other in snapshot.threads.iter().filter(|t| t.id != thread.id) { option { value: "{other.id}", selected: (state.secondary)() == Some(other.id), "{other.title}" } }
+                    NativeSelect { class: "a206-split-selector", size: InputSize::Sm, aria_label: "Open a second conversation", value: visible_split.map(|id| id.to_string()).unwrap_or_default(),
+                        onchange: move |value: String| { state.navigator.push(Route::Chat { id, split: Uuid::parse_str(&value).ok().filter(|second| *second != id) }); },
+                        option { value: "", selected: visible_split.is_none(), "Split view…" }
+                        for other in snapshot.threads.iter().filter(|t| t.id != id) { option { value: "{other.id}", selected: visible_split == Some(other.id), "{other.title}" } }
                     }
                     RenameTitle { key: "{thread.id}:{thread.title}", id: thread.id, initial: thread.title.clone() }
+                }
+            }
+            if split.is_some_and(|second| second != id) && secondary.is_none() {
+                Alert { title: rsx! { "Second conversation unavailable" }, "It may have been removed or belong to another gateway.",
+                    LinkButton { href: Route::Chat { id, split: None }.to_string(), variant: ButtonVariant::Ghost, "Close split view" }
                 }
             }
             div { class: "a206-chat-layout",
@@ -43,9 +48,11 @@ pub fn Workspace() -> Element {
                     }
                 }
             }
+        } else if !(state.loaded)() {
+            EmptyState { title: rsx! { "Opening conversation" }, body: rsx! { "Waiting for the gateway to load this workspace." } }
         } else {
-            EmptyState { title: rsx! { "Space for your next idea" }, body: rsx! { "Start a conversation, or open one from the sidebar." },
-                actions: rsx! { Button { variant: ButtonVariant::Primary, onclick: move |_| dispatch(state, Command::CreateThread { title: "New conversation".into(), mode: Mode::Chat }), "Start a conversation" } }
+            EmptyState { title: rsx! { "Conversation unavailable" }, body: rsx! { "It may have been removed or belong to another gateway." },
+                actions: rsx! { LinkButton { href: Route::Conversations {}.to_string(), variant: ButtonVariant::Primary, "All conversations" } }
             }
         }
     }
@@ -222,7 +229,7 @@ fn Conversation(thread: Thread) -> Element {
                 Card { variant: CardVariant::Feature, class: "a206-chat-welcome",
                 EmptyState { compact: true, title: rsx! { "Let's make something worthwhile." },
                     body: rsx! { if selected_model.is_some() { "Your conversation is ready. Describe the work you have in mind." } else { "Choose a model from a connected provider to begin." } },
-                    actions: rsx! { if models.is_empty() { Button { variant: ButtonVariant::Secondary, onclick: move |_| state.page.set(Page::Providers), "Connect a provider" } } }
+                    actions: rsx! { if models.is_empty() { LinkButton { variant: ButtonVariant::Secondary, href: Route::Providers {}.to_string(), "Connect a provider" } } }
                 }
                 }
             }
@@ -301,8 +308,8 @@ fn Conversation(thread: Thread) -> Element {
                             onchange: move |value: String| { if let Some(mode) = Mode::ALL.into_iter().find(|m| m.label() == value) { dispatch(state, Command::ConfigureThread { id, mode, model: selected_model.clone(), subagent_models: allowed_for_mode.clone() }); } }
                         }
                         if model_options.is_empty() {
-                            Button { class: "a206-model-connect", size: ButtonSize::Sm, variant: ButtonVariant::Ghost,
-                                onclick: move |_| state.page.set(Page::Providers), "Connect model" Icon { name: IconName::ChevronDown, size: IconSize::Sm }
+                            LinkButton { class: "a206-model-connect", size: ButtonSize::Sm, variant: ButtonVariant::Ghost,
+                                href: Route::Providers {}.to_string(), "Connect model" Icon { name: IconName::ChevronDown, size: IconSize::Sm }
                             }
                         } else {
                             Select { class: "a206-compose-select a206-model-select", label: name!("Provider and model"), value: ReadSignal::from(model_value), availability,
@@ -328,8 +335,8 @@ fn Conversation(thread: Thread) -> Element {
                         Button { class: "a206-account-widget", size: ButtonSize::Sm, variant: ButtonVariant::Ghost, popovertarget: "{details}",
                             aria_label: "API balance and model costs", title: "API balance and model costs", "{balance_label}" span { "· {cost_label}" }
                         }
-                        IconButton { icon: IconName::Settings, label: name!("Edit mode prompts"), title: "Edit mode prompts", size: ButtonSize::Sm, variant: ButtonVariant::Ghost,
-                            onclick: move |_| state.page.set(Page::Prompts) }
+                        LinkButton { icon_label: name!("Edit mode prompts"), title: "Edit mode prompts", size: ButtonSize::Sm, variant: ButtonVariant::Ghost,
+                            href: Route::Prompts {}.to_string(), Icon { name: IconName::Settings } }
                         IconButton { icon: if running { IconName::Stop } else { IconName::ArrowUp }, label: if running { name!("Stop response") } else { name!("Send message") },
                             title: if running { "Stop response" } else { "Send · Enter (Shift+Enter for a new line)" },
                             class: "a206-compose-send", size: ButtonSize::Sm, variant: ButtonVariant::Primary,
@@ -405,7 +412,7 @@ fn SubagentModel(thread: Uuid, model: a206_core::ModelInfo) -> Element {
 
 #[component]
 fn BackendControls(thread: Thread) -> Element {
-    let mut state = use_context::<State>();
+    let state = use_context::<State>();
     let id = thread.id;
     let selected = use_memo(move || {
         state
@@ -441,7 +448,7 @@ fn BackendControls(thread: Thread) -> Element {
         Select { label: name!("Coding-agent backend"), value: ReadSignal::from(selected), options, availability,
             onchange: move |value: String| { if let Some(backend) = CodingBackend::ALL.into_iter().find(|kind| kind.label() == value) { dispatch(state, Command::SetBackend { thread: id, backend, capabilities: grants.clone() }); } }
         }
-        Button { variant: ButtonVariant::Ghost, size: ButtonSize::Sm, onclick: move |_| state.page.set(crate::Page::Providers), "Manage connections" }
+        LinkButton { variant: ButtonVariant::Ghost, size: ButtonSize::Sm, href: Route::Providers {}.to_string(), "Manage connections" }
         if thread.backend != CodingBackend::Native {
             p { class: "a206-muted", "Project tools are off until you grant them. External subagents and direct network access are disabled." }
             if thread.project.is_none() { p { class: "a206-muted", "Open a project coordinator to grant workspace tools." } }

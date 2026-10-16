@@ -10,8 +10,8 @@ web = ["dioxus/web", "fc-dioxus/web"]
 [dependencies]
 a206-core.workspace = true
 a206-protocol.workspace = true
-dioxus.workspace = true
-fc-dioxus.workspace = true
+dioxus = { workspace = true, features = ["router"] }
+fc-dioxus = { workspace = true, features = ["router"] }
 uuid.workspace = true
 serde.workspace = true
 toml.workspace = true
