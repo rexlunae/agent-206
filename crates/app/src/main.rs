@@ -65,6 +65,11 @@ mod native {
             #[command(subcommand)]
             command: McpServerAction,
         },
+        /// Review and approve skills installed in the gateway's profile.
+        Skills {
+            #[command(subcommand)]
+            command: SkillAction,
+        },
         /// Manage the configured local or SSH gateway.
         Gateway {
             #[command(subcommand)]
@@ -200,6 +205,17 @@ mod native {
         Stop,
         Restart,
         Reconnect,
+    }
+    #[derive(Subcommand)]
+    enum SkillAction {
+        /// Show installed skills, whether each is approved, and problems.
+        List,
+        /// Print a skill's SKILL.md for review.
+        Show { name: String },
+        /// Approve the skill exactly as it is now.
+        Enable { name: String },
+        /// Withdraw approval.
+        Disable { name: String },
     }
     #[derive(Subcommand)]
     enum McpServerAction {
@@ -657,6 +673,31 @@ mod native {
                             capabilities,
                         }
                     }
+                    Action::Skills { command } => match command {
+                        SkillAction::List => {
+                            #[derive(serde::Serialize)]
+                            struct Skills {
+                                skills: Vec<a206_core::SkillSummary>,
+                            }
+                            match client.call(Command::Skills).await? {
+                                Reply::Skills(skills) => {
+                                    print!("{}", toml::to_string_pretty(&Skills { skills })?);
+                                    return Ok(());
+                                }
+                                Reply::Error(report) => return Err(report.into()),
+                                _ => anyhow::bail!("gateway did not list skills"),
+                            }
+                        }
+                        SkillAction::Show { name } => Command::ReadSkill { name },
+                        SkillAction::Enable { name } => Command::SetSkillEnabled {
+                            name,
+                            enabled: true,
+                        },
+                        SkillAction::Disable { name } => Command::SetSkillEnabled {
+                            name,
+                            enabled: false,
+                        },
+                    },
                     Action::McpServers { command } => match command {
                         McpServerAction::List => {
                             let Reply::Snapshot(snapshot) = client.call(Command::Snapshot).await?

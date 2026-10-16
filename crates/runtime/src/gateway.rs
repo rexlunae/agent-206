@@ -16,7 +16,9 @@ use std::{
 };
 use tokio::io::AsyncWriteExt;
 mod mcp_servers;
+mod skills;
 pub use mcp_servers::{McpOffer, McpOffers};
+pub use skills::SkillOffer;
 
 /// Streamed reply text that is not final yet. It is published as the
 /// thread's assistant message at most every [`PartialReply::INTERVAL`], so a
@@ -141,6 +143,8 @@ pub enum GatewayError {
     #[error(transparent)]
     Mcp(#[from] a206_mcp::McpError),
     #[error(transparent)]
+    Skill(#[from] a206_skills::SkillError),
+    #[error(transparent)]
     Frame(#[from] transport::FrameError),
     #[error("state could not be encoded")]
     Encode(#[from] rmp_serde::encode::Error),
@@ -212,6 +216,7 @@ impl crate::error::Classified for GatewayError {
             Self::Download(error) => return classify(error),
             Self::Extension(error) => return classify(error),
             Self::Mcp(error) => return classify(error),
+            Self::Skill(error) => return classify(error),
             Self::Frame(error) => return classify(error),
             // The cause's own kind (missing, denied, invalid data) is the useful one.
             Self::Receipt(_)
@@ -459,6 +464,8 @@ impl Gateway {
                 // never persisted in the request journal.
                 | Command::OpenPanel { .. }
                 | Command::CallTool { .. }
+                | Command::Skills
+                | Command::ReadSkill { .. }
                 // Never journal a pairing: request bodies are persisted.
                 | Command::PairBroker { .. }
         );
@@ -690,13 +697,7 @@ impl Gateway {
                 }
                 drop(running);
                 settings.revision += 1;
-                let text =
-                    toml::to_string_pretty(&settings).map_err(GatewayError::EncodeSettings)?;
-                let temporary = store.root.join("settings.toml.new");
-                std::fs::write(&temporary, text)
-                    .and_then(|()| std::fs::File::open(&temporary)?.sync_all())
-                    .and_then(|()| std::fs::rename(&temporary, store.root.join("settings.toml")))
-                    .map_err(GatewayError::WriteSettings)?;
+                write_settings(&store.root, &settings)?;
                 // Endpoint/credential changes invalidate any facts from the previous source.
                 let old = store.state.settings.providers.clone();
                 store.state.catalogs.retain(|c| {
@@ -1315,6 +1316,12 @@ impl Gateway {
                 store.persist(Some(EventKind::ExtensionChanged { id: extension }))?;
                 Ok(Reply::Ok)
             }
+            Command::Skills => Ok(Reply::Skills(self.skills()?)),
+            Command::ReadSkill { name } => Ok(Reply::Text(self.read_skill(&name)?)),
+            Command::SetSkillEnabled { name, enabled } => {
+                self.set_skill_enabled(&name, enabled)?;
+                Ok(Reply::Ok)
+            }
             Command::ConnectMcpServer { name } => {
                 self.connect_mcp(&name).await?;
                 Ok(Reply::Ok)
@@ -1609,6 +1616,15 @@ pub fn scoped_path(root: &Path, path: &str) -> Result<PathBuf> {
         GatewayError::Denied("document escapes the project"),
     )?;
     Ok(target)
+}
+/// Replace `settings.toml` atomically with `settings`.
+fn write_settings(root: &Path, settings: &Settings) -> Result<()> {
+    let text = toml::to_string_pretty(settings).map_err(GatewayError::EncodeSettings)?;
+    let temporary = root.join("settings.toml.new");
+    std::fs::write(&temporary, text)
+        .and_then(|()| std::fs::File::open(&temporary)?.sync_all())
+        .and_then(|()| std::fs::rename(&temporary, root.join("settings.toml")))
+        .map_err(GatewayError::WriteSettings)
 }
 fn validate_model(snapshot: &Snapshot, key: &ModelKey) -> Result<()> {
     check(

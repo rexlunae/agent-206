@@ -250,6 +250,10 @@ pub struct Settings {
     pub backends: Vec<BackendConfig>,
     #[serde(default)]
     pub mcp_servers: Vec<McpServerConfig>,
+    /// Enabled skills by name, each pinned to the SHA-256 of the `SKILL.md`
+    /// the user approved. Any edit to a skill disables it until re-approved.
+    #[serde(default)]
+    pub enabled_skills: std::collections::BTreeMap<String, String>,
     pub prompts: Vec<ModePrompt>,
     pub theme_design: String,
     pub theme_palette: Option<String>,
@@ -264,6 +268,7 @@ impl Default for Settings {
             provider_presets: ProviderPresetList::default(),
             backends: vec![],
             mcp_servers: vec![],
+            enabled_skills: Default::default(),
             prompts: Mode::ALL
                 .into_iter()
                 .map(|mode| ModePrompt {
@@ -416,6 +421,25 @@ pub struct PluginSummary {
     pub tools: Vec<extension::ToolSpec>,
     #[serde(default)]
     pub panels: Vec<extension::PanelSpec>,
+}
+/// A skill installed in the gateway's profile, as the user reviews it.
+/// Text fields are written by the skill's author.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillSummary {
+    /// The skill's directory name, which is also its name.
+    pub name: String,
+    pub description: Option<String>,
+    pub emoji: Option<String>,
+    /// Enabled, and unchanged since the user approved it.
+    pub enabled: bool,
+    /// Enabled once, but `SKILL.md` changed since; it is not offered until re-enabled.
+    pub changed: bool,
+    /// Requirements this gateway's computer does not meet.
+    pub unmet: Vec<String>,
+    /// Environment variables the author expects; tools never inherit them.
+    pub expects_env: Vec<String>,
+    /// Why the skill could not be read.
+    pub failure: Option<ErrorReport>,
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Snapshot {
@@ -618,6 +642,17 @@ pub enum Command {
     DisconnectMcpServer {
         name: String,
     },
+    /// List skills installed in the gateway's profile.
+    Skills,
+    /// The full `SKILL.md` of one skill, for review.
+    ReadSkill {
+        name: String,
+    },
+    /// Approve a skill as it is now, or withdraw approval (user operation).
+    SetSkillEnabled {
+        name: String,
+        enabled: bool,
+    },
 }
 impl Command {
     /// A stable operation name for logs and diagnostics; never includes arguments.
@@ -653,6 +688,9 @@ impl Command {
             Self::PairBroker { .. } => "pair_broker",
             Self::ConnectMcpServer { .. } => "connect_mcp_server",
             Self::DisconnectMcpServer { .. } => "disconnect_mcp_server",
+            Self::Skills => "skills",
+            Self::ReadSkill { .. } => "read_skill",
+            Self::SetSkillEnabled { .. } => "set_skill_enabled",
         }
     }
 }
@@ -670,6 +708,7 @@ pub enum Reply {
     /// Wire-compatible with the earlier `Error { message }` variant.
     Error(ErrorReport),
     Gateway(GatewayInfo),
+    Skills(Vec<SkillSummary>),
 }
 impl Reply {
     /// Separate a gateway-reported failure from a successful reply.
