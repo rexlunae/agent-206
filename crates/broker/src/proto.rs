@@ -11,7 +11,23 @@ use zeroize::Zeroizing;
 /// `Request::Hello`, `Request::Shutdown` (accepted before `Hello`) and
 /// `Reply::Ok`/`Reply::Error` must stay compatible across versions; variants
 /// are encoded by name.
-pub const BROKER_VERSION: u16 = 3;
+///
+/// Version 4 adds [`Request::ProviderStream`] and version 5
+/// [`Request::ImportVault`]. A broker accepts greetings from
+/// [`MIN_BROKER_VERSION`] up to this version, and a client falls back to the
+/// newest version an older broker accepts (see `Client::version`), so streams
+/// are only requested from brokers that understand them.
+pub const BROKER_VERSION: u16 = 5;
+/// The oldest protocol version this broker still serves and this client still
+/// speaks. Versions 3 to 5 differ only by the requests they add.
+pub const MIN_BROKER_VERSION: u16 = 3;
+/// The first version that serves [`Request::ProviderStream`].
+pub const STREAM_VERSION: u16 = 4;
+/// The first version that serves [`Request::ImportVault`].
+pub const IMPORT_VERSION: u16 = 5;
+/// Largest response body slice carried by one [`Reply::ProviderChunk`]. Small
+/// frames keep a stream responsive and bound what either side buffers.
+pub const MAX_STREAM_CHUNK: usize = 64 * 1024;
 /// Largest provider request or response body the broker carries. The rest of
 /// the 4 MiB frame is reserved for the envelope, so a body at this limit still
 /// fits in one frame.
@@ -192,6 +208,16 @@ pub enum Request {
         version: u16,
     },
     Status,
+    /// Adopt an existing password-protected SecureStore vault (such as
+    /// RustyClaw's) as this profile's vault when none exists yet. The broker
+    /// copies the encrypted file and opens only its copy; the source is never
+    /// written. `totp` is required when the source has two-factor enrolled.
+    /// On success the vault is unlocked, as after `Unlock`.
+    ImportVault {
+        source: std::path::PathBuf,
+        password: WireSecret,
+        totp: Option<String>,
+    },
     /// `create` permits creating a vault when none exists.
     Unlock {
         password: WireSecret,
@@ -255,6 +281,13 @@ pub enum Request {
         token: WireSecret,
     },
     Provider(ProviderCall),
+    /// Gateway role, version 4: like `Provider`, but the successful response
+    /// body is relayed as it arrives. The broker answers with one
+    /// `ProviderHead`, then `ProviderChunk`s numbered from 0, then
+    /// `ProviderEnd`; or with an `Error` at any point, which ends the stream.
+    /// A lock, pairing replacement or pairing void ends it with an `Error`; a
+    /// closed connection abandons the upstream request.
+    ProviderStream(ProviderCall),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -265,6 +298,10 @@ pub struct BrokerStatus {
     pub totp_enrolled: Option<bool>,
     pub agent_access: Option<bool>,
     pub step_up_active: bool,
+    /// Whether a gateway pairing is current for this unlock; unknown while
+    /// locked or from an older broker. Locking voids every pairing.
+    #[serde(default)]
+    pub gateway_paired: Option<bool>,
 }
 
 /// Structured broker failures. Clients render these with `Display`; nothing
@@ -299,6 +336,8 @@ pub enum BrokerError {
     NotFound,
     #[error("a credential with that name already exists")]
     AlreadyExists,
+    #[error("this profile already has a vault; an import never replaces or merges into it")]
+    VaultExists,
     #[error("invalid request")]
     Invalid(#[source] InvalidRequest),
     #[error("vault storage failed")]
@@ -333,6 +372,10 @@ pub enum InvalidRequest {
     TotpNotEnrolled,
     #[error("the two-factor enrollment expired; start again")]
     EnrollmentExpired,
+    #[error(
+        "the vault to import must be an absolute path to a readable regular file of at most 16 MiB"
+    )]
+    ImportSource,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
@@ -382,6 +425,24 @@ pub enum Reply {
         status: u16,
         #[serde(with = "serde_bytes")]
         body: Vec<u8>,
+    },
+    /// The upstream status of a streamed call. Like `Provider`, an
+    /// unsuccessful status is followed directly by `ProviderEnd`: upstream
+    /// error bodies are never relayed.
+    ProviderHead {
+        status: u16,
+    },
+    /// At most [`MAX_STREAM_CHUNK`] bytes of a streamed body. `seq` counts
+    /// chunks from 0 without gaps.
+    ProviderChunk {
+        seq: u64,
+        #[serde(with = "serde_bytes")]
+        bytes: Vec<u8>,
+    },
+    /// A streamed body ended normally, after `chunks` chunks totalling `bytes`.
+    ProviderEnd {
+        chunks: u64,
+        bytes: u64,
     },
     Error(BrokerError),
 }

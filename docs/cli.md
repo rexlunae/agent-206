@@ -18,18 +18,18 @@ without launching a gateway. With no subcommand, the app launches the desktop; `
 | RustyClaw command family | Agent 206 now | Required follow-up |
 | --- | --- | --- |
 | desktop / tui | desktop, tui / ui | Terminal interaction and graphics acceptance |
-| status | status: process and live workspace counts; gateway status: process only | Health checks/doctor, richer API-sourced usage, profile selection UX |
+| status | status: process and live workspace counts; gateway status: process only | Richer API-sourced usage, profile selection UX |
 | setup / onboard (gateway target) | gateway setup --local / --ssh with fingerprint review; same saved TOML as the desktop/TUI setup screen | Gateway security enrollment (vault/TOTP) after target selection |
 | gateway start / stop / restart / status | Same nested commands, plus reconnect; stop-gateway compatibility entry point | Verified installers/updaters and real SSH acceptance |
-| setup / onboard / configure | Not implemented | Same encrypted enrollment/TOTP/security state machine as the GUI; no weaker headless path |
+| setup / onboard / configure | setup [--local \| --ssh URL [--trust FP]] [--skip-totp]: chooses the gateway when asked, then on a local profile creates or unlocks the vault, offers TOTP enrollment and pairs a running gateway through the same broker requests as the GUI, skipping finished steps, and prints the doctor report. A closed stdin declines every step. Remote profiles are told to run setup on the gateway host | Provider step, desktop/TUI wizard, onboard/configure aliases only if semantics match |
 | config get / set / unset | settings exports TOML; settings --apply FILE uses revision-checked shared API | Reviewed field-level commands and parity aliases |
 | command / ask / chat | new TITLE, chat THREAD TEXT, cancel THREAD | Streaming, interactive/headless sessions, stdin/file prompts and clear compatibility options |
 | model / providers | providers presets/add, refresh-models; API-only catalogs | Model/account inspection and selection commands with no static model defaults |
 | secrets | vault init/unlock/lock/status/stop, pair (gateway pairing for this unlock), list, add, adopt (untyped legacy entries, optionally renamed with `--as`), policy, bind, enable/disable, delete, agent-access, reveal (step-up), totp enroll/remove, all through the vault broker | SSH key, form and payment entry; recovery codes; key-file import; remote broker over SSH; GUI parity |
-| import | Not implemented | RustyClaw, Cline, Claude Code, Codex, DeepSeek Harness and extensible adapters in imports.md |
+| import | import rustyclaw [PATH] previews (text or --toml) and changes nothing; --apply copies a password vault in through the broker (asks its password and TOTP code), adds missing provider accounts, writes imports/<id>.toml; --skip-vault / --skip-providers | Cline, Claude Code, Codex, DeepSeek Harness and extensible adapters in imports.md; GUI import screen |
 | skills / registries | extension list, grant ID [--capability C…], enable/disable ID, panel ID PANEL [--project P] [--press BUTTON], tool ID TOOL [--project P] [--args TOML], all through the gateway's extension policy | Reviewed install/update/list/export and separate instruction/skill management |
 | swarm / projects | project NAME ROOT creates a coordinator; snapshots retain linked threads | Delegation/task/project orchestration and scoped steering/control commands |
-| doctor | Not implemented | Non-mutating diagnostics by default; explicit reviewed fixes |
+| doctor | doctor [--toml]: non-mutating checks of the profile, gateway, vault broker, pairing and provider credentials/catalogs; exits non-zero when something must be fixed; never starts the gateway or broker | Explicit reviewed fixes (--repair) |
 
 Other current commands include Joshua start/stop/status, backend configure/select,
 downloads, Git status, document reads, durable events, ACP/MCP, web and render.

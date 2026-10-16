@@ -1,8 +1,17 @@
 pub use crate::extensions::Extensions;
+#[cfg(not(target_arch = "wasm32"))]
+use crate::health::HealthChecks;
 use crate::{PageFrame, State, call, dispatch, error::ErrorNotice, route::Route};
 use a206_core::{Command, DownloadState, ErrorReport, Mode, Reply};
 use fc_dioxus::prelude::*;
 use uuid::Uuid;
+/// The web bridge's gateway, vault and broker live on its server, where
+/// `agent206 doctor` checks them.
+#[cfg(target_arch = "wasm32")]
+#[component]
+fn HealthChecks() -> Element {
+    rsx! {}
+}
 #[component]
 pub fn Overview() -> Element {
     let state = use_context::<State>();
@@ -259,6 +268,7 @@ pub fn Gateway() -> Element {
                         dt { "Data directory" } dd { "{info.data_dir}" }
                         dt { "Active work" } dd { "{info.active_runs} agent runs · {info.active_downloads} downloads" }
                         dt { "Accepting work" } dd { match info.accepting_work { Some(true) => "Yes", Some(false) => "No · shutdown cleanup", None => "Not reported" } }
+                        dt { "Vault pairing" } dd { match info.vault_paired { Some(true) => "Holds a pairing (void once the vault locks)", Some(false) => "Not paired", None => "Not reported" } }
                     }
                 }
                 if let Some(error) = report.as_ref().and_then(|report| report.failure_report()) {
@@ -270,6 +280,7 @@ pub fn Gateway() -> Element {
                 CardFooter { Button { variant: ButtonVariant::Secondary, onclick: move |_| { let mut setup = state.setup; setup.set(true); }, "Change gateway" } }
             }
         }
+        HealthChecks {}
         Card { variant: CardVariant::Subtle, CardHeader { CardTitle { "Security setup" } }
             CardBody { p { "The separate vault broker holds API keys and performs authenticated provider requests, so the gateway never sees them. Create, unlock and pair it, and enroll two-factor authentication, from the Security page of the desktop or terminal app or with `agent206 vault`; add credentials with `agent206 vault add`. A running gateway is not proof that the vault is set up." } }
             CardFooter { LinkButton { href: Route::Security {}.to_string(), variant: ButtonVariant::Secondary, "Open vault and security" } }

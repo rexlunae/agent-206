@@ -583,6 +583,7 @@ mod tests {
             totp_enrolled: totp,
             agent_access: unlocked.then_some(false),
             step_up_active: false,
+            gateway_paired: unlocked.then_some(false),
         }
     }
 

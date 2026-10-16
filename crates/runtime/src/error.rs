@@ -134,7 +134,7 @@ impl Classified for a206_broker::BrokerError {
             | B::StepUpRequired
             | B::Forbidden
             | B::Denied(_) => ErrorKind::PermissionDenied,
-            B::NoPendingEnrollment | B::AlreadyExists => ErrorKind::Conflict,
+            B::NoPendingEnrollment | B::AlreadyExists | B::VaultExists => ErrorKind::Conflict,
             B::NotFound => ErrorKind::NotFound,
             B::Invalid(_) => ErrorKind::InvalidRequest,
             B::Vault(_) => ErrorKind::Storage,
@@ -149,7 +149,9 @@ impl Classified for a206_broker::ClientError {
         use a206_broker::ClientError as C;
         match self {
             C::Io(_) | C::Closed => Some(ErrorKind::Unavailable),
-            C::Protocol(_) => Some(ErrorKind::Protocol),
+            C::Protocol(_) | C::Stream(_) => Some(ErrorKind::Protocol),
+            // The provider layer falls back before this can reach a client.
+            C::StreamUnsupported => Some(ErrorKind::Unavailable),
             // `transparent` hides the reply from the chain, so classify it here.
             C::Broker(reply) => reply.kind(),
         }
