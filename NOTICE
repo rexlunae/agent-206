@@ -1,0 +1,10 @@
+Agent 206
+Copyright (c) 2026 Erica Stith
+
+Portions of the SSH transport design and atomic SecureStore persistence are
+adapted from RustyClaw, https://github.com/rexlunae/RustyClaw,
+Copyright (c) 2026 Erica Stith, MIT License (included in LICENSE).
+
+fc-dioxus and future-css are MIT dependencies pinned in Cargo.lock.
+dioxus-tui is MIT OR Apache-2.0. ACP and MCP SDKs are Apache-2.0.
+Other dependency licenses remain with their respective crates.

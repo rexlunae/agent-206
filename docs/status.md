@@ -1,0 +1,92 @@
+# Implementation ledger
+
+Agent 206 is a working first foundation. It is not yet a complete successor to
+RustyClaw. This ledger prevents the UI, docs or future contributors from mistaking
+implemented structure for finished agent execution or security parity.
+
+## Current implementation
+
+| Area | Available now | Remaining work |
+| --- | --- | --- |
+| Rust architecture | Seven small crates, typed shared commands, forbidden application unsafe, pinned dependencies | Further extraction as capabilities grow; measured build/runtime budgets |
+| Desktop | Native macOS app bundle, shared fc-dioxus interface, automatic local gateway startup, stop/reconnect controls | Windows named pipes; Linux desktop packaging and hardware validation |
+| CLI | Chat, projects, settings, catalog refresh, downloads, text documents, Git status, gateway, vault, ACP/MCP, renderer entry points | RustyClaw CLI compatibility aliases and every legacy function; GUI vault/ACP/MCP setup |
+| SSH | Ordinary OpenSSH, strict host verification, configured identities, keepalives, remote stdio bridge | In-app host pairing, remote installers/updaters, remote acceptance test |
+| Wire protocol | Versioned bounded MessagePack, fragmented/coalesced reads, strict decode, durable request receipts | Negotiated feature sets, pushed subscriptions, full reconnect/resume UX |
+| Persistence | One gateway writer, SQLite WAL snapshots/journal, revision checks, restart recovery, explicit replay gaps | Paginated/archived history, migration tooling; current snapshot is bounded below 4 MiB |
+| Chat | API-discovered model selection, native/compatible text generation, cancellation, persisted text attachments (8 files/128 KiB), API-advertised reasoning effort; streamed text from external backends | Native provider streaming, image/PDF/audio attachments, native tool-call loop, retries with explicit external-effect semantics |
+| Providers/models | Configurable global, Chinese and local preset library with GUI editing and TOML overrides; compatible, Anthropic and Gemini text APIs; bounded catalog pagination, provenance/expiry and refresh; unknown facts remain unknown | Isolated authenticated provider broker, accounting integrations and real vendor acceptance; model facts stay API-only |
+| Coding-agent backends | Optional Codex app-server and Claude Agent ACP client adapters; per-thread selection/grants, macOS OS isolation, restricted model proxy, streamed text, operation summaries, bounded I/O, cancellation/process-group teardown; exercised with independent mock peer executables | Authenticated broker integration, real vendor-runtime acceptance, Linux/Windows isolation, installation/updating, session resume, interactive approvals and external subagent policy; runtimes are not bundled |
+| Usage/context | Compact composer widgets for last-request context used/limit, reported response cost, API prices and reported account/token balances; detail popover | Compaction/context controls, cumulative accounting, richer history graphs and provider currency semantics |
+| Modes | Chat, Plan, Code, Review, Research; editable system prompts; mode ceilings | Mode-specific run engines, tools and approval UX |
+| Projects/subagents | Project coordinator conversations, parent-linked delegated threads, explicit model allowlists, narrowed grants, revocation checks | Autonomous project management, task assignment, scheduler/budgets, steering and hierarchical cancellation |
+| Concurrent UI | Resizable navigation/chat/inspector, two visible conversations, independently scoped controls, conversation title editing, compact integrated composer controls, themed raised/feature surfaces | More than two visible threads, saved layouts and comprehensive terminal interaction QA |
+| Vault | SecureStore-compatible encryption, locked state, redacted nonserializable secret type, private atomic writes, interactive standalone CLI | Isolated encrypted broker IPC, per-use approvals, TOTP, key-file and legacy metadata migration, credential use in providers/browser |
+| Security model | Deny-by-default grants, no secret-bearing agent tool, restricted MCP, bounded worker, SSRF-resistant public downloads, capability-scoped text reads | Full RustyClaw defense parity, OS sandbox profiles, leak/injection boundary scanning, adversarial review |
+| WASM | Genuine compiled bundled inspector, separate child, no imports/WASI, fuel/memory/output/time bounds | General SDK inputs/host calls, user/agent package creation and reviewed installation, most tools as extensions |
+| Plugin UI/API | Versioned manifest and executable v1 documented; trusted text-only extension panel | Rich validated component descriptions, panel/viewer/command contributions and subscriptions |
+| Downloads | HTTPS monitor, progress events, cancellation, SHA-256 verification, atomic no-clobber publication, transfer library or ~/models | Range resume, persisted ETags, retries, remote model transfer, agent-scoped subscriptions |
+| Joshua | Owned local/SSH child start/stop, loopback forwarding, user-selected file/port, API model discovery | Installation/updating, verified remote supervision/readiness, one-step model switching, real model/remote-host acceptance tests |
+| Documents | UTF-8 text/Markdown source preview scoped by cap-std to a project | WASM format plugins, editing/rendering, PDF/office viewers, ArtCraft evaluation |
+| Git/PR/CI | Scoped read-only Git status with bounded output and disabled fsmonitor | Diff/stage/commit workflows, forge-neutral PR/review/check APIs, multiple CI/CD adapters |
+| Browser | fc-dioxus sandboxed preview with opaque origin, browser chrome and navigation | Isolated automation profile/driver, test tooling, downloads integration and approved vault injection |
+| Theme/branding | New vector mark and generated PNG/ICO/ICNS bundle icons, future-css ThemePicker, designs/palettes/scheme/contrast saved as TOML | User theme import/editor after toolkit model support |
+| Standards/docs | AGENTS.md, architecture, executable plugin ABI, provenance/attribution, README, CI workflow | Keep this ledger current as each gate lands |
+
+## Explicitly disabled
+
+Credential-backed provider dispatch fails with an explanatory error. The gateway
+never falls back to reading a credential into its own model context. Browser
+preview has no credential injection. Third-party extension installation and
+capability-bearing imports are unavailable. New coding conversations have no
+execution or filesystem grants. A coding mode label alone does not claim a working
+autonomous native coding agent. External coding backends require separately configured
+runtimes and providers; authenticated dispatch and external delegation remain
+disabled. No subscription login is offered for Claude Agent.
+
+## Validation evidence
+
+The workspace has behavioral tests for permission attenuation, empty startup
+catalogs, fragmented/malformed frames, vault encryption/locking/wrong passwords,
+worker fuel/import restrictions, durable deduplication/replay, scoped file access,
+settings conflicts, model revocation and runtime API discovery/chat/persistence.
+Provider tests also check advertised effort enforcement/dispatch, attached text dispatch/persistence and size rejection, and API-sourced balances/prices.
+Preset tests cover TOML persistence, overrides, hiding/default opt-out, account
+independence and rejected credential-bearing endpoints. Compatible metadata tests
+cover API-reported context windows and nested effort choices in API order.
+Native protocol tests cover paginated Anthropic/Gemini discovery and request/response
+mapping. Backend tests run independent mock agent executables inside the actual
+macOS sandbox, verifying restricted network/file access, scoped read/write, symlink
+escape denial, foreign-session isolation, malformed/oversized output, cancellation
+of the root and descendant processes, and active configuration revocation. These
+are protocol/boundary tests, not evidence of real vendor-runtime compatibility.
+All model IDs and context limits used by provider tests are generated by a running
+local API; there are no copied model/provider fixtures.
+
+`scripts/protocol-smoke.py` exercises the actual executable, shared gateway process,
+WASM worker, ACP initialize/new-session and scoped MCP tool discovery/calls. The
+macOS native bundle and release WASM web assets have been built. Browser UI checks
+cover conversation creation, full-width layout, theme persistence, explicit light/dark schemes, compact split-pane composers, independent mode controls, attachment staging/removal/re-selection, keyboard entry, usage/account popovers, and onscreen bottom-edge selectors. TUI has been
+compiled and launched against the pinned Dioxus 0.7 fork. It renders, but its narrow
+terminal layout, graphics fallbacks and interaction still need manual QA.
+Provider UI checks cover grouped choices, Moonshot endpoint setup, custom preset
+creation/hiding/deletion, and restoring a bundled override with refreshed fields.
+
+See `README.md` for reproducible commands. The GitHub Actions workflow checks the
+workspace on macOS; check its run results separately from the local evidence above.
+Build success is not evidence of real remote SSH, real Joshua model inference,
+vault migration or production security certification.
+
+## Next gates
+
+1. Restore complete secret custody: encrypted broker IPC, explicit destination/use
+   approvals, TOTP and lossless legacy vault migration. Enable authenticated model
+   dispatch only after those boundary tests pass.
+2. Implement the agent execution engine, streaming, permissioned tools, project
+   scheduler and delegated task lifecycle, including cancellation and budgets.
+3. Ship a useful extension SDK, compiled tool plugins and reviewed agent-generated
+   extension packages with validated UI contributions.
+4. Add verified local/SSH installers, remote supervision, browser/vault integration,
+   document format plugins and forge-neutral PR/CI workflows.
+5. Complete context/accounting controls and API integrations without introducing a
+   static model catalog, fabricated prices or default account balances.

@@ -1,0 +1,13 @@
+[application]
+name = "Agent 206"
+default_platform = "desktop"
+[web.app]
+title = "Agent 206"
+[web.watcher]
+reload_html = true
+[bundle]
+identifier = "org.agent206.desktop"
+publisher = "Agent 206"
+category = "DeveloperTool"
+short_description = "Your work. Your agents."
+icon = ["../ui/assets/agent206.icns", "../ui/assets/agent206.ico", "../ui/assets/agent206.png"]

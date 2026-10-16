@@ -1,0 +1,245 @@
+# Agent 206 architecture
+
+Agent 206 replaces RustyClaw's large runtime with a small Rust workspace. The
+security model is the compatibility target; legacy module boundaries are not.
+This document distinguishes the current vertical slice from the target system.
+See [status.md](status.md) for the implementation ledger.
+
+## Boundaries
+
+```mermaid
+flowchart LR
+    Desktop[fc-dioxus desktop] --> Transport[Versioned MessagePack]
+    TUI[Same App via dioxus_tui] --> Transport
+    Web[Same App compiled to WASM] --> Bridge[Loopback authenticated web bridge]
+    Bridge --> Transport
+    CLI[CLI / ACP / scoped MCP] --> Transport
+    Transport --> SSH[OpenSSH or private local socket]
+    SSH --> Gateway[Single gateway writer]
+    Gateway --> Journal[SQLite WAL and event journal]
+    Gateway --> Provider[External provider API adapters]
+    Gateway --> Worker[Separate WASM worker process]
+    Gateway --> Backend[Optional isolated coding backend]
+    Backend --> Proxy[Model-restricted loopback proxy]
+    Proxy --> Provider
+    Gateway -. brokered operation .-> Vault[Isolated vault broker: pending]
+    Vault --> Storage[SecureStore encrypted vault]
+```
+
+`a206-core` is renderer-independent state, commands and policy. `a206-protocol`
+is bounded MessagePack framing. `a206-runtime` owns the state machine, journal,
+provider adapter, SSH, ACP/MCP and host services. `a206-extensions` validates
+manifests and runs WASM. `a206-vault` preserves the SecureStore format with a
+narrow API. `a206-ui` contains one fc-dioxus component tree. `agent206` selects
+the renderer or service entry point.
+
+The UI never stores a provider credential. The current build deliberately rejects
+credential-backed provider configuration because the complete isolated broker is
+not implemented. The standalone vault CLI uses a separate short-lived process.
+This is not yet a replacement for RustyClaw's complete secret approval system.
+
+## Single writer and process ownership
+
+One local gateway owns a state directory, protected by an advisory file lock.
+A mode-0600 Unix socket in a mode-0700 directory connects desktop, CLI and protocol
+adapters to that process. The first client starts it. Subsequent clients attach.
+The GUI, CLI, ACP and MCP do not open independent mutable state snapshots.
+
+A remote connection runs `agent206 gateway --stdio` using ordinary OpenSSH;
+that entry point bridges to the same remote per-user socket. Strict host key
+checking is mandatory. SSH's configured identities and agents are respected;
+unknown hosts require explicit SSH pairing outside the application today.
+Keepalives detect dead peers. TCP/SSH retransmits lost packets; the application
+handles fragmented frames and records durable request IDs and event cursors.
+
+The service currently persists beyond the window that started it. The desktop Security page can stop the shared gateway and reconnect/start it.
+Windows named pipes remain follow-up work.
+
+WASM builtins execute in a separate `extension-worker` child with a cleared
+environment, no WASI/host imports, bounded fuel/memory/output, and a five-second
+parent timeout. This is an interpreter sandbox plus process separation, not yet
+an OS sandbox for third-party installation. Only the bundled capability-free
+extension can be launched in this build.
+
+Joshua is started as an owned child process or an SSH session with a loopback
+forward. We never search for or kill unrelated processes. Stopping a remote SSH
+session does not establish a verified remote-process shutdown; remote supervision
+and signed installers need additional work. The process running is not equivalent
+to model readiness: readiness is established by a successful catalog API fetch.
+
+## Permission model
+
+For delegated work:
+
+```
+effective = user grants ∩ mode ceiling ∩ thread policy ∩ parent grants
+            ∩ requested task grants ∩ extension manifest
+```
+
+Capabilities and permitted model/provider pairs are separate sets. Empty means
+none. Agents cannot write either set. Each thread has an explicit subagent model
+allowlist; adding a model to an API catalog never adds it to that allowlist.
+Subagents get a project association and parent identity; no parent's raw secrets.
+
+The current MCP surface is intrinsic self-introspection plus editing its own
+conversation title. It has no
+installation, secret, approval, arbitrary shell or global configuration tool.
+Future tools must get an authenticated actor binding from the gateway and perform
+policy checks at execution, not trust a client-supplied role or hidden button.
+
+## Data contracts
+
+- TOML: user settings, mode prompts, theme choices, plugin manifests and docs examples.
+- MessagePack: application-owned requests, replies, snapshots, events and extension ABI.
+- JSON: external provider protocol, ACP, MCP and legacy SecureStore file compatibility.
+- SQLite: transactions, durable event ordering and accepted command receipts.
+
+A command ID identifies both request bytes and its response. Reusing it with a
+different body is an error. A duplicate accepted-but-unfinished command returns
+an indeterminate outcome instead of repeating a side effect. This is not an
+exactly-once guarantee for an external API. Recovery requires inspecting state.
+Events retain a bounded replay window; old or future cursors require a new snapshot.
+Clients reconnect for unsent requests after an unexpected disconnect; they do not
+repeat an accepted command. Explicit shutdown stays stopped until reconnect is
+requested. The current UI polls snapshots; event subscription and paged history
+remain follow-up work.
+
+Catalogs carry source URL, retrieval time and expiry. A background refresh fetches
+expired catalogs, with a five-minute delay after failed attempts. Missing limits,
+prices, balances and capabilities remain unknown. There are no model/provider
+catalog fixtures. Test APIs generate their identifiers and limits at runtime.
+
+## Provider presets and optional coding backends
+
+The shared Connections page and CLI ship a broad provider library spanning global,
+Chinese and local services, including DeepSeek, Moonshot, Alibaba Cloud, Z.ai,
+MiniMax, SiliconFlow, StepFun, Hunyuan, Volcengine and Qianfan. Names, protocols, endpoint
+defaults and setup instructions ship with the app; no accounts are activated and
+no models selected implicitly. TOML `provider_presets` stores user additions and
+overrides, hidden IDs and the bundled-list opt-in. The GUI edits the same library;
+existing accounts do not change when a preset is edited, hidden or removed.
+API-discovered model facts retain source, retrieval
+and expiry metadata. Native Anthropic and Gemini adapters follow bounded pagination
+and implement text generation; OpenAI-compatible APIs retain their existing path.
+Unknown prices and balances remain unknown. Anthropic generation uses an 8,192-token application request budget capped by a
+reported output limit when available, not a static
+model limit. Gemini reasoning-level mapping is not offered without supported API
+metadata and an implemented protocol mapping.
+
+A model provider supplies inference to Agent 206's own orchestration. A coding
+backend supplies an external agent loop. Keep these independently selectable:
+Anthropic as a provider is distinct from Claude Agent as a coding backend.
+Configured Codex runtimes use the documented app-server interface; configured
+Claude Agent runtimes use the existing Claude Agent SDK ACP adapter and official
+Rust ACP client SDK. Agent 206's own ACP agent entry point remains available.
+Backend selection and workspace read/edit/command grants are per root thread,
+checked against mode ceilings. External delegation is explicitly disabled until
+we can enforce separate policy for every child. Native backend tools that fit the
+explicit grants may run inside the OS boundary; expansion requests are denied.
+No client filesystem, terminal or authentication capabilities are advertised over
+ACP, and arbitrary MCP server installation is unavailable.
+
+Each external turn starts a new supervised child with a bounded transcript and
+user-editable mode prompt. It uses a private temporary home, cleared environment,
+and scratch working directory, preventing discovery of user/project agent settings,
+hooks and plugins. Granted project paths are explicit task context. Runtime code
+must live in a separate, user-selected installation directory; no project/state/home
+ancestor can serve as that installation root. Native executables, required libraries
+and the Claude adapter must be inside it. See [coding-backends.md](coding-backends.md).
+
+The current macOS supervisor uses deny-by-default Seatbelt filesystem and network
+rules. Other platforms fail closed until equivalent isolation exists. The backend
+can connect only to the supervisor's ephemeral loopback proxy port. The proxy accepts
+an opaque, per-run capability and only the selected API-discovered model; it strips
+that capability before forwarding, rejects other paths/models, bounds response
+streams and request counts, and caps inference output budgets. It does not read
+vault secrets and is not a replacement for the missing encrypted credential broker.
+Authenticated providers remain disabled. Backend configuration/provider changes
+cancel affected active runs; parent model revocation also cancels delegated runs.
+Cancellation closes the proxy, kills the process group and reaps its root before
+recording the run as cancelled. Text and bounded operation summaries update the
+conversation; final authoritative Codex items replace provisional text.
+
+The Claude adapter is Apache-2.0, but the Claude runtime has separate Anthropic
+terms. Use API-key authentication once the broker is connected unless Anthropic
+approves another arrangement; subscription login is not offered. Runtimes are not
+bundled or installed by this build. See [upstream.md](upstream.md) for primary sources.
+Vendor-runtime acceptance, authenticated integration, session resume, interactive
+approvals and external subagent policy remain further work.
+
+## UI direction
+
+The workbench separates navigation, conversations and inspection into accessible
+resizable panes. The desktop is the primary entry point. Concurrent conversations
+can share a split view. Projects have a coordinator; threads own mode/model policy.
+
+The shared tree uses fc-dioxus cards, buttons, fields, selects, composer, chat,
+messages, status, metrics, progress, transfers, splitters, alerts, browser chrome
+and ThemePicker. Product CSS controls composition using future-css tokens; the
+component library owns component appearance and interaction. The new vector mark
+is in `crates/ui/assets/agent206.svg`.
+
+The toolkit pin builds on stable Rust. The environment's default nightly rejects
+an upstream raw-identifier format capture; the stable toolchain avoids needing a
+local dependency patch. A maintained Dioxus 0.7 TUI fork is pinned by full commit.
+The terminal shares the component tree; browser-dependent behaviors need manual
+terminal validation and fallback work.
+
+## Next implementation gates
+
+1. Complete the vault broker with authenticated encrypted IPC, destination-bound
+   operations, TOTP and RustyClaw policy migration; adversarial tests before enabling.
+2. Agent run scheduler, streaming/tool-call loop, task budgets, hierarchical
+   cancellation, approvals, context compaction and per-task model selection.
+3. Versioned extension SDK with bounded MessagePack inputs, host calls and typed UI
+   contributions. Agent-built packages require a user-reviewed manifest and digest.
+4. Signed release discovery and verified local/SSH installers for Agent 206 and
+   Joshua, with rollback, platform checks and explicit service ownership.
+5. Forge-neutral PR/CI adapters, document plugins, browser broker, and accounting
+   integrations using only APIs that actually expose the needed facts.
+
+## Local web authority
+
+The web bridge binds only to 127.0.0.1. A one-use bootstrap URL establishes a
+bearer session in origin-scoped browser sessionStorage; the fragment is removed
+from the address bar immediately. Application-owned requests carry the bearer in
+an explicit Authorization header and require the exact Host, Origin and binary
+content type. The application issues no session cookie: cookies ignore ports and
+could otherwise be sent to a local development server inside the preview browser.
+App chrome cannot be framed. This is a single-user loopback bridge, not a public
+hosting/authentication system.
+
+Public downloads validate all resolved addresses, pin them for the TLS request,
+follow only validated HTTPS redirects, and bypass ambient proxy settings. Transfer
+events retain the source origin rather than signed query strings. File reads use
+cap-std directory capabilities, so a symlink cannot turn a relative project read
+into ambient filesystem access. Subprocess output is bounded while being read.
+
+Settings writes use a revision check to reject stale updates. Per-model delegation
+changes are atomic commands, and removing a parent's model permission prevents a
+new request by its child. These are runtime checks, separate from prompt wording.
+
+## Composer metadata and attachments
+
+The shared composer uses fc-dioxus Card, Textarea, Select, IconButton, Badge and
+Popover. Its toolbar stays inside the text surface, with two compact rows when a
+conversation column is narrow. It shows unknown values explicitly. Context use is
+the last request's provider-reported input usage, not a fabricated live token count.
+
+The current compatible catalog adapter accepts optional API fields
+`context_length`, `pricing.prompt`, `pricing.completion`,
+`supported_reasoning_efforts` on model records, and `balance`, `balance_currency`,
+`token_balance` on the catalog response. These metadata fields are not universally
+provided by the OpenAI-compatible models standard. Unreported effort choices remain
+unavailable; no model-name heuristics or hardcoded effort lists are used. Gateway
+validation checks the selected effort against the current catalog on save and send,
+and model changes reset it. Standard provider-specific accounting adapters remain
+a separate integration gate.
+
+User-selected attachments currently support UTF-8 text only. The client bounds
+reads, stages removable filename/size chips and sends nothing until submission. The
+gateway enforces eight files and 128 KiB combined message/document content, stores
+attachments with the user message and includes their named text in provider input.
+No local file paths or automatic workspace reads are sent. Image, PDF and audio
+attachments require format/capability adapters and are not implemented by this
+text attachment interface.

@@ -1,0 +1,15 @@
+[package]
+name = "a206-vault"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+[dependencies]
+securestore = { version = "0.100.3", default-features = false, features = ["rustls"] }
+zeroize.workspace = true
+thiserror.workspace = true
+tempfile.workspace = true
+[dev-dependencies]
+uuid.workspace = true
+[lints]
+workspace = true

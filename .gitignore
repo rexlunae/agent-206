@@ -1,0 +1,6 @@
+/target/
+/.reference/
+/.local/
+/dist/
+*.log
+.DS_Store

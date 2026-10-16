@@ -1,0 +1,39 @@
+[package]
+name = "a206-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+[dependencies]
+a206-core.workspace = true
+a206-protocol.workspace = true
+a206-extensions.workspace = true
+a206-vault.workspace = true
+serde.workspace = true
+schemars = "1"
+serde_json.workspace = true
+toml.workspace = true
+rmp-serde.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+tokio-util = { version = "0.7", features = ["rt"] }
+reqwest.workspace = true
+futures-util.workspace = true
+url.workspace = true
+uuid.workspace = true
+sha2.workspace = true
+zeroize.workspace = true
+fs2 = "0.4"
+cap-std = "4"
+axum = "0.8"
+tower-http = { version = "0.6", features = ["fs", "set-header"] }
+rmcp = { version = "3.5", features = ["transport-io"] }
+rusqlite = { version = "0.37", features = ["bundled"] }
+agent-client-protocol = { version = "3.3", features = ["stdio"] }
+tempfile.workspace = true
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.31", features = ["signal", "process"] }
+[dev-dependencies]
+tempfile.workspace = true
+[lints]
+workspace = true
