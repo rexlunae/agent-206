@@ -185,7 +185,9 @@ impl Classified for a206_broker::ClientError {
         use a206_broker::ClientError as C;
         match self {
             C::Io(_) | C::Closed => Some(ErrorKind::Unavailable),
-            C::Protocol(_) => Some(ErrorKind::Protocol),
+            C::Protocol(_) | C::Stream(_) => Some(ErrorKind::Protocol),
+            // The provider layer falls back before this can reach a client.
+            C::StreamUnsupported => Some(ErrorKind::Unavailable),
             // `transparent` hides the reply from the chain, so classify it here.
             C::Broker(reply) => reply.kind(),
         }

@@ -10,7 +10,7 @@ mod proto;
 mod server;
 
 #[cfg(unix)]
-pub use client::{Client, ClientError};
+pub use client::{Client, ClientError, ProviderStream, StreamViolation};
 pub use proto::*;
 #[cfg(unix)]
 pub use server::serve;
