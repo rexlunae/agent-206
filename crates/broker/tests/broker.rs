@@ -191,7 +191,7 @@ async fn roles_creation_step_up_reveal_and_lock_revocation() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn lockout_is_shared_across_connections_and_malformed_frames_close() {
-    let (_dir, root, _task) = start().await;
+    let (_dir, root, task) = start().await;
     let password = random();
     user(&root)
         .await
@@ -253,6 +253,13 @@ async fn lockout_is_shared_across_connections_and_malformed_frames_close() {
         replies[0].body,
         Reply::Error(BrokerError::Invalid(InvalidRequest::UnsupportedVersion))
     ));
+    // Shutdown needs no greeting, so any client version can stop the broker.
+    Client::shutdown(&root).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!socket_path(&root).exists());
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -37,6 +37,18 @@ impl Client {
         Ok(client)
     }
 
+    /// Stop whichever broker serves `root`, even one from another protocol
+    /// version: `Shutdown` is accepted before `Hello`.
+    pub async fn shutdown(root: &Path) -> Result<(), ClientError> {
+        let stream = tokio::net::UnixStream::connect(crate::socket_path(root)).await?;
+        let mut client = Self {
+            stream,
+            decoder: Decoder::default(),
+        };
+        client.call(Request::Shutdown).await?;
+        Ok(())
+    }
+
     /// Send one request. A broker error reply becomes `ClientError::Broker`.
     pub async fn call(&mut self, body: Request) -> Result<Reply, ClientError> {
         let id = uuid::Uuid::new_v4();

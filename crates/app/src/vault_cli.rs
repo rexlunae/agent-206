@@ -163,7 +163,7 @@ async fn connect(root: &Path) -> Result<Client> {
         Err(ClientError::Broker(BrokerError::Invalid(InvalidRequest::UnsupportedVersion))) => {
             bail!(
                 "the running vault broker is from a different Agent 206 version; \
-                 stop it with `agent206 vault stop` from that version, then retry"
+                 run `agent206 vault stop`, then retry"
             )
         }
         // Not running yet: start it below.
@@ -331,12 +331,24 @@ async fn set_disabled(client: &mut Client, name: String, disabled: bool) -> Resu
 
 pub fn run(root: &Path, action: VaultAction) -> Result<()> {
     tokio::runtime::Runtime::new()?.block_on(async move {
-        if let VaultAction::Broker = action {
-            return Ok(a206_broker::serve(root).await?);
+        match action {
+            VaultAction::Broker => return Ok(a206_broker::serve(root).await?),
+            // Works against a broker from any version, and never starts one.
+            VaultAction::Stop => {
+                match Client::shutdown(root).await {
+                    Err(ClientError::Io(_)) => println!("Vault broker is not running"),
+                    result => {
+                        result?;
+                        println!("Vault broker stopped");
+                    }
+                }
+                return Ok(());
+            }
+            _ => {}
         }
         let mut client = connect(root).await?;
         match action {
-            VaultAction::Broker => unreachable!(),
+            VaultAction::Broker | VaultAction::Stop => unreachable!(),
             VaultAction::Init => {
                 if status(&mut client).await?.exists {
                     bail!("a vault already exists; use `agent206 vault unlock`");
@@ -351,10 +363,6 @@ pub fn run(root: &Path, action: VaultAction) -> Result<()> {
             VaultAction::Lock => {
                 client.call(Request::Lock).await?;
                 println!("Vault locked");
-            }
-            VaultAction::Stop => {
-                client.call(Request::Shutdown).await?;
-                println!("Vault broker stopped");
             }
             VaultAction::Status => {
                 let s = status(&mut client).await?;

@@ -184,6 +184,13 @@ fn handle(shared: &Shared, session: &mut Session, request: Request) -> Handled {
                 ok()
             }
             Request::Hello { .. } => Err(BrokerError::Invalid(InvalidRequest::UnsupportedVersion)),
+            // Version-independent so an upgraded client can stop an older
+            // broker. Any same-user client could already greet and stop it.
+            Request::Shutdown => {
+                shared.vault().lock();
+                shared.stop.cancel();
+                ok()
+            }
             _ => Err(BrokerError::Forbidden),
         };
     };
