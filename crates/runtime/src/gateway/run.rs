@@ -26,7 +26,7 @@ use std::{collections::BTreeSet, path::PathBuf, sync::Arc};
 use tokio_util::sync::CancellationToken;
 
 /// A run that stopped because it used up the conversation's budget.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum RunError {
     #[error(
         "this run used its budget of {rounds} model rounds; send a message to continue or raise the conversation's tool budget"
@@ -36,6 +36,14 @@ pub enum RunError {
         "this run used its budget of {calls} tool calls; send a message to continue or raise the conversation's tool budget"
     )]
     ToolCalls { calls: u32 },
+    #[error(
+        "this run used {used} of its {limit}-token budget; send a message to continue or raise the conversation's token budget"
+    )]
+    Tokens { limit: u64, used: u64 },
+    #[error(
+        "the provider did not report this run's token use, so its {limit}-token budget cannot be kept; the run stopped"
+    )]
+    UsageUnknown { limit: u64 },
 }
 impl crate::error::Classified for RunError {
     fn kind(&self) -> Option<ErrorKind> {
@@ -138,6 +146,24 @@ struct View {
     ancestors: Vec<Thread>,
     scope: ToolScope,
 }
+/// Whether this run's usage so far, `total`, leaves room for another request
+/// within the token budget `limit`. Unknown usage never passes a limit.
+fn within_tokens(total: Option<&Usage>, limit: Option<u64>) -> std::result::Result<(), RunError> {
+    let (Some(limit), Some(total)) = (limit, total) else {
+        return Ok(());
+    };
+    match (total.input_tokens, total.output_tokens) {
+        (Some(input), Some(output)) => {
+            let used = input.saturating_add(output);
+            if used < limit {
+                Ok(())
+            } else {
+                Err(RunError::Tokens { limit, used })
+            }
+        }
+        _ => Err(RunError::UsageUnknown { limit }),
+    }
+}
 /// Add one request's usage to a run's total. A count any request did not
 /// report makes the total unknown rather than an undercount.
 fn add_usage(total: Usage, round: &Usage) -> Usage {
@@ -205,6 +231,7 @@ fn effective_budget(store: &Store, id: Id) -> Result<ToolBudget> {
             .map(|t| t.tool_budget.tool_calls)
             .min()
             .unwrap_or(0),
+        tokens: lineage.iter().filter_map(|t| t.tool_budget.tokens).min(),
     })
 }
 fn view(store: &Store, id: Id) -> Result<View> {
@@ -355,14 +382,24 @@ impl Gateway {
     }
     pub(super) fn set_tool_budget(&self, id: Id, budget: ToolBudget) -> Result<Reply> {
         check(
-            (1..=ToolBudget::MAX).contains(&budget.rounds) && budget.tool_calls <= ToolBudget::MAX,
-            GatewayError::Invalid("tool budgets are 1–256 rounds and 0–256 tool calls"),
+            (1..=ToolBudget::MAX).contains(&budget.rounds)
+                && budget.tool_calls <= ToolBudget::MAX
+                && budget.tokens != Some(0),
+            GatewayError::Invalid(
+                "tool budgets are 1–256 rounds, 0–256 tool calls and at least one token",
+            ),
         )?;
         let mut store = self.lock()?;
         if let Some(parent) = store.thread(id)?.parent {
             let parent = store.thread(parent)?.tool_budget;
             check(
-                budget.rounds <= parent.rounds && budget.tool_calls <= parent.tool_calls,
+                budget.rounds <= parent.rounds
+                    && budget.tool_calls <= parent.tool_calls
+                    && match (budget.tokens, parent.tokens) {
+                        (_, None) => true,
+                        (Some(child), Some(parent)) => child <= parent,
+                        (None, Some(_)) => false,
+                    },
                 GatewayError::Denied("a delegated conversation cannot exceed its parent's budget"),
             )?;
         }
@@ -439,6 +476,12 @@ impl Gateway {
             if self.lock()?.remaining()? < NEXT_ROUND {
                 return Ok(Ended::Failed(GatewayError::HistoryFull));
             }
+            // The token budget may have been lowered while a tool ran or an
+            // approval waited; no request starts over it, compaction included.
+            let budget = effective_budget(&*self.lock()?, run.thread)?;
+            if let Err(error) = within_tokens(total.as_ref(), budget.tokens) {
+                return Ok(Ended::Failed(error.into()));
+            }
             // Messages steered to the run join it here, between rounds and
             // before the compaction check counts them.
             self.drain_steering(run.thread)?;
@@ -478,6 +521,10 @@ impl Gateway {
                             None => usage,
                             Some(sum) => add_usage(sum, &usage),
                         });
+                        let budget = effective_budget(&*self.lock()?, run.thread)?;
+                        if let Err(error) = within_tokens(total.as_ref(), budget.tokens) {
+                            return Ok(Ended::Failed(error.into()));
+                        }
                     }
                     // Only the current turns are in context; send them as they are.
                     Err(GatewayError::Compaction(CompactionError::NothingToCompact)) => {}
@@ -535,15 +582,23 @@ impl Gateway {
             total = Some(sum.clone());
             last_input = turn.usage.input_tokens;
             if turn.calls.is_empty() {
+                let budget = effective_budget(&*self.lock()?, run.thread)?;
                 if !self.steering_pending(run.thread)? {
+                    // A final reply may cross a known limit, but a limit
+                    // with unmeasured use cannot be shown to have been kept.
+                    if let Err(error @ RunError::UsageUnknown { .. }) =
+                        within_tokens(total.as_ref(), budget.tokens)
+                    {
+                        return Ok(Ended::Failed(error.into()));
+                    }
                     return Ok(Ended::Complete {
                         last: turn.usage,
                         total: sum,
                     });
                 }
                 // A message steered during this reply is answered in a
-                // further round, within the same budget.
-                let budget = effective_budget(&*self.lock()?, run.thread)?;
+                // further round, within the same budget; the next round
+                // checks its tokens.
                 if round >= budget.rounds {
                     return Ok(Ended::Failed(
                         RunError::Rounds {
@@ -557,6 +612,11 @@ impl Gateway {
             let parsed = self.record_calls(run.thread, message, turn.calls)?;
             // Re-read at each check: a parent may lower its budget mid-run.
             let budget = effective_budget(&*self.lock()?, run.thread)?;
+            // Calls are only worth running if another request can follow.
+            if let Err(error) = within_tokens(total.as_ref(), budget.tokens) {
+                self.stop_calls(run.thread, message, &ToolError::Budget(error.clone()))?;
+                return Ok(Ended::Failed(error.into()));
+            }
             if round >= budget.rounds {
                 let error = RunError::Rounds {
                     rounds: budget.rounds,
