@@ -1,5 +1,5 @@
 //! The mount namespace and Landlock allowlist for one runtime launch.
-use crate::{Access, BUBBLEWRAP, Network, Rule, SPEC_VERSION, SandboxError, Spec};
+use crate::{Access, Network, Rule, SPEC_VERSION, SandboxError, Spec};
 use std::{
     ffi::OsString,
     path::{Path, PathBuf},
@@ -322,10 +322,29 @@ impl Profile<'_> {
     }
 
     /// The bubblewrap command that runs the helper, which starts the runtime.
+    #[cfg(not(target_os = "macos"))]
     pub fn command(&self) -> Result<std::process::Command, SandboxError> {
-        std::fs::metadata(BUBBLEWRAP).map_err(SandboxError::Bubblewrap)?;
-        let mut command = std::process::Command::new(BUBBLEWRAP);
+        std::fs::metadata(crate::BUBBLEWRAP).map_err(SandboxError::Bubblewrap)?;
+        let mut command = std::process::Command::new(crate::BUBBLEWRAP);
         command.args(self.arguments()?);
+        Ok(command)
+    }
+
+    /// The `sandbox-exec` command that starts the runtime under this
+    /// profile's Seatbelt policy, in `cwd`. Without `stderr` the runtime's
+    /// stderr is discarded, as the Linux helper does.
+    #[cfg(target_os = "macos")]
+    pub fn command(&self) -> Result<std::process::Command, SandboxError> {
+        std::fs::metadata(crate::SANDBOX_EXEC).map_err(SandboxError::SandboxExec)?;
+        let mut command = std::process::Command::new(crate::SANDBOX_EXEC);
+        command
+            .arg("-p")
+            .arg(self.seatbelt()?)
+            .arg(self.executable)
+            .current_dir(self.cwd);
+        if !self.stderr {
+            command.stderr(std::process::Stdio::null());
+        }
         Ok(command)
     }
 }

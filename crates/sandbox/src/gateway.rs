@@ -43,6 +43,32 @@ impl StartError {
 
 #[cfg(target_os = "linux")]
 pub use linux::Control;
+#[cfg(target_os = "macos")]
+pub use macos::Control;
+
+/// On macOS `sandbox-exec` applies the policy and then executes the process
+/// itself, failing before it runs anything if the policy is refused, so there
+/// is no helper to wait for and no proxy socket to bridge: a proxy profile
+/// lets the process reach the loopback port directly. `Control` keeps the
+/// Linux interface so callers stay platform-neutral.
+#[cfg(target_os = "macos")]
+mod macos {
+    use super::StartError;
+    use std::path::Path;
+    pub struct Control(());
+    impl Control {
+        /// Create the private `control` directory, as on Linux.
+        pub fn bind(control: &Path, _port: Option<u16>) -> Result<Self, StartError> {
+            std::fs::create_dir(control).map_err(StartError::Setup)?;
+            Ok(Self(()))
+        }
+        /// Nothing to wait for; see the module notes.
+        pub async fn ready(&self, _child: &mut tokio::process::Child) -> Result<(), StartError> {
+            Ok(())
+        }
+        pub async fn stop(self) {}
+    }
+}
 
 #[cfg(target_os = "linux")]
 mod linux {
