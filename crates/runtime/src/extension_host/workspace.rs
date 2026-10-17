@@ -271,6 +271,8 @@ fn descend(mut directory: Dir, relative: &Path, create: bool) -> Result<Dir, Hos
                 HostErrorCode::Invalid,
                 "the path goes through a symbolic link",
             ),
+            // A real directory that cannot be opened keeps its own error.
+            Ok(metadata) if metadata.is_dir() => io_failure(&error),
             Ok(_) if create => failure(HostErrorCode::Exists, "a file has that name"),
             Ok(_) => failure(
                 HostErrorCode::Invalid,
@@ -453,8 +455,28 @@ pub(super) fn edit_file(
 pub(super) fn create_directory(root: PathBuf, path: &str) -> Result<HostReply, HostFailure> {
     let relative = writable_path(path)?;
     let _writing = write_lock();
-    descend(open_workspace(root)?, relative, true)?;
-    Ok(HostReply::Done)
+    // `writable_path` accepts only plain names, so a last component exists.
+    let (Some(name), parent) = (relative.file_name(), relative.parent()) else {
+        return Err(failure(HostErrorCode::Invalid, "invalid path"));
+    };
+    let parent = descend(open_workspace(root)?, parent.unwrap_or(Path::new("")), true)?;
+    // The directory itself is only created, never opened, so one that
+    // exists but cannot be read still counts as done.
+    match parent.create_dir(name) {
+        Ok(()) => Ok(HostReply::Done),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            match parent.symlink_metadata(name) {
+                Ok(metadata) if metadata.is_symlink() => Err(failure(
+                    HostErrorCode::Invalid,
+                    "the path goes through a symbolic link",
+                )),
+                Ok(metadata) if metadata.is_dir() => Ok(HostReply::Done),
+                Ok(_) => Err(failure(HostErrorCode::Exists, "a file has that name")),
+                Err(error) => Err(io_failure(&error)),
+            }
+        }
+        Err(error) => Err(io_failure(&error)),
+    }
 }
 
 #[cfg(test)]
@@ -530,5 +552,19 @@ mod tests {
             std::fs::read_to_string(dir.path().join(&name)).unwrap(),
             contents
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_existing_unreadable_directory_counts_as_created() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let name = uuid::Uuid::new_v4().simple().to_string();
+        let path = dir.path().join(&name);
+        std::fs::create_dir(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o111)).unwrap();
+        let created = create_directory(dir.path().to_path_buf(), &name);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(created.unwrap(), HostReply::Done);
     }
 }
