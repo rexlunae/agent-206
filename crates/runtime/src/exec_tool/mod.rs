@@ -16,8 +16,18 @@
 //! exits; a process that leaves that group (with `setsid`) can outlive the
 //! call there, though it stays inside the same Seatbelt policy.
 //!
-//! Platforms without that isolation do not offer the tool: they report it
-//! unavailable rather than run commands unconfined.
+//! With `background`, the command keeps running after the call returns, in
+//! the same sandbox and under the same approval, and the conversation that
+//! started it follows it with `process` (list, poll, kill, remove) and gives
+//! it input with `process_write`, which the user approves like a command
+//! (`sessions`).
+//!
+//! Platforms without that isolation do not offer these tools: they report
+//! them unavailable rather than run commands unconfined.
+// Nothing starts a session where commands are unsupported.
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
+mod sessions;
+
 use crate::tools::{ToolHost, ToolListing, ToolOutput, ToolRequest, ToolScope, ToolSpec};
 use a206_core::{Capability, ErrorKind, ErrorReport, ToolPermission, UnavailableTools};
 use futures_util::future::BoxFuture;
@@ -26,6 +36,11 @@ use std::path::{Path, PathBuf};
 
 /// The tool's model-facing name, as RustyClaw named it.
 pub const NAME: &str = "execute_command";
+/// Follows background sessions.
+pub const PROCESS: &str = "process";
+/// Gives a background session input.
+pub const PROCESS_WRITE: &str = "process_write";
+pub use sessions::{MAX_INPUT, MAX_PER_THREAD, MAX_SESSIONS};
 /// The source named when the tool is unavailable.
 pub const SOURCE: &str = "native exec";
 /// The command's locale; macOS has no `C.UTF-8`.
@@ -39,6 +54,10 @@ const LOCALE: &str = if cfg!(target_os = "macos") {
 pub const DEFAULT_TIMEOUT: u64 = 30;
 /// Longest timeout a call may ask for.
 pub const MAX_TIMEOUT: u64 = 600;
+/// Seconds a background command may run when the call names no timeout.
+pub const DEFAULT_BACKGROUND_TIMEOUT: u64 = 600;
+/// Longest a background command may run.
+pub const MAX_BACKGROUND_TIMEOUT: u64 = 3600;
 /// Longest command accepted.
 pub const MAX_COMMAND: usize = 16 * 1024;
 /// Output kept from each of stdout and stderr; the rest is read and dropped
@@ -54,11 +73,15 @@ pub enum ExecError {
     ProtectedWorkspace,
     #[error("`{0}` must be a string")]
     NotAString(&'static str),
+    #[error("`{0}` must be true or false")]
+    NotABool(&'static str),
     #[error("`command` is required")]
     MissingCommand,
     #[error("the command is empty, longer than {MAX_COMMAND} bytes or contains a NUL byte")]
     Command,
-    #[error("`timeout_secs` must be a whole number from 1 to {MAX_TIMEOUT}")]
+    #[error(
+        "`timeout_secs` must be a whole number from 1 to {MAX_TIMEOUT}, or to {MAX_BACKGROUND_TIMEOUT} with `background`"
+    )]
     Timeout,
     #[error("`working_dir` must be a relative path inside the project")]
     WorkingDir,
@@ -86,6 +109,24 @@ pub enum ExecError {
     Output(#[source] std::io::Error),
     #[error("the command did not finish within {seconds} s and was stopped")]
     TimedOut { seconds: u64 },
+    #[error("`action` must be one of list, poll, kill or remove")]
+    Action,
+    #[error("`session` must name a background session")]
+    Session,
+    #[error("`data` is required, at most {MAX_INPUT} bytes, unless `close` is set")]
+    Data,
+    #[error("no such background session in this conversation")]
+    UnknownSession,
+    #[error("this conversation already holds {limit} background sessions; remove a finished one")]
+    TooManySessions { limit: usize },
+    #[error("the session has already finished")]
+    SessionFinished,
+    #[error("the session no longer takes input")]
+    InputClosed,
+    #[error("could not give the session its input")]
+    Input(#[source] std::io::Error),
+    #[error("the command did not take its input within {seconds} s")]
+    InputStalled { seconds: u64 },
     #[error(
         "commands are disabled on this platform until equivalent OS filesystem and network isolation is implemented"
     )]
@@ -96,6 +137,10 @@ impl crate::error::Classified for ExecError {
         Some(match self {
             Self::Denied | Self::ProtectedWorkspace => ErrorKind::PermissionDenied,
             Self::NotAString(_)
+            | Self::NotABool(_)
+            | Self::Action
+            | Self::Session
+            | Self::Data
             | Self::MissingCommand
             | Self::Command
             | Self::Timeout
@@ -108,7 +153,12 @@ impl crate::error::Classified for ExecError {
             // The sandbox's own errors know their kinds.
             Self::Sandbox(_) | Self::Start(_) => return None,
             Self::Spawn(_) | Self::Unsupported => ErrorKind::Unavailable,
-            Self::TimedOut { .. } => ErrorKind::Timeout,
+            Self::TimedOut { .. } | Self::InputStalled { .. } => ErrorKind::Timeout,
+            Self::UnknownSession => ErrorKind::NotFound,
+            Self::TooManySessions { .. }
+            | Self::SessionFinished
+            | Self::InputClosed
+            | Self::Input(_) => ErrorKind::Conflict,
         })
     }
 }
@@ -119,20 +169,37 @@ struct Call {
     command: String,
     working_dir: Option<PathBuf>,
     timeout: u64,
+    background: bool,
 }
 
-fn parse(arguments: &Map<String, Value>) -> Result<Call, ExecError> {
-    let text = |key: &'static str| match arguments.get(key) {
+fn text(arguments: &Map<String, Value>, key: &'static str) -> Result<Option<String>, ExecError> {
+    match arguments.get(key) {
         None | Some(Value::Null) => Ok(None),
         Some(Value::String(text)) => Ok(Some(text.clone())),
         Some(_) => Err(ExecError::NotAString(key)),
-    };
-    if let Some(unknown) = arguments
-        .keys()
-        .find(|key| !matches!(key.as_str(), "command" | "working_dir" | "timeout_secs"))
-    {
-        return Err(ExecError::Unknown(unknown.clone()));
     }
+}
+fn flag(arguments: &Map<String, Value>, key: &'static str) -> Result<bool, ExecError> {
+    match arguments.get(key) {
+        None | Some(Value::Null) => Ok(false),
+        Some(Value::Bool(flag)) => Ok(*flag),
+        Some(_) => Err(ExecError::NotABool(key)),
+    }
+}
+fn only(arguments: &Map<String, Value>, known: &[&str]) -> Result<(), ExecError> {
+    match arguments.keys().find(|key| !known.contains(&key.as_str())) {
+        Some(unknown) => Err(ExecError::Unknown(unknown.clone())),
+        None => Ok(()),
+    }
+}
+
+fn parse(arguments: &Map<String, Value>) -> Result<Call, ExecError> {
+    only(
+        arguments,
+        &["command", "working_dir", "timeout_secs", "background"],
+    )?;
+    let text = |key| text(arguments, key);
+    let background = flag(arguments, "background")?;
     let command = text("command")?.ok_or(ExecError::MissingCommand)?;
     if command.trim().is_empty() || command.len() > MAX_COMMAND || command.contains('\0') {
         return Err(ExecError::Command);
@@ -153,17 +220,69 @@ fn parse(arguments: &Map<String, Value>) -> Result<Call, ExecError> {
             Some(dir)
         }
     };
+    let (default, max) = if background {
+        (DEFAULT_BACKGROUND_TIMEOUT, MAX_BACKGROUND_TIMEOUT)
+    } else {
+        (DEFAULT_TIMEOUT, MAX_TIMEOUT)
+    };
     let timeout = match arguments.get("timeout_secs") {
-        None | Some(Value::Null) => DEFAULT_TIMEOUT,
+        None | Some(Value::Null) => default,
         Some(value) => value
             .as_u64()
-            .filter(|t| (1..=MAX_TIMEOUT).contains(t))
+            .filter(|t| (1..=max).contains(t))
             .ok_or(ExecError::Timeout)?,
     };
     Ok(Call {
         command,
         working_dir,
         timeout,
+        background,
+    })
+}
+
+/// One validated `process` call.
+#[derive(Debug, PartialEq, Eq)]
+enum Action {
+    List,
+    Poll(a206_core::Id),
+    Kill(a206_core::Id),
+    Remove(a206_core::Id),
+}
+fn session(arguments: &Map<String, Value>) -> Result<a206_core::Id, ExecError> {
+    text(arguments, "session")?
+        .and_then(|id| id.parse().ok())
+        .ok_or(ExecError::Session)
+}
+fn parse_action(arguments: &Map<String, Value>) -> Result<Action, ExecError> {
+    only(arguments, &["action", "session"])?;
+    match text(arguments, "action")?.as_deref() {
+        Some("list") => Ok(Action::List),
+        Some("poll") => Ok(Action::Poll(session(arguments)?)),
+        Some("kill") => Ok(Action::Kill(session(arguments)?)),
+        Some("remove") => Ok(Action::Remove(session(arguments)?)),
+        _ => Err(ExecError::Action),
+    }
+}
+
+/// One validated `process_write` call.
+#[derive(Debug, PartialEq, Eq)]
+struct Write {
+    session: a206_core::Id,
+    data: Vec<u8>,
+    close: bool,
+}
+fn parse_write(arguments: &Map<String, Value>) -> Result<Write, ExecError> {
+    only(arguments, &["session", "data", "close"])?;
+    let session = session(arguments)?;
+    let close = flag(arguments, "close")?;
+    let data = text(arguments, "data")?.unwrap_or_default().into_bytes();
+    if data.len() > MAX_INPUT || (data.is_empty() && !close) {
+        return Err(ExecError::Data);
+    }
+    Ok(Write {
+        session,
+        data,
+        close,
     })
 }
 
@@ -172,11 +291,13 @@ fn parse(arguments: &Map<String, Value>) -> Result<Call, ExecError> {
 pub struct ExecHost {
     #[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
     state_root: PathBuf,
+    sessions: sessions::Sessions,
 }
 impl ExecHost {
     pub fn new(state_root: &Path) -> Self {
         Self {
             state_root: state_root.to_owned(),
+            sessions: Default::default(),
         }
     }
     fn spec() -> ToolSpec {
@@ -188,7 +309,9 @@ impl ExecHost {
                  directory, or a private empty one without project access. It can read the \
                  project only with read access, change it only with write access and use the \
                  network only with network access. Nothing else on the computer is visible, \
-                 and the environment is empty. Every call needs the user's approval."
+                 and the environment is empty. Every call needs the user's approval. With \
+                 `background` it returns a session id at once and the command keeps running: \
+                 follow it with `{PROCESS}` and give it input with `{PROCESS_WRITE}`."
             ),
             parameters: json!({
                 "type": "object",
@@ -204,8 +327,16 @@ impl ExecHost {
                     "timeout_secs": {
                         "type": "integer",
                         "minimum": 1,
-                        "maximum": MAX_TIMEOUT,
-                        "description": format!("Seconds before the command is stopped (default {DEFAULT_TIMEOUT}).")
+                        "maximum": MAX_BACKGROUND_TIMEOUT,
+                        "description": format!(
+                            "Seconds before the command is stopped: default {DEFAULT_TIMEOUT}, at most \
+                             {MAX_TIMEOUT}; in the background default {DEFAULT_BACKGROUND_TIMEOUT}, at \
+                             most {MAX_BACKGROUND_TIMEOUT}."
+                        )
+                    },
+                    "background": {
+                        "type": "boolean",
+                        "description": "Return a session id at once and keep the command running."
                     }
                 },
                 "required": ["command"],
@@ -216,13 +347,119 @@ impl ExecHost {
             whole_output: false,
         }
     }
+    fn process_spec() -> ToolSpec {
+        ToolSpec {
+            name: PROCESS.into(),
+            description: format!(
+                "Follow this conversation's background commands from `{NAME}`. `list` shows each \
+                 session's id, status and command; `poll` returns its status and the output \
+                 written since the last poll (each stream keeps at most {MAX_STREAM} unread \
+                 bytes, dropping the oldest); `kill` stops it; `remove` stops it if needed and \
+                 forgets it. A conversation holds at most {MAX_PER_THREAD} sessions; starting \
+                 another removes its oldest finished one."
+            ),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "action": { "type": "string", "enum": ["list", "poll", "kill", "remove"] },
+                    "session": { "type": "string", "description": "The session id, except for list." }
+                },
+                "required": ["action"],
+                "additionalProperties": false
+            }),
+            capabilities: [Capability::Execute].into(),
+            permission: ToolPermission::Allow,
+            whole_output: false,
+        }
+    }
+    fn write_spec() -> ToolSpec {
+        ToolSpec {
+            name: PROCESS_WRITE.into(),
+            description: "Write text to the standard input of one of this conversation's \
+                          background commands, then close its input if `close` is set. Every \
+                          call needs the user's approval, like a command. Fails if the command \
+                          does not take the input within a few seconds."
+                .into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "session": { "type": "string" },
+                    "data": { "type": "string", "maxLength": MAX_INPUT },
+                    "close": { "type": "boolean", "description": "Close the command's input afterwards." }
+                },
+                "required": ["session"],
+                "additionalProperties": false
+            }),
+            capabilities: [Capability::Execute].into(),
+            permission: ToolPermission::Ask,
+            whole_output: false,
+        }
+    }
+    /// Run one authorized call.
+    async fn dispatch(
+        &self,
+        scope: &ToolScope,
+        request: ToolRequest,
+    ) -> Result<ToolOutput, ExecError> {
+        if !scope.capabilities.contains(&Capability::Execute) {
+            return Err(ExecError::Denied);
+        }
+        let done = |text: String| ToolOutput {
+            text,
+            is_error: false,
+        };
+        match request.name.as_str() {
+            NAME if request.approved => {
+                let call = parse(&request.arguments)?;
+                if call.background {
+                    self.background(scope, call).await
+                } else {
+                    self.run(scope, call).await
+                }
+            }
+            PROCESS => match parse_action(&request.arguments)? {
+                Action::List => Ok(done(self.sessions.list(scope.thread))),
+                Action::Poll(id) => {
+                    let (text, is_error) = self.sessions.poll(scope.thread, id)?;
+                    Ok(ToolOutput { text, is_error })
+                }
+                Action::Kill(id) => {
+                    self.sessions.kill(scope.thread, id)?;
+                    Ok(done(format!(
+                        "Stopping session {id}; poll it for its final output."
+                    )))
+                }
+                Action::Remove(id) => {
+                    self.sessions.remove(scope.thread, id)?;
+                    Ok(done(format!("Removed session {id}.")))
+                }
+            },
+            PROCESS_WRITE if request.approved => {
+                let write = parse_write(&request.arguments)?;
+                let bytes = write.data.len();
+                self.sessions
+                    .write(scope.thread, write.session, write.data, write.close)
+                    .await?;
+                Ok(done(format!(
+                    "Wrote {bytes} bytes to session {}{}.",
+                    write.session,
+                    if write.close {
+                        " and closed its input"
+                    } else {
+                        ""
+                    }
+                )))
+            }
+            _ => Err(ExecError::Denied),
+        }
+    }
 }
 impl ToolHost for ExecHost {
     fn list<'a>(&'a self, _scope: &'a ToolScope) -> BoxFuture<'a, ToolListing> {
         Box::pin(async move {
             if cfg!(any(target_os = "linux", target_os = "macos")) {
                 ToolListing {
-                    tools: vec![Self::spec()],
+                    tools: vec![Self::spec(), Self::process_spec(), Self::write_spec()],
                     unavailable: vec![],
                 }
             } else {
@@ -242,17 +479,9 @@ impl ToolHost for ExecHost {
         request: ToolRequest,
     ) -> BoxFuture<'a, Result<ToolOutput, ErrorReport>> {
         Box::pin(async move {
-            let result = async {
-                if request.name != NAME
-                    || !request.approved
-                    || !scope.capabilities.contains(&Capability::Execute)
-                {
-                    return Err(ExecError::Denied);
-                }
-                let call = parse(&request.arguments)?;
-                self.run(scope, call).await
-            };
-            result.await.map_err(|error| crate::error::report(&error))
+            self.dispatch(scope, request)
+                .await
+                .map_err(|error| crate::error::report(&error))
         })
     }
 }
@@ -262,6 +491,19 @@ impl ExecHost {
     async fn run(&self, _scope: &ToolScope, _call: Call) -> Result<ToolOutput, ExecError> {
         Err(ExecError::Unsupported)
     }
+    async fn background(&self, _scope: &ToolScope, _call: Call) -> Result<ToolOutput, ExecError> {
+        Err(ExecError::Unsupported)
+    }
+}
+
+/// A command whose sandbox has started.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+struct Started {
+    child: tokio::process::Child,
+    group: Group,
+    control: a206_sandbox::Control,
+    /// The command's private home and temporary directory, removed with it.
+    scratch: tempfile::TempDir,
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -269,8 +511,80 @@ impl ExecHost {
     /// Cancel-safe: dropping the future kills the sandbox and everything in it.
     async fn run(&self, scope: &ToolScope, call: Call) -> Result<ToolOutput, ExecError> {
         use a206_core::Ignore;
-        use std::process::Stdio;
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(call.timeout);
+        let Started {
+            mut child,
+            group,
+            control,
+            scratch,
+        } = self.start(scope, &call, deadline).await?;
+        let finished = tokio::time::timeout_at(deadline, async {
+            let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
+                unreachable!("stdout and stderr are piped")
+            };
+            // On Linux the sandbox's PID namespace ends with the shell. macOS
+            // has none, so the shell's group is killed once it exits: a
+            // leftover background process cannot hold the pipes open.
+            let exited = async {
+                let status = child.wait().await;
+                group.kill();
+                status
+            };
+            let (status, out, err) = tokio::join!(exited, bounded(stdout), bounded(stderr));
+            Ok::<_, ExecError>((status.map_err(ExecError::Output)?, out?, err?))
+        })
+        .await;
+        drop(group);
+        control.stop().await;
+        drop(scratch);
+        let (status, (out, out_cut), (err, err_cut)) = match finished {
+            Ok(result) => result?,
+            Err(_) => {
+                // Killed through `group` above; reap what is left.
+                child.kill().await.ignore();
+                return Err(ExecError::TimedOut {
+                    seconds: call.timeout,
+                });
+            }
+        };
+        Ok(ToolOutput {
+            text: format!(
+                "{status}\n{}\n{}",
+                stream_text("stdout", &out, out_cut),
+                stream_text("stderr", &err, err_cut)
+            ),
+            is_error: !status.success(),
+        })
+    }
+
+    /// Start the command and hand it to a session; returns once its sandbox
+    /// is up, so a sandbox failure still reaches this call.
+    async fn background(&self, scope: &ToolScope, call: Call) -> Result<ToolOutput, ExecError> {
+        // Refuse before starting anything; `adopt` checks again under its lock.
+        self.sessions.reserve(scope.thread)?;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(call.timeout);
+        let started = self.start(scope, &call, deadline).await?;
+        let id =
+            self.sessions
+                .adopt(scope.thread, call.command, started, call.timeout, deadline)?;
+        Ok(ToolOutput {
+            text: format!(
+                "Started background session {id}; it is stopped after {} s. Follow it with \
+                 `{PROCESS}` and give it input with `{PROCESS_WRITE}`.",
+                call.timeout
+            ),
+            is_error: false,
+        })
+    }
+
+    /// Prepare the sandbox and start the command in it. Cancel-safe.
+    async fn start(
+        &self,
+        scope: &ToolScope,
+        call: &Call,
+        deadline: tokio::time::Instant,
+    ) -> Result<Started, ExecError> {
+        use std::process::Stdio;
         let holds = |c| scope.capabilities.contains(&c);
         let workspace = match &scope.workspace {
             Some(workspace) if holds(Capability::ReadWorkspace) => Some(
@@ -357,7 +671,12 @@ impl ExecHost {
             .env("TMPDIR", &tmp)
             .env("PATH", "/usr/bin:/bin")
             .env("LANG", LOCALE)
-            .stdin(Stdio::null())
+            // Only a background command can be given input.
+            .stdin(if call.background {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
             .stdout(Stdio::piped())
             // Bubblewrap reports setup failures here before the command starts.
             .stderr(Stdio::piped())
@@ -370,43 +689,19 @@ impl ExecHost {
                 .and_then(|id| i32::try_from(id).ok())
                 .map(nix::unistd::Pid::from_raw),
         ));
-        let finished = tokio::time::timeout_at(deadline, async {
-            control.ready(&mut child).await.map_err(ExecError::Start)?;
-            let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
-                unreachable!("stdout and stderr are piped")
-            };
-            // On Linux the sandbox's PID namespace ends with the shell. macOS
-            // has none, so the shell's group is killed once it exits: a
-            // leftover background process cannot hold the pipes open.
-            let exited = async {
-                let status = child.wait().await;
-                group.kill();
-                status
-            };
-            let (status, out, err) = tokio::join!(exited, bounded(stdout), bounded(stderr));
-            Ok::<_, ExecError>((status.map_err(ExecError::Output)?, out?, err?))
-        })
-        .await;
-        drop(group);
-        control.stop().await;
-        let (status, (out, out_cut), (err, err_cut)) = match finished {
-            Ok(result) => result?,
-            Err(_) => {
-                // Killed through `group` above; reap what is left.
-                child.kill().await.ignore();
-                return Err(ExecError::TimedOut {
-                    seconds: call.timeout,
-                });
-            }
-        };
-        Ok(ToolOutput {
-            text: format!(
-                "{status}\n{}\n{}",
-                stream_text("stdout", &out, out_cut),
-                stream_text("stderr", &err, err_cut)
-            ),
-            is_error: !status.success(),
-        })
+        match tokio::time::timeout_at(deadline, control.ready(&mut child)).await {
+            Ok(Ok(())) => Ok(Started {
+                child,
+                group,
+                control,
+                scratch,
+            }),
+            Ok(Err(error)) => Err(ExecError::Start(error)),
+            // Dropping the child and its group stops what started.
+            Err(_) => Err(ExecError::TimedOut {
+                seconds: call.timeout,
+            }),
+        }
     }
 }
 
@@ -567,6 +862,7 @@ mod tests {
                 command: command.clone(),
                 working_dir: Some("src/./x".into()),
                 timeout: 5,
+                background: false,
             }
         );
         assert_eq!(
@@ -603,6 +899,107 @@ mod tests {
         }
     }
 
+    #[test]
+    fn background_calls_get_their_own_timeout_bounds() {
+        let command = uuid::Uuid::new_v4().to_string();
+        let call = |value: Value| parse(&arguments(value));
+        let background = call(json!({ "command": command, "background": true })).unwrap();
+        assert!(background.background);
+        assert_eq!(background.timeout, DEFAULT_BACKGROUND_TIMEOUT);
+        let long = json!({ "command": command, "timeout_secs": MAX_BACKGROUND_TIMEOUT });
+        assert!(
+            call(long.clone()).is_err(),
+            "only a background call runs that long"
+        );
+        let mut long_background = long;
+        long_background["background"] = json!(true);
+        assert_eq!(
+            call(long_background).unwrap().timeout,
+            MAX_BACKGROUND_TIMEOUT
+        );
+        for value in [
+            json!({ "command": command, "background": true, "timeout_secs": MAX_BACKGROUND_TIMEOUT + 1 }),
+            json!({ "command": command, "background": "yes" }),
+        ] {
+            assert_eq!(
+                crate::error::report(&call(value).unwrap_err()).kind,
+                ErrorKind::InvalidRequest
+            );
+        }
+    }
+
+    #[test]
+    fn session_calls_are_checked_before_anything_runs() {
+        let id = a206_core::Id::new_v4();
+        let action = |value: Value| parse_action(&arguments(value));
+        assert_eq!(action(json!({ "action": "list" })).unwrap(), Action::List);
+        assert_eq!(
+            action(json!({ "action": "poll", "session": id.to_string() })).unwrap(),
+            Action::Poll(id)
+        );
+        for value in [
+            json!({}),
+            json!({ "action": "poll" }),
+            json!({ "action": "poll", "session": "not-an-id" }),
+            json!({ "action": "signal", "session": id.to_string() }),
+            json!({ "action": "list", "extra": 1 }),
+        ] {
+            let error = action(value.clone()).unwrap_err();
+            assert_eq!(
+                crate::error::report(&error).kind,
+                ErrorKind::InvalidRequest,
+                "{value}"
+            );
+        }
+        let write = |value: Value| parse_write(&arguments(value));
+        assert!(write(json!({ "session": id.to_string(), "close": true })).is_ok());
+        for value in [
+            json!({ "session": id.to_string() }),
+            json!({ "session": id.to_string(), "data": "x".repeat(MAX_INPUT + 1) }),
+            json!({ "session": id.to_string(), "data": "x", "close": "no" }),
+        ] {
+            assert!(write(value.clone()).is_err(), "{value}");
+        }
+    }
+
+    #[tokio::test]
+    async fn sessions_belong_to_their_conversation() {
+        let state = tempfile::tempdir().unwrap();
+        let host = ExecHost::new(state.path());
+        let scope = ToolScope {
+            thread: a206_core::Id::new_v4(),
+            workspace: None,
+            capabilities: [Capability::Execute].into(),
+        };
+        let request = |name: &str, value: Value| ToolRequest {
+            call: a206_core::Id::new_v4().to_string(),
+            name: name.into(),
+            arguments: arguments(value),
+            approved: true,
+        };
+        let unknown = a206_core::Id::new_v4().to_string();
+        for (name, value) in [
+            (PROCESS, json!({ "action": "poll", "session": unknown })),
+            (PROCESS, json!({ "action": "kill", "session": unknown })),
+            (PROCESS_WRITE, json!({ "session": unknown, "data": "x" })),
+        ] {
+            assert_eq!(
+                host.call(&scope, request(name, value))
+                    .await
+                    .unwrap_err()
+                    .kind,
+                ErrorKind::NotFound
+            );
+        }
+        // Input is a command: it needs approval of that exact call.
+        let mut unapproved = request(PROCESS_WRITE, json!({ "session": unknown, "data": "x" }));
+        unapproved.approved = false;
+        assert_eq!(
+            host.call(&scope, unapproved).await.unwrap_err().kind,
+            ErrorKind::PermissionDenied
+        );
+    }
+
     #[tokio::test]
     async fn every_call_needs_approval_and_the_execute_grant() {
         let state = tempfile::tempdir().unwrap();
@@ -614,11 +1011,20 @@ mod tests {
         };
         let listing = host.list(&scope).await;
         if cfg!(any(target_os = "linux", target_os = "macos")) {
-            let [spec] = listing.tools.as_slice() else {
+            let [exec, process, write] = listing.tools.as_slice() else {
                 panic!("{listing:?}")
             };
-            assert_eq!(spec.permission, ToolPermission::Ask);
-            assert_eq!(spec.capabilities, [Capability::Execute].into());
+            assert_eq!(
+                [exec.permission, process.permission, write.permission],
+                [
+                    ToolPermission::Ask,
+                    ToolPermission::Allow,
+                    ToolPermission::Ask
+                ]
+            );
+            for spec in [exec, process, write] {
+                assert_eq!(spec.capabilities, [Capability::Execute].into());
+            }
         } else {
             assert!(listing.tools.is_empty());
             assert_eq!(listing.unavailable[0].error.kind, ErrorKind::Unavailable);

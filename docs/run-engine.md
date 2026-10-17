@@ -143,8 +143,9 @@ exact call.
 
 ### Native exec
 
-`ExecHost` (`crates/runtime/src/exec_tool.rs`) is registered by `Gateway::open`
-and offers one tool, `execute_command`.
+`ExecHost` (`crates/runtime/src/exec_tool/`) is registered by `Gateway::open`
+and offers `execute_command`, plus `process` and `process_write` for
+background sessions.
 
 - **Policy.** The spec declares only `Execute` and the host policy is `Ask`, so
   the tool is offered only to conversations granted Execute and every call
@@ -153,8 +154,9 @@ and offers one tool, `execute_command`.
   and Execute before starting anything, even on a direct call.
 - **Arguments.** `command` (run with `sh -c`, 1 byte to 16 KiB, no NUL),
   optional `working_dir` relative to the project root (no `..`, absolute paths
-  or symlinks leading out) and `timeout_secs` (1–600, default 30). Anything
-  else, including unknown keys, is `InvalidRequest` before anything starts.
+  or symlinks leading out), `timeout_secs` (1–600, default 30) and
+  `background` (then 1–3600, default 600). Anything else, including unknown
+  keys, is `InvalidRequest` before anything starts.
 - **Sandbox.** The command runs under `a206-sandbox`: bubblewrap namespaces
   plus Landlock inside on Linux, a generated Seatbelt policy applied by
   `sandbox-exec` on macOS. Both come from one profile, with `/usr/bin` and
@@ -175,13 +177,34 @@ and offers one tool, `execute_command`.
   along. macOS has no PID namespace, so the group is also killed as soon as
   the shell exits; a process that leaves the group with `setsid` can outlive
   the call there, still confined by the same policy.
-- **Other platforms.** Windows does not offer the tool; the listing reports
+- **Background sessions** (`exec_tool/sessions.rs`). With `background` the
+  call returns a session id once the sandbox is up (a sandbox failure still
+  reaches the call), and the command keeps running under the same profile
+  until it exits, is killed, reaches its timeout or the host is dropped with
+  the gateway. Its stdin is a pipe only in this mode. A session belongs to the
+  conversation that started it: any other conversation, a subagent included,
+  gets `NotFound` for it, as for an unknown id. `process` (Execute, host
+  policy Allow) lists sessions and polls, kills or removes one; `poll` drains
+  the output written since the last poll, keeping at most `MAX_STREAM` unread
+  bytes per stream and counting what it drops. `process_write` (Execute, host
+  policy Ask, so every input is approved like a command) writes at most
+  64 KiB and optionally closes stdin; input the command does not take within
+  5 s is a `Timeout`, and a finished session is a `Conflict`. A conversation
+  holds at most 8 sessions and the host 64; a new one removes the
+  conversation's oldest finished session, never a running one or another
+  conversation's output, and is otherwise refused with `Conflict`. Revoking
+  Execute stops new calls, not a running session, which still ends at its
+  timeout. There is no terminal, so `send_keys` (key chords for interactive
+  programs) is not offered.
+- **Other platforms.** Windows does not offer these tools; the listing reports
   `native exec` unavailable rather than run commands unconfined.
 
 Tests: `crates/runtime/tests/native_exec.rs` drives the host through the real
 sandbox on Linux and macOS CI (grants, hidden state, symlinked working
 directories, network, exit status, output and time bounds, leftover
-background processes; on Linux the test binary doubles as the helper), and
+background processes; background sessions' input, output, ownership, kill,
+timeout, limits and end with their host; on Linux the test binary doubles as
+the helper), and
 `crates/sandbox/src/seatbelt.rs` tests the macOS policy text on every platform.
 
 ### WASM extensions
