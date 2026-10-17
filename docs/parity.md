@@ -166,7 +166,7 @@ invocations and relays gateway-authorized host calls (`a206/docs/plugin-api.md`)
 | Panels: secrets, vault unlock, credential request, approvals, cron, memory, MCP (on the extensions page), channels, messengers, skills, services, engines, logs, analytics, system info, swarm, tool perms (desktop `components/*`, TUI `components/*_dialog.rs`) | partial: workspace, conversations, projects, connections, downloads, extensions, browser, documents, messengers, appearance, modes, security (vault create/unlock/lock, gateway pairing and TOTP enrollment for local profiles; `ui/src/vault.rs`), Joshua, gateway (`ui/src/route.rs`); secrets, credential request and approvals panels are not built | Each lands as routes when backing feature exists; no placeholder controls |
 | TUI slash commands + tab completion (`rustyclaw-tui/src/components/command_menu.rs`) | partial: shared Dioxus TUI renders, untested interaction | Command palette in shared fc-dioxus |
 | Thread tabs, tool-call rendering (`tui/components/thread_tabs.rs`, `tool_call.rs`) | partial: split view; no tool traces (no tool loop) | fc-dioxus tool trace component |
-| Web client over WebSocket/WASM (`rustyclaw-web`) | present: authenticated loopback web (`runtime/src/web.rs`) | — |
+| Web client over WebSocket/WASM (`rustyclaw-web`) | present: authenticated loopback web, and opt-in HTTPS for other devices with sign-in by the vault's authenticator (`runtime/src/web.rs`, 2026-10-17) | ACME certificates; multiple users |
 
 ## Sandboxing and runtime isolation
 
