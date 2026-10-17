@@ -1008,3 +1008,137 @@ fn patch_tool_refuses_a_malformed_diff_without_a_host_call() {
     assert_eq!(error.code, "invalid_patch");
     assert!(seen.borrow().is_empty());
 }
+
+fn web_page(body: Vec<u8>, content_type: &str) -> impl FnMut(&HostRequest) -> HostReply + 'static {
+    let content_type = content_type.to_string();
+    move |_| {
+        HostReply::Fetched(FetchResponse {
+            status: 200,
+            content_type: Some(content_type.clone()),
+            body: body.clone().into(),
+            truncated: false,
+        })
+    }
+}
+
+#[test]
+fn page_reader_returns_readable_markdown_and_metadata() {
+    let builtin = builtin("agent206.web").unwrap().unwrap();
+    let (title, words, script) = (unique("title"), unique("words"), unique("script"));
+    let html = format!(
+        "<html><head><title>{title}</title><meta name=description content=\"{words}\"></head>\
+<body><nav>{script}</nav><main><h1>{title}</h1><p>{words}</p></main><script>{script}</script></body></html>"
+    );
+    let url = format!("https://{}.example/p", unique("h"));
+    let (bridge, seen) = mock(web_page(html.into_bytes(), "text/html; charset=utf-8"));
+    let invocation = tool(
+        "read_web_page",
+        &[
+            ("url", Value::Str(format!("{url}#frag"))),
+            ("include_metadata", Value::Bool(true)),
+        ],
+    );
+    let (outcome, _) = engine::run(builtin.wasm, &invocation, Limits::default(), bridge);
+    let Ok(Outcome::Tool(output)) = outcome else {
+        panic!("expected tool output, got {outcome:?}");
+    };
+    assert_eq!(
+        output.text,
+        format!(
+            "HTTP 200\nContent-Type: text/html; charset=utf-8\nTitle: {title}\nDescription: {words}\n\n# {title}\n\n{words}"
+        )
+    );
+    assert!(!output.text.contains(&script));
+    assert_eq!(*seen.borrow(), vec![HostRequest::Fetch { url }]);
+
+    // Plain text is returned as it is, and `max_bytes` cuts it.
+    let (bridge, _) = mock(web_page(
+        format!("{words}{words}").into_bytes(),
+        "text/plain",
+    ));
+    let invocation = tool(
+        "read_web_page",
+        &[
+            ("url", Value::Str("https://a.example/".into())),
+            ("max_bytes", Value::Int(words.len() as i64)),
+        ],
+    );
+    let (outcome, _) = engine::run(builtin.wasm, &invocation, Limits::default(), bridge);
+    let Ok(Outcome::Tool(output)) = outcome else {
+        panic!("expected tool output, got {outcome:?}");
+    };
+    assert!(output.text.ends_with(&format!(
+        "\n\n{words}\n[the response continues; it was cut at a limit]"
+    )));
+
+    let (bridge, seen) = mock(web_page(Vec::new(), "text/html"));
+    let invocation = tool(
+        "read_web_page",
+        &[
+            ("url", Value::Str("https://a.example/".into())),
+            ("format", Value::Str(unique("pdf"))),
+        ],
+    );
+    let (outcome, _) = engine::run(builtin.wasm, &invocation, Limits::default(), bridge);
+    assert!(
+        matches!(&outcome, Ok(Outcome::Failed(error)) if error.code == "invalid_argument"),
+        "{outcome:?}"
+    );
+    assert!(
+        seen.borrow().is_empty(),
+        "nothing is fetched for a bad argument"
+    );
+}
+
+/// The largest page the host returns is read within the invocation's
+/// default fuel whatever it is made of: extraction meters its own work and
+/// stops with a notice. Each shape stresses a different part of it.
+#[test]
+fn page_reader_reads_the_largest_page_within_its_fuel() {
+    let builtin = builtin("agent206.web").unwrap().unwrap();
+    let repeat = |piece: &str| {
+        let mut html = String::new();
+        while html.len() < 512 * 1024 {
+            html.push_str(piece);
+        }
+        html
+    };
+    let shapes = [
+        repeat(
+            "<li><a href=\"/p?q=1&amp;r=2\" class=\"x y\">a&amp;b &#x263A;</a> <code>c</code></li>\n",
+        ),
+        repeat("<span>x</span>"),
+        repeat("<a href=\"/x\">y</a>"),
+        repeat("plain words of text here and there "),
+        repeat("a&amp;b &lt; "),
+        repeat("<p></p>"),
+        format!("<script>{}", repeat("var x = 1; ")),
+        format!("<!--{}", repeat("a comment ")),
+        format!("<a href=\"{}", repeat("x")),
+        repeat("x"),
+        repeat("& "),
+        repeat("1 < 2 "),
+        repeat("&#x263A;"),
+    ];
+    for (index, html) in shapes.into_iter().enumerate() {
+        for format in ["markdown", "text"] {
+            let (bridge, _) = mock(web_page(html.clone().into_bytes(), "text/html"));
+            let invocation = tool(
+                "read_web_page",
+                &[
+                    ("url", Value::Str("https://a.example/".into())),
+                    ("format", Value::Str(format.into())),
+                ],
+            );
+            let (outcome, _) = engine::run(builtin.wasm, &invocation, Limits::default(), bridge);
+            let Ok(Outcome::Tool(output)) = outcome else {
+                panic!("shape {index}, {format}: expected tool output, got {outcome:?}");
+            };
+            assert!(
+                output.text.ends_with("cut at a limit]"),
+                "shape {index}, {format}: {}",
+                &output.text[output.text.len().saturating_sub(200)..]
+            );
+        }
+    }
+}

@@ -24,8 +24,17 @@ quoted paths are refused, as is a hunk with more or fewer lines than the
 counts in its `@@` header. The write tools need a separate `write_workspace` grant. It also bundles
 `agent206.git` (`plugins/git`) with `git_status`, `git_log` and `git_diff`
 tools under the `git_read` grant and a `git_commit` tool under its own
-`git_write` grant, and `agent206.web` (`plugins/web`) with a
-`fetch_url` tool under the `network` grant.
+`git_write` grant, and `agent206.web` (`plugins/web`) with `fetch_url` (the
+raw response) and `read_web_page` tools under the `network` grant.
+`read_web_page` reads HTML in one pass in the guest, without a DOM: it drops
+scripts, styles, navigation, headers, footers, asides, forms and similar
+chrome; keeps only `<main>`/`<article>` content when the page has any; and
+writes Markdown (headings, lists, absolute `http(s)` links, code, rules) or
+plain text, with the page title and description on request. Other text types
+are returned as they are. Like memory search it meters its own work and stops
+with a notice before the invocation's fuel runs out; under the default fuel
+that is roughly 100 KB of ordinary HTML, and less for pages that are nearly all
+tags. CSS selectors (RustyClaw's `selector`) are not supported.
 `agent206.memory` (`plugins/memory`) has project memory tools that see only
 `MEMORY.md` and `memory/**/*.md`: `memory_search` (BM25 over heading/20-line
 sections, through the ordinary list and read host calls) and `memory_get` (a
