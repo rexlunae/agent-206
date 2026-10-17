@@ -3,7 +3,6 @@
 mod conversation;
 mod error;
 mod extensions;
-#[cfg(not(target_arch = "wasm32"))]
 mod health;
 mod mcp;
 mod messengers;

@@ -1,17 +1,9 @@
 pub use crate::extensions::Extensions;
-#[cfg(not(target_arch = "wasm32"))]
 use crate::health::HealthChecks;
 use crate::{PageFrame, State, call, dispatch, error::ErrorNotice, route::Route};
 use a206_core::{Command, DownloadState, ErrorReport, Mode, Reply};
 use fc_dioxus::prelude::*;
 use uuid::Uuid;
-/// The web bridge's gateway, vault and broker live on its server, where
-/// `agent206 doctor` checks them.
-#[cfg(target_arch = "wasm32")]
-#[component]
-fn HealthChecks() -> Element {
-    rsx! {}
-}
 #[component]
 pub fn Overview() -> Element {
     let state = use_context::<State>();

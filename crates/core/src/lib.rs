@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use uuid::Uuid;
 
+pub mod doctor;
 pub mod error;
 pub mod extension;
 pub mod ignore;

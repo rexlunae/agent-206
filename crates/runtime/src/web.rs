@@ -309,6 +309,7 @@ fn app(state: Web, static_dir: PathBuf) -> Router {
         .route("/api/gateway", post(control))
         .route("/api/setup", post(setup))
         .route("/api/sign-in", post(sign_in))
+        .route("/api/health", post(health))
         .layer(DefaultBodyLimit::max(a206_protocol::MAX_FRAME + 10))
         .fallback_service(static_files(static_dir))
         .layer(axum::middleware::from_fn_with_state(
@@ -574,6 +575,35 @@ async fn setup(State(state): State<Web>, headers: HeaderMap, bytes: Bytes) -> Re
         ))
     });
     respond(StatusCode::OK, request.id, &reply)
+}
+
+/// The Gateway page's health checks, run here: the profile, gateway, vault
+/// broker and provider accounts the bridge uses. Nothing is started or changed.
+async fn health(State(state): State<Web>, headers: HeaderMap, bytes: Bytes) -> Response {
+    if !authorized(&state, &headers) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let mut decoder = Decoder::default();
+    let Ok(mut requests) = decoder.feed::<Request<()>>(&bytes) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    if requests.len() != 1 || decoder.finish().is_err() {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let request = requests.remove(0);
+    // The gateway this bridge uses, not whatever the saved file says now.
+    let remote = state
+        .gateway
+        .read()
+        .unwrap_or_else(PoisonError::into_inner)
+        .target
+        .as_ref()
+        .and_then(|target| target.remote().map(str::to_owned));
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs());
+    let facts = crate::doctor::gather(&state.root, remote, now).await;
+    respond(StatusCode::OK, request.id, &crate::doctor::evaluate(&facts))
 }
 
 /// Sign-in for a server opened to other devices. Only a same-origin request
@@ -992,6 +1022,45 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
         assert!(!root.path().join("connection.toml").exists());
+    }
+    #[tokio::test]
+    async fn health_checks_run_on_the_bridge_for_the_bearer_only() {
+        use a206_core::doctor::{DoctorReport, Finding, Health};
+        let root = tempfile::tempdir().unwrap();
+        let (state, app) = unconfigured(root.path());
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/health")
+                    .header(header::HOST, state.lo().host.as_str())
+                    .header(header::ORIGIN, state.lo().origin.as_str())
+                    .header(header::CONTENT_TYPE, "application/msgpack")
+                    .body(axum::body::Body::from(
+                        a206_protocol::encode(&Request {
+                            id: uuid::Uuid::new_v4(),
+                            body: (),
+                        })
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let (code, report) = post::<_, DoctorReport>(&app, &state, "/api/health", ()).await;
+        assert_eq!(code, StatusCode::OK);
+        let missing = report
+            .checks
+            .iter()
+            .find(|check| check.finding == Finding::GatewayNotConfigured)
+            .unwrap_or_else(|| panic!("no gateway finding in {report:?}"));
+        assert_ne!(missing.health, Health::Ok);
+        assert_ne!(report.health(), Health::Ok);
+        // Checking changes nothing.
+        assert!(!root.path().join("connection.toml").exists());
+        assert!(state.client().is_none());
     }
     #[tokio::test]
     async fn status_reports_the_gateway_in_use_not_a_rewritten_file() {
