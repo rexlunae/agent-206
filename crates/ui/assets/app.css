@@ -125,3 +125,7 @@ body { max-inline-size: none; inline-size: 100%; padding: 0; background: var(--f
 .a206-recent-thread .a206-muted { font-size: .7rem; }
 .a206-secret-text { overflow-wrap: anywhere; user-select: all; }
 .a206-quote { margin: 0; padding-inline-start: var(--fc-space-3); border-inline-start: 2px solid var(--fc-color-border-subtle); white-space: pre-wrap; }
+/* The shell takes focus only so Ctrl+K reaches it; it is not a control. */
+.a206-shell:focus { outline: none; }
+.a206-palette-results { max-block-size: min(60vh, 28rem); overflow-y: auto; }
+.a206-palette-current { background: var(--fc-color-accent-bg-subtle); color: var(--fc-color-accent-text); border-radius: var(--fc-radius-md); }
