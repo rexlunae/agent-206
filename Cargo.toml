@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/core", "crates/protocol", "crates/vault", "crates/broker", "crates/import", "crates/extension-abi", "crates/extension-sdk", "crates/extensions", "crates/sandbox", "crates/mcp", "plugins/workspace", "plugins/git", "crates/runtime", "crates/ui", "crates/app"]
+members = ["crates/core", "crates/protocol", "crates/vault", "crates/broker", "crates/import", "crates/extension-abi", "crates/extension-sdk", "crates/extensions", "crates/sandbox", "crates/mcp", "crates/skills", "plugins/workspace", "plugins/git", "crates/runtime", "crates/ui", "crates/app"]
 default-members = ["crates/app"]
 resolver = "3"
 
@@ -19,6 +19,7 @@ a206-import = { path = "crates/import" }
 a206-extensions = { path = "crates/extensions" }
 a206-mcp = { path = "crates/mcp" }
 a206-sandbox = { path = "crates/sandbox" }
+a206-skills = { path = "crates/skills" }
 a206-runtime = { path = "crates/runtime" }
 a206-ui = { path = "crates/ui" }
 serde = { version = "1", features = ["derive"] }

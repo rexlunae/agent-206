@@ -125,8 +125,8 @@ invocations and relays gateway-authorized host calls (`a206/docs/plugin-api.md`)
 
 | RustyClaw capability | Agent 206 status | How it should land |
 | --- | --- | --- |
-| Skills: markdown/YAML, dependency gating, enable/disable (`skills/mod.rs`, `tools/skills_tools.rs`) | missing | Instruction packages (TOML manifest) separate from executable extensions |
-| ClawHub registry install/search (`skills/clawhub.rs`, CLI `clawhub`) | missing | Reviewed install with manifest validation + audit |
+| Skills: markdown/YAML, dependency gating, enable/disable (`skills/mod.rs`, `tools/skills_tools.rs`) | partial (experimental): RustyClaw-compatible `SKILL.md` folders in the profile, parse errors reported, OS/program requirements shown, approval pinned to the file's SHA-256 so edits withdraw it, bounded supporting-file reads, CLI `skills` and Extensions page (`a206/crates/skills`, `runtime/src/gateway/skills.rs`, `docs/skills.md`); not shown to models until the run engine lands | Run engine adds `skill_index` to the prompt and a skill tool calling `skill_instructions`/`skill_file`; SkillOnly credentials; project skill folders |
+| ClawHub registry install/search (`skills/clawhub.rs`, CLI `clawhub`) | missing (install is copying a folder; approval still required) | Reviewed install with manifest validation + audit |
 | Agent-created skills/curator (`tools/skill_curator.rs`, `skill_create`) | missing | Agent prepares package; user enables |
 | Plugin UI panels + state (`plugins/mod.rs`, `tools/plugin.rs`) | partial: ABI v2 (`a206/crates/extension-abi`, `extension-sdk`, `extensions`, `runtime/src/extension_host.rs`): declared tools and panels, typed fc-dioxus panel nodes with button events, per-extension persisted state, user grants/enable on the Extensions page and CLI, gateway-authorized workspace and git host calls; only bundled extensions load, agents cannot create or call them until the run engine lands | Agent `plugin_*` tools via the run engine; reviewed package install; more host domains (patch, git write, network, exec after the OS sandbox) |
 | MCP **client** connect/list/tools (`mcp/*`, `tools/mcp_tools.rs`) | partial (experimental): stdio servers in the macOS or Linux sandbox with declared authority, per-tool Allow/Ask/Deny, grant- and project-bound calls, bounded framing/listing/results, status in snapshot, desktop/TUI Extensions page, `mcp-servers` CLI (`a206/crates/mcp`, `runtime/src/gateway/mcp_servers.rs`, `docs/mcp.md`); not reachable by models until the run engine lands; no HTTP transport, credentials or Windows isolation | Run engine offers `mcp_offers` and calls `call_mcp_tool` with approvals; streamable HTTP with vault-brokered auth |
@@ -155,7 +155,7 @@ invocations and relays gateway-authorized host calls (`a206/docs/plugin-api.md`)
 | `command`, `ask` | partial: `new`, `chat THREAD TEXT`, `cancel` | Streaming, stdin/file prompts |
 | `status`, `gateway start/stop/restart/status/reload/run` | present (no `reload`; adds `reconnect`, `--stdio`) | — |
 | `model defaults` | n/a by design; `providers presets/add`, `refresh-models` | Model inspection/selection commands |
-| `skills list/info/check`, `clawhub` | missing (`extension ID` runs bundled WASM) | — |
+| `skills list/info/check`, `clawhub` | partial: `skills list/show/enable/disable` (requirements shown in list); `clawhub` missing | — |
 | `swarm` | missing (`project NAME ROOT`) | — |
 
 ## Onboarding, TUI and desktop UX
