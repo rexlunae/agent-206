@@ -57,14 +57,19 @@ private scratch directory, and nothing else unless the entry holds:
 Without `network` a Linux server has its own empty network namespace and
 Landlock allows no TCP connection; with it, the server shares the host's network
 and sees only the name-resolution files and certificates from `/etc`. On both
-platforms `network` currently includes the host's loopback, so grant it only to
-servers you would trust with local services. On Linux the PID namespace stays
+platforms `network` means IP networks: it includes the host's loopback, so grant
+it only to servers you would trust with local services, but not the host's
+filesystem sockets (container engines, SSH agents, local databases). On macOS
+the Seatbelt rule allows outbound IP and the system resolver socket only; on
+Linux those sockets lie outside the server's mount view. Excluding loopback is
+not offered, because on Linux the server shares the host network namespace and
+Landlock filters TCP by port, not address, so it cannot be enforced on both. On Linux the PID namespace stays
 private either way, so a server cannot inspect the gateway's or other processes. Both
 sandboxes check resolved paths, so a symlink inside the project that points
 outside it reaches nothing the server could not already read. CI drives a fixture
 server through the real sandbox on macOS and on Linux, checking project and
 state visibility, symlink escapes, loopback reachability with and without
-`network`, and running `/bin/sh` with and without `execute`
+`network`, host Unix sockets staying unreachable with it, and running `/bin/sh` with and without `execute`
 (`crates/mcp/tests/sandboxed.rs`).
 Private application state and common credential stores (`~/.ssh`, `~/.aws`,
 `~/.agent206`, keychains and agent configuration) are denied even inside a
@@ -121,6 +126,7 @@ The run engine calls two gateway methods (`crates/runtime/src/gateway/mcp_server
 
 - Streamable HTTP servers, and credentials for any server (vault-brokered auth).
 - Windows isolation.
-- Network grants that exclude the host's loopback services (see Isolation).
+- Network grants that exclude the host's loopback services: not enforceable on
+  Linux without a separate network namespace and relay (see Isolation).
 - Resources, prompts, sampling, elicitation and list-change notifications.
 - Approval UI and model access (run engine).
