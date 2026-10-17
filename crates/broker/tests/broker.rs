@@ -1567,7 +1567,7 @@ async fn sockets_identify_in_the_broker_and_relay_both_ways() {
     let mut socket = opened(
         gateway()
             .await
-            .socket(call("/gateway/bot", discord))
+            .socket(call("/gateway/bot", discord.clone()))
             .await
             .unwrap(),
     );
@@ -1600,7 +1600,7 @@ async fn sockets_identify_in_the_broker_and_relay_both_ways() {
     let mut socket = opened(
         gateway()
             .await
-            .socket(call("/apps.connections.open", slack))
+            .socket(call("/apps.connections.open", slack.clone()))
             .await
             .unwrap(),
     );
@@ -1626,7 +1626,7 @@ async fn sockets_identify_in_the_broker_and_relay_both_ways() {
     .unwrap();
     let refused = gateway()
         .await
-        .socket(call("/gateway/bot", discord))
+        .socket(call("/gateway/bot", discord.clone()))
         .await
         .unwrap();
     assert!(matches!(
@@ -1638,7 +1638,7 @@ async fn sockets_identify_in_the_broker_and_relay_both_ways() {
     ));
     let refused = gateway()
         .await
-        .socket(call("/apps.connections.open", slack))
+        .socket(call("/apps.connections.open", slack.clone()))
         .await
         .unwrap();
     assert!(matches!(
@@ -1649,7 +1649,7 @@ async fn sockets_identify_in_the_broker_and_relay_both_ways() {
     // Bound to another origin: denied before anything is sent.
     let elsewhere = SocketCall {
         url: "http://127.0.0.1:9/gateway/bot".to_owned(),
-        ..call("/gateway/bot", discord)
+        ..call("/gateway/bot", discord.clone())
     };
     let denied_open = gateway().await.socket(elsewhere).await;
     assert!(matches!(
@@ -1660,11 +1660,11 @@ async fn sockets_identify_in_the_broker_and_relay_both_ways() {
     // Only a paired gateway opens sockets, and sends need an open one.
     let mut u = user(&root).await;
     let forbidden = u
-        .call(Request::SocketOpen(call("/gateway/bot", discord)))
+        .call(Request::SocketOpen(call("/gateway/bot", discord.clone())))
         .await;
     assert_eq!(denied(forbidden), BrokerError::Forbidden);
     let unpaired = Client::connect(&root, Role::Gateway).await.unwrap();
-    let unpaired = unpaired.socket(call("/gateway/bot", discord)).await;
+    let unpaired = unpaired.socket(call("/gateway/bot", discord.clone())).await;
     assert!(matches!(
         unpaired.map(|_| ()),
         Err(ClientError::Broker(BrokerError::GatewayNotPaired))
@@ -1763,4 +1763,283 @@ async fn sockets_are_never_requested_from_an_older_broker() {
         refused.map(|_| ()),
         Err(ClientError::SocketUnsupported)
     ));
+}
+
+/// A stand-in IRC server on loopback. Each connection negotiates `caps`,
+/// accepts SASL PLAIN only with `password`, welcomes the client, delivers
+/// one tagged message, records what the client sends afterwards and closes
+/// after the client's first message.
+struct IrcService {
+    port: u16,
+    /// Every line each connection received, in order.
+    received: Arc<Mutex<Vec<Vec<String>>>>,
+}
+
+async fn irc_service(password: String, caps: &'static str) -> IrcService {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let received = Arc::new(Mutex::new(vec![]));
+    let log = received.clone();
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (password, log) = (password.clone(), log.clone());
+            tokio::spawn(async move {
+                let index = {
+                    let mut log = log.lock().unwrap();
+                    log.push(vec![]);
+                    log.len() - 1
+                };
+                let (reader, mut writer) = stream.into_split();
+                let mut lines = BufReader::new(reader).lines();
+                let mut nick = String::new();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    log.lock().unwrap()[index].push(line.clone());
+                    let mut send = vec![];
+                    if let Some(name) = line.strip_prefix("NICK ") {
+                        nick = name.to_owned();
+                        // Pings during registration are answered by the broker.
+                        send.push(format!("PING :{}", uuid::Uuid::new_v4().simple()));
+                    } else if line == "CAP LS 302" {
+                        send.push(format!(":irc.test CAP * LS :{caps}"));
+                    } else if let Some(request) = line.strip_prefix("CAP REQ :") {
+                        send.push(format!(":irc.test CAP * ACK :{request}"));
+                    } else if line == "AUTHENTICATE PLAIN" {
+                        send.push("AUTHENTICATE +".to_owned());
+                    } else if let Some(payload) = line.strip_prefix("AUTHENTICATE ") {
+                        use base64::Engine;
+                        let plain = base64::engine::general_purpose::STANDARD
+                            .decode(payload)
+                            .unwrap();
+                        let expected = format!("\0{nick}\0{password}");
+                        send.push(if plain == expected.as_bytes() {
+                            format!(":irc.test 903 {nick} :SASL authentication successful")
+                        } else {
+                            format!(":irc.test 904 {nick} :SASL authentication failed")
+                        });
+                    } else if line == "CAP END" {
+                        send.push(format!(":irc.test 001 {nick} :Welcome"));
+                        send.push(format!(
+                            "@account=friend :friend!u@h PRIVMSG {nick} :{}",
+                            uuid::Uuid::new_v4()
+                        ));
+                    } else if line.starts_with("PRIVMSG ") {
+                        break;
+                    }
+                    for line in send {
+                        writer
+                            .write_all(format!("{line}\r\n").as_bytes())
+                            .await
+                            .unwrap();
+                    }
+                }
+            });
+        }
+    });
+    IrcService { port, received }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn irc_sessions_sign_in_with_sasl_in_the_broker_and_relay_lines() {
+    let password = random();
+    let service = irc_service(password.clone(), "sasl=PLAIN account-tag").await;
+    let server = format!("irc://127.0.0.1:{}", service.port);
+    let (_dir, root, _task) = start().await;
+    let mut a = user(&root).await;
+    a.call(unlock(&random(), None, true)).await.unwrap();
+    let name = random();
+    // Destinations name the server as written; the broker binds its origin.
+    a.call(Request::PutCredential {
+        name: name.clone(),
+        meta: meta(vec![format!("{server}/")]),
+        value: WireValue::Single(WireSecret::new(password.clone())),
+        replace: false,
+    })
+    .await
+    .unwrap();
+    let Reply::Credentials { typed, .. } = a.call(Request::Credentials).await.unwrap() else {
+        panic!("expected credentials");
+    };
+    assert_eq!(typed[0].1.destinations, std::slice::from_ref(&server));
+    let token_pairing = pairing(&mut a).await;
+    let mut anchor = Client::connect(&root, Role::Gateway).await.unwrap();
+    anchor
+        .call(Request::GatewayAuth {
+            token: WireSecret::new(token_pairing.expose().to_owned()),
+        })
+        .await
+        .unwrap();
+    let gateway = || async {
+        let mut gateway = Client::connect(&root, Role::Gateway).await.unwrap();
+        gateway
+            .call(Request::GatewayAuth {
+                token: WireSecret::new(token_pairing.expose().to_owned()),
+            })
+            .await
+            .unwrap();
+        gateway
+    };
+    let login = format!("bot{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
+    let call = |login: &str| SocketCall {
+        credential: name.clone(),
+        url: server.clone(),
+        scheme: SocketScheme::IrcSasl {
+            login: login.to_owned(),
+        },
+    };
+
+    // Lines are relayed from the welcome on; sign-in stays in the broker.
+    let mut socket = opened(gateway().await.socket(call(&login)).await.unwrap());
+    let welcome = text(&mut socket).await;
+    assert_eq!(welcome, format!(":irc.test 001 {login} :Welcome"));
+    let message = text(&mut socket).await;
+    assert!(message.starts_with("@account=friend :friend!u@h PRIVMSG"));
+    let reply = format!("PRIVMSG friend :{}", random());
+    socket.send(reply.clone()).await.unwrap();
+    assert_eq!(socket.next().await.unwrap(), SocketEvent::Closed(None));
+    {
+        let received = service.received.lock().unwrap();
+        let lines = &received[0];
+        assert_eq!(
+            lines[..3],
+            [
+                "CAP LS 302".to_owned(),
+                format!("NICK {login}"),
+                format!("USER {login} 0 * :Agent 206")
+            ]
+        );
+        assert!(lines.iter().any(|l| l.starts_with("PONG :")));
+        assert!(lines.contains(&"CAP REQ :sasl account-tag".to_owned()));
+        assert_eq!(lines.last(), Some(&reply));
+        assert!(!lines.iter().any(|l| l.contains(&password)));
+    }
+
+    // A one-line limit: a line ending would let the gateway smuggle a command.
+    let socket = opened(gateway().await.socket(call(&login)).await.unwrap());
+    let mut socket = socket;
+    text(&mut socket).await;
+    socket
+        .send(format!("PRIVMSG friend :x\r\nQUIT :{}", random()))
+        .await
+        .unwrap();
+    loop {
+        match socket.next().await {
+            Ok(SocketEvent::Text(_)) => continue,
+            Err(ClientError::Broker(error)) => {
+                assert_eq!(error, BrokerError::Invalid(InvalidRequest::IrcLine));
+                break;
+            }
+            other => panic!("expected the session to end, got {other:?}"),
+        }
+    }
+
+    // A wrong password is a SASL refusal, not a session.
+    a.call(Request::PutCredential {
+        name: name.clone(),
+        meta: meta(vec![server.clone()]),
+        value: WireValue::Single(WireSecret::new(random())),
+        replace: true,
+    })
+    .await
+    .unwrap();
+    let refused = gateway().await.socket(call(&login)).await.unwrap();
+    assert!(matches!(
+        refused,
+        SocketOpen::Refused { status: 0, code: Some(code) } if code == "sasl_failed"
+    ));
+
+    // The login cannot change a command, and the URL must be an IRC server.
+    let bad_login = gateway().await.socket(call(&format!("{login} :x"))).await;
+    assert!(matches!(
+        bad_login.map(|_| ()),
+        Err(ClientError::Broker(BrokerError::Invalid(
+            InvalidRequest::IrcLogin
+        )))
+    ));
+    let https = SocketCall {
+        url: format!("http://127.0.0.1:{}", service.port),
+        ..call(&login)
+    };
+    assert!(matches!(
+        gateway().await.socket(https).await.map(|_| ()),
+        Err(ClientError::Broker(BrokerError::Invalid(
+            InvalidRequest::IrcServer
+        )))
+    ));
+    let irc_for_web = SocketCall {
+        scheme: SocketScheme::SlackSocketMode,
+        ..call(&login)
+    };
+    assert!(matches!(
+        gateway().await.socket(irc_for_web).await.map(|_| ()),
+        Err(ClientError::Broker(BrokerError::Invalid(
+            InvalidRequest::ProviderUrl
+        )))
+    ));
+
+    // A credential bound to another server is never sent.
+    let elsewhere = SocketCall {
+        url: "irc://127.0.0.1:9".to_owned(),
+        ..call(&login)
+    };
+    assert!(matches!(
+        gateway().await.socket(elsewhere).await.map(|_| ()),
+        Err(ClientError::Broker(BrokerError::Denied(_)))
+    ));
+    assert_eq!(service.received.lock().unwrap().len(), 3);
+
+    // Plain-text IRC is refused off loopback, at binding time too.
+    let insecure = a
+        .call(Request::PutCredential {
+            name: random(),
+            meta: meta(vec![format!(
+                "irc://{}.test",
+                uuid::Uuid::new_v4().simple()
+            )]),
+            value: WireValue::Single(WireSecret::new(random())),
+            replace: false,
+        })
+        .await;
+    assert_eq!(
+        denied(insecure),
+        BrokerError::Invalid(InvalidRequest::Destination)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn irc_servers_without_account_tags_are_refused() {
+    let password = random();
+    let service = irc_service(password.clone(), "sasl").await;
+    let server = format!("irc://127.0.0.1:{}", service.port);
+    let (_dir, root, _task) = start().await;
+    let mut a = user(&root).await;
+    a.call(unlock(&random(), None, true)).await.unwrap();
+    let name = random();
+    a.call(Request::PutCredential {
+        name: name.clone(),
+        meta: meta(vec![server.clone()]),
+        value: WireValue::Single(WireSecret::new(password)),
+        replace: false,
+    })
+    .await
+    .unwrap();
+    let gateway = paired_gateway(&mut a, &root).await;
+    let refused = gateway
+        .socket(SocketCall {
+            credential: name,
+            url: server,
+            scheme: SocketScheme::IrcSasl {
+                login: format!("bot{}", &uuid::Uuid::new_v4().simple().to_string()[..8]),
+            },
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        refused,
+        SocketOpen::Refused { status: 0, code: Some(code) } if code == "account_tag_unavailable"
+    ));
+    // Nothing was authenticated.
+    let received = service.received.lock().unwrap();
+    assert!(!received[0].iter().any(|l| l.starts_with("AUTHENTICATE")));
 }
