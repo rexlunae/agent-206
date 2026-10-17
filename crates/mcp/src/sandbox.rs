@@ -332,16 +332,7 @@ fn sandbox_command(
         .and_then(std::fs::canonicalize)
         .map_err(McpError::Helper)?;
     let holds = |c| server.capabilities.contains(&c);
-    let mut hidden: Vec<PathBuf> = std::env::var_os("HOME")
-        // A home that cannot be resolved is still hidden at its literal path.
-        .map(|home| std::fs::canonicalize(&home).unwrap_or_else(|_| PathBuf::from(home)))
-        .map(|home| {
-            a206_sandbox::HIDDEN_HOME_PATHS
-                .iter()
-                .map(|suffix| home.join(suffix))
-                .collect()
-        })
-        .unwrap_or_default();
+    let mut hidden = a206_sandbox::hidden_home_paths();
     hidden.push(placement.state.clone());
     let control = scratch.join("control");
     let profile = a206_sandbox::Profile {
@@ -362,6 +353,8 @@ fn sandbox_command(
         } else {
             a206_sandbox::NetworkAccess::None
         },
+        // MCP servers' stderr is discarded on every platform.
+        stderr: false,
     };
     Ok(Command::from(profile.command().map_err(McpError::Sandbox)?))
 }

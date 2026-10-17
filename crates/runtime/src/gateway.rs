@@ -380,7 +380,10 @@ impl Gateway {
             pair_requests: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             refreshed: Arc::new(Mutex::new(BTreeMap::new())),
             paired: Arc::new(tokio::sync::Notify::new()),
-            tool_hosts: Arc::new(vec![extension_tools]),
+            tool_hosts: Arc::new(vec![
+                extension_tools,
+                Arc::new(crate::exec_tool::ExecHost::new(root)),
+            ]),
             approvals: Arc::new(Mutex::new(BTreeMap::new())),
             policy: Arc::new(tokio::sync::watch::Sender::new(0)),
             pairings: tokio::sync::watch::Sender::new(0),

@@ -81,6 +81,7 @@ mod linux {
                 hidden: &[],
                 cwd: &root,
                 network: a206_sandbox::NetworkAccess::None,
+                stderr: false,
             };
             let mut command = tokio::process::Command::from(profile.command()?);
             let control = Control::bind(&control, None)?;

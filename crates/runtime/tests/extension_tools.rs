@@ -206,7 +206,19 @@ impl Rig {
         else {
             panic!("tool listing failed");
         };
-        assert!(list.unavailable.is_empty(), "{:?}", list.unavailable);
+        // Native exec is registered alongside extensions, but deliberately
+        // unavailable until equivalent isolation exists on this platform.
+        // Still reject any unavailable extension or unexpected host failure.
+        if cfg!(target_os = "linux") {
+            assert!(list.unavailable.is_empty(), "{:?}", list.unavailable);
+        } else {
+            assert_eq!(list.unavailable.len(), 1, "{:?}", list.unavailable);
+            assert_eq!(list.unavailable[0].source, a206_runtime::exec_tool::SOURCE);
+            assert_eq!(
+                list.unavailable[0].error.kind,
+                a206_core::ErrorKind::Unavailable
+            );
+        }
         list.tools.into_iter().find(|t| t.name == self.tool)
     }
     fn send(&self) -> tokio::task::JoinHandle<Reply> {

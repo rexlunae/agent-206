@@ -131,6 +131,42 @@ so its kind and causes survive the process boundary.
 capabilities. `ToolRequest::approved` is true only after the user approved that
 exact call.
 
+### Native exec
+
+`ExecHost` (`crates/runtime/src/exec_tool.rs`) is registered by `Gateway::open`
+and offers one tool, `execute_command`.
+
+- **Policy.** The spec declares only `Execute` and the host policy is `Ask`, so
+  the tool is offered only to conversations granted Execute and every call
+  waits for the user's approval of that exact command, whatever the
+  conversation's own setting. The host independently checks both approval
+  and Execute before starting anything, even on a direct call.
+- **Arguments.** `command` (run with `sh -c`, 1 byte to 16 KiB, no NUL),
+  optional `working_dir` relative to the project root (no `..`, absolute paths
+  or symlinks leading out) and `timeout_secs` (1–600, default 30). Anything
+  else, including unknown keys, is `InvalidRequest` before anything starts.
+- **Sandbox.** On Linux the command runs under `a206-sandbox` (bubblewrap
+  namespaces plus Landlock inside), with `/usr/bin` and `/bin` executable. The
+  project is mounted only with `ReadWorkspace` and is writable only with
+  `WriteWorkspace`; the host network is shared only with `Network`; gateway
+  state and the credential stores under `$HOME` stay hidden even inside the
+  project. A project equal to or inside protected state is refused. Without project access the command starts in an empty private
+  directory. The environment holds only a private `HOME`, `TMPDIR`, a fixed
+  `PATH` (`/usr/bin:/bin`) and `LANG`; stdin is empty.
+- **Results.** The text is the exit status, then stdout and stderr, each cut
+  to `MAX_STREAM` UTF-8 bytes after lossy conversion, with a marker; the rest is read and dropped so a
+  chatty command cannot stall. A non-zero exit is `is_error`. A command still
+  running at its timeout is killed and reported as a `Timeout` error.
+  The deadline includes sandbox startup and readiness, as well as execution.
+- **Cancellation.** Dropping the call kills the sandbox's process group; the
+  sandbox's PID namespace ends with it, taking every descendant along.
+- **Other platforms.** The tool is not offered; the listing reports
+  `native exec` unavailable rather than run commands unconfined.
+
+Tests: `crates/runtime/tests/native_exec.rs` drives the host through the real
+sandbox (grants, hidden state, symlinked working directories, network, exit
+status, output and time bounds); the test binary doubles as the helper.
+
 ### WASM extensions
 
 `ExtensionToolHost` (`crates/runtime/src/extension_tools.rs`) is registered by

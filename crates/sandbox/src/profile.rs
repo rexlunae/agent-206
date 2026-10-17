@@ -17,6 +17,21 @@ pub const HIDDEN_HOME_PATHS: &[&str] = &[
     "Library/Keychains",
 ];
 
+/// [`HIDDEN_HOME_PATHS`] under the user's home. A symlinked home resolves to
+/// the canonical paths the grants are compared with; a home that cannot be
+/// resolved is still hidden at its literal path.
+pub fn hidden_home_paths() -> Vec<PathBuf> {
+    std::env::var_os("HOME")
+        .map(|home| std::fs::canonicalize(&home).unwrap_or_else(|_| PathBuf::from(home)))
+        .map(|home| {
+            HIDDEN_HOME_PATHS
+                .iter()
+                .map(|suffix| home.join(suffix))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// System directories mounted read-only; symbolic links (merged `/usr`) are
 /// recreated as links instead.
 const SYSTEM_MOUNTS: &[&str] = &[
@@ -83,6 +98,9 @@ pub struct Profile<'a> {
     pub hidden: &'a [PathBuf],
     pub cwd: &'a Path,
     pub network: NetworkAccess,
+    /// Pass the runtime's stderr to the gateway once it starts, after
+    /// bubblewrap's own diagnostics; otherwise it is discarded.
+    pub stderr: bool,
 }
 
 /// The network a runtime may use.
@@ -189,6 +207,7 @@ impl Profile<'_> {
                 NetworkAccess::Host => Network::Host,
             },
             status: self.status_socket(),
+            stderr: self.stderr,
             rules: self.rules()?,
         })
     }
@@ -380,6 +399,7 @@ mod tests {
                 hidden,
                 cwd: &self.scratch,
                 network: NetworkAccess::Proxy(1),
+                stderr: false,
             }
         }
     }
