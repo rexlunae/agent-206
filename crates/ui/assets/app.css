@@ -14,14 +14,14 @@ body { max-inline-size: none; inline-size: 100%; padding: 0; background: var(--f
 .a206-sidebar .a206-eyebrow { margin-block: var(--fc-space-2) var(--fc-space-1); }
 .a206-sidebar .a206-nav-active { background: var(--fc-color-bg-muted); }
 .a206-nav-group { display: flex; flex-direction: column; gap: 0; }
-.a206-eyebrow { font-size: .65rem; letter-spacing: .16em; text-transform: uppercase; color: var(--fc-color-text-muted); font-weight: 650; }
+.a206-eyebrow { font-size: .65rem; letter-spacing: .16em; text-transform: uppercase; color: var(--fc-content-muted, var(--fc-color-text-muted)); font-weight: 650; }
 .a206-sidebar-footer { margin-block-start: auto; padding-block-start: var(--fc-space-4); border-block-start: 1px solid var(--fc-color-border-subtle); }
 .a206-main { block-size: 100%; display: flex; flex-direction: column; min-inline-size: 0; overflow: hidden; }
 .a206-page { overflow: auto; padding: clamp(1rem, 2vw, 1.75rem); block-size: 100%; }
 .a206-page-inner { max-inline-size: 1100px; margin-inline: auto; display: flex; flex-direction: column; gap: var(--fc-space-4); }
 .a206-page h1 { font-size: clamp(1.8rem, 3vw, 3.1rem); letter-spacing: -.055em; font-weight: 500; line-height: 1.1; margin: .5rem 0; }
 .a206-page h2 { font-size: 1.2rem; font-weight: 550; letter-spacing: -.025em; }
-.a206-muted { color: var(--fc-color-text-muted); }
+.a206-muted { color: var(--fc-content-muted, var(--fc-color-text-muted)); }
 .a206-row { display: flex; gap: var(--fc-space-3); align-items: center; flex-wrap: wrap; }
 .a206-between { justify-content: space-between; }
 .a206-stack { display: flex; flex-direction: column; gap: var(--fc-space-4); }
@@ -30,7 +30,7 @@ body { max-inline-size: none; inline-size: 100%; padding: 0; background: var(--f
 .a206-orbit { inline-size: 152px; aspect-ratio: 1; color: var(--fc-color-accent-text); opacity: .75; }
 .a206-hero-copy { max-inline-size: 540px; }
 .a206-hero-copy p { font-size: .85rem; line-height: 1.5; margin-block: var(--fc-space-2) var(--fc-space-3); }
-.a206-number { font-family: var(--fc-font-family-mono, monospace); font-size: .7rem; color: var(--fc-color-text-muted); }
+.a206-number { font-family: var(--fc-font-family-mono, monospace); font-size: .7rem; color: var(--fc-content-muted, var(--fc-color-text-muted)); }
 .a206-card-action { inline-size: 100%; }
 .a206-chat-header { padding: var(--fc-space-1) var(--fc-space-4); min-block-size: 2.5rem; flex: none; border-block-end: 1px solid var(--fc-color-border-subtle); font-size: .8rem; background: var(--fc-color-bg-surface); }
 .a206-chat-actions { flex-wrap: nowrap; gap: var(--fc-space-1); }
@@ -62,9 +62,9 @@ body { max-inline-size: none; inline-size: 100%; padding: 0; background: var(--f
 .a206-chat-popover { inline-size: min(22rem, 90vw); }
 .a206-thread-facts { font-size: .75rem; }
 .a206-fact-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.4fr); align-items: baseline; gap: var(--fc-space-2) var(--fc-space-3); margin: 0; }
-.a206-fact-grid dt { color: var(--fc-color-text-muted); }
+.a206-fact-grid dt { color: var(--fc-content-muted, var(--fc-color-text-muted)); }
 .a206-fact-grid dd { overflow-wrap: anywhere; margin: 0; text-align: end; font-variant-numeric: tabular-nums; }
-.a206-fact-note { font-size: .65rem; color: var(--fc-color-text-muted); margin-block: var(--fc-space-2) var(--fc-space-3); }
+.a206-fact-note { font-size: .65rem; color: var(--fc-content-muted, var(--fc-color-text-muted)); margin-block: var(--fc-space-2) var(--fc-space-3); }
 .a206-permissions { display: flex; flex-wrap: wrap; gap: var(--fc-space-2); align-items: center; }
 .a206-inspector { padding: var(--fc-space-3) var(--fc-space-4); gap: var(--fc-space-3); overflow: auto; block-size: 100%; font-size: .8rem; margin-inline-start: var(--fc-space-2); border-radius: min(var(--fc-radius-xl), 1rem); background: var(--fc-color-bg-raised); }
 .a206-inspector h3 { font-size: .8rem; margin-block: var(--fc-space-1); }
@@ -121,3 +121,5 @@ body { max-inline-size: none; inline-size: 100%; padding: 0; background: var(--f
 .a206-recent-thread .a206-nav-title { display: flex; flex-direction: column; gap: var(--fc-space-1); font-size: .75rem; }
 .a206-recent-thread .a206-muted { font-size: .7rem; }
 .a206-secret-text { overflow-wrap: anywhere; user-select: all; }
+/* Authenticator QR data stays black on white for scanners in every theme. */
+.a206-totp-qr { display: block; inline-size: min(16rem, 100%); block-size: auto; aspect-ratio: 1; margin-block: var(--fc-space-4); shape-rendering: crispEdges; forced-color-adjust: none; }

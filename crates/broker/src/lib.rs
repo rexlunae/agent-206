@@ -3,6 +3,7 @@
 //! user-private socket; the gateway may only ask it to perform
 //! destination-bound provider requests and never sees a credential value.
 #![forbid(unsafe_code)]
+pub mod channel;
 #[cfg(unix)]
 mod client;
 mod proto;

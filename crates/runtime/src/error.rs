@@ -220,6 +220,7 @@ impl Classified for a206_broker::BrokerError {
             B::NoPendingEnrollment | B::AlreadyExists | B::VaultExists => ErrorKind::Conflict,
             B::NotFound => ErrorKind::NotFound,
             B::Invalid(_) => ErrorKind::InvalidRequest,
+            B::Channel(_) => ErrorKind::Protocol,
             B::Vault(_) => ErrorKind::Storage,
             B::Upstream(U::Timeout) => ErrorKind::Timeout,
             B::Upstream(U::Connect) => ErrorKind::Unavailable,

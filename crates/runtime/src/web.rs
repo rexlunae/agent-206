@@ -4,6 +4,7 @@
 //! vault's authenticator; see [`access`].
 mod access;
 pub mod tls;
+mod vault;
 pub use access::SignInError;
 pub use tls::{Certificate, TlsError};
 
@@ -35,6 +36,7 @@ use tower::ServiceExt;
 use tower_http::services::{ServeDir, ServeFile};
 #[derive(Clone)]
 struct Web {
+    vault: Arc<vault::Relay>,
     gateway: Arc<RwLock<Gateway>>,
     root: Arc<PathBuf>,
     access: Arc<Access>,
@@ -191,6 +193,7 @@ async fn serve_loopback(
     let gateway = Gateway::resolve(&root, remote)?;
     let token = uuid::Uuid::new_v4().simple().to_string();
     let state = Web {
+        vault: Arc::default(),
         gateway: Arc::new(RwLock::new(gateway)),
         root: Arc::new(root),
         access: Arc::new(Access::Loopback(Loopback {
@@ -239,6 +242,7 @@ async fn serve_network(
         .map(|host| format!("https://{host}/"))
         .collect();
     let state = Web {
+        vault: Arc::default(),
         gateway: Arc::new(RwLock::new(gateway)),
         root: Arc::new(root.clone()),
         access: Arc::new(Access::Network(Network {
@@ -308,6 +312,7 @@ fn app(state: Web, static_dir: PathBuf) -> Router {
         .route("/api/command", post(command))
         .route("/api/gateway", post(control))
         .route("/api/setup", post(setup))
+        .route("/api/vault", post(vault::handle))
         .route("/api/sign-in", post(sign_in))
         .layer(DefaultBodyLimit::max(a206_protocol::MAX_FRAME + 10))
         .fallback_service(static_files(static_dir))
@@ -734,6 +739,7 @@ mod tests {
     fn bridge(port: u16) -> Web {
         let root = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
         Web {
+            vault: Arc::default(),
             gateway: Arc::new(RwLock::new(Gateway {
                 client: Some(GatewayController::attach(root.clone(), None)),
                 target: Some(GatewayTarget::Local),
@@ -1067,6 +1073,7 @@ mod tests {
     /// A bridge opened to other devices over `root`'s vault.
     fn network_bridge(root: &std::path::Path) -> Router {
         let state = Web {
+            vault: Arc::default(),
             gateway: Arc::new(RwLock::new(Gateway::resolve(root, None).unwrap())),
             root: Arc::new(root.into()),
             access: Arc::new(Access::Network(Network {
@@ -1246,5 +1253,143 @@ mod tests {
             let other = get_with_host(&app, path, "rebound.test:8443").await;
             assert_eq!(other.status(), StatusCode::MISDIRECTED_REQUEST, "{path}");
         }
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn browser_vault_setup_is_ciphertext_only_and_sessions_are_owner_bound() {
+        use a206_broker::{Client, Reply as BR, Request as B, Role};
+        use a206_vault_channel::{
+            Handshake, RelayReply as RR, RelayRequest as RQ, Reply as R, Request as Q, Secret,
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().to_path_buf();
+        let serving = root.clone();
+        let broker = tokio::spawn(async move { a206_broker::serve(&serving).await.unwrap() });
+        for _ in 0..200 {
+            if a206_broker::socket_path(&root).exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let mut user = Client::connect(&root, Role::User).await.unwrap();
+        let BR::ChannelKey(public) = user.call(B::ChannelKey).await.unwrap() else {
+            panic!();
+        };
+        let mut state = bridge(8206);
+        state.root = Arc::new(root.clone());
+        let router = app(state.clone(), root.join("static"));
+        let (status, _) = post_as::<_, RR>(
+            &router,
+            (&state.lo().host, &state.lo().origin),
+            None,
+            "/api/vault",
+            RQ::Key,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let (handshake, first) = Handshake::start(&public).unwrap();
+        let (_, reply) = post::<_, RR>(&router, &state, "/api/vault", RQ::Open { first }).await;
+        let RR::Opened { session, response } = reply else {
+            panic!("{reply:?}");
+        };
+        let mut channel = handshake.finish(&response).unwrap();
+        let password = uuid::Uuid::new_v4().to_string();
+        let bytes = channel
+            .seal(&Q::Unlock {
+                password: Secret::new(password.clone()),
+                totp: None,
+                create: true,
+            })
+            .unwrap();
+        assert!(
+            !bytes
+                .windows(password.len())
+                .any(|w| w == password.as_bytes())
+        );
+        // A second, independently authorized browser cannot spend this session.
+        let mut other = bridge(8206);
+        other.root = state.root.clone();
+        other.vault = state.vault.clone();
+        let other_router = app(other.clone(), root.join("static"));
+        let (_, stolen) = post::<_, RR>(
+            &other_router,
+            &other,
+            "/api/vault",
+            RQ::Exchange {
+                session: session.clone(),
+                bytes: bytes.clone(),
+            },
+        )
+        .await;
+        assert!(matches!(stolen, RR::Error(_)));
+        let (_, reply) = post::<_, RR>(
+            &router,
+            &state,
+            "/api/vault",
+            RQ::Exchange {
+                session: session.clone(),
+                bytes,
+            },
+        )
+        .await;
+        let RR::Message(ciphertext) = reply else {
+            panic!("{reply:?}");
+        };
+        assert!(matches!(channel.open::<R>(&ciphertext).unwrap(), R::Ok));
+        // The relay must return an encrypted seed, never an ordinary broker reply.
+        let bytes = channel
+            .seal(&Q::BeginTotp {
+                account: uuid::Uuid::new_v4().to_string(),
+            })
+            .unwrap();
+        let (_, reply) = post::<_, RR>(
+            &router,
+            &state,
+            "/api/vault",
+            RQ::Exchange {
+                session: session.clone(),
+                bytes,
+            },
+        )
+        .await;
+        let RR::Message(ciphertext) = reply else {
+            panic!();
+        };
+        let R::TotpEnrollment { manual_key, .. } = channel.open::<R>(&ciphertext).unwrap() else {
+            panic!();
+        };
+        assert!(
+            !ciphertext
+                .windows(manual_key.expose().len())
+                .any(|w| w == manual_key.expose().as_bytes())
+        );
+        // Closing an owned local channel must still discard its pending seed
+        // after another tab changes the selected gateway.
+        state
+            .install(GatewayTarget::Ssh {
+                endpoint: "ssh://test-host".to_owned(),
+            })
+            .unwrap();
+        let (_, reply) = post::<_, RR>(
+            &router,
+            &state,
+            "/api/vault",
+            RQ::Close {
+                session: session.clone(),
+            },
+        )
+        .await;
+        assert!(matches!(reply, RR::Closed));
+        let bytes = channel.seal(&Q::Status).unwrap();
+        let (_, reply) = post::<_, RR>(
+            &router,
+            &state,
+            "/api/vault",
+            RQ::Exchange { session, bytes },
+        )
+        .await;
+        assert!(matches!(reply, RR::Error(_)));
+        user.call(B::Shutdown).await.unwrap();
+        broker.await.unwrap();
     }
 }

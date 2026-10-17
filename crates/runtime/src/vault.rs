@@ -33,6 +33,10 @@ pub enum VaultError {
     Broker(#[from] a206_broker::ClientError),
     #[error("unexpected vault broker reply")]
     UnexpectedReply,
+    #[error(
+        "the running vault broker does not support encrypted web setup; run `agent206 vault stop`, then retry"
+    )]
+    ChannelUnsupported,
     #[error(transparent)]
     Gateway(crate::service::ServiceError),
     #[error("could not exchange the pairing with the gateway")]
@@ -59,7 +63,7 @@ impl crate::error::Classified for VaultError {
             Self::UnexpectedReply | Self::UnexpectedGatewayReply => ErrorKind::Protocol,
             Self::GatewayTimeout(_) => ErrorKind::Timeout,
             Self::CurrentExe(_) | Self::Worker(_) => ErrorKind::Internal,
-            Self::Unsupported => ErrorKind::Unavailable,
+            Self::Unsupported | Self::ChannelUnsupported => ErrorKind::Unavailable,
             // `transparent` hides these from the chain, so classify them here.
             Self::Broker(error) => return crate::error::classify(error),
             Self::Gateway(error) => return crate::error::classify(error),
@@ -298,7 +302,20 @@ mod imp {
             };
             let healthy = match job {
                 Job::Call(request, reply) => {
-                    let result = connected.call(*request).await.map_err(VaultError::from);
+                    if matches!(*request, Request::CancelTotp) && connected.version() < 8 {
+                        // Legacy brokers clear pending enrollment on disconnect,
+                        // but cannot decode CancelTotp. Do not send a new opcode.
+                        reply.send(Ok(Reply::Ok)).ignore();
+                        continue;
+                    }
+                    let mut result = connected.call(*request).await.map_err(VaultError::from);
+                    if connected.version() < 8
+                        && let Ok(Reply::Status(status)) = &mut result
+                    {
+                        // Older brokers reported a minted token as paired,
+                        // even if no gateway had received or proved it.
+                        status.gateway_paired = None;
+                    }
                     let healthy = keeps_connection(&result);
                     reply.send(result).ignore();
                     healthy
