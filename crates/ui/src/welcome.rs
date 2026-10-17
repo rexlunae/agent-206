@@ -3,9 +3,12 @@
 //! and the snapshot report right now; nothing is remembered as "done" by the
 //! page itself, and a fact nobody reported stays unknown. The steps are the
 //! ones `agent206 setup` walks through, plus a provider and a first
-//! conversation.
-use crate::{PageFrame, State, dispatch, route::Route};
-use a206_core::{Command, GatewayPhase, GatewayReport, Mode, Snapshot};
+//! conversation; projects, messengers and skills follow as extras.
+use crate::{PageFrame, State, call, dispatch, error::ErrorNotice, route::Route};
+use a206_core::{
+    Command, ErrorKind, ErrorReport, GatewayPhase, GatewayReport, MessengerKind, Mode, Reply,
+    SkillSummary, Snapshot,
+};
 use fc_dioxus::prelude::*;
 
 /// What a vault card last read from its broker, in terms the checklist uses.
@@ -265,6 +268,84 @@ fn steps(
     steps
 }
 
+/// Steps that widen what Agent 206 can reach. None is needed to start, so they
+/// stay out of the checklist count.
+/// `skills` is the gateway's last skill listing: `None` until it answers.
+fn extras(
+    snapshot: &Snapshot,
+    skills: Option<&Result<Vec<SkillSummary>, ErrorReport>>,
+) -> [Step; 3] {
+    let done_or = |done: bool, title, detail: String, hint: String| {
+        if done {
+            Step::new(title, Progress::Done, detail)
+        } else {
+            Step::new(title, Progress::Optional, hint)
+        }
+    };
+    let projects = snapshot.projects.len();
+    let messengers = &snapshot.settings.messengers;
+    let enabled = messengers.iter().filter(|m| m.enabled).count();
+    [
+        done_or(
+            projects > 0,
+            "Add a project",
+            format!("Projects: {projects}."),
+            "Point a project at a folder so its conversations share a root and a coordinator."
+                .into(),
+        )
+        .on(Route::Projects {}),
+        done_or(
+            enabled > 0,
+            "Connect a messenger",
+            format!("Turned on: {enabled} of {}.", messengers.len()),
+            if messengers.is_empty() {
+                let kinds: Vec<_> = MessengerKind::ALL.iter().map(|kind| kind.label()).collect();
+                let kinds = match kinds.split_last() {
+                    Some((last, rest)) if !rest.is_empty() => {
+                        format!("{} or {last}", rest.join(", "))
+                    }
+                    _ => kinds.concat(),
+                };
+                format!("Reach your agent from {kinds}. Its token stays in the vault.")
+            } else {
+                "Configured but turned off; a messenger connects only once you turn it on.".into()
+            },
+        )
+        .on(Route::Messengers {}),
+        skill_step(skills, done_or).on(Route::Extensions {}),
+    ]
+}
+
+/// Counts what the gateway offers now: an approval whose `SKILL.md` changed
+/// since, or that no longer exists, is not an enabled skill.
+fn skill_step(
+    skills: Option<&Result<Vec<SkillSummary>, ErrorReport>>,
+    done_or: impl Fn(bool, &'static str, String, String) -> Step,
+) -> Step {
+    const TITLE: &str = "Enable a skill";
+    match skills {
+        None => Step::new(TITLE, Progress::Checking, "Reading the gateway's skills…"),
+        Some(Err(_)) => Step::new(
+            TITLE,
+            Progress::Unknown,
+            "The gateway's skills could not be read; the error is shown below.",
+        ),
+        Some(Ok(list)) => {
+            let enabled = list.iter().filter(|skill| skill.enabled).count();
+            let changed = list.iter().filter(|skill| skill.changed).count();
+            let hint = if changed > 0 {
+                format!(
+                    "Changed since you approved them: {changed}. Review them again to turn them back on."
+                )
+            } else {
+                "Review a skill folder from your profile and turn it on. Skills never add permissions."
+                    .into()
+            };
+            done_or(enabled > 0, TITLE, format!("Enabled: {enabled}."), hint)
+        }
+    }
+}
+
 /// Whether the workspace should point at this page: the steps the snapshot
 /// alone can tell are unfinished.
 pub(crate) fn unfinished(snapshot: &Snapshot, now: u64) -> bool {
@@ -276,6 +357,42 @@ pub(crate) fn Welcome() -> Element {
     let state = use_context::<State>();
     let progress = use_context_provider(|| VaultProgress(Signal::new(None)));
     let now = crate::messengers::use_catalog_clock(state)();
+    let mut skills = use_signal(|| None::<Result<Vec<SkillSummary>, ErrorReport>>);
+    // Each read is numbered; only the latest may report, so a slow reply
+    // from before an approval or a gateway switch never overwrites a newer one.
+    let mut latest = use_signal(|| 0_u64);
+    let mut reload = move || {
+        let request = latest.peek().wrapping_add(1);
+        latest.set(request);
+        skills.set(None);
+        // Detached: the reply lands in this page's signals, and one that
+        // outlives the page or a newer read is dropped by the check below.
+        spawn(async move {
+            let read = match call(Command::Skills).await {
+                Ok(Reply::Skills(list)) => Ok(list),
+                Ok(_) => Err(ErrorReport::new(
+                    ErrorKind::Protocol,
+                    "The gateway answered the skill listing with a different reply",
+                )),
+                Err(report) => {
+                    crate::error::record("skills", &report);
+                    Err(report)
+                }
+            };
+            if *latest.peek() == request {
+                skills.set(Some(read));
+            }
+        });
+    };
+    // Approvals made elsewhere arrive as settings revisions, and a switch to
+    // another gateway changes its generation; edits to a skill's files change
+    // neither, so the card also offers a refresh.
+    let revision = state.data.read().settings.revision;
+    let gateway_generation = (state.gateway_generation)();
+    use_effect(use_reactive!(|revision, gateway_generation| {
+        let _ = (revision, gateway_generation);
+        reload();
+    }));
     let vault = initial_vault(progress);
     let snapshot = state.data.read();
     let gateway = state.gateway.read();
@@ -285,6 +402,11 @@ pub(crate) fn Welcome() -> Element {
         .filter(|step| step.progress == Progress::Done)
         .count();
     let total = steps.len();
+    let extras = extras(&snapshot, skills.read().as_ref());
+    let skills_failed = skills
+        .read()
+        .as_ref()
+        .and_then(|read| read.as_ref().err().cloned());
     rsx! { PageFrame { kicker: "Get started", title: "Set up Agent 206.", description: "Each step shows what your gateway and vault report now. Finish them in any order; this page updates as you go.",
         Card { variant: CardVariant::Feature,
             CardHeader { CardTitle { "Setup checklist" }
@@ -292,18 +414,19 @@ pub(crate) fn Welcome() -> Element {
             }
             CardBody {
                 List { ordered: true, divided: true,
-                    for step in steps {
-                        { let (label, tone, icon) = step.progress.badge();
-                          rsx! { ListItem { key: "{step.title}",
-                              leading: rsx! { Icon { name: icon, size: IconSize::Sm } },
-                              headline: rsx! { "{step.title}" },
-                              supporting: rsx! { "{step.detail}" },
-                              trailing: rsx! { Badge { tone, "{label}" } },
-                              action: step.page.map_or(ListAction::None, |page| ListAction::Link(page.to_string())),
-                          } }
-                        }
-                    }
+                    for step in steps { StepItem { key: "{step.title}", step } }
                 }
+            }
+        }
+        Card { variant: CardVariant::Elevated,
+            CardHeader { CardTitle { "When you're ready" }
+                Button { size: ButtonSize::Sm, variant: ButtonVariant::Ghost, onclick: move |_| reload(), "Check skills again" }
+            }
+            CardBody {
+                List { divided: true,
+                    for step in extras { StepItem { key: "{step.title}", step } }
+                }
+                if let Some(report) = skills_failed { ErrorNotice { report, title: "Skills could not be read".to_owned() } }
             }
         }
         crate::pages::VaultControls {}
@@ -317,6 +440,18 @@ pub(crate) fn Welcome() -> Element {
         Card { variant: CardVariant::Subtle,
             CardBody { p { class: "a206-muted", "Working in a terminal? `agent206 setup` runs the gateway, vault, authenticator and pairing steps through the same requests, then prints the health report." } }
         }
+    } }
+}
+
+#[component]
+fn StepItem(step: Step) -> Element {
+    let (label, tone, icon) = step.progress.badge();
+    rsx! { ListItem {
+        leading: rsx! { Icon { name: icon, size: IconSize::Sm } },
+        headline: rsx! { "{step.title}" },
+        supporting: rsx! { "{step.detail}" },
+        trailing: rsx! { Badge { tone, "{label}" } },
+        action: step.page.map_or(ListAction::None, |page| ListAction::Link(page.to_string())),
     } }
 }
 
@@ -510,6 +645,55 @@ mod tests {
         assert!(!unfinished(&snapshot, 0));
     }
 
+    #[test]
+    fn extras_are_recommended_until_the_snapshot_shows_them() {
+        let none = Some(&Ok(vec![]));
+        let mut snapshot = crate::empty_snapshot();
+        assert_eq!(progress(&extras(&snapshot, none)), [Progress::Optional; 3]);
+        snapshot.projects.push(a206_core::Project {
+            id: Uuid::new_v4(),
+            name: text(),
+            root: text(),
+            manager: Uuid::new_v4(),
+        });
+        let mut messenger = a206_core::MessengerConfig::new(text(), MessengerKind::ALL[0]);
+        snapshot.settings.messengers.push(messenger.clone());
+        let [project, off, _] = extras(&snapshot, none);
+        assert_eq!(project.progress, Progress::Done);
+        // Configured but off is not connected.
+        assert_eq!(off.progress, Progress::Optional);
+        assert!(off.detail.contains("turned off"), "{}", off.detail);
+        messenger.enabled = true;
+        snapshot.settings.messengers = vec![messenger];
+        let enabled = Ok(vec![SkillSummary {
+            name: text(),
+            enabled: true,
+            ..Default::default()
+        }]);
+        assert_eq!(
+            progress(&extras(&snapshot, Some(&enabled))),
+            [Progress::Done; 3]
+        );
+    }
+
+    #[test]
+    fn a_skill_counts_only_while_the_gateway_offers_it() {
+        let snapshot = crate::empty_snapshot();
+        let skill = |read| extras(&snapshot, read).into_iter().last().unwrap();
+        assert_eq!(skill(None).progress, Progress::Checking);
+        let failed = Err(ErrorReport::new(ErrorKind::Protocol, text()));
+        assert_eq!(skill(Some(&failed)).progress, Progress::Unknown);
+        // An approval whose SKILL.md changed since is not offered.
+        let changed = Ok(vec![SkillSummary {
+            name: text(),
+            changed: true,
+            ..Default::default()
+        }]);
+        let step = skill(Some(&changed));
+        assert_eq!(step.progress, Progress::Optional);
+        assert!(step.detail.contains("Changed since"), "{}", step.detail);
+    }
+
     #[derive(Clone, Debug, PartialEq, Routable)]
     enum PageRoute {
         #[route("/")]
@@ -544,5 +728,11 @@ mod tests {
             "{html}"
         );
         assert!(html.contains("Start a conversation"), "{html}");
+        // Extras link to their pages and stay out of the count.
+        assert!(html.contains("Connect a messenger"), "{html}");
+        assert!(
+            html.contains(&format!("href=\"{}\"", Route::Messengers {})),
+            "{html}"
+        );
     }
 }
