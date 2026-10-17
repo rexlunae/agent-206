@@ -32,13 +32,19 @@ pub enum ProgramsError {
     TooBroad { path: PathBuf },
     #[error("program directory {} is listed twice", path.display())]
     Duplicate { path: PathBuf },
+    #[error(
+        "program directory {} contains `:`, which separates PATH entries; use a path without it",
+        path.display()
+    )]
+    Separator { path: PathBuf },
 }
 impl crate::error::Classified for ProgramsError {
     fn kind(&self) -> Option<ErrorKind> {
         Some(match self {
-            Self::NotAbsolute { .. } | Self::NotDirectory { .. } | Self::Duplicate { .. } => {
-                ErrorKind::InvalidRequest
-            }
+            Self::NotAbsolute { .. }
+            | Self::NotDirectory { .. }
+            | Self::Duplicate { .. }
+            | Self::Separator { .. } => ErrorKind::InvalidRequest,
             // Absent and unreadable paths need different recovery.
             Self::Missing { .. } => return None,
             Self::Protected { .. } | Self::TooBroad { .. } => ErrorKind::PermissionDenied,
@@ -48,9 +54,13 @@ impl crate::error::Classified for ProgramsError {
 
 /// `entries` in canonical form, or why one of them cannot be offered to
 /// commands. `hidden` are the paths commands may never see, `home` the
-/// user's home directory and `state_root` the gateway's state.
+/// user's home directory and `state_root` the gateway's state. Entries in
+/// `saved` were checked when they were saved and are kept as they are, so a
+/// toolchain that is gone for now does not block unrelated edits; commands
+/// pass none and check every entry as they start.
 pub fn validate(
     entries: &[PathBuf],
+    saved: &[PathBuf],
     hidden: &[PathBuf],
     home: Option<&Path>,
     state_root: &Path,
@@ -62,6 +72,13 @@ pub fn validate(
     entries
         .iter()
         .map(|path| {
+            if saved.contains(path) {
+                return if seen.insert(path.clone()) {
+                    Ok(path.clone())
+                } else {
+                    Err(ProgramsError::Duplicate { path: path.clone() })
+                };
+            }
             if !path.is_absolute() {
                 return Err(ProgramsError::NotAbsolute { path: path.clone() });
             }
@@ -72,6 +89,9 @@ pub fn validate(
                 })?;
             if !resolved.is_dir() {
                 return Err(ProgramsError::NotDirectory { path: path.clone() });
+            }
+            if resolved.as_os_str().as_encoded_bytes().contains(&b':') {
+                return Err(ProgramsError::Separator { path: path.clone() });
             }
             if hidden.iter().any(|hidden| resolved.starts_with(hidden)) {
                 return Err(ProgramsError::Protected { path: path.clone() });
@@ -119,7 +139,7 @@ mod tests {
 
     impl Layout {
         fn validate(&self, entries: &[PathBuf]) -> Result<Vec<PathBuf>, ProgramsError> {
-            validate(entries, &self.hidden, Some(&self.home), &self.state)
+            validate(entries, &[], &self.hidden, Some(&self.home), &self.state)
         }
         fn directory(&self, under: &Path) -> PathBuf {
             let path = under.join(uuid::Uuid::new_v4().to_string());
@@ -154,7 +174,10 @@ mod tests {
         let missing = layout.base.join(uuid::Uuid::new_v4().to_string());
         let secret = layout.directory(&layout.hidden[0]);
         let state = layout.directory(&layout.state);
+        let colon = layout.base.join(format!("{}:bin", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&colon).unwrap();
         let cases = [
+            (colon, "Separator"),
             (relative, "NotAbsolute"),
             (missing, "Missing"),
             (file, "NotDirectory"),
@@ -169,6 +192,7 @@ mod tests {
         for (path, expected) in cases {
             let error = validate(
                 std::slice::from_ref(&path),
+                &[],
                 &hidden,
                 Some(&layout.home),
                 &layout.state,
@@ -181,5 +205,32 @@ mod tests {
                 path.display()
             );
         }
+    }
+
+    #[test]
+    fn saved_directories_that_went_missing_do_not_block_other_edits() {
+        let layout = layout();
+        let tools = layout.directory(&layout.base);
+        let saved = layout.validate(std::slice::from_ref(&tools)).unwrap();
+        std::fs::remove_dir(&tools).unwrap();
+        let check = |entries: &[PathBuf]| {
+            validate(
+                entries,
+                &saved,
+                &layout.hidden,
+                Some(&layout.home),
+                &layout.state,
+            )
+        };
+        assert_eq!(check(&saved).unwrap(), saved);
+        assert!(matches!(
+            check(&[saved[0].clone(), saved[0].clone()]),
+            Err(ProgramsError::Duplicate { .. })
+        ));
+        // Commands check every entry again.
+        assert!(matches!(
+            layout.validate(&saved),
+            Err(ProgramsError::Missing { .. })
+        ));
     }
 }

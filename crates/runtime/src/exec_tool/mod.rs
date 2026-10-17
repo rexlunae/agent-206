@@ -741,6 +741,7 @@ impl ExecHost {
         let user_home = std::env::var_os("HOME").map(PathBuf::from);
         let programs = programs::validate(
             &scope.programs,
+            &[],
             &hidden,
             user_home.as_deref(),
             &self.state_root,

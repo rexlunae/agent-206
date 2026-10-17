@@ -173,12 +173,16 @@ background sessions.
   setting `program_directories` (the Modes settings page or
   `agent206 settings --apply`). Saving checks each is an absolute, existing
   directory, not inside gateway state or a hidden credential store, not
-  containing the home directory or gateway state, and listed once, then
-  stores it canonicalized. Each command checks them again as it starts and
+  containing the home directory or gateway state, without `:` (it separates
+  `PATH` entries), and listed once, then stores it canonicalized. Entries
+  already saved are kept as they are, so a toolchain that is gone for now
+  does not block unrelated settings edits. Each command checks them again as it starts and
   mounts them read-only and executable, with hidden paths inside them
-  covered as in a project. A directory that overlaps a writable project in
-  either direction is refused with `Conflict` (the command could rewrite
-  programs it runs later); with read access only it is allowed. Removing a
+  covered as in a project, and mounted before the grants so a broader one
+  cannot hide them. A directory that overlaps a writable project or the
+  command's private scratch directory in either direction is refused with
+  `Conflict` (the command could write programs and run them); a read-only
+  project inside one is allowed. Removing a
   directory stops background sessions that were given it. MCP servers and
   external backends do not get them.
 - **Results.** The text is the exit status, then stdout and stderr, each cut

@@ -209,9 +209,17 @@ impl Profile<'_> {
     }
 
     /// Refuses program directories that would expose a hidden path or
-    /// overlap a writable workspace, whose mounts would then shadow each
-    /// other in one direction or the other.
+    /// overlap a writable directory: the private scratch directory or a
+    /// writable workspace. Execute applies to everything beneath a program
+    /// directory, so one containing a writable directory would run whatever
+    /// the command writes there, and one inside it could be rewritten.
     pub fn check_programs(&self) -> Result<(), SandboxError> {
+        let writable = std::iter::once(self.scratch).chain(
+            self.workspace
+                .filter(|(_, write)| *write)
+                .map(|(workspace, _)| workspace),
+        );
+        let writable: Vec<&Path> = writable.collect();
         for program in self.programs {
             if let Some(hidden) = self
                 .hidden
@@ -223,12 +231,13 @@ impl Profile<'_> {
                     hidden: hidden.clone(),
                 });
             }
-            if let Some((workspace, true)) = self.workspace
-                && (program.starts_with(workspace) || workspace.starts_with(program))
+            if let Some(writable) = writable
+                .iter()
+                .find(|writable| program.starts_with(writable) || writable.starts_with(program))
             {
                 return Err(SandboxError::WritableProgramDirectory {
                     directory: program.clone(),
-                    workspace: workspace.to_path_buf(),
+                    writable: writable.to_path_buf(),
                 });
             }
         }
@@ -306,6 +315,10 @@ impl Profile<'_> {
         for path in etc.chain(network_etc) {
             bind(&mut args, "--ro-bind-try", Path::new(path));
         }
+        // First, so the grants below stay visible inside a broader one.
+        for program in self.programs {
+            bind(&mut args, "--ro-bind", program);
+        }
         bind(&mut args, "--ro-bind", self.root);
         bind(&mut args, "--ro-bind", self.helper);
         bind(&mut args, "--bind", self.scratch);
@@ -320,9 +333,6 @@ impl Profile<'_> {
             if write {
                 writable.push(workspace);
             }
-        }
-        for program in self.programs {
-            bind(&mut args, "--ro-bind", program);
         }
         let mounted: Vec<&Path> = [self.root, self.scratch]
             .into_iter()
@@ -662,6 +672,8 @@ mod tests {
         let position = |needle: &Path| args.iter().position(|arg| arg == needle.as_os_str());
         let mount = position(&tools).unwrap();
         assert_eq!(args[mount - 1], "--ro-bind");
+        // Grant mounts follow, so a broader program directory cannot hide them.
+        assert!(mount < position(&layout.root).unwrap());
         // A hidden directory inside it is covered like one inside a grant.
         let cover = position(&state).unwrap();
         assert!(cover > mount);
@@ -702,6 +714,16 @@ mod tests {
                 Err(SandboxError::WritableProgramDirectory { .. })
             ));
         }
+        // Nor one around the scratch directory, which is always writable.
+        let scratch = vec![layout.scratch.parent().unwrap().to_path_buf()];
+        assert!(matches!(
+            Profile {
+                programs: &scratch,
+                ..layout.profile(None, &[], false)
+            }
+            .arguments(),
+            Err(SandboxError::WritableProgramDirectory { .. })
+        ));
         // A read-only workspace cannot rewrite them.
         std::fs::create_dir(&within[0]).unwrap();
         Profile {

@@ -807,6 +807,7 @@ impl Gateway {
                 hidden.push(store.root.clone());
                 settings.program_directories = crate::exec_tool::programs::validate(
                     &settings.program_directories,
+                    &store.state.settings.program_directories,
                     &hidden,
                     home.as_deref(),
                     &store.root,

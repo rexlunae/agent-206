@@ -183,13 +183,13 @@ pub enum SandboxError {
     )]
     HiddenProgramDirectory { directory: PathBuf, hidden: PathBuf },
     #[error(
-        "program directory {} overlaps the writable workspace {}; programs there could be rewritten by the command",
+        "program directory {} overlaps the writable directory {}; programs there could be written by the command",
         directory.display(),
-        workspace.display()
+        writable.display()
     )]
     WritableProgramDirectory {
         directory: PathBuf,
-        workspace: PathBuf,
+        writable: PathBuf,
     },
     #[error("could not encode the sandbox specification")]
     Encode(#[source] rmp_serde::encode::Error),
