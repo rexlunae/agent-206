@@ -75,7 +75,16 @@ mod tests {
     use super::*;
     #[test]
     fn rendered_geometry_decodes_to_the_complete_authenticator_uri() {
-        let seed = uuid::Uuid::new_v4().simple().to_string().to_uppercase();
+        let seed: String = uuid::Uuid::new_v4()
+            .as_bytes()
+            .iter()
+            .flat_map(|byte| {
+                [
+                    char::from(b'A' + (byte >> 4)),
+                    char::from(b'A' + (byte & 15)),
+                ]
+            })
+            .collect();
         let uri = format!(
             "otpauth://totp/Agent%20206:test?secret={seed}&issuer=Agent%20206&algorithm=SHA1&digits=6&period=30"
         );

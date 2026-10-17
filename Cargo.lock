@@ -3112,12 +3112,12 @@ checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
 [[package]]
 name = "fc-context-menu"
 version = "0.1.0"
-source = "git+https://github.com/rexlunae/future-css?rev=a6d2846c6e0d6858d101550acb06a657dd18d857#a6d2846c6e0d6858d101550acb06a657dd18d857"
+source = "git+https://github.com/rexlunae/future-css?rev=934663011629a3c97938fb1fc2541afe8c38c39d#934663011629a3c97938fb1fc2541afe8c38c39d"
 
 [[package]]
 name = "fc-core"
 version = "0.1.0"
-source = "git+https://github.com/rexlunae/future-css?rev=a6d2846c6e0d6858d101550acb06a657dd18d857#a6d2846c6e0d6858d101550acb06a657dd18d857"
+source = "git+https://github.com/rexlunae/future-css?rev=934663011629a3c97938fb1fc2541afe8c38c39d#934663011629a3c97938fb1fc2541afe8c38c39d"
 dependencies = [
  "serde",
 ]
@@ -3125,12 +3125,12 @@ dependencies = [
 [[package]]
 name = "fc-diff"
 version = "0.1.0"
-source = "git+https://github.com/rexlunae/future-css?rev=a6d2846c6e0d6858d101550acb06a657dd18d857#a6d2846c6e0d6858d101550acb06a657dd18d857"
+source = "git+https://github.com/rexlunae/future-css?rev=934663011629a3c97938fb1fc2541afe8c38c39d#934663011629a3c97938fb1fc2541afe8c38c39d"
 
 [[package]]
 name = "fc-dioxus"
 version = "0.1.1"
-source = "git+https://github.com/rexlunae/fc-dioxus?rev=1b5eee0a54a13b19ac02f3c93d43c65d8f662a2e#1b5eee0a54a13b19ac02f3c93d43c65d8f662a2e"
+source = "git+https://github.com/rexlunae/fc-dioxus?rev=e304639c97ce9c6769728ac204043f934be2c783#e304639c97ce9c6769728ac204043f934be2c783"
 dependencies = [
  "dioxus",
  "fc-context-menu",
@@ -3149,12 +3149,12 @@ dependencies = [
 [[package]]
 name = "fc-git"
 version = "0.1.0"
-source = "git+https://github.com/rexlunae/future-css?rev=a6d2846c6e0d6858d101550acb06a657dd18d857#a6d2846c6e0d6858d101550acb06a657dd18d857"
+source = "git+https://github.com/rexlunae/future-css?rev=934663011629a3c97938fb1fc2541afe8c38c39d#934663011629a3c97938fb1fc2541afe8c38c39d"
 
 [[package]]
 name = "fc-grid"
 version = "0.1.0"
-source = "git+https://github.com/rexlunae/future-css?rev=a6d2846c6e0d6858d101550acb06a657dd18d857#a6d2846c6e0d6858d101550acb06a657dd18d857"
+source = "git+https://github.com/rexlunae/future-css?rev=934663011629a3c97938fb1fc2541afe8c38c39d#934663011629a3c97938fb1fc2541afe8c38c39d"
 dependencies = [
  "fc-core",
  "serde",
@@ -3163,12 +3163,12 @@ dependencies = [
 [[package]]
 name = "fc-highlight"
 version = "0.1.0"
-source = "git+https://github.com/rexlunae/future-css?rev=a6d2846c6e0d6858d101550acb06a657dd18d857#a6d2846c6e0d6858d101550acb06a657dd18d857"
+source = "git+https://github.com/rexlunae/future-css?rev=934663011629a3c97938fb1fc2541afe8c38c39d#934663011629a3c97938fb1fc2541afe8c38c39d"
 
 [[package]]
 name = "fc-model"
 version = "0.1.0"
-source = "git+https://github.com/rexlunae/future-css?rev=a6d2846c6e0d6858d101550acb06a657dd18d857#a6d2846c6e0d6858d101550acb06a657dd18d857"
+source = "git+https://github.com/rexlunae/future-css?rev=934663011629a3c97938fb1fc2541afe8c38c39d#934663011629a3c97938fb1fc2541afe8c38c39d"
 dependencies = [
  "fc-core",
  "serde",
@@ -3177,7 +3177,7 @@ dependencies = [
 [[package]]
 name = "fc-rich-text"
 version = "0.1.0"
-source = "git+https://github.com/rexlunae/future-css?rev=a6d2846c6e0d6858d101550acb06a657dd18d857#a6d2846c6e0d6858d101550acb06a657dd18d857"
+source = "git+https://github.com/rexlunae/future-css?rev=934663011629a3c97938fb1fc2541afe8c38c39d#934663011629a3c97938fb1fc2541afe8c38c39d"
 dependencies = [
  "fc-core",
  "fc-model",
@@ -3187,12 +3187,12 @@ dependencies = [
 [[package]]
 name = "fc-select"
 version = "0.1.0"
-source = "git+https://github.com/rexlunae/future-css?rev=a6d2846c6e0d6858d101550acb06a657dd18d857#a6d2846c6e0d6858d101550acb06a657dd18d857"
+source = "git+https://github.com/rexlunae/future-css?rev=934663011629a3c97938fb1fc2541afe8c38c39d#934663011629a3c97938fb1fc2541afe8c38c39d"
 
 [[package]]
 name = "fc-tokens"
 version = "0.1.1"
-source = "git+https://github.com/rexlunae/fc-dioxus?rev=1b5eee0a54a13b19ac02f3c93d43c65d8f662a2e#1b5eee0a54a13b19ac02f3c93d43c65d8f662a2e"
+source = "git+https://github.com/rexlunae/fc-dioxus?rev=e304639c97ce9c6769728ac204043f934be2c783#e304639c97ce9c6769728ac204043f934be2c783"
 
 [[package]]
 name = "fdeflate"

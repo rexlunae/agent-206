@@ -479,7 +479,7 @@ fn VaultPanel(target: Target) -> Element {
         Some(s) if !s.unlocked => ("Locked", BadgeTone::Warning),
         Some(_) => ("Unlocked", BadgeTone::Success),
     };
-    rsx! { Card { variant: CardVariant::Elevated,
+    rsx! { Card { variant: CardVariant::Feature,
         CardHeader { CardTitle { "Vault" } Badge { tone, dot: true, "{label}" } }
         CardBody {
             if let Some(status) = &status {
@@ -735,7 +735,7 @@ pub(crate) fn VaultSection() -> Element {
         };
     }
     rsx! {
-        Card { variant: CardVariant::Elevated,
+        Card { variant: CardVariant::Feature,
             CardHeader { CardTitle { "Connect securely to your vault" } Badge { tone: BadgeTone::Warning, "Verification required" } }
             CardBody {
                 p { "Before entering a password, verify the vault broker using a trusted terminal on the computer running your gateway." }
