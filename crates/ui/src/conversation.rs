@@ -150,7 +150,13 @@ fn Conversation(thread: Thread, target: Option<Uuid>) -> Element {
                         .find(|t| t.id == id)
                         .ok_or_else(|| rejected("This conversation is no longer available"))
                         .and_then(|thread| {
-                            crate::slash::resolve(slash, thread, &snapshot, can_create)
+                            crate::slash::resolve(
+                                slash,
+                                thread,
+                                &snapshot,
+                                can_create,
+                                crate::messengers::now(),
+                            )
                         })
                 };
                 match resolved {
