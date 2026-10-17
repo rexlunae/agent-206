@@ -289,6 +289,18 @@ fn describe(kind: &EventKind, snapshot: &Snapshot) -> Entry {
                 ),
             )
         }
+        EventKind::JobChanged { id } => match snapshot.jobs.iter().find(|job| job.id == *id) {
+            Some(job) => (
+                IconName::Clock,
+                conversation(&job.thread, &|c| {
+                    format!("Scheduled message “{}” changed in {c}", job.name)
+                }),
+            ),
+            None => (
+                IconName::Clock,
+                ("A scheduled message was removed".to_owned(), None),
+            ),
+        },
         EventKind::SettingsChanged => (
             IconName::Settings,
             ("Settings saved".to_owned(), Some(Route::Gateway {})),
