@@ -14,14 +14,14 @@ use zeroize::Zeroizing;
 ///
 /// Version 4 adds [`Request::ProviderStream`], version 5
 /// [`Request::ImportVault`], version 6 [`AuthScheme::TelegramBot`] and
-/// version 7 [`HttpMethod::Put`] and version 8 [`Request::SocketOpen`] with
-/// [`AuthScheme::DiscordBot`]. A broker accepts greetings from
+/// version 7 [`HttpMethod::Put`], version 8 [`Request::SocketOpen`] with
+/// [`AuthScheme::DiscordBot`] and version 9 [`SocketScheme::IrcSasl`]. A broker accepts greetings from
 /// [`MIN_BROKER_VERSION`] up to this version, and a client falls back to the
 /// newest version an older broker accepts (see `Client::version`), so streams
 /// are only requested from brokers that understand them.
-pub const BROKER_VERSION: u16 = 8;
+pub const BROKER_VERSION: u16 = 9;
 /// The oldest protocol version this broker still serves and this client still
-/// speaks. Versions 3 to 8 differ only by the requests and schemes they add.
+/// speaks. Versions 3 to 9 differ only by the requests and schemes they add.
 pub const MIN_BROKER_VERSION: u16 = 3;
 /// The first version that serves [`Request::ProviderStream`].
 pub const STREAM_VERSION: u16 = 4;
@@ -35,6 +35,11 @@ pub const PUT_VERSION: u16 = 7;
 /// The first version that opens WebSocket sessions ([`Request::SocketOpen`])
 /// and attaches Discord bot tokens ([`AuthScheme::DiscordBot`]).
 pub const SOCKET_VERSION: u16 = 8;
+/// The first version that opens IRC sessions ([`SocketScheme::IrcSasl`]).
+pub const IRC_VERSION: u16 = 9;
+/// Longest IRC line the gateway may send, without its CR LF (RFC 1459's
+/// 512 bytes, less the line ending).
+pub const MAX_IRC_LINE: usize = 510;
 /// Largest text message relayed in either direction of a socket session.
 /// Larger upstream messages end the session; the rest of the frame is
 /// reserved for the envelope.
@@ -204,7 +209,7 @@ pub enum AuthScheme {
 /// first asked, with the credential, where to connect; the socket URL it
 /// answers with (which may itself carry a session ticket) never leaves the
 /// broker. Since [`SOCKET_VERSION`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SocketScheme {
     /// `GET` the call's URL (Discord's `/gateway/bot`) with
     /// [`AuthScheme::DiscordBot`] and connect to the `url` it names, with
@@ -215,13 +220,26 @@ pub enum SocketScheme {
     /// `POST` the call's URL (Slack's `apps.connections.open`) with the
     /// app-level token as a bearer, and connect to the `url` it names.
     SlackSocketMode,
+    /// Connect to the IRC server the call's URL names (`ircs://host:port`,
+    /// or `irc://` on loopback), over TLS unless on loopback. The broker
+    /// requests the `sasl` and `account-tag` capabilities (and
+    /// `message-tags` when offered), registers with `login` as nickname,
+    /// and signs in to that services account with SASL PLAIN, the credential
+    /// being its password. Lines are relayed only once sign-in succeeded:
+    /// each frame is one line without its line ending, and each
+    /// `SocketSend` is one line of at most [`MAX_IRC_LINE`] bytes that the
+    /// broker ends with CR LF. A refusal has status 0 and one of the codes
+    /// `sasl_unavailable`, `account_tag_unavailable`, `sasl_failed`,
+    /// `nick_in_use` or `registration_failed`. Since [`IRC_VERSION`].
+    IrcSasl { login: String },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SocketCall {
     pub credential: String,
-    /// The HTTPS (or loopback HTTP) URL that names the socket. The credential
-    /// must be bound to its origin.
+    /// The HTTPS (or loopback HTTP) URL that names the socket, or the IRC
+    /// server for [`SocketScheme::IrcSasl`]. The credential must be bound to
+    /// its origin (for IRC, `ircs://host:port`).
     pub url: String,
     pub scheme: SocketScheme,
 }
@@ -417,7 +435,9 @@ pub enum InvalidRequest {
     Name,
     #[error("credential value does not match its kind")]
     KindMismatch,
-    #[error("destinations must be HTTPS (or loopback HTTP) URLs without embedded credentials")]
+    #[error(
+        "destinations must be HTTPS (or loopback HTTP) URLs, or ircs:// servers, without embedded credentials"
+    )]
     Destination,
     #[error("at most 16 destinations may be bound")]
     TooManyDestinations,
@@ -439,6 +459,12 @@ pub enum InvalidRequest {
     SocketBusy,
     #[error("a socket message is larger than the vault broker relays")]
     SocketMessage,
+    #[error("IRC servers are ircs:// (or loopback irc://) URLs without credentials or paths")]
+    IrcServer,
+    #[error("an IRC login must be a valid nickname")]
+    IrcLogin,
+    #[error("an IRC message must be one line of at most 510 bytes without NUL")]
+    IrcLine,
     #[error(
         "the vault to import must be an absolute path to a readable regular file of at most 16 MiB"
     )]
@@ -469,6 +495,8 @@ pub enum UpstreamFailure {
     InvalidHeader,
     #[error("the stored credential is not a valid bot token")]
     InvalidBotToken,
+    #[error("the stored credential cannot be sent as an IRC account password")]
+    InvalidPassword,
     #[error("the service named a socket URL that is not allowed")]
     SocketUrl,
     #[error("the service broke its socket protocol")]

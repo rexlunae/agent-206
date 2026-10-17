@@ -125,6 +125,7 @@ pub(crate) fn SignIn() -> Element {
 #[component]
 pub(crate) fn SignOut() -> Element {
     let state = use_context::<State>();
+    let crate::conversation::Drafts(mut drafts) = use_context();
     let mut busy = use_signal(|| false);
     // Subscribe before checking `network()`, which is not a signal: the
     // shell signs in or connects right after it learns the server's kind.
@@ -144,6 +145,8 @@ pub(crate) fn SignOut() -> Element {
                 state.error.set(Some(report));
             }
             state.data.set(crate::empty_snapshot());
+            // The next person to sign in on this browser must not see them.
+            drafts.write().clear();
             state.loaded.set(false);
             state.connected.set(false);
             state.sign_in.set(true);

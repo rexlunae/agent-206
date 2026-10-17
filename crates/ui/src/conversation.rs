@@ -1,9 +1,13 @@
-use crate::{State, dispatch, route::Route};
+use crate::{
+    State, dispatch,
+    route::{Columns, Route},
+};
 use a206_core::{
     Capability, CodingBackend, Command, CompactionTrigger, ErrorKind, ErrorReport,
     InstructionStatus, Mode, ModelKey, PlanStatus, Reply, Role, RunState, TextAttachment, Thread,
 };
 use fc_dioxus::prelude::*;
+use std::collections::HashMap;
 use uuid::Uuid;
 /// Scrolls a linked message into view where the renderer can scroll.
 async fn reveal(mounted: MountedEvent) {
@@ -20,50 +24,86 @@ async fn reveal(mounted: MountedEvent) {
         }
     }
 }
+/// What a composer holds but has not sent.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct Unsent {
+    pub(crate) text: String,
+    pub(crate) attachments: Vec<TextAttachment>,
+}
+/// Unsent drafts by conversation for the life of the client, so adding or
+/// closing a column, which remounts the conversations, or leaving the page
+/// keeps them.
+#[derive(Clone, Copy)]
+pub(crate) struct Drafts(pub(crate) Signal<HashMap<Uuid, Unsent>>);
 #[component]
-pub fn Workspace(id: Uuid, split: Option<Uuid>, message: Option<Uuid>) -> Element {
+pub fn Workspace(id: Uuid, split: Option<Columns>, message: Option<Uuid>) -> Element {
     let state = use_context::<State>();
     let snapshot = state.data.read();
     let thread = snapshot.threads.iter().find(|t| t.id == id).cloned();
-    let secondary = split
-        .filter(|second| *second != id)
-        .and_then(|second| snapshot.threads.iter().find(|t| t.id == second))
-        .cloned();
-    let visible_split = secondary.as_ref().map(|thread| thread.id);
+    let beside = split.as_ref().map(|c| c.beside(id)).unwrap_or_default();
+    let shown: Vec<Thread> = beside
+        .iter()
+        .filter_map(|other| snapshot.threads.iter().find(|t| t.id == *other))
+        .cloned()
+        .collect();
+    let missing = beside.len() - shown.len();
+    let shown_ids: Vec<Uuid> = shown.iter().map(|t| t.id).collect();
+    // This view with exactly `ids` beside the first conversation.
+    let with = move |ids: Vec<Uuid>| Route::Chat {
+        id,
+        split: Columns::of(ids),
+        message: None,
+    };
+    let can_add = shown.len() + 1 < Columns::MAX_VISIBLE;
     rsx! {
         if let Some(thread) = thread {
             div { class: "a206-chat-header a206-row a206-between",
                 strong { "Conversations" }
                 div { class: "a206-row a206-chat-actions",
-                    NativeSelect { class: "a206-split-selector", size: InputSize::Sm, aria_label: "Open a second conversation", value: visible_split.map(|id| id.to_string()).unwrap_or_default(),
-                        onchange: move |value: String| { state.navigator.push(Route::Chat { id, split: Uuid::parse_str(&value).ok().filter(|second| *second != id), message: None }); },
-                        option { value: "", selected: visible_split.is_none(), "Split view…" }
-                        for other in snapshot.threads.iter().filter(|t| t.id != id) { option { value: "{other.id}", selected: visible_split == Some(other.id), "{other.title}" } }
+                    if can_add {
+                        NativeSelect { class: "a206-split-selector", size: InputSize::Sm, aria_label: "Open another conversation beside this one", value: String::new(),
+                            onchange: {
+                                let shown_ids = shown_ids.clone();
+                                move |value: String| {
+                                    if let Ok(added) = Uuid::parse_str(&value) {
+                                        let mut ids = shown_ids.clone();
+                                        ids.push(added);
+                                        state.navigator.push(with(ids));
+                                    }
+                                }
+                            },
+                            option { value: "", selected: true, if shown.is_empty() { "Split view…" } else { "Add a column…" } }
+                            for other in snapshot.threads.iter().filter(|t| t.id != id && !shown_ids.contains(&t.id)) { option { value: "{other.id}", "{other.title}" } }
+                        }
+                    }
+                    for other in shown.iter() {
+                        LinkButton { key: "{other.id}", size: ButtonSize::Sm, variant: ButtonVariant::Ghost,
+                            href: with(shown_ids.iter().copied().filter(|shown| *shown != other.id).collect()).to_string(),
+                            "Close {other.title}"
+                        }
                     }
                     RenameTitle { key: "{thread.id}:{thread.title}", id: thread.id, initial: thread.title.clone() }
                 }
             }
-            if split.is_some_and(|second| second != id) && secondary.is_none() {
-                Alert { title: rsx! { "Second conversation unavailable" }, "It may have been removed or belong to another gateway.",
-                    LinkButton { href: Route::Chat { id, split: None, message: None }.to_string(), variant: ButtonVariant::Ghost, "Close split view" }
+            if missing > 0 {
+                Alert { title: rsx! { if missing == 1 { "A conversation beside this one is unavailable" } else { "{missing} conversations beside this one are unavailable" } },
+                    "It may have been removed or belong to another gateway.",
+                    LinkButton { href: with(shown_ids.clone()).to_string(), variant: ButtonVariant::Ghost, if shown.is_empty() { "Close split view" } else { "Close the unavailable columns" } }
                 }
             }
             if message.is_some_and(|message| !thread.messages.iter().any(|m| m.id == message)) {
                 Alert { title: rsx! { "Message unavailable" }, "That message is no longer in this conversation.",
-                    LinkButton { href: Route::Chat { id, split, message: None }.to_string(), variant: ButtonVariant::Ghost, "Show the whole conversation" }
+                    LinkButton { href: Route::Chat { id, split: split.clone(), message: None }.to_string(), variant: ButtonVariant::Ghost, "Show the whole conversation" }
                 }
             }
             div { class: "a206-chat-layout",
-                if let Some(second) = secondary {
-                    Split { key: "columns:{thread.id}", label: name!("Conversation columns"), default_value: 50.0, min: 25.0, max: 75.0,
-                        primary: rsx! { Conversation { key: "{thread.id}", thread, target: message } },
-                        secondary: rsx! { Conversation { key: "{second.id}", thread: second, target: None } }
-                    }
-                } else {
+                if shown.is_empty() {
                     Split { key: "inspector:{thread.id}", label: name!("Conversation and inspector"), default_value: 73.0, min: 45.0, max: 85.0,
                         primary: rsx! { Conversation { key: "{thread.id}", thread: thread.clone(), target: message } },
                         secondary: rsx! { Inspector { thread } }
                     }
+                } else {
+                    SideBySide { first: thread, target: message, rest: shown }
                 }
             }
         } else if !(state.loaded)() {
@@ -94,6 +134,22 @@ fn composer(thread: &Thread, sending: bool, steering: bool) -> Composer {
         steerable: active && thread.backend == CodingBackend::Native && !steering,
     }
 }
+/// `first` and then each of `rest`, side by side in resizable columns that
+/// start with equal shares. `target` is the message to show in `first`.
+#[component]
+fn SideBySide(first: Thread, target: Option<Uuid>, rest: Vec<Thread>) -> Element {
+    let Some((next, after)) = rest.split_first() else {
+        return rsx! { Conversation { key: "{first.id}", thread: first, target } };
+    };
+    // Columns are few, so the count converts to f64 exactly.
+    let share = 100.0 / (rest.len() + 1) as f64;
+    rsx! {
+        Split { key: "columns:{first.id}:{rest.len()}", label: name!("Conversation columns"), default_value: share, min: 15.0, max: 85.0,
+            primary: rsx! { Conversation { key: "{first.id}", thread: first.clone(), target } },
+            secondary: rsx! { SideBySide { first: next.clone(), target: None, rest: after.to_vec() } }
+        }
+    }
+}
 /// The activity line under a running conversation.
 pub(crate) fn run_status(thread: &Thread) -> (Lifecycle, String) {
     match (thread.held, thread.paused) {
@@ -116,8 +172,34 @@ pub(crate) fn run_status(thread: &Thread) -> (Lifecycle, String) {
 #[component]
 fn Conversation(thread: Thread, target: Option<Uuid>) -> Element {
     let mut state = use_context::<State>();
-    let mut draft = use_signal(String::new);
-    let mut attachments = use_signal(Vec::<TextAttachment>::new);
+    let Drafts(mut drafts) = use_context::<Drafts>();
+    let id = thread.id;
+    let mut draft = use_signal(|| {
+        drafts
+            .peek()
+            .get(&id)
+            .map(|u| u.text.clone())
+            .unwrap_or_default()
+    });
+    let mut attachments = use_signal(|| {
+        drafts
+            .peek()
+            .get(&id)
+            .map(|u| u.attachments.clone())
+            .unwrap_or_default()
+    });
+    use_effect(move || {
+        let unsent = Unsent {
+            text: draft(),
+            attachments: attachments(),
+        };
+        let mut all = drafts.write();
+        if unsent == Unsent::default() {
+            all.remove(&id);
+        } else {
+            all.insert(id, unsent);
+        }
+    });
     let mut attachment_error = use_signal(|| None::<ErrorReport>);
     let mut command_error = use_signal(|| None::<ErrorReport>);
     let mut reading_files = use_signal(|| false);
@@ -128,7 +210,6 @@ fn Conversation(thread: Thread, target: Option<Uuid>) -> Element {
     let steered: Vec<String> = thread.steering.iter().map(|m| m.text.clone()).collect();
     let has_model = thread.model.is_some();
     let selected_model = thread.model.clone();
-    let id = thread.id;
     let allowed_for_mode = thread.subagent_models.clone();
     let allowed_for_model = thread.subagent_models.clone();
     let mode = thread.mode;
