@@ -422,33 +422,22 @@ impl Gateway {
                 return Ok(Ended::Failed(GatewayError::HistoryFull));
             }
             let mut view = self.view(run.thread)?;
-            let catalog = tokio::select! {
-                catalog = tools::catalog(&self.tool_hosts, &view.scope) => catalog,
-                _ = run.cancel.cancelled() => return Ok(Ended::Cancelled),
+            let Some((mut catalog, mut offered)) = self.offer(run, &view).await else {
+                return Ok(Ended::Cancelled);
             };
-            for unavailable in &catalog.unavailable {
-                let _source = tracing::warn_span!("tools", source = %unavailable.source).entered();
-                crate::error::record("list_tools", &unavailable.error);
-            }
-            let offered: Vec<ToolSpec> = catalog
-                .tools
-                .values()
-                .filter(|routed| view.decide(&routed.spec).0 != ToolPermission::Deny)
-                .map(|routed| routed.spec.clone())
-                .collect();
             let over = compaction::over_threshold(last_input, run.info.context_limit);
-            // Flush only with a round left after it to answer in.
+            // Flush only before a compaction that will summarize something,
+            // with a save call and a round left after it to answer in.
+            let budget = effective_budget(&*self.lock()?, run.thread)?;
             let flush = over
                 && memory_flush::due(&view.thread)
-                && round < effective_budget(&*self.lock()?, run.thread)?.rounds
+                && compaction::compactable(&view.thread, compaction::KEEP_DURING_RUN)
+                && round < budget.rounds
+                && calls_used < budget.tool_calls
                 && offered
                     .iter()
                     .any(|spec| spec.name == memory_flush::save_tool());
-            if flush {
-                let mut store = self.lock()?;
-                memory_flush::mark(store.thread_mut(run.thread)?);
-                store.persist(Some(EventKind::ThreadChanged { id: run.thread }))?;
-            } else if over {
+            if over && !flush {
                 let compacted = self
                     .compact(compaction::Request {
                         thread: run.thread,
@@ -476,8 +465,12 @@ impl Gateway {
                     }
                     Err(error) => return Ok(Ended::Failed(error)),
                 }
-                // Send what the compaction left.
+                // Send what the compaction left, with the tools offered now.
                 view = self.view(run.thread)?;
+                (catalog, offered) = match self.offer(run, &view).await {
+                    Some(listed) => listed,
+                    None => return Ok(Ended::Cancelled),
+                };
                 // The next check uses what this round's request reports.
             }
             let flushing;
@@ -502,6 +495,12 @@ impl Gateway {
                 Some(Err(error)) => return Ok(Ended::Failed(error.into())),
                 None => return Ok(Ended::Cancelled),
             };
+            // Only a flush round the model completed counts as offered.
+            if flush {
+                let mut store = self.lock()?;
+                memory_flush::mark(store.thread_mut(run.thread)?);
+                store.persist(Some(EventKind::ThreadChanged { id: run.thread }))?;
+            }
             let sum = match total.take() {
                 None => turn.usage.clone(),
                 Some(sum) => add_usage(sum, &turn.usage),
@@ -552,6 +551,25 @@ impl Gateway {
                 }
             }
         }
+    }
+    /// List the tools a round may offer: every tool not denied to the
+    /// conversation. `None` when the run was cancelled meanwhile.
+    async fn offer(&self, run: &Native, view: &View) -> Option<(tools::Catalog, Vec<ToolSpec>)> {
+        let catalog = tokio::select! {
+            catalog = tools::catalog(&self.tool_hosts, &view.scope) => catalog,
+            _ = run.cancel.cancelled() => return None,
+        };
+        for unavailable in &catalog.unavailable {
+            let _source = tracing::warn_span!("tools", source = %unavailable.source).entered();
+            crate::error::record("list_tools", &unavailable.error);
+        }
+        let offered = catalog
+            .tools
+            .values()
+            .filter(|routed| view.decide(&routed.spec).0 != ToolPermission::Deny)
+            .map(|routed| routed.spec.clone())
+            .collect();
+        Some((catalog, offered))
     }
     /// Stream one model response, publishing text as it arrives. `None` when
     /// the run was cancelled; partial text stays in the conversation.

@@ -689,26 +689,77 @@ async fn no_flush_without_permission_to_save() {
 }
 
 #[tokio::test]
-async fn no_flush_when_the_round_budget_leaves_no_room_to_answer() {
+async fn no_flush_when_the_budget_leaves_no_save_or_answer() {
+    let api = ProviderApi::OpenAi;
+    for (rounds, tool_calls) in [(Some(1), None), (None, Some(0))] {
+        let (mut rig, ..) = flush_rig(api).await;
+        let mut budget = rig.thread().tool_budget;
+        budget.rounds = rounds.unwrap_or(budget.rounds);
+        budget.tool_calls = tool_calls.unwrap_or(budget.tool_calls);
+        let set = rig
+            .run(Command::SetToolBudget {
+                thread: rig.thread,
+                budget,
+            })
+            .await;
+        assert!(matches!(set, Reply::Ok | Reply::Thread(_)), "{set:?}");
+        let run = rig.send(rig.thread, &nonce());
+        let summary_request = rig.next().await;
+        assert!(!system_of(api, &summary_request.body).contains(FLUSH));
+        summary_request.respond(text_response(api, &nonce())).await;
+        rig.next().await.respond(text_response(api, &nonce())).await;
+        let thread = finished(run).await;
+        assert_eq!(summaries(&thread).len(), 1, "{budget:?}");
+        assert_eq!(thread.memory_flush, None, "{budget:?}");
+    }
+}
+
+#[tokio::test]
+async fn no_flush_until_a_compaction_would_summarize_something() {
+    let api = ProviderApi::OpenAi;
+    let limit = limit();
+    let over = around_threshold(limit).1;
+    let host = EchoHost {
+        name: tool_name("agent206.memory", "memory_save"),
+        marker: nonce(),
+    };
+    let mut rig = rig(api, Some(limit), Some(host)).await;
+    rig.turn(over).await;
+    // Only the previous and current turns: nothing to summarize yet.
+    let run = rig.send(rig.thread, &nonce());
+    let plain = rig.next().await;
+    assert!(!system_of(api, &plain.body).contains(FLUSH));
+    plain
+        .respond(text_response_reporting(api, &nonce(), over))
+        .await;
+    let thread = finished(run).await;
+    assert_eq!(thread.memory_flush, None);
+    assert!(summaries(&thread).is_empty());
+    // A third turn would leave the first out of context: flush first.
+    let run = rig.send(rig.thread, &nonce());
+    let flushing = rig.next().await;
+    assert!(system_of(api, &flushing.body).contains(FLUSH));
+    flushing.respond(text_response(api, &nonce())).await;
+    assert!(finished(run).await.memory_flush.is_some());
+}
+
+#[tokio::test]
+async fn a_failed_flush_round_is_offered_again() {
     let api = ProviderApi::OpenAi;
     let (mut rig, ..) = flush_rig(api).await;
-    let mut budget = rig.thread().tool_budget;
-    budget.rounds = 1;
-    let set = rig
-        .run(Command::SetToolBudget {
-            thread: rig.thread,
-            budget,
-        })
-        .await;
-    assert!(matches!(set, Reply::Ok | Reply::Thread(_)), "{set:?}");
     let run = rig.send(rig.thread, &nonce());
-    let summary_request = rig.next().await;
-    assert!(!system_of(api, &summary_request.body).contains(FLUSH));
-    summary_request.respond(text_response(api, &nonce())).await;
-    rig.next().await.respond(text_response(api, &nonce())).await;
+    let flushing = rig.next().await;
+    assert!(system_of(api, &flushing.body).contains(FLUSH));
+    flushing.respond(failure_response(api, &nonce())).await;
     let thread = finished(run).await;
-    assert_eq!(summaries(&thread).len(), 1);
+    assert_eq!(thread.state, RunState::Failed);
     assert_eq!(thread.memory_flush, None);
+    assert!(summaries(&thread).is_empty());
+    let run = rig.send(rig.thread, &nonce());
+    let again = rig.next().await;
+    assert!(system_of(api, &again.body).contains(FLUSH));
+    again.respond(text_response(api, &nonce())).await;
+    assert!(finished(run).await.memory_flush.is_some());
 }
 
 // ── Project instruction files ───────────────────────────────────────────────

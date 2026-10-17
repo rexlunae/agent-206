@@ -437,9 +437,12 @@ previous summary first.
   turn is kept; the model answers in the same run. Saves go through the ordinary
   tool path, so an `Ask` permission asks the user. The compaction then happens
   before the next round, or at the start of the next run if the model just
-  answered. The flush is offered once per summary (`Thread::memory_flush` records
-  the latest summary at the time, so restarts and later runs do not repeat it), and
-  only when the round budget leaves a round to answer in. Manual compaction has no
+  answered. The flush is offered once per summary: `Thread::memory_flush` records
+  the latest summary when a flush round completes, so restarts and later runs do
+  not repeat it, while a failed or cancelled flush round is offered again. It is
+  offered only when the compaction would summarize at least one turn and the budget
+  leaves a tool call for the save and a round to answer in. The tools offered are
+  listed again after a compaction. Manual compaction has no
   flush. Follows RustyClaw's `memory_flush.rs`, but triggers at the compaction
   threshold instead of a fixed token count before it.
 - Compaction does not reduce the conversation's stored size.
