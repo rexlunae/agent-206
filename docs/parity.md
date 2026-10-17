@@ -108,7 +108,7 @@ invocations and relays gateway-authorized host calls (`a206/docs/plugin-api.md`)
 | Swarm orchestration + templates (`swarm/*`, `tools/swarm_tools.rs`, CLI `swarm`) | missing | Project coordinator thread + delegated task lifecycle |
 | Task fg/bg/pause/resume/input (`tasks/*`, `tools/task_tools.rs`) | missing | Task state machine with durable events |
 | `session_status` usage/cost (`tools/sessions_tools.rs`) | partial: per-request usage/cost/balance widgets from API (`docs/status.md` Usage) | Cumulative accounting, API-sourced only |
-| Concurrent model execution (`gateway/concurrent.rs`) | partial: two visible conversations; runs per thread | >2 views, saved layouts |
+| Concurrent model execution (`gateway/concurrent.rs`) | partial (owner: web client thread): up to four conversations side by side in resizable columns, kept in the address (`?split=` lists them, so older one-conversation links still open; `ui/src/route.rs` Columns, `ui/src/conversation.rs` SideBySide), each column closable and its actions in the command palette; runs per thread | Saved layouts |
 
 ## Scheduling and automation
 
