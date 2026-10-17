@@ -2,7 +2,7 @@
 //! gateway authorizes against the caller's `read_workspace` grant.
 use a206_extension_sdk::{
     Args, DirEntry, EntryKind, Extension, Field, GuestError, Node, Tone, ToolOutput, UiEvent, View,
-    bool_arg, host, int_arg, string_arg,
+    bool_arg, excerpt, host, int_arg, string_arg,
 };
 
 struct Workspace;
@@ -13,8 +13,6 @@ const SHOW_HIDDEN: &str = "show_hidden";
 const TOGGLE_HIDDEN: &str = "toggle-hidden";
 const README_LINES: usize = 40;
 const DEFAULT_MATCHES: i64 = 100;
-/// Text a tool returns, kept well inside the host's 256 KiB outcome limit.
-const MAX_TOOL_TEXT: usize = 192 * 1024;
 
 impl Extension for Workspace {
     fn tool(name: &str, args: &Args) -> Result<ToolOutput, GuestError> {
@@ -173,23 +171,6 @@ fn field(label: &str, value: usize) -> Field {
 }
 fn text(bytes: Vec<u8>) -> Result<String, GuestError> {
     String::from_utf8(bytes).map_err(|_| GuestError::new("not_text", "the file is not UTF-8 text"))
-}
-/// Cut long text at a character boundary and say so, rather than fail the
-/// call by exceeding the outcome limit.
-fn excerpt(mut text: String) -> String {
-    if text.len() <= MAX_TOOL_TEXT {
-        return text;
-    }
-    let total = text.len();
-    let mut end = MAX_TOOL_TEXT;
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    text.truncate(end);
-    text.push_str(&format!(
-        "\n\n[truncated: showing the first {end} of {total} bytes]"
-    ));
-    text
 }
 fn required<'a>(args: &'a Args, name: &str) -> Result<&'a str, GuestError> {
     string_arg(args, name)?

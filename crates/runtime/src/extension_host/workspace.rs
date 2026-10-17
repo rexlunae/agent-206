@@ -296,6 +296,29 @@ fn writable_path(path: &str) -> Result<&Path, HostFailure> {
     }
     Ok(relative)
 }
+/// A plain relative path outside `.git`, for calls that name a tracked file.
+pub(super) fn check_relative(path: &str) -> Result<(), HostFailure> {
+    writable_path(path).map(drop)
+}
+/// A workspace file's bytes, or `None` when it does not exist.
+/// A file as git sees it in the working tree: a symbolic link is its target
+/// text, read without following it; anything else is read like `read_file`.
+pub(super) fn read_worktree(root: PathBuf, path: &str) -> Result<Option<Vec<u8>>, HostFailure> {
+    let dir = open_workspace(root)?;
+    match dir.symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            let target = dir.read_link_contents(path).map_err(|e| io_failure(&e))?;
+            Ok(Some(target.into_os_string().into_encoded_bytes()))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(io_failure(&error)),
+        Ok(_) => match open_regular(&dir, path) {
+            Ok(file) => read_bounded(file)?.map(Some).ok_or_else(too_large),
+            Err(failure) if failure.code == HostErrorCode::NotFound => Ok(None),
+            Err(failure) => Err(failure),
+        },
+    }
+}
 /// The parent directory and file name of a path the guest may write.
 fn writable(root: PathBuf, path: &str) -> Result<(Dir, String), HostFailure> {
     let relative = writable_path(path)?;

@@ -221,6 +221,31 @@ async fn extension_smoke(app: &App) -> Result<()> {
         found.contains("made/new.txt:1:"),
         "search missed the edit: {found}"
     );
+    // The git extension reaches the gateway's git host calls; this
+    // workspace has no repository, and the client hears why.
+    app.cli(&[
+        "extension",
+        "grant",
+        "agent206.git",
+        "--capability",
+        "git_read",
+    ])
+    .await?;
+    let status = capture(app.command(&[
+        "extension",
+        "tool",
+        "agent206.git",
+        "git_status",
+        "--project",
+        &project,
+    ]))
+    .await?;
+    ensure!(
+        !status.status.success()
+            && String::from_utf8_lossy(&status.stderr).contains("not a git repository"),
+        "git status outside a repository: {}",
+        String::from_utf8_lossy(&status.stderr)
+    );
     app.cli(&["extension", "grant", id]).await?;
     ensure!(
         !capture(app.command(&panel)).await?.status.success(),

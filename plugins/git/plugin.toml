@@ -1,0 +1,37 @@
+id = "agent206.git"
+name = "Git"
+description = "Shows the status, history and diffs of a project's git repository, without running anything the repository configures."
+version = "0.1.0"
+abi = 2
+capabilities = ["git_read"]
+
+[[tools]]
+name = "git_status"
+description = "List the branch, HEAD commit and changed paths (staged, unstaged and untracked) of the project's git repository."
+capabilities = ["git_read"]
+
+[[tools]]
+name = "git_log"
+description = "List the most recent commits reachable from HEAD, newest first, with id, author name, time and summary."
+capabilities = ["git_read"]
+
+[[tools.params]]
+name = "max"
+type = "integer"
+description = "Most commits to list, from 1 to 200. Defaults to 20."
+
+[[tools]]
+name = "git_diff"
+description = "Show a unified diff of one file: the index against the working tree, or HEAD against the index when staged is true."
+capabilities = ["git_read"]
+
+[[tools.params]]
+name = "path"
+type = "string"
+description = "File path relative to the repository root."
+required = true
+
+[[tools.params]]
+name = "staged"
+type = "boolean"
+description = "Diff the staged change instead of the unstaged one. Defaults to false."

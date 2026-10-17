@@ -32,6 +32,8 @@ zeroize.workspace = true
 fs2 = "0.4"
 cap-std = "4"
 cap-fs-ext = "4"
+# Pure-Rust git: no hooks, filters or other repository-configured programs run.
+gix = { version = "0.89", default-features = false, features = ["status", "blob-diff", "sha1", "parallel"] }
 axum = "0.8"
 axum-server = { version = "0.8", features = ["tls-rustls-no-provider"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
