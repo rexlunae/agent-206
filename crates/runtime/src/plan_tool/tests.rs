@@ -80,6 +80,7 @@ fn update(state: ToolCallState) -> Message {
         error: None,
         signature: None,
         reduction: None,
+        redactions: Vec::new(),
     });
     message
 }

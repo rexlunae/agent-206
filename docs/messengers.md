@@ -1,8 +1,8 @@
 # Messengers
 
 A messenger connects a chat service account to Agent 206 so that people can
-talk to a thread from that service. Telegram, Matrix, Discord and Slack are
-implemented;
+talk to a thread from that service. Telegram, Matrix, Discord, Slack and IRC
+are implemented;
 RustyClaw's other channels are listed in
 [parity.md](parity.md#messengers--channels).
 
@@ -15,12 +15,14 @@ of the desktop, web and terminal apps):
 ```toml
 [[messengers]]
 name = "team"                 # lowercase letters, digits, single hyphens
-kind = "telegram"             # or "matrix", "discord" or "slack"
+kind = "telegram"             # or "matrix", "discord", "slack" or "irc"
 enabled = false               # off until the user turns it on
 credential = "team-token"     # vault credential name, never the token
 # app_credential = "team-app"  # Slack only: the app-level token's credential
+# login = "teambot"           # IRC only: the services account (and nickname)
 # endpoint = "https://..."    # an origin; defaults to the official API,
-                              # required for Matrix (the homeserver)
+                              # required for Matrix (the homeserver) and
+                              # IRC (the server, ircs://host[:port])
 allowed_chats = ["-1001234"]  # chats whose messages reach a thread
 allowed_users = ["5551234"]   # senders accepted; groups need it
 model = { provider = "<provider id>", model = "<id from the provider's API>" }
@@ -260,6 +262,66 @@ agent206 messenger enable workspace
   or a missing app credential stops the messenger until the user acts. The
   bot user is checked (`auth.test`) before each batch.
 
+## IRC
+
+An IRC messenger signs in to one network as a registered services account,
+over TLS, with SASL PLAIN. Register the bot's nickname with the network's
+services (NickServ) first; the account name is the entry's `login` and is
+also the nickname it asks for. The account password is a vault credential
+bound to the server.
+
+```sh
+agent206 vault add libera-bot --kind token --destination ircs://irc.libera.chat
+agent206 messenger add libera --kind irc --endpoint ircs://irc.libera.chat --login teambot --credential libera-bot
+agent206 messenger allow libera '#team'
+agent206 messenger allow-sender libera alice
+agent206 messenger enable libera
+```
+
+- **Server.** The endpoint is `ircs://host[:port]` (port 6697 by default).
+  Plain `irc://` is accepted only for a loopback address, where nothing
+  crosses the network; a public server without TLS is refused rather than
+  sent the password in plain text. The broker connects directly, checks the
+  certificate against the bundled web roots and binds the credential to
+  `ircs://host:port`.
+- **Brokered sign-in.** The broker opens the connection, negotiates
+  capabilities and sends the SASL payload itself
+  (`SocketScheme::IrcSasl`, broker protocol v9), so the password never
+  reaches the gateway. It refuses a server that does not offer SASL PLAIN or
+  `account-tag`, a rejected password, or a nickname already in use, each with
+  its own code; these stop the messenger until the user acts. After the
+  welcome (001) the broker relays whole lines; the gateway can send only a
+  single line of at most 510 bytes, and the broker answers keepalives and
+  ends a silent connection after 90 seconds.
+- **Identity.** Nicknames can be taken by anyone, so senders are services
+  accounts, read from each message's `account` tag. Allowed senders are
+  account names; a message without an account (its sender is not signed in)
+  is never answered. Chats are channel names (`#team`, which need listed
+  senders like any group) or, for direct messages, the sender's account
+  name. Names are compared with ASCII letters folded to lowercase, and the
+  CLI, the Messengers page and import fold them as they are saved. Networks
+  that also treat `[]\~` as `{}|^` (RFC 1459 case mapping) are not folded
+  that far, since networks with ASCII case mapping keep `[bot]` and `{bot}`
+  as different accounts; a name written the other way is refused rather
+  than taken for someone else.
+- **Direct replies.** Each line of a reply to a direct message goes to the
+  nickname that sent it only after a `WHOIS` shows that nickname is still
+  signed in to the same account; otherwise nothing more is sent and the
+  status says the recipient is gone. The messenger keeps running.
+- **What is read and sent.** Only `PRIVMSG` text is read; CTCP requests,
+  notices, the bot's own lines and lines tagged as from a bot are ignored.
+  The bot joins its allowed channels on connecting and when invited to one.
+  Replies are `PRIVMSG` lines with control characters removed (so no
+  formatting or CTCP), short enough that the relayed line fits in 512 bytes
+  whatever the channel's length, and at most 24 lines per reply (longer
+  replies end with a note that they were cut). They are sent 700 ms apart,
+  or 1.4 s for direct replies, whose lines each follow a `WHOIS`, so the
+  server does not disconnect the bot for flooding.
+- **Delivery.** Messages sent while the bot was disconnected are not
+  answered; a dropped connection signs in again. A nickname in use (often
+  the bot's own earlier connection, until the server notices it is gone) is
+  retried with the usual backoff, with the failure shown meanwhile.
+
 ## Interface for the run engine
 
 `a206_runtime::messengers::Host` is the boundary between a messenger and the
@@ -284,7 +346,9 @@ participant cannot approve their own request.
 
 ## Not yet
 
-- IRC, Signal, WhatsApp, Google Chat, Teams, iMessage and webhooks.
+- Signal, WhatsApp, Google Chat, Teams, iMessage and webhooks.
+- IRC certificate fingerprints or custom roots, SASL EXTERNAL, networks
+  without `account-tag`, and channel keys.
 - Slack thread replies, the Events API over HTTP (Socket Mode only) and
   conversation names in the refused list.
 - Discord session resume, slash commands, threads' own channel ids beyond
