@@ -193,6 +193,26 @@ async fn writes_need_the_write_grant_and_stay_inside_the_root() {
             Some(HostErrorCode::Invalid)
         );
         assert_eq!(std::fs::read_to_string(&outside).unwrap(), "kept");
+
+        // A relative link stays inside the root, so cap-std allows it; it
+        // still must not lead a write into `.git`.
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::os::unix::fs::symlink(".git", root.join("repo")).unwrap();
+        assert_eq!(
+            code(host.handle(write("repo/config", &body, false)).await),
+            Some(HostErrorCode::Invalid)
+        );
+        assert_eq!(
+            code(
+                host.handle(HostRequest::CreateDirectory {
+                    path: "repo/hooks".into()
+                })
+                .await
+            ),
+            Some(HostErrorCode::Invalid)
+        );
+        assert!(!root.join(".git/config").exists());
+        assert!(!root.join(".git/hooks").exists());
     }
     let huge = "x".repeat(MAX_FILE as usize + 1);
     assert_eq!(
@@ -304,6 +324,8 @@ async fn search_is_bounded_and_does_not_follow_links() {
     std::fs::write(root.join("src/deep/b.txt"), format!("{needle}\n")).unwrap();
     std::fs::write(root.join(".git/c.txt"), &needle).unwrap();
     std::fs::write(root.join("binary.bin"), [0xff, 0xfe, 0x00]).unwrap();
+    // After `src/` in name order, though it is nearer the search root.
+    std::fs::write(root.join("top.txt"), &needle).unwrap();
     std::fs::write(dir.path().join("outside.txt"), &needle).unwrap();
     #[cfg(unix)]
     std::os::unix::fs::symlink(dir.path(), root.join("escape")).unwrap();
@@ -336,13 +358,25 @@ async fn search_is_bounded_and_does_not_follow_links() {
                 line: 1,
                 text: needle.clone()
             },
+            SearchMatch {
+                path: "top.txt".into(),
+                line: 1,
+                text: needle.clone()
+            },
         ]
     );
-    let HostReply::Matches(first) = host.handle(search("src", 1)).await else {
+    let HostReply::Matches(first) = host.handle(search(".", 1)).await else {
         panic!("search failed");
     };
     assert!(first.truncated);
-    assert_eq!(first.matches.len(), 1);
+    assert_eq!(
+        first
+            .matches
+            .iter()
+            .map(|m| &m.path[..])
+            .collect::<Vec<_>>(),
+        ["src/a.txt"]
+    );
     assert_eq!(
         code(host.handle(search("..", 10)).await),
         Some(HostErrorCode::Invalid)

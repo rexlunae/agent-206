@@ -110,9 +110,9 @@ unsafe operation.
 | --- | --- | --- | --- |
 | `read_file { path }` | `read_workspace` + a project | file bytes | 512 KiB, regular files only (opened without blocking) |
 | `list_directory { path }` | `read_workspace` + a project | entries (name, kind, size if known) | 1,024 entries |
-| `search { path, query, max_matches }` | `read_workspace` + a project | matches (path, line, text) and whether it stopped early | literal, case-sensitive query of 1 KiB; 500 matches, 5,000 files, 32 MiB read; skips `.git`, symlinks, files over 512 KiB and non-UTF-8 files; name order |
-| `write_file { path, contents, overwrite }` | `write_workspace` + a project | done | 512 KiB; a new file is created exclusively, an existing regular file is replaced atomically (temporary file and rename) keeping its permissions; without `overwrite` an existing file is `exists` |
-| `edit_file { path, old, new }` | `write_workspace` + a project | done | UTF-8, 512 KiB; `old` must occur exactly once, else `conflict` |
+| `search { path, query, max_matches }` | `read_workspace` + a project | matches (path, line, text) and whether it stopped early | literal, case-sensitive query of 1 KiB; 500 matches, 5,000 files, 32 MiB read; 10,000 directories, 64 levels; skips `.git`, symlinks, files over 512 KiB and non-UTF-8 files; results in path order |
+| `write_file { path, contents, overwrite }` | `write_workspace` + a project | done | 512 KiB; written to a temporary file first, so readers never see a partial file; a new file is published with a hard link that refuses one created meanwhile, an existing regular file is replaced by rename keeping its permissions; without `overwrite` an existing file is `exists` |
+| `edit_file { path, old, new }` | `write_workspace` + a project | done | UTF-8, 512 KiB; `old` must occur exactly once, else `conflict`; also `conflict` when the file changed after it was read |
 | `create_directory { path }` | `write_workspace` + a project | done, also when it exists | missing parents are created |
 | `state_get { key }` | nothing | the extension's own value | — |
 | `state_put { key, value }` | nothing | done (`value = None` deletes) | 64 keys, 256 KiB per extension |
@@ -120,7 +120,8 @@ unsafe operation.
 
 Workspace paths are relative and resolved with cap-std: absolute paths, `..`
 escapes and symlinks that leave the root are refused. Writes also refuse any
-path through `.git` and never write through a symlink. A refusal is a typed
+path through `.git` (in any letter case) or through a symlink, and the
+gateway serializes extension writes so an edit cannot interleave with another. A refusal is a typed
 `failed { code, message }` reply (`denied`, `no_workspace`, `not_found`,
 `invalid`, `too_large`, `exists`, `conflict`, `budget`, `unsupported`, `io`;
 a host that predates a code sends it as `other`); messages never contain
