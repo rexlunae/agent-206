@@ -1,7 +1,7 @@
 //! Bundled git extension. Every repository read is a host call that the
 //! gateway authorizes against the caller's `git_read` grant.
 use a206_extension_sdk::{
-    Args, Extension, GitArea, GitChange, GuestError, ToolOutput, bool_arg, host, int_arg,
+    Args, Extension, GitArea, GitChange, GuestError, ToolOutput, bool_arg, excerpt, host, int_arg,
     string_arg,
 };
 
@@ -76,14 +76,16 @@ impl Extension for Git {
                 } else {
                     let mut text = format!("--- a/{path}\n+++ b/{path}\n{}", diff.text);
                     if diff.truncated {
-                        text.push_str("\n[diff truncated at 256 KiB]");
+                        text.push_str("\n[diff truncated at 192 KiB]");
                     }
                     text
                 }
             }
             _ => return Err(GuestError::new("unknown_tool", format!("no tool `{name}`"))),
         };
-        Ok(ToolOutput { text })
+        Ok(ToolOutput {
+            text: excerpt(text),
+        })
     }
 }
 

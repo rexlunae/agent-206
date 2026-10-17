@@ -316,6 +316,32 @@ fn git_tool_renders_status_from_host_calls() {
     assert_eq!(*seen.borrow(), vec![HostRequest::GitStatus]);
 }
 
+/// A diff at the host's limit still fits the outcome limit once the guest
+/// adds its headers, however long the path.
+#[test]
+fn long_diffs_fit_the_outcome_limit() {
+    let builtin = builtin("agent206.git").unwrap().unwrap();
+    let limits = Limits::default();
+    let path = unique("p").repeat(limits.output_bytes / 16);
+    let reply = GitDiff {
+        text: "+x\n".repeat(limits.output_bytes / 4),
+        binary: false,
+        truncated: true,
+    };
+    let (bridge, _) = mock(move |_| HostReply::Diff(reply.clone()));
+    let (outcome, _) = engine::run(
+        builtin.wasm,
+        &tool("git_diff", &[("path", Value::Str(path.clone()))]),
+        limits,
+        bridge,
+    );
+    let Ok(Outcome::Tool(output)) = outcome else {
+        panic!("expected tool output, got {outcome:?}");
+    };
+    assert!(output.text.starts_with(&format!("--- a/{path}\n")));
+    assert!(output.text.ends_with(" bytes]"));
+}
+
 #[test]
 fn budgets_stop_the_guest() {
     let reply = |_: &HostRequest| HostReply::Directory(vec![]);

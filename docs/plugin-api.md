@@ -13,11 +13,13 @@ only reach. Without bubblewrap or Landlock, calls fail rather than run unconfine
 
 Agent 206 bundles `agent206.workspace` (`plugins/workspace`), written in Rust
 against the guest SDK and compiled to WASM by `crates/extensions/build.rs`. It
-offers the `list_directory`, `read_text_file` (text past 192 KiB is cut with a
-notice), `search_text`, `write_text_file` and `edit_text_file` tools and an
-`overview` panel. The write tools need a separate `write_workspace` grant.
-It also bundles `agent206.git` (`plugins/git`) with `git_status`, `git_log`
-and `git_diff` tools under the `git_read` grant. User-installed and agent-prepared packages are not implemented yet: the
+offers the `list_directory`, `read_text_file`, `search_text`,
+`write_text_file` and `edit_text_file` tools and an `overview` panel. The
+write tools need a separate `write_workspace` grant. It also bundles
+`agent206.git` (`plugins/git`) with `git_status`, `git_log` and `git_diff`
+tools under the `git_read` grant. Bundled tools cut text past 192 KiB with a
+notice (the SDK's `excerpt`), so a long result never exceeds the outcome
+limit. User-installed and agent-prepared packages are not implemented yet: the
 worker only loads bundled modules.
 
 The wire types live in `a206-extension-abi`; the guest SDK is
@@ -121,13 +123,17 @@ unsafe operation.
 | `create_directory { path }` | `write_workspace` + a project | done, also when it exists | missing parents are created |
 | `git_status` | `git_read` + a project | branch, `HEAD` id, changed paths (staged, unstaged, untracked) | 1,000 entries; 5 s scan; renames not tracked; submodules ignored |
 | `git_log { max }` | `git_read` + a project | commits from `HEAD`: id, summary, author name (no email), author time | 200 commits |
-| `git_diff { path, staged }` | `git_read` + a project | unified diff of one file (`HEAD`→index when `staged`, else index→working tree), or `binary` | 512 KiB per side, 256 KiB of text, 3 context lines |
+| `git_diff { path, staged }` | `git_read` + a project | unified diff of one file (`HEAD`→index when `staged`, else index→working tree; a symbolic link compares its target text), or `binary` | 512 KiB per side (checked before a blob is read), 192 KiB of text, 3 context lines |
 | `state_get { key }` | nothing | the extension's own value | — |
 | `state_put { key, value }` | nothing | done (`value = None` deletes) | 64 keys, 256 KiB per extension |
 | `log { level, message }` | nothing | done; recorded through tracing | 32 per call, 1 KiB each |
 
 Git calls use gitoxide on the repository at exactly the project root (never a
-parent directory). They read no system or global git configuration and no
+parent directory): a `.git` directory there, or a bare repository that is the
+root itself. All repository metadata must be inside the project, so a `.git`
+file or symlink (linked worktrees, submodule checkouts), a `commondir`,
+`objects/info/alternates` or symlinked metadata is refused as `unsupported`,
+and `core.worktree` is ignored. They read no system or global git configuration and no
 `GIT_*` environment, and nothing the repository configures can run: no hooks,
 filter, diff, textconv, fsmonitor or credential programs. The working-tree side
 of a diff is the raw file, without line-ending or filter conversion.

@@ -182,3 +182,173 @@ async fn repository_programs_never_run() {
     assert!(diff.text.contains("+diff"));
     assert!(!marker.exists(), "a repository-configured program ran");
 }
+
+#[tokio::test]
+async fn git_tools_need_a_project() {
+    let (dir, store) = store();
+    let host = ExtensionHost::new(Arc::clone(&store), dir.path().into());
+    let id = "agent206.git";
+    grant(&store, id, &[Capability::GitRead]);
+    let error = host
+        .call_tool(id, "git_status", Args::new(), Scope::default())
+        .await
+        .unwrap_err();
+    assert!(matches!(error, ExtensionError::NoProject), "{error:?}");
+}
+
+#[tokio::test]
+async fn a_bare_repository_at_the_root_is_read() {
+    let (dir, store) = store();
+    let root = dir.path().join("bare.git");
+    gix::init_bare(&root).unwrap();
+    let mut host = workspace_calls(&store, Some(root), &[Capability::GitRead]);
+    let HostReply::GitStatus(status) = host.handle(HostRequest::GitStatus).await else {
+        panic!("status failed");
+    };
+    assert!(status.head.is_none() && status.entries.is_empty());
+    assert_eq!(
+        host.handle(HostRequest::GitLog { max: 5 }).await,
+        HostReply::Commits(Vec::new())
+    );
+    assert_eq!(
+        code(
+            host.handle(HostRequest::GitDiff {
+                path: "a.txt".into(),
+                staged: false
+            })
+            .await
+        ),
+        Some(HostErrorCode::Unsupported)
+    );
+}
+
+/// Metadata that resolves outside the project is never followed: a `.git`
+/// file or symlink, a linked worktree's `commondir` or alternates are
+/// refused, and a configured worktree elsewhere is ignored.
+#[tokio::test]
+async fn repository_metadata_outside_the_project_is_refused() {
+    let (dir, store) = store();
+    let outside = dir.path().join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    repository(&outside, &[("secret.txt", "hidden\n")]);
+    let outside_git = outside.join(".git");
+    let status = |root: PathBuf| {
+        let mut host = workspace_calls(&store, Some(root), &[Capability::GitRead]);
+        async move { code(host.handle(HostRequest::GitStatus).await) }
+    };
+    let project = |name: &str| {
+        let root = dir.path().join(name);
+        std::fs::create_dir(&root).unwrap();
+        root
+    };
+
+    let gitfile = project("gitfile");
+    std::fs::write(
+        gitfile.join(".git"),
+        format!("gitdir: {}\n", outside_git.display()),
+    )
+    .unwrap();
+    assert_eq!(status(gitfile).await, Some(HostErrorCode::Unsupported));
+
+    #[cfg(unix)]
+    {
+        let linked = project("linked");
+        std::os::unix::fs::symlink(&outside_git, linked.join(".git")).unwrap();
+        assert_eq!(status(linked).await, Some(HostErrorCode::Unsupported));
+    }
+
+    let alternates = project("alternates");
+    repository(&alternates, &[("a.txt", "a\n")]);
+    std::fs::write(
+        alternates.join(".git/objects/info/alternates"),
+        format!("{}\n", outside_git.join("objects").display()),
+    )
+    .unwrap();
+    assert_eq!(status(alternates).await, Some(HostErrorCode::Unsupported));
+
+    let common = project("common");
+    repository(&common, &[("a.txt", "a\n")]);
+    std::fs::write(
+        common.join(".git/commondir"),
+        format!("{}\n", outside_git.display()),
+    )
+    .unwrap();
+    assert_eq!(status(common).await, Some(HostErrorCode::Unsupported));
+
+    let worktree = project("worktree");
+    repository(&worktree, &[("a.txt", "a\n")]);
+    let config = worktree.join(".git/config");
+    let mut text = std::fs::read_to_string(&config).unwrap();
+    text.push_str(&format!("[core]\n\tworktree = {}\n", outside.display()));
+    std::fs::write(&config, text).unwrap();
+    let mut host = workspace_calls(&store, Some(worktree), &[Capability::GitRead]);
+    let HostReply::GitStatus(listed) = host.handle(HostRequest::GitStatus).await else {
+        panic!("status failed");
+    };
+    assert!(listed.entries.is_empty(), "{:?}", listed.entries);
+}
+
+/// Git stores a symbolic link as its target text, so the working-tree side
+/// is the link itself, never the file it points to.
+#[cfg(unix)]
+#[tokio::test]
+async fn symbolic_links_diff_as_their_targets() {
+    let (dir, store) = store();
+    let root = dir.path().join("repo");
+    std::fs::create_dir(&root).unwrap();
+    let (old, new) = (unique("old"), unique("new"));
+    repository(&root, &[(old.as_str(), "contents\n")]);
+    let repo = gix::open(&root).unwrap();
+    let mut index = repo.index_or_empty().unwrap().as_ref().clone();
+    let target = repo.write_blob(old.as_bytes()).unwrap().detach();
+    index.dangerously_push_entry(
+        Default::default(),
+        target,
+        gix::index::entry::Flags::empty(),
+        gix::index::entry::Mode::SYMLINK,
+        "link".into(),
+    );
+    index.sort_entries();
+    index.write(Default::default()).unwrap();
+    std::fs::write(root.join(&new), "other\n").unwrap();
+    std::os::unix::fs::symlink(&old, root.join("link")).unwrap();
+    let mut host = workspace_calls(&store, Some(root.clone()), &[Capability::GitRead]);
+    let diff = || HostRequest::GitDiff {
+        path: "link".into(),
+        staged: false,
+    };
+    assert_eq!(
+        host.handle(diff()).await,
+        HostReply::Diff(GitDiff::default())
+    );
+    std::fs::remove_file(root.join("link")).unwrap();
+    std::os::unix::fs::symlink(&new, root.join("link")).unwrap();
+    let HostReply::Diff(changed) = host.handle(diff()).await else {
+        panic!("diff failed");
+    };
+    assert!(
+        changed.text.contains(&format!("-{old}")) && changed.text.contains(&format!("+{new}")),
+        "{}",
+        changed.text
+    );
+}
+
+#[tokio::test]
+async fn oversized_blobs_are_refused() {
+    let (dir, store) = store();
+    let root = dir.path().join("repo");
+    std::fs::create_dir(&root).unwrap();
+    let big = "x".repeat(MAX_FILE as usize + 1);
+    repository(&root, &[("big.txt", big.as_str())]);
+    let mut host = workspace_calls(&store, Some(root), &[Capability::GitRead]);
+    assert_eq!(
+        code(
+            host.handle(HostRequest::GitDiff {
+                path: "big.txt".into(),
+                staged: true
+            })
+            .await
+        ),
+        Some(HostErrorCode::TooLarge)
+    );
+}

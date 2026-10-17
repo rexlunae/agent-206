@@ -17,7 +17,7 @@ pub const MAX_STATUS_ENTRIES: usize = 1_000;
 /// Most commits one log returns.
 pub const MAX_COMMITS: u32 = 200;
 /// Longest diff text returned.
-pub const MAX_DIFF: usize = 256 * 1024;
+pub const MAX_DIFF: usize = 192 * 1024;
 const CONTEXT_LINES: u32 = 3;
 
 /// Record a gitoxide failure where it is handled; the guest gets a generic
@@ -27,19 +27,73 @@ fn git_failure(operation: &'static str, error: &(dyn std::error::Error + 'static
     failure(HostErrorCode::Io, "the repository could not be read")
 }
 
-/// Open the repository at exactly the workspace root, never a parent.
+fn unsupported(message: &'static str) -> HostFailure {
+    failure(HostErrorCode::Unsupported, message)
+}
+
+/// Open the repository at exactly the workspace root, never a parent: either
+/// a `.git` directory there or a bare repository that is the root itself.
+/// Every piece of repository metadata must live inside the project, so a
+/// `.git` file or symlink, a linked worktree (`commondir`), an alternate
+/// object store or a configured worktree elsewhere is refused.
 fn open(root: PathBuf) -> Result<gix::Repository, HostFailure> {
-    if std::fs::symlink_metadata(root.join(".git")).is_err() {
-        return Err(failure(
-            HostErrorCode::NotFound,
-            "the workspace is not a git repository",
+    let dot_git = root.join(".git");
+    let git_dir = match std::fs::symlink_metadata(&dot_git) {
+        Ok(metadata) if metadata.is_dir() => dot_git,
+        Ok(_) => {
+            return Err(unsupported(
+                "`.git` must be a directory in the project; linked worktrees and \
+                 submodule checkouts are not supported",
+            ));
+        }
+        Err(_) if root.join("HEAD").is_file() && root.join("objects").is_dir() => root.clone(),
+        Err(_) => {
+            return Err(failure(
+                HostErrorCode::NotFound,
+                "the workspace is not a git repository",
+            ));
+        }
+    };
+    let linked = ["HEAD", "config", "index", "packed-refs", "objects", "refs"]
+        .iter()
+        .any(|name| std::fs::symlink_metadata(git_dir.join(name)).is_ok_and(|m| m.is_symlink()));
+    if linked {
+        return Err(unsupported(
+            "repository metadata that is a symbolic link is not supported",
+        ));
+    }
+    let shared = ["commondir", "objects/info/alternates"]
+        .iter()
+        .any(|name| std::fs::symlink_metadata(git_dir.join(name)).is_ok());
+    if shared {
+        return Err(unsupported(
+            "repositories that share objects or metadata outside the project are not supported",
         ));
     }
     // `isolated` drops system and global configuration and the environment.
     // Refusing every section to the "trusted values" filter disables the
     // repository's own filter, diff and credential programs and URL rewrites.
     let options = gix::open::Options::isolated().filter_config_section(|_| false);
-    gix::open_opts(root, options).map_err(|e| git_failure("open", &e))
+    let repo = gix::open_opts(&git_dir, options).map_err(|e| git_failure("open", &e))?;
+    let same = |a: &std::path::Path, b: &std::path::Path| match (
+        std::fs::canonicalize(a),
+        std::fs::canonicalize(b),
+    ) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    };
+    let inside = same(repo.git_dir(), &git_dir)
+        && same(repo.common_dir(), &git_dir)
+        && match repo.workdir() {
+            Some(workdir) => git_dir != root && same(workdir, &root),
+            None => true,
+        };
+    if !inside {
+        return Err(unsupported(
+            "the repository's working tree or metadata is outside the project",
+        ));
+    }
+    Ok(repo)
 }
 
 pub(super) fn status(root: PathBuf, interrupt: Arc<AtomicBool>) -> Result<HostReply, HostFailure> {
@@ -171,7 +225,10 @@ pub(super) fn diff(root: PathBuf, path: &str, staged: bool) -> Result<HostReply,
         };
         (committed, indexed)
     } else {
-        (indexed, super::workspace::read_optional(root, path)?)
+        if repo.workdir().is_none() {
+            return Err(unsupported("a bare repository has no working tree"));
+        }
+        (indexed, super::workspace::read_worktree(root, path)?)
     };
     let (before, after) = (before.unwrap_or_default(), after.unwrap_or_default());
     if before == after {
@@ -193,12 +250,13 @@ pub(super) fn diff(root: PathBuf, path: &str, staged: bool) -> Result<HostReply,
 }
 
 fn blob(repo: &gix::Repository, id: impl Into<gix::ObjectId>) -> Result<Vec<u8>, HostFailure> {
-    let object = repo
-        .find_object(id.into())
-        .map_err(|e| git_failure("diff", &e))?;
-    if object.data.len() as u64 > MAX_FILE {
+    let id = id.into();
+    // Check the stored size first so an oversized blob is never inflated.
+    let header = repo.find_header(id).map_err(|e| git_failure("diff", &e))?;
+    if header.size() > MAX_FILE {
         return Err(failure(HostErrorCode::TooLarge, "the file exceeds 512 KiB"));
     }
+    let object = repo.find_object(id).map_err(|e| git_failure("diff", &e))?;
     Ok(object.detach().data)
 }
 

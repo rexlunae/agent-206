@@ -280,7 +280,11 @@ impl ExtensionHost {
                 });
             }
         }
-        let workspace_capabilities = [Capability::ReadWorkspace, Capability::WriteWorkspace];
+        let workspace_capabilities = [
+            Capability::ReadWorkspace,
+            Capability::WriteWorkspace,
+            Capability::GitRead,
+        ];
         if scope.workspace.is_none() && workspace_capabilities.iter().any(|c| declared.contains(c))
         {
             return Err(ExtensionError::NoProject);
@@ -501,16 +505,19 @@ impl HostCalls {
             HostRequest::GitStatus => {
                 let root = self.workspace()?;
                 let interrupt = Arc::new(std::sync::atomic::AtomicBool::new(false));
-                let flag = Arc::clone(&interrupt);
-                // Bounds the blocking scan even after the invocation's own
-                // timeout drops this future; aborted below when it is done.
-                let deadline = tokio::spawn(async move {
-                    tokio::time::sleep(GIT_STATUS_TIMEOUT).await;
-                    flag.store(true, std::sync::atomic::Ordering::Relaxed);
-                });
-                let reply = blocking(move || git::status(root, interrupt)).await;
-                deadline.abort();
-                reply
+                // Stops the blocking scan if this future is dropped (the
+                // invocation timed out or was revoked); a blocking task cannot
+                // be aborted, so the flag is how it learns to end.
+                let stop = Interrupt(Arc::clone(&interrupt));
+                let mut scan = tokio::task::spawn_blocking(move || git::status(root, interrupt));
+                let joined = match tokio::time::timeout(GIT_STATUS_TIMEOUT, &mut scan).await {
+                    Ok(joined) => joined,
+                    Err(_) => {
+                        stop.set();
+                        scan.await
+                    }
+                };
+                joined_reply(joined)
             }
             HostRequest::GitLog { max } => {
                 let root = self.workspace()?;
@@ -603,12 +610,27 @@ fn bounded(text: &str, limit: usize) -> &str {
 async fn blocking(
     work: impl FnOnce() -> Result<HostReply, HostFailure> + Send + 'static,
 ) -> Result<HostReply, HostFailure> {
-    tokio::task::spawn_blocking(work)
-        .await
-        .unwrap_or_else(|error| {
-            crate::error::handle("extension_host_call", &error);
-            Err(failure(HostErrorCode::Io, "host call failed"))
-        })
+    joined_reply(tokio::task::spawn_blocking(work).await)
+}
+fn joined_reply(
+    joined: Result<Result<HostReply, HostFailure>, tokio::task::JoinError>,
+) -> Result<HostReply, HostFailure> {
+    joined.unwrap_or_else(|error| {
+        crate::error::handle("extension_host_call", &error);
+        Err(failure(HostErrorCode::Io, "host call failed"))
+    })
+}
+/// Raises a scan's interrupt flag when set or dropped.
+struct Interrupt(Arc<std::sync::atomic::AtomicBool>);
+impl Interrupt {
+    fn set(&self) {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+impl Drop for Interrupt {
+    fn drop(&mut self) {
+        self.set();
+    }
 }
 mod git;
 mod workspace;
