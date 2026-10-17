@@ -153,6 +153,10 @@ impl From<HostFailure> for GuestError {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HostRequest {
+    /// Restricted to the bundled skills extension and current approval pins.
+    SkillList,
+    /// Read approved instructions or a bounded, relative supporting file.
+    SkillRead { name: String, path: Option<String> },
     /// Read a file, relative to the invocation's workspace.
     ReadFile { path: String },
     /// List a directory, relative to the invocation's workspace.
@@ -346,6 +350,8 @@ pub enum HostErrorCode {
     /// This host does not implement the request.
     Unsupported,
     Io,
+    /// The bounded host operation did not finish in time.
+    Timeout,
     /// The destination could not be reached: DNS, connection, TLS, timeout
     /// or too many redirects.
     Network,
@@ -366,6 +372,7 @@ impl HostErrorCode {
             Self::Budget => "budget",
             Self::Unsupported => "unsupported",
             Self::Io => "io",
+            Self::Timeout => "timeout",
             Self::Network => "network",
             Self::Other => "other",
         }

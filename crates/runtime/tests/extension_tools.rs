@@ -32,6 +32,10 @@ const STALLED: &str = "stalled-extension-worker.pid";
 
 type Test = fn() -> BoxFuture<'static, ()>;
 const TESTS: &[(&str, Test)] = &[
+    (
+        "approved_skills_reach_the_model_through_the_skill_tools",
+        || Box::pin(approved_skills_reach_the_model_through_the_skill_tools()),
+    ),
     ("a_permitted_extension_tool_runs_in_a_native_run", || {
         Box::pin(a_permitted_extension_tool_runs_in_a_native_run())
     }),
@@ -587,4 +591,57 @@ fn alive(pid: u32) -> bool {
 fn alive(_pid: u32) -> bool {
     // No portable liveness check: the run's cancellation is still verified.
     false
+}
+
+async fn approved_skills_reach_the_model_through_the_skill_tools() {
+    let api = API;
+    let mut rig = rig().await;
+    rig.tool = a206_runtime::skill_tool::INFO.into();
+    let body = nonce();
+    let dir = rig.state.path().join("skills/notes");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("SKILL.md"),
+        format!("---\nname: notes\ndescription: Take notes.\n---\n{body}"),
+    )
+    .unwrap();
+    let Reply::Skill(reviewed) = rig
+        .run(Command::ReadSkill {
+            name: "notes".into(),
+        })
+        .await
+    else {
+        panic!("skill read for review");
+    };
+    let approved = rig
+        .run(Command::SetSkillEnabled {
+            name: "notes".into(),
+            enabled: true,
+            digest: Some(reviewed.digest),
+        })
+        .await;
+    assert_eq!(approved, Reply::Ok);
+    // The skill tools stay denied until this conversation permits them.
+    let task = rig.send();
+    let first = rig.next_request().await;
+    assert!(offered(api, &first.body).is_empty());
+    first.respond(text_response(api, &nonce())).await;
+    finished(task).await;
+
+    rig.permit(ToolPermission::Allow).await;
+    let task = rig.send();
+    let first = rig.next_request().await;
+    assert_eq!(
+        offered(api, &first.body),
+        vec![a206_runtime::skill_tool::INFO.to_string()]
+    );
+    let call = Call::new(a206_runtime::skill_tool::INFO, json!({"name": "notes"}));
+    first
+        .respond(calls_response(api, std::slice::from_ref(&call), &nonce()))
+        .await;
+    let second = rig.next_request().await;
+    assert_eq!(result_for(api, &second.body, &call.id), Some(body));
+    second.respond(text_response(api, &nonce())).await;
+    let thread = finished(task).await;
+    assert_eq!(thread.state, RunState::Complete, "{:?}", thread.error);
 }

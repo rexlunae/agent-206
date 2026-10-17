@@ -2,16 +2,10 @@
 //! The user approves a skill as it is; any later edit withdraws that approval.
 //! A model sees only approved, unchanged skills, and a skill adds no authority.
 use super::{Gateway, Result, write_settings};
+use crate::skill_tool::{self, SkillOffer};
 use a206_core::*;
 use a206_skills::{Skill, SkillError};
 use std::path::PathBuf;
-
-/// An approved skill the run engine may list for a model.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SkillOffer {
-    pub name: String,
-    pub description: Option<String>,
-}
 
 impl Gateway {
     fn skills_root(&self) -> Result<PathBuf> {
@@ -91,36 +85,20 @@ impl Gateway {
 
     /// Load a skill only if the user approved exactly this version of it.
     fn approved_skill(&self, thread: Id, name: &str) -> Result<Skill> {
-        let pinned = {
-            let store = self.lock()?;
-            store.thread(thread)?;
-            store.state.settings.enabled_skills.get(name).cloned()
-        };
-        let pinned = pinned.ok_or(SkillError::Disabled)?;
-        let (skill, _) = a206_skills::load(&self.skills_root()?, name)?;
-        if skill.digest != pinned {
-            return Err(SkillError::Changed.into());
-        }
-        Ok(skill)
+        let pins = self.skill_pins(thread)?;
+        Ok(skill_tool::approved(&self.skills_root()?, &pins, name)?)
+    }
+    fn skill_pins(&self, thread: Id) -> Result<std::collections::BTreeMap<String, String>> {
+        let store = self.lock()?;
+        store.thread(thread)?;
+        Ok(store.state.settings.enabled_skills.clone())
     }
 
     /// Approved, unchanged skills `thread` may be told about. Skills that
     /// changed or no longer parse are left out; the Skills page shows why.
     pub fn skill_offers(&self, thread: Id) -> Result<Vec<SkillOffer>> {
-        let pinned = {
-            let store = self.lock()?;
-            store.thread(thread)?;
-            store.state.settings.enabled_skills.clone()
-        };
-        Ok(a206_skills::scan(&self.skills_root()?)?
-            .into_iter()
-            .filter_map(|entry| entry.skill.ok())
-            .filter(|skill| pinned.get(&skill.name) == Some(&skill.digest))
-            .map(|skill| SkillOffer {
-                name: skill.name,
-                description: skill.description,
-            })
-            .collect())
+        let pins = self.skill_pins(thread)?;
+        Ok(skill_tool::offers(&self.skills_root()?, &pins)?)
     }
 
     /// The model-facing skill list for `thread`'s system prompt.

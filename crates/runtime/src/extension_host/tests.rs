@@ -41,6 +41,7 @@ fn calls_for(
     effective: &[Capability],
 ) -> HostCalls {
     HostCalls {
+        skills_root: store.lock().unwrap().root.join("skills"),
         extension: id.into(),
         effective: effective.iter().copied().collect(),
         workspace,
@@ -616,4 +617,66 @@ async fn policy_is_checked_before_the_guest_runs() {
         .await
         .unwrap_err();
     assert!(matches!(error, ExtensionError::Disabled(_)));
+}
+
+#[tokio::test]
+async fn skill_imports_are_builtin_scoped_and_recheck_current_approval() {
+    let (_dir, store) = store();
+    let root = store.lock().unwrap().root.join("skills/notes");
+    std::fs::create_dir_all(&root).unwrap();
+    let body = uuid::Uuid::new_v4().to_string();
+    let source = format!("---\nname: notes\ndescription: Approved instructions\n---\n{body}");
+    std::fs::write(root.join("SKILL.md"), &source).unwrap();
+    let digest = a206_skills::parse(&source, "notes").unwrap().digest;
+    store
+        .lock()
+        .unwrap()
+        .state
+        .settings
+        .enabled_skills
+        .insert("notes".into(), digest);
+    let request = HostRequest::SkillRead {
+        name: "notes".into(),
+        path: None,
+    };
+    let mut unrelated = host_calls(&store, None, &[]);
+    assert_eq!(
+        code(unrelated.handle(request.clone()).await),
+        Some(HostErrorCode::Denied)
+    );
+    let mut builtin = calls_for(crate::skill_tool::EXTENSION, &store, None, &[]);
+    let HostReply::File(bytes) = builtin.handle(request.clone()).await else {
+        panic!("approved read failed");
+    };
+    assert_eq!(String::from_utf8(bytes.into_vec()).unwrap(), body);
+    store.lock().unwrap().state.settings.enabled_skills.clear();
+    assert_eq!(
+        code(builtin.handle(request).await),
+        Some(HostErrorCode::Denied)
+    );
+}
+
+#[tokio::test]
+async fn oversized_skill_index_keeps_its_size_error_at_the_wasm_boundary() {
+    let (_dir, store) = store();
+    let root = store.lock().unwrap().root.join("skills/notes");
+    std::fs::create_dir_all(&root).unwrap();
+    let source = format!(
+        "---\nname: notes\ndescription: {}\n---\nBody",
+        "x".repeat(crate::tools::MAX_OUTPUT)
+    );
+    std::fs::write(root.join("SKILL.md"), &source).unwrap();
+    let digest = a206_skills::parse(&source, "notes").unwrap().digest;
+    store
+        .lock()
+        .unwrap()
+        .state
+        .settings
+        .enabled_skills
+        .insert("notes".into(), digest);
+    let mut builtin = calls_for(crate::skill_tool::EXTENSION, &store, None, &[]);
+    assert_eq!(
+        code(builtin.handle(HostRequest::SkillList).await),
+        Some(HostErrorCode::TooLarge)
+    );
 }
