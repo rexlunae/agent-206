@@ -214,6 +214,7 @@ pub(crate) fn GatewaySetup() -> Element {
 #[component]
 fn SetupForm(current: SetupStatus) -> Element {
     let state = use_context::<State>();
+    let navigator = use_navigator();
     let saved_ssh = match &current.active {
         Some(GatewayTarget::Ssh { endpoint }) => Some(endpoint.clone()),
         _ => None,
@@ -239,6 +240,8 @@ fn SetupForm(current: SetupStatus) -> Element {
         spawn(async move {
             if let Err(report) = finish(state, target).await {
                 step.set(Step::Failed(report));
+            } else {
+                navigator.push(crate::route::Route::Security {});
             }
         });
     };
@@ -319,6 +322,6 @@ fn SetupForm(current: SetupStatus) -> Element {
                 }
             }
         }
-        Alert { title: rsx! { "Separate from security setup" }, "Choosing a gateway does not enroll it. Vault encryption and TOTP enrollment are configured on the gateway itself." }
+        Alert { title: rsx! { "Next: secure your gateway" }, "After choosing a gateway, continue to Security to create or unlock its encrypted vault, verify an authenticator, and pair the gateway. Choosing a location alone does not complete security setup." }
     } }
 }

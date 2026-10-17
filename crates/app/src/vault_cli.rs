@@ -11,6 +11,8 @@ use std::path::Path;
 pub enum VaultAction {
     /// Create a new encrypted vault and unlock it.
     Init,
+    /// Show the public broker key to verify browser vault setup.
+    ChannelKey,
     /// Unlock the vault in the broker (asks for an authenticator code when enrolled).
     Unlock,
     /// Lock the vault and revoke every step-up.
@@ -360,6 +362,18 @@ pub fn run(root: &Path, action: VaultAction) -> Result<()> {
         let mut client = connect(root).await?;
         match action {
             VaultAction::Broker | VaultAction::Stop => unreachable!(),
+            VaultAction::ChannelKey => {
+                if client.version() < 8 {
+                    bail!("the running vault broker does not support encrypted web setup; run `agent206 vault stop`, then retry");
+                }
+                let Reply::ChannelKey(key) = client.call(Request::ChannelKey).await? else {
+                    bail!("broker does not support encrypted browser setup; stop it and retry");
+                };
+                for byte in key {
+                    print!("{byte:02x}");
+                }
+                println!();
+            }
             VaultAction::Init => {
                 if status(&mut client).await?.exists {
                     bail!("a vault already exists; use `agent206 vault unlock`");

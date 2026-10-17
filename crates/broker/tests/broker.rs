@@ -686,7 +686,8 @@ async fn only_a_paired_gateway_spends_credentials_and_lock_voids_pairing() {
     );
     assert_eq!(status(&mut a).await.gateway_paired, Some(false));
     let token = pairing(&mut a).await;
-    assert_eq!(status(&mut a).await.gateway_paired, Some(true));
+    // A minted token is not evidence that a gateway received or proved it.
+    assert_eq!(status(&mut a).await.gateway_paired, Some(false));
     assert_eq!(
         denied(
             fresh
@@ -705,6 +706,7 @@ async fn only_a_paired_gateway_spends_credentials_and_lock_voids_pairing() {
         .await
         .unwrap();
     assert!(paired(gateway.call(call()).await));
+    assert_eq!(status(&mut a).await.gateway_paired, Some(true));
 
     // A new pairing replaces the old token for new connections.
     let replacement = pairing(&mut a).await;
@@ -1399,4 +1401,169 @@ async fn put_requests_carry_their_body_and_the_bearer_token() {
         *seen.lock().unwrap(),
         [(Some(format!("Bearer {token}")), body)]
     );
+}
+
+async fn secure_open(root: &Path) -> (Client, a206_vault_channel::Channel) {
+    use a206_vault_channel::Handshake;
+    let mut relay = Client::connect(root, Role::Relay).await.unwrap();
+    let Reply::ChannelKey(key) = relay.call(Request::ChannelKey).await.unwrap() else {
+        panic!("missing key");
+    };
+    let (handshake, first) = Handshake::start(&key).unwrap();
+    let Reply::ChannelOpened(response) = relay.call(Request::OpenChannel { first }).await.unwrap()
+    else {
+        panic!("missing handshake");
+    };
+    (relay, handshake.finish(&response).unwrap())
+}
+async fn secure_call(
+    client: &mut Client,
+    channel: &mut a206_vault_channel::Channel,
+    request: a206_vault_channel::Request,
+) -> a206_vault_channel::Reply {
+    let bytes = channel.seal(&request).unwrap();
+    let Reply::ChannelMessage(bytes) = client
+        .call(Request::ChannelMessage { bytes })
+        .await
+        .unwrap()
+    else {
+        panic!("expected ciphertext");
+    };
+    channel.open(&bytes).unwrap()
+}
+#[tokio::test]
+async fn encrypted_setup_keeps_seeds_private_and_cancellation_discards_them() {
+    use a206_vault_channel::{Code, Reply as R, Request as Q, Secret};
+    let (_dir, root, task) = start().await;
+    let (mut relay, mut channel) = secure_open(&root).await;
+    assert_eq!(
+        denied(relay.call(Request::Status).await),
+        BrokerError::Forbidden
+    );
+    assert_eq!(
+        denied(relay.call(unlock(&random(), None, true)).await),
+        BrokerError::Forbidden
+    );
+    let password = random();
+    assert!(matches!(
+        secure_call(
+            &mut relay,
+            &mut channel,
+            Q::Unlock {
+                password: Secret::new(password.clone()),
+                totp: None,
+                create: true
+            }
+        )
+        .await,
+        R::Ok
+    ));
+    assert!(matches!(
+        secure_call(&mut relay, &mut channel, Q::BeginTotp { account: random() }).await,
+        R::TotpEnrollment { .. }
+    ));
+    assert!(matches!(
+        secure_call(&mut relay, &mut channel, Q::CancelTotp).await,
+        R::Ok
+    ));
+    assert!(matches!(
+        secure_call(
+            &mut relay,
+            &mut channel,
+            Q::ConfirmTotp {
+                code: Secret::new("000000".into())
+            }
+        )
+        .await,
+        R::Error(_)
+    ));
+    let R::TotpEnrollment { manual_key, .. } =
+        secure_call(&mut relay, &mut channel, Q::BeginTotp { account: random() }).await
+    else {
+        panic!("enrollment missing");
+    };
+    let generator = totp_rs::TOTP::new_unchecked(
+        totp_rs::Algorithm::SHA1,
+        6,
+        1,
+        30,
+        totp_rs::Secret::Encoded(manual_key.expose().to_owned())
+            .to_bytes()
+            .unwrap(),
+        None,
+        String::new(),
+    );
+    let code = generator.generate(a206_vault::unix_now());
+    assert!(matches!(
+        secure_call(
+            &mut relay,
+            &mut channel,
+            Q::ConfirmTotp {
+                code: Secret::new(code.clone())
+            }
+        )
+        .await,
+        R::Ok
+    ));
+    assert!(
+        matches!(secure_call(&mut relay, &mut channel, Q::Status).await, R::Status(s) if s.totp_enrolled == Some(true))
+    );
+    assert!(matches!(
+        secure_call(&mut relay, &mut channel, Q::Lock).await,
+        R::Ok
+    ));
+    assert!(
+        matches!(secure_call(&mut relay, &mut channel, Q::Unlock { password: Secret::new(password.clone()), totp: None, create: false }).await, R::Error(e) if e.code == Code::TotpRequired)
+    );
+    assert!(
+        matches!(secure_call(&mut relay, &mut channel, Q::Unlock { password: Secret::new(password), totp: Some(Secret::new(code)), create: false }).await, R::Error(e) if e.code == Code::TotpReplayed)
+    );
+    let mut owner = user(&root).await;
+    owner.call(Request::Shutdown).await.unwrap();
+    task.await.unwrap();
+}
+#[tokio::test]
+async fn relay_cannot_replace_an_authenticated_channel_or_replay_messages() {
+    use a206_vault_channel::{Handshake, Request as Q, Secret};
+    let (_dir, root, task) = start().await;
+    let (mut relay, mut channel) = secure_open(&root).await;
+    secure_call(
+        &mut relay,
+        &mut channel,
+        Q::Unlock {
+            password: Secret::new(random()),
+            totp: None,
+            create: true,
+        },
+    )
+    .await;
+    let bytes = channel.seal(&Q::Status).unwrap();
+    relay
+        .call(Request::ChannelMessage {
+            bytes: bytes.clone(),
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        denied(relay.call(Request::ChannelMessage { bytes }).await),
+        BrokerError::Channel(_)
+    ));
+    let Reply::ChannelKey(key) = relay.call(Request::ChannelKey).await.unwrap() else {
+        panic!();
+    };
+    let (_, first) = Handshake::start(&key).unwrap();
+    assert_eq!(
+        denied(relay.call(Request::OpenChannel { first }).await),
+        BrokerError::Forbidden
+    );
+    assert_eq!(
+        denied(relay.call(Request::PairGateway).await),
+        BrokerError::Forbidden
+    );
+    let (mut fresh, mut other) = secure_open(&root).await;
+    assert!(
+        matches!(secure_call(&mut fresh, &mut other, Q::PairGateway).await, a206_vault_channel::Reply::Error(e) if e.code == a206_vault_channel::Code::StepUpRequired)
+    );
+    user(&root).await.call(Request::Shutdown).await.unwrap();
+    task.await.unwrap();
 }

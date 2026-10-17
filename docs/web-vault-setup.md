@@ -1,0 +1,106 @@
+# Enroll a gateway from the web client
+
+Choose the local gateway in first-time setup. The client then opens Security.
+The Gateway page also links to Security and provides Start, Stop, Restart and
+Reconnect through the existing lifecycle controller. These controls do not
+unlock or enroll the vault, and polling does not undo a deliberate Stop.
+
+## Verify before entering a password
+
+In a trusted terminal on the gateway host, run:
+
+```sh
+agent206 --data-dir <profile-directory> vault channel-key
+```
+
+Use the **same profile directory** as `agent206 web`. Paste the printed public
+key into Security's **Broker public key** field and select **Verify and open
+vault setup**. This is a public identity key, not a vault key or password. Do not
+obtain it from an untrusted web page. The browser proves that the broker possesses
+the corresponding private key before showing any password inputs. A broker
+restart generates a new identity: verify it again. Keys are not silently updated
+or accepted from the relay's API. An older broker must be stopped explicitly with
+`agent206 vault stop` before retrying with the current executable.
+
+## Create, enroll and pair
+
+1. Create a vault with a confirmed password, or unlock the existing password
+   vault. Password and code fields are cleared when submitted or cancelled.
+2. choose **Set up two-factor**, scan the QR code with an authenticator,
+   or expand **Can't scan? Enter a setup key instead**, then enter its first code. The broker commits enrollment only after verification.
+   Cancel discards the pending seed in the broker. Closing the panel also closes
+   its connection; a lost browser is bounded by the relay's five-minute idle expiry.
+3. Start the gateway, then choose **Pair gateway**. Unlock automatically pairs a
+   gateway that is already running. Pairing failure is reported separately from
+   successful unlock. Pairing uses an opaque token, never a credential value.
+4. Lock and unlock to verify the workflow. An enrolled vault requires its
+   authenticator regardless of editable TOML flags. A code works only once; use
+   the next code for a new step-up. Locking voids the pairing and every step-up;
+   after a gateway restart, pair it again.
+
+The panel reports encryption, enrolled TOTP, agent access and pairing from the
+broker's actual state. Global agent access remains off for new vaults. Setup does
+not grant tools, activate providers, or authorize agents to spend credentials.
+
+## Optional migration
+
+Before creating a new empty vault, existing RustyClaw users can instead preview:
+
+```sh
+agent206 --data-dir <profile-directory> import rustyclaw <source-directory>
+```
+
+Review the preview and use `--apply` only for the categories you intend to import.
+The command runs on the gateway host and uses the isolated broker for encrypted
+vault adoption. It never replaces an existing vault. See [imports.md](imports.md)
+for policy preservation, supported categories and partial-failure behavior. A GUI
+import review/apply screen and adapters for other tools remain planned; this web
+flow does not invoke foreign commands or import grants implicitly.
+
+## Channel and trust boundary
+
+The common Rust `a206-vault-channel` crate uses Snow 0.10's
+`Noise_NK_25519_ChaChaPoly_SHA256`, with a versioned Agent 206 prologue. The broker
+holds its ephemeral static private key; the browser initiator pins the public key
+obtained in the trusted terminal. The HTTP bridge holds neither transport keys
+nor decrypted requests/replies. The browser still has to trust the application
+code and its serving origin: encryption does not make compromised JavaScript safe.
+Loopback authorization and remote HTTPS/TOTP sign-in retain their existing guards.
+
+Only a typed setup subset travels inside the encrypted channel: status,
+create/unlock, lock, step-up, begin/confirm/cancel TOTP, and minting a gateway
+pairing. Reveal, export, grants, provider requests and shutdown are absent. A new
+broker `Relay` role rejects plaintext privileged requests and allows just one
+handshake per socket, so a relay cannot replace a channel and inherit its step-up.
+MessagePack plaintext buffers and UI secret wrappers zeroize on drop; Debug
+redacts secret fields. Ordinary snapshots and events contain no seeds/passwords.
+
+Stateful Noise nonces reject replay, reordering, tampering and cross-session
+substitution. A lost response voids the browser channel and is never retried as a
+mutation. The UI refreshes actual status on a new channel to show what succeeded.
+The relay binds each opaque session to its authenticated browser bearer, permits
+at most 32 live channels, one queued exchange per channel, a 30-second exchange
+timeout and a five-minute idle timeout. Broker sockets preserve per-connection
+step-up and enrollment state. Noise messages are bounded at 65,535 bytes. TLS and
+SSH still provide transport reliability; no packet-loss layer is invented.
+
+This implements browser setup for a gateway local to the web server, including
+browsers using its HTTPS interface. Vault setup for a gateway reached by the web
+server over SSH remains unavailable and fails closed. Key-file workflows, modern
+vault-envelope migration, recovery codes and full RustyClaw parity remain listed
+in [security-setup.md](security-setup.md); this flow retains the existing encrypted
+SecureStore storage rather than claiming new at-rest cryptography.
+
+Acceptance includes Rust tests over the real broker and HTTP router for encrypted
+creation/enrollment, cancellation, TOTP replay, role restrictions, channel replay,
+key substitution and session ownership, plus renderer builds and a disposable
+profile browser walkthrough.
+
+QR codes are generated locally in Rust with `qrcode`, using inline SVG geometry
+and a four-module quiet zone. The raw seed/URI is never an image URL, attribute,
+remote QR request or persisted asset. Fixed black-on-white QR contrast is
+intentional in every theme; surrounding controls remain themed fc-dioxus
+components. The `Disclosure` manual-key alternative is expanded automatically
+for TUI, where SVG is unavailable, or if QR encoding fails. An independent Rust
+`rqrr` decoder tests the actual rendered geometry against the complete URI.
+The pending QR geometry is sensitive and is discarded with the enrollment.

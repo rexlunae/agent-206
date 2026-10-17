@@ -8,9 +8,9 @@ implemented structure for finished agent execution or security parity.
 
 | Area | Available now | Remaining work |
 | --- | --- | --- |
-| Rust architecture | Fourteen small crates, typed shared commands, forbidden application unsafe, pinned dependencies | Further extraction as capabilities grow; measured build/runtime budgets |
+| Rust architecture | Small Rust workspace, typed shared commands, forbidden application unsafe, pinned dependencies | Further extraction as capabilities grow; measured build/runtime budgets |
 | Desktop | Native macOS app bundle, shared fc-dioxus interface, automatic local gateway startup, shared lifecycle controls | Windows named pipes; Linux desktop packaging and hardware validation |
-| Gateway lifecycle | Shared Gateway page and controller, status from the actual process, start/stop/restart/reconnect, durable deliberate-stop marker, cleanup before acknowledgement, bounded control receipts; web uses an authenticated user-only binary endpoint | Remote SSH acceptance, stronger cross-process lifecycle coordination, encrypted enrollment and authentication; running is not security readiness |
+| Gateway lifecycle | Shared Gateway page and controller, status from the actual process, start/stop/restart/reconnect, durable deliberate-stop marker, cleanup before acknowledgement, bounded control receipts; web uses an authenticated user-only binary endpoint | Remote SSH acceptance, stronger cross-process lifecycle coordination, remote encrypted enrollment and authentication; running is not security readiness |
 | Initial setup/import | `agent206 setup` resumes first-run setup on the existing flows (gateway target, vault create/unlock, optional TOTP enrollment, pairing) and ends with the health report; `agent206 import rustyclaw` previews by default and with `--apply` adds missing provider accounts and disabled messenger entries through the revision-checked settings API, copies a password vault in through the broker (`ImportVault`: encrypted copy, password and enrolled TOTP verified on the copy, never merged or replacing a vault, source untouched) and writes an owner-only receipt; MCP servers, tool permissions, skills and plaintext tokens (messenger tokens included) are counted or reported and left inactive; tested in the import crate, the broker and through the real binary against a real gateway | Desktop/TUI setup wizard and import screen, key-file vaults, conversations/workspace instructions/memory, rollback command, adapters for Cline, Claude Code, Codex, DeepSeek Harness and others, isolated reader process; interactive vault import is exercised only in broker tests (it needs a terminal) |
 | Messengers | Telegram through the Bot API and Matrix through a homeserver's client API (no end-to-end encryption; never sends to an encrypted room), run by the gateway while it is paired with an unlocked vault; the broker spends the bot or access token for the bound origin only; entries start disabled and allow no chat, and groups need listed senders; refused chats and senders, account and structured failures are in the status; allowed chats get one thread each and ordinary `Send` turns; `messenger` CLI, TOML settings, a shared desktop/web/TUI Messengers page and RustyClaw import; tested against a stand-in Bot API and a stand-in homeserver with a real broker and through the gateway's settings API (docs/messengers.md) | Messengers page render-tested only (not clicked through in a running app), other services, attachments, persisted poll offset (Telegram delivery is at least once across restarts; Matrix answers nothing sent while the gateway was stopped), Matrix encryption, not tested against the real Telegram or Matrix services |
 | CLI | Headless build, system status, nested gateway lifecycle/status, setup, doctor, import (RustyClaw), messengers, chat, projects, settings, catalog refresh, downloads, text documents, Git status, vault, ACP/MCP, renderer entry points and ui alias | Full RustyClaw-compatible command families in docs/cli.md; doctor repairs, more import adapters and remaining parity |
@@ -161,3 +161,16 @@ vault migration or production security certification.
    document format plugins and forge-neutral PR/CI workflows.
 5. Complete context/accounting controls and API integrations without introducing a
    static model catalog, fabricated prices or default account balances.
+
+## Encrypted web enrollment update (2026-10-16)
+
+The shared Security panel is available in the web renderer for a gateway local to
+the web server. Broker-authenticated Noise NK carries password/TOTP requests and
+seed replies through a ciphertext-only HTTP relay. A trusted-terminal public-key
+verification precedes secret inputs. The panel supports create/unlock/lock,
+step-up, begin/confirm/cancel TOTP and pairing, with actual broker state and
+separate pairing failures. First-run gateway selection opens Security. Native and
+web use the same typed setup subset and broker rules. See
+[web-vault-setup.md](web-vault-setup.md). Remote SSH vault setup, a GUI import
+review/apply screen, key-file workflows and modern vault-envelope migration are
+still pending; the existing RustyClaw CLI import remains available.

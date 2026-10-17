@@ -95,3 +95,16 @@ Alibaba's workspace/region URL remains user-entered instead of embedding an acco
 identifier or assuming a legacy regional endpoint. Compatible metadata parsing also
 follows [DeepSeek's live model schema](https://api-docs.deepseek.com/api/list-models/)
 for `context_window` and nested `effort.supported_levels`; no example facts are copied.
+
+Encrypted browser vault setup uses [Snow 0.10](https://docs.rs/snow/0.10.0/snow/)
+for the standard Noise NK handshake and sequential authenticated transport.
+The application supplies a versioned prologue, an independently verified broker
+public key and a deliberately limited MessagePack setup schema; it does not
+implement new cryptographic primitives. The native and WASM builds share this
+crate. See [web-vault-setup.md](web-vault-setup.md) for trust and failure semantics.
+
+Authenticator enrollment QR encoding uses [qrcode](https://docs.rs/qrcode/0.14.1/qrcode/)
+without its image features; [rqrr](https://docs.rs/rqrr/0.11.0/rqrr/) is a test-only
+independent decoder. The app renders typed SVG geometry within its trusted setup
+surface and uses fc-dioxus Disclosure for the manual alternative; no QR service
+or seed-bearing image URL is involved.

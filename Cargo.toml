@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/core", "crates/protocol", "crates/vault", "crates/broker", "crates/import", "crates/extension-abi", "crates/extension-sdk", "crates/extensions", "crates/sandbox", "crates/mcp", "crates/skills", "plugins/workspace", "plugins/git", "crates/runtime", "crates/ui", "crates/app"]
+members = ["crates/vault-channel", "crates/core", "crates/protocol", "crates/vault", "crates/broker", "crates/import", "crates/extension-abi", "crates/extension-sdk", "crates/extensions", "crates/sandbox", "crates/mcp", "crates/skills", "plugins/workspace", "plugins/git", "crates/runtime", "crates/ui", "crates/app"]
 default-members = ["crates/app"]
 resolver = "3"
 
@@ -10,6 +10,7 @@ rust-version = "1.97"
 license = "MIT"
 
 [workspace.dependencies]
+a206-vault-channel = { path = "crates/vault-channel" }
 a206-core = { path = "crates/core" }
 a206-protocol = { path = "crates/protocol" }
 a206-vault = { path = "crates/vault" }
