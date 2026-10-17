@@ -199,6 +199,7 @@ fn messenger_kind(id: &str) -> Option<MessengerKind> {
     match id {
         "telegram" => Some(MessengerKind::Telegram),
         "matrix" => Some(MessengerKind::Matrix),
+        "discord" => Some(MessengerKind::Discord),
         _ => None,
     }
 }
@@ -826,6 +827,41 @@ homeserver = "https://{host}/matrix"
             home.allowed_chats,
             BTreeSet::from([format!("!{room}:{host}")])
         );
+    }
+
+    #[test]
+    fn discord_bots_arrive_disabled_on_the_official_api_without_their_token() {
+        let (token, channel, user) = (random(), random(), random());
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            &dir.path().join("config.toml"),
+            &format!(
+                r#"
+[[messengers]]
+name = "guild"
+messenger_type = "discord"
+enabled = true
+token = "{token}"
+allowed_chats = ["{channel}"]
+allowed_users = ["{user}"]
+"#
+            ),
+        );
+        let mut settings = Settings::default();
+        let preview = preview(dir.path(), &settings, None).unwrap();
+        let [guild] = &preview.messengers[..] else {
+            panic!("{:?}", preview.messengers)
+        };
+        assert_eq!(guild.action, MessengerAction::Add);
+        assert_eq!(guild.kind, Some(MessengerKind::Discord));
+        assert!(guild.token_left_behind);
+        assert!(!toml::to_string(&preview).unwrap().contains(&token));
+        assert_eq!(preview.apply_messengers(&mut settings), ["guild"]);
+        let guild = &settings.messengers[0];
+        assert!(!guild.enabled && guild.credential.is_none());
+        assert_eq!(guild.endpoint(), MessengerKind::Discord.default_endpoint());
+        assert_eq!(guild.allowed_chats, BTreeSet::from([channel]));
+        assert_eq!(guild.allowed_users, BTreeSet::from([user]));
     }
 
     #[test]
