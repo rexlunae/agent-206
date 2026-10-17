@@ -72,7 +72,10 @@ handling starts and survives reconnects, so while the gateway runs a message
 is handled at most once (a reply that fails to send is not retried; the
 failure is in the status). The offset is held in memory, so a batch the
 gateway handled just before stopping can be delivered again after a
-restart. Replies longer than Telegram's limit are split at newlines without
+restart. Update ids belong to one bot, so the offset is kept per bot: the
+gateway checks which bot the credential names (`getMe`) before each poll, and
+a credential replaced with another bot's token starts from a fresh offset
+instead of confirming that bot's undelivered updates. Replies longer than Telegram's limit are split at newlines without
 cutting a character.
 
 A turn runs as its own task. A messenger stopped mid-turn (disabled,

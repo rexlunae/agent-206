@@ -55,6 +55,8 @@ pub enum MessengerError {
     },
     #[error("{service} reported a failed request")]
     Refused { service: &'static str },
+    #[error("{service} did not identify the bot account")]
+    NoAccountId { service: &'static str },
     #[error("choose a model for this messenger before allowing chats")]
     NoModel,
     #[error("the thread could not answer the message")]
@@ -73,7 +75,9 @@ impl crate::error::Classified for MessengerError {
             Self::TurnAborted(_) => ErrorKind::Internal,
             Self::BrokerTooOld | Self::VaultUnavailable(_) => ErrorKind::Unavailable,
             Self::Broker(error) => return crate::error::classify(error),
-            Self::UnexpectedReply | Self::Malformed { .. } => ErrorKind::Protocol,
+            Self::UnexpectedReply | Self::Malformed { .. } | Self::NoAccountId { .. } => {
+                ErrorKind::Protocol
+            }
             Self::Unauthorized { .. } => ErrorKind::PermissionDenied,
             Self::PollingConflict { .. } => ErrorKind::Conflict,
             Self::Status { .. } | Self::Refused { .. } => ErrorKind::Provider,
@@ -269,7 +273,7 @@ async fn run<H: Host>(
         let mut delay = backoff.initial;
         // Updates up to here are handled; kept across sessions so a retry
         // does not ask the service to deliver them again.
-        let mut offset = None;
+        let mut cursor = None;
         let mut pairings = host.pairings();
         loop {
             // Mark the pairing in hand as seen, so waiting below wakes only
@@ -283,7 +287,7 @@ async fn run<H: Host>(
                 continue;
             };
             host.update(&name, |s| s.state = MessengerState::Connecting);
-            let result = session(&host, &config, pairing, &mut delay, &mut offset, backoff).await;
+            let result = session(&host, &config, pairing, &mut delay, &mut cursor, backoff).await;
             let Err(error) = result else { return };
             let report = crate::error::handle("messenger", &error);
             host.update(&name, |s| {
@@ -314,32 +318,68 @@ async fn run<H: Host>(
     }
 }
 
+/// How far one bot's updates are handled. Update ids are per bot, and an
+/// offset confirms every earlier id, so it is never sent to another bot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Cursor {
+    bot: i64,
+    next: Option<i64>,
+}
+
+impl Cursor {
+    /// The cursor to poll `bot` with: this one if it is the same bot,
+    /// otherwise a fresh one that confirms nothing.
+    fn for_bot(current: Option<Self>, bot: i64) -> Self {
+        current
+            .filter(|cursor| cursor.bot == bot)
+            .unwrap_or(Self { bot, next: None })
+    }
+}
+
 /// Connect and serve until an error. Resets `delay` once connected and
-/// advances `offset` past each update as its handling starts, so a message
+/// advances the cursor past each update as its handling starts, so a message
 /// is handled at most once while the gateway runs.
+///
+/// The credential is looked up by the broker on every request, so its value
+/// can be replaced by another bot's token at any time. The bot is checked
+/// again before each poll, and a different bot starts from a fresh cursor
+/// instead of confirming updates it never delivered.
 async fn session<H: Host>(
     host: &H,
     config: &MessengerConfig,
     pairing: BrokerPairing,
     delay: &mut Duration,
-    offset: &mut Option<i64>,
+    cursor: &mut Option<Cursor>,
     backoff: Backoff,
 ) -> Result<()> {
     let api = Api::new(host.root(), pairing, config)?;
     let mut adapter = match config.kind {
         MessengerKind::Telegram => telegram::Telegram::new(api),
     };
-    let account = adapter.connect().await?;
+    let mut account = adapter.connect().await?;
     host.update(&config.name, |s| {
         s.state = MessengerState::Connected;
-        s.account = account;
+        s.account = account.name.clone();
         s.failure = None;
     });
     *delay = backoff.initial;
+    let mut checked = true;
     loop {
-        let batch = adapter.receive(*offset).await?;
+        if !checked {
+            let current = adapter.connect().await?;
+            if current != account {
+                if current.id != account.id {
+                    tracing::info!("the messenger credential now names another bot");
+                }
+                host.update(&config.name, |s| s.account = current.name.clone());
+                account = current;
+            }
+        }
+        checked = false;
+        let position = cursor.insert(Cursor::for_bot(*cursor, account.id));
+        let batch = adapter.receive(position.next).await?;
         for (update, inbound) in batch.updates {
-            *offset = Some(update.saturating_add(1));
+            position.next = Some(update.saturating_add(1));
             if let Some(inbound) = inbound {
                 deliver(host, config, &adapter, inbound).await?;
             }

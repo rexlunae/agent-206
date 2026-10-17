@@ -20,6 +20,14 @@ pub(crate) struct Telegram {
     api: Api,
 }
 
+/// The bot the credential currently names. Update ids belong to one bot, so
+/// an offset is only meaningful for the same `id`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Account {
+    pub id: i64,
+    pub name: Option<String>,
+}
+
 /// One poll's updates in order, each with its text message if it has one.
 pub(crate) struct Batch {
     pub updates: Vec<(i64, Option<Inbound>)>,
@@ -116,9 +124,14 @@ impl Telegram {
     }
 
     /// Check the token and name the bot account.
-    pub(crate) async fn connect(&mut self) -> Result<Option<String>> {
+    pub(crate) async fn connect(&mut self) -> Result<Account> {
         let me: User = self.request(HttpMethod::Get, "getMe", None).await?;
-        Ok(me.username.map(|name| format!("@{name}")).or(me.first_name))
+        Ok(Account {
+            id: me
+                .id
+                .ok_or(MessengerError::NoAccountId { service: SERVICE })?,
+            name: me.username.map(|name| format!("@{name}")).or(me.first_name),
+        })
     }
 
     /// Wait for the next batch of updates after `offset`, which confirms

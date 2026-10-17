@@ -20,6 +20,8 @@ fn random() -> String {
 struct Bot {
     token: String,
     username: String,
+    /// The bot's account id; changing it stands for another bot's token.
+    id: Arc<Mutex<i64>>,
     /// Status `getMe` answers with.
     me_status: Arc<Mutex<u16>>,
     /// Batches `getUpdates` returns in order (`null` answers HTTP 500);
@@ -43,7 +45,10 @@ async fn me(
     let status = axum::http::StatusCode::from_u16(*bot.me_status.lock().unwrap()).unwrap();
     (
         status,
-        Json(json!({"ok": true, "result": {"username": bot.username}})),
+        Json(json!({"ok": true, "result": {
+            "id": *bot.id.lock().unwrap(),
+            "username": bot.username,
+        }})),
     )
 }
 
@@ -402,7 +407,7 @@ async fn a_rejected_token_fails_once_and_waits_for_the_user() {
     desired.send_replace(wanted);
     host.until(|h| h.status(name).state == MessengerState::Connected)
         .await;
-    assert_eq!(*bot.me_calls.lock().unwrap(), 2);
+    assert_eq!(host.connects(name), 2);
     assert_eq!(host.status(name).failure, None);
     stop.cancel();
     supervisor.await.unwrap();
@@ -456,6 +461,51 @@ async fn a_failed_poll_does_not_replay_answered_messages() {
         Some("4")
     );
     assert_eq!(host.turns.lock().unwrap().len(), 1);
+    stop.cancel();
+    supervisor.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn another_bot_behind_the_credential_starts_from_a_fresh_offset() {
+    let (bot, origin, _dir, credential, host, _anchor) = setup(200, None).await;
+    let name = "replaced";
+    let chat = 12;
+    bot.batches
+        .lock()
+        .unwrap()
+        .push_back(json!([message(7, chat, None, &random(), &random())]));
+    let (_desired, receiver) = watch::channel(vec![Desired {
+        config: config(name, &origin, &credential, chat),
+        run: true,
+    }]);
+    let stop = CancellationToken::new();
+    let supervisor = tokio::spawn(supervise(host.clone(), receiver, FAST, stop.clone()));
+    // The same bot is polled with the offset past the handled update.
+    host.until(|_| bot.polls.lock().unwrap().len() >= 2).await;
+    assert_eq!(
+        bot.polls.lock().unwrap()[1]
+            .get("offset")
+            .map(String::as_str),
+        Some("8")
+    );
+    // The stored token now belongs to another bot, whose update ids are its
+    // own: its polls must not confirm any of them.
+    let polled = bot.polls.lock().unwrap().len();
+    *bot.id.lock().unwrap() += 1;
+    host.until(|_| bot.polls.lock().unwrap().len() >= polled + 2)
+        .await;
+    let polls = bot.polls.lock().unwrap().clone();
+    let after = polls
+        .iter()
+        .skip(polled)
+        .position(|poll| !poll.contains_key("offset"))
+        .expect("the new bot was polled without an offset");
+    assert!(
+        polls[polled + after + 1..]
+            .iter()
+            .all(|poll| poll.get("offset").is_none()),
+        "an offset was sent to the new bot"
+    );
     stop.cancel();
     supervisor.await.unwrap();
 }

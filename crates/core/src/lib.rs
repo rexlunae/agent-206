@@ -254,6 +254,7 @@ pub struct Settings {
     pub backends: Vec<BackendConfig>,
     #[serde(default)]
     pub messengers: Vec<MessengerConfig>,
+    #[serde(default)]
     pub mcp_servers: Vec<McpServerConfig>,
     pub prompts: Vec<ModePrompt>,
     pub theme_design: String,
@@ -827,6 +828,25 @@ pub struct HostKey {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn settings_saved_before_later_sections_still_load() {
+        let mut table: toml::Table = toml::from_str(
+            &toml::to_string(&Settings {
+                messengers: vec![MessengerConfig::new(
+                    format!("m-{}", Id::new_v4().simple()),
+                    MessengerKind::Telegram,
+                )],
+                ..Settings::default()
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        for section in ["backends", "messengers", "mcp_servers"] {
+            table.remove(section);
+        }
+        let settings: Settings = toml::from_str(&toml::to_string(&table).unwrap()).unwrap();
+        assert!(settings.messengers.is_empty() && settings.mcp_servers.is_empty());
+    }
     #[test]
     fn delegation_never_increases_authority() {
         use Capability::*;
