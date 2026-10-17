@@ -14,7 +14,8 @@ use a206_core::{Capability, ErrorKind};
 use std::error::Error;
 
 /// The capability a host request needs. Extension-scoped state and logs need
-/// none; everything that reaches outside the extension does.
+/// none. Approved skill imports are separately restricted to the bundled
+/// skills identity and current approval pins by the gateway.
 pub fn required_capability(request: &abi::HostRequest) -> Option<Capability> {
     use abi::HostRequest as R;
     match request {
@@ -26,7 +27,11 @@ pub fn required_capability(request: &abi::HostRequest) -> Option<Capability> {
         }
         R::GitStatus | R::GitLog { .. } | R::GitDiff { .. } => Some(Capability::GitRead),
         R::Fetch { .. } => Some(Capability::Network),
-        R::StateGet { .. } | R::StatePut { .. } | R::Log { .. } => None,
+        R::StateGet { .. }
+        | R::StatePut { .. }
+        | R::Log { .. }
+        | R::SkillList
+        | R::SkillRead { .. } => None,
     }
 }
 
@@ -46,6 +51,10 @@ const BUNDLED: &[(&str, &[u8])] = &[
     (
         include_str!("../../../plugins/git/plugin.toml"),
         include_bytes!(concat!(env!("OUT_DIR"), "/a206_plugin_git.wasm")),
+    ),
+    (
+        include_str!("../../../plugins/skills/plugin.toml"),
+        include_bytes!(concat!(env!("OUT_DIR"), "/a206_plugin_skills.wasm")),
     ),
     (
         include_str!("../../../plugins/web/plugin.toml"),

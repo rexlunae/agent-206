@@ -23,7 +23,7 @@ mod messengers;
 pub use mcp_servers::{McpOffer, McpOffers};
 pub use run::{RunError, ToolError};
 mod skills;
-pub use skills::SkillOffer;
+pub use crate::skill_tool::SkillOffer;
 
 /// Streamed reply text that is not final yet. It is published as the
 /// thread's assistant message at most every [`PartialReply::INTERVAL`], so a
@@ -366,6 +366,10 @@ impl Gateway {
         let extension_tools: Arc<dyn crate::tools::ToolHost> = Arc::new(
             crate::extension_tools::ExtensionToolHost::new(extensions.clone()),
         );
+        // Approved skills; each conversation still denies the tools until the
+        // user permits them.
+        let skill_tools: Arc<dyn crate::tools::ToolHost> =
+            Arc::new(crate::skill_tool::SkillToolHost::new(store.clone(), root));
         Ok(Self {
             admission: Arc::new(Mutex::new(Admission::default())),
             shutdown_committed: Arc::new(tokio::sync::Mutex::new(false)),
@@ -383,6 +387,7 @@ impl Gateway {
             tool_hosts: Arc::new(vec![
                 extension_tools,
                 Arc::new(crate::exec_tool::ExecHost::new(root)),
+                skill_tools,
             ]),
             approvals: Arc::new(Mutex::new(BTreeMap::new())),
             policy: Arc::new(tokio::sync::watch::Sender::new(0)),
