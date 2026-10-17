@@ -3,9 +3,9 @@
 //! and the snapshot report right now; nothing is remembered as "done" by the
 //! page itself, and a fact nobody reported stays unknown. The steps are the
 //! ones `agent206 setup` walks through, plus a provider and a first
-//! conversation.
+//! conversation; projects, messengers and skills follow as extras.
 use crate::{PageFrame, State, dispatch, route::Route};
-use a206_core::{Command, GatewayPhase, GatewayReport, Mode, Snapshot};
+use a206_core::{Command, GatewayPhase, GatewayReport, MessengerKind, Mode, Snapshot};
 use fc_dioxus::prelude::*;
 
 /// What a vault card last read from its broker, in terms the checklist uses.
@@ -265,6 +265,58 @@ fn steps(
     steps
 }
 
+/// Steps that widen what Agent 206 can reach. None is needed to start, so they
+/// stay out of the checklist count.
+fn extras(snapshot: &Snapshot) -> [Step; 3] {
+    let done_or = |done: bool, title, detail: String, hint: String| {
+        if done {
+            Step::new(title, Progress::Done, detail)
+        } else {
+            Step::new(title, Progress::Optional, hint)
+        }
+    };
+    let projects = snapshot.projects.len();
+    let messengers = &snapshot.settings.messengers;
+    let enabled = messengers.iter().filter(|m| m.enabled).count();
+    let skills = snapshot.settings.enabled_skills.len();
+    [
+        done_or(
+            projects > 0,
+            "Add a project",
+            format!("Projects: {projects}."),
+            "Point a project at a folder so its conversations share a root and a coordinator."
+                .into(),
+        )
+        .on(Route::Projects {}),
+        done_or(
+            enabled > 0,
+            "Connect a messenger",
+            format!("Turned on: {enabled} of {}.", messengers.len()),
+            if messengers.is_empty() {
+                let kinds: Vec<_> = MessengerKind::ALL.iter().map(|kind| kind.label()).collect();
+                let kinds = match kinds.split_last() {
+                    Some((last, rest)) if !rest.is_empty() => {
+                        format!("{} or {last}", rest.join(", "))
+                    }
+                    _ => kinds.concat(),
+                };
+                format!("Reach your agent from {kinds}. Its token stays in the vault.")
+            } else {
+                "Configured but turned off; a messenger connects only once you turn it on.".into()
+            },
+        )
+        .on(Route::Messengers {}),
+        done_or(
+            skills > 0,
+            "Enable a skill",
+            format!("Enabled: {skills}."),
+            "Review a skill folder from your profile and turn it on. Skills never add permissions."
+                .into(),
+        )
+        .on(Route::Extensions {}),
+    ]
+}
+
 /// Whether the workspace should point at this page: the steps the snapshot
 /// alone can tell are unfinished.
 pub(crate) fn unfinished(snapshot: &Snapshot, now: u64) -> bool {
@@ -285,6 +337,7 @@ pub(crate) fn Welcome() -> Element {
         .filter(|step| step.progress == Progress::Done)
         .count();
     let total = steps.len();
+    let extras = extras(&snapshot);
     rsx! { PageFrame { kicker: "Get started", title: "Set up Agent 206.", description: "Each step shows what your gateway and vault report now. Finish them in any order; this page updates as you go.",
         Card { variant: CardVariant::Feature,
             CardHeader { CardTitle { "Setup checklist" }
@@ -292,17 +345,15 @@ pub(crate) fn Welcome() -> Element {
             }
             CardBody {
                 List { ordered: true, divided: true,
-                    for step in steps {
-                        { let (label, tone, icon) = step.progress.badge();
-                          rsx! { ListItem { key: "{step.title}",
-                              leading: rsx! { Icon { name: icon, size: IconSize::Sm } },
-                              headline: rsx! { "{step.title}" },
-                              supporting: rsx! { "{step.detail}" },
-                              trailing: rsx! { Badge { tone, "{label}" } },
-                              action: step.page.map_or(ListAction::None, |page| ListAction::Link(page.to_string())),
-                          } }
-                        }
-                    }
+                    for step in steps { StepItem { key: "{step.title}", step } }
+                }
+            }
+        }
+        Card { variant: CardVariant::Elevated,
+            CardHeader { CardTitle { "When you're ready" } }
+            CardBody {
+                List { divided: true,
+                    for step in extras { StepItem { key: "{step.title}", step } }
                 }
             }
         }
@@ -317,6 +368,18 @@ pub(crate) fn Welcome() -> Element {
         Card { variant: CardVariant::Subtle,
             CardBody { p { class: "a206-muted", "Working in a terminal? `agent206 setup` runs the gateway, vault, authenticator and pairing steps through the same requests, then prints the health report." } }
         }
+    } }
+}
+
+#[component]
+fn StepItem(step: Step) -> Element {
+    let (label, tone, icon) = step.progress.badge();
+    rsx! { ListItem {
+        leading: rsx! { Icon { name: icon, size: IconSize::Sm } },
+        headline: rsx! { "{step.title}" },
+        supporting: rsx! { "{step.detail}" },
+        trailing: rsx! { Badge { tone, "{label}" } },
+        action: step.page.map_or(ListAction::None, |page| ListAction::Link(page.to_string())),
     } }
 }
 
@@ -510,6 +573,30 @@ mod tests {
         assert!(!unfinished(&snapshot, 0));
     }
 
+    #[test]
+    fn extras_are_recommended_until_the_snapshot_shows_them() {
+        let mut snapshot = crate::empty_snapshot();
+        assert_eq!(progress(&extras(&snapshot)), [Progress::Optional; 3]);
+        snapshot.projects.push(a206_core::Project {
+            id: Uuid::new_v4(),
+            name: text(),
+            root: text(),
+            manager: Uuid::new_v4(),
+        });
+        let mut messenger = a206_core::MessengerConfig::new(text(), MessengerKind::ALL[0]);
+        snapshot.settings.messengers.push(messenger.clone());
+        let [project, off, skill] = extras(&snapshot);
+        assert_eq!(project.progress, Progress::Done);
+        // Configured but off is not connected.
+        assert_eq!(off.progress, Progress::Optional);
+        assert!(off.detail.contains("turned off"), "{}", off.detail);
+        assert_eq!(skill.progress, Progress::Optional);
+        messenger.enabled = true;
+        snapshot.settings.messengers = vec![messenger];
+        snapshot.settings.enabled_skills.insert(text(), text());
+        assert_eq!(progress(&extras(&snapshot)), [Progress::Done; 3]);
+    }
+
     #[derive(Clone, Debug, PartialEq, Routable)]
     enum PageRoute {
         #[route("/")]
@@ -544,5 +631,11 @@ mod tests {
             "{html}"
         );
         assert!(html.contains("Start a conversation"), "{html}");
+        // Extras link to their pages and stay out of the count.
+        assert!(html.contains("Connect a messenger"), "{html}");
+        assert!(
+            html.contains(&format!("href=\"{}\"", Route::Messengers {})),
+            "{html}"
+        );
     }
 }
