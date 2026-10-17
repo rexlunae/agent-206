@@ -22,8 +22,10 @@ const MESSAGE_OVERHEAD: usize = 4096;
 mod messengers;
 pub use mcp_servers::{McpOffer, McpOffers};
 pub use run::{RunError, ToolError};
+mod delegation;
 mod skills;
 pub use crate::skill_tool::SkillOffer;
+pub use delegation::{Caller, Child, Delegator, DelegatorError, Reservation};
 
 /// Streamed reply text that is not final yet. It is published as the
 /// thread's assistant message at most every [`PartialReply::INTERVAL`], so a
@@ -330,6 +332,10 @@ pub struct Gateway {
     /// Messengers the user disconnected; they connect again only on request.
     messengers_stopped: Arc<Mutex<BTreeSet<String>>>,
     mcp: Arc<mcp_servers::McpServers>,
+    /// This gateway's subagent tools and the hosts their subagents run with.
+    delegation: delegation::Binding,
+    /// Runs the subagent tools reserved before starting them, by subagent.
+    reserved: delegation::Reserved,
 }
 /// The broker pairing this gateway holds, with the connection that anchors it.
 struct Paired {
@@ -391,7 +397,7 @@ impl Gateway {
         // user permits them.
         let skill_tools: Arc<dyn crate::tools::ToolHost> =
             Arc::new(crate::skill_tool::SkillToolHost::new(store.clone(), root));
-        Ok(Self {
+        let mut gateway = Self {
             admission: Arc::new(Mutex::new(Admission::default())),
             shutdown_committed: Arc::new(tokio::sync::Mutex::new(false)),
             started: std::time::Instant::now(),
@@ -418,7 +424,13 @@ impl Gateway {
             messengers: tokio::sync::watch::Sender::new(desired),
             messengers_stopped: Arc::new(Mutex::new(BTreeSet::new())),
             mcp: Arc::default(),
-        })
+            delegation: Default::default(),
+            reserved: Arc::default(),
+        };
+        // Subagent tools; each conversation still denies them until the user
+        // permits them, and they are offered only with subagent models.
+        gateway.bind_delegation();
+        Ok(gateway)
     }
     fn pairing(&self) -> Result<Option<BrokerPairing>> {
         Ok(self
@@ -1027,8 +1039,7 @@ impl Gateway {
                         && text.len() <= 128 * 1024,
                     GatewayError::Invalid("message must be 1–131072 bytes"),
                 )?;
-                let token = tokio_util::sync::CancellationToken::new();
-                let (config, thread, prompt, info, backend, workspace, root) = {
+                let (token, config, thread, prompt, info, backend, workspace, root) = {
                     let mut store = self.lock()?;
                     // Admit the message only with room for it and for the
                     // run's first round, which applies the same bound, so an
@@ -1114,12 +1125,10 @@ impl Gateway {
                     // The previous run's cost is not this run's.
                     thread.run_usage = None;
                     let copy = thread.clone();
-                    self.running
-                        .lock()
-                        .map_err(poisoned("run"))?
-                        .insert(id, token.clone());
+                    // A subagent run its parent reserved is cancelled with it.
+                    let token = delegation::admit(self, id)?;
                     store.persist(Some(EventKind::ThreadChanged { id }))?;
-                    (config, copy, prompt, info, backend, workspace, root)
+                    (token, config, copy, prompt, info, backend, workspace, root)
                 };
                 let Some(backend) = backend else {
                     let ended = self
@@ -1249,14 +1258,7 @@ impl Gateway {
                 self.prompts.answer(thread, prompt, answer)?;
                 Ok(Reply::Ok)
             }
-            Command::CancelRun { thread } => {
-                let running = self.running.lock().map_err(poisoned("run"))?;
-                let token = running
-                    .get(&thread)
-                    .ok_or(GatewayError::NotFound("thread is not running"))?;
-                token.cancel();
-                Ok(Reply::Ok)
-            }
+            Command::CancelRun { thread } => delegation::cancel_run(self, thread),
             Command::CreateProject { name, root } => {
                 check(
                     !name.trim().is_empty(),
