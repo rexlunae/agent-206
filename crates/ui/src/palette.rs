@@ -84,26 +84,24 @@ pub(crate) fn entries(snapshot: &Snapshot, route: &Route, can_create: bool) -> V
             ));
         }
         // The same conditions as the conversation's own Pause and Resume.
-        if running
-            && thread.backend == CodingBackend::Native
-            && (thread.paused || thread.compacting.is_none())
-        {
-            entries.push(if thread.paused {
-                Entry::new(
-                    title("Resume response"),
-                    "This conversation",
-                    IconName::Play,
-                    Action::Resume(thread.id),
-                )
-            } else {
+        if crate::running::resumable(thread) {
+            entries.push(Entry::new(
+                title("Resume response"),
+                "This conversation",
+                IconName::Play,
+                Action::Resume(thread.id),
+            ));
+        }
+        if crate::running::pausable(thread) {
+            entries.push(
                 Entry::new(
                     title("Pause response"),
                     "This conversation",
                     IconName::Pause,
                     Action::Pause(thread.id),
                 )
-                .detail("Hold it before its next step")
-            });
+                .detail("Hold it before its next step"),
+            );
         }
         if can_compact(thread) {
             entries.push(

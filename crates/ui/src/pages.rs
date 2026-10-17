@@ -21,7 +21,8 @@ pub fn Overview() -> Element {
                     LinkButton { variant: ButtonVariant::Secondary, href: Route::Gateway {}.to_string(), "Manage gateway" }
                 }
             }
-            Badge { tone: BadgeTone::Accent, "{snapshot.threads.iter().filter(|t| t.state == a206_core::RunState::Running).count()} active responses" }
+            LinkButton { variant: ButtonVariant::Ghost, href: Route::Running {}.to_string(),
+                Badge { tone: BadgeTone::Accent, "{snapshot.threads.iter().filter(|t| t.state == a206_core::RunState::Running).count()} active responses" } }
         }
         if crate::welcome::unfinished(&snapshot, now) {
             Card { variant: CardVariant::Subtle, CardBody { div { class: "a206-row a206-between",
