@@ -20,7 +20,19 @@ write tools need a separate `write_workspace` grant. It also bundles
 `agent206.git` (`plugins/git`) with `git_status`, `git_log` and `git_diff`
 tools under the `git_read` grant and a `git_commit` tool under its own
 `git_write` grant, and `agent206.web` (`plugins/web`) with a
-`fetch_url` tool under the `network` grant. Bundled tools cut text past
+`fetch_url` tool under the `network` grant.
+`agent206.memory` (`plugins/memory`) has project memory tools that see only
+`MEMORY.md` and `memory/**/*.md`: `memory_search` (BM25 over heading/20-line
+sections, through the ordinary list and read host calls) and `memory_get` (a
+line range of one memory file) under `read_workspace`, and `memory_save`
+(create or append to a note under `memory/`; never `MEMORY.md`) under the
+separate `write_workspace` grant. The guest refuses any other path before
+making a host call, skips symbolic links, and appends with `edit_file` over the
+whole old text, so a note changed meanwhile fails with `conflict` instead of
+being overwritten. Search meters its own work against the invocation's fuel and
+stops with a notice naming how many files it ranked; under the default
+50,000,000 fuel that is roughly 230 KB of English or 30 KB of CJK text per
+search. Bundled tools cut text past
 192 KiB with a notice (the SDK's `excerpt`), so a long result never exceeds
 the outcome limit. Users can also install third-party packages (see
 [Installed packages](#installed-packages)), including packages agents prepare
