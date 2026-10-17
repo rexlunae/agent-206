@@ -93,7 +93,20 @@ it reads the two files under `read_workspace`, confined to the project root.
 - Unrecorded package files are pruned when the gateway starts; recorded
   proposals are kept.
 
-Not yet: registry or URL installs, signatures, and a pre-install audit.
+Before enabling, the user sees a **pre-install audit** of the package's text
+(`a206-audit`): the extension's name and description and its tools',
+parameters' and panels' text are matched against patterns that often appear in
+harmful instructions (a downloaded script piped into a shell, a reverse shell,
+credential file paths, instructions to ignore the system prompt or keep
+something from the user, invisible or direction-changing characters, key-like
+values, decoded commands). Findings name the field they are in and appear on
+installed, non-bundled extensions and on waiting proposals, in the Extensions
+page and in `agent206 extension list`. They are advice: they neither approve
+nor block, and a clean report does not make a package safe. The audit reads
+text only; it runs nothing and does not inspect the WASM module, whose
+authority is already limited to what the user grants.
+
+Not yet: registry or URL installs and signatures.
 
 ### What agents see
 

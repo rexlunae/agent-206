@@ -143,6 +143,12 @@ mod native {
             thread: uuid::Uuid,
             text: String,
         },
+        /// Add a message to a conversation's running native run; it is read
+        /// before the run's next model request.
+        Steer {
+            thread: uuid::Uuid,
+            text: String,
+        },
         Cancel {
             thread: uuid::Uuid,
         },
@@ -874,6 +880,20 @@ mod native {
                             match client.call(Command::ReadSkill { name }).await? {
                                 Reply::Skill(skill) => {
                                     print!("{}", skill.text);
+                                    let audit = a206_audit::text(&skill.text);
+                                    if !audit.is_clean() {
+                                        eprintln!("\nCheck before approving; the audit matched:");
+                                        for finding in &audit.findings {
+                                            if let a206_core::AuditLocation::Line(line) =
+                                                finding.location
+                                            {
+                                                eprintln!("  line {line}: {}", finding.rule.label());
+                                            }
+                                        }
+                                        if audit.more > 0 {
+                                            eprintln!("  and {} more", audit.more);
+                                        }
+                                    }
                                     eprintln!(
                                         "\nTo approve exactly this text: agent206 skills enable {} --digest {}",
                                         skill.name, skill.digest
@@ -951,6 +971,7 @@ mod native {
                         text,
                         attachments: vec![],
                     },
+                    Action::Steer { thread, text } => Command::Steer { thread, text },
                     Action::Cancel { thread } => Command::CancelRun { thread },
                     Action::Compact { thread } => Command::CompactThread { thread },
                     Action::Tools { command } => match command {
@@ -1126,17 +1147,43 @@ mod native {
                                 else {
                                     anyhow::bail!("could not read extensions");
                                 };
+                                /// A listed package with what the pre-install
+                                /// audit found in its text; bundled ones have none.
+                                #[derive(serde::Serialize)]
+                                struct Audited<T> {
+                                    #[serde(flatten)]
+                                    item: T,
+                                    #[serde(skip_serializing_if = "Option::is_none")]
+                                    audit: Option<a206_core::AuditReport>,
+                                }
                                 #[derive(serde::Serialize)]
                                 struct Extensions {
-                                    extensions: Vec<a206_core::PluginSummary>,
+                                    extensions: Vec<Audited<a206_core::PluginSummary>>,
                                     #[serde(skip_serializing_if = "Vec::is_empty")]
-                                    proposals: Vec<a206_core::ExtensionProposal>,
+                                    proposals: Vec<Audited<a206_core::ExtensionProposal>>,
                                 }
+                                let extensions = snapshot
+                                    .plugins
+                                    .into_iter()
+                                    .map(|item| Audited {
+                                        audit: (item.source != a206_core::PluginSource::Bundled)
+                                            .then(|| a206_audit::plugin(&item)),
+                                        item,
+                                    })
+                                    .collect();
+                                let proposals = snapshot
+                                    .extension_proposals
+                                    .into_iter()
+                                    .map(|item| Audited {
+                                        audit: Some(a206_audit::plugin(&item.summary)),
+                                        item,
+                                    })
+                                    .collect();
                                 print!(
                                     "{}",
                                     toml::to_string_pretty(&Extensions {
-                                        extensions: snapshot.plugins,
-                                        proposals: snapshot.extension_proposals,
+                                        extensions,
+                                        proposals,
                                     })?
                                 );
                                 return Ok(());

@@ -468,6 +468,40 @@ pub(crate) mod tests {
         assert!(html.contains(&format!("href=\"{whole}\"")));
     }
 
+    #[test]
+    fn a_running_native_conversation_takes_and_shows_steered_messages() {
+        let mut thread = a206_core::Thread::new(Uuid::new_v4().to_string(), a206_core::Mode::Chat);
+        let waiting = Uuid::new_v4().to_string();
+        thread.state = a206_core::RunState::Running;
+        thread.steering.push(a206_core::Message::new(
+            a206_core::Role::User,
+            waiting.clone(),
+            0,
+            a206_core::CodingBackend::Native,
+        ));
+        let mut snapshot = crate::empty_snapshot();
+        snapshot.threads = vec![thread.clone()];
+        let fixture = ThreadFixture {
+            snapshot,
+            id: thread.id,
+            split: None,
+            message: None,
+        };
+        let html = render_thread(fixture.clone());
+        assert!(html.contains("Add to the running response"), "{html}");
+        assert!(html.contains(&waiting) && html.contains("Read before its next step"));
+        assert!(!html.contains("readonly"), "{html}");
+        // Another engine's run cannot take messages while it works.
+        let mut external = fixture;
+        external.snapshot.threads[0].backend = a206_core::CodingBackend::ALL
+            .into_iter()
+            .find(|b| *b != a206_core::CodingBackend::Native)
+            .unwrap();
+        let html = render_thread(external);
+        assert!(!html.contains("Add to the running response"));
+        assert!(html.contains("readonly"), "{html}");
+    }
+
     #[derive(Clone, Debug, PartialEq, Routable)]
     enum MessengerRoute {
         #[route("/")]
