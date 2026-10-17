@@ -62,6 +62,8 @@ struct TestHost {
     calls: mpsc::UnboundedSender<(ToolScope, ToolRequest)>,
     dropped: Arc<AtomicBool>,
     rescoped: Rescoped,
+    /// Tools named `held_…` finish only when this is notified.
+    release: Arc<tokio::sync::Notify>,
 }
 /// Conversations whose scope `rescope` records, with the capabilities it
 /// last saw for each (`None` before any rescope, or once one is gone).
@@ -96,10 +98,14 @@ impl ToolHost for TestHost {
             );
             // Tools named `fail_…` report their own failure.
             let is_error = request.name.starts_with("fail_");
+            let held = request.name.starts_with("held_");
             self.calls.send((scope.clone(), request)).unwrap();
             if blocking {
                 let _flag = DropFlag(self.dropped.clone());
                 std::future::pending::<()>().await;
+            }
+            if held {
+                self.release.notified().await;
             }
             Ok(ToolOutput { text, is_error })
         })
@@ -133,12 +139,14 @@ struct Rig {
     marker: String,
     dropped: Arc<AtomicBool>,
     rescoped: Rescoped,
+    release: Arc<tokio::sync::Notify>,
 }
 async fn rig(api: ProviderApi, tools: Vec<ToolSpec>, blocking: Option<String>) -> Rig {
     let (sender, calls) = mpsc::unbounded_channel();
     let marker = nonce();
     let dropped = Arc::new(AtomicBool::new(false));
     let rescoped = Rescoped::default();
+    let release = Arc::new(tokio::sync::Notify::new());
     let state = tempfile::tempdir().unwrap();
     let gateway = Gateway::open(state.path())
         .unwrap()
@@ -149,6 +157,7 @@ async fn rig(api: ProviderApi, tools: Vec<ToolSpec>, blocking: Option<String>) -
             calls: sender,
             dropped: dropped.clone(),
             rescoped: rescoped.clone(),
+            release: release.clone(),
         }));
     let (model, requests) = connect(&gateway, api).await;
     let mut rig = Rig {
@@ -161,6 +170,7 @@ async fn rig(api: ProviderApi, tools: Vec<ToolSpec>, blocking: Option<String>) -
         marker,
         dropped,
         rescoped,
+        release,
     };
     let Reply::Thread(thread) = rig
         .run(Command::CreateThread {
@@ -1129,6 +1139,87 @@ async fn changing_a_grant_lets_tool_hosts_stop_work_it_no_longer_covers() {
     );
     assert_eq!(rig.run(grant(&[])).await, Reply::Ok);
     assert_eq!(seen(manager), Some(Some(BTreeSet::new())));
+}
+
+#[tokio::test]
+async fn a_grant_changed_during_a_call_is_rescoped_once_the_call_returns() {
+    let api = ProviderApi::OpenAi;
+    let name = format!("held_{}", nonce().replace('-', "_"));
+    let mut rig = rig(
+        api,
+        vec![tool(
+            &name,
+            ToolPermission::Allow,
+            &[Capability::ReadWorkspace],
+        )],
+        None,
+    )
+    .await;
+    let workspace = tempfile::tempdir().unwrap();
+    let Reply::Project(project) = rig
+        .run(Command::CreateProject {
+            name: nonce(),
+            root: workspace.path().to_string_lossy().into(),
+        })
+        .await
+    else {
+        panic!("project creation failed");
+    };
+    let manager = project.manager;
+    let configured = rig
+        .run(Command::ConfigureThread {
+            id: manager,
+            mode: Mode::Code,
+            model: Some(rig.model.clone()),
+            subagent_models: [rig.model.clone()].into(),
+        })
+        .await;
+    assert!(matches!(configured, Reply::Thread(_)), "{configured:?}");
+    let grant = |capabilities: &[Capability]| Command::SetBackend {
+        thread: manager,
+        backend: CodingBackend::Native,
+        capabilities: capabilities.iter().copied().collect(),
+    };
+    assert_eq!(
+        rig.run(grant(&[Capability::ReadWorkspace, Capability::Execute]))
+            .await,
+        Reply::Ok
+    );
+    rig.thread = manager;
+    let child = {
+        delegate(
+            &mut rig,
+            Mode::Code,
+            &[Capability::ReadWorkspace, Capability::Execute],
+            &name,
+        )
+        .await;
+        rig.thread
+    };
+    let task = rig.send();
+    let first = rig.next_request().await;
+    let call = Call::new(&name, json!({}));
+    first
+        .respond(calls_response(api, std::slice::from_ref(&call), ""))
+        .await;
+    let (scope, _) = wait_for_call(&mut rig).await;
+    assert!(scope.capabilities.contains(&Capability::Execute));
+    // The parent loses a grant while its child's call runs: the tool itself
+    // is still permitted, but what the call started must be looked at again.
+    assert_eq!(
+        rig.run(grant(&[Capability::ReadWorkspace])).await,
+        Reply::Ok
+    );
+    rig.rescoped.lock().unwrap().insert(child, None);
+    rig.release.notify_one();
+    let second = rig.next_request().await;
+    assert_eq!(
+        rig.rescoped.lock().unwrap()[&child],
+        Some(Some([Capability::ReadWorkspace].into())),
+        "no rescope after the call returned"
+    );
+    second.respond(text_response(api, &nonce())).await;
+    assert_eq!(finished(task).await.state, RunState::Complete);
 }
 
 #[tokio::test]

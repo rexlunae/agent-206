@@ -205,7 +205,9 @@ background sessions.
   sandbox holds a capability (Execute, ReadWorkspace, WriteWorkspace,
   Network) or project the conversation, or one of its ancestors, no longer
   grants is stopped and reported as such, and a command still starting is
-  stopped with `PermissionDenied`. There is no terminal, so `send_keys`
+  stopped with `PermissionDenied`. Because a call runs with the scope taken
+  when it started, the gateway rescopes again when a call returns after
+  policy changed during it. There is no terminal, so `send_keys`
   (key chords for interactive programs) is not offered.
 - **Other platforms.** Windows does not offer these tools; the listing reports
   `native exec` unavailable rather than run commands unconfined.
