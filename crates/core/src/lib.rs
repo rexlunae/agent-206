@@ -491,6 +491,42 @@ pub struct Thread {
     /// offered once for each summary, before the next one is made.
     #[serde(default)]
     pub memory_flush: Option<MemoryFlush>,
+    /// The checklist the conversation's models keep with `plan_update`,
+    /// shown to the user beside the conversation. Empty when there is none.
+    #[serde(default)]
+    pub plan: Vec<PlanStep>,
+}
+/// One step of a conversation's plan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanStep {
+    pub text: String,
+    pub status: PlanStatus,
+}
+/// How far a plan step has got.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanStatus {
+    Pending,
+    InProgress,
+    Done,
+}
+impl PlanStatus {
+    pub const ALL: [Self; 3] = [Self::Pending, Self::InProgress, Self::Done];
+    /// The name models and the API use.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::InProgress => "in_progress",
+            Self::Done => "done",
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Pending => "Not started",
+            Self::InProgress => "In progress",
+            Self::Done => "Done",
+        }
+    }
 }
 /// A pre-compaction memory flush offered to a native run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -533,6 +569,7 @@ impl Thread {
             instructions: vec![],
             compacting: None,
             memory_flush: None,
+            plan: vec![],
         }
     }
 }

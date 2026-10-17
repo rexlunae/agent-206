@@ -124,6 +124,7 @@ pub(crate) fn classify(error: &(dyn Error + 'static)) -> Option<ErrorKind> {
         crate::gateway::DelegatorError,
         crate::schedule::ScheduleError,
         crate::schedule_tool::ScheduleToolError,
+        crate::plan_tool::PlanToolError,
         a206_extensions::abi::HostFailure,
         a206_mcp::McpError,
         a206_skills::SkillError,
