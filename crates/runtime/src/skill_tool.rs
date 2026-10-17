@@ -128,6 +128,11 @@ impl SkillToolHost {
     }
     /// Run `read` on a blocking thread: skills are files, and a slow file
     /// system must not stall the gateway's async workers.
+    ///
+    /// Dropping the call detaches the read deliberately: blocking file I/O
+    /// cannot be interrupted, and a read changes nothing, holds the settings
+    /// lock only to copy the pins, is bounded by the skill crate's size
+    /// limits, and its result is discarded. The call itself ends at once.
     async fn read<T: Send + 'static>(
         &self,
         read: impl FnOnce(&Source) -> Result<T, SkillToolError> + Send + 'static,
