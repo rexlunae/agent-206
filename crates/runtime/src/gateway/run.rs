@@ -205,7 +205,7 @@ fn bounded_output(mut text: String, limit: usize) -> String {
 /// Most ancestors followed when combining delegated permissions.
 const MAX_LINEAGE: usize = 32;
 /// A thread followed by each of its ancestors, nearest first.
-fn lineage(store: &Store, id: Id) -> Result<Vec<&Thread>> {
+pub(super) fn lineage(store: &Store, id: Id) -> Result<Vec<&Thread>> {
     let mut lineage = vec![store.thread(id)?];
     while let Some(next) = lineage.last().and_then(|t| t.parent) {
         check(
@@ -469,6 +469,11 @@ impl Gateway {
             // A cancellation between rounds ends the run as Cancelled, before
             // any other reason not to start the next round.
             if run.cancel.is_cancelled() {
+                return Ok(Ended::Cancelled);
+            }
+            // A paused conversation, or one whose ancestor is paused, waits
+            // here until resumed or cancelled.
+            if !self.wait_while_paused(run.thread, &run.cancel).await? {
                 return Ok(Ended::Cancelled);
             }
             // Every round's reply must fit; refuse the round rather than

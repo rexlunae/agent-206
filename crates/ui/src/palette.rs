@@ -12,6 +12,8 @@ pub(crate) enum Action {
     NewConversation,
     Compact(Id),
     Stop(Id),
+    Pause(Id),
+    Resume(Id),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -80,6 +82,25 @@ pub(crate) fn entries(snapshot: &Snapshot, route: &Route, can_create: bool) -> V
                 IconName::Stop,
                 Action::Stop(thread.id),
             ));
+        }
+        // The same conditions as the conversation's own Pause and Resume.
+        if running && thread.backend == CodingBackend::Native {
+            entries.push(if thread.paused {
+                Entry::new(
+                    title("Resume response"),
+                    "This conversation",
+                    IconName::Play,
+                    Action::Resume(thread.id),
+                )
+            } else {
+                Entry::new(
+                    title("Pause response"),
+                    "This conversation",
+                    IconName::Pause,
+                    Action::Pause(thread.id),
+                )
+                .detail("Hold it before its next step")
+            });
         }
         if can_compact(thread) {
             entries.push(
@@ -211,6 +232,8 @@ pub(crate) fn run(state: State, action: Action) {
         ),
         Action::Compact(thread) => dispatch(state, Command::CompactThread { thread }),
         Action::Stop(thread) => dispatch(state, Command::CancelRun { thread }),
+        Action::Pause(thread) => dispatch(state, Command::PauseRun { thread }),
+        Action::Resume(thread) => dispatch(state, Command::ResumeRun { thread }),
     }
 }
 
@@ -398,6 +421,25 @@ mod tests {
         let snap = snapshot(vec![running.clone()]);
         let offered = entries_for(&snap, chat(running.id));
         assert!(offered.iter().any(|e| e.action == Action::Stop(running.id)));
+        assert!(
+            offered
+                .iter()
+                .any(|e| e.action == Action::Pause(running.id))
+        );
+        assert!(
+            !offered
+                .iter()
+                .any(|e| e.action == Action::Resume(running.id))
+        );
+        let mut paused = running.clone();
+        paused.paused = true;
+        let offered = entries_for(&snapshot(vec![paused.clone()]), chat(paused.id));
+        assert!(
+            offered
+                .iter()
+                .any(|e| e.action == Action::Resume(paused.id))
+        );
+        assert!(!offered.iter().any(|e| e.action == Action::Pause(paused.id)));
         assert!(
             !offered
                 .iter()
