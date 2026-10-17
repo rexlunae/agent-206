@@ -799,7 +799,14 @@ async fn delegated_conversations_cannot_permit_more_than_their_parent() {
     let Reply::Tools(list) = rig.run(Command::ListTools { thread: child.id }).await else {
         panic!("tool listing failed");
     };
-    assert_eq!(list.tools[0].effective, ToolPermission::Ask);
+    assert_eq!(
+        list.tools
+            .iter()
+            .find(|tool| tool.name == name)
+            .unwrap()
+            .effective,
+        ToolPermission::Ask
+    );
     // Narrowing the parent later narrows the child as well.
     assert_eq!(
         rig.run(Command::SetToolPermission {
@@ -813,7 +820,14 @@ async fn delegated_conversations_cannot_permit_more_than_their_parent() {
     let Reply::Tools(list) = rig.run(Command::ListTools { thread: child.id }).await else {
         panic!("tool listing failed");
     };
-    assert_eq!(list.tools[0].effective, ToolPermission::Deny);
+    assert_eq!(
+        list.tools
+            .iter()
+            .find(|tool| tool.name == name)
+            .unwrap()
+            .effective,
+        ToolPermission::Deny
+    );
 }
 
 /// Create a subagent of `parent` permitted to use `tool`, as the rig's thread.
@@ -1046,8 +1060,9 @@ async fn a_parent_losing_a_grant_stops_its_childs_running_call() {
     let Reply::Tools(list) = rig.run(Command::ListTools { thread: rig.thread }).await else {
         panic!("tool listing failed");
     };
-    assert_eq!(list.tools[0].effective, ToolPermission::Deny);
-    assert_eq!(list.tools[0].missing, [Capability::ReadWorkspace].into());
+    let offer = list.tools.iter().find(|tool| tool.name == name).unwrap();
+    assert_eq!(offer.effective, ToolPermission::Deny);
+    assert_eq!(offer.missing, [Capability::ReadWorkspace].into());
 }
 
 #[tokio::test]
