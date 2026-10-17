@@ -50,5 +50,9 @@ a206-vault.workspace = true
 name = "coding_backends"
 path = "tests/coding_backends/main.rs"
 harness = false
+# Its own `main` also serves as the extension worker the gateway starts.
+[[test]]
+name = "extension_tools"
+harness = false
 [lints]
 workspace = true

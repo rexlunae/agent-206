@@ -355,13 +355,19 @@ impl Gateway {
             })
             .collect();
         let store = Arc::new(Mutex::new(store));
+        let extensions = crate::extension_host::ExtensionHost::new(store.clone(), root.to_owned());
+        // Enabled, granted extension tools are offered by default; each
+        // conversation still denies them until the user permits one.
+        let extension_tools: Arc<dyn crate::tools::ToolHost> = Arc::new(
+            crate::extension_tools::ExtensionToolHost::new(extensions.clone()),
+        );
         Ok(Self {
             admission: Arc::new(Mutex::new(Admission::default())),
             shutdown_committed: Arc::new(tokio::sync::Mutex::new(false)),
             started: std::time::Instant::now(),
             stop: tokio_util::sync::CancellationToken::new(),
             joshua: Arc::new(tokio::sync::Mutex::new(crate::joshua::Manager::default())),
-            extensions: crate::extension_host::ExtensionHost::new(store.clone(), root.to_owned()),
+            extensions,
             store,
             downloads: Arc::new(Mutex::new(BTreeMap::new())),
             running: Arc::new(Mutex::new(BTreeMap::new())),
@@ -369,7 +375,7 @@ impl Gateway {
             pair_requests: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             refreshed: Arc::new(Mutex::new(BTreeMap::new())),
             paired: Arc::new(tokio::sync::Notify::new()),
-            tool_hosts: Arc::new(vec![]),
+            tool_hosts: Arc::new(vec![extension_tools]),
             approvals: Arc::new(Mutex::new(BTreeMap::new())),
             policy: Arc::new(tokio::sync::watch::Sender::new(0)),
             pairings: tokio::sync::watch::Sender::new(0),
