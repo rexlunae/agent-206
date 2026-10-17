@@ -175,8 +175,10 @@ pub use messengers::{
     ChatBinding, MessengerConfig, MessengerKind, MessengerState, MessengerStatus, RefusedChat,
 };
 pub mod mcp;
+pub mod schedule;
 pub use mcp::{McpServerConfig, McpServerState, McpServerStatus, McpToolInfo, ToolPolicy};
 pub use providers::{ProviderApi, ProviderPreset, ProviderPresetList};
+pub use schedule::{Job, JobAuthor, JobOutcome, JobRun, Schedule};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -635,6 +637,9 @@ pub struct Snapshot {
     /// Runtime state of configured MCP servers; never a grant.
     #[serde(default)]
     pub mcp_servers: Vec<McpServerStatus>,
+    /// Scheduled messages.
+    #[serde(default)]
+    pub jobs: Vec<Job>,
     /// Extension packages agents prepared, waiting for the user.
     #[serde(default)]
     pub extension_proposals: Vec<ExtensionProposal>,
@@ -716,6 +721,10 @@ pub enum EventKind {
         thread: Id,
         prompt: Id,
         outcome: PromptOutcome,
+    },
+    /// A scheduled message was added, changed, ran or was removed.
+    JobChanged {
+        id: Id,
     },
 }
 
@@ -946,6 +955,25 @@ pub enum Command {
         #[serde(default)]
         digest: Option<String>,
     },
+    /// Send `text` to `thread` on `schedule`. The job is enabled.
+    ScheduleJob {
+        name: String,
+        thread: Id,
+        text: String,
+        schedule: Schedule,
+    },
+    /// Pause or resume a job; resuming computes its next time from now.
+    SetJobEnabled {
+        id: Id,
+        enabled: bool,
+    },
+    RemoveJob {
+        id: Id,
+    },
+    /// Run a job now, whatever its schedule.
+    RunJob {
+        id: Id,
+    },
 }
 impl Command {
     /// A stable operation name for logs and diagnostics; never includes arguments.
@@ -997,6 +1025,10 @@ impl Command {
             Self::Skills => "skills",
             Self::ReadSkill { .. } => "read_skill",
             Self::SetSkillEnabled { .. } => "set_skill_enabled",
+            Self::ScheduleJob { .. } => "schedule_job",
+            Self::SetJobEnabled { .. } => "set_job_enabled",
+            Self::RemoveJob { .. } => "remove_job",
+            Self::RunJob { .. } => "run_job",
         }
     }
 }
@@ -1019,6 +1051,7 @@ pub enum Reply {
     Tools(ToolList),
     Messages(Vec<MessageHit>),
     Extension(Box<PluginSummary>),
+    Job(Box<Job>),
 }
 impl Reply {
     /// Separate a gateway-reported failure from a successful reply.

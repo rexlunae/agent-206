@@ -133,6 +133,11 @@ pub async fn daemon(root: &Path, explicit: bool) -> Result<()> {
         let gateway = gateway.clone();
         async move { gateway.supervise_messengers().await }
     });
+    // Ends when the gateway's stop signal fires; awaited after the drain.
+    let schedule = tokio::spawn({
+        let gateway = gateway.clone();
+        async move { gateway.supervise_schedule().await }
+    });
     let path = root.join("gateway.sock");
     if path.exists() {
         std::fs::remove_file(&path).map_err(ServiceError::Socket)?;
@@ -203,6 +208,9 @@ pub async fn daemon(root: &Path, explicit: bool) -> Result<()> {
     while connections.join_next().await.is_some() {}
     if let Err(error) = messengers.await {
         crate::error::handle("messenger", &error);
+    }
+    if let Err(error) = schedule.await {
+        crate::error::handle("schedule_jobs", &error);
     }
     Ok(())
 }

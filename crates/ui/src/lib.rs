@@ -128,6 +128,7 @@ fn empty_snapshot() -> Snapshot {
         last_event: 0,
         managed_joshua_provider: None,
         mcp_servers: vec![],
+        jobs: vec![],
         extension_proposals: vec![],
     }
 }
