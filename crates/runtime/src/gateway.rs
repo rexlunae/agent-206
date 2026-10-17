@@ -30,6 +30,7 @@ mod schedules;
 mod skills;
 pub use crate::skill_tool::SkillOffer;
 pub use delegation::{Caller, Child, Delegator, DelegatorError, Reservation};
+pub use schedules::{Jobs, MAX_AGENT_JOBS};
 
 /// Streamed reply text that is not final yet. It is published as the
 /// thread's assistant message at most every [`PartialReply::INTERVAL`], so a
@@ -454,6 +455,10 @@ impl Gateway {
             reserved: Arc::default(),
             jobs_changed: Arc::default(),
         };
+        // Schedule tools; each conversation still denies them until the user
+        // permits them, and each new job waits for the user's approval.
+        let schedule_tools = Arc::new(crate::schedule_tool::ScheduleHost::new(gateway.jobs()));
+        Arc::make_mut(&mut gateway.tool_hosts).push(schedule_tools);
         // Subagent tools; each conversation still denies them until the user
         // permits them, and they are offered only with subagent models.
         gateway.bind_delegation();
@@ -1491,7 +1496,9 @@ impl Gateway {
                 thread,
                 text,
                 schedule,
-            } => self.schedule_job(name, thread, text, schedule, JobAuthor::User),
+            } => self
+                .schedule_job(name, thread, text, schedule, JobAuthor::User)
+                .map(|job| Reply::Job(Box::new(job))),
             Command::SetJobEnabled { id, enabled } => self.set_job_enabled(id, enabled),
             Command::RemoveJob { id } => self.remove_job(id),
             Command::RunJob { id } => self.run_job(id),

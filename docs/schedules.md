@@ -45,6 +45,24 @@ CLI: `agent206 schedule list`, `schedule add THREAD --name N --text T` with one
 of `--at RFC3339`, `--every 90m [--anchor RFC3339]` or `--cron EXPR [--zone Z]`,
 and `schedule pause|resume|run|remove ID`.
 
+## Scheduling from a native run
+
+`crates/runtime/src/schedule_tool.rs` offers a model three tools, denied on each
+conversation until the user permits them:
+
+- `schedule_add { name, message, at | every_seconds | cron [, zone] }` schedules
+  a message to the model's own conversation (`JobAuthor::Agent`). Every call
+  waits for the user's approval of that exact call, even where the conversation
+  allows the tool. A conversation keeps at most 16 jobs its models added.
+- `schedule_list` lists the conversation's jobs, the user's included, marked
+  `added_by: user` or `you`.
+- `schedule_remove { id }` removes a job a model of this conversation added; the
+  user's jobs and other conversations' jobs are not found.
+
+The tools reach no other conversation, cannot run, pause or resume a job, and
+hold the gateway without its tool hosts. Tests: `schedule_tool/tests.rs` and an
+approval round trip in `crates/runtime/tests/schedules.rs`.
+
 ## Implementation
 
 `crates/runtime/src/schedule.rs` computes due times as pure functions;
@@ -55,6 +73,6 @@ and zones), `gateway/schedules/tests.rs` (validation, one run per wake, pause,
 run now) and `crates/runtime/tests/schedules.rs` (a due job's native run against a
 scripted provider).
 
-Not yet: a desktop/TUI page, agent-requested jobs, delivery of results to a
+Not yet: a desktop/TUI page, delivery of results to a
 messenger chat, run history beyond the latest run, and jitter for many jobs due
 at once.
