@@ -191,10 +191,12 @@ enum Adapter {
     Matrix(matrix::Matrix),
 }
 impl Adapter {
-    fn new(kind: MessengerKind, api: Api) -> Self {
-        match kind {
+    fn new(config: &MessengerConfig, api: Api) -> Self {
+        match config.kind {
             MessengerKind::Telegram => Self::Telegram(telegram::Telegram::new(api)),
-            MessengerKind::Matrix => Self::Matrix(matrix::Matrix::new(api)),
+            MessengerKind::Matrix => {
+                Self::Matrix(matrix::Matrix::new(api, config.allowed_chats.clone()))
+            }
         }
     }
     /// Check the credential and name the account.
@@ -461,7 +463,7 @@ async fn session<H: Host>(
     backoff: Backoff,
 ) -> Result<()> {
     let api = Api::new(host.root(), pairing, config)?;
-    let mut adapter = Adapter::new(config.kind, api);
+    let mut adapter = Adapter::new(config, api);
     let mut account = adapter.connect().await?;
     host.update(&config.name, |s| {
         s.state = MessengerState::Connected;

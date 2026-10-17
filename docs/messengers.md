@@ -131,10 +131,15 @@ agent206 messenger enable home
   credential starts from a fresh sync token.
   Limited timelines are backfilled using `/rooms/{roomId}/messages` before
   accepting the next sync token, with event-ID deduplication across pages
-  and the timeline. Each batch is capped at 64 rooms, 1,000 total events
+  and the timeline. Each batch is capped at 64 allowed rooms, 1,000 total events
   (including invitations and backfill), and 32 pagination requests across
   all rooms. Overflow or cyclic pagination fails the batch and preserves
   the previous cursor; it never silently skips messages.
+  Unrelated joined rooms are discarded before charging these budgets; at
+  most 64 other invitations are surfaced for user review per sync. Full
+  room state is scanned with constant additional memory under the broker's
+  byte limit, separately from sync-event budgets, so large membership lists
+  do not prevent checking encryption.
 
 The adapter follows the [Matrix Client-Server API](https://spec.matrix.org/latest/client-server-api/)
 for `/join/{roomIdOrAlias}`, full room state, sync and forward message pagination.

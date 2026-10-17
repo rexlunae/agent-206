@@ -33,6 +33,7 @@ const CLIENT: [&str; 3] = ["_matrix", "client", "v3"];
 
 pub(crate) struct Matrix {
     api: Api,
+    allowed: BTreeSet<String>,
     /// The bot's own user id, whose messages are never answered.
     user: Option<String>,
 }
@@ -111,6 +112,40 @@ struct Relation {
     rel_type: Option<String>,
 }
 
+/// A full successful state response, scanned without allocating a membership
+/// list. The broker already bounds its bytes. Consume the entire sequence:
+/// truncated or malformed state must never authorize plaintext.
+struct EncryptionState(bool);
+impl<'de> Deserialize<'de> for EncryptionState {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = EncryptionState;
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a complete room state array")
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> std::result::Result<Self::Value, A::Error> {
+                #[derive(Deserialize)]
+                struct Kind {
+                    #[serde(rename = "type")]
+                    kind: String,
+                }
+                let mut encrypted = false;
+                while let Some(event) = seq.next_element::<Kind>()? {
+                    encrypted |= event.kind == "m.room.encryption";
+                }
+                Ok(EncryptionState(encrypted))
+            }
+        }
+        deserializer.deserialize_seq(Visitor)
+    }
+}
+
 #[derive(Default, Deserialize)]
 struct Invited {
     #[serde(default)]
@@ -124,8 +159,12 @@ struct InviteState {
 }
 
 impl Matrix {
-    pub(crate) fn new(api: Api) -> Self {
-        Self { api, user: None }
+    pub(crate) fn new(api: Api, allowed: BTreeSet<String>) -> Self {
+        Self {
+            api,
+            allowed,
+            user: None,
+        }
     }
 
     fn url(&self, path: &[&str]) -> Result<url::Url> {
@@ -203,7 +242,39 @@ impl Matrix {
         if let Some(since) = since {
             url.query_pairs_mut().append_pair("since", since);
         }
-        let sync: Sync = self.request(HttpMethod::Get, url, None).await?;
+        let mut sync: Sync = self.request(HttpMethod::Get, url, None).await?;
+        // Unrelated joined rooms have no delivery authority. Discard them
+        // before charging the work budget, so they cannot starve allowed rooms.
+        sync.rooms
+            .join
+            .retain(|room, _| self.allowed.contains(room));
+        // Keep bounded discovery of pending, unapproved invitations. These
+        // can only reach the user's refused-room list, never a conversation.
+        let refused: Vec<_> = sync
+            .rooms
+            .invite
+            .iter()
+            .filter(|(room, _)| !self.allowed.contains(*room))
+            .take(MAX_ROOMS)
+            .map(|(room, invited)| {
+                (
+                    format!("invite {room}"),
+                    Event::Invite {
+                        chat: room.clone(),
+                        title: invited
+                            .invite_state
+                            .events
+                            .iter()
+                            .take(50)
+                            .find(|e| e.kind == "m.room.name")
+                            .and_then(|e| e.content.name.clone()),
+                    },
+                )
+            })
+            .collect();
+        sync.rooms
+            .invite
+            .retain(|room, _| self.allowed.contains(room));
         if sync
             .rooms
             .join
@@ -225,7 +296,7 @@ impl Matrix {
         }
         let mut pages = 0;
         let mut seen = BTreeSet::new();
-        let mut events = vec![];
+        let mut events = refused;
         for (room, invited) in sync.rooms.invite {
             let title = invited
                 .invite_state
@@ -354,13 +425,10 @@ impl Matrix {
     /// Require a successful full state read. A missing single state event
     /// (404) is ambiguous and must never authorize a plaintext reply.
     pub(crate) async fn check_room(&self, room: &str) -> Result<()> {
-        let state: Vec<RoomEvent> = self
+        let state: EncryptionState = self
             .request(HttpMethod::Get, self.url(&["rooms", room, "state"])?, None)
             .await?;
-        if state.len() > MAX_EVENTS {
-            return Err(MessengerError::SyncBudget { service: SERVICE });
-        }
-        if state.iter().any(|event| event.kind == "m.room.encryption") {
+        if state.0 {
             Err(MessengerError::EncryptedRoom {
                 chat: room.to_owned(),
             })
