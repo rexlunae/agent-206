@@ -96,7 +96,7 @@ token, bound to that origin:
 
 ```sh
 agent206 vault add bot-token --kind token --destination https://matrix.example.org
-agent206 messenger add home matrix --endpoint https://matrix.example.org --credential bot-token
+agent206 messenger add home --kind matrix --endpoint https://matrix.example.org --credential bot-token
 agent206 messenger allow home '!roomid:example.org'
 agent206 messenger allow-sender home '@me:example.org'
 agent206 messenger enable home
@@ -112,7 +112,8 @@ agent206 messenger enable home
   invitation and joins it.
 - **No end-to-end encryption.** Encrypted messages cannot be read. Before
   each turn and before each reply the gateway checks the room's encryption
-  state, and never sends anything, not even a failure notice, to an encrypted
+  state through a successful full-room state read (a 404 is not proof of
+  missing encryption), and never sends anything, not even a failure notice, to an encrypted
   room, since a plain-text message there would downgrade it. The refusal is
   reported in the status only.
 - **What is read and sent.** Only `m.text` messages from other accounts are
@@ -128,6 +129,15 @@ agent206 messenger enable home
   revoked token) stops the messenger until the user acts. The account is
   checked (`whoami`) before each sync, and another account behind the
   credential starts from a fresh sync token.
+  Limited timelines are backfilled using `/rooms/{roomId}/messages` before
+  accepting the next sync token, with event-ID deduplication across pages
+  and the timeline. Each batch is capped at 64 rooms, 1,000 total events
+  (including invitations and backfill), and 32 pagination requests across
+  all rooms. Overflow or cyclic pagination fails the batch and preserves
+  the previous cursor; it never silently skips messages.
+
+The adapter follows the [Matrix Client-Server API](https://spec.matrix.org/latest/client-server-api/)
+for `/join/{roomIdOrAlias}`, full room state, sync and forward message pagination.
 
 ## Interface for the run engine
 

@@ -15,7 +15,7 @@
 use super::{Account, Api, Batch, Event, Inbound, MessengerError, Result, split};
 use a206_broker::{AuthScheme, HttpMethod};
 use serde::Deserialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 const SERVICE: &str = "Matrix";
 /// Milliseconds the homeserver holds a sync open; well inside the broker's
@@ -23,6 +23,9 @@ const SERVICE: &str = "Matrix";
 const POLL_MILLISECONDS: u32 = 25_000;
 /// Most timeline events one sync returns per room.
 const TIMELINE_LIMIT: u32 = 50;
+const MAX_ROOMS: usize = 64;
+const MAX_EVENTS: usize = 1_000;
+const MAX_PAGES: usize = 32;
 /// Parts a long reply is split into, in UTF-16 code units. Matrix limits an
 /// event to 64 KiB including its JSON envelope.
 const MAX_MESSAGE_UNITS: usize = 8000;
@@ -64,7 +67,18 @@ struct Joined {
 #[derive(Default, Deserialize)]
 struct Timeline {
     #[serde(default)]
+    limited: bool,
+    #[serde(default)]
+    prev_batch: Option<String>,
+    #[serde(default)]
     events: Vec<RoomEvent>,
+}
+
+#[derive(Deserialize)]
+struct Page {
+    chunk: Vec<RoomEvent>,
+    #[serde(default)]
+    end: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -81,12 +95,20 @@ struct RoomEvent {
 
 #[derive(Default, Deserialize)]
 struct Content {
+    #[serde(default, rename = "m.relates_to")]
+    relation: Option<Relation>,
     #[serde(default)]
     msgtype: Option<String>,
     #[serde(default)]
     body: Option<String>,
     #[serde(default)]
     name: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct Relation {
+    #[serde(default)]
+    rel_type: Option<String>,
 }
 
 #[derive(Default, Deserialize)]
@@ -182,6 +204,27 @@ impl Matrix {
             url.query_pairs_mut().append_pair("since", since);
         }
         let sync: Sync = self.request(HttpMethod::Get, url, None).await?;
+        if sync
+            .rooms
+            .join
+            .len()
+            .saturating_add(sync.rooms.invite.len())
+            > MAX_ROOMS
+        {
+            return Err(MessengerError::SyncBudget { service: SERVICE });
+        }
+        let mut count = 0;
+        for joined in sync.rooms.join.values() {
+            charge(&mut count, joined.timeline.events.len())?;
+        }
+        for invited in sync.rooms.invite.values() {
+            charge(
+                &mut count,
+                invited.invite_state.events.len().saturating_add(1),
+            )?;
+        }
+        let mut pages = 0;
+        let mut seen = BTreeSet::new();
         let mut events = vec![];
         for (room, invited) in sync.rooms.invite {
             let title = invited
@@ -195,13 +238,27 @@ impl Matrix {
                 Event::Invite { chat: room, title },
             ));
         }
-        if since.is_some() {
+        if let Some(since) = since {
             for (room, joined) in sync.rooms.join {
-                for event in joined.timeline.events {
+                let mut timeline = joined.timeline;
+                if timeline.limited {
+                    let to = timeline
+                        .prev_batch
+                        .as_deref()
+                        .ok_or(MessengerError::SyncGap { service: SERVICE })?;
+                    let mut recovered = self
+                        .backfill(&room, since, to, &mut count, &mut pages)
+                        .await?;
+                    recovered.append(&mut timeline.events);
+                    timeline.events = recovered;
+                }
+                for event in timeline.events {
                     let Some(id) = event.event_id.clone() else {
                         continue;
                     };
-                    events.push((id, self.event(&room, event)));
+                    if seen.insert(id.clone()) {
+                        events.push((id, self.event(&room, event)));
+                    }
                 }
             }
         }
@@ -211,7 +268,60 @@ impl Matrix {
         })
     }
 
+    /// Fill the gap preceding a limited timeline, oldest first. Sync tokens
+    /// are valid /messages tokens. Apply the same event filter on every page.
+    /// No batch (and therefore no cursor) escapes until the whole gap is read.
+    async fn backfill(
+        &self,
+        room: &str,
+        since: &str,
+        to: &str,
+        count: &mut usize,
+        pages: &mut usize,
+    ) -> Result<Vec<RoomEvent>> {
+        let mut from = since.to_owned();
+        let mut tokens = BTreeSet::new();
+        let mut events = Vec::new();
+        while from != to {
+            *pages += 1;
+            if *pages > MAX_PAGES {
+                return Err(MessengerError::SyncBudget { service: SERVICE });
+            }
+            if !tokens.insert(from.clone()) {
+                return Err(MessengerError::SyncGap { service: SERVICE });
+            }
+            let mut url = self.url(&["rooms", room, "messages"])?;
+            url.query_pairs_mut()
+                .append_pair("from", &from)
+                .append_pair("to", to)
+                .append_pair("dir", "f")
+                .append_pair("limit", "50")
+                .append_pair(
+                    "filter",
+                    r#"{"types":["m.room.message","m.room.encrypted"]}"#,
+                );
+            let mut page: Page = self.request(HttpMethod::Get, url, None).await?;
+            charge(count, page.chunk.len())?;
+            events.append(&mut page.chunk);
+            match page.end {
+                Some(end) => from = end,
+                // The Matrix API omits `end` when no further events remain.
+                None => break,
+            }
+        }
+        Ok(events)
+    }
+
     fn event(&self, room: &str, event: RoomEvent) -> Event {
+        if event
+            .content
+            .relation
+            .as_ref()
+            .and_then(|r| r.rel_type.as_deref())
+            == Some("m.replace")
+        {
+            return Event::Ignored;
+        }
         let Some(sender) = event.sender.filter(|s| Some(s) != self.user.as_ref()) else {
             return Event::Ignored;
         };
@@ -241,16 +351,21 @@ impl Matrix {
         }
     }
 
-    /// Fails if `room` is end-to-end encrypted: the encryption state event
-    /// exists. A room cannot turn encryption off again.
+    /// Require a successful full state read. A missing single state event
+    /// (404) is ambiguous and must never authorize a plaintext reply.
     pub(crate) async fn check_room(&self, room: &str) -> Result<()> {
-        let url = self.url(&["rooms", room, "state", "m.room.encryption"])?;
-        match self.call(HttpMethod::Get, url, None).await?.0 {
-            404 => Ok(()),
-            200..=299 => Err(MessengerError::EncryptedRoom {
+        let state: Vec<RoomEvent> = self
+            .request(HttpMethod::Get, self.url(&["rooms", room, "state"])?, None)
+            .await?;
+        if state.len() > MAX_EVENTS {
+            return Err(MessengerError::SyncBudget { service: SERVICE });
+        }
+        if state.iter().any(|event| event.kind == "m.room.encryption") {
+            Err(MessengerError::EncryptedRoom {
                 chat: room.to_owned(),
-            }),
-            status => success(status),
+            })
+        } else {
+            Ok(())
         }
     }
 
@@ -258,7 +373,7 @@ impl Matrix {
         let _: serde_json::Value = self
             .request(
                 HttpMethod::Post,
-                self.url(&["rooms", room, "join"])?,
+                self.url(&["join", room])?,
                 Some(serde_json::json!({})),
             )
             .await?;
@@ -268,8 +383,8 @@ impl Matrix {
     /// Send `text` to `room` as notices, split to stay within an event's
     /// size. The room's encryption is checked first, every time.
     pub(crate) async fn send(&self, room: &str, text: &str) -> Result<()> {
-        self.check_room(room).await?;
         for part in split(text, MAX_MESSAGE_UNITS) {
+            self.check_room(room).await?;
             let transaction = uuid::Uuid::new_v4().simple().to_string();
             let url = self.url(&["rooms", room, "send", "m.room.message", &transaction])?;
             let _: serde_json::Value = self
@@ -280,6 +395,15 @@ impl Matrix {
                 )
                 .await?;
         }
+        Ok(())
+    }
+}
+
+fn charge(count: &mut usize, added: usize) -> Result<()> {
+    *count = count.saturating_add(added);
+    if *count > MAX_EVENTS {
+        Err(MessengerError::SyncBudget { service: SERVICE })
+    } else {
         Ok(())
     }
 }

@@ -571,6 +571,9 @@ struct Homeserver {
     /// always), and how often each was checked.
     encrypted_from: Arc<Mutex<HashMap<String, u32>>>,
     checks: Arc<Mutex<HashMap<String, u32>>>,
+    state_status: Arc<Mutex<HashMap<String, u16>>>,
+    pages: Arc<Mutex<VecDeque<Value>>>,
+    page_queries: Arc<Mutex<Vec<HashMap<String, String>>>>,
     joined: Arc<Mutex<Vec<String>>>,
     /// Room, transaction id and content of each sent event.
     sent: Arc<Mutex<Vec<(String, String, Value)>>>,
@@ -623,14 +626,34 @@ async fn serve_homeserver(server: Homeserver) -> String {
             .get(&room)
             .is_some_and(|from| *check >= *from);
         *check += 1;
-        if encrypted {
-            (StatusCode::OK, Json(json!({"algorithm": random()})))
-        } else {
-            (
-                StatusCode::NOT_FOUND,
+        if let Some(status) = server.state_status.lock().unwrap().get(&room) {
+            return (
+                StatusCode::from_u16(*status).unwrap(),
                 Json(json!({"errcode": "M_NOT_FOUND"})),
-            )
+            );
         }
+        if encrypted {
+            (
+                StatusCode::OK,
+                Json(json!([{"type": "m.room.encryption", "content": {"algorithm": random()}}])),
+            )
+        } else {
+            (StatusCode::OK, Json(json!([])))
+        }
+    };
+    let messages = |State(server): State<Homeserver>,
+                    headers: HeaderMap,
+                    Query(query): Query<HashMap<String, String>>| async move {
+        check_bearer(&server, &headers);
+        server.page_queries.lock().unwrap().push(query);
+        Json(
+            server
+                .pages
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("unexpected backfill"),
+        )
     };
     let join = |State(server): State<Homeserver>, headers: HeaderMap, Path(room): Path<String>| async move {
         check_bearer(&server, &headers);
@@ -652,11 +675,9 @@ async fn serve_homeserver(server: Homeserver) -> String {
     let router = Router::new()
         .route("/_matrix/client/v3/account/whoami", get(whoami))
         .route("/_matrix/client/v3/sync", get(sync))
-        .route(
-            "/_matrix/client/v3/rooms/{room}/state/m.room.encryption",
-            get(encryption),
-        )
-        .route("/_matrix/client/v3/rooms/{room}/join", post(join))
+        .route("/_matrix/client/v3/rooms/{room}/state", get(encryption))
+        .route("/_matrix/client/v3/join/{room}", post(join))
+        .route("/_matrix/client/v3/rooms/{room}/messages", get(messages))
         .route(
             "/_matrix/client/v3/rooms/{room}/send/m.room.message/{transaction}",
             put(send),
@@ -895,4 +916,129 @@ async fn a_matrix_messenger_without_a_homeserver_waits_for_the_user() {
     assert!(server.sync_queries.lock().unwrap().is_empty());
     stop.cancel();
     supervisor.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn matrix_recovers_limited_timelines_and_ignores_edits() {
+    let (server, origin, _dir, credential, host, _anchor) = matrix_setup().await;
+    let config = matrix_config("backfill", &origin, &credential, &[]);
+    let mut adapter =
+        matrix::Matrix::new(Api::new(host.root.clone(), host.pairing.clone(), &config).unwrap());
+    adapter.connect().await.unwrap();
+    let room = matrix_id('!', "example.test");
+    let sender = matrix_id('@', "example.test");
+    let old = text_event(&sender, "m.text", &random());
+    let recent = text_event(&sender, "m.text", &random());
+    let mut edit = text_event(&sender, "m.text", "* edited");
+    edit["content"]["m.relates_to"] = json!({"rel_type": "m.replace", "event_id": old["event_id"]});
+    server
+        .syncs
+        .lock()
+        .unwrap()
+        .push_back(json!({"join": {&room: {"timeline": {
+            "limited": true, "prev_batch": "boundary", "events": [recent.clone(), edit],
+        }}}}));
+    server.pages.lock().unwrap().extend([
+        json!({"chunk": [old.clone()], "end": "page2"}),
+        // Deliberate overlap with both an earlier page and the timeline.
+        json!({"chunk": [old, recent], "end": "boundary"}),
+    ]);
+    let batch = adapter.receive(Some("previous-sync")).await.unwrap();
+    assert_eq!(batch.events.len(), 3);
+    assert!(matches!(batch.events[0].1, Event::Message(_)));
+    assert!(matches!(batch.events[1].1, Event::Message(_)));
+    assert_eq!(batch.events[2].1, Event::Ignored);
+    assert_eq!(batch.next.as_deref(), Some("s1"));
+    let queries = server.page_queries.lock().unwrap();
+    assert_eq!(queries.len(), 2);
+    assert_eq!(queries[0]["from"], "previous-sync");
+    assert_eq!(queries[1]["from"], "page2");
+    assert_eq!(queries[0]["to"], "boundary");
+    assert_eq!(queries[0]["dir"], "f");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn matrix_refuses_ambiguous_state_before_sending_plaintext() {
+    let (server, origin, _dir, credential, host, _anchor) = matrix_setup().await;
+    let config = matrix_config("state", &origin, &credential, &[]);
+    let adapter =
+        matrix::Matrix::new(Api::new(host.root.clone(), host.pairing.clone(), &config).unwrap());
+    let room = matrix_id('!', "example.test");
+    for status in [404, 403, 401, 500] {
+        server
+            .state_status
+            .lock()
+            .unwrap()
+            .insert(room.clone(), status);
+        assert!(adapter.send(&room, "must stay private").await.is_err());
+        assert!(server.sent.lock().unwrap().is_empty());
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn matrix_batch_budgets_do_not_advance_the_cursor() {
+    let (server, origin, _dir, credential, host, _anchor) = matrix_setup().await;
+    let config = matrix_config("bounds", &origin, &credential, &[]);
+    let mut adapter =
+        matrix::Matrix::new(Api::new(host.root.clone(), host.pairing.clone(), &config).unwrap());
+    let room = matrix_id('!', "example.test");
+    let sender = matrix_id('@', "example.test");
+    let rooms: serde_json::Map<String, Value> = (0..65)
+        .map(|_| (matrix_id('!', "example.test"), json!({})))
+        .collect();
+    server
+        .syncs
+        .lock()
+        .unwrap()
+        .push_back(json!({"join": rooms}));
+    assert!(matches!(
+        adapter.receive(Some("previous")).await,
+        Err(MessengerError::SyncBudget { .. })
+    ));
+    let events: Vec<_> = (0..1_001)
+        .map(|_| text_event(&sender, "m.text", "x"))
+        .collect();
+    server
+        .syncs
+        .lock()
+        .unwrap()
+        .push_back(timeline(vec![(&room, events)]));
+    assert!(matches!(
+        adapter.receive(Some("previous")).await,
+        Err(MessengerError::SyncBudget { .. })
+    ));
+    server.syncs.lock().unwrap().push_back(json!({"join": {&room: {"timeline": {"limited": true, "prev_batch": "boundary", "events": []}}}}));
+    server
+        .pages
+        .lock()
+        .unwrap()
+        .push_back(json!({"chunk": [], "end": "previous"}));
+    assert!(matches!(
+        adapter.receive(Some("previous")).await,
+        Err(MessengerError::SyncGap { .. })
+    ));
+    server.syncs.lock().unwrap().push_back(json!({"join": {&room: {"timeline": {"limited": true, "prev_batch": "boundary", "events": []}}}}));
+    server.pages.lock().unwrap().push_back(json!({"chunk": (0..1_001).map(|_| text_event(&sender, "m.text", "x")).collect::<Vec<_>>(), "end": "boundary"}));
+    assert!(matches!(
+        adapter.receive(Some("previous")).await,
+        Err(MessengerError::SyncBudget { .. })
+    ));
+    server.syncs.lock().unwrap().push_back(json!({"join": {&room: {"timeline": {"limited": true, "prev_batch": "boundary", "events": []}}}}));
+    server
+        .pages
+        .lock()
+        .unwrap()
+        .extend((0..32).map(|i| json!({"chunk": [], "end": format!("page-{i}")})));
+    assert!(matches!(
+        adapter.receive(Some("previous")).await,
+        Err(MessengerError::SyncBudget { .. })
+    ));
+    assert!(
+        server
+            .sync_queries
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|q| q["since"] == "previous")
+    );
 }

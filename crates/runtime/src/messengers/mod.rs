@@ -24,6 +24,14 @@ use tokio_util::sync::CancellationToken;
 /// Why a messenger could not connect, receive or deliver.
 #[derive(Debug, thiserror::Error)]
 pub enum MessengerError {
+    #[error(
+        "{service} sync exceeds the room, event or pagination budget; the cursor was not advanced"
+    )]
+    SyncBudget { service: &'static str },
+    #[error(
+        "{service} returned an incomplete timeline that could not be recovered; the cursor was not advanced"
+    )]
+    SyncGap { service: &'static str },
     #[error("the messenger has no vault credential; add its token and bind it to {origin}")]
     NoCredential { origin: String },
     #[error("{service} has no official server; set the messenger's endpoint to yours")]
@@ -76,6 +84,7 @@ pub enum MessengerError {
 impl crate::error::Classified for MessengerError {
     fn kind(&self) -> Option<ErrorKind> {
         Some(match self {
+            Self::SyncBudget { .. } | Self::SyncGap { .. } => ErrorKind::Protocol,
             Self::NoCredential { .. }
             | Self::NoEndpoint { .. }
             | Self::NoModel
