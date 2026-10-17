@@ -31,8 +31,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// Wall-clock bound on one invocation, host calls included.
 pub const TIMEOUT: Duration = Duration::from_secs(10);
-/// Wall-clock bound on one git status scan.
-pub const GIT_STATUS_TIMEOUT: Duration = Duration::from_secs(5);
+/// Wall-clock bound on one git host call, metadata checks included.
+pub const GIT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Largest file a guest may read in one call.
 pub const MAX_FILE: u64 = 512 * 1024;
 /// Most entries one directory listing returns.
@@ -504,28 +504,15 @@ impl HostCalls {
             }
             HostRequest::GitStatus => {
                 let root = self.workspace()?;
-                let interrupt = Arc::new(std::sync::atomic::AtomicBool::new(false));
-                // Stops the blocking scan if this future is dropped (the
-                // invocation timed out or was revoked); a blocking task cannot
-                // be aborted, so the flag is how it learns to end.
-                let stop = Interrupt(Arc::clone(&interrupt));
-                let mut scan = tokio::task::spawn_blocking(move || git::status(root, interrupt));
-                let joined = match tokio::time::timeout(GIT_STATUS_TIMEOUT, &mut scan).await {
-                    Ok(joined) => joined,
-                    Err(_) => {
-                        stop.set();
-                        scan.await
-                    }
-                };
-                joined_reply(joined)
+                git_call(move |interrupt| git::status(root, interrupt)).await
             }
             HostRequest::GitLog { max } => {
                 let root = self.workspace()?;
-                blocking(move || git::log(root, max)).await
+                git_call(move |interrupt| git::log(root, max, &interrupt)).await
             }
             HostRequest::GitDiff { path, staged } => {
                 let root = self.workspace()?;
-                blocking(move || git::diff(root, &path, staged)).await
+                git_call(move |interrupt| git::diff(root, &path, staged, &interrupt)).await
             }
             HostRequest::StateGet { key } => {
                 check_key(&key)?;
@@ -619,6 +606,27 @@ fn joined_reply(
         crate::error::handle("extension_host_call", &error);
         Err(failure(HostErrorCode::Io, "host call failed"))
     })
+}
+/// Run a blocking git call that stops at `GIT_TIMEOUT` or when this future
+/// is dropped (the invocation timed out or was revoked). A blocking task
+/// cannot be aborted, so the interrupt flag is how it learns to end; on
+/// timeout the flag is raised and the call awaited until it returns.
+async fn git_call(
+    work: impl FnOnce(Arc<std::sync::atomic::AtomicBool>) -> Result<HostReply, HostFailure>
+    + Send
+    + 'static,
+) -> Result<HostReply, HostFailure> {
+    let interrupt = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop = Interrupt(Arc::clone(&interrupt));
+    let mut call = tokio::task::spawn_blocking(move || work(interrupt));
+    let joined = match tokio::time::timeout(GIT_TIMEOUT, &mut call).await {
+        Ok(joined) => joined,
+        Err(_) => {
+            stop.set();
+            call.await
+        }
+    };
+    joined_reply(joined)
 }
 /// Raises a scan's interrupt flag when set or dropped.
 struct Interrupt(Arc<std::sync::atomic::AtomicBool>);

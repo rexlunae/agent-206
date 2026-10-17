@@ -363,3 +363,17 @@ async fn oversized_blobs_are_refused() {
         Some(HostErrorCode::TooLarge)
     );
 }
+
+/// The metadata walk stops once the call's deadline passes or its caller is
+/// gone, rather than finishing a slow traversal first.
+#[test]
+fn the_metadata_check_stops_when_interrupted() {
+    let dir = tempfile::tempdir().unwrap();
+    repository(dir.path(), &[("a.txt", "a\n")]);
+    let git_dir = dir.path().join(".git");
+    let flag = std::sync::atomic::AtomicBool::new(false);
+    assert!(super::super::git::contained(&git_dir, &flag).is_ok());
+    flag.store(true, std::sync::atomic::Ordering::Relaxed);
+    let refused = super::super::git::contained(&git_dir, &flag).unwrap_err();
+    assert_eq!(refused.code, HostErrorCode::Budget);
+}

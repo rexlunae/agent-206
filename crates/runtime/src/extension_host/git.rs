@@ -27,6 +27,15 @@ fn git_failure(operation: &'static str, error: &(dyn std::error::Error + 'static
     failure(HostErrorCode::Io, "the repository could not be read")
 }
 
+/// Stop once the call's deadline has passed or its caller has gone.
+fn check(interrupt: &AtomicBool) -> Result<(), HostFailure> {
+    if interrupt.load(std::sync::atomic::Ordering::Relaxed) {
+        Err(failure(HostErrorCode::Budget, "the git call took too long"))
+    } else {
+        Ok(())
+    }
+}
+
 fn unsupported(message: &'static str) -> HostFailure {
     failure(HostErrorCode::Unsupported, message)
 }
@@ -36,7 +45,10 @@ const MAX_METADATA_ENTRIES: usize = 200_000;
 
 /// Refuse a repository whose metadata holds a symbolic link anywhere, such
 /// as a pack directory or loose object pointing outside the project.
-fn contained(git_dir: &std::path::Path) -> Result<(), HostFailure> {
+pub(super) fn contained(
+    git_dir: &std::path::Path,
+    interrupt: &AtomicBool,
+) -> Result<(), HostFailure> {
     let mut pending = vec![git_dir.to_path_buf()];
     let mut seen = 0usize;
     while let Some(directory) = pending.pop() {
@@ -44,6 +56,7 @@ fn contained(git_dir: &std::path::Path) -> Result<(), HostFailure> {
         for entry in entries {
             let entry = entry.map_err(|e| git_failure("open", &e))?;
             seen += 1;
+            check(interrupt)?;
             if seen > MAX_METADATA_ENTRIES {
                 return Err(unsupported(
                     "the repository has too many loose files to check; pack it with `git gc`",
@@ -69,7 +82,7 @@ fn contained(git_dir: &std::path::Path) -> Result<(), HostFailure> {
 /// Every piece of repository metadata must live inside the project, so a
 /// `.git` file or symlink, a linked worktree (`commondir`), an alternate
 /// object store or a configured worktree elsewhere is refused.
-fn open(root: PathBuf) -> Result<gix::Repository, HostFailure> {
+fn open(root: PathBuf, interrupt: &AtomicBool) -> Result<gix::Repository, HostFailure> {
     let dot_git = root.join(".git");
     let git_dir = match std::fs::symlink_metadata(&dot_git) {
         Ok(metadata) if metadata.is_dir() => dot_git,
@@ -87,7 +100,7 @@ fn open(root: PathBuf) -> Result<gix::Repository, HostFailure> {
             ));
         }
     };
-    contained(&git_dir)?;
+    contained(&git_dir, interrupt)?;
     let shared = ["commondir", "objects/info/alternates"]
         .iter()
         .any(|name| std::fs::symlink_metadata(git_dir.join(name)).is_ok());
@@ -123,7 +136,7 @@ fn open(root: PathBuf) -> Result<gix::Repository, HostFailure> {
 }
 
 pub(super) fn status(root: PathBuf, interrupt: Arc<AtomicBool>) -> Result<HostReply, HostFailure> {
-    let repo = open(root)?;
+    let repo = open(root, &interrupt)?;
     let head = repo.head().map_err(|e| git_failure("head", &e))?;
     let mut status = GitStatus {
         branch: head
@@ -160,8 +173,8 @@ pub(super) fn status(root: PathBuf, interrupt: Arc<AtomicBool>) -> Result<HostRe
         }
         status.entries.push(entry);
     }
-    if interrupt.load(std::sync::atomic::Ordering::Relaxed) && !status.truncated {
-        return Err(failure(HostErrorCode::Budget, "git status took too long"));
+    if !status.truncated {
+        check(&interrupt)?;
     }
     status
         .entries
@@ -205,8 +218,12 @@ fn entry(item: &gix::status::Item) -> Option<GitEntry> {
     }
 }
 
-pub(super) fn log(root: PathBuf, max: u32) -> Result<HostReply, HostFailure> {
-    let repo = open(root)?;
+pub(super) fn log(
+    root: PathBuf,
+    max: u32,
+    interrupt: &AtomicBool,
+) -> Result<HostReply, HostFailure> {
+    let repo = open(root, interrupt)?;
     let head = repo.head().map_err(|e| git_failure("head", &e))?;
     let Some(id) = head.id() else {
         return Ok(HostReply::Commits(Vec::new()));
@@ -214,6 +231,7 @@ pub(super) fn log(root: PathBuf, max: u32) -> Result<HostReply, HostFailure> {
     let walk = id.ancestors().all().map_err(|e| git_failure("log", &e))?;
     let mut commits = Vec::new();
     for info in walk.take(max.clamp(1, MAX_COMMITS) as usize) {
+        check(interrupt)?;
         let info = info.map_err(|e| git_failure("log", &e))?;
         let commit = info.object().map_err(|e| git_failure("log", &e))?;
         let message = commit.message().map_err(|e| git_failure("log", &e))?;
@@ -228,9 +246,14 @@ pub(super) fn log(root: PathBuf, max: u32) -> Result<HostReply, HostFailure> {
     Ok(HostReply::Commits(commits))
 }
 
-pub(super) fn diff(root: PathBuf, path: &str, staged: bool) -> Result<HostReply, HostFailure> {
+pub(super) fn diff(
+    root: PathBuf,
+    path: &str,
+    staged: bool,
+    interrupt: &AtomicBool,
+) -> Result<HostReply, HostFailure> {
     super::workspace::check_relative(path)?;
-    let repo = open(root.clone())?;
+    let repo = open(root.clone(), interrupt)?;
     let index = repo
         .index_or_empty()
         .map_err(|e| git_failure("index", &e))?;
@@ -266,6 +289,7 @@ pub(super) fn diff(root: PathBuf, path: &str, staged: bool) -> Result<HostReply,
             ..GitDiff::default()
         }));
     }
+    check(interrupt)?;
     let text = unified(&before, &after)?;
     let truncated = text.len() > MAX_DIFF;
     Ok(HostReply::Diff(GitDiff {
