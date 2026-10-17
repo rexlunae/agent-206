@@ -16,8 +16,12 @@ Agent 206 bundles `agent206.workspace` (`plugins/workspace`), written in Rust
 against the guest SDK and compiled to WASM by `crates/extensions/build.rs`. It
 offers the `list_directory`, `find_files`, `read_text_file`, `search_text`
 (literal or regular expression, optionally ignoring case and limited to files
-matching a glob), `write_text_file` and `edit_text_file` tools and an `overview` panel. The
-write tools need a separate `write_workspace` grant. It also bundles
+matching a glob), `write_text_file`, `edit_text_file` and `apply_patch` tools
+and an `overview` panel. `apply_patch` reads a unified diff (`git diff` or
+`diff -u`) in the guest, with several files and hunks, created files
+(`/dev/null` old side) and deleted ones; renames, mode and binary changes and
+quoted paths are refused, as is a hunk line beyond the counts in its `@@`
+header. The write tools need a separate `write_workspace` grant. It also bundles
 `agent206.git` (`plugins/git`) with `git_status`, `git_log` and `git_diff`
 tools under the `git_read` grant and a `git_commit` tool under its own
 `git_write` grant, and `agent206.web` (`plugins/web`) with a
@@ -255,6 +259,7 @@ unsafe operation.
 | `write_file { path, contents, overwrite }` | `write_workspace` + a project | done | 512 KiB; written to a temporary file first, so readers never see a partial file; a new file is published with a hard link that refuses one created meanwhile, an existing regular file is replaced by rename keeping its permissions; without `overwrite` an existing file is `exists` |
 | `edit_file { path, old, new }` | `write_workspace` + a project | done | UTF-8, 512 KiB; `old` must occur exactly once, else `conflict`; also `conflict` when the file changed or was removed after it was read |
 | `create_directory { path }` | `write_workspace` + a project | done, also when it exists | missing parents are created |
+| `patch_files { files, check_only }` | `write_workspace` + a project | `patched`: files written in request order, and the file that failed with its failure | 1 to 64 files, each named once, as `create` (must not exist), `modify` or `delete` (the hunks must remove every line), UTF-8 and 512 KiB per file; each hunk's context and removed lines must match exact line text (`\r\n` and a missing final newline compare equal) after the hunk before it, nearest its `old_start`, or uniquely when `old_start` is 0, else `conflict`; unchanged lines keep their bytes and added lines take the file's line ending; every file is read and patched in memory before any is written, all new contents are staged in temporary files, then they are put in place in order (as `write_file`, with `conflict` if a file changed after it was read); `check_only` writes nothing; directories a new file needs are made while staging and remain if a later file fails |
 | `git_status` | `git_read` + a project | branch, `HEAD` id, changed paths (staged, unstaged, untracked) | 1,000 entries; 5 s per git call; renames not tracked; submodules ignored |
 | `git_log { max }` | `git_read` + a project | commits from `HEAD`: id, summary, author name (no email), author time | 200 commits |
 | `git_diff { path, staged }` | `git_read` + a project | unified diff of one file (`HEAD`→index when `staged`, else index→working tree; a symbolic link compares its target text), or `binary` | 512 KiB per side (checked before a blob is read), 192 KiB of text, 3 context lines; at most 8,192 input lines combined and 1,000,000 line pairs, otherwise a budget failure |

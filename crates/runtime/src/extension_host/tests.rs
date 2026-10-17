@@ -5,6 +5,7 @@ use super::*;
 mod fetch;
 mod git;
 mod git_commit;
+mod patch;
 use a206_extensions::abi::{EntryKind, SearchMatch};
 
 fn store() -> (tempfile::TempDir, Arc<Mutex<Store>>) {

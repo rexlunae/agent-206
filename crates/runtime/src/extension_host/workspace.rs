@@ -3,8 +3,8 @@
 //! never include host paths; the guest sees only its own request.
 use super::{MAX_ENTRIES, MAX_FILE, failure};
 use a206_extensions::abi::{
-    DirEntry, EntryKind, FindResult, FoundEntry, HostErrorCode, HostFailure, HostReply,
-    SearchMatch, SearchResult,
+    DirEntry, EntryKind, FileChange, FilePatch, FindResult, FoundEntry, HostErrorCode, HostFailure,
+    HostReply, PatchFailure, PatchResult, SearchMatch, SearchResult,
 };
 use cap_std::fs::{Dir, File, OpenOptions};
 use std::{
@@ -630,6 +630,25 @@ fn replace(
     overwrite: bool,
     expected: Option<&[u8]>,
 ) -> Result<(), HostFailure> {
+    stage(directory, name, contents, overwrite, expected.is_some())?.publish(expected)
+}
+/// A replacement written to its temporary file but not yet published. One
+/// that is dropped unpublished removes its temporary file.
+pub(super) struct Staged<'a> {
+    directory: &'a Dir,
+    name: &'a str,
+    temporary: String,
+    existing: bool,
+}
+/// Write the temporary file for [`replace`]. With `editing`, the file must
+/// still exist.
+pub(super) fn stage<'a>(
+    directory: &'a Dir,
+    name: &'a str,
+    contents: &[u8],
+    overwrite: bool,
+    editing: bool,
+) -> Result<Staged<'a>, HostFailure> {
     let existing = match directory.symlink_metadata(name) {
         Ok(metadata) if !metadata.is_file() => return Err(not_regular()),
         Ok(_) if !overwrite => {
@@ -639,7 +658,7 @@ fn replace(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => return Err(io_failure(&error)),
     };
-    if expected.is_some() && existing.is_none() {
+    if editing && existing.is_none() {
         return Err(failure(
             HostErrorCode::Conflict,
             "the file was removed while it was being edited",
@@ -650,30 +669,51 @@ fn replace(
     let file = directory
         .open_with(&temporary, OpenOptions::new().write(true).create_new(true))
         .map_err(|e| io_failure(&e))?;
-    let filled = match &existing {
+    let staged = Staged {
+        directory,
+        name,
+        temporary,
+        existing: existing.is_some(),
+    };
+    match &existing {
         Some(permissions) => file
             .set_permissions(permissions.clone())
             .map_err(|e| io_failure(&e))
             .and_then(|()| fill(file, contents)),
         None => fill(file, contents),
-    };
-    if let Err(error) = filled {
-        discard(directory, &temporary);
-        return Err(error);
+    }?;
+    Ok(staged)
+}
+impl Staged<'_> {
+    /// Put the staged contents in place; see [`replace`].
+    pub(super) fn publish(self, expected: Option<&[u8]>) -> Result<(), HostFailure> {
+        let (directory, name, temporary) = (self.directory, self.name, &self.temporary);
+        if self.existing {
+            unchanged(directory, name, expected)?;
+            directory
+                .rename(temporary, directory, name)
+                .map_err(|e| io_failure(&e))
+        } else {
+            directory
+                .hard_link(temporary, directory, name)
+                .map_err(|e| io_failure(&e))
+        }
+        // Drop removes the temporary file; after a rename it is already gone.
     }
-    if existing.is_none() {
-        let linked = directory
-            .hard_link(&temporary, directory, name)
-            .map_err(|e| io_failure(&e));
-        discard(directory, &temporary);
-        return linked;
+}
+impl Drop for Staged<'_> {
+    fn drop(&mut self) {
+        match self.directory.remove_file(&self.temporary) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            // The write already finished or failed and reports that; a
+            // leftover file is recorded, not returned.
+            Err(error) => tracing::warn!(
+                error = &error as &dyn std::error::Error,
+                "could not remove an unfinished extension write"
+            ),
+            Ok(()) => {}
+        }
     }
-    let published = unchanged(directory, name, expected).and_then(|()| {
-        directory
-            .rename(&temporary, directory, name)
-            .map_err(|e| io_failure(&e))
-    });
-    published.inspect_err(|_| discard(directory, &temporary))
 }
 /// Whether `name` still holds what an edit read. Workspace writes from
 /// extensions are serialized; this catches a change made outside them.
@@ -696,17 +736,6 @@ fn fill(mut file: File, contents: &[u8]) -> Result<(), HostFailure> {
         .and_then(|()| file.sync_all())
         .map_err(|e| io_failure(&e))
 }
-/// Remove a file this call created and could not finish. The write already
-/// failed and reports that; a leftover file is recorded, not returned.
-fn discard(directory: &Dir, name: &str) {
-    if let Err(error) = directory.remove_file(name) {
-        tracing::warn!(
-            error = &error as &dyn std::error::Error,
-            "could not remove an unfinished extension write"
-        );
-    }
-}
-
 pub(super) fn edit_file(
     root: PathBuf,
     path: &str,
@@ -772,6 +801,195 @@ pub(super) fn create_directory(root: PathBuf, path: &str) -> Result<HostReply, H
         }
         Err(error) => Err(io_failure(&error)),
     }
+}
+
+/// Most files one patch may change.
+pub const MAX_PATCH_FILES: usize = 64;
+
+/// One file of a patch, read and changed in memory.
+struct Planned<'a> {
+    file: &'a FilePatch,
+    parent: &'a Path,
+    name: &'a str,
+    /// `None` until made, for a new file whose directory does not exist.
+    directory: Option<Dir>,
+    /// What the file held, for an existing one.
+    original: Option<Vec<u8>>,
+    /// What it will hold, unless it is deleted.
+    text: Option<String>,
+}
+
+/// Apply `files` together: every file is read and patched in memory before
+/// anything is written, then every new text is staged in a temporary file,
+/// and only then are they put in place in request order. Directories a new
+/// file needs are made while staging and stay if a later file fails.
+pub(super) fn patch_files(
+    root: PathBuf,
+    files: &[FilePatch],
+    check_only: bool,
+) -> Result<HostReply, HostFailure> {
+    if files.is_empty() {
+        return Err(failure(
+            HostErrorCode::Invalid,
+            "the patch changes no files",
+        ));
+    }
+    if files.len() > MAX_PATCH_FILES {
+        return Err(failure(
+            HostErrorCode::TooLarge,
+            "a patch may change at most 64 files",
+        ));
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for file in files {
+        // Compared by component, so `a//b` and `a/b` are the same file.
+        if !seen.insert(writable_path(&file.path)?.components().collect::<PathBuf>()) {
+            return Err(failure(
+                HostErrorCode::Invalid,
+                "the patch changes a file more than once",
+            ));
+        }
+    }
+    let _writing = write_lock();
+    let workspace = open_workspace(root)?;
+    let failed = |file: &FilePatch, failure| {
+        Ok(HostReply::Patched(PatchResult {
+            changed: Vec::new(),
+            failed: Some(PatchFailure {
+                path: file.path.clone(),
+                failure,
+            }),
+        }))
+    };
+    let mut planned = Vec::with_capacity(files.len());
+    for file in files {
+        match plan(&workspace, file) {
+            Ok(plan) => planned.push(plan),
+            Err(failure) => return failed(file, failure),
+        }
+    }
+    if check_only {
+        return Ok(HostReply::Patched(PatchResult::default()));
+    }
+    let mut ready = Vec::with_capacity(planned.len());
+    for mut plan in planned {
+        let directory = match plan.directory.take() {
+            Some(directory) => directory,
+            None => match workspace
+                .try_clone()
+                .map_err(|e| io_failure(&e))
+                .and_then(|workspace| descend(workspace, plan.parent, true))
+            {
+                Ok(directory) => directory,
+                Err(failure) => return failed(plan.file, failure),
+            },
+        };
+        ready.push((plan, directory));
+    }
+    let mut staged = Vec::with_capacity(ready.len());
+    for (plan, directory) in &ready {
+        let staging = match &plan.text {
+            Some(text) => stage(
+                directory,
+                plan.name,
+                text.as_bytes(),
+                plan.original.is_some(),
+                plan.original.is_some(),
+            )
+            .map(Some),
+            None => Ok(None),
+        };
+        match staging {
+            Ok(staging) => staged.push((plan, directory, staging)),
+            Err(failure) => return failed(plan.file, failure),
+        }
+    }
+    let mut changed = Vec::with_capacity(staged.len());
+    for (plan, directory, staging) in staged.drain(..) {
+        let expected = plan.original.as_deref();
+        let published = match staging {
+            Some(staging) => staging.publish(expected),
+            None => unchanged(directory, plan.name, expected)
+                .and_then(|()| directory.remove_file(plan.name).map_err(|e| io_failure(&e))),
+        };
+        if let Err(failure) = published {
+            return Ok(HostReply::Patched(PatchResult {
+                changed,
+                failed: Some(PatchFailure {
+                    path: plan.file.path.clone(),
+                    failure,
+                }),
+            }));
+        }
+        changed.push(plan.file.path.clone());
+    }
+    Ok(HostReply::Patched(PatchResult {
+        changed,
+        failed: None,
+    }))
+}
+
+/// Read `file` and apply its hunks in memory.
+fn plan<'a>(workspace: &Dir, file: &'a FilePatch) -> Result<Planned<'a>, HostFailure> {
+    let relative = writable_path(&file.path)?;
+    let (Some(name), parent) = (
+        relative.file_name().and_then(|name| name.to_str()),
+        relative.parent().unwrap_or(Path::new("")),
+    ) else {
+        return Err(failure(HostErrorCode::Invalid, "invalid path"));
+    };
+    let directory = match descend(
+        workspace.try_clone().map_err(|e| io_failure(&e))?,
+        parent,
+        false,
+    ) {
+        Err(failure)
+            if file.change == FileChange::Create && failure.code == HostErrorCode::NotFound =>
+        {
+            None
+        }
+        found => Some(found?),
+    };
+    let original = match (file.change, &directory) {
+        (FileChange::Create, None) => None,
+        (FileChange::Create, Some(directory)) => match directory.symlink_metadata(name) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(io_failure(&error)),
+            Ok(_) => return Err(failure(HostErrorCode::Exists, "the file already exists")),
+        },
+        (_, directory) => {
+            let directory = directory
+                .as_ref()
+                .ok_or_else(|| failure(HostErrorCode::NotFound, "no such file or directory"))?;
+            Some(read_bounded(open_regular(directory, name)?)?.ok_or_else(too_large)?)
+        }
+    };
+    let before = match &original {
+        Some(bytes) => std::str::from_utf8(bytes)
+            .map_err(|_| failure(HostErrorCode::Invalid, "the file is not UTF-8 text"))?,
+        None => "",
+    };
+    let after = super::patch::apply(before, &file.hunks)
+        .map_err(|mismatch| failure(HostErrorCode::Conflict, &mismatch.to_string()))?;
+    let text = match file.change {
+        FileChange::Delete if !after.is_empty() => {
+            return Err(failure(
+                HostErrorCode::Conflict,
+                "the patch deletes a file but does not remove all of its lines",
+            ));
+        }
+        FileChange::Delete => None,
+        _ if after.len() as u64 > MAX_FILE => return Err(too_large()),
+        _ => Some(after),
+    };
+    Ok(Planned {
+        file,
+        parent,
+        name,
+        directory,
+        original,
+        text,
+    })
 }
 
 #[cfg(test)]

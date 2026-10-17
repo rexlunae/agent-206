@@ -926,6 +926,10 @@ impl HostCalls {
                 let root = self.workspace()?;
                 blocking(move || workspace::edit_file(root, &path, &old, &new)).await
             }
+            HostRequest::PatchFiles { files, check_only } => {
+                let root = self.workspace()?;
+                blocking(move || workspace::patch_files(root, &files, check_only)).await
+            }
             HostRequest::CreateDirectory { path } => {
                 let root = self.workspace()?;
                 blocking(move || workspace::create_directory(root, &path)).await
@@ -1140,6 +1144,7 @@ mod fetch;
 mod git;
 mod git_commit;
 pub mod packages;
+mod patch;
 mod proposals;
 mod workspace;
 pub(crate) use workspace::read_limited;
