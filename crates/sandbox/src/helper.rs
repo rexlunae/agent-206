@@ -2,7 +2,7 @@
 //! port on the private loopback when there is one, applies Landlock to itself,
 //! starts the runtime (which inherits that Landlock domain) and relays proxy
 //! traffic.
-use crate::{Access, SPEC_VERSION, SandboxError, Spec, Status};
+use crate::{Access, Network, SPEC_VERSION, SandboxError, Spec, Status};
 use a206_core::Ignore;
 use landlock::{
     ABI, Access as _, AccessFs, AccessNet, CompatLevel, Compatible, NetPort, PathBeneath, PathFd,
@@ -52,12 +52,12 @@ fn start(
     args: impl Iterator<Item = OsString>,
 ) -> Result<std::process::Child, SandboxError> {
     // Bound before Landlock, which then forbids the runtime from binding.
-    let listener = match &spec.proxy {
-        Some(proxy) => Some((
+    let listener = match &spec.network {
+        Network::Proxy(proxy) => Some((
             TcpListener::bind(("127.0.0.1", proxy.port)).map_err(SandboxError::Listen)?,
             proxy.socket.clone(),
         )),
-        None => None,
+        Network::None | Network::Host => None,
     };
     restrict(spec)?;
     if let Some((listener, socket)) = listener {
@@ -96,15 +96,22 @@ fn start(
 fn restrict(spec: &Spec) -> Result<(), SandboxError> {
     let required = AccessFs::from_all(ABI::V1);
     let all = AccessFs::from_all(ABI::V5);
-    let mut ruleset = landlock::Ruleset::default()
+    let ruleset = landlock::Ruleset::default()
         .set_compatibility(CompatLevel::HardRequirement)
         .handle_access(required)
         .map_err(SandboxError::Landlock)?
         .set_compatibility(CompatLevel::BestEffort)
         .handle_access(all)
-        .map_err(SandboxError::Landlock)?
-        .handle_access(AccessNet::from_all(ABI::V4))
-        .map_err(SandboxError::Landlock)?
+        .map_err(SandboxError::Landlock)?;
+    // Host networking is a user grant; every other runtime's TCP is limited.
+    let ruleset = if spec.network == Network::Host {
+        ruleset
+    } else {
+        ruleset
+            .handle_access(AccessNet::from_all(ABI::V4))
+            .map_err(SandboxError::Landlock)?
+    };
+    let mut ruleset = ruleset
         .scope(Scope::from_all(ABI::V6))
         .map_err(SandboxError::Landlock)?
         .create()
@@ -131,8 +138,8 @@ fn restrict(spec: &Spec) -> Result<(), SandboxError> {
             .add_rule(PathBeneath::new(fd, access))
             .map_err(SandboxError::Landlock)?;
     }
-    // Without a proxy no TCP connection is allowed at all.
-    if let Some(proxy) = &spec.proxy {
+    // Without a proxy or the host network, no TCP connection is allowed.
+    if let Network::Proxy(proxy) = &spec.network {
         ruleset = ruleset
             .add_rule(NetPort::new(proxy.port, AccessNet::ConnectTcp))
             .map_err(SandboxError::Landlock)?;

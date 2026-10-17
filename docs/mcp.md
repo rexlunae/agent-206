@@ -4,9 +4,12 @@ Agent 206 can use tools from MCP servers the user installs. This is separate fro
 `agent206 mcp THREAD`, the harness *server* that exposes one conversation's
 introspection tools to an external runtime.
 
-Status: **experimental**. Stdio servers run under macOS `sandbox-exec`; other
-platforms refuse to start them until an equivalent OS sandbox exists (Linux
-Landlock/bwrap is tracked in `docs/parity.md`). The run engine that offers MCP
+Status: **experimental**. Stdio servers run under macOS `sandbox-exec`, or on
+Linux inside bubblewrap namespaces with Landlock applied inside them
+(`a206-sandbox`, the same layers as the coding backends). Other platforms refuse
+to start them until an equivalent OS sandbox exists. On Linux a missing
+bubblewrap or a kernel without Landlock is a startup error, never a weaker
+sandbox. The run engine that offers MCP
 tools to models is not merged yet, so no model can call them today.
 
 ## Configuration
@@ -48,10 +51,20 @@ private scratch directory, and nothing else unless the entry holds:
 | `read_workspace` | read the bound project's directory (also the working directory) |
 | `write_workspace` | also write it; requires `read_workspace` |
 | `execute` | run `/bin` and `/usr/bin` programs |
-| `network` | outbound network, DNS and system trust store (untested on CI) |
+| `network` | outbound network, DNS and system trust store |
 
-Seatbelt checks resolved paths, so a symlink inside the project that points
-outside it reaches nothing the server could not already read (tested on macOS CI).
+Without `network` a Linux server has its own empty network namespace and
+Landlock allows no TCP connection; with it, the server shares the host's network
+and sees only the name-resolution files and certificates from `/etc`. On both
+platforms `network` currently includes the host's loopback, so grant it only to
+servers you would trust with local services. On Linux the PID namespace stays
+private either way, so a server cannot inspect the gateway's or other processes. Both
+sandboxes check resolved paths, so a symlink inside the project that points
+outside it reaches nothing the server could not already read. CI drives a fixture
+server through the real sandbox on macOS and on Linux, checking project and
+state visibility, symlink escapes, loopback reachability with and without
+`network`, and running `/bin/sh` with and without `execute`
+(`crates/mcp/tests/sandboxed.rs`).
 Private application state and common credential stores (`~/.ssh`, `~/.aws`,
 `~/.agent206`, keychains and agent configuration) are denied even inside a
 project. Any other capability (secrets, git, agents, browser) is rejected:
@@ -106,6 +119,7 @@ The run engine calls two gateway methods (`crates/runtime/src/gateway/mcp_server
 ## Not yet implemented
 
 - Streamable HTTP servers, and credentials for any server (vault-brokered auth).
-- Linux and Windows isolation.
+- Windows isolation.
+- Network grants that exclude the host's loopback services (see Isolation).
 - Resources, prompts, sampling, elicitation and list-change notifications.
 - Approval UI and model access (run engine).

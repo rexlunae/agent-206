@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 [dependencies]
 a206-core.workspace = true
+a206-sandbox.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -19,5 +20,8 @@ nix = { version = "0.31", features = ["signal", "process"] }
 [dev-dependencies]
 uuid.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
+[[test]]
+name = "sandboxed"
+harness = false
 [lints]
 workspace = true

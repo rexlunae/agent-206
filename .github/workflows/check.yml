@@ -51,7 +51,7 @@ jobs:
           key: ${{ runner.os }}-${{ runner.arch }}-sandbox-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', '**/Cargo.toml') }}
           restore-keys: |
             ${{ runner.os }}-${{ runner.arch }}-sandbox-
-      - run: cargo clippy -p a206-sandbox -p a206-runtime --all-targets --locked -- -D warnings
-      - run: cargo test -p a206-sandbox -p a206-runtime --locked
+      - run: cargo clippy -p a206-sandbox -p a206-mcp -p a206-runtime --all-targets --locked -- -D warnings
+      - run: cargo test -p a206-sandbox -p a206-mcp -p a206-runtime --locked
       # The bundled extension through the real, confined worker.
       - run: cargo test -p agent206 --no-default-features --test smoke --locked
