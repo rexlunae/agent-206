@@ -305,6 +305,10 @@ async fn the_user_can_compact_without_a_known_limit() {
             assert!(mentions(&summary_request.body, &message.text));
         }
         assert!(!mentions(&summary_request.body, &second.0));
+        // The state to restore is saved, so a restart restores it too.
+        let during = rig.thread();
+        assert_eq!(during.state, RunState::Running);
+        assert_eq!(during.compacting, Some(RunState::Complete));
         let summary = nonce();
         summary_request
             .respond(text_response_reporting(api, &summary, 1))
@@ -313,6 +317,7 @@ async fn the_user_can_compact_without_a_known_limit() {
             panic!("compaction failed");
         };
         assert_eq!(thread.state, RunState::Complete);
+        assert_eq!(thread.compacting, None);
         assert_eq!(thread.backend_activity, None);
         let found = summaries(&thread);
         assert_eq!(found.len(), 1);

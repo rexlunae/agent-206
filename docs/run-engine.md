@@ -365,8 +365,9 @@ and are not read.
 
 - Files are opened through cap-std from the project root: absolute paths, `..` and
   symlinks that leave the project are refused; a symlink within the project is
-  followed. Only regular UTF-8 files without NUL are read (FIFOs are opened
-  non-blocking and refused).
+  followed. Only regular files are read (FIFOs are opened non-blocking and
+  refused), and only up to the per-file limit: the text included must be UTF-8
+  without NUL, while bytes past the limit are never read or checked.
 - Each file contributes at most 32 KiB and all of them 64 KiB, cut on a character
   boundary with a note in the prompt; a file whose content repeats an included one
   (for example `CLAUDE.md` linked to `AGENTS.md`) is skipped.
@@ -398,8 +399,10 @@ previous summary first.
   request is sent as it is (a single turn larger than the window is not reduced).
 - **Manual.** `Command::CompactThread { thread }` compacts a native conversation
   that is not running, keeping its latest turn, whatever its context usage or
-  limit. It marks the thread `Running` (so `Send` waits and `CancelRun` stops it),
-  restores the previous state afterwards and replies with the thread. Nothing to
+  limit. It marks the thread `Running` (so `Send` waits and `CancelRun` stops it)
+  with the previous state saved in `Thread::compacting`, restores that state
+  afterwards, or on the next start if the gateway stopped meanwhile, and replies
+  with the thread. Nothing to
   compact is a `Conflict` before any request. CLI: `agent206 compact THREAD`.
 - **Result.** The summary is inserted as a `Role::System` message with
   `Message::compaction` (trigger, messages covered, previous summary, input tokens

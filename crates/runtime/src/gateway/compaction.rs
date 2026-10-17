@@ -320,12 +320,17 @@ impl Gateway {
             let prior = current.state.clone();
             let input_tokens = current.usage.as_ref().and_then(|u| u.input_tokens);
             let root: PathBuf = store.root.clone();
-            store.thread_mut(id)?.state = RunState::Running;
+            let thread = store.thread_mut(id)?;
+            thread.state = RunState::Running;
+            thread.compacting = Some(prior.clone());
+            store.persist(Some(EventKind::ThreadChanged { id }))?;
+            // Registered only once the Running state is saved, still under the
+            // store lock, so a failed save leaves no run behind and
+            // `CancelRun` always finds the token.
             self.running
                 .lock()
                 .map_err(poisoned("run"))?
                 .insert(id, cancel.clone());
-            store.persist(Some(EventKind::ThreadChanged { id }))?;
             (config, info, root, prior, input_tokens)
         };
         let result = self
@@ -345,6 +350,7 @@ impl Gateway {
         let thread = store.thread_mut(id)?;
         // Compaction is not a run: the previous run's outcome stays.
         thread.state = prior;
+        thread.compacting = None;
         let thread = thread.clone();
         store.persist(Some(EventKind::ThreadChanged { id }))?;
         result?;

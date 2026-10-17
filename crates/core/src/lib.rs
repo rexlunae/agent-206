@@ -461,6 +461,11 @@ pub struct Thread {
     /// it did with each. Empty when the run could not read the project.
     #[serde(default)]
     pub instructions: Vec<InstructionFile>,
+    /// While a user-requested compaction marks the thread `Running`, the
+    /// state it restores afterwards, so a restart restores it too rather
+    /// than reporting an interrupted run.
+    #[serde(default)]
+    pub compacting: Option<RunState>,
 }
 impl Thread {
     pub fn new(title: String, mode: Mode) -> Self {
@@ -487,6 +492,7 @@ impl Thread {
             prompts: vec![],
             chat: None,
             instructions: vec![],
+            compacting: None,
         }
     }
 }
