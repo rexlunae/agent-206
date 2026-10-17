@@ -2063,6 +2063,54 @@ async fn a_token_budget_stops_a_run_whose_usage_is_unknown() {
     let error = thread.error.unwrap();
     assert_eq!(error.kind, ErrorKind::PermissionDenied);
     assert!(error.message.contains("did not report"), "{error:?}");
+
+    // A final reply cannot be shown to have kept the limit either; the
+    // reply itself is kept.
+    let task = rig.send();
+    let answer = nonce();
+    rig.next_request()
+        .await
+        .respond(text_response(api, &answer))
+        .await;
+    let thread = finished(task).await;
+    assert_eq!(thread.state, RunState::Failed);
+    assert!(thread.messages.iter().any(|m| m.text == answer));
+    let error = thread.error.unwrap();
+    assert!(error.message.contains("did not report"), "{error:?}");
+}
+
+#[tokio::test]
+async fn a_token_budget_lowered_while_a_call_waits_stops_the_next_request() {
+    let api = ProviderApi::Anthropic;
+    let name = nonce();
+    let mut rig = rig(api, vec![tool(&name, ToolPermission::Ask, &[])], None).await;
+    rig.permit(&name, ToolPermission::Ask).await;
+    let (input, output) = (count(), count());
+    let limit = input + output + 1_000_000;
+    assert_eq!(rig.token_budget(rig.thread, Some(limit)).await, Reply::Ok);
+    let task = rig.send();
+    let first = rig.next_request().await;
+    first
+        .respond(with_usage(
+            calls_response(api, &[Call::new(&name, json!({}))], ""),
+            input,
+            output,
+        ))
+        .await;
+    let approval = rig.pending_approval().await;
+    // Lowered below what the run has already used while it waits.
+    assert_eq!(rig.token_budget(rig.thread, Some(input)).await, Reply::Ok);
+    assert_eq!(
+        rig.resolve(&approval, &approval.digest, ApprovalDecision::Approve)
+            .await,
+        Reply::Ok
+    );
+    let thread = finished(task).await;
+    assert_eq!(thread.state, RunState::Failed);
+    let error = thread.error.unwrap();
+    assert_eq!(error.kind, ErrorKind::PermissionDenied);
+    assert!(error.message.contains("token budget"), "{error:?}");
+    assert!(rig.requests.try_recv().is_err());
 }
 
 #[tokio::test]

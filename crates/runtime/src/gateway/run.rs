@@ -475,6 +475,12 @@ impl Gateway {
             if self.lock()?.remaining()? < NEXT_ROUND {
                 return Ok(Ended::Failed(GatewayError::HistoryFull));
             }
+            // The token budget may have been lowered while a tool ran or an
+            // approval waited; no request starts over it, compaction included.
+            let budget = effective_budget(&*self.lock()?, run.thread)?;
+            if let Err(error) = within_tokens(total.as_ref(), budget.tokens) {
+                return Ok(Ended::Failed(error.into()));
+            }
             // Messages steered to the run join it here, between rounds and
             // before the compaction check counts them.
             self.drain_steering(run.thread)?;
@@ -575,18 +581,23 @@ impl Gateway {
             total = Some(sum.clone());
             last_input = turn.usage.input_tokens;
             if turn.calls.is_empty() {
+                let budget = effective_budget(&*self.lock()?, run.thread)?;
                 if !self.steering_pending(run.thread)? {
+                    // A final reply may cross a known limit, but a limit
+                    // with unmeasured use cannot be shown to have been kept.
+                    if let Err(error @ RunError::UsageUnknown { .. }) =
+                        within_tokens(total.as_ref(), budget.tokens)
+                    {
+                        return Ok(Ended::Failed(error.into()));
+                    }
                     return Ok(Ended::Complete {
                         last: turn.usage,
                         total: sum,
                     });
                 }
                 // A message steered during this reply is answered in a
-                // further round, within the same budget.
-                let budget = effective_budget(&*self.lock()?, run.thread)?;
-                if let Err(error) = within_tokens(total.as_ref(), budget.tokens) {
-                    return Ok(Ended::Failed(error.into()));
-                }
+                // further round, within the same budget; the next round
+                // checks its tokens.
                 if round >= budget.rounds {
                     return Ok(Ended::Failed(
                         RunError::Rounds {

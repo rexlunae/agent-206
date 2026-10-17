@@ -115,11 +115,13 @@ summaries included (what the run is billed for, not what the context holds).
 The smallest limit along the delegation chain applies, and a delegated
 conversation needs a limit no higher than its parent's whenever the parent has
 one, so a parent's token budget bounds each subagent. A run is checked after
-each request: when no further request fits (`used ≥ limit`), its pending calls
-are stopped and it fails with `PermissionDenied` (`RunError::Tokens`); a final
-reply that crosses the limit still completes. With a limit set, usage a
-provider leaves unknown stops the run (`RunError::UsageUnknown`) instead of
-letting it run unmeasured. CLI: `tools budget THREAD --rounds R --tool-calls C
+each request and again, against the current limit, before each further round:
+when no further request fits (`used ≥ limit`), its pending calls are stopped
+and it fails with `PermissionDenied` (`RunError::Tokens`), so a limit lowered
+while a call runs or waits for approval stops the next request. A final reply
+that crosses a known limit still completes. With a limit set, usage a provider
+leaves unknown fails the run (`RunError::UsageUnknown`), even after a final
+reply, which is kept, instead of letting it run or end unmeasured. CLI: `tools budget THREAD --rounds R --tool-calls C
 [--tokens T]`.
 
 Commands: `ListTools`, `SetToolPermission`, `SetToolBudget`, `ResolveApproval`.
