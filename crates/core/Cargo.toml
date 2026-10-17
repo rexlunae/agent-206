@@ -9,6 +9,8 @@ serde.workspace = true
 serde_bytes = "0.11"
 a206-extension-abi.workspace = true
 thiserror.workspace = true
+# Times and intervals people type for scheduled messages.
+jiff = "0.2"
 uuid.workspace = true
 url.workspace = true
 zeroize.workspace = true

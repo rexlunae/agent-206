@@ -33,6 +33,7 @@ name = "a206-core"
 version = "0.1.0"
 dependencies = [
  "a206-extension-abi",
+ "jiff",
  "rmp-serde",
  "serde",
  "serde_bytes",
@@ -257,6 +258,7 @@ dependencies = [
  "fc-dioxus",
  "futures-timer",
  "futures-util",
+ "jiff",
  "reqwest",
  "serde",
  "tokio",
@@ -5499,11 +5501,14 @@ dependencies = [
  "defmt 1.2.0",
  "jiff-core",
  "jiff-static",
+ "jiff-tzdb",
  "jiff-tzdb-platform",
+ "js-sys",
  "log",
  "portable-atomic",
  "portable-atomic-util",
  "serde_core",
+ "wasm-bindgen",
  "windows-link 0.2.1",
 ]
 
