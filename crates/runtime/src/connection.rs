@@ -5,7 +5,7 @@
 //! Failures are typed [`ConnectionError`]s, recorded with `tracing` where they
 //! occur, so clients can both branch on them (an untrusted host key opens the
 //! fingerprint review) and display them without parsing strings.
-use a206_core::{GatewayConnection, GatewayTarget, HostKey};
+use a206_core::{GatewayConnection, GatewayProbe, GatewayTarget, HostKey};
 use base64::Engine;
 use sha2::{Digest, Sha256};
 use std::{
@@ -22,7 +22,7 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(20);
 pub enum ConnectionError {
     #[error(
         "no gateway is configured; run `agent206 gateway setup --local` or \
-         `agent206 gateway setup --ssh ssh://user@host`, or choose one in the desktop app"
+         `agent206 gateway setup --ssh ssh://user@host`, or choose one in the app"
     )]
     NotConfigured,
     #[error("invalid gateway endpoint {endpoint:?}")]
@@ -84,6 +84,8 @@ pub enum ConnectionError {
     ProxiedHost { host: String },
     #[error("the host key entry does not match its fingerprint")]
     HostKeyMismatch,
+    #[error("{host} no longer offers the key you verified; check its fingerprints again")]
+    FingerprintNotOffered { host: String },
     /// A client could not run setup work off its UI thread.
     #[error("gateway setup work stopped before finishing")]
     SetupWorker {
@@ -100,7 +102,8 @@ impl crate::error::Classified for ConnectionError {
             Self::UnknownHost { .. }
             | Self::HostKeyChanged { .. }
             | Self::ProxiedHost { .. }
-            | Self::HostKeyMismatch => K::PermissionDenied,
+            | Self::HostKeyMismatch
+            | Self::FingerprintNotOffered { .. } => K::PermissionDenied,
             Self::TimedOut { .. } => K::Timeout,
             Self::Ssh { .. } | Self::NoHostKeys { .. } => K::Unavailable,
             Self::EncodeSetup { .. } => K::Internal,
@@ -268,6 +271,47 @@ fn tail(text: &str) -> String {
         .find(|i| text.is_char_boundary(*i))
         .unwrap_or(text.len());
     text[start..].to_owned()
+}
+/// Check an SSH gateway. An untrusted host is not a failure here: its offered
+/// keys come back for the user to compare out of band.
+pub async fn probe(root: &Path, endpoint: &str) -> Result<GatewayProbe> {
+    match check_ssh(root, endpoint).await {
+        Ok(version) => Ok(GatewayProbe::Reachable { version }),
+        Err(ConnectionError::UnknownHost { .. }) => Ok(GatewayProbe::Unverified {
+            keys: scan_host_keys(endpoint).await?,
+        }),
+        Err(error) => Err(error),
+    }
+}
+/// Trust the keys whose fingerprints the user verified, then check again. The
+/// host is scanned afresh, so only a key it still offers with exactly one of
+/// those fingerprints is recorded; a client never supplies a known_hosts entry.
+pub async fn trust_fingerprints(
+    root: &Path,
+    endpoint: &str,
+    fingerprints: &[String],
+) -> Result<GatewayProbe> {
+    let accepted: Vec<_> = scan_host_keys(endpoint)
+        .await?
+        .into_iter()
+        .filter(|key| fingerprints.contains(&key.fingerprint))
+        .collect();
+    if accepted.is_empty() {
+        return Err(traced(ConnectionError::FingerprintNotOffered {
+            host: endpoint_of(endpoint)?.host,
+        }));
+    }
+    trust_host_keys(root, &accepted)?;
+    probe(root, endpoint).await
+}
+/// Confirm a target is usable before it is saved: an SSH gateway must answer
+/// with a trusted host key.
+pub async fn verify(root: &Path, target: &GatewayTarget) -> Result<()> {
+    validate(target)?;
+    if let GatewayTarget::Ssh { endpoint } = target {
+        check_ssh(root, endpoint).await?;
+    }
+    Ok(())
 }
 /// Where OpenSSH will really connect for an endpoint, and the name it looks up
 /// in known_hosts, after applying the user's ssh_config (`Host` aliases,

@@ -77,6 +77,8 @@ pub enum ProviderError {
     Incomplete,
     #[error("the provider reported an error during the response (code: {})", .code.as_deref().unwrap_or("none given"))]
     Upstream { code: Option<String> },
+    #[error("the provider streamed an unusable tool call")]
+    ToolCall(#[source] crate::tool_calls::StreamError),
 }
 impl crate::error::Classified for ProviderError {
     fn kind(&self) -> Option<ErrorKind> {
@@ -103,7 +105,8 @@ impl crate::error::Classified for ProviderError {
             | Self::Sse(_)
             | Self::Event(_)
             | Self::Incomplete
-            | Self::Upstream { .. } => ErrorKind::Provider,
+            | Self::Upstream { .. }
+            | Self::ToolCall(_) => ErrorKind::Provider,
         })
     }
 }
@@ -589,12 +592,20 @@ fn price(value: Option<&Value>) -> Option<f64> {
         .filter(|v| v.is_finite() && *v >= 0.0)
 }
 /// The longest reply text the conversation accepts.
-const MAX_REPLY_TEXT: usize = 128 * 1024;
+pub const MAX_REPLY_TEXT: usize = 128 * 1024;
+/// One model response: its text, the tool calls it requested, and usage.
+#[derive(Debug)]
+pub struct Turn {
+    pub text: String,
+    pub calls: Vec<crate::tool_calls::StreamedCall>,
+    pub usage: Usage,
+}
 /// Generate a reply, streaming it. Each text delta is sent on `progress` as
 /// [`Progress::Delta`](crate::backends::Progress::Delta) in arrival order,
 /// after it passed every check; the returned text is their concatenation.
 /// An error after some deltas means the reply is incomplete, never that the
-/// partial text is the answer.
+/// partial text is the answer. `tools` are offered to the model; the calls it
+/// requests are returned, never run here.
 ///
 /// Cancel-safe in the sense that dropping the future abandons the request:
 /// the broker connection or HTTP request closes and upstream work stops.
@@ -604,29 +615,48 @@ pub async fn complete(
     thread: &Thread,
     prompt: &str,
     info: &ModelInfo,
+    tools: &[crate::tools::ToolSpec],
     progress: &tokio::sync::mpsc::Sender<crate::backends::Progress>,
-) -> Result<(String, Usage)> {
+) -> Result<Turn> {
     let model = thread.model.as_ref().ok_or(ProviderError::NoModel)?;
     check(model == &info.key, ProviderError::ModelMismatch)?;
     let (url, body) = match config.api {
         ProviderApi::OpenAi => {
             let mut messages = vec![json!({"role": "system", "content": prompt})];
-            messages.extend(thread.messages.iter().map(|m| json!({"role": match m.role { Role::User => "user", Role::Assistant => "assistant", Role::System => "system", Role::Tool => "tool" }, "content": message_content(m)})));
+            for message in &thread.messages {
+                openai_message(message, &mut messages);
+            }
             // Usage arrives in a final chunk only when asked for.
             let mut body = json!({"model": model.model, "messages": messages, "stream": true,
                 "stream_options": {"include_usage": true}});
             if let Some(effort) = &thread.effort {
                 body["reasoning_effort"] = json!(effort);
             }
+            if !tools.is_empty() {
+                body["tools"] = tools
+                    .iter()
+                    .map(|tool| json!({"type": "function", "function": {"name": tool.name, "description": tool.description, "parameters": tool.parameters}}))
+                    .collect();
+            }
             (endpoint(config, "chat/completions")?, body)
         }
         ProviderApi::Anthropic => {
             // This is a request budget, not a claim about a model's context or output capacity.
             let budget = info.output_limit.unwrap_or(8192).min(8192);
+            let mut messages = vec![];
+            for message in &thread.messages {
+                anthropic_message(message, &mut messages);
+            }
             let mut body = json!({"model": model.model, "system": prompt, "max_tokens": budget, "stream": true,
-                "messages": thread.messages.iter().filter(|m| matches!(m.role, Role::User | Role::Assistant)).map(|m| json!({"role": if m.role == Role::Assistant { "assistant" } else { "user" }, "content": message_content(m)})).collect::<Vec<_>>() });
+                "messages": messages });
             if let Some(effort) = &thread.effort {
                 body["output_config"] = json!({"effort": effort});
+            }
+            if !tools.is_empty() {
+                body["tools"] = tools
+                    .iter()
+                    .map(|tool| json!({"name": tool.name, "description": tool.description, "input_schema": tool.parameters}))
+                    .collect();
             }
             (endpoint(config, "messages")?, body)
         }
@@ -650,8 +680,19 @@ pub async fn complete(
                 .pop_if_empty()
                 .push(&format!("{resource}:streamGenerateContent"));
             url.query_pairs_mut().append_pair("alt", "sse");
-            let body = json!({"systemInstruction": {"parts": [{"text": prompt}]},
-                "contents": thread.messages.iter().filter(|m| matches!(m.role, Role::User | Role::Assistant)).map(|m| json!({"role": if m.role == Role::Assistant { "model" } else { "user" }, "parts": [{"text": message_content(m)}]})).collect::<Vec<_>>() });
+            let mut contents = vec![];
+            for message in &thread.messages {
+                gemini_content(message, &mut contents);
+            }
+            let mut body = json!({"systemInstruction": {"parts": [{"text": prompt}]},
+                "contents": contents });
+            if !tools.is_empty() {
+                let declarations: Vec<_> = tools
+                    .iter()
+                    .map(|tool| json!({"name": tool.name, "description": tool.description, "parametersJsonSchema": tool.parameters}))
+                    .collect();
+                body["tools"] = json!([{"functionDeclarations": declarations}]);
+            }
             (url, body)
         }
     };
@@ -667,6 +708,115 @@ pub async fn complete(
         }
     }
     sink.reply.finish()
+}
+/// The text a model receives as one call's result.
+fn tool_result(call: &ToolCall) -> &str {
+    call.output
+        .as_deref()
+        .unwrap_or("The tool call did not complete.")
+}
+/// The field that carries a call's argument text when the model sent
+/// something other than a JSON object.
+pub const UNPARSED_ARGUMENTS: &str = "unparsed_arguments";
+/// A call's arguments as an object, for protocols that replay calls as
+/// objects. Recorded arguments are either the canonical object the call ran
+/// with or, when they could not be used, exactly the text the model sent.
+/// Anthropic and Gemini accept only an object here, so unusable text is
+/// replayed verbatim under [`UNPARSED_ARGUMENTS`]: inventing `{}` would show
+/// the model a call it never made, while the wrapper keeps every byte it
+/// sent beside the error result explaining why the call did not run.
+fn tool_input(call: &ToolCall) -> Value {
+    match serde_json::from_str(&call.arguments) {
+        Ok(value @ Value::Object(_)) => value,
+        _ => json!({UNPARSED_ARGUMENTS: call.arguments}),
+    }
+}
+fn openai_message(message: &Message, out: &mut Vec<Value>) {
+    let role = match message.role {
+        Role::User => "user",
+        Role::Assistant => "assistant",
+        Role::System => "system",
+        Role::Tool => "tool",
+    };
+    if message.role != Role::Assistant || message.tool_calls.is_empty() {
+        out.push(json!({"role": role, "content": message_content(message)}));
+        return;
+    }
+    let calls: Vec<_> = message
+        .tool_calls
+        .iter()
+        .map(|call| json!({"id": call.id, "type": "function", "function": {"name": call.tool, "arguments": call.arguments}}))
+        .collect();
+    let content = (!message.text.is_empty()).then(|| message_content(message));
+    out.push(json!({"role": "assistant", "content": content, "tool_calls": calls}));
+    for call in &message.tool_calls {
+        out.push(json!({"role": "tool", "tool_call_id": call.id, "content": tool_result(call)}));
+    }
+}
+fn anthropic_message(message: &Message, out: &mut Vec<Value>) {
+    match message.role {
+        Role::User => out.push(json!({"role": "user", "content": message_content(message)})),
+        Role::Assistant if message.tool_calls.is_empty() => {
+            out.push(json!({"role": "assistant", "content": message_content(message)}))
+        }
+        Role::Assistant => {
+            let mut content = vec![];
+            if !message.text.is_empty() {
+                content.push(json!({"type": "text", "text": message_content(message)}));
+            }
+            content.extend(message.tool_calls.iter().map(|call| {
+                json!({"type": "tool_use", "id": call.id, "name": call.tool, "input": tool_input(call)})
+            }));
+            out.push(json!({"role": "assistant", "content": content}));
+            let results: Vec<_> = message
+                .tool_calls
+                .iter()
+                .map(|call| json!({"type": "tool_result", "tool_use_id": call.id, "content": tool_result(call),
+                    "is_error": call.state != ToolCallState::Succeeded}))
+                .collect();
+            out.push(json!({"role": "user", "content": results}));
+        }
+        Role::System | Role::Tool => {}
+    }
+}
+fn gemini_content(message: &Message, out: &mut Vec<Value>) {
+    match message.role {
+        Role::User => {
+            out.push(json!({"role": "user", "parts": [{"text": message_content(message)}]}))
+        }
+        Role::Assistant => {
+            let mut parts = vec![];
+            if !message.text.is_empty() || message.tool_calls.is_empty() {
+                parts.push(json!({"text": message_content(message)}));
+            }
+            let mut responses = vec![];
+            for call in &message.tool_calls {
+                let mut function = json!({"name": call.tool, "args": tool_input(call)});
+                let mut response = json!({"name": call.tool});
+                if !call.generated_id {
+                    function["id"] = json!(call.id);
+                    response["id"] = json!(call.id);
+                }
+                let mut part = json!({"functionCall": function});
+                if let Some(signature) = &call.signature {
+                    part["thoughtSignature"] = json!(signature);
+                }
+                parts.push(part);
+                let field = if call.state == ToolCallState::Succeeded {
+                    "output"
+                } else {
+                    "error"
+                };
+                response["response"] = json!({field: tool_result(call)});
+                responses.push(json!({"functionResponse": response}));
+            }
+            out.push(json!({"role": "model", "parts": parts}));
+            if !responses.is_empty() {
+                out.push(json!({"role": "user", "parts": responses}));
+            }
+        }
+        Role::System | Role::Tool => {}
+    }
 }
 /// Decodes a response body as it arrives and forwards checked text deltas.
 struct Sink<'a> {
@@ -784,8 +934,10 @@ struct StreamedReply {
     usage: Usage,
     /// The protocol's own end marker arrived; later events are ignored.
     ended: bool,
-    /// A finish reason arrived (enough to complete OpenAI and Gemini streams).
+    /// A finish reason arrived (with `[DONE]` it completes an OpenAI stream;
+    /// alone it completes a Gemini one). A tool-call finish counts the same.
     finished: bool,
+    calls: crate::tool_calls::Assembler,
 }
 impl StreamedReply {
     fn new(api: ProviderApi) -> Self {
@@ -799,6 +951,7 @@ impl StreamedReply {
             },
             ended: false,
             finished: false,
+            calls: crate::tool_calls::Assembler::default(),
         }
     }
     /// Apply one event and return the text it appends, if any.
@@ -828,6 +981,28 @@ impl StreamedReply {
                 {
                     self.finished = true;
                 }
+                let calls = value.pointer("/choices/0/delta/tool_calls");
+                for (position, call) in calls
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .enumerate()
+                {
+                    // `index` identifies the call across deltas; servers that
+                    // omit it send each call whole, in order.
+                    let index = call
+                        .get("index")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(position as u64);
+                    self.calls
+                        .delta(
+                            index,
+                            call.get("id").and_then(Value::as_str),
+                            call.pointer("/function/name").and_then(Value::as_str),
+                            call.pointer("/function/arguments").and_then(Value::as_str),
+                        )
+                        .map_err(ProviderError::ToolCall)?;
+                }
                 value
                     .pointer("/choices/0/delta/content")
                     .and_then(Value::as_str)
@@ -850,6 +1025,51 @@ impl StreamedReply {
                             .ok_or(ProviderError::Malformed("text delta without text"))?
                             .to_owned(),
                     )
+                }
+                Some("content_block_start")
+                    if value.pointer("/content_block/type").and_then(Value::as_str)
+                        == Some("tool_use") =>
+                {
+                    let index = value
+                        .get("index")
+                        .and_then(Value::as_u64)
+                        .ok_or(ProviderError::Malformed("tool block without an index"))?;
+                    let block = &value["content_block"];
+                    // The block starts with an empty input that deltas fill;
+                    // a proxy that sends the whole input up front is honored.
+                    let initial = block
+                        .get("input")
+                        .and_then(Value::as_object)
+                        .filter(|input| !input.is_empty())
+                        .map(serde_json::to_string)
+                        .transpose()
+                        .map_err(ProviderError::Event)?;
+                    self.calls
+                        .delta(
+                            index,
+                            block.get("id").and_then(Value::as_str),
+                            block.get("name").and_then(Value::as_str),
+                            initial.as_deref(),
+                        )
+                        .map_err(ProviderError::ToolCall)?;
+                    None
+                }
+                Some("content_block_delta")
+                    if value.pointer("/delta/type").and_then(Value::as_str)
+                        == Some("input_json_delta") =>
+                {
+                    let index = value
+                        .get("index")
+                        .and_then(Value::as_u64)
+                        .ok_or(ProviderError::Malformed("tool delta without an index"))?;
+                    let partial = value
+                        .pointer("/delta/partial_json")
+                        .and_then(Value::as_str)
+                        .ok_or(ProviderError::Malformed("tool delta without arguments"))?;
+                    self.calls
+                        .append(index, partial)
+                        .map_err(ProviderError::ToolCall)?;
+                    None
                 }
                 Some("message_delta") => {
                     // Counts in `message_delta` are cumulative.
@@ -888,7 +1108,32 @@ impl StreamedReply {
                 {
                     self.finished = true;
                 }
-                text_parts(value.pointer("/candidates/0/content/parts"), "text", true)
+                let parts = value.pointer("/candidates/0/content/parts");
+                for part in parts.and_then(Value::as_array).into_iter().flatten() {
+                    let Some(call) = part.get("functionCall") else {
+                        continue;
+                    };
+                    let name = call.get("name").and_then(Value::as_str).unwrap_or_default();
+                    let arguments = match call.get("args") {
+                        None | Some(Value::Null) => "{}".to_owned(),
+                        Some(args) => serde_json::to_string(args).map_err(ProviderError::Event)?,
+                    };
+                    self.calls
+                        .whole(crate::tool_calls::StreamedCall {
+                            id: call
+                                .get("id")
+                                .and_then(Value::as_str)
+                                .map(ToOwned::to_owned),
+                            name: name.to_owned(),
+                            arguments,
+                            signature: part
+                                .get("thoughtSignature")
+                                .and_then(Value::as_str)
+                                .map(ToOwned::to_owned),
+                        })
+                        .map_err(ProviderError::ToolCall)?;
+                }
+                text_parts(parts, "text", true)
             }
         };
         let Some(delta) = delta.filter(|d| !d.is_empty()) else {
@@ -901,7 +1146,7 @@ impl StreamedReply {
         self.text.push_str(&delta);
         Ok(Some(delta))
     }
-    fn finish(self) -> Result<(String, Usage)> {
+    fn finish(self) -> Result<Turn> {
         let complete = match self.api {
             ProviderApi::Anthropic => self.ended,
             // `[DONE]` closes the stream; a finish reason alone may be followed
@@ -911,10 +1156,14 @@ impl StreamedReply {
         };
         check(complete, ProviderError::Incomplete)?;
         check(
-            !self.text.is_empty(),
+            !self.text.is_empty() || !self.calls.is_empty(),
             ProviderError::Malformed("provider returned no text response"),
         )?;
-        Ok((self.text, self.usage))
+        Ok(Turn {
+            text: self.text,
+            calls: self.calls.finish().map_err(ProviderError::ToolCall)?,
+            usage: self.usage,
+        })
     }
 }
 /// An in-stream error event. Only a short machine code is kept: messages can

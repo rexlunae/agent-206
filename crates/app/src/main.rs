@@ -16,7 +16,8 @@ mod vault_cli;
 #[cfg(not(target_arch = "wasm32"))]
 mod native {
     use a206_core::{
-        BackendConfig, Capability, CodingBackend, Command, Mode, ProviderPreset, Reply,
+        ApprovalDecision, ApprovalRequest, BackendConfig, Capability, CodingBackend, Command, Mode,
+        ProviderPreset, Reply, ToolBudget, ToolPermission,
     };
     use clap::{Parser, Subcommand};
     use std::path::PathBuf;
@@ -133,6 +134,16 @@ mod native {
         Cancel {
             thread: uuid::Uuid,
         },
+        /// Inspect and set a conversation's tool permissions and budget.
+        Tools {
+            #[command(subcommand)]
+            command: ToolAction,
+        },
+        /// Answer tool calls waiting for approval.
+        Approvals {
+            #[command(subcommand)]
+            command: ApprovalAction,
+        },
         /// Export settings as TOML, or apply a reviewed TOML configuration.
         Settings {
             #[arg(long)]
@@ -187,6 +198,52 @@ mod native {
         Render {
             output: PathBuf,
         },
+    }
+    #[derive(Subcommand)]
+    enum ToolAction {
+        /// List the tools a conversation could use and how each is permitted.
+        List { thread: uuid::Uuid },
+        /// Set one tool to allow, ask or deny; `unset` returns it to deny.
+        Permit {
+            thread: uuid::Uuid,
+            tool: String,
+            permission: String,
+        },
+        /// Limit model rounds and tool calls per run.
+        Budget {
+            thread: uuid::Uuid,
+            #[arg(long)]
+            rounds: u32,
+            #[arg(long)]
+            tool_calls: u32,
+        },
+    }
+    #[derive(Subcommand)]
+    enum ApprovalAction {
+        /// Show the tool calls waiting for this conversation's user.
+        List { thread: uuid::Uuid },
+        /// Run one pending call; DIGEST must be the one `approvals list` showed.
+        Approve {
+            thread: uuid::Uuid,
+            approval: uuid::Uuid,
+            digest: String,
+        },
+        /// Refuse one pending call.
+        Deny {
+            thread: uuid::Uuid,
+            approval: uuid::Uuid,
+            digest: String,
+        },
+    }
+    fn permission(value: &str) -> anyhow::Result<Option<ToolPermission>> {
+        if value.eq_ignore_ascii_case("unset") {
+            return Ok(None);
+        }
+        ToolPermission::ALL
+            .into_iter()
+            .find(|p| p.label().eq_ignore_ascii_case(value))
+            .map(Some)
+            .ok_or_else(|| anyhow::anyhow!("permission must be allow, ask, deny or unset"))
     }
     #[derive(Subcommand)]
     enum GatewayAction {
@@ -333,31 +390,25 @@ mod native {
         ssh: Option<String>,
         trust: &[String],
     ) -> anyhow::Result<()> {
-        use a206_core::{GatewayConnection, GatewayTarget};
-        use a206_runtime::connection::{self, ConnectionError};
+        use a206_core::{GatewayConnection, GatewayProbe, GatewayTarget};
+        use a206_runtime::connection;
         let target = match ssh {
             Some(endpoint) if !local => {
-                let version = match connection::check_ssh(root, &endpoint).await {
-                    Err(ConnectionError::UnknownHost { .. }) => {
-                        let offered = connection::scan_host_keys(&endpoint).await?;
-                        let accepted: Vec<_> = offered
-                            .iter()
-                            .filter(|key| trust.contains(&key.fingerprint))
-                            .cloned()
-                            .collect();
-                        if accepted.is_empty() {
-                            println!("The host offers these keys:");
-                            for key in &offered {
-                                println!("  {} {}", key.algorithm, key.fingerprint);
-                            }
-                            anyhow::bail!(
-                                "verify a fingerprint with the server's administrator, then rerun with --trust <fingerprint>"
-                            );
+                let mut probe = connection::probe(root, &endpoint).await?;
+                if let GatewayProbe::Unverified { keys } = &probe {
+                    if !keys.iter().any(|key| trust.contains(&key.fingerprint)) {
+                        println!("The host offers these keys:");
+                        for key in keys {
+                            println!("  {} {}", key.algorithm, key.fingerprint);
                         }
-                        connection::trust_host_keys(root, &accepted)?;
-                        connection::check_ssh(root, &endpoint).await?
+                        anyhow::bail!(
+                            "verify a fingerprint with the server's administrator, then rerun with --trust <fingerprint>"
+                        );
                     }
-                    other => other?,
+                    probe = connection::trust_fingerprints(root, &endpoint, trust).await?;
+                }
+                let GatewayProbe::Reachable { version } = probe else {
+                    anyhow::bail!("the host key is still not trusted after recording it");
                 };
                 println!("Remote gateway: {version}");
                 GatewayTarget::Ssh { endpoint }
@@ -549,9 +600,14 @@ mod native {
                     };
                 }
                 if let Action::Web { static_dir, port } = action {
-                    return Ok(
-                        a206_runtime::web::serve(root.clone(), remote()?, static_dir, port).await?,
-                    );
+                    // The bridge offers first-time setup to the browser itself.
+                    return Ok(a206_runtime::web::serve(
+                        root.clone(),
+                        args.remote.clone(),
+                        static_dir,
+                        port,
+                    )
+                    .await?);
                 }
                 let client = a206_runtime::client::Client::start(root.clone(), remote()?);
                 if let Action::Acp { thread } = action {
@@ -724,6 +780,70 @@ mod native {
                         attachments: vec![],
                     },
                     Action::Cancel { thread } => Command::CancelRun { thread },
+                    Action::Tools { command } => match command {
+                        ToolAction::List { thread } => Command::ListTools { thread },
+                        ToolAction::Permit {
+                            thread,
+                            tool,
+                            permission: value,
+                        } => Command::SetToolPermission {
+                            thread,
+                            tool,
+                            permission: permission(&value)?,
+                        },
+                        ToolAction::Budget {
+                            thread,
+                            rounds,
+                            tool_calls,
+                        } => Command::SetToolBudget {
+                            thread,
+                            budget: ToolBudget { rounds, tool_calls },
+                        },
+                    },
+                    Action::Approvals { command } => match command {
+                        ApprovalAction::List { thread } => {
+                            let Reply::Snapshot(snapshot) = client.call(Command::Snapshot).await?
+                            else {
+                                anyhow::bail!("failed to read the conversation");
+                            };
+                            let thread = snapshot
+                                .threads
+                                .into_iter()
+                                .find(|t| t.id == thread)
+                                .ok_or_else(|| anyhow::anyhow!("conversation not found"))?;
+                            #[derive(serde::Serialize)]
+                            struct Pending {
+                                approvals: Vec<ApprovalRequest>,
+                            }
+                            print!(
+                                "{}",
+                                toml::to_string_pretty(&Pending {
+                                    approvals: thread.approvals
+                                })?
+                            );
+                            return Ok(());
+                        }
+                        ApprovalAction::Approve {
+                            thread,
+                            approval,
+                            digest,
+                        } => Command::ResolveApproval {
+                            thread,
+                            approval,
+                            digest,
+                            decision: ApprovalDecision::Approve,
+                        },
+                        ApprovalAction::Deny {
+                            thread,
+                            approval,
+                            digest,
+                        } => Command::ResolveApproval {
+                            thread,
+                            approval,
+                            digest,
+                            decision: ApprovalDecision::Deny,
+                        },
+                    },
                     Action::Settings { apply: Some(path) } => {
                         Command::SaveSettings(toml::from_str(&std::fs::read_to_string(path)?)?)
                     }

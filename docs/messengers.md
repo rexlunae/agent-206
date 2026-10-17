@@ -95,12 +95,13 @@ fn converse(&self, thread: Id, text: String)
 ```
 
 `converse` currently sends `Command::Send` through `Gateway::request` and
-returns the last assistant text after the user's message. When the run engine
-gains tool calls and approvals, a turn that waits for approval should stay
-pending: the messenger waits for `converse` to return, so an approval made in
-the app completes the reply. The run engine needs no messenger-specific code
-as long as `Send` returns the finished thread (or a failed one with its
-`ErrorReport`). Approval prompts are never sent to the chat, so a chat
+returns the last assistant text after the user's message. A turn whose tool
+call waits for approval stays pending: `Send` returns only the finished thread
+(or a failed one with its `ErrorReport`), so the messenger waits in `converse`
+and an approval made in the app completes the reply. The run engine has no
+messenger-specific code; `docs/run-engine.md` documents this contract and
+`send_stays_pending_while_an_approval_waits_and_returns_the_finished_thread`
+tests it. Approval prompts are never sent to the chat, so a chat
 participant cannot approve their own request.
 
 ## Not yet
