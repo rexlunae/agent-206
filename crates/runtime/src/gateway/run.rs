@@ -77,7 +77,7 @@ pub enum ToolError {
     )]
     Capacity { bytes: usize },
     #[error(
-        "tool `{tool}` returned {bytes} bytes, exceeding the available {limit}-byte output budget; complete instructions were not delivered"
+        "tool `{tool}` returned {bytes} bytes, exceeding the available {limit}-byte output budget; its output is only useful whole, so none of it was delivered"
     )]
     CompleteOutput {
         tool: String,
@@ -772,13 +772,29 @@ impl Gateway {
                 }
             }
         };
+        // Withdrawing a host's authority can end its call before the policy
+        // change is seen here, as when a disconnected MCP server's session
+        // closes: such a failure is the withdrawal, not the tool's. Hosts
+        // signal a withdrawal before ending the work, so a failure with no
+        // unseen change (a server that crashed) keeps its own report.
+        if result.is_err()
+            && policy.has_changed().unwrap_or(false)
+            && !self
+                .still_permits(id, &record.tool, &routed.spec, approved)
+                .await?
+        {
+            refuse(ToolError::Revoked(record.tool.clone()))?;
+            return Ok(true);
+        }
         self.update_call(
             id,
             message,
             &call,
             changed,
             |_, record, room| match result {
-                Ok(output) if !output.is_error => finish_success(record, output.text, room),
+                Ok(output) if !output.is_error => {
+                    finish_success(record, output.text, room, routed.spec.whole_output)
+                }
                 Ok(output) => {
                     let text = bounded_output(output.text, room);
                     settle(
@@ -947,15 +963,13 @@ fn settle(call: &mut ToolCall, state: ToolCallState, why: &ToolError) {
     call.error = Some(report);
 }
 
-/// Skill instructions are atomic model input. Available storage can be smaller
-/// than the global output cap, so both bounds are checked at settlement time.
-fn finish_success(record: &mut ToolCall, text: String, room: usize) {
+/// A tool whose output is only useful whole ([`ToolSpec::whole_output`], such
+/// as skill instructions) fails rather than being cut. Available storage can
+/// be smaller than the global output cap, so both bounds are checked at
+/// settlement time.
+fn finish_success(record: &mut ToolCall, text: String, room: usize, whole: bool) {
     let limit = room.min(tools::MAX_OUTPUT);
-    if matches!(
-        record.tool.as_str(),
-        crate::skill_tool::LIST | crate::skill_tool::INFO
-    ) && text.len() > limit
-    {
+    if whole && text.len() > limit {
         settle(
             record,
             ToolCallState::Failed,
@@ -992,12 +1006,12 @@ mod output_tests {
         let text = Id::new_v4().to_string();
         for name in [crate::skill_tool::INFO, crate::skill_tool::LIST] {
             let mut call = record(name);
-            finish_success(&mut call, text.clone(), text.len() - 1);
+            finish_success(&mut call, text.clone(), text.len() - 1, true);
             assert_eq!(call.state, ToolCallState::Failed);
             assert_eq!(call.error.as_ref().unwrap().kind, ErrorKind::Storage);
             assert!(!call.output.as_ref().unwrap().contains(&text));
             let mut call = record(name);
-            finish_success(&mut call, text.clone(), text.len());
+            finish_success(&mut call, text.clone(), text.len(), true);
             assert_eq!(call.state, ToolCallState::Succeeded);
             assert_eq!(call.output, Some(text.clone()));
         }
@@ -1005,10 +1019,15 @@ mod output_tests {
     #[test]
     fn complete_results_obey_global_limit_and_other_tools_keep_excerpting() {
         let mut skill = record(crate::skill_tool::INFO);
-        finish_success(&mut skill, "x".repeat(tools::MAX_OUTPUT + 1), usize::MAX);
+        finish_success(
+            &mut skill,
+            "x".repeat(tools::MAX_OUTPUT + 1),
+            usize::MAX,
+            true,
+        );
         assert_eq!(skill.state, ToolCallState::Failed);
         let mut ordinary = record("other_tool");
-        finish_success(&mut ordinary, "1234567890".into(), 5);
+        finish_success(&mut ordinary, "1234567890".into(), 5, false);
         assert_eq!(ordinary.state, ToolCallState::Succeeded);
         assert!(ordinary.output.unwrap().contains("truncated"));
     }
