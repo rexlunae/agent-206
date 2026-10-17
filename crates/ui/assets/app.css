@@ -73,6 +73,7 @@ body { max-inline-size: none; inline-size: 100%; padding: 0; background: var(--f
 .a206-status { padding: var(--fc-space-2) var(--fc-space-4); background: var(--fc-color-bg-muted); font-size: .8rem; }
 .a206-error-causes { margin-block: var(--fc-space-1) 0; padding-inline-start: var(--fc-space-4); }
 .a206-document { white-space: pre-wrap; overflow-wrap: anywhere; font-family: var(--fc-font-family-mono, monospace); font-size: .85rem; line-height: 1.7; }
+.a206-prompt-choices { display: flex; flex-wrap: wrap; gap: var(--fc-space-2); margin-block-end: var(--fc-space-3); }
 .a206-tool-output { margin: 0; max-block-size: 16rem; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; padding: var(--fc-space-2); border: 1px solid var(--fc-color-border-subtle); border-radius: var(--fc-radius-md, .375rem); background: var(--fc-color-bg-muted); font-family: var(--fc-font-family-mono, monospace); font-size: .8rem; }
 .a206-grow { flex: 1; }
 .a206-gateway-copy { color: var(--fc-theme-feature-fg, var(--fc-color-text-default)); }

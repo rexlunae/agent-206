@@ -8,9 +8,11 @@ pub mod doctor;
 pub mod error;
 pub mod extension;
 pub mod ignore;
+pub mod prompts;
 pub mod tools;
 pub use error::{ErrorKind, ErrorReport};
 pub use ignore::Ignore;
+pub use prompts::{AnswerError, PromptAnswer, PromptOutcome, UserPrompt};
 pub use tools::{
     ApprovalDecision, ApprovalOutcome, ApprovalRequest, ToolBudget, ToolCall, ToolCallState,
     ToolList, ToolOffer, ToolPermission, UnavailableTools,
@@ -384,6 +386,9 @@ pub struct Thread {
     /// Tool calls of the current run waiting for the user.
     #[serde(default)]
     pub approvals: Vec<ApprovalRequest>,
+    /// Questions the current run asked the user and is waiting on.
+    #[serde(default)]
+    pub prompts: Vec<UserPrompt>,
     /// The messenger chat this thread converses with, if any.
     #[serde(default)]
     pub chat: Option<Box<ChatBinding>>,
@@ -410,6 +415,7 @@ impl Thread {
             tool_permissions: BTreeMap::new(),
             tool_budget: ToolBudget::default(),
             approvals: vec![],
+            prompts: vec![],
             chat: None,
         }
     }
@@ -607,6 +613,16 @@ pub enum EventKind {
         approval: Id,
         outcome: ApprovalOutcome,
     },
+    /// An agent asked the user a question; it is in the thread.
+    PromptRequested {
+        thread: Id,
+        prompt: Id,
+    },
+    PromptResolved {
+        thread: Id,
+        prompt: Id,
+        outcome: PromptOutcome,
+    },
 }
 
 /// A capability the vault broker issues to the gateway for one unlock, so the
@@ -703,6 +719,12 @@ pub enum Command {
         approval: Id,
         digest: String,
         decision: ApprovalDecision,
+    },
+    /// Answer a question an agent asked in `thread`.
+    AnswerPrompt {
+        thread: Id,
+        prompt: Id,
+        answer: PromptAnswer,
     },
     CreateProject {
         name: String,
@@ -833,6 +855,7 @@ impl Command {
             Self::SetToolPermission { .. } => "set_tool_permission",
             Self::SetToolBudget { .. } => "set_tool_budget",
             Self::ResolveApproval { .. } => "resolve_approval",
+            Self::AnswerPrompt { .. } => "answer_prompt",
             Self::CreateProject { .. } => "create_project",
             Self::CreateSubagent { .. } => "create_subagent",
             Self::Events { .. } => "events",
