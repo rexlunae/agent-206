@@ -8,6 +8,7 @@ license.workspace = true
 a206-core.workspace = true
 a206-protocol.workspace = true
 a206-extensions.workspace = true
+a206-mcp.workspace = true
 a206-vault.workspace = true
 a206-broker.workspace = true
 a206-sandbox.workspace = true
