@@ -9,10 +9,12 @@ pub mod error;
 pub mod extension;
 pub mod ignore;
 pub mod prompts;
+pub mod search;
 pub mod tools;
 pub use error::{ErrorKind, ErrorReport};
 pub use ignore::Ignore;
 pub use prompts::{AnswerError, PromptAnswer, PromptOutcome, UserPrompt};
+pub use search::{MessageHit, SearchError};
 pub use tools::{
     ApprovalDecision, ApprovalOutcome, ApprovalRequest, ToolBudget, ToolCall, ToolCallState,
     ToolList, ToolOffer, ToolPermission, UnavailableTools,
@@ -681,6 +683,12 @@ pub enum Command {
     CancelRun {
         thread: Id,
     },
+    /// Messages in any conversation containing every term of `query`,
+    /// newest first; see [`search::search`].
+    SearchMessages {
+        query: String,
+        limit: u32,
+    },
     /// The tools this conversation could use and how each is permitted.
     ListTools {
         thread: Id,
@@ -821,6 +829,7 @@ impl Command {
             Self::SetEffort { .. } => "set_effort",
             Self::Send { .. } => "send",
             Self::CancelRun { .. } => "cancel_run",
+            Self::SearchMessages { .. } => "search_messages",
             Self::ListTools { .. } => "list_tools",
             Self::SetToolPermission { .. } => "set_tool_permission",
             Self::SetToolBudget { .. } => "set_tool_budget",
@@ -867,6 +876,7 @@ pub enum Reply {
     Skills(Vec<SkillSummary>),
     Skill(SkillText),
     Tools(ToolList),
+    Messages(Vec<MessageHit>),
 }
 impl Reply {
     /// Separate a gateway-reported failure from a successful reply.
