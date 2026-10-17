@@ -50,6 +50,7 @@ impl Rig {
             thread: Id::new_v4(),
             workspace: Some(self.dir.path().into()),
             capabilities: capabilities.iter().copied().collect(),
+            programs: vec![],
         }
     }
     async fn list(&self) -> ToolListing {

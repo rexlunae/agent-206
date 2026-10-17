@@ -65,6 +65,9 @@ pub struct ToolScope {
     /// The conversation's grant within its mode's ceiling. A host must not use
     /// anything outside it, even for tools that declared nothing.
     pub capabilities: BTreeSet<Capability>,
+    /// The directories the user chose whose programs sandboxed commands may
+    /// run, besides `/usr/bin` and `/bin`; canonical, from the settings.
+    pub programs: Vec<PathBuf>,
 }
 
 /// What a host lists for a scope.
@@ -405,6 +408,7 @@ mod tests {
             thread: Id::new_v4(),
             workspace: None,
             capabilities: BTreeSet::new(),
+            programs: vec![],
         };
         let catalog = catalog(&hosts, &scope).await;
         assert_eq!(catalog.tools.keys().collect::<Vec<_>>(), vec![&own]);

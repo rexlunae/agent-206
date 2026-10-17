@@ -83,6 +83,7 @@ enum Stop {
 pub(super) struct Authority {
     capabilities: BTreeSet<Capability>,
     workspace: Option<PathBuf>,
+    programs: Vec<PathBuf>,
 }
 impl Authority {
     pub(super) fn of(scope: &ToolScope) -> Self {
@@ -107,6 +108,7 @@ impl Authority {
         Self {
             capabilities,
             workspace,
+            programs: scope.programs.clone(),
         }
     }
     /// Whether `scope` still grants everything the sandbox holds.
@@ -114,6 +116,10 @@ impl Authority {
         scope.is_some_and(|scope| {
             self.capabilities.is_subset(&scope.capabilities)
                 && (self.workspace.is_none() || self.workspace == scope.workspace)
+                && self
+                    .programs
+                    .iter()
+                    .all(|program| scope.programs.contains(program))
         })
     }
 }
@@ -744,6 +750,7 @@ mod tests {
             thread,
             workspace: Some(PathBuf::from(Id::new_v4().to_string())),
             capabilities: capabilities.iter().copied().collect(),
+            programs: vec![],
         }
     }
 
@@ -804,6 +811,37 @@ mod tests {
             busy.reserve(&scope),
             Err(ExecError::TooManySessions { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn removing_a_program_directory_stops_sessions_that_were_given_it() {
+        let sessions = Sessions::default();
+        let tools = PathBuf::from(Id::new_v4().to_string());
+        let other = PathBuf::from(Id::new_v4().to_string());
+        let given = ToolScope {
+            programs: vec![tools.clone(), other.clone()],
+            ..scope(Id::new_v4(), &[Capability::Execute])
+        };
+        let mut stopped = hold(&sessions, &given, Status::Running);
+        let plain = ToolScope {
+            programs: vec![],
+            ..given.clone()
+        };
+        let mut unaffected = hold(&sessions, &plain, Status::Running);
+        // Adding a directory or reordering keeps both.
+        let more = ToolScope {
+            programs: vec![other.clone(), PathBuf::from("added"), tools],
+            ..given.clone()
+        };
+        sessions.rescope(&|_| Some(more.clone()));
+        assert!(stopped.try_recv().is_err());
+        let fewer = ToolScope {
+            programs: vec![other],
+            ..given
+        };
+        sessions.rescope(&|_| Some(fewer.clone()));
+        assert!(matches!(stopped.try_recv(), Ok(Stop::Revoked)));
+        assert!(unaffected.try_recv().is_err());
     }
 
     #[tokio::test]

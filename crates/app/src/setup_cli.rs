@@ -365,7 +365,7 @@ pub async fn import(root: &Path, remote: Option<String>, source: ImportSource) -
     };
     if !providers.is_empty() || !messengers.is_empty() {
         saved = client
-            .call(Command::SaveSettings(settings))
+            .call(Command::SaveSettings(Box::new(settings)))
             .await
             .map_err(anyhow::Error::from)
             .and_then(|reply| Ok(reply.into_result().map(drop)?));

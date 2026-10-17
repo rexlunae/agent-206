@@ -166,7 +166,7 @@ pub async fn run(client: &Client, action: MessengerAction) -> Result<()> {
                 _ => bail!("gateway did not return settings"),
             };
             match edit(snapshot.settings.clone(), action)? {
-                Some(settings) => Command::SaveSettings(settings),
+                Some(settings) => Command::SaveSettings(Box::new(settings)),
                 None => {
                     #[derive(serde::Serialize)]
                     struct Listing<'a> {

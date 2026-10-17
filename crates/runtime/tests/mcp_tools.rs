@@ -112,7 +112,7 @@ impl Rig {
     async fn save(&self, servers: Vec<McpServerConfig>) {
         let mut settings = self.gateway.snapshot().unwrap().settings;
         settings.mcp_servers = servers;
-        self.ok(Command::SaveSettings(settings)).await;
+        self.ok(Command::SaveSettings(Box::new(settings))).await;
     }
     /// Serve the fixture in process and connect the entry to it. Aborting
     /// the returned task ends the server as a crash would.

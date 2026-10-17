@@ -94,6 +94,10 @@ pub struct Profile<'a> {
     pub workspace: Option<(&'a Path, bool)>,
     /// Whether programs in `/usr/bin` and `/bin` may run.
     pub execute: bool,
+    /// Further directories the user chose whose programs may run, mounted
+    /// read-only. None may overlap a writable workspace or lie inside a
+    /// hidden path.
+    pub programs: &'a [PathBuf],
     /// Paths that stay invisible even inside a granted directory.
     pub hidden: &'a [PathBuf],
     pub cwd: &'a Path,
@@ -176,6 +180,9 @@ impl Profile<'_> {
                 },
             );
         }
+        for program in self.programs {
+            add(program.clone(), Access::Execute);
+        }
         if self.network == NetworkAccess::Host {
             for path in NETWORK_ETC {
                 let path = Path::new(path);
@@ -201,8 +208,36 @@ impl Profile<'_> {
         Ok(rules)
     }
 
+    /// Refuses program directories that would expose a hidden path or
+    /// overlap a writable workspace, whose mounts would then shadow each
+    /// other in one direction or the other.
+    pub fn check_programs(&self) -> Result<(), SandboxError> {
+        for program in self.programs {
+            if let Some(hidden) = self
+                .hidden
+                .iter()
+                .find(|hidden| program.starts_with(hidden))
+            {
+                return Err(SandboxError::HiddenProgramDirectory {
+                    directory: program.clone(),
+                    hidden: hidden.clone(),
+                });
+            }
+            if let Some((workspace, true)) = self.workspace
+                && (program.starts_with(workspace) || workspace.starts_with(program))
+            {
+                return Err(SandboxError::WritableProgramDirectory {
+                    directory: program.clone(),
+                    workspace: workspace.to_path_buf(),
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// The helper's specification.
     pub fn spec(&self) -> Result<Spec, SandboxError> {
+        self.check_programs()?;
         Ok(Spec {
             version: SPEC_VERSION,
             executable: self.executable.to_path_buf(),
@@ -224,6 +259,7 @@ impl Profile<'_> {
     /// Bubblewrap's arguments up to and including the helper invocation.
     /// Arguments appended to the returned command go to the runtime.
     pub fn arguments(&self) -> Result<Vec<OsString>, SandboxError> {
+        self.check_programs()?;
         let mut args: Vec<OsString> = [
             "--unshare-all",
             "--die-with-parent",
@@ -285,17 +321,16 @@ impl Profile<'_> {
                 writable.push(workspace);
             }
         }
-        let mounted = [
-            Some(self.root),
-            Some(self.scratch),
-            self.workspace.map(|(w, _)| w),
-        ];
+        for program in self.programs {
+            bind(&mut args, "--ro-bind", program);
+        }
+        let mounted: Vec<&Path> = [self.root, self.scratch]
+            .into_iter()
+            .chain(self.workspace.map(|(w, _)| w))
+            .chain(self.programs.iter().map(PathBuf::as_path))
+            .collect();
         for hidden in self.hidden {
-            if !mounted
-                .iter()
-                .flatten()
-                .any(|base| hidden.starts_with(base))
-            {
+            if !mounted.iter().any(|base| hidden.starts_with(base)) {
                 continue;
             }
             match std::fs::symlink_metadata(hidden) {
@@ -436,6 +471,7 @@ mod tests {
                 control: &self.control,
                 workspace,
                 execute,
+                programs: &[],
                 hidden,
                 cwd: &self.scratch,
                 network: NetworkAccess::Proxy(1),
@@ -607,5 +643,72 @@ mod tests {
                 .iter()
                 .any(|arg| arg == layout.control.join("proxy.sock").as_os_str())
         );
+    }
+
+    #[test]
+    fn program_directories_are_mounted_read_only_and_executable() {
+        let layout = layout();
+        let tools = layout.root.with_file_name(uuid::Uuid::new_v4().to_string());
+        let state = tools.join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        let hidden = vec![state.clone()];
+        let programs = vec![tools.clone()];
+        let profile = Profile {
+            programs: &programs,
+            ..layout.profile(Some((&layout.project, true)), &hidden, false)
+        };
+        assert_eq!(access(&profile.rules().unwrap(), &tools), [Access::Execute]);
+        let args = profile.arguments().unwrap();
+        let position = |needle: &Path| args.iter().position(|arg| arg == needle.as_os_str());
+        let mount = position(&tools).unwrap();
+        assert_eq!(args[mount - 1], "--ro-bind");
+        // A hidden directory inside it is covered like one inside a grant.
+        let cover = position(&state).unwrap();
+        assert!(cover > mount);
+        assert_eq!(args[cover - 1], "--tmpfs");
+        let without = layout
+            .profile(Some((&layout.project, true)), &hidden, false)
+            .arguments()
+            .unwrap();
+        assert!(!without.iter().any(|arg| arg == tools.as_os_str()));
+    }
+
+    #[test]
+    fn program_directories_may_not_expose_hidden_or_writable_paths() {
+        let layout = layout();
+        let hidden = vec![layout.root.with_file_name(uuid::Uuid::new_v4().to_string())];
+        let inside = vec![hidden[0].join("bin")];
+        let profile = Profile {
+            programs: &inside,
+            ..layout.profile(None, &hidden, false)
+        };
+        assert!(matches!(
+            profile.arguments(),
+            Err(SandboxError::HiddenProgramDirectory { .. })
+        ));
+        assert!(matches!(
+            profile.spec(),
+            Err(SandboxError::HiddenProgramDirectory { .. })
+        ));
+        let within = vec![layout.project.join("bin")];
+        let around = vec![layout.project.parent().unwrap().to_path_buf()];
+        for programs in [&within, &around] {
+            let writable = Profile {
+                programs,
+                ..layout.profile(Some((&layout.project, true)), &[], false)
+            };
+            assert!(matches!(
+                writable.arguments(),
+                Err(SandboxError::WritableProgramDirectory { .. })
+            ));
+        }
+        // A read-only workspace cannot rewrite them.
+        std::fs::create_dir(&within[0]).unwrap();
+        Profile {
+            programs: &within,
+            ..layout.profile(Some((&layout.project, false)), &[], false)
+        }
+        .arguments()
+        .unwrap();
     }
 }

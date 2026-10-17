@@ -5,7 +5,7 @@ async fn save(gateway: &Gateway, settings: Settings) -> Reply {
     gateway
         .request(Request {
             id: Id::new_v4(),
-            body: Command::SaveSettings(settings),
+            body: Command::SaveSettings(Box::new(settings)),
         })
         .await
         .body

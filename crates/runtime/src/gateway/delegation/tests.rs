@@ -138,6 +138,7 @@ async fn wait(host: &DelegationHost, caller: Id, child: Id, seconds: u64) -> Val
                 thread: caller,
                 workspace: None,
                 capabilities: Default::default(),
+                programs: vec![],
             },
             ToolRequest {
                 call: Id::new_v4().to_string(),

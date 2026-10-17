@@ -441,7 +441,7 @@ mod native {
                 anyhow::anyhow!("no MCP server named {name}; add it with settings --apply")
             })?
             .enabled = enabled;
-        Ok(Command::SaveSettings(settings))
+        Ok(Command::SaveSettings(Box::new(settings)))
     }
     fn default_root() -> anyhow::Result<PathBuf> {
         Ok(PathBuf::from(
@@ -786,7 +786,7 @@ mod native {
                         }
                         provider.credential = credential;
                         settings.providers.push(provider);
-                        Command::SaveSettings(settings)
+                        Command::SaveSettings(Box::new(settings))
                     }
                     Action::Backend {
                         command:
@@ -810,7 +810,7 @@ mod native {
                             runtime_root,
                             adapter_script,
                         });
-                        Command::SaveSettings(settings)
+                        Command::SaveSettings(Box::new(settings))
                     }
                     Action::Backend {
                         command:
@@ -1048,7 +1048,7 @@ mod native {
                         },
                     },
                     Action::Settings { apply: Some(path) } => {
-                        Command::SaveSettings(toml::from_str(&std::fs::read_to_string(path)?)?)
+                        Command::SaveSettings(Box::new(toml::from_str(&std::fs::read_to_string(path)?)?))
                     }
                     Action::Settings { apply: None } => {
                         if let Reply::Snapshot(snapshot) = client.call(Command::Snapshot).await? {

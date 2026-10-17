@@ -272,6 +272,11 @@ pub struct Settings {
     /// the user approved. Any edit to a skill disables it until re-approved.
     #[serde(default)]
     pub enabled_skills: std::collections::BTreeMap<String, String>,
+    /// Absolute directories, beyond `/usr/bin` and `/bin`, whose programs
+    /// sandboxed commands may run read-only, such as a Homebrew prefix or a
+    /// toolchain. The gateway stores them canonicalized.
+    #[serde(default)]
+    pub program_directories: Vec<std::path::PathBuf>,
     pub prompts: Vec<ModePrompt>,
     pub theme_design: String,
     pub theme_palette: Option<String>,
@@ -288,6 +293,7 @@ impl Default for Settings {
             messengers: vec![],
             mcp_servers: vec![],
             enabled_skills: Default::default(),
+            program_directories: vec![],
             prompts: Mode::ALL
                 .into_iter()
                 .map(|mode| ModePrompt {
@@ -825,7 +831,7 @@ pub enum Command {
     StopJoshua,
     JoshuaStatus,
     Snapshot,
-    SaveSettings(Settings),
+    SaveSettings(Box<Settings>),
     RefreshCatalog {
         provider: Id,
     },

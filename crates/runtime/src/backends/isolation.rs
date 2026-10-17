@@ -269,6 +269,7 @@ fn sandbox_command(
             .contains(&Capability::ReadWorkspace)
             .then(|| (cwd, capabilities.contains(&Capability::WriteWorkspace))),
         execute: capabilities.contains(&Capability::Execute),
+        programs: &[],
         hidden: &hidden,
         cwd: &start,
         network: a206_sandbox::NetworkAccess::Proxy(port),
