@@ -140,6 +140,20 @@ async fn commands_hold_only_the_conversations_grants() {
     let host = ExecHost::new(&nested);
     let output = sh(&host, &write, "cat state/state.db").await;
     assert!(output.is_error, "{}", output.text);
+
+    // Neither the state directory nor any descendant may be rebound as the
+    // readable project (which would hide it from the nested-path mask).
+    std::fs::create_dir(nested.join("project")).unwrap();
+    for root in [&nested, &nested.join("project")] {
+        let scope = scope(
+            Some(root),
+            &[Capability::Execute, Capability::ReadWorkspace],
+        );
+        let error = run(&host, &scope, serde_json::json!({"command": "pwd"}))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind, ErrorKind::PermissionDenied);
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -176,6 +190,16 @@ async fn output_status_and_time_are_bounded() {
     assert!(!output.is_error, "{}", output.text);
     assert!(output.text.contains("[stdout cut to"));
     assert!(output.text.len() < 2 * MAX_STREAM);
+
+    let output = sh(
+        &host,
+        &scope,
+        "head -c 40000 /dev/zero | tr '\\000' '\\377'; echo preserved-stderr >&2",
+    )
+    .await;
+    assert!(output.text.len() <= 64 * 1024);
+    assert!(output.text.contains("[stdout cut to"));
+    assert!(output.text.contains("preserved-stderr"));
 
     let error = run(
         &host,

@@ -7,8 +7,8 @@
 //! Hosts receive no handle to the gateway, the vault or approvals, so a tool
 //! cannot widen its own authority or approve a call.
 //!
-//! Adapters planned on top of this trait: the MCP client (`mcp_offers` /
-//! `call_mcp_tool`) and the WASM extension host (`Gateway::extensions()`).
+//! The WASM extension adapter (`crate::extension_tools`) is registered by
+//! default; the MCP client (`mcp_offers` / `call_mcp_tool`) is planned.
 use a206_core::{
     Capability, ErrorKind, ErrorReport, Id, Thread, ToolList, ToolOffer, ToolPermission,
     UnavailableTools,

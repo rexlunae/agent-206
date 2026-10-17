@@ -36,6 +36,10 @@ pub const MAX_STREAM: usize = crate::tools::MAX_OUTPUT / 2 - 256;
 /// Why a command did not run to completion.
 #[derive(Debug, thiserror::Error)]
 pub enum ExecError {
+    #[error("command execution requires the Execute grant and approval of this exact call")]
+    Denied,
+    #[error("the project is inside protected gateway or credential state")]
+    ProtectedWorkspace,
     #[error("`{0}` must be a string")]
     NotAString(&'static str),
     #[error("`command` is required")]
@@ -78,6 +82,7 @@ pub enum ExecError {
 impl crate::error::Classified for ExecError {
     fn kind(&self) -> Option<ErrorKind> {
         Some(match self {
+            Self::Denied | Self::ProtectedWorkspace => ErrorKind::PermissionDenied,
             Self::NotAString(_)
             | Self::MissingCommand
             | Self::Command
@@ -225,6 +230,12 @@ impl ToolHost for ExecHost {
     ) -> BoxFuture<'a, Result<ToolOutput, ErrorReport>> {
         Box::pin(async move {
             let result = async {
+                if request.name != NAME
+                    || !request.approved
+                    || !scope.capabilities.contains(&Capability::Execute)
+                {
+                    return Err(ExecError::Denied);
+                }
                 let call = parse(&request.arguments)?;
                 self.run(scope, call).await
             };
@@ -246,6 +257,7 @@ impl ExecHost {
     async fn run(&self, scope: &ToolScope, call: Call) -> Result<ToolOutput, ExecError> {
         use a206_core::Ignore;
         use std::process::Stdio;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(call.timeout);
         let holds = |c| scope.capabilities.contains(&c);
         let workspace = match &scope.workspace {
             Some(workspace) if holds(Capability::ReadWorkspace) => Some(
@@ -296,6 +308,9 @@ impl ExecHost {
         hidden.push(
             std::fs::canonicalize(&self.state_root).unwrap_or_else(|_| self.state_root.clone()),
         );
+        if let Some(workspace) = &workspace {
+            reject_protected_workspace(workspace, &hidden)?;
+        }
         let control = root.join("control");
         let profile = a206_sandbox::Profile {
             helper: &helper,
@@ -327,7 +342,7 @@ impl ExecHost {
             .current_dir(&cwd)
             .env("HOME", &home)
             .env("TMPDIR", &tmp)
-            .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+            .env("PATH", "/usr/bin:/bin")
             .env("LANG", "C.UTF-8")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -342,11 +357,11 @@ impl ExecHost {
                 .and_then(|id| i32::try_from(id).ok())
                 .map(nix::unistd::Pid::from_raw),
         );
-        control.ready(&mut child).await.map_err(ExecError::Start)?;
-        let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
-            unreachable!("stdout and stderr are piped")
-        };
-        let finished = tokio::time::timeout(std::time::Duration::from_secs(call.timeout), async {
+        let finished = tokio::time::timeout_at(deadline, async {
+            control.ready(&mut child).await.map_err(ExecError::Start)?;
+            let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
+                unreachable!("stdout and stderr are piped")
+            };
             // The sandbox's PID namespace ends with the shell, so no
             // descendant can hold the pipes open past its exit.
             let (status, out, err) = tokio::join!(child.wait(), bounded(stdout), bounded(stderr));
@@ -365,18 +380,11 @@ impl ExecHost {
                 });
             }
         };
-        let stream = |name: &str, bytes: &[u8], cut: bool| {
-            let mut text = format!("--- {name} ---\n{}", String::from_utf8_lossy(bytes));
-            if cut {
-                text.push_str(&format!("\n[{name} cut to {MAX_STREAM} bytes]"));
-            }
-            text
-        };
         Ok(ToolOutput {
             text: format!(
                 "{status}\n{}\n{}",
-                stream("stdout", &out, out_cut),
-                stream("stderr", &err, err_cut)
+                stream_text("stdout", &out, out_cut),
+                stream_text("stderr", &err, err_cut)
             ),
             is_error: !status.success(),
         })
@@ -384,6 +392,42 @@ impl ExecHost {
 }
 
 /// The sandbox's process group, killed when dropped.
+#[cfg(any(target_os = "linux", test))]
+fn reject_protected_workspace(workspace: &Path, hidden: &[PathBuf]) -> Result<(), ExecError> {
+    for path in hidden {
+        // Missing credential stores cannot contain a canonical workspace.
+        // Existing symlink aliases must be resolved before comparison.
+        let protected = match std::fs::canonicalize(path) {
+            Ok(path) => path,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(source) => {
+                return Err(ExecError::Missing {
+                    path: path.clone(),
+                    source,
+                });
+            }
+        };
+        if workspace.starts_with(protected) {
+            return Err(ExecError::ProtectedWorkspace);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn stream_text(name: &str, bytes: &[u8], cut: bool) -> String {
+    let decoded = String::from_utf8_lossy(bytes);
+    let mut end = decoded.len().min(MAX_STREAM);
+    while !decoded.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut text = format!("--- {name} ---\n{}", &decoded[..end]);
+    if cut || end < decoded.len() {
+        text.push_str(&format!("\n[{name} cut to {MAX_STREAM} bytes]"));
+    }
+    text
+}
+
 #[cfg(target_os = "linux")]
 struct Group(Option<nix::unistd::Pid>);
 #[cfg(target_os = "linux")]
@@ -426,6 +470,62 @@ mod tests {
             panic!("arguments are an object")
         };
         map
+    }
+
+    #[test]
+    fn binary_output_preserves_room_for_both_streams() {
+        let out = stream_text("stdout", &vec![0xff; 40_000], false);
+        let err = stream_text("stderr", &vec![0xfe; 40_000], false);
+        let result = format!("exit status: 255\n{out}\n{err}");
+        assert!(result.len() <= 64 * 1024);
+        assert!(result.contains("[stdout cut to"));
+        assert!(result.contains("[stderr cut to"));
+        assert!(result.contains("--- stderr ---"));
+    }
+
+    #[test]
+    fn protected_state_cannot_be_a_project_root_or_ancestor() {
+        let project = tempfile::tempdir().unwrap();
+        let state = project.path().join("state");
+        std::fs::create_dir_all(state.join("child")).unwrap();
+        let project = std::fs::canonicalize(project.path()).unwrap();
+        let state = std::fs::canonicalize(state).unwrap();
+        let hidden = vec![state.clone()];
+        assert!(reject_protected_workspace(&project, &hidden).is_ok());
+        assert!(matches!(
+            reject_protected_workspace(&state, &hidden),
+            Err(ExecError::ProtectedWorkspace)
+        ));
+        assert!(matches!(
+            reject_protected_workspace(&state.join("child"), &hidden),
+            Err(ExecError::ProtectedWorkspace)
+        ));
+    }
+
+    #[tokio::test]
+    async fn direct_host_calls_cannot_skip_authorization() {
+        let state = tempfile::tempdir().unwrap();
+        let host = ExecHost::new(state.path());
+        for (approved, capabilities) in [
+            (false, [Capability::Execute].into()),
+            (true, Default::default()),
+        ] {
+            let scope = ToolScope {
+                thread: a206_core::Id::new_v4(),
+                workspace: None,
+                capabilities,
+            };
+            let request = ToolRequest {
+                call: a206_core::Id::new_v4().to_string(),
+                name: NAME.into(),
+                arguments: arguments(json!({"command": "exit 0"})),
+                approved,
+            };
+            assert_eq!(
+                host.call(&scope, request).await.unwrap_err().kind,
+                ErrorKind::PermissionDenied
+            );
+        }
     }
 
     #[test]

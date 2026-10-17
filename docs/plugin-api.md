@@ -176,14 +176,13 @@ extension, tool, args, project }`, `GrantExtension { extension, capabilities }`
 and `EnableExtension { extension, enabled }`. The CLI wraps them as
 `agent206 extension list|grant|enable|disable|panel|tool`.
 
-Agents do not call extension tools yet. The interface the native run engine
-will use is in place: `Gateway::extensions()` returns the `ExtensionHost`,
-whose `tools()` lists enabled tools whose declared capabilities the user
-granted, and `call_tool(extension, tool, args, Scope { workspace, ceiling:
-Some(thread grant) })` runs one. Tool arguments are `a206_core::extension::Args`.
-The run engine will need to convert provider JSON to and from these values and
-expose `ParamSpec` lists as JSON Schema at the provider edge; no such bridge
-exists yet. Tool text is extension output, never instructions.
+Native runs call extension tools through the default `ExtensionToolHost`
+(see `docs/run-engine.md`): enabled extensions' granted tools are offered as
+`ext__<extension id>__<tool>` with their `ParamSpec`s as a JSON Schema object,
+and each call runs `call_tool(extension, tool, args, Scope { workspace,
+ceiling: Some(thread grant) })` after the conversation permits the tool.
+Provider JSON arguments convert kind for kind to `a206_core::extension::Args`.
+Tool text is extension output, never instructions.
 
 ## Planned
 
