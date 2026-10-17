@@ -149,6 +149,15 @@ mod native {
             thread: uuid::Uuid,
             text: String,
         },
+        /// Hold a conversation's native run, and its subagents', before
+        /// their next model round.
+        Pause {
+            thread: uuid::Uuid,
+        },
+        /// Let a paused conversation's runs continue.
+        Resume {
+            thread: uuid::Uuid,
+        },
         Cancel {
             thread: uuid::Uuid,
         },
@@ -975,6 +984,8 @@ mod native {
                         attachments: vec![],
                     },
                     Action::Steer { thread, text } => Command::Steer { thread, text },
+                    Action::Pause { thread } => Command::PauseRun { thread },
+                    Action::Resume { thread } => Command::ResumeRun { thread },
                     Action::Cancel { thread } => Command::CancelRun { thread },
                     Action::Compact { thread } => Command::CompactThread { thread },
                     Action::Tools { command } => match command {
