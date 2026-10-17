@@ -64,10 +64,13 @@ ceiling. A delegated conversation cannot be set above its parent, and a parent
 narrowed later narrows its descendants at their next decision.
 
 Withdrawn authority also stops work in flight. `SetToolPermission`,
-`ConfigureThread` and `SetBackend` wake every run, which re-decides its running
-call and its pending approval against the conversation and its ancestors. A
-running call that is no longer permitted (Deny, or Ask for a call the user did
-not approve) is dropped, which stops it, and is settled `Denied` with a
+`ConfigureThread`, `SetBackend`, `GrantExtension` and `EnableExtension` wake
+every run, which re-decides its running call and its pending approval against
+the conversation and its ancestors, and lists the tools again to confirm the
+call's host still offers that tool with the same capabilities (an extension
+the user disabled or ungranted no longer does). A running call that is no
+longer permitted (Deny, or Ask for a call the user did not approve, or a tool
+its host withdrew) is dropped, which stops it, and is settled `Denied` with a
 `PermissionDenied` report; a pending approval whose tool is now denied ends with
 `ApprovalResolved { outcome: Revoked }`. The run continues with the refusal as
 that call's result.

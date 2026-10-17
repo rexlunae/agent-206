@@ -45,6 +45,9 @@ const TESTS: &[(&str, Test)] = &[
     ("disabled_or_ungranted_extensions_are_not_offered", || {
         Box::pin(disabled_or_ungranted_extensions_are_not_offered())
     }),
+    ("withdrawing_the_extension_stops_its_running_call", || {
+        Box::pin(withdrawing_the_extension_stops_its_running_call())
+    }),
     (
         "cancelling_during_an_extension_call_kills_the_worker",
         || Box::pin(cancelling_during_an_extension_call_kills_the_worker()),
@@ -449,6 +452,64 @@ async fn cancelling_during_an_extension_call_kills_the_worker() {
     .unwrap_or_else(wait("the extension worker to be killed"));
     // No further model round was requested.
     assert!(rig.requests.try_recv().is_err());
+}
+
+async fn withdrawing_the_extension_stops_its_running_call() {
+    for disable in [false, true] {
+        let mut rig = rig().await;
+        rig.permit(ToolPermission::Allow).await;
+        let task = rig.send();
+        let first = rig.next_request().await;
+        let call = Call::new(&rig.tool, json!({"path": format!("{STALL}-{}", nonce())}));
+        first
+            .respond(calls_response(API, std::slice::from_ref(&call), ""))
+            .await;
+        let pid = stalled(&rig).await;
+        // The conversation still permits the tool; only the user's authority
+        // over the extension itself is withdrawn.
+        if disable {
+            rig.ok(Command::EnableExtension {
+                extension: EXTENSION.into(),
+                enabled: false,
+            })
+            .await;
+        } else {
+            rig.grant_extension(&[]).await;
+        }
+        let second = rig.next_request().await;
+        let result = result_for(API, &second.body, &call.id).unwrap();
+        assert!(result.contains("withdrawn"), "{result}");
+        second.respond(text_response(API, &nonce())).await;
+        let thread = finished(task).await;
+        assert_eq!(thread.state, RunState::Complete, "{:?}", thread.error);
+        let record = &calls_of(&thread)[0];
+        assert_eq!(record.state, ToolCallState::Denied);
+        assert_eq!(error_kind(record), ErrorKind::PermissionDenied);
+        gone(pid).await;
+    }
+}
+/// Wait for the worker of a stalled call; its host process ID.
+async fn stalled(rig: &Rig) -> u32 {
+    tokio::time::timeout(PATIENCE, async {
+        loop {
+            if let Some(pid) = stalled_worker(rig.state.path()) {
+                return pid;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(wait("the extension worker to start"))
+}
+/// Wait for `pid` to exit.
+async fn gone(pid: u32) {
+    tokio::time::timeout(PATIENCE, async {
+        while alive(pid) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(wait("the extension worker to be killed"));
 }
 
 /// The host process ID of a worker that announced it stalled. Linux workers

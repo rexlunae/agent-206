@@ -1396,6 +1396,10 @@ impl Gateway {
                 )?;
                 plugin.granted = capabilities;
                 store.persist(Some(EventKind::ExtensionChanged { id: extension }))?;
+                drop(store);
+                // Running extension calls and approval waits re-check that
+                // their tool is still offered.
+                self.policy_changed();
                 Ok(Reply::Ok)
             }
             Command::EnableExtension { extension, enabled } => {
@@ -1408,6 +1412,10 @@ impl Gateway {
                     .ok_or(GatewayError::NotFound("extension not found"))?
                     .enabled = enabled;
                 store.persist(Some(EventKind::ExtensionChanged { id: extension }))?;
+                drop(store);
+                // Running extension calls and approval waits re-check that
+                // their tool is still offered.
+                self.policy_changed();
                 Ok(Reply::Ok)
             }
             Command::ConnectMcpServer { name } => {
