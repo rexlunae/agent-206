@@ -256,8 +256,10 @@ impl Gateway {
             root: request.root,
             pairing: pairing.as_ref(),
         };
-        // The summary is not streamed to anyone: a closed receiver drops deltas.
-        let (sender, _) = tokio::sync::mpsc::channel(1);
+        // The summary is not streamed to anyone: with the receiver closed,
+        // deltas and retry notices are dropped instead of waiting for room.
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        drop(receiver);
         let operation = provider::complete(
             request.config,
             broker,

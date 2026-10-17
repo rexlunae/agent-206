@@ -14,6 +14,7 @@
 //! a cap, ±20% jitter, a ceiling on `Retry-After`) and its classification of
 //! retryable statuses and transport failures.
 use crate::provider::ProviderError;
+use a206_broker::{BrokerError, ClientError, UpstreamFailure};
 use std::time::Duration;
 
 /// How a model request is retried. These are policy choices, not provider
@@ -61,7 +62,8 @@ impl RetryPolicy {
             .checked_mul(1 << attempt.saturating_sub(1).min(16))
             .unwrap_or(self.max)
             .min(self.max);
-        Some(doubled.mul_f64(0.8 + 0.4 * jitter.clamp(0.0, 1.0)))
+        let spread = doubled.mul_f64(0.8 + 0.4 * jitter.clamp(0.0, 1.0));
+        Some(spread.min(self.max))
     }
 }
 
@@ -86,12 +88,19 @@ impl Reason {
             ProviderError::Transport(error)
                 if error.is_connect() || error.is_timeout() || error.is_request() =>
             {
-                Some(Self {
-                    status: None,
-                    retry_after: None,
-                })
+                Some(Self::unreachable())
             }
+            // The broker reports the same failures for credentialed requests.
+            ProviderError::Broker(ClientError::Broker(BrokerError::Upstream(
+                UpstreamFailure::Connect | UpstreamFailure::Timeout,
+            ))) => Some(Self::unreachable()),
             _ => None,
+        }
+    }
+    fn unreachable() -> Self {
+        Self {
+            status: None,
+            retry_after: None,
         }
     }
 }
@@ -132,6 +141,8 @@ mod tests {
         assert_eq!(at(2), Some(policy.base * 2));
         assert_eq!(at(3), Some(policy.max));
         assert_eq!(at(4), None);
+        // Jitter never stretches a wait past the cap.
+        assert_eq!(policy.delay(&busy, 3, 1.0), Some(policy.max));
         assert_eq!(RetryPolicy::NONE.delay(&busy, 1, 0.5), None);
     }
 
@@ -172,7 +183,19 @@ mod tests {
                 "{code}"
             );
         }
+        let upstream =
+            |failure| ProviderError::Broker(ClientError::Broker(BrokerError::Upstream(failure)));
+        for failure in [UpstreamFailure::Connect, UpstreamFailure::Timeout] {
+            assert!(
+                policy.delay(&upstream(failure), 1, 0.5).is_some(),
+                "{failure:?}"
+            );
+        }
         for error in [
+            upstream(UpstreamFailure::Transfer),
+            upstream(UpstreamFailure::TooLarge),
+            upstream(UpstreamFailure::InvalidHeader),
+            ProviderError::Broker(ClientError::Closed),
             ProviderError::Incomplete,
             ProviderError::ResponseTooLarge,
             ProviderError::Upstream { code: None },
