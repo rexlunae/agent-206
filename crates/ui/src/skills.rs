@@ -85,7 +85,7 @@ pub fn Skills() -> Element {
             }
         });
     };
-    let open = move |name: String| {
+    let mut open = move |name: String| {
         let generation = review.write().open(name.clone());
         spawn(async move {
             let result = call(Command::ReadSkill { name }).await;
