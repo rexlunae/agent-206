@@ -531,8 +531,9 @@ async fn gone(pid: u32) {
 /// The host process ID of a worker that announced it stalled. Linux workers
 /// run confined, with the sandbox's scratch directory as their data directory
 /// and their own PID namespace, so the process found is this process's child
-/// whose arguments name that directory; elsewhere the worker shares the
-/// gateway's data directory and writes its own ID.
+/// whose arguments name that directory. macOS workers are confined too but
+/// share the host's PIDs, so the ID they write in their scratch directory is
+/// the host's. Elsewhere the worker shares the gateway's data directory.
 #[cfg(target_os = "linux")]
 fn stalled_worker(_state: &Path) -> Option<u32> {
     let tasks = std::fs::read_dir("/proc/self/task").ok()?;
@@ -563,7 +564,27 @@ fn stalled_worker(_state: &Path) -> Option<u32> {
     }
     None
 }
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
+fn stalled_worker(_state: &Path) -> Option<u32> {
+    // Each confined worker's scratch directory is a fresh `a206-confined-`
+    // directory in the temporary directory; only this binary stalls workers.
+    std::fs::read_dir(std::env::temp_dir())
+        .ok()?
+        .flatten()
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("a206-confined-")
+        })
+        .find_map(|entry| {
+            std::fs::read_to_string(entry.path().join(STALLED))
+                .ok()?
+                .parse()
+                .ok()
+        })
+}
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn stalled_worker(state: &Path) -> Option<u32> {
     std::fs::read_to_string(state.join(STALLED))
         .ok()?

@@ -1,8 +1,9 @@
-//! The runtime's use of the Linux sandbox (`a206_sandbox`): its readiness
-//! check, and re-running this executable confined for its own workers.
+//! The runtime's use of the OS sandbox (`a206_sandbox`: bubblewrap and
+//! Landlock on Linux, Seatbelt on macOS): its readiness check, and re-running
+//! this executable confined for its own workers.
 use a206_core::ErrorKind;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub use a206_sandbox::Control;
 pub use a206_sandbox::StartError;
 
@@ -32,16 +33,16 @@ impl crate::error::Classified for ConfineError {
     }
 }
 
-#[cfg(target_os = "linux")]
-pub use linux::Confined;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub use confined::Confined;
 
-#[cfg(target_os = "linux")]
-mod linux {
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod confined {
     use super::{ConfineError, Control};
     use std::path::Path;
     use tokio::process::Child;
-    /// This executable, re-run inside bubblewrap and Landlock with only the
-    /// system libraries and itself visible, no network, nothing else to
+    /// This executable, re-run inside the OS sandbox with only the system
+    /// libraries and itself visible, no network, nothing else to
     /// execute and an empty private directory as its working directory.
     pub struct Confined {
         /// Piped stdin and stdout; the environment is empty.
@@ -50,7 +51,9 @@ mod linux {
         _scratch: tempfile::TempDir,
     }
     impl Confined {
-        /// Start once the helper reports both layers in place. `args` gets
+        /// Start once the sandbox is in place: on Linux, once the helper
+        /// reports both layers; on macOS `sandbox-exec` applies the policy
+        /// before it runs this executable, or fails without running it. `args` gets
         /// the private directory and returns the arguments to run with.
         pub async fn spawn_self(
             args: impl FnOnce(&Path) -> Vec<std::ffi::OsString>,
@@ -90,12 +93,14 @@ mod linux {
                 .env_clear()
                 .stdin(std::process::Stdio::piped())
                 .stdout(std::process::Stdio::piped())
-                // Bubblewrap and the helper report setup failures here; the
-                // confined process's own stderr is discarded.
-                .stderr(std::process::Stdio::piped())
                 .kill_on_drop(true);
+            // Bubblewrap and the helper report setup failures on stderr; the
+            // confined process's own stderr is discarded. On macOS nothing
+            // reads it, so the profile's discarded stderr stands.
+            #[cfg(target_os = "linux")]
+            command.stderr(std::process::Stdio::piped());
             let mut child = command.spawn().map_err(ConfineError::Spawn)?;
-            // Dropping `child` on failure kills bubblewrap and the sandbox with it.
+            // Dropping `child` on failure kills the sandbox and its process.
             control.ready(&mut child).await?;
             Ok(Self {
                 child,

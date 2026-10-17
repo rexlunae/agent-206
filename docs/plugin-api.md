@@ -7,9 +7,10 @@ manifest. They contribute **tools** (for agents and the CLI) and **panels**
 (typed UI descriptions rendered by trusted fc-dioxus code). Every invocation
 runs in a fresh instance inside a separate `agent206 extension-worker` process
 with a cleared environment, and every host call is authorized by the gateway.
-On Linux that process is also confined by bubblewrap and Landlock with no
-network, no project files and nothing to execute but itself; host calls are its
-only reach. Without bubblewrap or Landlock, calls fail rather than run unconfined.
+On Linux that process is also confined by bubblewrap and Landlock, and on macOS
+by a Seatbelt policy, with no network, no project files and nothing to execute
+but itself; host calls are its only reach. Without the platform's sandbox, calls
+fail rather than run unconfined. Windows workers are not yet OS-confined.
 
 Agent 206 bundles `agent206.workspace` (`plugins/workspace`), written in Rust
 against the guest SDK and compiled to WASM by `crates/extensions/build.rs`. It

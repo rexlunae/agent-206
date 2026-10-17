@@ -164,8 +164,8 @@ pub struct ExtensionTools {
 pub struct ExtensionHost {
     store: Arc<Mutex<Store>>,
     net: Arc<dyn crate::network::Net>,
-    /// Passed to unconfined workers; a Linux worker gets an empty one instead.
-    #[cfg_attr(target_os = "linux", allow(dead_code))]
+    /// Passed to unconfined workers; a confined worker gets an empty one instead.
+    #[cfg_attr(any(target_os = "linux", target_os = "macos"), allow(dead_code))]
     data_dir: PathBuf,
 }
 impl ExtensionHost {
@@ -394,26 +394,26 @@ impl ExtensionHost {
     }
 }
 
-/// A running worker, confined on Linux.
-#[cfg(target_os = "linux")]
+/// A running worker, confined on Linux and macOS.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 struct Worker(crate::sandbox::Confined);
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 struct Worker(tokio::process::Child);
 impl Worker {
     fn child(&mut self) -> &mut tokio::process::Child {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         return &mut self.0.child;
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         return &mut self.0;
     }
     async fn stop(self) {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         self.0.stop().await;
     }
 }
 
 impl ExtensionHost {
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     async fn spawn_worker(&self) -> Result<Worker, ExtensionError> {
         let child = tokio::process::Command::new(
             std::env::current_exe().map_err(ExtensionError::CurrentExe)?,
@@ -432,7 +432,7 @@ impl ExtensionHost {
     }
 
     /// A missing sandbox layer is an error, never an unconfined worker.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     async fn spawn_worker(&self) -> Result<Worker, ExtensionError> {
         // The worker keeps nothing; its data directory is the empty scratch.
         let confined = crate::sandbox::Confined::spawn_self(|scratch| {
