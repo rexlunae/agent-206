@@ -11,11 +11,16 @@ pub const MAX_QUERY: usize = 200;
 pub const MAX_HITS: u32 = 100;
 /// Characters of context kept on each side of a match.
 const CONTEXT: usize = 60;
+/// Characters of a conversation title copied into each hit. Titles are not
+/// otherwise bounded, and a reply repeats one per hit, so this keeps a full
+/// reply well inside a protocol frame.
+pub const MAX_TITLE: usize = 120;
 
 /// One message that contains every term of the query.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MessageHit {
     pub thread: Id,
+    /// The conversation's title, cut to [`MAX_TITLE`] characters.
     pub title: String,
     pub message: Id,
     pub role: Role,
@@ -35,7 +40,8 @@ pub enum SearchError {
     TooLong,
 }
 
-/// Lowercased text, with the byte offset in the original text of the
+/// Lowercased text, with final sigma folded to sigma as Unicode case folding
+/// does (`Σ`, `σ` and `ς` are the same letter), and the byte offset in the original text of the
 /// character each lowercased byte came from.
 struct Folded {
     text: String,
@@ -48,6 +54,7 @@ fn fold(text: &str) -> Folded {
     };
     for (offset, character) in text.char_indices() {
         for lower in character.to_lowercase() {
+            let lower = if lower == 'ς' { 'σ' } else { lower };
             folded.text.push(lower);
             folded
                 .origin
@@ -76,7 +83,9 @@ fn head(text: &str, count: usize) -> &str {
 }
 
 /// Messages containing every whitespace-separated term of `query`, ignoring
-/// case, newest first and at most `limit` (capped at [`MAX_HITS`]).
+/// case, newest first and at most `limit` (capped at [`MAX_HITS`]). Messages
+/// stamped in the same second keep their order within a conversation, newest
+/// first.
 pub fn search(threads: &[Thread], query: &str, limit: u32) -> Result<Vec<MessageHit>, SearchError> {
     let query = query.trim();
     if query.is_empty() {
@@ -89,7 +98,13 @@ pub fn search(threads: &[Thread], query: &str, limit: u32) -> Result<Vec<Message
     let limit = usize::try_from(limit.min(MAX_HITS)).unwrap_or(usize::MAX);
     let mut hits: Vec<MessageHit> = threads
         .iter()
-        .flat_map(|thread| thread.messages.iter().map(move |message| (thread, message)))
+        .flat_map(|thread| {
+            thread
+                .messages
+                .iter()
+                .rev()
+                .map(move |message| (thread, message))
+        })
         .filter_map(|(thread, message)| {
             let folded = fold(&message.text);
             let mut first = None;
@@ -100,7 +115,7 @@ pub fn search(threads: &[Thread], query: &str, limit: u32) -> Result<Vec<Message
             let (start, end) = first?;
             Some(MessageHit {
                 thread: thread.id,
-                title: thread.title.clone(),
+                title: head(&thread.title, MAX_TITLE).to_owned(),
                 message: message.id,
                 role: message.role.clone(),
                 at: message.at,
@@ -169,6 +184,33 @@ mod tests {
         let hits = search(&threads, &key.to_uppercase(), MAX_HITS).unwrap();
         assert_eq!(hits[0].matched, key);
         assert!(hits[0].after.chars().all(|c| c == 'é'));
+    }
+
+    #[test]
+    fn same_second_messages_come_newest_first() {
+        let key = word();
+        let threads = [thread(&[(format!("{key} 1"), 5), (format!("{key} 2"), 5)])];
+        let hits = search(&threads, &key, MAX_HITS).unwrap();
+        assert_eq!(hits[0].message, threads[0].messages[1].id);
+        assert_eq!(hits[1].message, threads[0].messages[0].id);
+    }
+
+    #[test]
+    fn final_sigma_matches_either_sigma() {
+        let threads = [thread(&[("ΟΔΟΣ".to_owned(), 1), ("οδός".to_owned(), 2)])];
+        assert_eq!(search(&threads, "Σ", MAX_HITS).unwrap().len(), 2);
+        let hits = search(&threads, "οδοσ", MAX_HITS).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].matched, "ΟΔΟΣ");
+    }
+
+    #[test]
+    fn hits_carry_a_bounded_title() {
+        let key = word();
+        let mut long = thread(&[(key.clone(), 1)]);
+        long.title = "é".repeat(MAX_TITLE * 50);
+        let hits = search(std::slice::from_ref(&long), &key, MAX_HITS).unwrap();
+        assert_eq!(hits[0].title, "é".repeat(MAX_TITLE));
     }
 
     #[test]

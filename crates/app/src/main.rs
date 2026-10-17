@@ -1083,19 +1083,12 @@ mod native {
                     Reply::Text(text) => println!("{text}"),
                     Reply::Panel(view) => println!("{}", crate::extension_cli::render(&view)),
                     Reply::Ok => println!("OK"),
-                    Reply::Messages(hits) if hits.is_empty() => println!("No matching messages."),
                     Reply::Messages(hits) => {
-                        for hit in hits {
-                            println!(
-                                "{} ({}) · {:?}: …{}[{}]{}…",
-                                hit.title,
-                                hit.thread,
-                                hit.role,
-                                hit.before.replace('\n', " "),
-                                hit.matched,
-                                hit.after.replace('\n', " ")
-                            );
+                        #[derive(serde::Serialize)]
+                        struct Hits {
+                            hits: Vec<a206_core::MessageHit>,
                         }
+                        print!("{}", toml::to_string_pretty(&Hits { hits })?);
                     }
                     reply => println!("{}", toml::to_string_pretty(&reply)?),
                 }
