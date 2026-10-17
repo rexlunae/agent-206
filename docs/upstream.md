@@ -54,9 +54,9 @@ no upstream engine implementation was copied):
 - [Claude runtime license](https://github.com/anthropics/claude-code/blob/main/LICENSE.md):
   separate Anthropic terms; the ACP adapter's license does not license the runtime.
 
-The fc-dioxus dependency pins `e304639c97ce9c6769728ac204043f934be2c783`
+The fc-dioxus dependency pins `5f210254877c6871127cee3d54af9134ed1b715b`
 from the feature-surface-contrast fix branch. Its future-css pin is
-`934663011629a3c97938fb1fc2541afe8c38c39d`. These revisions retain fixes for
+`af80ed4be7b386a2799f6218990c239f5b26ac24`. These revisions retain fixes for
 bottom-edge popup placement in the source toolkit and host bridge, with parity
 and viewport regression tests. The source fixes are in [future-css #63](https://github.com/rexlunae/future-css/pull/63) and [fc-dioxus #8](https://github.com/rexlunae/fc-dioxus/pull/8).
 The toolkit revision also includes [fc-dioxus #10](https://github.com/rexlunae/fc-dioxus/pull/10):
