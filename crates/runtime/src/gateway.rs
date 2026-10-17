@@ -158,6 +158,8 @@ pub enum GatewayError {
     #[error(transparent)]
     Prompt(#[from] crate::prompt_tool::PromptError),
     #[error(transparent)]
+    Search(#[from] a206_core::SearchError),
+    #[error(transparent)]
     Frame(#[from] transport::FrameError),
     #[error(transparent)]
     Run(#[from] run::RunError),
@@ -202,7 +204,7 @@ impl crate::error::Classified for GatewayError {
     fn kind(&self) -> Option<ErrorKind> {
         use crate::error::classify;
         Some(match self {
-            Self::Invalid(_) | Self::DownloadUrl(_) => ErrorKind::InvalidRequest,
+            Self::Invalid(_) | Self::DownloadUrl(_) | Self::Search(_) => ErrorKind::InvalidRequest,
             Self::NotFound(_) => ErrorKind::NotFound,
             Self::Conflict(_) => ErrorKind::Conflict,
             Self::Denied(_) => ErrorKind::PermissionDenied,
@@ -569,6 +571,8 @@ impl Gateway {
                 | Command::Skills
                 | Command::ReadSkill { .. }
                 | Command::ListTools { .. }
+                // Read-only; its reply copies message text.
+                | Command::SearchMessages { .. }
                 // Never journal a pairing: request bodies are persisted.
                 | Command::PairBroker { .. }
         );
@@ -1236,6 +1240,14 @@ impl Gateway {
                 let thread = thread.clone();
                 store.persist(Some(EventKind::ThreadChanged { id }))?;
                 Ok(Reply::Thread(Box::new(thread)))
+            }
+            Command::SearchMessages { query, limit } => {
+                let store = self.store.lock().map_err(poisoned("store"))?;
+                Ok(Reply::Messages(a206_core::search::search(
+                    &store.state.threads,
+                    &query,
+                    limit,
+                )?))
             }
             Command::ListTools { thread } => self.list_tools(thread).await,
             Command::SetToolPermission {
@@ -1912,6 +1924,63 @@ mod tests {
             .unwrap();
         assert!(crate::service::is_stopped(directory.path()));
         assert!(worker.await.unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn message_search_reads_live_state_and_refuses_empty_queries() {
+        let directory = tempfile::tempdir().unwrap();
+        let gateway = Gateway::open(directory.path()).unwrap();
+        let term = Id::new_v4().simple().to_string();
+        let add = |at| {
+            let mut store = gateway.lock().unwrap();
+            let mut thread = Thread::new(Id::new_v4().to_string(), Mode::Chat);
+            thread.messages.push(a206_core::Message::new(
+                a206_core::Role::Assistant,
+                format!("{} {term}", Id::new_v4()),
+                at,
+                thread.backend,
+            ));
+            store.state.threads.push(thread);
+            store.persist(None).unwrap();
+        };
+        add(1);
+        let id = Id::new_v4();
+        let search = || {
+            gateway.request(Request {
+                id,
+                body: Command::SearchMessages {
+                    query: term.to_uppercase(),
+                    limit: a206_core::search::MAX_HITS,
+                },
+            })
+        };
+        let Reply::Messages(first) = search().await.body else {
+            panic!("search failed");
+        };
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].matched, term);
+        // Searches are not journaled: the same request ID sees new messages.
+        add(2);
+        let Reply::Messages(second) = search().await.body else {
+            panic!("search failed");
+        };
+        assert_eq!(second.iter().map(|hit| hit.at).collect::<Vec<_>>(), [2, 1]);
+        let request = Id::new_v4();
+        let reply = gateway
+            .request(Request {
+                id: request,
+                body: Command::SearchMessages {
+                    query: " ".into(),
+                    limit: 1,
+                },
+            })
+            .await
+            .body;
+        assert!(
+            matches!(reply, Reply::Error(ref report)
+                if report.kind == ErrorKind::InvalidRequest && report.correlation == Some(request)),
+            "{reply:?}"
+        );
     }
 
     #[tokio::test]
