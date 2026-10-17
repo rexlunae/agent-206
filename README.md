@@ -121,8 +121,29 @@ Open the one-session authorization URL printed by the server. It binds only to
 127.0.0.1 and establishes an origin-scoped bearer session through a one-use link.
 POST requests need the exact Host/Origin and explicit Authorization header.
 The browser token lives in storage scoped to that exact origin, so other tabs of the same browser stay connected; it is removed from the address bar and expires when the bridge restarts. `http://localhost:<port>` redirects to the `127.0.0.1` origin. Do not reverse-proxy this preview onto
-a public network: multi-user authentication, HTTPS deployment and remote web
-sessions are not implemented.
+a public network; use `--listen` below instead.
+
+### Opening the web server to other devices
+
+```sh
+./target/debug/agent206 web --static-dir target/dx/agent206/release/web/public \
+    --listen 0.0.0.0:8443 --name workstation.lan --name 192.168.1.20
+```
+
+This is off unless `--listen` is given. The server then speaks HTTPS only and
+answers requests only for the names given with `--name`. Browsers sign in with
+a code from the authenticator enrolled in this profile's vault (`agent206 vault
+totp enroll`); the vault broker checks the code, with its usual throttling and
+one-use codes, and only while the vault is unlocked. The server refuses to
+start without a vault, or with an unlocked vault that has no authenticator.
+Each sign-in lasts 12 hours, until **Sign out**, or until the server restarts.
+
+Without `--tls-cert`/`--tls-key` the server generates a self-signed certificate
+for exactly those names, keeps it in the profile and prints its SHA-256
+fingerprint. The browser warns about it; continue only if the browser shows the
+same fingerprint. With your own certificate (for example from an internal CA or
+ACME), pass `--tls-cert chain.pem --tls-key key.pem`. Failed codes count toward
+the vault's lockout, so repeated guesses also delay unlocking on this computer.
 
 Navigation uses Dioxus Router across renderers. Web pages have direct addresses
 such as `/connections`, `/projects`, and `/settings/appearance`. Conversations use

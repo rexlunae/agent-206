@@ -963,6 +963,53 @@ impl SetupStatus {
     }
 }
 
+/// Signing in to a web server opened to other devices. The vault broker checks
+/// codes against the vault's enrolled authenticator; a loopback server signs
+/// browsers in with its one-time link instead.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SignInRequest {
+    /// Which sign-in this server offers. Needs no session.
+    Methods,
+    Totp {
+        code: String,
+    },
+    /// End the session presenting this request.
+    SignOut,
+}
+impl std::fmt::Debug for SignInRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Methods => f.write_str("Methods"),
+            Self::Totp { .. } => f.write_str("Totp { code: [REDACTED] }"),
+            Self::SignOut => f.write_str("SignOut"),
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SignInReply {
+    /// `totp` is true when browsers sign in with an authenticator code.
+    Methods {
+        totp: bool,
+    },
+    /// The bearer for this browser's session on this server.
+    SignedIn {
+        session: String,
+    },
+    SignedOut,
+    Error(ErrorReport),
+}
+impl std::fmt::Debug for SignInReply {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Methods { totp } => f.debug_struct("Methods").field("totp", totp).finish(),
+            Self::SignedIn { .. } => f.write_str("SignedIn { session: [REDACTED] }"),
+            Self::SignedOut => f.write_str("SignedOut"),
+            Self::Error(report) => f.debug_tuple("Error").field(report).finish(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SetupReply {
     Status(SetupStatus),
