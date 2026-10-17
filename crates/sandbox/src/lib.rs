@@ -40,6 +40,8 @@ mod helper;
 mod profile;
 #[cfg(unix)]
 mod seatbelt;
+#[cfg(target_os = "macos")]
+mod terminal;
 
 #[cfg(unix)]
 pub use elf::interpreter;
@@ -51,9 +53,13 @@ pub use profile::{HIDDEN_HOME_PATHS, NetworkAccess, Profile, hidden_home_paths};
 
 /// First argument that turns a process into the in-sandbox helper.
 pub const HELPER_COMMAND: &str = "__a206-sandbox-helper";
+/// First argument that turns a process into the macOS launcher that makes
+/// its stdin its controlling terminal and then runs the rest of its
+/// arguments; see [`Profile::command`].
+pub const TERMINAL_COMMAND: &str = "__a206-sandbox-terminal";
 /// Version of [`Spec`] and [`Status`]; the helper and the gateway are the same
 /// executable, so a mismatch means a corrupted or foreign invocation.
-pub const SPEC_VERSION: u32 = 4;
+pub const SPEC_VERSION: u32 = 5;
 /// Bubblewrap is resolved from this fixed system path, never from `PATH`.
 pub const BUBBLEWRAP: &str = "/usr/bin/bwrap";
 /// macOS's Seatbelt launcher, likewise from its fixed system path.
@@ -112,6 +118,9 @@ pub struct Spec {
     pub status: PathBuf,
     /// Whether the runtime keeps the helper's stderr; otherwise it is null.
     pub stderr: bool,
+    /// The helper's stdin is a terminal that becomes the runtime's
+    /// controlling terminal, and its stdout and stderr.
+    pub terminal: bool,
     pub rules: Vec<Rule>,
 }
 
@@ -198,6 +207,14 @@ pub enum SandboxError {
     Spawn(#[source] std::io::Error),
     #[error("could not wait for the runtime inside the sandbox")]
     Wait(#[source] std::io::Error),
+    #[error("could not make the terminal the runtime's controlling terminal")]
+    Terminal(#[source] std::io::Error),
+    #[error("could not start {}", program.to_string_lossy())]
+    Launch {
+        program: std::ffi::OsString,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("OS isolation for external runtimes is only implemented for Linux and macOS")]
     Unsupported,
 }
@@ -220,9 +237,12 @@ impl SandboxError {
             | Self::NonUtf8Argument => ErrorKind::Protocol,
             #[cfg(target_os = "linux")]
             Self::Landlock(_) | Self::LandlockPath { .. } => ErrorKind::Unavailable,
-            Self::Listen(_) | Self::Report(_) | Self::Spawn(_) | Self::Wait(_) => {
-                ErrorKind::Internal
-            }
+            Self::Listen(_)
+            | Self::Report(_)
+            | Self::Spawn(_)
+            | Self::Wait(_)
+            | Self::Terminal(_)
+            | Self::Launch { .. } => ErrorKind::Internal,
         })
     }
     /// Capture this error and its causes for the gateway.
@@ -233,15 +253,24 @@ impl SandboxError {
     }
 }
 
-/// Run the in-sandbox helper when this process was started as one.
+/// Run the in-sandbox helper, or the macOS terminal launcher, when this
+/// process was started as one.
 ///
 /// Every binary that hosts a gateway calls this first, before it starts
 /// threads, and exits with the returned code. `None` means this is not a
 /// helper invocation. An error is returned only when it could not also be
-/// reported to the gateway, for the binary to print.
+/// reported to the gateway, for the binary to print; the launcher's errors
+/// are all returned, and its stderr is the command's terminal.
 pub fn dispatch() -> Option<Result<std::process::ExitCode, SandboxError>> {
     let mut args = std::env::args_os().skip(1);
-    if args.next()? != HELPER_COMMAND {
+    let command = args.next()?;
+    if command == TERMINAL_COMMAND {
+        #[cfg(target_os = "macos")]
+        return Some(terminal::run(args));
+        #[cfg(not(target_os = "macos"))]
+        return Some(Err(SandboxError::Unsupported));
+    }
+    if command != HELPER_COMMAND {
         return None;
     }
     #[cfg(target_os = "linux")]

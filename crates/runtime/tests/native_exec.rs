@@ -5,7 +5,10 @@
 use a206_core::{Capability, ErrorKind, Id};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use a206_runtime::{
-    exec_tool::{ExecHost, MAX_INPUT, MAX_PER_THREAD, MAX_STREAM, NAME, PROCESS, PROCESS_WRITE},
+    exec_tool::{
+        ExecHost, MAX_INPUT, MAX_PER_THREAD, MAX_STREAM, NAME, PROCESS, PROCESS_WRITE,
+        TERMINAL_COLUMNS, TERMINAL_ROWS,
+    },
     tools::{ToolHost, ToolOutput, ToolRequest, ToolScope},
 };
 
@@ -22,6 +25,7 @@ fn main() -> std::process::ExitCode {
         runtime.block_on(background_sessions_follow_their_conversation());
         runtime.block_on(background_sessions_stop_when_their_grant_is_withdrawn());
         runtime.block_on(stalled_input_fails_within_its_deadline());
+        runtime.block_on(terminal_sessions_take_keys_and_interrupts());
         runtime.block_on(background_sessions_end_with_their_host());
         println!("native exec: ok");
     }
@@ -311,6 +315,95 @@ async fn output_status_and_time_are_bounded() {
     .await
     .unwrap_err();
     assert_eq!(error.kind, ErrorKind::Timeout);
+}
+
+/// Poll until the session's output, from all its polls together, contains
+/// every one of `needles`; returns what was collected.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+async fn shown(host: &ExecHost, scope: &ToolScope, session: &str, needles: &[&str]) -> String {
+    let mut text = String::new();
+    for _ in 0..400 {
+        text.push_str(&process(host, scope, "poll", session).await.unwrap().text);
+        if needles.iter().all(|needle| text.contains(needle)) {
+            return text;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!("{needles:?} never appeared in {text}")
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+async fn terminal_sessions_take_keys_and_interrupts() {
+    let state = tempfile::tempdir().unwrap();
+    let host = ExecHost::new(state.path());
+    let scope = scope(None, &[Capability::Execute]);
+    let marker = Id::new_v4().simple().to_string();
+    let write = |session: &str, arguments: serde_json::Value| {
+        let mut arguments = arguments;
+        arguments["session"] = session.into();
+        call(&host, &scope, PROCESS_WRITE, arguments)
+    };
+
+    // All three streams are the terminal, which is also the controlling
+    // one, at the advertised size.
+    let session = spawn(
+        &host,
+        &scope,
+        serde_json::json!({
+            "command": "test -t 0 && test -t 1 && test -t 2 && echo is-a-$TERM-tty; \
+                        echo via-dev-tty > /dev/tty; echo size-$(stty size); \
+                        read line; echo got-$line; exec sleep 600",
+            "terminal": true,
+        }),
+    )
+    .await;
+    let size = format!("size-{TERMINAL_ROWS} {TERMINAL_COLUMNS}");
+    let text = shown(
+        &host,
+        &scope,
+        &session,
+        &["is-a-dumb-tty", "via-dev-tty", &size],
+    )
+    .await;
+    assert!(text.starts_with("running\n--- terminal ---"), "{text}");
+
+    // Text and keys arrive in order; Enter ends the line.
+    let written = write(
+        &session,
+        serde_json::json!({ "data": marker, "keys": ["Enter"] }),
+    )
+    .await
+    .unwrap();
+    assert!(!written.is_error, "{}", written.text);
+    shown(&host, &scope, &session, &[&format!("got-{marker}")]).await;
+
+    // A terminal's input cannot be closed.
+    let error = write(&session, serde_json::json!({ "close": true }))
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind, ErrorKind::Conflict, "{}", error.message);
+
+    // Ctrl-C reaches the command through the terminal's line discipline.
+    write(&session, serde_json::json!({ "keys": ["Ctrl-C"] }))
+        .await
+        .unwrap();
+    idle(&host, &scope, &session).await;
+    let ended = finish(&host, &scope, &session).await;
+    assert!(ended.is_error, "{}", ended.text);
+    // On Linux the sandbox's helper reports the signal as 128 + SIGINT.
+    assert!(
+        ended.text.starts_with("signal: 2 ") || ended.text.starts_with("exit status: 130\n"),
+        "interrupted, not killed: {}",
+        ended.text
+    );
+
+    // A session without a terminal takes text but no keys.
+    let piped = spawn(&host, &scope, serde_json::json!({ "command": "sleep 600" })).await;
+    let error = write(&piped, serde_json::json!({ "keys": ["Ctrl-C"] }))
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind, ErrorKind::Conflict, "{}", error.message);
+    process(&host, &scope, "remove", &piped).await.unwrap();
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
