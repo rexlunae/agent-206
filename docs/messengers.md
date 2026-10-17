@@ -1,7 +1,7 @@
 # Messengers
 
 A messenger connects a chat service account to Agent 206 so that people can
-talk to a thread from that service. Telegram and Matrix are implemented;
+talk to a thread from that service. Telegram, Matrix and Discord are implemented;
 RustyClaw's other channels are listed in
 [parity.md](parity.md#messengers--channels).
 
@@ -14,7 +14,7 @@ of the desktop, web and terminal apps):
 ```toml
 [[messengers]]
 name = "team"                 # lowercase letters, digits, single hyphens
-kind = "telegram"             # or "matrix"
+kind = "telegram"             # or "matrix" or "discord"
 enabled = false               # off until the user turns it on
 credential = "team-token"     # vault credential name, never the token
 # endpoint = "https://..."    # an origin; defaults to the official API,
@@ -35,7 +35,9 @@ adding one, including through import, connects nothing and answers nobody.
 
 - **Tokens stay in the vault.** The gateway asks the vault broker to make
   each API call (Telegram: `AuthScheme::TelegramBot`, broker protocol v6;
-  Matrix: a bearer token, with `PUT` from protocol v7). The broker checks
+  Matrix: a bearer token, with `PUT` from protocol v7; Discord:
+  `AuthScheme::DiscordBot` and a brokered WebSocket session, protocol v8,
+  see [below](#discord)). The broker checks
   that the credential is bound to the endpoint's exact origin and attaches
   the token itself (Telegram's goes in the request path). Plain HTTP (loopback only)
   never goes through a configured proxy, which would see the token. The token never reaches the
@@ -153,6 +155,56 @@ agent206 messenger enable home
 The adapter follows the [Matrix Client-Server API](https://spec.matrix.org/latest/client-server-api/)
 for `/join/{roomIdOrAlias}`, full room state, sync and forward message pagination.
 
+## Discord
+
+A Discord messenger is a bot application from the
+[developer portal](https://discord.com/developers/applications). Its owner
+turns on the bot's **Message Content** intent (a privileged intent; without
+it Discord withholds message text), invites the bot to a server, and stores
+the bot token bound to the API origin:
+
+```sh
+agent206 vault add discord-bot --kind token --destination https://discord.com
+agent206 messenger add guild --kind discord --credential discord-bot
+agent206 messenger allow guild <channel id>
+agent206 messenger allow-sender guild <user id>
+agent206 messenger enable guild
+```
+
+- **Ids.** Chats are channel ids (a direct message has its own channel id,
+  shown as refused on first contact) and senders are user ids, as Discord's
+  "Copy ID" (developer mode) gives them. Server channels are groups, so
+  their senders must be listed; a direct message is private.
+- **Brokered socket.** Messages arrive over the
+  [Gateway](https://discord.com/developers/docs/events/gateway) WebSocket.
+  The gateway asks the broker to open it (`Request::SocketOpen`,
+  `SocketScheme::DiscordGateway`, broker protocol v8): the broker asks
+  `/api/v10/gateway/bot` with the token where to connect, connects there
+  itself, relays Discord's Hello, and sends the Identify message that carries
+  the token. The gateway then exchanges heartbeats and receives events
+  through the broker, and never sees the token. The broker accepts only a
+  `wss` socket URL (a `ws` one only on loopback, for a loopback API), relays
+  text messages of at most 2 MiB, pings the service every 30 s and ends a
+  session that stays silent for 90 s. Close reasons and error bodies are not
+  relayed; close codes are. The socket connects directly, not through a
+  configured HTTPS proxy.
+- **What is read and sent.** Only default messages and replies with text are
+  read; the bot's own messages, webhook posts and system messages are
+  ignored. Replies go through `POST /api/v10/channels/{id}/messages`, split
+  at 2000 characters, with every mention disabled
+  (`allowed_mentions.parse = []`) so a model's reply cannot ping a role or
+  `@everyone`.
+- **Delivery.** The socket runs in its own task, which keeps heartbeating
+  while a turn runs and queues up to 1024 messages; more than that restarts
+  the session. Sessions are not resumed: a disconnect, a Reconnect or
+  Invalid Session request, or a heartbeat still unacknowledged when the next
+  one is due start a new
+  session (with the usual backoff), and messages sent meanwhile are not
+  answered. A rejected token (HTTP 401 or close code 4004) or refused intents
+  (4013, 4014) stop the messenger until the user acts. The account is
+  checked (`/users/@me`) before each batch; another bot behind the
+  credential gets its own session.
+
 ## Interface for the run engine
 
 `a206_runtime::messengers::Host` is the boundary between a messenger and the
@@ -177,9 +229,12 @@ participant cannot approve their own request.
 
 ## Not yet
 
-- Discord, Slack, IRC, Signal, WhatsApp, Google Chat, Teams, iMessage and
-  webhooks. Discord's gateway and Slack's Socket Mode need a brokered
-  WebSocket connection, which the broker does not offer yet.
+- Slack, IRC, Signal, WhatsApp, Google Chat, Teams, iMessage and webhooks.
+  The broker's socket sessions already support Slack's Socket Mode
+  (`SocketScheme::SlackSocketMode`); the Slack adapter is next.
+- Discord session resume, slash commands, threads' own channel ids beyond
+  allowing them, and channel names in the refused list (only direct messages
+  carry a title).
 - Attachments, edits, reactions and group mention handling; only text
   messages are read.
 - A persisted poll offset or sync token for exactly-once delivery across

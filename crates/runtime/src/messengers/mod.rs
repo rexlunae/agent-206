@@ -8,10 +8,12 @@
 //! through [`Host::converse`], under that thread's mode, grants and approvals.
 //! A person in an allowed chat can therefore do whatever the user could do
 //! by typing into that thread, and nothing more.
+mod discord;
 mod matrix;
 mod telegram;
 
 use a206_broker::{AuthScheme, HttpMethod, ProviderCall, Reply as BrokerReply, Request, Role};
+use a206_broker::{SocketCall, SocketOpen, SocketScheme};
 use a206_core::{BrokerPairing, ChatBinding, ErrorKind, Id, MessengerConfig, MessengerKind};
 use a206_core::{MessengerState, MessengerStatus};
 use std::collections::{BTreeMap, BTreeSet};
@@ -72,6 +74,25 @@ pub enum MessengerError {
         "room {chat} is end-to-end encrypted, which Agent 206 does not support yet; it neither reads nor answers there"
     )]
     EncryptedRoom { chat: String },
+    #[error("{service} closed the connection{}", code.map(|code| format!(" with code {code}")).unwrap_or_default())]
+    SocketClosed {
+        service: &'static str,
+        code: Option<u16>,
+    },
+    #[error("the {service} connection ended unexpectedly")]
+    SocketEnded { service: &'static str },
+    #[error("{service} stopped acknowledging heartbeats")]
+    HeartbeatMissed { service: &'static str },
+    #[error("{service} asked the bot to reconnect")]
+    Reconnect { service: &'static str },
+    #[error("too many {service} messages were waiting; reconnecting")]
+    Backlog { service: &'static str },
+    #[error(
+        "Discord refused the bot's intents; turn on the Message Content intent for the bot in the Discord developer portal"
+    )]
+    DiscordIntents,
+    #[error("{service} refused the connection ({code})")]
+    Rejected { service: &'static str, code: String },
     #[error("choose a model for this messenger before allowing chats")]
     NoModel,
     #[error("the thread could not answer the message")]
@@ -99,6 +120,13 @@ impl crate::error::Classified for MessengerError {
             // Answering in plain text there would downgrade the room.
             Self::Unauthorized { .. } | Self::EncryptedRoom { .. } => ErrorKind::PermissionDenied,
             Self::PollingConflict { .. } => ErrorKind::Conflict,
+            Self::SocketClosed { .. }
+            | Self::SocketEnded { .. }
+            | Self::HeartbeatMissed { .. }
+            | Self::Reconnect { .. }
+            | Self::Backlog { .. } => ErrorKind::Unavailable,
+            Self::DiscordIntents => ErrorKind::PermissionDenied,
+            Self::Rejected { .. } => ErrorKind::Provider,
             Self::Status { .. } | Self::Refused { .. } => ErrorKind::Provider,
             Self::Conversation(error) => return crate::error::classify(error.as_ref()),
             Self::Turn(report) => report.kind,
@@ -118,6 +146,7 @@ impl MessengerError {
                 | Self::BrokerTooOld
                 | Self::Unauthorized { .. }
                 | Self::PollingConflict { .. }
+                | Self::DiscordIntents
                 // The stored credential is missing, refused for this
                 // destination or not a bot token: the same one will fail again.
                 | Self::Broker(ClientError::Broker(
@@ -197,6 +226,7 @@ pub(crate) struct Account {
 enum Adapter {
     Telegram(telegram::Telegram),
     Matrix(matrix::Matrix),
+    Discord(discord::Discord),
 }
 impl Adapter {
     fn new(config: &MessengerConfig, api: Api) -> Self {
@@ -205,6 +235,7 @@ impl Adapter {
             MessengerKind::Matrix => {
                 Self::Matrix(matrix::Matrix::new(api, config.allowed_chats.clone()))
             }
+            MessengerKind::Discord => Self::Discord(discord::Discord::new(api)),
         }
     }
     /// Check the credential and name the account.
@@ -212,6 +243,7 @@ impl Adapter {
         match self {
             Self::Telegram(adapter) => adapter.connect().await,
             Self::Matrix(adapter) => adapter.connect().await,
+            Self::Discord(adapter) => adapter.connect().await,
         }
     }
     /// Wait for the next batch after `cursor`.
@@ -219,20 +251,22 @@ impl Adapter {
         match self {
             Self::Telegram(adapter) => adapter.receive(cursor).await,
             Self::Matrix(adapter) => adapter.receive(cursor).await,
+            Self::Discord(adapter) => adapter.receive(cursor).await,
         }
     }
     /// Fails with [`MessengerError::EncryptedRoom`] if an answer could not be
     /// sent to `chat` as it is now.
     async fn check_chat(&self, chat: &str) -> Result<()> {
         match self {
-            Self::Telegram(_) => Ok(()),
+            Self::Telegram(_) | Self::Discord(_) => Ok(()),
             Self::Matrix(adapter) => adapter.check_room(chat).await,
         }
     }
     async fn join(&self, chat: &str) -> Result<()> {
         match self {
-            // Telegram adds bots to chats itself and reports no invitations.
-            Self::Telegram(_) => Ok(()),
+            // Telegram and Discord add bots to chats themselves and report
+            // no invitations.
+            Self::Telegram(_) | Self::Discord(_) => Ok(()),
             Self::Matrix(adapter) => adapter.join(chat).await,
         }
     }
@@ -240,6 +274,7 @@ impl Adapter {
         match self {
             Self::Telegram(adapter) => adapter.send(chat, text).await,
             Self::Matrix(adapter) => adapter.send(chat, text).await,
+            Self::Discord(adapter) => adapter.send(chat, text).await,
         }
     }
 }
@@ -650,7 +685,9 @@ fn split(text: &str, limit: usize) -> Vec<&str> {
 }
 
 /// Destination-bound requests through the vault broker for one messenger.
+#[derive(Clone)]
 pub(crate) struct Api {
+    service: &'static str,
     root: PathBuf,
     pairing: BrokerPairing,
     credential: String,
@@ -672,6 +709,7 @@ impl Api {
                 origin: base.origin().ascii_serialization(),
             })?;
         Ok(Self {
+            service: config.kind.label(),
             root,
             pairing,
             credential,
@@ -711,22 +749,15 @@ impl Api {
         url: url::Url,
         body: Option<Vec<u8>>,
     ) -> Result<(u16, Vec<u8>)> {
-        let mut client = a206_broker::Client::connect(&self.root, Role::Gateway)
-            .await
-            .map_err(MessengerError::VaultUnavailable)?;
         let needed = match method {
             HttpMethod::Put => a206_broker::PUT_VERSION,
             HttpMethod::Get | HttpMethod::Post => a206_broker::MESSENGER_VERSION,
         };
-        if client.version() < needed {
-            return Err(MessengerError::BrokerTooOld);
-        }
-        client
-            .call(Request::GatewayAuth {
-                token: a206_broker::WireSecret::new(self.pairing.expose().to_owned()),
-            })
-            .await
-            .map_err(MessengerError::Broker)?;
+        let needed = match auth {
+            AuthScheme::DiscordBot => needed.max(a206_broker::SOCKET_VERSION),
+            _ => needed,
+        };
+        let mut client = self.client(needed).await?;
         let reply = client
             .call(Request::Provider(ProviderCall {
                 credential: self.credential.clone(),
@@ -743,7 +774,66 @@ impl Api {
             _ => Err(MessengerError::UnexpectedReply),
         }
     }
+
+    /// A paired gateway connection to a broker that speaks `needed`.
+    async fn client(&self, needed: u16) -> Result<a206_broker::Client> {
+        let mut client = a206_broker::Client::connect(&self.root, Role::Gateway)
+            .await
+            .map_err(MessengerError::VaultUnavailable)?;
+        if client.version() < needed {
+            return Err(MessengerError::BrokerTooOld);
+        }
+        client
+            .call(Request::GatewayAuth {
+                token: a206_broker::WireSecret::new(self.pairing.expose().to_owned()),
+            })
+            .await
+            .map_err(MessengerError::Broker)?;
+        Ok(client)
+    }
+
+    /// Open a WebSocket session named by `url`, with the credential spent
+    /// by the broker as `scheme` says.
+    async fn socket(&self, scheme: SocketScheme, url: url::Url) -> Result<a206_broker::Socket> {
+        let client = self.client(a206_broker::SOCKET_VERSION).await?;
+        let opened = client
+            .socket(SocketCall {
+                credential: self.credential.clone(),
+                url: url.to_string(),
+                scheme,
+            })
+            .await
+            .map_err(MessengerError::Broker)?;
+        let service = self.service;
+        match opened {
+            SocketOpen::Opened(socket) => Ok(socket),
+            SocketOpen::Refused {
+                status: 401 | 403, ..
+            } => Err(MessengerError::Unauthorized { service }),
+            SocketOpen::Refused {
+                code: Some(code), ..
+            } if UNAUTHORIZED_CODES.contains(&code.as_str()) => {
+                Err(MessengerError::Unauthorized { service })
+            }
+            SocketOpen::Refused {
+                code: Some(code), ..
+            } => Err(MessengerError::Rejected { service, code }),
+            SocketOpen::Refused { status, code: None } => {
+                Err(MessengerError::Status { service, status })
+            }
+        }
+    }
 }
+
+/// Error codes (Slack's) that mean the stored token is wrong for the request.
+const UNAUTHORIZED_CODES: [&str; 6] = [
+    "invalid_auth",
+    "not_authed",
+    "account_inactive",
+    "token_revoked",
+    "token_expired",
+    "not_allowed_token_type",
+];
 
 #[cfg(test)]
 mod tests;

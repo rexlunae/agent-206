@@ -1211,3 +1211,288 @@ async fn matrix_reconnect_after_a_final_chunk_failure_never_repeats_a_turn() {
     assert_eq!(queries[2]["since"], "s1");
     assert_eq!(queries[3]["since"], "s3");
 }
+
+/// What the stand-in Discord API and Gateway serve and record.
+#[derive(Clone, Default)]
+struct DiscordApi {
+    token: String,
+    bot_id: String,
+    username: String,
+    origin: Arc<Mutex<String>>,
+    /// Dispatches the open gateway sends, in order.
+    dispatches: Arc<Mutex<VecDeque<Value>>>,
+    /// Close the open gateway with this code.
+    close: Arc<Mutex<Option<u16>>>,
+    /// Stop acknowledging heartbeats.
+    silent: Arc<Mutex<bool>>,
+    identifies: Arc<Mutex<Vec<Value>>>,
+    heartbeats: Arc<Mutex<u32>>,
+    /// Channel and body of each sent message.
+    sent: Arc<Mutex<Vec<(String, Value)>>>,
+}
+
+fn check_bot(api: &DiscordApi, headers: &axum::http::HeaderMap) {
+    assert_eq!(
+        headers.get("authorization").and_then(|v| v.to_str().ok()),
+        Some(format!("Bot {}", api.token).as_str()),
+        "no bot token"
+    );
+}
+
+async fn serve_discord(api: DiscordApi) -> String {
+    use axum::extract::ws::{CloseFrame, Message as Ws, WebSocketUpgrade};
+    use axum::http::HeaderMap;
+    use axum::routing::any;
+    let me = |State(api): State<DiscordApi>, headers: HeaderMap| async move {
+        check_bot(&api, &headers);
+        Json(json!({"id": api.bot_id, "username": api.username, "bot": true}))
+    };
+    let gateway = |State(api): State<DiscordApi>, headers: HeaderMap| async move {
+        check_bot(&api, &headers);
+        let origin = api.origin.lock().unwrap().replace("http", "ws");
+        Json(json!({"url": format!("{origin}/gateway")}))
+    };
+    let send = |State(api): State<DiscordApi>,
+                headers: HeaderMap,
+                Path(channel): Path<String>,
+                Json(body): Json<Value>| async move {
+        check_bot(&api, &headers);
+        api.sent.lock().unwrap().push((channel, body));
+        Json(json!({"id": random()}))
+    };
+    let socket = |State(api): State<DiscordApi>, upgrade: WebSocketUpgrade| async move {
+        upgrade.on_upgrade(move |mut socket| async move {
+            let hello = json!({"op": 10, "d": {"heartbeat_interval": 1000}});
+            socket.send(Ws::text(hello.to_string())).await.unwrap();
+            let Some(Ok(Ws::Text(identify))) = socket.recv().await else {
+                panic!("no identify");
+            };
+            api.identifies
+                .lock()
+                .unwrap()
+                .push(serde_json::from_str(identify.as_str()).unwrap());
+            let ready = json!({"op": 0, "t": "READY", "s": 1, "d": {
+                "user": {"id": api.bot_id, "username": api.username, "bot": true},
+            }});
+            socket.send(Ws::text(ready.to_string())).await.unwrap();
+            let mut seq = 1;
+            loop {
+                let close = api.close.lock().unwrap().take();
+                if let Some(code) = close {
+                    let frame = CloseFrame {
+                        code,
+                        reason: random().into(),
+                    };
+                    // The client may already be gone; either way this session ends.
+                    socket.send(Ws::Close(Some(frame))).await.ok();
+                    return;
+                }
+                let next = api.dispatches.lock().unwrap().pop_front();
+                if let Some(mut dispatch) = next {
+                    seq += 1;
+                    dispatch["s"] = json!(seq);
+                    socket.send(Ws::text(dispatch.to_string())).await.unwrap();
+                    continue;
+                }
+                let received =
+                    tokio::time::timeout(std::time::Duration::from_millis(10), socket.recv()).await;
+                match received {
+                    Err(_) => {}
+                    Ok(Some(Ok(Ws::Text(text)))) => {
+                        let beat: Value = serde_json::from_str(text.as_str()).unwrap();
+                        assert_eq!(beat["op"], 1);
+                        *api.heartbeats.lock().unwrap() += 1;
+                        if !*api.silent.lock().unwrap() {
+                            let ack = json!({"op": 11});
+                            socket.send(Ws::text(ack.to_string())).await.unwrap();
+                        }
+                    }
+                    Ok(Some(Ok(_))) => {}
+                    Ok(_) => return,
+                }
+            }
+        })
+    };
+    let router = Router::new()
+        .route("/api/v10/users/@me", get(me))
+        .route("/api/v10/gateway/bot", get(gateway))
+        .route("/api/v10/channels/{channel}/messages", post(send))
+        .route("/gateway", any(socket))
+        .with_state(api.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    *api.origin.lock().unwrap() = origin.clone();
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    origin
+}
+
+async fn discord_setup() -> (
+    DiscordApi,
+    String,
+    tempfile::TempDir,
+    String,
+    Recorder,
+    crate::provider::PairingAnchor,
+) {
+    let api = DiscordApi {
+        token: random(),
+        bot_id: random(),
+        username: random(),
+        ..DiscordApi::default()
+    };
+    let origin = serve_discord(api.clone()).await;
+    let (dir, credential, pairing, anchor) = broker(&origin, &api.token).await;
+    let host = Recorder {
+        root: dir.path().to_owned(),
+        pairing,
+        pairings: Arc::new(watch::Sender::new(0)),
+        threads: Arc::default(),
+        turns: Arc::default(),
+        statuses: Arc::default(),
+        connects: Arc::default(),
+        changed: Arc::default(),
+    };
+    (api, origin, dir, credential, host, anchor)
+}
+
+fn discord_config(
+    name: &str,
+    origin: &str,
+    credential: &str,
+    channels: &[&str],
+) -> MessengerConfig {
+    MessengerConfig {
+        kind: MessengerKind::Discord,
+        allowed_chats: channels.iter().map(|c| (*c).to_owned()).collect(),
+        ..config(name, origin, credential, 0)
+    }
+}
+
+fn discord_message(channel: &str, guild: Option<&str>, author: &str, text: &str) -> Value {
+    let mut d = json!({
+        "id": random(),
+        "type": 0,
+        "channel_id": channel,
+        "author": {"id": author, "username": random()},
+        "content": text,
+    });
+    if let Some(guild) = guild {
+        d["guild_id"] = json!(guild);
+    }
+    json!({"op": 0, "t": "MESSAGE_CREATE", "d": d})
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn discord_answers_allowed_channels_and_ignores_itself_and_webhooks() {
+    let (api, origin, _dir, credential, host, _anchor) = discord_setup().await;
+    let name = "discord";
+    let (dm, channel, other, guild) = (random(), random(), random(), random());
+    let (member, stranger, friend) = (random(), random(), random());
+    let mut entry = discord_config(name, &origin, &credential, &[&dm, &channel]);
+    entry.allowed_users.extend([member.clone(), friend.clone()]);
+    let (dm_text, group_text) = (random(), random());
+    let mut webhook = discord_message(&channel, Some(&guild), &member, &random());
+    webhook["d"]["webhook_id"] = json!(random());
+    let mut join = discord_message(&channel, Some(&guild), &member, &random());
+    join["d"]["type"] = json!(7);
+    api.dispatches.lock().unwrap().extend([
+        // The bot's own message, a webhook posing as a member, a join notice.
+        discord_message(&channel, Some(&guild), &api.bot_id, &random()),
+        webhook,
+        join,
+        discord_message(&other, Some(&guild), &member, &random()),
+        discord_message(&channel, Some(&guild), &stranger, &random()),
+        discord_message(&dm, None, &friend, &dm_text),
+        discord_message(&channel, Some(&guild), &member, &group_text),
+    ]);
+    let (_desired, receiver) = watch::channel(vec![Desired {
+        config: entry,
+        run: true,
+    }]);
+    let stop = CancellationToken::new();
+    let supervisor = tokio::spawn(supervise(host.clone(), receiver, FAST, stop.clone()));
+    host.until(|h| api.sent.lock().unwrap().len() == 2 && h.status(name).refused.len() == 2)
+        .await;
+    let status = host.status(name);
+    assert_eq!(status.state, MessengerState::Connected);
+    assert_eq!(status.account.as_deref(), Some(api.username.as_str()));
+    assert_eq!(status.refused[0].chat, other);
+    assert_eq!(status.refused[1].chat, channel);
+    assert_eq!(status.refused[1].sender.as_deref(), Some(stranger.as_str()));
+    let turns: Vec<String> = host
+        .turns
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|t| t.1.clone())
+        .collect();
+    assert_eq!(turns, [dm_text.clone(), group_text.clone()]);
+    let sent = api.sent.lock().unwrap().clone();
+    assert_eq!(sent[0].0, dm);
+    assert_eq!(sent[0].1["content"], format!("reply to {dm_text}"));
+    assert_eq!(sent[1].0, channel);
+    // Replies never ping anyone.
+    assert_eq!(sent[1].1["allowed_mentions"], json!({"parse": []}));
+    // The broker identified with the token and the message content intent.
+    let identify = api.identifies.lock().unwrap()[0].clone();
+    assert_eq!(identify["d"]["token"], api.token.as_str());
+    let intents = identify["d"]["intents"].as_u64().unwrap();
+    assert_ne!(intents & (1 << 15), 0);
+    // Heartbeats keep the session alive.
+    host.until(|_| *api.heartbeats.lock().unwrap() >= 2).await;
+    assert_eq!(host.connects(name), 1);
+    stop.cancel();
+    supervisor.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn discord_reconnects_when_asked_or_unacknowledged_and_stops_on_intents() {
+    let (api, origin, _dir, credential, host, _anchor) = discord_setup().await;
+    let name = "discord";
+    let channel = random();
+    let entry = discord_config(name, &origin, &credential, &[&channel]);
+    let (desired, receiver) = watch::channel(vec![Desired {
+        config: entry.clone(),
+        run: true,
+    }]);
+    let stop = CancellationToken::new();
+    let supervisor = tokio::spawn(supervise(host.clone(), receiver, FAST, stop.clone()));
+    host.until(|_| api.identifies.lock().unwrap().len() == 1)
+        .await;
+
+    // Discord asks for a reconnect: the session starts again and still answers.
+    api.dispatches
+        .lock()
+        .unwrap()
+        .push_back(json!({"op": 7, "d": null}));
+    host.until(|_| api.identifies.lock().unwrap().len() == 2)
+        .await;
+    let text = random();
+    let author = random();
+    api.dispatches
+        .lock()
+        .unwrap()
+        .push_back(discord_message(&channel, None, &author, &text));
+    host.until(|_| api.sent.lock().unwrap().len() == 1).await;
+
+    // A gateway that stops acknowledging heartbeats is left for a new one.
+    *api.silent.lock().unwrap() = true;
+    host.until(|_| api.identifies.lock().unwrap().len() == 3)
+        .await;
+    *api.silent.lock().unwrap() = false;
+
+    // Missing intents need the user, so the messenger stops retrying.
+    *api.close.lock().unwrap() = Some(4014);
+    host.until(|h| h.status(name).state == MessengerState::Failed)
+        .await;
+    let failure = host.status(name).failure.unwrap();
+    assert_eq!(failure.kind, ErrorKind::PermissionDenied);
+    assert!(failure.detail().contains("Message Content"));
+    let identifies = api.identifies.lock().unwrap().len();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(api.identifies.lock().unwrap().len(), identifies);
+    assert_eq!(host.status(name).state, MessengerState::Failed);
+    drop(desired);
+    stop.cancel();
+    supervisor.await.unwrap();
+}
