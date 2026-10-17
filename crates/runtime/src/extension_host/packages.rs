@@ -4,6 +4,7 @@
 use a206_extensions::{Manifest, ManifestError};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::BTreeSet,
     io::Read,
     path::{Path, PathBuf},
 };
@@ -15,6 +16,8 @@ pub const RESERVED_PREFIX: &str = "agent206.";
 const WASM_HEADER: &[u8] = b"\0asm\x01\0\0\0";
 const MANIFEST_FILE: &str = "plugin.toml";
 const MODULE_FILE: &str = "module.wasm";
+/// Prefix of temporary directories inside the package store.
+const STAGING: &str = ".staging-";
 
 #[derive(Debug, thiserror::Error)]
 pub enum PackageError {
@@ -32,6 +35,10 @@ pub enum PackageError {
     Write(#[source] std::io::Error),
     #[error("could not read the installed extension package")]
     Read(#[source] std::io::Error),
+    #[error(
+        "could not delete extension package files; they are deleted when the gateway next starts"
+    )]
+    Remove(#[source] std::io::Error),
     #[error("the installed package for `{0}` changed since it was installed; install it again")]
     Changed(String),
 }
@@ -44,7 +51,7 @@ impl crate::error::Classified for PackageError {
             | Self::ManifestTooLarge
             | Self::ModuleTooLarge
             | Self::NotWasm => K::InvalidRequest,
-            Self::Write(_) | Self::Read(_) => K::Storage,
+            Self::Write(_) | Self::Read(_) | Self::Remove(_) => K::Storage,
             Self::Changed(_) => K::Conflict,
         })
     }
@@ -103,16 +110,18 @@ pub fn directory(data_dir: &Path) -> PathBuf {
     data_dir.join("extensions")
 }
 
-/// Store `package` under its digest. Storing the same package again keeps
-/// the verified copy already there.
-pub fn store(dir: &Path, package: &Package) -> Result<(), PackageError> {
+/// Store `package` under its digest, returning whether this created its
+/// directory. Storing the same package again keeps the verified copy already
+/// there. A damaged copy is replaced only once the new one is in place, and
+/// restored if that fails. Callers serialize package operations.
+pub fn store(dir: &Path, package: &Package) -> Result<bool, PackageError> {
     let target = dir.join(&package.digest);
     if load(dir, &package.manifest.id, &package.digest).is_ok() {
-        return Ok(());
+        return Ok(false);
     }
     std::fs::create_dir_all(dir).map_err(PackageError::Write)?;
     let staging = tempfile::Builder::new()
-        .prefix(".staging-")
+        .prefix(STAGING)
         .tempdir_in(dir)
         .map_err(PackageError::Write)?;
     for (name, bytes) in [
@@ -124,20 +133,39 @@ pub fn store(dir: &Path, package: &Package) -> Result<(), PackageError> {
         std::io::Write::write_all(&mut file, bytes).map_err(PackageError::Write)?;
         file.sync_all().map_err(PackageError::Write)?;
     }
-    // A directory left by an interrupted or altered install is replaced.
-    match std::fs::remove_dir_all(&target) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+    // Move a damaged copy aside rather than deleting it first.
+    let aside = tempfile::Builder::new()
+        .prefix(STAGING)
+        .tempdir_in(dir)
+        .map_err(PackageError::Write)?;
+    let damaged = aside.path().join("damaged");
+    let existed = match std::fs::rename(&target, &damaged) {
+        Ok(()) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
         Err(error) => return Err(PackageError::Write(error)),
+    };
+    if let Err(error) = std::fs::rename(staging.path(), &target) {
+        if existed && let Err(restore) = std::fs::rename(&damaged, &target) {
+            tracing::warn!(error = &restore as &dyn std::error::Error, digest = %package.digest, "could not restore the earlier extension package");
+        }
+        return Err(PackageError::Write(error));
     }
-    std::fs::rename(staging.keep(), &target).map_err(PackageError::Write)
+    // The staging directory was renamed away; `aside` removes the damaged copy.
+    drop(staging);
+    if let Err(error) = aside.close() {
+        tracing::warn!(
+            error = &error as &dyn std::error::Error,
+            "could not remove a damaged extension package"
+        );
+    }
+    Ok(!existed)
 }
 
 /// Read the package installed for `id` and check it is still the one with
 /// digest `expected`.
 pub fn load(dir: &Path, id: &str, expected: &str) -> Result<Package, PackageError> {
     let changed = || PackageError::Changed(id.into());
-    if expected.len() != 64 || !expected.bytes().all(|b| b.is_ascii_hexdigit()) {
+    if !valid_digest(expected) {
         return Err(changed());
     }
     let package = dir.join(expected);
@@ -174,11 +202,44 @@ fn read(path: &Path, limit: usize) -> Result<Option<Vec<u8>>, PackageError> {
 
 /// Remove the package stored under `digest`, if any.
 pub fn remove(dir: &Path, digest: &str) -> Result<(), PackageError> {
+    if !valid_digest(digest) {
+        return Err(PackageError::Changed(digest.into()));
+    }
     match std::fs::remove_dir_all(dir.join(digest)) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(PackageError::Write(error)),
+        Err(error) => Err(PackageError::Remove(error)),
     }
+}
+
+/// Remove stored packages no extension records, and staging left by an
+/// interrupted install. Only names this module creates are touched.
+pub fn prune(dir: &Path, keep: &BTreeSet<String>) -> Result<(), PackageError> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(PackageError::Read(error)),
+    };
+    for entry in entries {
+        let name = entry.map_err(PackageError::Read)?.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let ours = name.starts_with(STAGING) || valid_digest(name);
+        if ours && !keep.contains(name) {
+            match std::fs::remove_dir_all(dir.join(name)) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(PackageError::Remove(error)),
+            }
+        }
+    }
+    Ok(())
+}
+
+fn valid_digest(digest: &str) -> bool {
+    digest.len() == 64
+        && digest
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 #[cfg(test)]
@@ -227,5 +288,36 @@ mod tests {
         remove(dir.path(), &package.digest).unwrap();
         assert!(!dir.path().join(&package.digest).exists());
         remove(dir.path(), &package.digest).unwrap();
+    }
+
+    #[test]
+    fn storing_repairs_a_damaged_copy_and_prune_keeps_recorded_packages() {
+        let dir = tempfile::tempdir().unwrap();
+        let (kept, dropped) = (package(), package());
+        assert!(store(dir.path(), &kept).unwrap());
+        assert!(!store(dir.path(), &kept).unwrap());
+        std::fs::write(dir.path().join(&kept.digest).join(MODULE_FILE), b"x").unwrap();
+        // Repairing reuses the recorded directory, so it is not new.
+        assert!(!store(dir.path(), &kept).unwrap());
+        load(dir.path(), &kept.manifest.id, &kept.digest).unwrap();
+        assert!(store(dir.path(), &dropped).unwrap());
+        let staging = dir
+            .path()
+            .join(format!("{STAGING}{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir(&staging).unwrap();
+        let unrelated = dir.path().join(uuid::Uuid::new_v4().simple().to_string());
+        std::fs::create_dir(&unrelated).unwrap();
+        prune(dir.path(), &[kept.digest.clone()].into()).unwrap();
+        load(dir.path(), &kept.manifest.id, &kept.digest).unwrap();
+        assert!(!dir.path().join(&dropped.digest).exists());
+        assert!(!staging.exists());
+        assert!(unrelated.exists());
+        // A name that is not a digest is never removed.
+        assert!(matches!(
+            remove(dir.path(), "../x"),
+            Err(PackageError::Changed(_))
+        ));
+        let names: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
+        assert_eq!(names.len(), 2);
     }
 }

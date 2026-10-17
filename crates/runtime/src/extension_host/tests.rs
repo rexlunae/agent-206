@@ -47,6 +47,7 @@ fn calls_for(
         store: Arc::clone(store),
         hosts: Vec::new(),
         net: Arc::new(crate::network::Internet),
+        source: PluginSource::Bundled,
         logs: 0,
         last_failure: None,
     }
@@ -59,6 +60,29 @@ fn code(reply: HostReply) -> Option<HostErrorCode> {
 }
 fn read(path: &str) -> HostRequest {
     HostRequest::ReadFile { path: path.into() }
+}
+
+#[tokio::test]
+async fn host_calls_stop_once_the_package_is_replaced() {
+    let (_dir, store) = store();
+    let digest = || PluginSource::Installed {
+        digest: uuid::Uuid::new_v4().simple().to_string(),
+    };
+    let running = digest();
+    let mut calls = host_calls(&store, None, &[]);
+    calls.source = running.clone();
+    let get = || HostRequest::StateGet { key: "k".into() };
+    let set = |source: PluginSource| {
+        let mut store = store.lock().unwrap();
+        let plugin = store.state.plugins.last_mut().unwrap();
+        plugin.source = source;
+    };
+    set(running.clone());
+    assert_eq!(calls.handle(get()).await, HostReply::State(None));
+    // An update recorded while the old module runs ends its authority, even
+    // once the extension is enabled again.
+    set(digest());
+    assert_eq!(code(calls.handle(get()).await), Some(HostErrorCode::Denied));
 }
 
 #[tokio::test]

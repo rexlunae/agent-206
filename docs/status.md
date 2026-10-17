@@ -64,7 +64,7 @@ unlocked, the gateway paired for that unlock, and the credential bound to the
 provider's exact origin, or the request fails with an explanation. The gateway never reads a credential value, and agents
 still have no credential use. External coding backends still refuse credentialed
 providers. Browser
-preview has no credential injection. Third-party extension installation is unavailable.
+preview has no credential injection. Third-party extensions install only from a manifest and module the user supplies; agent-prepared packages and registry installs are unavailable.
 Bundled extensions reach the workspace and their own state only through
 gateway-authorized host calls; no extension links WASI or any other
 capability-bearing WASM import. New coding conversations have no

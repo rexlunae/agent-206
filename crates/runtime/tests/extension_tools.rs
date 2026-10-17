@@ -58,6 +58,9 @@ const TESTS: &[(&str, Test)] = &[
     ("invalid_packages_are_refused_before_storing", || {
         Box::pin(invalid_packages_are_refused_before_storing())
     }),
+    ("a_retried_install_replays_its_receipt", || {
+        Box::pin(a_retried_install_replays_its_receipt())
+    }),
 ];
 
 fn main() {
@@ -769,4 +772,36 @@ async fn invalid_packages_are_refused_before_storing() {
     assert!(!state.path().join("extensions").exists());
     let plugins = gateway.snapshot().unwrap().plugins;
     assert!(plugins.iter().all(|p| p.source == PluginSource::Bundled));
+}
+
+async fn a_retried_install_replays_its_receipt() {
+    let state = tempfile::tempdir().unwrap();
+    let gateway = Gateway::open(state.path()).unwrap();
+    let id = format!("test.{}", nonce());
+    let send = |request: Id, (manifest, module): (String, Vec<u8>)| {
+        let gateway = gateway.clone();
+        async move {
+            gateway
+                .request(a206_protocol::Request {
+                    id: request,
+                    body: Command::InstallExtension { manifest, module },
+                })
+                .await
+                .body
+        }
+    };
+    let first = Id::new_v4();
+    let receipt = send(first, package(&id, "1.0.0")).await;
+    assert!(matches!(receipt, Reply::Extension(_)), "{receipt:?}");
+    let Reply::Extension(newer) = send(Id::new_v4(), package(&id, "2.0.0")).await else {
+        panic!("update failed");
+    };
+    // A late retry returns its receipt instead of reinstalling the old package.
+    assert_eq!(send(first, package(&id, "1.0.0")).await, receipt);
+    let plugins = gateway.snapshot().unwrap().plugins;
+    assert!(plugins.contains(&newer), "{plugins:?}");
+    // The same id with a different package is refused, not installed.
+    let reused = failure(send(first, package(&id, "3.0.0")).await);
+    assert_eq!(reused.kind, ErrorKind::Conflict, "{reused:?}");
+    assert!(gateway.snapshot().unwrap().plugins.contains(&newer));
 }

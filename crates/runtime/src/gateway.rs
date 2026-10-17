@@ -334,6 +334,21 @@ struct Paired {
 }
 /// Minimum seconds between automatic refreshes of one stale catalog.
 const REFRESH_RETRY: u64 = 300;
+/// What the request journal keeps of a command: an installed module is
+/// recorded by its SHA-256 rather than copied, which still tells a retry
+/// apart from a different request reusing its id.
+fn journal_form(command: &Command) -> std::borrow::Cow<'_, Command> {
+    match command {
+        Command::InstallExtension { manifest, module } => {
+            std::borrow::Cow::Owned(Command::InstallExtension {
+                manifest: manifest.clone(),
+                module: Sha256::digest(module).to_vec(),
+            })
+        }
+        command => std::borrow::Cow::Borrowed(command),
+    }
+}
+
 impl Gateway {
     pub fn open(root: &Path) -> Result<Self, StoreError> {
         let mut store = Store::open(root)?;
@@ -531,13 +546,10 @@ impl Gateway {
                 | Command::ListTools { .. }
                 // Never journal a pairing: request bodies are persisted.
                 | Command::PairBroker { .. }
-                // Installing the same package again changes nothing, and a
-                // journal entry would keep a copy of the whole module.
-                | Command::InstallExtension { .. }
         );
         let begin = if mutation {
             self.lock()
-                .and_then(|mut store| Ok(store.begin(id, &request.body)?))
+                .and_then(|mut store| Ok(store.begin(id, &journal_form(&request.body))?))
         } else {
             Ok(None)
         };
@@ -1433,7 +1445,7 @@ impl Gateway {
                 Ok(Reply::Extension(Box::new(summary)))
             }
             Command::UninstallExtension { extension } => {
-                self.extensions.uninstall(&extension)?;
+                self.extensions.uninstall(extension).await?;
                 // Running calls and approval waits re-check their tool.
                 self.policy_changed();
                 Ok(Reply::Ok)
