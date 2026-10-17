@@ -36,7 +36,7 @@ pub fn Providers() -> Element {
             CardFooter { Button { variant: ButtonVariant::Primary, availability: if label().trim().is_empty() || endpoint().trim().is_empty() { Availability::Disabled } else { Availability::Enabled }, onclick: move |_| {
                 let mut settings = state.data.read().settings.clone();
                 settings.providers.push(ProviderConfig { id: Uuid::new_v4(), label: label().trim().to_owned(), base_url: endpoint().trim().to_owned(), credential: (!credential().trim().is_empty()).then(|| credential().trim().to_owned()), api: ProviderApi::ALL.into_iter().find(|a| a.label() == api()).unwrap_or_default() });
-                dispatch(state, Command::SaveSettings(settings));
+                dispatch(state, Command::SaveSettings(Box::new(settings)));
             }, "Save connection" } }
         }
         for provider in &snapshot.settings.providers {
@@ -56,7 +56,7 @@ pub fn Providers() -> Element {
                 }
                 CardFooter {
                     Button { variant: ButtonVariant::Secondary, onclick: move |_| dispatch(state, Command::RefreshCatalog { provider: provider_id }), "Refresh models" }
-                    Button { variant: ButtonVariant::Ghost, onclick: move |_| { let mut settings = state.data.read().settings.clone(); settings.providers.retain(|p| p.id != provider_id); dispatch(state, Command::SaveSettings(settings)); }, "Remove connection" }
+                    Button { variant: ButtonVariant::Ghost, onclick: move |_| { let mut settings = state.data.read().settings.clone(); settings.providers.retain(|p| p.id != provider_id); dispatch(state, Command::SaveSettings(Box::new(settings))); }, "Remove connection" }
                 }
               } }
             }
@@ -79,7 +79,7 @@ pub fn Appearance() -> Element {
             let mut settings = state.data.read().settings.clone();
             settings.theme_design = choice.design.as_str().into(); settings.theme_palette = Some(choice.palette.as_str().into());
             settings.theme_scheme = choice.scheme.as_str().into(); settings.theme_contrast = choice.contrast.as_str().into();
-            dispatch(state, Command::SaveSettings(settings));
+            dispatch(state, Command::SaveSettings(Box::new(settings)));
         } }
     } }
 }
@@ -88,6 +88,31 @@ pub fn Prompts() -> Element {
     let state = use_context::<State>();
     rsx! { PageFrame { kicker: "Agent behavior", title: "The right mode for the work.", description: "Prompts guide behavior. Tool permissions are enforced separately at the gateway.",
         for mode in Mode::ALL { PromptEditor { key: "{mode.label()}", mode, initial: state.data.read().settings.prompts.iter().find(|p| p.mode == mode).map(|p| p.prompt.clone()).unwrap_or_default() } }
+        ProgramDirectories {}
+    } }
+}
+/// The directories, beyond the system's, whose programs sandboxed commands
+/// may run. The gateway checks and canonicalizes each one when saved.
+#[component]
+fn ProgramDirectories() -> Element {
+    let state = use_context::<State>();
+    let mut entry = use_signal(String::new);
+    let directories = state.data.read().settings.program_directories.clone();
+    rsx! { Card { variant: CardVariant::Elevated,
+        CardHeader { CardTitle { "Command programs" } CardSubtitle { "Directories whose programs sandboxed commands may run, read-only, besides /usr/bin and /bin" } }
+        CardBody {
+            if directories.is_empty() {
+                p { class: "a206-muted", "None. Add a toolchain or package manager prefix, such as a Homebrew directory, to make its programs available. Its bin directory goes on the command's PATH." }
+            }
+            for directory in directories {
+                div { key: "{directory.display()}", class: "a206-row",
+                    code { "{directory.display()}" }
+                    Button { variant: ButtonVariant::Ghost, onclick: { let directory = directory.clone(); move |_| { let mut settings = state.data.read().settings.clone(); settings.program_directories.retain(|d| *d != directory); dispatch(state, Command::SaveSettings(Box::new(settings))); } }, "Remove" }
+                }
+            }
+            Field { label: rsx! { "Directory" }, hint: rsx! { "An absolute path. Not your home, a writable project or private state; programs there can read what commands are granted." }, Input { value: ReadSignal::from(entry), oninput: move |v| entry.set(v), placeholder: "Absolute directory path" } }
+        }
+        CardFooter { Button { variant: ButtonVariant::Secondary, disabled: entry.read().trim().is_empty(), onclick: move |_| { let mut settings = state.data.read().settings.clone(); settings.program_directories.push(entry().trim().into()); dispatch(state, Command::SaveSettings(Box::new(settings))); }, "Add directory" } }
     } }
 }
 #[component]
@@ -97,7 +122,7 @@ fn PromptEditor(mode: Mode, initial: String) -> Element {
     rsx! { Card {
         CardHeader { CardTitle { "{mode.label()}" } CardSubtitle { {format!("Maximum tool surface: {}", mode.ceiling().iter().map(|c| format!("{c:?}")).collect::<Vec<_>>().join(", "))} } }
         CardBody { Field { label: rsx! { "System prompt" }, Textarea { value: ReadSignal::from(prompt), oninput: move |v| prompt.set(v), rows: "3" } } }
-        CardFooter { Button { variant: ButtonVariant::Secondary, onclick: move |_| { let mut settings = state.data.read().settings.clone(); if let Some(entry) = settings.prompts.iter_mut().find(|p| p.mode == mode) { entry.prompt = prompt(); } dispatch(state, Command::SaveSettings(settings)); }, "Save prompt" } }
+        CardFooter { Button { variant: ButtonVariant::Secondary, onclick: move |_| { let mut settings = state.data.read().settings.clone(); if let Some(entry) = settings.prompts.iter_mut().find(|p| p.mode == mode) { entry.prompt = prompt(); } dispatch(state, Command::SaveSettings(Box::new(settings))); }, "Save prompt" } }
     } }
 }
 
@@ -140,9 +165,9 @@ fn BackendEditor(kind: CodingBackend, initial: Option<BackendConfig>) -> Element
                 let mut settings = state.data.read().settings.clone();
                 settings.backends.retain(|b| b.kind != kind);
                 settings.backends.push(BackendConfig { kind, executable: executable(), runtime_root: root(), adapter_script: (kind == CodingBackend::ClaudeAgent).then(&*script) });
-                dispatch(state, Command::SaveSettings(settings));
+                dispatch(state, Command::SaveSettings(Box::new(settings)));
             }, if enabled { "Save runtime" } else { "Configure runtime" } }
-            if enabled { Button { variant: ButtonVariant::Ghost, onclick: move |_| { let mut settings = state.data.read().settings.clone(); settings.backends.retain(|b| b.kind != kind); dispatch(state, Command::SaveSettings(settings)); }, "Disconnect runtime" } }
+            if enabled { Button { variant: ButtonVariant::Ghost, onclick: move |_| { let mut settings = state.data.read().settings.clone(); settings.backends.retain(|b| b.kind != kind); dispatch(state, Command::SaveSettings(Box::new(settings))); }, "Disconnect runtime" } }
         }
     } }
 }
@@ -186,7 +211,7 @@ fn PresetLibrary() -> Element {
     rsx! { Card { variant: CardVariant::Elevated,
         CardHeader { CardTitle { "Provider library" } CardSubtitle { "{library.effective().len()} visible presets · stored overrides never change existing accounts" } }
         CardBody {
-            Checkbox { label: rsx! { "Include bundled providers" }, checked: ReadSignal::from(builtins), onchange: move |include| { let mut settings = state.data.read().settings.clone(); settings.provider_presets.include_builtins = include; dispatch(state, Command::SaveSettings(settings)); } }
+            Checkbox { label: rsx! { "Include bundled providers" }, checked: ReadSignal::from(builtins), onchange: move |include| { let mut settings = state.data.read().settings.clone(); settings.provider_presets.include_builtins = include; dispatch(state, Command::SaveSettings(Box::new(settings))); } }
             div { class: "a206-row",
                 Select { label: name!("Edit provider preset"), value: ReadSignal::from(selected), options, placeholder: "Choose a preset to edit", onchange: move |value| { selected.set(Some(value)); editing.set(true); } }
                 Button { variant: ButtonVariant::Secondary, onclick: move |_| { selected.set(None); generation.set(generation().wrapping_add(1)); editing.set(true); }, "New preset" }
@@ -260,10 +285,10 @@ fn PresetEditor(initial: Option<ProviderPreset>) -> Element {
                 settings.provider_presets.entries.retain(|p| p.id != entry.id);
                 settings.provider_presets.disabled.remove(&entry.id);
                 settings.provider_presets.entries.push(entry);
-                dispatch(state, Command::SaveSettings(settings));
+                dispatch(state, Command::SaveSettings(Box::new(settings)));
             }, "Save preset" }
-            if let Some(target) = hide_id { Button { variant: ButtonVariant::Ghost, onclick: move |_| { let mut settings = state.data.read().settings.clone(); if hidden { settings.provider_presets.disabled.remove(&target); } else { settings.provider_presets.disabled.insert(target.clone()); } dispatch(state, Command::SaveSettings(settings)); }, if hidden { "Show preset" } else { "Hide preset" } } }
-            if let Some(target) = reset_id { Button { variant: ButtonVariant::Ghost, onclick: move |_| { let mut settings = state.data.read().settings.clone(); settings.provider_presets.entries.retain(|p| p.id != target); settings.provider_presets.disabled.remove(&target); dispatch(state, Command::SaveSettings(settings)); }, if is_builtin { "Restore bundled version" } else { "Delete custom preset" } } }
+            if let Some(target) = hide_id { Button { variant: ButtonVariant::Ghost, onclick: move |_| { let mut settings = state.data.read().settings.clone(); if hidden { settings.provider_presets.disabled.remove(&target); } else { settings.provider_presets.disabled.insert(target.clone()); } dispatch(state, Command::SaveSettings(Box::new(settings))); }, if hidden { "Show preset" } else { "Hide preset" } } }
+            if let Some(target) = reset_id { Button { variant: ButtonVariant::Ghost, onclick: move |_| { let mut settings = state.data.read().settings.clone(); settings.provider_presets.entries.retain(|p| p.id != target); settings.provider_presets.disabled.remove(&target); dispatch(state, Command::SaveSettings(Box::new(settings))); }, if is_builtin { "Restore bundled version" } else { "Delete custom preset" } } }
         }
     } }
 }

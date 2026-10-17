@@ -43,6 +43,12 @@ pub struct ToolBudget {
     pub rounds: u32,
     /// Tool calls the gateway decides on per run, across all rounds.
     pub tool_calls: u32,
+    /// Model tokens per run: input plus output as the provider reports them,
+    /// summed over every request of the run, summaries included. `None` sets
+    /// no limit. Where one applies, a run whose provider leaves its usage
+    /// unknown stops rather than running unmeasured.
+    #[serde(default)]
+    pub tokens: Option<u64>,
 }
 impl ToolBudget {
     /// The largest budget the gateway accepts for either limit.
@@ -53,6 +59,7 @@ impl Default for ToolBudget {
         Self {
             rounds: 8,
             tool_calls: 32,
+            tokens: None,
         }
     }
 }

@@ -4,8 +4,8 @@
 //!
 //! The policy denies by default and then allows what the Linux layers allow:
 //! the system libraries, the runtime's installation, its private scratch
-//! directory, the granted project, `/usr/bin` and `/bin` with `execute`, and
-//! the network the profile names. Hidden paths are denied last, so they stay
+//! directory, the granted project, `/usr/bin` and `/bin` with `execute`, the
+//! program directories the user chose, and the network the profile names. Hidden paths are denied last, so they stay
 //! invisible even inside a granted directory; Seatbelt applies the last
 //! matching rule. Unlike bubblewrap, Seatbelt checks paths rather than
 //! mounts, so a hidden path that is a file or does not exist yet is covered
@@ -57,6 +57,7 @@ impl Profile<'_> {
     /// The Seatbelt policy for this launch. All paths must be canonical, as
     /// Seatbelt compares resolved paths.
     pub fn seatbelt(&self) -> Result<String, SandboxError> {
+        self.check_programs()?;
         let root = quote(self.root)?;
         let scratch = quote(self.scratch)?;
         let mut policy = String::from(
@@ -107,6 +108,13 @@ impl Profile<'_> {
                 quote(Path::new(SHELL_SELECTION))?
             ));
             traversed.push(Path::new(SHELL_SELECTION));
+        }
+        for program in self.programs {
+            rule(format!(
+                "(allow process-exec file-read* file-map-executable (subpath {}))\n",
+                quote(program)?
+            ));
+            traversed.push(program);
         }
         if let Some(terminal) = self.terminal {
             rule(format!(
@@ -200,6 +208,7 @@ mod tests {
                 control: &self.control,
                 workspace,
                 execute,
+                programs: &[],
                 hidden: &self.hidden,
                 cwd: &self.scratch,
                 network: NetworkAccess::None,
@@ -353,5 +362,44 @@ mod tests {
         let policy = profile.seatbelt().unwrap();
         assert!(!policy.lines().any(|line| line == "(allow default)"));
         assert!(policy.contains(r#"x\")) (allow default"#));
+    }
+
+    #[test]
+    fn program_directories_may_run_and_hidden_paths_still_win() {
+        let paths = paths();
+        let tools = paths.root.with_file_name("tools");
+        let programs = vec![tools.clone()];
+        let policy = Profile {
+            programs: &programs,
+            ..paths.profile(None, false)
+        }
+        .seatbelt()
+        .unwrap();
+        let quoted_tools = quoted(&tools);
+        let grant = policy
+            .find(&format!(
+                "(allow process-exec file-read* file-map-executable (subpath {quoted_tools}))"
+            ))
+            .unwrap();
+        let parent = quoted(tools.parent().unwrap());
+        assert!(policy.contains(&format!("(allow file-read-metadata (literal {parent}))")));
+        let hidden = policy.find("(deny file-read* file-write*").unwrap();
+        assert!(hidden > grant);
+        assert!(
+            !paths
+                .profile(None, false)
+                .seatbelt()
+                .unwrap()
+                .contains(&quoted_tools)
+        );
+        let inside = vec![paths.hidden[0].join("bin")];
+        assert!(matches!(
+            Profile {
+                programs: &inside,
+                ..paths.profile(None, false)
+            }
+            .seatbelt(),
+            Err(SandboxError::HiddenProgramDirectory { .. })
+        ));
     }
 }

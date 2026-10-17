@@ -272,13 +272,16 @@ mod native {
             tool: String,
             permission: String,
         },
-        /// Limit model rounds and tool calls per run.
+        /// Limit model rounds, tool calls and, optionally, tokens per run.
         Budget {
             thread: uuid::Uuid,
             #[arg(long)]
             rounds: u32,
             #[arg(long)]
             tool_calls: u32,
+            /// Input plus output tokens per run, as the provider reports them.
+            #[arg(long)]
+            tokens: Option<u64>,
         },
     }
     #[derive(Subcommand)]
@@ -460,7 +463,7 @@ mod native {
                 anyhow::anyhow!("no MCP server named {name}; add it with settings --apply")
             })?
             .enabled = enabled;
-        Ok(Command::SaveSettings(settings))
+        Ok(Command::SaveSettings(Box::new(settings)))
     }
     fn default_root() -> anyhow::Result<PathBuf> {
         Ok(PathBuf::from(
@@ -805,7 +808,7 @@ mod native {
                         }
                         provider.credential = credential;
                         settings.providers.push(provider);
-                        Command::SaveSettings(settings)
+                        Command::SaveSettings(Box::new(settings))
                     }
                     Action::Backend {
                         command:
@@ -829,7 +832,7 @@ mod native {
                             runtime_root,
                             adapter_script,
                         });
-                        Command::SaveSettings(settings)
+                        Command::SaveSettings(Box::new(settings))
                     }
                     Action::Backend {
                         command:
@@ -989,9 +992,14 @@ mod native {
                             thread,
                             rounds,
                             tool_calls,
+                            tokens,
                         } => Command::SetToolBudget {
                             thread,
-                            budget: ToolBudget { rounds, tool_calls },
+                            budget: ToolBudget {
+                                rounds,
+                                tool_calls,
+                                tokens,
+                            },
                         },
                     },
                     Action::Plan { thread } => {
@@ -1107,7 +1115,7 @@ mod native {
                         },
                     },
                     Action::Settings { apply: Some(path) } => {
-                        Command::SaveSettings(toml::from_str(&std::fs::read_to_string(path)?)?)
+                        Command::SaveSettings(Box::new(toml::from_str(&std::fs::read_to_string(path)?)?))
                     }
                     Action::Settings { apply: None } => {
                         if let Reply::Snapshot(snapshot) = client.call(Command::Snapshot).await? {

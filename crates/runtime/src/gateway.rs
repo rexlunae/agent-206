@@ -171,6 +171,8 @@ pub enum GatewayError {
     #[error(transparent)]
     Prompt(#[from] crate::prompt_tool::PromptError),
     #[error(transparent)]
+    Programs(#[from] crate::exec_tool::programs::ProgramsError),
+    #[error(transparent)]
     Schedule(#[from] crate::schedule::ScheduleError),
     #[error(transparent)]
     Search(#[from] a206_core::SearchError),
@@ -254,6 +256,7 @@ impl crate::error::Classified for GatewayError {
             Self::Mcp(error) => return classify(error),
             Self::Skill(error) => return classify(error),
             Self::Prompt(error) => return classify(error),
+            Self::Programs(error) => return classify(error),
             Self::Schedule(error) => return classify(error),
             Self::Frame(error) => return classify(error),
             Self::Run(error) => return classify(error),
@@ -806,7 +809,17 @@ impl Gateway {
                         GatewayError::Invalid("each mode needs exactly one prompt"),
                     )?;
                 }
+                let home = std::env::var_os("HOME").map(PathBuf::from);
                 let mut store = self.lock()?;
+                let mut hidden = a206_sandbox::hidden_home_paths();
+                hidden.push(store.root.clone());
+                settings.program_directories = crate::exec_tool::programs::validate(
+                    &settings.program_directories,
+                    &store.state.settings.program_directories,
+                    &hidden,
+                    home.as_deref(),
+                    &store.root,
+                )?;
                 check(
                     settings.revision == store.state.settings.revision,
                     GatewayError::Conflict(
@@ -873,11 +886,13 @@ impl Gateway {
                 });
                 store.state.messengers =
                     Self::messenger_statuses(&store.state.messengers, &settings.messengers);
-                let previous = std::mem::replace(&mut store.state.settings, settings);
+                let previous = std::mem::replace(&mut store.state.settings, *settings);
                 store.state.mcp_servers = mcp_servers;
                 store.persist(Some(EventKind::SettingsChanged))?;
                 self.stop_changed_mcp(&previous.mcp_servers, &store.state.settings.mcp_servers)?;
                 drop(store);
+                // Background commands given a directory that was removed stop.
+                self.grants_changed()?;
                 self.publish_messengers()?;
                 Ok(Reply::Ok)
             }
@@ -2244,7 +2259,7 @@ mod tests {
             gateway
                 .request(Request {
                     id: Id::new_v4(),
-                    body: Command::SaveSettings(rename)
+                    body: Command::SaveSettings(Box::new(rename))
                 })
                 .await
                 .body,
@@ -2264,7 +2279,7 @@ mod tests {
             let reply = gateway
                 .request(Request {
                     id: request,
-                    body: Command::SaveSettings(settings),
+                    body: Command::SaveSettings(Box::new(settings)),
                 })
                 .await
                 .body;
@@ -2277,6 +2292,42 @@ mod tests {
             );
             assert_eq!(gateway.snapshot().unwrap(), before);
         }
+    }
+    #[tokio::test]
+    async fn program_directories_are_saved_canonically_or_refused_intact() {
+        let directory = tempfile::tempdir().unwrap();
+        let gateway = Gateway::open(directory.path()).unwrap();
+        let tools = tempfile::tempdir().unwrap();
+        let alias = tools.path().with_extension(Id::new_v4().to_string());
+        std::os::unix::fs::symlink(tools.path(), &alias).unwrap();
+        let save = |settings: Settings| {
+            gateway.request(Request {
+                id: Id::new_v4(),
+                body: Command::SaveSettings(Box::new(settings)),
+            })
+        };
+        let mut settings = gateway.snapshot().unwrap().settings;
+        settings.program_directories = vec![alias.clone()];
+        assert_eq!(save(settings).await.body, Reply::Ok);
+        let saved = gateway.snapshot().unwrap();
+        assert_eq!(
+            saved.settings.program_directories,
+            [std::fs::canonicalize(tools.path()).unwrap()]
+        );
+        // Gateway state cannot be offered to commands; nothing changes.
+        let mut settings = saved.settings.clone();
+        settings
+            .program_directories
+            .push(directory.path().join("."));
+        let reply = save(settings).await.body;
+        assert!(
+            matches!(reply, Reply::Error(ref report)
+                if report.kind == ErrorKind::PermissionDenied
+                    && report.message.contains("program directory")),
+            "{reply:?}"
+        );
+        assert_eq!(gateway.snapshot().unwrap(), saved);
+        std::fs::remove_file(alias).unwrap();
     }
     #[tokio::test]
     async fn partial_downloads_are_cleaned_on_errors_cancellation_and_publication() {
