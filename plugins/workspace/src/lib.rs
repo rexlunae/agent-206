@@ -1,9 +1,12 @@
 //! Bundled workspace extension. Every file access is a host call that the
 //! gateway authorizes against the caller's `read_workspace` grant.
 use a206_extension_sdk::{
-    Args, DirEntry, EntryKind, Extension, Field, GuestError, Node, SearchOptions, Tone, ToolOutput,
-    UiEvent, View, bool_arg, excerpt, host, int_arg, string_arg,
+    Args, DirEntry, EntryKind, Extension, Field, FileChange, FilePatch, GuestError, Node,
+    PatchResult, SearchOptions, Tone, ToolOutput, UiEvent, View, bool_arg, excerpt, host, int_arg,
+    string_arg,
 };
+
+mod patch;
 
 struct Workspace;
 a206_extension_sdk::export!(Workspace);
@@ -108,6 +111,13 @@ impl Extension for Workspace {
                     text: format!("edited {path}"),
                 })
             }
+            "apply_patch" => {
+                let files = patch::parse(required(args, "patch")?)
+                    .map_err(|error| GuestError::new("invalid_patch", error.to_string()))?;
+                let check_only = bool_arg(args, "check_only")?.unwrap_or(false);
+                let result = host::patch_files(files.clone(), check_only)?;
+                patched(&files, result, check_only).map(|text| ToolOutput { text })
+            }
             _ => Err(GuestError::new("unknown_tool", format!("no tool `{name}`"))),
         }
     }
@@ -179,6 +189,49 @@ impl Extension for Workspace {
         }
         Ok(View { nodes })
     }
+}
+
+/// What a patch did, or why it stopped: a failure says which files were
+/// already written, so the agent never takes a partial patch for none.
+fn patched(
+    files: &[FilePatch],
+    result: PatchResult,
+    check_only: bool,
+) -> Result<String, GuestError> {
+    let describe = |file: &FilePatch| {
+        let (create, change, delete) = if check_only {
+            ("create", "change", "delete")
+        } else {
+            ("created", "changed", "deleted")
+        };
+        match (file.change, file.hunks.len()) {
+            (FileChange::Create, _) => format!("{create} {}", file.path),
+            (FileChange::Modify, 1) => format!("{change} {} (1 hunk)", file.path),
+            (FileChange::Modify, hunks) => format!("{change} {} ({hunks} hunks)", file.path),
+            (FileChange::Delete, _) => format!("{delete} {}", file.path),
+        }
+    };
+    if let Some(failed) = result.failed {
+        let written = if result.changed.is_empty() {
+            "No file was changed.".to_string()
+        } else {
+            format!(
+                "Already changed: {}. The files after {} were not changed.",
+                result.changed.join(", "),
+                failed.path
+            )
+        };
+        return Err(GuestError::new(
+            failed.failure.code.as_str(),
+            format!("{}: {} {written}", failed.path, failed.failure.message),
+        ));
+    }
+    let done: Vec<String> = files.iter().map(describe).collect();
+    Ok(if check_only {
+        format!("the patch applies and would: {}", done.join("; "))
+    } else {
+        done.join("; ")
+    })
 }
 
 fn sort(entries: &mut [DirEntry]) {
