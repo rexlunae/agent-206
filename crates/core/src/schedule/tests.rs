@@ -89,3 +89,23 @@ fn intervals_are_positive_whole_seconds_and_print_as_typed() {
         Err(ScheduleInputError::Duration { .. })
     ));
 }
+
+#[test]
+fn days_and_weeks_are_fixed_lengths_and_months_are_refused() {
+    let days = 1 + arbitrary(1_000);
+    let hours = arbitrary(24);
+    assert_eq!(
+        parse_interval(&format!("{days}d {hours}h")).unwrap(),
+        (days * 24 + hours) * 3600
+    );
+    assert_eq!(
+        parse_interval(&format!("{days}w")).unwrap(),
+        days * 7 * 24 * 3600
+    );
+    for calendar in ["1mo", "1y"] {
+        assert!(matches!(
+            parse_interval(calendar),
+            Err(ScheduleInputError::Duration { .. })
+        ));
+    }
+}

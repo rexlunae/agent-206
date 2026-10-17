@@ -10,9 +10,18 @@ use serde::{Deserialize, Serialize};
 pub enum Schedule {
     /// Once, at a Unix time in seconds.
     At { at: u64 },
+    /// Once, `seconds` after the gateway accepts the job. The gateway stores
+    /// it as `At`, measured by its own clock, so a client's clock never moves it.
+    In { seconds: u64 },
     /// Every `seconds`, at `anchor + n × seconds` (Unix seconds), so a late
-    /// run does not shift later ones.
-    Every { seconds: u64, anchor: u64 },
+    /// run does not shift later ones. With no anchor the gateway anchors it
+    /// when it accepts the job, by its own clock, so the first run comes one
+    /// interval later.
+    Every {
+        seconds: u64,
+        #[serde(default)]
+        anchor: Option<u64>,
+    },
     /// A cron expression (five fields, or six with seconds first) evaluated
     /// in an IANA time zone, or in the gateway's own zone when `zone` is unset.
     Cron {
@@ -173,15 +182,19 @@ pub fn parse_local(date: &str, time: &str, zone: &str) -> Result<u64, ScheduleIn
     unix(zoned.timestamp())
 }
 
-/// A positive whole-second interval such as `90m`, `1d` or `1h 30m`.
+/// A positive whole-second interval such as `90m`, `1d` or `1h 30m`. Days
+/// and weeks are 24 and 168 hours; months and years have no fixed length and
+/// are refused.
 pub fn parse_interval(input: &str) -> Result<u64, ScheduleInputError> {
+    let refused = |cause| ScheduleInputError::Duration {
+        input: input.to_owned(),
+        cause,
+    };
     let interval = input
         .trim()
-        .parse::<jiff::SignedDuration>()
-        .map_err(|cause| ScheduleInputError::Duration {
-            input: input.to_owned(),
-            cause,
-        })?;
+        .parse::<jiff::Span>()
+        .and_then(|span| span.to_duration(jiff::SpanRelativeTo::days_are_24_hours()))
+        .map_err(refused)?;
     if interval.subsec_nanos() != 0 {
         return Err(ScheduleInputError::Fraction(input.to_owned()));
     }

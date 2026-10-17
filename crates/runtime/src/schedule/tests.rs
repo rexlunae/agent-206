@@ -22,10 +22,48 @@ fn one_time_jobs_are_due_once_and_never_in_the_past() {
 }
 
 #[test]
+fn relative_schedules_are_placed_at_acceptance_and_not_before() {
+    let now = time();
+    let seconds = 1 + time() % MAX_INTERVAL;
+    let delay = Schedule::In { seconds };
+    let unanchored = Schedule::Every {
+        seconds,
+        anchor: None,
+    };
+    for relative in [&delay, &unanchored] {
+        assert!(matches!(
+            next_after(relative, now),
+            Err(ScheduleError::Unresolved)
+        ));
+    }
+    assert_eq!(
+        resolve(delay, now).unwrap(),
+        Schedule::At { at: now + seconds }
+    );
+    assert_eq!(
+        resolve(unanchored, now).unwrap(),
+        Schedule::Every {
+            seconds,
+            anchor: Some(now)
+        }
+    );
+    assert!(matches!(
+        resolve(Schedule::In { seconds: 0 }, now),
+        Err(ScheduleError::Delay)
+    ));
+    // Placed schedules are kept as they are.
+    let cron = utc("0 9 * * *");
+    assert_eq!(resolve(cron.clone(), now).unwrap(), cron);
+}
+
+#[test]
 fn intervals_stay_on_their_anchored_grid() {
     let anchor = time();
     let seconds = MIN_INTERVAL + time() % 86_400;
-    let schedule = Schedule::Every { seconds, anchor };
+    let schedule = Schedule::Every {
+        seconds,
+        anchor: Some(anchor),
+    };
     let steps = time() % 1000;
     let late = time() % seconds;
     assert_eq!(
@@ -35,7 +73,13 @@ fn intervals_stay_on_their_anchored_grid() {
     assert_eq!(next_after(&schedule, anchor - 1).unwrap(), Some(anchor));
     for seconds in [MIN_INTERVAL - 1, MAX_INTERVAL + 1] {
         assert!(matches!(
-            next_after(&Schedule::Every { seconds, anchor }, anchor),
+            next_after(
+                &Schedule::Every {
+                    seconds,
+                    anchor: Some(anchor)
+                },
+                anchor
+            ),
             Err(ScheduleError::Interval)
         ));
     }
@@ -91,7 +135,7 @@ fn a_restart_sends_an_interrupted_message_once() {
     let seconds = MIN_INTERVAL + time() % 86_400;
     let every = Schedule::Every {
         seconds,
-        anchor: started,
+        anchor: Some(started),
     };
 
     // Sent before the restart, and the run finished or was interrupted.

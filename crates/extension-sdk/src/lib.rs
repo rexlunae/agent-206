@@ -321,6 +321,16 @@ pub mod host {
             new: new.into(),
         })?)
     }
+    /// Apply `files` together; see [`HostRequest::PatchFiles`].
+    pub fn patch_files(
+        files: Vec<FilePatch>,
+        check_only: bool,
+    ) -> Result<PatchResult, HostFailure> {
+        match call(&HostRequest::PatchFiles { files, check_only })? {
+            HostReply::Patched(result) => Ok(result),
+            _ => Err(unexpected()),
+        }
+    }
     /// Create a directory and any missing parents.
     pub fn create_directory(path: &str) -> Result<(), HostFailure> {
         done(call(&HostRequest::CreateDirectory { path: path.into() })?)
