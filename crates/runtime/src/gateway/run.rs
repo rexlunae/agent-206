@@ -364,6 +364,11 @@ impl Gateway {
         let mut round = 0;
         loop {
             round += 1;
+            // A cancellation between rounds ends the run as Cancelled, before
+            // any other reason not to start the next round.
+            if run.cancel.is_cancelled() {
+                return Ok(Ended::Cancelled);
+            }
             // Every round's reply must fit; refuse the round rather than
             // stream a reply the conversation could not store.
             if self.lock()?.remaining()? < NEXT_ROUND {
