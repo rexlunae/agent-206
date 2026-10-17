@@ -10,7 +10,6 @@ mod route;
 mod settings;
 #[cfg(target_arch = "wasm32")]
 use a206_core::Ignore;
-#[cfg(not(target_arch = "wasm32"))]
 mod setup;
 #[cfg(not(target_arch = "wasm32"))]
 mod vault;
@@ -33,9 +32,7 @@ static PROFILE: std::sync::Mutex<Option<(std::path::PathBuf, Option<String>)>> =
     std::sync::Mutex::new(None);
 /// A saved setup that could not be loaded; the setup screen shows it.
 #[cfg(not(target_arch = "wasm32"))]
-static SETUP_ERROR: std::sync::Mutex<
-    Option<std::sync::Arc<a206_runtime::connection::ConnectionError>>,
-> = std::sync::Mutex::new(None);
+static SETUP_ERROR: std::sync::Mutex<Option<ErrorReport>> = std::sync::Mutex::new(None);
 /// Connect only to an explicit `--remote` or a saved setup. Without either, the
 /// desktop and terminal clients open first-time setup instead of launching a gateway.
 #[cfg(not(target_arch = "wasm32"))]
@@ -48,7 +45,8 @@ pub fn configure(root: std::path::PathBuf, remote: Option<String>) {
         Ok(None) => {}
         Err(error) => {
             if let Ok(mut slot) = SETUP_ERROR.lock() {
-                *slot = Some(std::sync::Arc::new(error));
+                // Traced where it occurred; kept structured for the setup screen.
+                *slot = Some(a206_runtime::error::report(&error));
             }
         }
     }
@@ -73,7 +71,7 @@ fn setup_required() -> bool {
     }
     #[cfg(target_arch = "wasm32")]
     {
-        // The web bridge is configured on the server with `agent206 gateway setup`.
+        // The bridge is asked once the shell mounts; see `Shell`.
         false
     }
 }
@@ -143,7 +141,7 @@ fn captured(kind: ErrorKind) -> impl Fn(&(dyn std::error::Error + 'static)) -> E
     move |error| ErrorReport::capture(error, |_| Some(kind))
 }
 #[cfg(target_arch = "wasm32")]
-async fn web_request<T: serde::Serialize, R: serde::de::DeserializeOwned>(
+pub(crate) async fn web_request<T: serde::Serialize, R: serde::de::DeserializeOwned>(
     path: &str,
     body: T,
 ) -> Result<R, ErrorReport> {
@@ -166,6 +164,10 @@ async fn web_request<T: serde::Serialize, R: serde::de::DeserializeOwned>(
         .send()
         .await
         .map_err(|e| captured(ErrorKind::Unavailable)(&e))?;
+    // A failed gateway control carries its structured report as the body.
+    if response.status().as_u16() == 409 {
+        return Err(decode_response::<ErrorReport>(&request.id, response).await?);
+    }
     if !response.status().is_success() {
         if matches!(response.status().as_u16(), 404 | 405) {
             return Err(ErrorReport::new(
@@ -187,6 +189,13 @@ async fn web_request<T: serde::Serialize, R: serde::de::DeserializeOwned>(
             response.status()
         )));
     }
+    decode_response(&request.id, response).await
+}
+#[cfg(target_arch = "wasm32")]
+async fn decode_response<R: serde::de::DeserializeOwned>(
+    id: &Uuid,
+    response: reqwest::Response,
+) -> Result<R, ErrorReport> {
     let bytes = response
         .bytes()
         .await
@@ -205,7 +214,7 @@ async fn web_request<T: serde::Serialize, R: serde::de::DeserializeOwned>(
         ));
     }
     let response = replies.remove(0);
-    if response.id != request.id {
+    if response.id != *id {
         return Err(ErrorReport::new(
             ErrorKind::Protocol,
             "gateway response id mismatch",
@@ -503,6 +512,15 @@ fn Shell() -> Element {
     };
     use_context_provider(|| state);
     use_future(move || async move {
+        // The web bridge may not have a gateway yet; ask before polling one.
+        // If the bridge cannot be asked, polling reports why.
+        #[cfg(target_arch = "wasm32")]
+        if let Ok(status) = setup::status().await
+            && status.required()
+        {
+            let mut setup = state.setup;
+            setup.set(true);
+        }
         let mut themed = false;
         loop {
             // Never poll (or launch) a gateway before the user has chosen one.
@@ -552,14 +570,7 @@ fn Shell() -> Element {
 }
 #[component]
 fn GatewaySetupGate() -> Element {
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        rsx! { setup::GatewaySetup {} }
-    }
-    #[cfg(target_arch = "wasm32")]
-    {
-        rsx! {}
-    }
+    rsx! { setup::GatewaySetup {} }
 }
 #[component]
 fn Header() -> Element {

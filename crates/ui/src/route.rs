@@ -240,6 +240,13 @@ mod tests {
         let mut dom = VirtualDom::new(setup_app);
         dom.provide_root_context(Rc::new(MemoryHistory::default()) as Rc<dyn History>);
         dom.rebuild_in_place();
+        // Let the setup status resource resolve, then render what it shows.
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(dom.wait_for_work());
+        dom.render_immediate(&mut dioxus::dioxus_core::NoOpMutations);
         let html = dioxus_ssr::render(&dom);
         assert!(html.contains("Choose your gateway."));
         assert!(html.contains("This computer"));

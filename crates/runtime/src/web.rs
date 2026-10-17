@@ -1,6 +1,12 @@
 //! Loopback web bridge. Origin-scoped bearer sessions avoid leaking cookies to preview servers.
-use crate::control::GatewayController;
-use a206_core::{Command, GatewayAction, Reply};
+use crate::{
+    connection::{self, ConnectionError},
+    control::GatewayController,
+};
+use a206_core::{
+    Command, ErrorReport, GatewayAction, GatewayConnection, GatewayTarget, Reply, SetupReply,
+    SetupRequest, SetupStatus,
+};
 use a206_protocol::{Decoder, Request};
 use axum::{
     Router,
@@ -13,7 +19,7 @@ use axum::{
 use std::{
     path::PathBuf,
     sync::{
-        Arc,
+        Arc, PoisonError, RwLock,
         atomic::{AtomicBool, Ordering},
     },
 };
@@ -21,7 +27,8 @@ use tower::ServiceExt;
 use tower_http::services::{ServeDir, ServeFile};
 #[derive(Clone)]
 struct Web {
-    client: GatewayController,
+    gateway: Arc<RwLock<Gateway>>,
+    root: Arc<PathBuf>,
     token: Arc<String>,
     bootstrap: Arc<String>,
     claimed: Arc<AtomicBool>,
@@ -39,6 +46,82 @@ pub enum WebError {
     },
     #[error("web bridge stopped")]
     Serve(#[source] std::io::Error),
+    #[error("cannot use the gateway given with --remote")]
+    Remote(#[source] ConnectionError),
+}
+/// The gateway the bridge fronts. Until one is saved (or a saved one is
+/// repaired) the browser is offered setup and nothing connects or launches.
+struct Gateway {
+    client: Option<GatewayController>,
+    pinned: Option<String>,
+    problem: Option<ErrorReport>,
+}
+impl Gateway {
+    fn resolve(root: &std::path::Path, remote: Option<String>) -> Result<Self, WebError> {
+        Ok(match connection::resolve(root, remote.clone()) {
+            Ok(target) => Gateway {
+                client: target.map(|target| {
+                    GatewayController::new(root.into(), target.remote().map(str::to_owned))
+                }),
+                pinned: remote,
+                problem: None,
+            },
+            Err(error) if remote.is_some() => return Err(WebError::Remote(error)),
+            // A damaged saved setup is shown to the browser, which can replace it.
+            Err(error) => Gateway {
+                client: None,
+                pinned: None,
+                problem: Some(crate::error::handle("load gateway setup", &error)),
+            },
+        })
+    }
+}
+impl Web {
+    /// The current controller. The lock guards a plain swap, so a poisoned
+    /// value is still consistent; it is never held across an await.
+    fn client(&self) -> Option<GatewayController> {
+        self.gateway
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .client
+            .clone()
+    }
+    /// A saved setup that cannot be read is reported as the problem to fix.
+    fn status(&self) -> SetupStatus {
+        let gateway = self.gateway.read().unwrap_or_else(PoisonError::into_inner);
+        let (configured, problem) = match connection::load(&self.root) {
+            Ok(saved) => (saved.map(|saved| saved.target), gateway.problem.clone()),
+            Err(error) => (
+                None,
+                Some(crate::error::handle("load gateway setup", &error)),
+            ),
+        };
+        SetupStatus {
+            configured,
+            pinned: gateway.pinned.clone(),
+            problem,
+        }
+    }
+    /// Save a verified target and switch to it in one step, so the file and the
+    /// controller cannot disagree when two tabs save at once.
+    fn install(&self, target: GatewayTarget) -> Result<(), ConnectionError> {
+        let mut gateway = self.gateway.write().unwrap_or_else(PoisonError::into_inner);
+        connection::save(
+            &self.root,
+            &GatewayConnection {
+                target: target.clone(),
+            },
+        )?;
+        *gateway = Gateway {
+            client: Some(GatewayController::new(
+                self.root.to_path_buf(),
+                target.remote().map(str::to_owned),
+            )),
+            pinned: None,
+            problem: None,
+        };
+        Ok(())
+    }
 }
 /// The bridge connects to the configured gateway, local or SSH, on the browser's behalf.
 pub async fn serve(
@@ -54,9 +137,11 @@ pub async fn serve(
         .local_addr()
         .map_err(|source| WebError::Bind { port, source })?
         .port();
+    let gateway = Gateway::resolve(&root, remote)?;
     let token = uuid::Uuid::new_v4().simple().to_string();
     let state = Web {
-        client: GatewayController::new(root, remote),
+        gateway: Arc::new(RwLock::new(gateway)),
+        root: Arc::new(root),
         token: Arc::new(uuid::Uuid::new_v4().simple().to_string()),
         bootstrap: Arc::new(token.clone()),
         claimed: Arc::new(AtomicBool::new(false)),
@@ -74,6 +159,7 @@ fn app(state: Web, static_dir: PathBuf) -> Router {
         .route("/connect/{token}", get(connect))
         .route("/api/command", post(command))
         .route("/api/gateway", post(control))
+        .route("/api/setup", post(setup))
         .layer(DefaultBodyLimit::max(a206_protocol::MAX_FRAME + 10))
         .fallback_service(static_files(static_dir))
         .layer(axum::middleware::from_fn_with_state(
@@ -236,18 +322,26 @@ async fn command(State(state): State<Web>, headers: HeaderMap, bytes: Bytes) -> 
         return StatusCode::FORBIDDEN.into_response();
     }
     let operation = request.body.name();
-    let body = state
-        .client
-        .call_with_id(request.id, request.body)
-        .await
-        .unwrap_or_else(|error| {
-            Reply::Error(crate::error::correlated(operation, request.id, &error))
-        });
-    match a206_protocol::encode(&a206_protocol::Response {
-        id: request.id,
-        body,
-    }) {
+    let body = match state.client() {
+        Some(client) => client
+            .call_with_id(request.id, request.body)
+            .await
+            .unwrap_or_else(|error| {
+                Reply::Error(crate::error::correlated(operation, request.id, &error))
+            }),
+        None => Reply::Error(crate::error::correlated(
+            operation,
+            request.id,
+            &ConnectionError::NotConfigured,
+        )),
+    };
+    respond(StatusCode::OK, request.id, &body)
+}
+/// A MessagePack response frame for request `id`.
+fn respond<T: serde::Serialize>(status: StatusCode, id: uuid::Uuid, body: &T) -> Response {
+    match a206_protocol::encode(&a206_protocol::Response { id, body }) {
         Ok(bytes) => (
+            status,
             [
                 (header::CONTENT_TYPE, "application/msgpack"),
                 (header::CACHE_CONTROL, "no-store"),
@@ -255,7 +349,10 @@ async fn command(State(state): State<Web>, headers: HeaderMap, bytes: Bytes) -> 
             bytes,
         )
             .into_response(),
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        Err(error) => {
+            crate::error::correlated("encode web response", id, &error);
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
     }
 }
 
@@ -271,23 +368,61 @@ async fn control(State(state): State<Web>, headers: HeaderMap, bytes: Bytes) -> 
         return StatusCode::BAD_REQUEST.into_response();
     }
     let request = requests.remove(0);
-    match state.client.control_with_id(request.id, request.body).await {
-        Ok(report) => match a206_protocol::encode(&a206_protocol::Response {
-            id: request.id,
-            body: report,
-        }) {
-            Ok(bytes) => (
-                [
-                    (header::CONTENT_TYPE, "application/msgpack"),
-                    (header::CACHE_CONTROL, "no-store"),
-                ],
-                bytes,
-            )
-                .into_response(),
-            Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    let operation = request.body.name();
+    // A failed control answers 409 with the structured report as its body.
+    let failed = |error: &(dyn std::error::Error + 'static)| {
+        let report = crate::error::correlated(operation, request.id, error);
+        respond(StatusCode::CONFLICT, request.id, &report)
+    };
+    match state.client() {
+        Some(client) => match client.control_with_id(request.id, request.body).await {
+            Ok(report) => respond(StatusCode::OK, request.id, &report),
+            Err(error) => failed(&error),
         },
-        Err(_) => StatusCode::CONFLICT.into_response(),
+        None => failed(&ConnectionError::NotConfigured),
     }
+}
+
+/// Gateway setup for the browser. SSH runs here, with the bridge's OpenSSH
+/// configuration and the profile's known_hosts; the browser sees only
+/// fingerprints and chooses which one it verified.
+async fn setup(State(state): State<Web>, headers: HeaderMap, bytes: Bytes) -> Response {
+    if !authorized(&state, &headers) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let mut decoder = Decoder::default();
+    let Ok(mut requests) = decoder.feed::<Request<SetupRequest>>(&bytes) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    if requests.len() != 1 || decoder.finish().is_err() {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let request = requests.remove(0);
+    let root = state.root.as_path();
+    let outcome = match request.body {
+        SetupRequest::Status => Ok(SetupReply::Status(state.status())),
+        SetupRequest::Probe { endpoint } => connection::probe(root, &endpoint)
+            .await
+            .map(SetupReply::Probe),
+        SetupRequest::Trust {
+            endpoint,
+            fingerprint,
+        } => connection::trust_fingerprints(root, &endpoint, &[fingerprint])
+            .await
+            .map(SetupReply::Probe),
+        SetupRequest::Save { target } => match connection::verify(root, &target).await {
+            Ok(()) => state.install(target).map(|()| SetupReply::Saved),
+            Err(error) => Err(error),
+        },
+    };
+    let reply = outcome.unwrap_or_else(|error| {
+        SetupReply::Error(crate::error::correlated(
+            "gateway setup",
+            request.id,
+            &error,
+        ))
+    });
+    respond(StatusCode::OK, request.id, &reply)
 }
 
 #[cfg(test)]
@@ -397,11 +532,14 @@ mod tests {
         }
     }
     fn bridge(port: u16) -> Web {
+        let root = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
         Web {
-            client: GatewayController::attach(
-                std::env::temp_dir().join(uuid::Uuid::new_v4().to_string()),
-                None,
-            ),
+            gateway: Arc::new(RwLock::new(Gateway {
+                client: Some(GatewayController::attach(root.clone(), None)),
+                pinned: None,
+                problem: None,
+            })),
+            root: Arc::new(root),
             token: Arc::new(uuid::Uuid::new_v4().simple().to_string()),
             bootstrap: Arc::new(uuid::Uuid::new_v4().simple().to_string()),
             claimed: Arc::new(AtomicBool::new(false)),
@@ -460,16 +598,8 @@ mod tests {
     }
     #[test]
     fn auth_requires_an_explicit_origin_bound_bearer() {
-        let root = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
-        let token = uuid::Uuid::new_v4().simple().to_string();
-        let state = Web {
-            client: GatewayController::attach(root, None),
-            token: Arc::new(token.clone()),
-            bootstrap: Arc::new(uuid::Uuid::new_v4().to_string()),
-            claimed: Arc::new(AtomicBool::new(false)),
-            host: Arc::new("127.0.0.1:8206".into()),
-            origin: Arc::new("http://127.0.0.1:8206".into()),
-        };
+        let state = bridge(8206);
+        let token = state.token.to_string();
         let mut headers = HeaderMap::new();
         headers.insert(header::HOST, state.host.parse().unwrap());
         headers.insert(header::ORIGIN, state.origin.parse().unwrap());
@@ -486,5 +616,159 @@ mod tests {
         assert!(authorized(&state, &headers));
         headers.insert(header::ORIGIN, "http://127.0.0.1:9999".parse().unwrap());
         assert!(!authorized(&state, &headers));
+    }
+    /// An unconfigured bridge over a fresh profile that has never connected.
+    fn unconfigured(root: &std::path::Path) -> (Web, Router) {
+        let mut state = bridge(8206);
+        state.root = Arc::new(root.into());
+        state.gateway = Arc::new(RwLock::new(Gateway::resolve(root, None).unwrap()));
+        let directory = root.join("static");
+        let app = app(state.clone(), directory);
+        (state, app)
+    }
+    async fn post<T: serde::Serialize, R: serde::de::DeserializeOwned>(
+        app: &Router,
+        state: &Web,
+        path: &str,
+        body: T,
+    ) -> (StatusCode, R) {
+        let id = uuid::Uuid::new_v4();
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(path)
+                    .header(header::HOST, state.host.as_str())
+                    .header(header::ORIGIN, state.origin.as_str())
+                    .header(header::CONTENT_TYPE, "application/msgpack")
+                    .header(header::AUTHORIZATION, format!("Bearer {}", state.token))
+                    .body(axum::body::Body::from(
+                        a206_protocol::encode(&Request { id, body }).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), a206_protocol::MAX_FRAME)
+            .await
+            .unwrap();
+        let mut decoder = Decoder::default();
+        let mut frames = decoder.feed::<a206_protocol::Response<R>>(&bytes).unwrap();
+        assert_eq!(frames.len(), 1);
+        let frame = frames.remove(0);
+        assert_eq!(frame.id, id);
+        (status, frame.body)
+    }
+    #[tokio::test]
+    async fn an_unconfigured_bridge_offers_setup_and_reports_why_it_cannot_serve() {
+        let root = tempfile::tempdir().unwrap();
+        let (state, app) = unconfigured(root.path());
+        let (_, status) =
+            post::<_, SetupReply>(&app, &state, "/api/setup", SetupRequest::Status).await;
+        let SetupReply::Status(status) = status else {
+            panic!("unexpected {status:?}");
+        };
+        assert!(status.required());
+        assert_eq!(status.configured, None);
+        let (_, reply) = post::<_, Reply>(&app, &state, "/api/command", Command::Snapshot).await;
+        let Reply::Error(report) = reply else {
+            panic!("unexpected {reply:?}");
+        };
+        assert_eq!(report.kind, a206_core::ErrorKind::Unavailable);
+        assert!(
+            report.message.contains("no gateway is configured"),
+            "{report:?}"
+        );
+        assert!(report.correlation.is_some());
+        let (code, report) =
+            post::<_, ErrorReport>(&app, &state, "/api/gateway", GatewayAction::Start).await;
+        assert_eq!(code, StatusCode::CONFLICT);
+        assert_eq!(report.kind, a206_core::ErrorKind::Unavailable);
+        // Nothing was saved, launched or created on the browser's behalf.
+        assert!(!root.path().join("connection.toml").exists());
+        assert!(state.client().is_none());
+    }
+    #[tokio::test]
+    async fn setup_rejects_unsafe_targets_without_saving_them() {
+        let root = tempfile::tempdir().unwrap();
+        let (state, app) = unconfigured(root.path());
+        let endpoint = format!("ssh://-oProxyCommand={}", uuid::Uuid::new_v4().simple());
+        for request in [
+            SetupRequest::Probe {
+                endpoint: endpoint.clone(),
+            },
+            SetupRequest::Trust {
+                endpoint: endpoint.clone(),
+                fingerprint: format!("SHA256:{}", uuid::Uuid::new_v4().simple()),
+            },
+            SetupRequest::Save {
+                target: GatewayTarget::Ssh {
+                    endpoint: endpoint.clone(),
+                },
+            },
+        ] {
+            let (_, reply) = post::<_, SetupReply>(&app, &state, "/api/setup", request).await;
+            let SetupReply::Error(report) = reply else {
+                panic!("unexpected {reply:?}");
+            };
+            assert_eq!(
+                report.kind,
+                a206_core::ErrorKind::InvalidRequest,
+                "{report:?}"
+            );
+            // The cause chain reaches the browser intact.
+            assert!(report.source.is_some(), "{report:?}");
+        }
+        assert!(!root.path().join("connection.toml").exists());
+        assert!(!connection::known_hosts(root.path()).exists());
+        assert!(state.client().is_none());
+    }
+    #[tokio::test]
+    async fn a_damaged_saved_setup_is_shown_to_the_browser_for_repair() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("connection.toml"), "target = 7").unwrap();
+        let (state, app) = unconfigured(root.path());
+        let (_, reply) =
+            post::<_, SetupReply>(&app, &state, "/api/setup", SetupRequest::Status).await;
+        let SetupReply::Status(status) = reply else {
+            panic!("unexpected {reply:?}");
+        };
+        assert!(status.required());
+        let report = status.problem.unwrap();
+        assert_eq!(report.kind, a206_core::ErrorKind::InvalidRequest);
+        assert!(report.source.is_some(), "{report:?}");
+        let problem = state.gateway.read().unwrap().problem.clone().unwrap();
+        assert_eq!(problem.kind, a206_core::ErrorKind::InvalidRequest);
+        assert!(state.client().is_none());
+    }
+    #[tokio::test]
+    async fn setup_requires_the_bridge_bearer() {
+        let root = tempfile::tempdir().unwrap();
+        let (state, app) = unconfigured(root.path());
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/setup")
+                    .header(header::HOST, state.host.as_str())
+                    .header(header::ORIGIN, state.origin.as_str())
+                    .header(header::CONTENT_TYPE, "application/msgpack")
+                    .body(axum::body::Body::from(
+                        a206_protocol::encode(&Request {
+                            id: uuid::Uuid::new_v4(),
+                            body: SetupRequest::Save {
+                                target: GatewayTarget::Local,
+                            },
+                        })
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(!root.path().join("connection.toml").exists());
     }
 }

@@ -13,7 +13,7 @@ implemented structure for finished agent execution or security parity.
 | Gateway lifecycle | Shared Gateway page and controller, status from the actual process, start/stop/restart/reconnect, durable deliberate-stop marker, cleanup before acknowledgement, bounded control receipts; web uses an authenticated user-only binary endpoint | Remote SSH acceptance, stronger cross-process lifecycle coordination, encrypted enrollment and authentication; running is not security readiness |
 | Initial setup/import | `agent206 setup` resumes first-run setup on the existing flows (gateway target, vault create/unlock, optional TOTP enrollment, pairing) and ends with the health report; `agent206 import rustyclaw` previews by default and with `--apply` adds missing provider accounts through the revision-checked settings API, copies a password vault in through the broker (`ImportVault`: encrypted copy, password and enrolled TOTP verified on the copy, never merged or replacing a vault, source untouched) and writes an owner-only receipt; messengers, MCP servers, tool permissions, skills and plaintext tokens are counted and left inactive; tested in the import crate, the broker and through the real binary against a real gateway | Desktop/TUI setup wizard and import screen, key-file vaults, conversations/workspace instructions/memory, rollback command, adapters for Cline, Claude Code, Codex, DeepSeek Harness and others, isolated reader process; interactive vault import is exercised only in broker tests (it needs a terminal) |
 | CLI | Headless build, system status, nested gateway lifecycle/status, setup, doctor, import (RustyClaw), chat, projects, settings, catalog refresh, downloads, text documents, Git status, vault, ACP/MCP, renderer entry points and ui alias | Full RustyClaw-compatible command families in docs/cli.md; doctor repairs, more import adapters and remaining parity |
-| Gateway setup | Clients connect only after first-time setup (desktop/TUI screen or `gateway setup`) saves a local or SSH target in `connection.toml`; unknown SSH hosts require fingerprint confirmation into the profile's own known_hosts; changed keys are refused; typed `ConnectionError`s are traced and shown | Web clients use the bridge's server-side setup; gateway enrollment (vault/TOTP) is a separate gate |
+| Gateway setup | Clients connect only after first-time setup (the desktop, TUI and web setup screen or `gateway setup`) saves a local or SSH target in `connection.toml`; unknown SSH hosts require fingerprint confirmation into the profile's own known_hosts; changed keys are refused; typed `ConnectionError`s are traced and shown; the web bridge's setup endpoint is tested for bearer checks, unsafe endpoints and damaged saved setups, and web SSH setup was checked in headless Chromium against a local OpenSSH server | Gateway enrollment (vault/TOTP) is a separate gate; the web bridge is loopback-only, so other devices cannot use it |
 | SSH | Ordinary OpenSSH, strict host verification, configured identities, keepalives, remote stdio bridge |  remote installers/updaters, remote acceptance test |
 | Wire protocol | Versioned bounded MessagePack, fragmented/coalesced reads, strict decode, durable request receipts | Negotiated feature sets, pushed subscriptions, full reconnect/resume UX |
 | Health checks | `agent206 doctor` (text or `--toml`) and the Gateway page's Health checks card share typed findings from `a206_runtime::doctor`: profile privacy, gateway setup and process, vault broker/lock/TOTP, gateway vault pairing (reported by the gateway, checked only while unlocked), each provider's credential against the broker's destination rule and its API catalog age; nothing is started or changed; unknown stays unknown; evaluation unit-tested and the CLI tested through the real binary | `--repair`, remote-host broker checks (run doctor on that host), web client |
@@ -44,10 +44,11 @@ implemented structure for finished agent execution or security parity.
 Gateway work targets the desktop and TUI clients first. Like RustyClaw, remote
 gateways are reached by SSH process transport; the wire format is Agent 206's own
 versioned MessagePack protocol, not RustyClaw's codec (see docs/upstream.md). The
-web client controls a local gateway through the authenticated local web bridge.
-Remote gateway access from the web client is deferred: there is no
-SSH-over-WebSocket bridge, and the web client must not be described as reaching
-remote gateways until one exists.
+web client talks to the authenticated loopback web bridge, which is itself the
+gateway client: it reaches a local or SSH gateway server-side, and its setup
+screen runs SSH checks and host key review in the bridge, so keys never reach
+the browser. There is no SSH-over-WebSocket transport, and the bridge is not
+served to other devices (no HTTPS or account sign-in).
 
 ## Explicitly disabled
 

@@ -6,6 +6,8 @@ status changes; `docs/status.md` remains the authoritative implementation ledger
 Scope decisions (2026-10-16): gateway communication keeps RustyClaw's SSH-based
 protocol, and parity work targets desktop and TUI first. Web-client parity is
 deferred; existing web support is kept but new gateway features need not reach it.
+The web client reaches gateways, local or SSH, through its server-side bridge
+(2026-10-17), not through SSH in the browser.
 
 Reference: [RustyClaw `481a428c`](https://github.com/rexlunae/RustyClaw/tree/481a428cb7a3b82d1a5e556ffef40e3dd9f52ce3) (`rc/` below).
 Agent 206 paths are prefixed `a206/`; the survey was taken at `1666303`. Parity = equivalent user-facing
