@@ -178,7 +178,7 @@ pub mod mcp;
 pub mod schedule;
 pub use mcp::{McpServerConfig, McpServerState, McpServerStatus, McpToolInfo, ToolPolicy};
 pub use providers::{ProviderApi, ProviderPreset, ProviderPresetList};
-pub use schedule::{Job, JobAuthor, JobOutcome, JobRun, Schedule};
+pub use schedule::{Job, JobAuthor, JobOutcome, JobRun, Schedule, ScheduleInputError};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

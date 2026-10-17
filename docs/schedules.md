@@ -43,7 +43,22 @@ busy or had no model.
 
 CLI: `agent206 schedule list`, `schedule add THREAD --name N --text T` with one
 of `--at RFC3339`, `--every 90m [--anchor RFC3339]` or `--cron EXPR [--zone Z]`,
-and `schedule pause|resume|run|remove ID`.
+and `schedule pause|resume|run|remove ID`. Times and intervals are parsed by
+`a206_core::schedule::{parse_instant, parse_interval}`, shared with the page below.
+
+## Schedules page
+
+Desktop, TUI and web share the Schedules page (`/schedules`, `crates/ui/src/schedules.rs`).
+It lists every job, soonest first, with its conversation, what its schedule means,
+who added it, its next time and its latest run (a refusal shows the gateway's
+report), and offers Pause/Resume, Run now and Remove. Its form sends `ScheduleJob`:
+once at a date and time in an IANA zone (prefilled with the client's own zone;
+`parse_local` moves a time a clock change skips forward by the gap and takes the
+later of a repeated one), on an interval counted from now, or on a cron
+expression with an optional zone. Times are shown in the client's zone. The web
+build bundles the time zone database, since browsers have no zone files. Tested
+by rendering the page and the form's schedule construction; not yet clicked
+through in a running app.
 
 ## Scheduling from a native run
 
@@ -82,6 +97,6 @@ and zones), `gateway/schedules/tests.rs` (validation, one run per wake, pause,
 run now) and `crates/runtime/tests/schedules.rs` (a due job's native run against a
 scripted provider).
 
-Not yet: a desktop/TUI page, delivery of results to a
+Not yet: delivery of results to a
 messenger chat, run history beyond the latest run, and jitter for many jobs due
 at once.
