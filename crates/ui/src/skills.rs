@@ -1,5 +1,5 @@
 //! Skills installed in the gateway's profile, reviewed and approved here.
-use crate::{State, call, error::ErrorNotice};
+use crate::{State, audit::AuditFindings, call, error::ErrorNotice};
 use a206_core::{Command, ErrorReport, Reply, SkillSummary, SkillText};
 use fc_dioxus::prelude::*;
 
@@ -120,7 +120,7 @@ pub fn Skills() -> Element {
                         }
                         for unmet in &skill.unmet { p { class: "a206-muted", "Not available here: {unmet}" } }
                         if !skill.expects_env.is_empty() { p { class: "a206-muted", {format!("Expects environment variables tools do not receive: {}", skill.expects_env.join(", "))} } }
-                        if let Some(report) = skill.failure.clone() { ErrorNotice { report, title: "This skill cannot be read".to_string() } }
+                        if let Some(report) = skill.failure.clone() { ErrorNotice { report, title: "This skill cannot be read".to_string() } } else { AuditFindings { report: skill.audit.clone() } }
                     }
                     CardFooter {
                         if skill.failure.is_none() {

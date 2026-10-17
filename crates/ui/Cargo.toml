@@ -9,6 +9,7 @@ default = []
 web = ["dioxus/web", "fc-dioxus/web"]
 [dependencies]
 a206-core.workspace = true
+a206-audit.workspace = true
 a206-protocol.workspace = true
 dioxus = { workspace = true, features = ["router"] }
 fc-dioxus = { workspace = true, features = ["router"] }

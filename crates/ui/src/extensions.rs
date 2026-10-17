@@ -1,6 +1,6 @@
 //! The Extensions page: grants are a user operation in trusted chrome, and
 //! panels are typed descriptions rendered here, never extension markup.
-use crate::{PageFrame, State, call, dispatch, error::ErrorNotice};
+use crate::{PageFrame, State, audit::AuditFindings, call, dispatch, error::ErrorNotice};
 use a206_core::{
     Capability, Command, ErrorKind, ErrorReport, ExtensionProposal, MAX_EXTENSION_MANIFEST,
     MAX_EXTENSION_MODULE, PluginSource, PluginSummary, Reply,
@@ -271,6 +271,9 @@ fn ExtensionCard(plugin: PluginSummary, onopen: EventHandler<Open>) -> Element {
                     }
                 }
             }
+            // Bundled extensions ship with the application; packages from
+            // anyone else get the audit beside the switches that enable them.
+            if plugin.source != PluginSource::Bundled { AuditFindings { report: a206_audit::plugin(&plugin) } }
         }
         if confirm() {
             CardBody { Alert { title: rsx! { "Uninstall {plugin.name}?" }, "Its package and everything it stored are removed. Installing it again starts disabled, with nothing granted.",
@@ -350,6 +353,7 @@ fn ProposalCard(proposal: ExtensionProposal) -> Element {
                     }
                 }
             }
+            AuditFindings { report: a206_audit::plugin(summary) }
         }
         CardFooter {
             Button { variant: ButtonVariant::Primary, onclick: { let digest = digest.clone(); move |_| dispatch(state, Command::InstallProposal { digest: digest.clone() }) }, "Install" }
