@@ -580,14 +580,17 @@ async fn background_sessions_end_with_their_host() {
     )
     .await;
     let (running, started) = tokio::sync::oneshot::channel();
-    let reader = tokio::task::spawn_blocking(move || {
+    let (ended, rest) = tokio::sync::oneshot::channel();
+    // A plain thread, so a failure does not wait for the command to end.
+    std::thread::spawn(move || {
         let mut held = std::fs::File::open(fifo).unwrap();
         let mut first = [0u8; 8];
         held.read_exact(&mut first).unwrap();
         running.send(first).unwrap();
         let mut rest = Vec::new();
         held.read_to_end(&mut rest).unwrap();
-        rest
+        // The test may have given up already.
+        let _ = ended.send(rest);
     });
     let patience = std::time::Duration::from_secs(60);
     let first = tokio::time::timeout(patience, started)
@@ -598,9 +601,18 @@ async fn background_sessions_end_with_their_host() {
     drop(host);
     // The read ends only once nothing of the command is left; the bound
     // only catches a session that outlives its host.
-    let rest = tokio::time::timeout(patience, reader)
-        .await
-        .expect("a session must not outlive the gateway's host")
-        .unwrap();
+    let Ok(rest) = tokio::time::timeout(patience, rest).await else {
+        let processes = std::process::Command::new("ps")
+            .args(["-axo", "pid,ppid,pgid,stat,command"])
+            .output()
+            .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
+            .unwrap_or_default();
+        let left: Vec<_> = processes
+            .lines()
+            .filter(|l| l.contains("sleep 600"))
+            .collect();
+        panic!("a session must not outlive the gateway's host: {left:#?}");
+    };
+    let rest = rest.unwrap();
     assert!(rest.is_empty());
 }
