@@ -10,23 +10,32 @@ use a206_core::{Command, ErrorKind, ErrorReport, Mode, ModelInfo, RunState, Snap
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Spec {
     pub(crate) name: &'static str,
-    /// What follows the name, for a command that takes text.
-    pub(crate) argument: Option<&'static str>,
+    pub(crate) argument: Argument,
     pub(crate) about: &'static str,
+}
+
+/// The text that may follow a command's name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Argument {
+    None,
+    Required(&'static str),
+    /// May be left out, which means something of its own.
+    Optional(&'static str),
 }
 
 impl Spec {
     /// What completing to this command puts in the composer.
     pub(crate) fn completion(&self) -> String {
         match self.argument {
-            Some(_) => format!("/{} ", self.name),
-            None => format!("/{}", self.name),
+            Argument::Required(_) | Argument::Optional(_) => format!("/{} ", self.name),
+            Argument::None => format!("/{}", self.name),
         }
     }
     pub(crate) fn usage(&self) -> String {
         match self.argument {
-            Some(argument) => format!("/{} {argument}", self.name),
-            None => format!("/{}", self.name),
+            Argument::Required(argument) => format!("/{} {argument}", self.name),
+            Argument::Optional(argument) => format!("/{} [{argument}]", self.name),
+            Argument::None => format!("/{}", self.name),
         }
     }
 }
@@ -34,38 +43,38 @@ impl Spec {
 pub(crate) const COMMANDS: [Spec; 7] = [
     Spec {
         name: "new",
-        argument: None,
+        argument: Argument::None,
         about: "Start a new conversation",
     },
     Spec {
         name: "rename",
-        argument: Some("title"),
+        argument: Argument::Required("title"),
         about: "Rename this conversation",
     },
     Spec {
         name: "compact",
-        argument: None,
+        argument: Argument::None,
         about: "Summarize all but the latest turn",
     },
     Spec {
         name: "stop",
-        argument: None,
+        argument: Argument::None,
         about: "Stop the running response",
     },
     Spec {
         name: "mode",
-        argument: Some("mode"),
+        argument: Argument::Required("mode"),
         about: "Switch this conversation's agent mode",
     },
     Spec {
         name: "model",
-        argument: Some("model"),
+        argument: Argument::Required("model"),
         about: "Choose a connected model by name",
     },
     Spec {
         name: "effort",
-        argument: Some("level"),
-        about: "Set reasoning effort, or auto",
+        argument: Argument::Optional("level"),
+        about: "Set reasoning effort; alone, the automatic effort",
     },
 ];
 
@@ -77,7 +86,8 @@ pub(crate) enum Slash {
     Stop,
     Mode(String),
     Model(String),
-    Effort(String),
+    /// `None` is the automatic effort the selector calls Auto.
+    Effort(Option<String>),
 }
 
 /// What Enter does with a draft.
@@ -107,10 +117,10 @@ pub(crate) fn parse(draft: &str) -> Result<Typed, ErrorReport> {
         return Ok(Typed::Send(draft.to_owned()));
     };
     match (spec.argument, argument.is_empty()) {
-        (Some(wanted), true) => {
+        (Argument::Required(wanted), true) => {
             return Err(refused(&format!("Give the {wanted} after /{}", spec.name)));
         }
-        (None, false) => {
+        (Argument::None, false) => {
             return Err(refused(&format!(
                 "/{} takes no text; send it on its own",
                 spec.name
@@ -126,7 +136,7 @@ pub(crate) fn parse(draft: &str) -> Result<Typed, ErrorReport> {
         "stop" => Slash::Stop,
         "mode" => Slash::Mode(argument),
         "model" => Slash::Model(argument),
-        "effort" => Slash::Effort(argument),
+        "effort" => Slash::Effort((!argument.is_empty()).then_some(argument)),
         _ => return Ok(Typed::Send(draft.to_owned())),
     };
     Ok(Typed::Run(slash))
@@ -157,12 +167,6 @@ fn models(snapshot: &Snapshot) -> impl Iterator<Item = &ModelInfo> {
     snapshot.catalogs.iter().flat_map(|c| &c.models)
 }
 
-/// How a model is shown when a name is ambiguous: its connection, a `/`,
-/// and its name. Typing it names that one model.
-fn qualified(snapshot: &Snapshot, model: &ModelInfo) -> String {
-    format!("{}/{}", connection(snapshot, model), model.name)
-}
-
 fn connection<'a>(snapshot: &'a Snapshot, model: &ModelInfo) -> &'a str {
     snapshot
         .settings
@@ -172,10 +176,17 @@ fn connection<'a>(snapshot: &'a Snapshot, model: &ModelInfo) -> &'a str {
         .map_or("Unavailable connection", |p| p.label.as_str())
 }
 
+/// The key the model selector stores: unique even when connections share a
+/// label or a connection lists two models under one name.
+fn key_name(model: &ModelInfo) -> String {
+    format!("{}:{}", model.key.provider, model.key.model)
+}
+
 /// The one model `query` names: an exact name or identifier, optionally
-/// after its connection and a `/`, else the only one containing it, ignoring
-/// case. Several connections can list the same model, so a name they share
-/// is refused with the qualified names that tell them apart.
+/// after its connection and a `/`, or its `provider:identifier` key, else
+/// the only one containing it, ignoring case. A name several models share is
+/// refused, listing each by `Connection/name` where that tells them apart
+/// and by its key where it does not.
 fn find_model<'a>(snapshot: &'a Snapshot, query: &str) -> Result<&'a ModelInfo, ErrorReport> {
     let query = query.to_lowercase();
     let names = |m: &ModelInfo| {
@@ -185,6 +196,7 @@ fn find_model<'a>(snapshot: &'a Snapshot, query: &str) -> Result<&'a ModelInfo, 
             m.key.model.clone(),
             format!("{connection}/{}", m.name),
             format!("{connection}/{}", m.key.model),
+            key_name(m),
         ]
         .map(|name| name.to_lowercase())
     };
@@ -199,14 +211,26 @@ fn find_model<'a>(snapshot: &'a Snapshot, query: &str) -> Result<&'a ModelInfo, 
     match found.as_slice() {
         [one] => Ok(one),
         [] => Err(refused("No connected model matches that name")),
-        many => Err(refused(&format!(
-            "{} models match; name one of {}",
-            many.len(),
-            many.iter()
-                .map(|m| qualified(snapshot, m))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ))),
+        many => {
+            let friendly = |m: &ModelInfo| format!("{}/{}", connection(snapshot, m), m.name);
+            let shown: Vec<_> = many
+                .iter()
+                .map(|m| {
+                    let name = friendly(m);
+                    let shared = many
+                        .iter()
+                        .filter(|other| friendly(other).eq_ignore_ascii_case(&name))
+                        .count()
+                        > 1;
+                    if shared { key_name(m) } else { name }
+                })
+                .collect();
+            Err(refused(&format!(
+                "{} models match; name one of {}",
+                many.len(),
+                shown.join(", ")
+            )))
+        }
     }
 }
 
@@ -287,21 +311,22 @@ pub(crate) fn resolve(
                     "The selected model's API reports no reasoning effort choices",
                 ));
             }
-            // An advertised choice wins, even one spelled `auto`; `default`
-            // always means the selector's unadvertised Auto effort.
-            let effort = match efforts.iter().find(|e| e.eq_ignore_ascii_case(&level)) {
-                Some(listed) => Some(listed.clone()),
-                None if level.eq_ignore_ascii_case("auto")
-                    || level.eq_ignore_ascii_case("default") =>
-                {
-                    None
-                }
-                None => {
-                    return Err(refused(&format!(
-                        "Choose default or one of {}",
-                        efforts.join(", ")
-                    )));
-                }
+            // Left out is the only spelling of the automatic effort, so every
+            // advertised choice, whatever it is called, stays reachable.
+            let effort = match level {
+                None => None,
+                Some(level) => Some(
+                    efforts
+                        .iter()
+                        .find(|e| e.eq_ignore_ascii_case(&level))
+                        .cloned()
+                        .ok_or_else(|| {
+                            refused(&format!(
+                                "Choose one of {}, or send /effort alone for the automatic effort",
+                                efforts.join(", ")
+                            ))
+                        })?,
+                ),
             };
             Ok(Command::SetEffort {
                 thread: thread.id,
@@ -354,13 +379,15 @@ mod tests {
         assert_eq!(rename.kind, ErrorKind::InvalidRequest);
         assert!(parse(&format!("/stop {}", text())).is_err());
         assert!(parse(&format!("/new {}", text())).is_err());
-        for name in ["mode", "model", "effort"] {
+        for name in ["mode", "model"] {
             assert!(parse(&format!("/{name}")).is_err());
         }
+        // The effort's level may be left out.
+        assert_eq!(parse("/effort"), Ok(Typed::Run(Slash::Effort(None))));
         let level = text();
         assert_eq!(
             parse(&format!("/effort {level}")),
-            Ok(Typed::Run(Slash::Effort(level)))
+            Ok(Typed::Run(Slash::Effort(Some(level))))
         );
     }
 
@@ -522,32 +549,37 @@ mod tests {
         let plain = model(vec![]);
         let snapshot = listing(vec![listed.clone(), plain.clone()]);
         let mut thread = Thread::new(text(), Mode::Chat);
-        let effort = |thread: &Thread, typed: &str| {
-            resolve(Slash::Effort(typed.to_owned()), thread, &snapshot, true)
+        let effort = |thread: &Thread, typed: Option<&str>| {
+            resolve(
+                Slash::Effort(typed.map(str::to_owned)),
+                thread,
+                &snapshot,
+                true,
+            )
         };
         // No model selected, or one whose listing has no effort choices.
-        assert!(effort(&thread, &level).is_err());
+        assert!(effort(&thread, Some(&level)).is_err());
         thread.model = Some(plain.key);
-        assert!(effort(&thread, "auto").is_err());
+        assert!(effort(&thread, None).is_err());
 
         thread.model = Some(listed.key);
         assert_eq!(
-            effort(&thread, &level.to_uppercase()),
+            effort(&thread, Some(&level.to_uppercase())),
             Ok(Command::SetEffort {
                 thread: thread.id,
                 effort: Some(level.clone())
             })
         );
         assert_eq!(
-            effort(&thread, "Auto"),
+            effort(&thread, None),
             Ok(Command::SetEffort {
                 thread: thread.id,
                 effort: None
             })
         );
-        assert!(effort(&thread, &text()).is_err());
+        assert!(effort(&thread, Some(&text())).is_err());
         thread.state = RunState::Running;
-        assert!(effort(&thread, &level).is_err());
+        assert!(effort(&thread, Some(&level)).is_err());
     }
 
     #[test]
@@ -586,25 +618,58 @@ mod tests {
     }
 
     #[test]
-    fn an_advertised_auto_effort_is_chosen_and_default_clears_it() {
-        let listed = model(vec!["auto".into(), text()]);
+    fn every_advertised_effort_is_reachable_whatever_it_is_called() {
+        let listed = model(vec!["auto".into(), "default".into()]);
         let snapshot = listing(vec![listed.clone()]);
         let mut thread = Thread::new(text(), Mode::Chat);
         thread.model = Some(listed.key);
-        let effort = |typed: &str| resolve(Slash::Effort(typed.into()), &thread, &snapshot, true);
+        let effort = |typed: Option<&str>| {
+            resolve(
+                Slash::Effort(typed.map(str::to_owned)),
+                &thread,
+                &snapshot,
+                true,
+            )
+        };
+        for level in ["auto", "default"] {
+            assert_eq!(
+                effort(Some(&level.to_uppercase())),
+                Ok(Command::SetEffort {
+                    thread: thread.id,
+                    effort: Some(level.into())
+                })
+            );
+        }
         assert_eq!(
-            effort("AUTO"),
-            Ok(Command::SetEffort {
-                thread: thread.id,
-                effort: Some("auto".into())
-            })
-        );
-        assert_eq!(
-            effort("default"),
+            effort(None),
             Ok(Command::SetEffort {
                 thread: thread.id,
                 effort: None
             })
         );
+    }
+
+    #[test]
+    fn models_no_label_tells_apart_are_named_by_their_key() {
+        let label = text();
+        let first = model(vec![]);
+        let mut second = model(vec![]);
+        second.name = first.name.clone();
+        let mut snapshot = listing(vec![first.clone(), second.clone()]);
+        for model in [&first, &second] {
+            snapshot.settings.providers.push(ProviderConfig {
+                id: model.key.provider,
+                label: label.clone(),
+                base_url: text(),
+                credential: None,
+                api: ProviderApi::default(),
+            });
+        }
+        let thread = Thread::new(text(), Mode::Chat);
+        let chosen = |query: String| resolve(Slash::Model(query), &thread, &snapshot, true);
+        let shared = chosen(format!("{label}/{}", first.name)).expect_err("both match");
+        let key = format!("{}:{}", second.key.provider, second.key.model);
+        assert!(shared.message.contains(&key));
+        assert_eq!(configured(chosen(key)).1, Some(second.key.clone()));
     }
 }
