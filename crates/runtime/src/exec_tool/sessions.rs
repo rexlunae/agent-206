@@ -188,8 +188,11 @@ impl Unread {
 #[derive(Debug)]
 struct Shared {
     status: Status,
+    /// The command's stdout, or with a terminal everything it shows there.
     stdout: Unread,
+    /// With a terminal, only what the sandbox itself reports.
     stderr: Unread,
+    terminal: bool,
 }
 type Output = Arc<Mutex<Shared>>;
 
@@ -203,6 +206,8 @@ struct Session {
     seq: u64,
     thread: Id,
     authority: Authority,
+    /// Started on a pseudo-terminal.
+    terminal: bool,
     output: Output,
     input: mpsc::Sender<Input>,
     /// Sending to or dropping this stops the command.
@@ -339,10 +344,12 @@ impl Sessions {
         for id in Self::evictions(&map, thread)? {
             map.remove(&id);
         }
+        let terminal = started.terminal.is_some();
         let output: Output = Arc::new(Mutex::new(Shared {
             status: Status::Running,
             stdout: Unread::default(),
             stderr: Unread::default(),
+            terminal,
         }));
         let (input, inputs) = mpsc::channel(1);
         let (stop, stopped) = oneshot::channel();
@@ -361,6 +368,7 @@ impl Sessions {
                 seq: ticket.seq,
                 thread,
                 authority,
+                terminal,
                 output,
                 input,
                 stop: Some(stop),
@@ -425,8 +433,19 @@ impl Sessions {
             _ => true,
         } || shared.stdout.lost.is_some()
             || shared.stderr.lost.is_some();
-        let (out, err) = (shared.stdout.take("stdout"), shared.stderr.take("stderr"));
-        let text = format!("{}\n{out}\n{err}", shared.status);
+        let text = if shared.terminal {
+            let shown = shared.stdout.take("terminal");
+            let mut text = format!("{}\n{shown}", shared.status);
+            // The sandbox reports here only when something went wrong.
+            if !shared.stderr.bytes.is_empty() || shared.stderr.lost.is_some() {
+                text.push('\n');
+                text.push_str(&shared.stderr.take("sandbox"));
+            }
+            text
+        } else {
+            let (out, err) = (shared.stdout.take("stdout"), shared.stderr.take("stderr"));
+            format!("{}\n{out}\n{err}", shared.status)
+        };
         Ok((text, failed))
     }
 
@@ -459,16 +478,26 @@ impl Sessions {
     /// Give the command input, then close its input if `close`. One
     /// deadline covers waiting for a place in the queue and for the write;
     /// past it the input is withdrawn, though part of it may have been
-    /// written by then.
+    /// written by then. `keys` says the input names keys, which only a
+    /// terminal takes; a terminal's input cannot be closed.
     pub(super) async fn write(
         &self,
         thread: Id,
         id: Id,
         data: Vec<u8>,
+        keys: bool,
         close: bool,
     ) -> Result<(), ExecError> {
         // Taken out so no lock is held while waiting for the command.
-        let input = owned(&self.map(), thread, id)?.input.clone();
+        let input = {
+            let map = self.map();
+            let session = owned(&map, thread, id)?;
+            match (session.terminal, keys, close) {
+                (false, true, _) => return Err(ExecError::KeysNeedTerminal),
+                (true, _, true) => return Err(ExecError::TerminalClose),
+                _ => session.input.clone(),
+            }
+        };
         let (done, written) = oneshot::channel();
         let delivered = async {
             input
@@ -515,21 +544,35 @@ async fn supervise(
     seconds: u64,
     deadline: tokio::time::Instant,
 ) {
+    use tokio::io::{AsyncRead, AsyncWrite};
     let Started {
         mut child,
+        terminal,
         group,
         control,
         scratch,
     } = started;
-    let (Some(stdout), Some(stderr), Some(mut stdin)) =
-        (child.stdout.take(), child.stderr.take(), child.stdin.take())
-    else {
-        unreachable!("background sessions pipe all three streams")
+    type Reader = Box<dyn AsyncRead + Unpin + Send>;
+    type Writer = Box<dyn AsyncWrite + Unpin + Send>;
+    let streams: Option<(Reader, Writer)> = match terminal {
+        Some(terminal) => Some((Box::new(terminal.clone()), Box::new(terminal))),
+        None => child
+            .stdout
+            .take()
+            .zip(child.stdin.take())
+            .map(|(out, input)| (Box::new(out) as Reader, Box::new(input) as Writer)),
     };
-    let pumps = futures_util::future::join(
-        pump(stdout, output.clone(), |s| &mut s.stdout),
-        pump(stderr, output.clone(), |s| &mut s.stderr),
-    );
+    let Some((stdout, mut stdin)) = streams else {
+        unreachable!("background sessions pipe or attach stdin and stdout")
+    };
+    // Absent only on macOS with a terminal, where stderr is the terminal.
+    let stderr = child.stderr.take();
+    let pumps =
+        futures_util::future::join(pump(stdout, output.clone(), |s| &mut s.stdout), async {
+            if let Some(stderr) = stderr {
+                pump(stderr, output.clone(), |s| &mut s.stderr).await;
+            }
+        });
     tokio::pin!(pumps);
     let mut drained = false;
     let feed = async {
@@ -593,7 +636,7 @@ async fn supervise(
 /// Write one input, then close the command's input if `close`.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 async fn give(
-    stdin: &mut tokio::process::ChildStdin,
+    stdin: &mut (impl tokio::io::AsyncWrite + Unpin),
     open: &mut bool,
     data: &[u8],
     close: bool,
@@ -712,6 +755,7 @@ mod tests {
             status,
             stdout: Unread::default(),
             stderr: Unread::default(),
+            terminal: false,
         }));
         sessions.map().insert(
             Id::new_v4(),
@@ -721,6 +765,7 @@ mod tests {
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
                 thread: scope.thread,
                 authority: Authority::of(scope),
+                terminal: false,
                 output,
                 input,
                 stop: Some(stop),

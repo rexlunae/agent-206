@@ -273,6 +273,7 @@ fn sandbox_command(
         cwd: &start,
         network: a206_sandbox::NetworkAccess::Proxy(port),
         stderr: false,
+        terminal: None,
     };
     Ok(Command::from(profile.command()?))
 }
