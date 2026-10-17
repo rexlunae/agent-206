@@ -69,7 +69,7 @@ struct Messenger {
     #[serde(default)]
     allowed_chats: Vec<String>,
     #[serde(default)]
-    allowed_users: Vec<IgnoredAny>,
+    allowed_users: Vec<String>,
 }
 
 #[derive(Default, Deserialize)]
@@ -245,13 +245,15 @@ fn plan_messengers(settings: &Settings, source: Vec<Messenger>) -> Vec<Messenger
             }
             claimed.insert(name.clone());
             let allowed_chats: BTreeSet<String> = messenger.allowed_chats.into_iter().collect();
+            let allowed_users: BTreeSet<String> = messenger.allowed_users.into_iter().collect();
+            let valid = |ids: &BTreeSet<String>| {
+                ids.len() <= MAX_ALLOWED_CHATS && ids.iter().all(|id| valid_field(id))
+            };
             let unsupported = if kind.is_none() {
                 Some(UnsupportedMessenger::UnknownKind)
             } else if messenger.config_path.is_some() {
                 Some(UnsupportedMessenger::ExternalConfig)
-            } else if allowed_chats.len() > MAX_ALLOWED_CHATS
-                || !allowed_chats.iter().all(|chat| valid_field(chat))
-            {
+            } else if !valid(&allowed_chats) || !valid(&allowed_users) {
                 Some(UnsupportedMessenger::InvalidChats)
             } else {
                 None
@@ -271,7 +273,11 @@ fn plan_messengers(settings: &Settings, source: Vec<Messenger>) -> Vec<Messenger
                 } else {
                     allowed_chats
                 },
-                users_restricted: !messenger.allowed_users.is_empty(),
+                allowed_users: if unsupported.is_some() {
+                    BTreeSet::new()
+                } else {
+                    allowed_users
+                },
                 token_left_behind: messenger.token.is_some(),
                 action,
             }
@@ -621,6 +627,7 @@ execute_command = "Deny"
     fn messengers_arrive_disabled_without_tokens_and_never_widen_their_chats() {
         let token = random();
         let chat = random();
+        let user = random();
         let dir = tempfile::tempdir().unwrap();
         write(
             &dir.path().join("config.toml"),
@@ -636,7 +643,7 @@ allowed_chats = ["{chat}"]
 name = "team bot"
 messenger_type = "telegram"
 allowed_chats = ["{chat}"]
-allowed_users = ["{token}"]
+allowed_users = ["{user}"]
 
 [[messengers]]
 name = "{chat} matrix"
@@ -679,7 +686,10 @@ allowed_chats = [""]
             )
         );
         assert!(preview.messengers.iter().all(|m| valid_name(&m.name)));
-        assert!(preview.messengers[1].users_restricted);
+        assert_eq!(
+            preview.messengers[1].allowed_users,
+            BTreeSet::from([user.clone()])
+        );
         let text = toml::to_string(&preview).unwrap();
         assert!(!text.contains(&token));
 
@@ -693,8 +703,13 @@ allowed_chats = [""]
             settings.messengers[0].allowed_chats,
             BTreeSet::from([chat.clone()])
         );
-        // The source also restricted users, which cannot be represented.
-        assert!(settings.messengers[1].allowed_chats.is_empty());
+        // The source's restriction to some users still holds.
+        assert_eq!(
+            settings.messengers[1].allowed_chats,
+            BTreeSet::from([chat.clone()])
+        );
+        assert_eq!(settings.messengers[1].allowed_users, BTreeSet::from([user]));
+        assert!(settings.messengers[0].allowed_users.is_empty());
 
         let again = super::preview(dir.path(), &settings, None).unwrap();
         assert_eq!(

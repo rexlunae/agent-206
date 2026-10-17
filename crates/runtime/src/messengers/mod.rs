@@ -27,6 +27,8 @@ pub enum MessengerError {
     NoCredential { origin: String },
     #[error("the messenger endpoint is not allowed")]
     Endpoint(#[source] a206_core::providers::EndpointError),
+    #[error("a messenger endpoint is an origin, without a path")]
+    EndpointPath,
     #[error(
         "the running vault broker predates messengers; stop it with `agent206 vault stop` and unlock again"
     )]
@@ -59,13 +61,16 @@ pub enum MessengerError {
     Conversation(#[source] Box<crate::gateway::GatewayError>),
     #[error("the thread answered with an error")]
     Turn(#[source] a206_core::ErrorReport),
+    #[error("the turn stopped unexpectedly")]
+    TurnAborted(#[source] tokio::task::JoinError),
 }
 impl crate::error::Classified for MessengerError {
     fn kind(&self) -> Option<ErrorKind> {
         Some(match self {
-            Self::NoCredential { .. } | Self::NoModel | Self::Endpoint(_) => {
+            Self::NoCredential { .. } | Self::NoModel | Self::Endpoint(_) | Self::EndpointPath => {
                 ErrorKind::InvalidRequest
             }
+            Self::TurnAborted(_) => ErrorKind::Internal,
             Self::BrokerTooOld | Self::VaultUnavailable(_) => ErrorKind::Unavailable,
             Self::Broker(error) => return crate::error::classify(error),
             Self::UnexpectedReply | Self::Malformed { .. } => ErrorKind::Protocol,
@@ -80,13 +85,22 @@ impl crate::error::Classified for MessengerError {
 impl MessengerError {
     /// Retrying cannot help until the user changes something.
     fn needs_user(&self) -> bool {
+        use a206_broker::{BrokerError, ClientError, UpstreamFailure};
         matches!(
             self,
             Self::NoCredential { .. }
                 | Self::Endpoint(_)
+                | Self::EndpointPath
                 | Self::BrokerTooOld
                 | Self::Unauthorized { .. }
                 | Self::PollingConflict { .. }
+                // The stored credential is missing, refused for this
+                // destination or not a bot token: the same one will fail again.
+                | Self::Broker(ClientError::Broker(
+                    BrokerError::NotFound
+                        | BrokerError::Denied(_)
+                        | BrokerError::Upstream(UpstreamFailure::InvalidBotToken)
+                ))
         )
     }
     /// The pairing ended (vault locked or re-paired): wait for a new one.
@@ -106,6 +120,10 @@ type Result<T, E = MessengerError> = std::result::Result<T, E>;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Inbound {
     pub chat: String,
+    /// The sender's id, when the service names one.
+    pub sender: Option<String>,
+    /// Sent in a group, channel or other chat with several members.
+    pub group: bool,
     /// The chat's title or the sender's name: untrusted display text.
     pub title: Option<String>,
     pub text: String,
@@ -179,7 +197,13 @@ pub async fn supervise<H: Host>(
         for entry in wanted {
             let name = entry.config.name.clone();
             match running.remove(&name) {
-                Some(current) if entry.run && current.config == entry.config => {
+                // A task that ended on a failure needing the user is
+                // restarted by any change, such as a connect request.
+                Some(current)
+                    if entry.run
+                        && current.config == entry.config
+                        && !current.task.is_finished() =>
+                {
                     keep.insert(name, current);
                 }
                 previous => {
@@ -243,6 +267,9 @@ async fn run<H: Host>(
     let span = tracing::info_span!("messenger", messenger = %name);
     let work = async {
         let mut delay = backoff.initial;
+        // Updates up to here are handled; kept across sessions so a retry
+        // does not ask the service to deliver them again.
+        let mut offset = None;
         let mut pairings = host.pairings();
         loop {
             // Mark the pairing in hand as seen, so waiting below wakes only
@@ -256,7 +283,7 @@ async fn run<H: Host>(
                 continue;
             };
             host.update(&name, |s| s.state = MessengerState::Connecting);
-            let result = session(&host, &config, pairing, &mut delay, backoff).await;
+            let result = session(&host, &config, pairing, &mut delay, &mut offset, backoff).await;
             let Err(error) = result else { return };
             let report = crate::error::handle("messenger", &error);
             host.update(&name, |s| {
@@ -287,12 +314,15 @@ async fn run<H: Host>(
     }
 }
 
-/// Connect and serve until an error. Resets `delay` once connected.
+/// Connect and serve until an error. Resets `delay` once connected and
+/// advances `offset` past each update as its handling starts, so a message
+/// is handled at most once while the gateway runs.
 async fn session<H: Host>(
     host: &H,
     config: &MessengerConfig,
     pairing: BrokerPairing,
     delay: &mut Duration,
+    offset: &mut Option<i64>,
     backoff: Backoff,
 ) -> Result<()> {
     let api = Api::new(host.root(), pairing, config)?;
@@ -307,8 +337,12 @@ async fn session<H: Host>(
     });
     *delay = backoff.initial;
     loop {
-        for inbound in adapter.receive().await? {
-            deliver(host, config, &adapter, inbound).await?;
+        let batch = adapter.receive(*offset).await?;
+        for (update, inbound) in batch.updates {
+            *offset = Some(update.saturating_add(1));
+            if let Some(inbound) = inbound {
+                deliver(host, config, &adapter, inbound).await?;
+            }
         }
     }
 }
@@ -322,10 +356,17 @@ async fn deliver<H: Host>(
     adapter: &telegram::Telegram,
     inbound: Inbound,
 ) -> Result<()> {
-    if !config.allowed_chats.contains(&inbound.chat) {
-        tracing::info!(chat = %inbound.chat, "refused a message from a chat that is not allowed");
+    if !config.accepts(&inbound.chat, inbound.sender.as_deref(), inbound.group) {
+        // Name the sender only when the chat itself is allowed.
+        let sender = inbound
+            .sender
+            .as_deref()
+            .filter(|_| config.allowed_chats.contains(&inbound.chat));
+        tracing::info!(chat = %inbound.chat, sender, "refused a message that is not allowed");
         let at = crate::provider::now();
-        host.update(&config.name, |s| s.refuse(&inbound.chat, inbound.title, at));
+        host.update(&config.name, |s| {
+            s.refuse(&inbound.chat, sender, inbound.title, at)
+        });
         return Ok(());
     }
     let binding = ChatBinding {
@@ -368,6 +409,9 @@ impl Api {
     fn new(root: PathBuf, pairing: BrokerPairing, config: &MessengerConfig) -> Result<Self> {
         let base =
             a206_core::providers::base_url(config.endpoint()).map_err(MessengerError::Endpoint)?;
+        if base.path() != "/" {
+            return Err(MessengerError::EndpointPath);
+        }
         let credential = config
             .credential
             .clone()

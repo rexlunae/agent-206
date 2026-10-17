@@ -31,10 +31,16 @@ pub enum MessengerAction {
     Enable { name: String },
     /// Stop a messenger and keep it from connecting.
     Disable { name: String },
-    /// Let a chat's messages reach a thread.
+    /// Let a chat's messages reach a thread. In a group chat, only senders
+    /// allowed with allow-sender are accepted.
     Allow { name: String, chat: String },
     /// Refuse a chat's messages from now on.
     Disallow { name: String, chat: String },
+    /// Accept this sender's messages in allowed chats. Once any sender is
+    /// allowed, other senders are refused in private chats too.
+    AllowSender { name: String, sender: String },
+    /// Refuse this sender's messages from now on.
+    DisallowSender { name: String, sender: String },
     /// Reconnect an enabled messenger after a failure or a disconnect.
     Connect { name: String },
     /// Disconnect a messenger until the next connect or gateway restart.
@@ -122,6 +128,14 @@ fn edit(mut settings: Settings, action: MessengerAction) -> Result<Option<Settin
         MessengerAction::Disallow { name, chat } => {
             if !entry(&mut settings, &name)?.allowed_chats.remove(&chat) {
                 bail!("{name} does not allow chat {chat}");
+            }
+        }
+        MessengerAction::AllowSender { name, sender } => {
+            entry(&mut settings, &name)?.allowed_users.insert(sender);
+        }
+        MessengerAction::DisallowSender { name, sender } => {
+            if !entry(&mut settings, &name)?.allowed_users.remove(&sender) {
+                bail!("{name} does not allow sender {sender}");
             }
         }
         MessengerAction::List
@@ -242,6 +256,32 @@ mod tests {
         .unwrap()
         .unwrap();
         assert!(allowed.messengers[0].allowed_chats.contains(&chat));
+        let sender = random();
+        let allowed = edit(
+            allowed,
+            MessengerAction::AllowSender {
+                name: name.clone(),
+                sender: sender.clone(),
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert!(allowed.messengers[0].allowed_users.contains(&sender));
+        let unlisted = MessengerAction::DisallowSender {
+            name: name.clone(),
+            sender: random(),
+        };
+        assert!(edit(allowed.clone(), unlisted).is_err());
+        let allowed = edit(
+            allowed,
+            MessengerAction::DisallowSender {
+                name: name.clone(),
+                sender,
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert!(allowed.messengers[0].allowed_users.is_empty());
         let disallow = |chat: &str| MessengerAction::Disallow {
             name: name.clone(),
             chat: chat.to_owned(),

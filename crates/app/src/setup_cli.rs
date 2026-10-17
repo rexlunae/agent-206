@@ -195,17 +195,24 @@ fn print_preview(preview: &Preview) {
         if messenger.action != MessengerAction::Add {
             continue;
         }
-        if messenger.users_restricted {
-            println!(
-                "    it allowed only certain users, which Agent 206 cannot check; no chat is allowed until you allow one"
-            );
-        } else if messenger.allowed_chats.is_empty() {
+        if messenger.allowed_chats.is_empty() {
             println!("    no chat is allowed until you allow one");
         } else {
             println!(
                 "    allows chats {}",
                 messenger
                     .allowed_chats
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        if !messenger.allowed_users.is_empty() {
+            println!(
+                "    accepts only senders {}",
+                messenger
+                    .allowed_users
                     .iter()
                     .map(String::as_str)
                     .collect::<Vec<_>>()

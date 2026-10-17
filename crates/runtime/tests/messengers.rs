@@ -36,9 +36,14 @@ async fn unsafe_entries_are_refused_and_saved_ones_start_stopped() {
             ..Settings::default()
         }
     };
-    let cases: [fn(&mut MessengerConfig); 4] = [
+    let cases: [fn(&mut MessengerConfig); 6] = [
         |c| c.name = c.name.to_uppercase(),
         |c| c.endpoint = Some(format!("ftp://{}.example", Id::new_v4())),
+        // The token goes first in the path, so a base path is refused.
+        |c| c.endpoint = Some(format!("https://{}.example/telegram", Id::new_v4())),
+        |c| {
+            c.allowed_users.insert(format!("{}\u{7}", Id::new_v4()));
+        },
         |c| c.credential = Some(format!("{}\n", Id::new_v4())),
         |c| {
             c.allowed_chats.insert(String::new());

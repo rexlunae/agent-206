@@ -175,10 +175,10 @@ pub struct MessengerImport {
     /// Chats the source allowed; carried over as this entry's allow-list.
     #[serde(default)]
     pub allowed_chats: BTreeSet<String>,
-    /// The source also allowed only certain users. Agent 206 allows by chat
-    /// alone, so no chat is allowed rather than widening the restriction.
+    /// Senders the source allowed; carried over, so a restriction to some
+    /// users still holds.
     #[serde(default)]
-    pub users_restricted: bool,
+    pub allowed_users: BTreeSet<String>,
     /// The source kept a token in its configuration in plain text. It is
     /// not read; the user stores it in the vault.
     #[serde(default)]
@@ -204,7 +204,8 @@ pub enum UnsupportedMessenger {
     UnknownKind,
     /// The account's settings live in a separate file, which is not read.
     ExternalConfig,
-    /// More allowed chats than Agent 206 accepts, or ids it would refuse.
+    /// More allowed chats or users than Agent 206 accepts, or ids it would
+    /// refuse.
     InvalidChats,
 }
 
@@ -297,9 +298,8 @@ impl Preview {
                 continue;
             }
             let mut config = MessengerConfig::new(import.name.clone(), kind);
-            if !import.users_restricted {
-                config.allowed_chats = import.allowed_chats.clone();
-            }
+            config.allowed_chats = import.allowed_chats.clone();
+            config.allowed_users = import.allowed_users.clone();
             added.push(config.name.clone());
             settings.messengers.push(config);
         }

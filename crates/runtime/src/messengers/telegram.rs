@@ -2,9 +2,10 @@
 //! `sendMessage`. The broker puts the bot token in the request path
 //! ([`AuthScheme::TelegramBot`]); this side never sees it.
 //!
-//! Updates are confirmed by the next poll's offset, so a message is answered
-//! at least once: if the gateway stops between answering and the next poll,
-//! Telegram delivers that batch again after a restart.
+//! Updates are confirmed by the next poll's offset. The caller keeps the
+//! offset across reconnects, so while the gateway runs a message is handled
+//! at most once; the offset is not persisted, so if the gateway stops before
+//! the next poll, Telegram delivers that batch again after a restart.
 use super::{Api, Inbound, MessengerError, Result};
 use a206_broker::{AuthScheme, HttpMethod};
 use serde::Deserialize;
@@ -17,8 +18,11 @@ const MAX_MESSAGE_UNITS: usize = 4096;
 
 pub(crate) struct Telegram {
     api: Api,
-    /// The next update to ask for; earlier ones are confirmed.
-    offset: Option<i64>,
+}
+
+/// One poll's updates in order, each with its text message if it has one.
+pub(crate) struct Batch {
+    pub updates: Vec<(i64, Option<Inbound>)>,
 }
 
 #[derive(Deserialize)]
@@ -29,6 +33,8 @@ struct Envelope<T> {
 
 #[derive(Deserialize)]
 struct User {
+    #[serde(default)]
+    id: Option<i64>,
     #[serde(default)]
     username: Option<String>,
     #[serde(default)]
@@ -54,13 +60,16 @@ struct Message {
 #[derive(Deserialize)]
 struct Chat {
     id: i64,
+    /// `private`, `group`, `supergroup` or `channel`.
+    #[serde(default, rename = "type")]
+    kind: Option<String>,
     #[serde(default)]
     title: Option<String>,
 }
 
 impl Telegram {
     pub(crate) fn new(api: Api) -> Self {
-        Self { api, offset: None }
+        Self { api }
     }
 
     async fn request<T: for<'de> Deserialize<'de>>(
@@ -112,34 +121,21 @@ impl Telegram {
         Ok(me.username.map(|name| format!("@{name}")).or(me.first_name))
     }
 
-    /// Wait for the next batch of text messages.
-    pub(crate) async fn receive(&mut self) -> Result<Vec<Inbound>> {
+    /// Wait for the next batch of updates after `offset`, which confirms
+    /// every earlier one.
+    pub(crate) async fn receive(&mut self, offset: Option<i64>) -> Result<Batch> {
         let mut path =
             format!("getUpdates?timeout={POLL_SECONDS}&allowed_updates=%5B%22message%22%5D");
-        if let Some(offset) = self.offset {
+        if let Some(offset) = offset {
             path.push_str(&format!("&offset={offset}"));
         }
-        let updates: Vec<Update> = self.request(HttpMethod::Get, &path, None).await?;
-        if let Some(last) = updates.iter().map(|u| u.update_id).max() {
-            self.offset = Some(last.saturating_add(1));
-        }
-        Ok(updates
+        let mut updates: Vec<Update> = self.request(HttpMethod::Get, &path, None).await?;
+        updates.sort_by_key(|u| u.update_id);
+        let updates = updates
             .into_iter()
-            .filter_map(|update| {
-                let message = update.message?;
-                let text = message.text.filter(|t| !t.trim().is_empty())?;
-                let title = message.chat.title.or_else(|| {
-                    message
-                        .from
-                        .and_then(|u| u.username.map(|n| format!("@{n}")).or(u.first_name))
-                });
-                Some(Inbound {
-                    chat: message.chat.id.to_string(),
-                    title,
-                    text,
-                })
-            })
-            .collect())
+            .map(|update| (update.update_id, update.message.and_then(inbound)))
+            .collect();
+        Ok(Batch { updates })
     }
 
     /// Send `text` to `chat`, split to Telegram's message limit.
@@ -155,6 +151,28 @@ impl Telegram {
         }
         Ok(())
     }
+}
+
+fn inbound(message: Message) -> Option<Inbound> {
+    let text = message.text.filter(|t| !t.trim().is_empty())?;
+    let sender = message
+        .from
+        .as_ref()
+        .and_then(|u| u.id)
+        .map(|id| id.to_string());
+    let title = message.chat.title.or_else(|| {
+        message
+            .from
+            .and_then(|u| u.username.map(|n| format!("@{n}")).or(u.first_name))
+    });
+    Some(Inbound {
+        chat: message.chat.id.to_string(),
+        sender,
+        // Anything not known to be private is treated as a group.
+        group: message.chat.kind.as_deref() != Some("private"),
+        title,
+        text,
+    })
 }
 
 /// Split `text` into parts of at most `limit` UTF-16 code units, preferring

@@ -21,8 +21,9 @@ struct Bot {
     token: String,
     username: String,
     /// Status `getMe` answers with.
-    me_status: u16,
-    /// Batches `getUpdates` returns in order; then empty batches.
+    me_status: Arc<Mutex<u16>>,
+    /// Batches `getUpdates` returns in order (`null` answers HTTP 500);
+    /// then empty batches.
     batches: Arc<Mutex<VecDeque<Value>>>,
     polls: Arc<Mutex<Vec<HashMap<String, String>>>>,
     sent: Arc<Mutex<Vec<(String, String)>>>,
@@ -39,7 +40,7 @@ async fn me(
 ) -> (axum::http::StatusCode, Json<Value>) {
     check_path(&bot, &path);
     *bot.me_calls.lock().unwrap() += 1;
-    let status = axum::http::StatusCode::from_u16(bot.me_status).unwrap();
+    let status = axum::http::StatusCode::from_u16(*bot.me_status.lock().unwrap()).unwrap();
     (
         status,
         Json(json!({"ok": true, "result": {"username": bot.username}})),
@@ -50,16 +51,26 @@ async fn updates(
     State(bot): State<Bot>,
     Path(path): Path<String>,
     Query(query): Query<HashMap<String, String>>,
-) -> Json<Value> {
+) -> (axum::http::StatusCode, Json<Value>) {
     check_path(&bot, &path);
     bot.polls.lock().unwrap().push(query);
     let next = bot.batches.lock().unwrap().pop_front();
     match next {
-        Some(batch) => Json(json!({"ok": true, "result": batch})),
+        Some(Value::Null) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"ok": false})),
+        ),
+        Some(batch) => (
+            axum::http::StatusCode::OK,
+            Json(json!({"ok": true, "result": batch})),
+        ),
         None => {
             // An idle long poll, kept short for the test.
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            Json(json!({"ok": true, "result": []}))
+            (
+                axum::http::StatusCode::OK,
+                Json(json!({"ok": true, "result": []})),
+            )
         }
     }
 }
@@ -151,6 +162,8 @@ struct Recorder {
     threads: Arc<Mutex<BTreeMap<ChatBinding, Id>>>,
     turns: Arc<Mutex<Vec<(Id, String)>>>,
     statuses: Arc<Mutex<BTreeMap<String, MessengerStatus>>>,
+    /// How many times each messenger started connecting.
+    connects: Arc<Mutex<BTreeMap<String, u32>>>,
     changed: Arc<tokio::sync::Notify>,
 }
 impl Host for Recorder {
@@ -176,13 +189,19 @@ impl Host for Recorder {
         Ok(Some(format!("reply to {text}")))
     }
     fn update(&self, name: &str, change: impl FnOnce(&mut MessengerStatus) + Send) {
-        change(
-            self.statuses
+        let mut statuses = self.statuses.lock().unwrap();
+        let status = statuses.entry(name.to_owned()).or_default();
+        let before = status.state;
+        change(status);
+        if status.state == MessengerState::Connecting && before != MessengerState::Connecting {
+            *self
+                .connects
                 .lock()
                 .unwrap()
                 .entry(name.to_owned())
-                .or_default(),
-        );
+                .or_default() += 1;
+        }
+        drop(statuses);
         self.changed.notify_waiters();
     }
 }
@@ -194,6 +213,14 @@ impl Recorder {
             .get(name)
             .cloned()
             .unwrap_or_default()
+    }
+    fn connects(&self, name: &str) -> u32 {
+        self.connects
+            .lock()
+            .unwrap()
+            .get(name)
+            .copied()
+            .unwrap_or(0)
     }
     /// Wait until `done` holds, re-checking after every status change.
     async fn until(&self, done: impl Fn(&Self) -> bool) {
@@ -215,13 +242,15 @@ impl Recorder {
     }
 }
 
-fn message(update: i64, chat: i64, title: &str, text: &str) -> Value {
+/// A text message; a private chat's id is its sender's.
+fn message(update: i64, chat: i64, from: Option<i64>, title: &str, text: &str) -> Value {
+    let kind = if from.is_some() { "group" } else { "private" };
     json!({
         "update_id": update,
         "message": {
             "message_id": update,
-            "chat": {"id": chat, "type": "group", "title": title},
-            "from": {"id": chat, "first_name": random()},
+            "chat": {"id": chat, "type": kind, "title": title},
+            "from": {"id": from.unwrap_or(chat), "first_name": random()},
             "text": text,
         }
     })
@@ -244,6 +273,7 @@ fn config(name: &str, origin: &str, credential: &str, allowed: i64) -> Messenger
 
 async fn setup(
     me_status: u16,
+    token: Option<String>,
 ) -> (
     Bot,
     String,
@@ -253,9 +283,10 @@ async fn setup(
     crate::provider::PairingAnchor,
 ) {
     let bot = Bot {
-        token: format!("{}:{}", std::process::id(), random().replace('-', "_")),
+        token: token
+            .unwrap_or_else(|| format!("{}:{}", std::process::id(), random().replace('-', "_"))),
         username: random(),
-        me_status,
+        me_status: Arc::new(Mutex::new(me_status)),
         ..Bot::default()
     };
     let origin = serve_bot(bot.clone()).await;
@@ -267,6 +298,7 @@ async fn setup(
         threads: Arc::default(),
         turns: Arc::default(),
         statuses: Arc::default(),
+        connects: Arc::default(),
         changed: Arc::default(),
     };
     (bot, origin, dir, credential, host, anchor)
@@ -279,32 +311,40 @@ const FAST: Backoff = Backoff {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn allowed_chats_get_a_thread_and_a_reply_and_others_are_refused() {
-    let (bot, origin, _dir, credential, host, _anchor) = setup(200).await;
+    let (bot, origin, _dir, credential, host, _anchor) = setup(200, None).await;
     let name = "team-bot";
     let (allowed, refused) = (-1_000_000 - i64::from(std::process::id()), 42);
+    let (member, stranger) = (7_000, 8_000);
     let refused_title = random();
     let text = random();
     bot.batches.lock().unwrap().push_back(json!([
-        message(7, refused, &refused_title, &random()),
-        message(8, allowed, &random(), &text),
+        message(5, refused, None, &refused_title, &random()),
+        // An allowed group, but a sender who is not listed.
+        message(6, allowed, Some(stranger), &random(), &random()),
+        message(8, allowed, Some(member), &random(), &text),
     ]));
+    let mut entry = config(name, &origin, &credential, allowed);
+    entry.allowed_users.insert(member.to_string());
     let (desired, receiver) = watch::channel(vec![Desired {
-        config: config(name, &origin, &credential, allowed),
+        config: entry.clone(),
         run: true,
     }]);
     let stop = CancellationToken::new();
     let supervisor = tokio::spawn(supervise(host.clone(), receiver, FAST, stop.clone()));
 
-    host.until(|h| !bot.sent.lock().unwrap().is_empty() && h.status(name).refused.len() == 1)
+    host.until(|h| !bot.sent.lock().unwrap().is_empty() && h.status(name).refused.len() == 2)
         .await;
     let status = host.status(name);
     assert_eq!(status.state, MessengerState::Connected);
     assert_eq!(status.account, Some(format!("@{}", bot.username)));
     assert_eq!(status.refused[0].chat, refused.to_string());
+    assert_eq!(status.refused[0].sender, None);
     assert_eq!(
         status.refused[0].title.as_deref(),
         Some(refused_title.as_str())
     );
+    assert_eq!(status.refused[1].chat, allowed.to_string());
+    assert_eq!(status.refused[1].sender, Some(stranger.to_string()));
     // Only the allowed chat reached a thread, and its reply went back to it.
     let turns = host.turns.lock().unwrap().clone();
     assert_eq!(turns.len(), 1);
@@ -325,7 +365,7 @@ async fn allowed_chats_get_a_thread_and_a_reply_and_others_are_refused() {
 
     // Disabling stops it; a stopped supervisor awaits its task.
     desired.send_replace(vec![Desired {
-        config: config(name, &origin, &credential, allowed),
+        config: entry,
         run: false,
     }]);
     host.until(|h| h.status(name).state == MessengerState::Stopped)
@@ -336,8 +376,43 @@ async fn allowed_chats_get_a_thread_and_a_reply_and_others_are_refused() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_rejected_token_fails_once_and_waits_for_the_user() {
-    let (bot, origin, _dir, credential, host, _anchor) = setup(401).await;
+    let (bot, origin, _dir, credential, host, _anchor) = setup(401, None).await;
     let name = "rejected";
+    let wanted = vec![Desired {
+        config: config(name, &origin, &credential, 1),
+        run: true,
+    }];
+    let (desired, receiver) = watch::channel(wanted.clone());
+    let stop = CancellationToken::new();
+    let supervisor = tokio::spawn(supervise(host.clone(), receiver, FAST, stop.clone()));
+    host.until(|h| h.status(name).state == MessengerState::Failed)
+        .await;
+    let failure = host.status(name).failure.unwrap();
+    assert_eq!(failure.kind, ErrorKind::PermissionDenied);
+    // Retrying cannot help, so it does not retry: with the fast backoff, a
+    // retry would have happened many times over meanwhile.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(*bot.me_calls.lock().unwrap(), 1);
+    assert!(bot.polls.lock().unwrap().is_empty());
+    assert_eq!(host.status(name).state, MessengerState::Failed);
+
+    // Once the token is fixed, connecting again (the same settings
+    // republished) retries it.
+    *bot.me_status.lock().unwrap() = 200;
+    desired.send_replace(wanted);
+    host.until(|h| h.status(name).state == MessengerState::Connected)
+        .await;
+    assert_eq!(*bot.me_calls.lock().unwrap(), 2);
+    assert_eq!(host.status(name).failure, None);
+    stop.cancel();
+    supervisor.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_token_that_is_not_a_bot_token_is_not_retried() {
+    let token = format!("{}/../{}", std::process::id(), random());
+    let (bot, origin, _dir, credential, host, _anchor) = setup(200, Some(token)).await;
+    let name = "odd-token";
     let (_desired, receiver) = watch::channel(vec![Desired {
         config: config(name, &origin, &credential, 1),
         run: true,
@@ -346,26 +421,54 @@ async fn a_rejected_token_fails_once_and_waits_for_the_user() {
     let supervisor = tokio::spawn(supervise(host.clone(), receiver, FAST, stop.clone()));
     host.until(|h| h.status(name).state == MessengerState::Failed)
         .await;
-    let failure = host.status(name).failure.unwrap();
-    assert_eq!(failure.kind, ErrorKind::PermissionDenied);
-    // Retrying cannot help, so it does not retry: with the fast backoff, a
-    // retry would have happened many times over by the time a later message
-    // could be delivered.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(host.connects(name), 1);
+    assert_eq!(*bot.me_calls.lock().unwrap(), 0);
     stop.cancel();
     supervisor.await.unwrap();
-    assert_eq!(*bot.me_calls.lock().unwrap(), 1);
-    assert!(bot.polls.lock().unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_poll_does_not_replay_answered_messages() {
+    let (bot, origin, _dir, credential, host, _anchor) = setup(200, None).await;
+    let name = "flaky";
+    let chat = 77;
+    let text = random();
+    {
+        let mut batches = bot.batches.lock().unwrap();
+        batches.push_back(json!([message(3, chat, None, &random(), &text)]));
+        // The poll that would confirm it fails; the session reconnects.
+        batches.push_back(Value::Null);
+    }
+    let (_desired, receiver) = watch::channel(vec![Desired {
+        config: config(name, &origin, &credential, chat),
+        run: true,
+    }]);
+    let stop = CancellationToken::new();
+    let supervisor = tokio::spawn(supervise(host.clone(), receiver, FAST, stop.clone()));
+    host.until(|h| h.connects(name) >= 2 && bot.polls.lock().unwrap().len() >= 3)
+        .await;
+    // The poll after reconnecting still confirms the answered message.
+    assert_eq!(
+        bot.polls.lock().unwrap()[2]
+            .get("offset")
+            .map(String::as_str),
+        Some("4")
+    );
+    assert_eq!(host.turns.lock().unwrap().len(), 1);
+    stop.cancel();
+    supervisor.await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_chat_without_a_model_is_told_why() {
-    let (bot, origin, _dir, credential, host, _anchor) = setup(200).await;
+    let (bot, origin, _dir, credential, host, _anchor) = setup(200, None).await;
     let name = "no-model";
     let chat = 5;
     bot.batches
         .lock()
         .unwrap()
-        .push_back(json!([message(1, chat, &random(), &random())]));
+        .push_back(json!([message(1, chat, None, &random(), &random())]));
     let mut entry = config(name, &origin, &credential, chat);
     entry.model = None;
     let (_desired, receiver) = watch::channel(vec![Desired {

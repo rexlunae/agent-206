@@ -22,7 +22,13 @@ pub(super) fn validate(messengers: &[MessengerConfig]) -> Result<()> {
             names.insert(messenger.name.as_str()),
             GatewayError::Invalid("messenger names must be unique"),
         )?;
-        a206_core::providers::base_url(messenger.endpoint())?;
+        let endpoint = a206_core::providers::base_url(messenger.endpoint())?;
+        // The broker puts the token in the first path segment, so a base
+        // path would move behind it.
+        check(
+            endpoint.path() == "/",
+            GatewayError::Invalid("a messenger endpoint is an origin, without a path"),
+        )?;
         check(
             messenger.credential.as_deref().is_none_or(field),
             GatewayError::Invalid("invalid messenger credential name"),
@@ -31,6 +37,11 @@ pub(super) fn validate(messengers: &[MessengerConfig]) -> Result<()> {
             messenger.allowed_chats.len() <= MAX_ALLOWED_CHATS
                 && messenger.allowed_chats.iter().all(|chat| field(chat)),
             GatewayError::Invalid("a messenger allows at most 256 chats with valid ids"),
+        )?;
+        check(
+            messenger.allowed_users.len() <= MAX_ALLOWED_CHATS
+                && messenger.allowed_users.iter().all(|user| field(user)),
+            GatewayError::Invalid("a messenger allows at most 256 senders with valid ids"),
         )?;
     }
     Ok(())
@@ -174,16 +185,26 @@ impl Host for Gateway {
         Ok(id)
     }
     async fn converse(&self, thread: Id, text: String) -> Result<Option<String>, MessengerError> {
-        let response = self
-            .request(a206_protocol::Request {
-                id: Id::new_v4(),
-                body: Command::Send {
-                    thread,
-                    text,
-                    attachments: vec![],
-                },
-            })
-            .await;
+        let gateway = self.clone();
+        // The turn runs as its own task: `Send` is not cancel-safe (its run
+        // registration and thread state are cleaned up only when it
+        // completes), so a messenger that is stopped mid-turn drops this
+        // handle, detaching the turn, which then ends on its own or through
+        // shutdown's cancellation of registered runs.
+        let response = tokio::spawn(async move {
+            gateway
+                .request(a206_protocol::Request {
+                    id: Id::new_v4(),
+                    body: Command::Send {
+                        thread,
+                        text,
+                        attachments: vec![],
+                    },
+                })
+                .await
+        })
+        .await
+        .map_err(MessengerError::TurnAborted)?;
         let thread = match response.body {
             Reply::Thread(thread) => thread,
             Reply::Error(report) => return Err(MessengerError::Turn(report)),

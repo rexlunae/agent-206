@@ -10,7 +10,7 @@ use std::collections::BTreeSet;
 
 /// Longest messenger name, chat id or credential name accepted in settings.
 pub const MAX_MESSENGER_FIELD: usize = 128;
-/// Most chats one messenger may allow.
+/// Most chats, and most senders, one messenger may allow.
 pub const MAX_ALLOWED_CHATS: usize = 256;
 /// Most refused chats a status remembers, so the user can allow one.
 pub const MAX_REFUSED_CHATS: usize = 16;
@@ -88,6 +88,11 @@ pub struct MessengerConfig {
     /// listed in the status so the user can allow it.
     #[serde(default)]
     pub allowed_chats: BTreeSet<String>,
+    /// Senders whose messages are accepted. Group chats need it: a group's
+    /// messages are accepted only from senders listed here. When it is not
+    /// empty, it also applies to private chats.
+    #[serde(default)]
+    pub allowed_users: BTreeSet<String>,
     /// Model a new chat thread uses. Without one, chats are answered with
     /// nothing and the status reports why.
     #[serde(default)]
@@ -105,6 +110,7 @@ impl MessengerConfig {
             credential: None,
             endpoint: None,
             allowed_chats: BTreeSet::new(),
+            allowed_users: BTreeSet::new(),
             model: None,
             mode: Mode::Chat,
         }
@@ -113,6 +119,18 @@ impl MessengerConfig {
         self.endpoint
             .as_deref()
             .unwrap_or_else(|| self.kind.default_endpoint())
+    }
+    /// Whether a message from `sender` in `chat` may reach a thread: the chat
+    /// is allowed, and the sender is listed, or the list is empty and the
+    /// chat is private. Never true for an unknown sender in a group.
+    pub fn accepts(&self, chat: &str, sender: Option<&str>, group: bool) -> bool {
+        self.allowed_chats.contains(chat)
+            && match sender {
+                Some(sender) => {
+                    self.allowed_users.contains(sender) || (self.allowed_users.is_empty() && !group)
+                }
+                None => self.allowed_users.is_empty() && !group,
+            }
     }
 }
 
@@ -142,11 +160,15 @@ impl MessengerState {
     }
 }
 
-/// A chat that sent a message the messenger refused because it is not allowed.
-/// Titles come from the chat service and are untrusted display text.
+/// A chat, or a sender in a chat, whose message the messenger refused because
+/// it is not allowed. Titles come from the chat service and are untrusted
+/// display text.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RefusedChat {
     pub chat: String,
+    /// The sender, when the chat is allowed but the sender is not.
+    #[serde(default)]
+    pub sender: Option<String>,
     #[serde(default)]
     pub title: Option<String>,
     pub count: u32,
@@ -169,9 +191,14 @@ pub struct MessengerStatus {
     pub refused: Vec<RefusedChat>,
 }
 impl MessengerStatus {
-    /// Remember a refused chat, keeping the list bounded.
-    pub fn refuse(&mut self, chat: &str, title: Option<String>, at: u64) {
-        if let Some(index) = self.refused.iter().position(|r| r.chat == chat) {
+    /// Remember a refused chat or sender, keeping the list bounded.
+    pub fn refuse(&mut self, chat: &str, sender: Option<&str>, title: Option<String>, at: u64) {
+        let sender = sender.map(str::to_owned);
+        if let Some(index) = self
+            .refused
+            .iter()
+            .position(|r| r.chat == chat && r.sender == sender)
+        {
             let mut entry = self.refused.remove(index);
             entry.count = entry.count.saturating_add(1);
             entry.last_at = at;
@@ -183,6 +210,7 @@ impl MessengerStatus {
             }
             self.refused.push(RefusedChat {
                 chat: chat.to_owned(),
+                sender,
                 title,
                 count: 1,
                 last_at: at,
@@ -224,15 +252,41 @@ mod tests {
             .map(|_| uuid::Uuid::new_v4().to_string())
             .collect();
         for (at, chat) in chats.iter().enumerate() {
-            status.refuse(chat, None, at as u64);
+            status.refuse(chat, None, None, at as u64);
         }
         assert_eq!(status.refused.len(), MAX_REFUSED_CHATS);
         assert_eq!(status.refused[0].chat, chats[3]);
         let title = uuid::Uuid::new_v4().to_string();
-        status.refuse(&chats[3], Some(title.clone()), 99);
+        status.refuse(&chats[3], None, Some(title.clone()), 99);
         let last = status.refused.last().unwrap();
         assert_eq!((last.chat.as_str(), last.count), (chats[3].as_str(), 2));
         assert_eq!(last.title.as_deref(), Some(title.as_str()));
         assert_eq!(status.refused.len(), MAX_REFUSED_CHATS);
+        // A refused sender in that chat is a separate entry.
+        let sender = uuid::Uuid::new_v4().to_string();
+        status.refuse(&chats[3], Some(&sender), None, 100);
+        assert_eq!(
+            status.refused.last().unwrap().sender.as_ref(),
+            Some(&sender)
+        );
+        assert_eq!(status.refused.len(), MAX_REFUSED_CHATS);
+    }
+
+    #[test]
+    fn groups_need_listed_senders_and_a_sender_list_applies_everywhere() {
+        let random = || uuid::Uuid::new_v4().to_string();
+        let (chat, user, other) = (random(), random(), random());
+        let mut config = MessengerConfig::new(random(), MessengerKind::Telegram);
+        assert!(!config.accepts(&chat, Some(&user), false));
+        config.allowed_chats.insert(chat.clone());
+        assert!(config.accepts(&chat, Some(&user), false));
+        assert!(!config.accepts(&chat, Some(&user), true));
+        assert!(!config.accepts(&chat, None, true));
+        assert!(!config.accepts(&random(), Some(&user), false));
+        config.allowed_users.insert(user.clone());
+        assert!(config.accepts(&chat, Some(&user), true));
+        assert!(!config.accepts(&chat, Some(&other), true));
+        assert!(!config.accepts(&chat, Some(&other), false));
+        assert!(!config.accepts(&chat, None, false));
     }
 }
