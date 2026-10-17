@@ -21,12 +21,43 @@ write tools need a separate `write_workspace` grant. It also bundles
 tools under the `git_read` grant, and `agent206.web` (`plugins/web`) with a
 `fetch_url` tool under the `network` grant. Bundled tools cut text past
 192 KiB with a notice (the SDK's `excerpt`), so a long result never exceeds
-the outcome limit. User-installed and agent-prepared packages are not implemented yet: the
-worker only loads bundled modules.
+the outcome limit. Users can also install third-party packages (see
+[Installed packages](#installed-packages)); agent-prepared packages are not implemented yet.
 
 The wire types live in `a206-extension-abi`; the guest SDK is
 `a206-extension-sdk`; manifests, the interpreter and the worker are
 `a206-extensions`; policy and host calls are `a206-runtime::extension_host`.
+
+### Installed packages
+
+A package is a `plugin.toml` and its compiled `wasm32-unknown-unknown` module.
+The user installs it with `agent206 extension install <plugin.toml> <module.wasm>`
+or by choosing both files on the Extensions page; both send
+`Command::InstallExtension`. Installing is a user operation, never an agent one.
+
+- Before anything is stored the gateway validates the manifest, refuses ids
+  starting with `agent206.` (reserved for bundled extensions), and limits the
+  manifest to 64 KiB and the module to 3 MiB with a WebAssembly 1.0 header. The
+  module itself is compiled only inside the confined worker.
+- The package is stored under `<data dir>/extensions/<digest>/`, where the
+  digest is SHA-256 over the manifest text and the module. The snapshot records
+  `PluginSource::Installed { digest }`, and every load checks the stored files
+  against it, so a package altered on disk fails with `Conflict` and never runs.
+  The worker receives the verified module bytes in its `Start` frame; it has no
+  access to the gateway's files.
+- A new package arrives disabled with nothing granted. Installing a different
+  package with the same id is an update: it is disabled again, keeps only the
+  grants its new manifest still requests, and replaces the earlier copy.
+  Installing the identical package again changes nothing, except restoring a
+  stored copy that was altered.
+- `agent206 extension uninstall <id>` (or Uninstall on its card) removes the
+  package and the extension's stored state. Bundled extensions can be disabled
+  but not uninstalled.
+- The Extensions page marks installed packages as "Installed by you" with their
+  id and digest, so an installed package cannot pass for a bundled one by name.
+
+Not yet: agent-prepared packages, registry or URL installs, signatures, and a
+pre-install audit.
 
 ### Manifest
 
@@ -253,6 +284,5 @@ No host call will accept raw secret values; a secret handle is not authority to
 export its contents. Execution host calls will run their commands in a separate
 sandboxed process, never in the worker, and wait for the run engine's native exec.
 
-Installed packages will be digest-pinned and validated before installation.
-Agent-created extensions remain disabled until the user reviews their source or
+Agent-created extensions will remain disabled until the user reviews their source or
 artifact digest, manifest, requested capabilities and UI contributions.
