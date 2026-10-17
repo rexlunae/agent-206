@@ -171,6 +171,18 @@ async fn network_and_programs_follow_their_grants() {
 
     let entry = fixture_entry(&[Capability::Network, Capability::Execute]);
     let session = spawn(&entry, None, state.path()).await;
+    // On Linux, sharing the network shares no process view: this test's own
+    // process, and the gateway it stands for, stay invisible.
+    #[cfg(target_os = "linux")]
+    {
+        let own = format!("/proc/{}/cmdline", std::process::id());
+        let cmdline = std::fs::read_to_string(&own).unwrap();
+        assert_ne!(
+            call(&session, "read_file", "path", &own).await,
+            Ok(cmdline),
+            "a server with Network must not see host processes"
+        );
+    }
     assert_eq!(
         call(&session, "connect", "address", &address).await,
         Ok("connected".into())

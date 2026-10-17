@@ -55,7 +55,10 @@ private scratch directory, and nothing else unless the entry holds:
 
 Without `network` a Linux server has its own empty network namespace and
 Landlock allows no TCP connection; with it, the server shares the host's network
-and sees only the name-resolution files and certificates from `/etc`. Both
+and sees only the name-resolution files and certificates from `/etc`. On both
+platforms `network` currently includes the host's loopback, so grant it only to
+servers you would trust with local services. On Linux the PID namespace stays
+private either way, so a server cannot inspect the gateway's or other processes. Both
 sandboxes check resolved paths, so a symlink inside the project that points
 outside it reaches nothing the server could not already read. CI drives a fixture
 server through the real sandbox on macOS and on Linux, checking project and
@@ -116,6 +119,7 @@ The run engine calls two gateway methods (`crates/runtime/src/gateway/mcp_server
 ## Not yet implemented
 
 - Streamable HTTP servers, and credentials for any server (vault-brokered auth).
-- Linux and Windows isolation.
+- Windows isolation.
+- Network grants that exclude the host's loopback services (see Isolation).
 - Resources, prompts, sampling, elicitation and list-change notifications.
 - Approval UI and model access (run engine).

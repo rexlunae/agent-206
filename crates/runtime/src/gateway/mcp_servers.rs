@@ -661,15 +661,17 @@ mod tests {
         assert_eq!(g.snapshot().unwrap().mcp_servers[0].failure, None);
     }
 
-    #[cfg(not(target_os = "macos"))]
+    /// Fails before any sandbox starts, so it runs on every platform; this
+    /// test binary cannot serve as the Linux sandbox helper.
     #[tokio::test]
-    async fn a_server_that_cannot_be_isolated_fails_visibly() {
+    async fn a_server_that_cannot_start_fails_visibly() {
         let state = tempfile::tempdir().unwrap();
         let install = tempfile::tempdir().unwrap();
         let g = Gateway::open(state.path()).unwrap();
         let mut server = entry(install.path());
         server.enabled = true;
-        assert_eq!(save(&g, vec![server]).await, Reply::Ok);
+        assert_eq!(save(&g, vec![server.clone()]).await, Reply::Ok);
+        std::fs::remove_file(&server.executable).unwrap();
         let reply = send(
             &g,
             Command::ConnectMcpServer {
@@ -677,10 +679,10 @@ mod tests {
             },
         )
         .await;
-        assert_eq!(kind(reply), ErrorKind::Unavailable);
+        assert_eq!(kind(reply), ErrorKind::NotFound);
         let status = g.snapshot().unwrap().mcp_servers.remove(0);
         assert_eq!(status.state, McpServerState::Failed);
-        assert_eq!(status.failure.unwrap().kind, ErrorKind::Unavailable);
+        assert_eq!(status.failure.unwrap().kind, ErrorKind::NotFound);
 
         // A restarted gateway reports no session from before.
         drop(g);
