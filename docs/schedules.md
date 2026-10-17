@@ -45,6 +45,15 @@ CLI: `agent206 schedule list`, `schedule add THREAD --name N --text T` with one
 of `--at RFC3339`, `--every 90m [--anchor RFC3339]` or `--cron EXPR [--zone Z]`,
 and `schedule pause|resume|run|remove ID`.
 
+The shared desktop, web and TUI **Schedules** page (`crates/ui/src/schedules.rs`)
+lists every job with its conversation, schedule, next run, latest outcome (with
+the gateway's report when a run was refused) and who added it, offers Pause or
+Resume, Run now and Remove, and schedules new messages: once at an RFC 3339
+time, at an interval counted from now, or on a cron expression with an optional
+IANA zone. Times are shown in UTC, because the web build carries no time zone
+data. The page and the CLI read times and intervals with the same parser
+(`a206_core::schedule::parse_time` and `parse_interval`).
+
 ## Implementation
 
 `crates/runtime/src/schedule.rs` computes due times as pure functions;
@@ -55,6 +64,6 @@ and zones), `gateway/schedules/tests.rs` (validation, one run per wake, pause,
 run now) and `crates/runtime/tests/schedules.rs` (a due job's native run against a
 scripted provider).
 
-Not yet: a desktop/TUI page, agent-requested jobs, delivery of results to a
+Not yet: agent-requested jobs, delivery of results to a
 messenger chat, run history beyond the latest run, and jitter for many jobs due
 at once.

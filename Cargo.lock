@@ -32,6 +32,7 @@ name = "a206-core"
 version = "0.1.0"
 dependencies = [
  "a206-extension-abi",
+ "jiff",
  "rmp-serde",
  "serde",
  "serde_bytes",

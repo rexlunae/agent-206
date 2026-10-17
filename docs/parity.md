@@ -114,7 +114,7 @@ invocations and relays gateway-authorized host calls (`a206/docs/plugin-api.md`)
 
 | RustyClaw capability | Agent 206 status | How it should land |
 | --- | --- | --- |
-| Cron at/every/cron + agent-turn payloads (`cron.rs`, `tools/cron_tool.rs`, `gateway/cron_runtime.rs`) | partial: gateway scheduler for at/every/cron (with seconds and IANA zones) sending a message to a conversation under its current grants; missed runs fire once on start; pause/resume/run now/remove through commands and `agent206 schedule` (`docs/schedules.md`) | Agent-requested jobs (approved per call), desktop/TUI page, messenger delivery, run history |
+| Cron at/every/cron + agent-turn payloads (`cron.rs`, `tools/cron_tool.rs`, `gateway/cron_runtime.rs`) | partial: gateway scheduler for at/every/cron (with seconds and IANA zones) sending a message to a conversation under its current grants; missed runs fire once on start; pause/resume/run now/remove through commands, `agent206 schedule` and the shared Schedules page (`a206/crates/ui/src/schedules.rs`, `docs/schedules.md`) | Agent-requested jobs (approved per call), messenger delivery, run history |
 | External triggers as child programs (`triggers.rs`, `gateway/trigger_manager.rs`, `tools/trigger_tools.rs`) | missing | WASM/sandboxed trigger extensions; TriggerOnly credentials |
 | Heartbeat / subconscious loop (`subconscious.rs`, `workspace_context.rs`) | missing | Scheduled self-check task with budget |
 | Auto-fetch sync sources (`auto_fetch.rs`) | missing | Downloads lifecycle + scheduler |

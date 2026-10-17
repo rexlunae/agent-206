@@ -85,3 +85,108 @@ pub struct Job {
     #[serde(default)]
     pub author: JobAuthor,
 }
+
+/// Why a typed schedule time or interval was refused.
+#[derive(Debug, thiserror::Error)]
+pub enum InputError {
+    #[error("“{text}” is not an RFC 3339 time such as 2026-10-18T09:00:00Z")]
+    Time {
+        text: String,
+        #[source]
+        source: jiff::Error,
+    },
+    #[error("times before 1970 are not supported")]
+    BeforeEpoch,
+    #[error("“{text}” is not a duration such as 90m, 1h 30m or 1d")]
+    Interval {
+        text: String,
+        #[source]
+        source: jiff::Error,
+    },
+    #[error("intervals are whole seconds")]
+    FractionalInterval,
+    #[error("the interval must be positive")]
+    NonPositiveInterval,
+}
+
+/// Unix seconds of an RFC 3339 time.
+pub fn parse_time(text: &str) -> Result<u64, InputError> {
+    let time: jiff::Timestamp = text.trim().parse().map_err(|source| InputError::Time {
+        text: text.to_owned(),
+        source,
+    })?;
+    u64::try_from(time.as_second()).map_err(|_| InputError::BeforeEpoch)
+}
+
+/// Whole seconds of a duration such as `90m`, `1h 30m` or `PT2H`.
+pub fn parse_interval(text: &str) -> Result<u64, InputError> {
+    let interval: jiff::SignedDuration =
+        text.trim().parse().map_err(|source| InputError::Interval {
+            text: text.to_owned(),
+            source,
+        })?;
+    if interval.subsec_nanos() != 0 {
+        return Err(InputError::FractionalInterval);
+    }
+    u64::try_from(interval.as_secs())
+        .ok()
+        .filter(|&seconds| seconds > 0)
+        .ok_or(InputError::NonPositiveInterval)
+}
+
+/// An RFC 3339 UTC time for Unix seconds, for showing a schedule.
+pub fn format_time(seconds: u64) -> Option<String> {
+    let seconds = i64::try_from(seconds).ok()?;
+    jiff::Timestamp::from_second(seconds)
+        .ok()
+        .map(|time| time.to_string())
+}
+
+/// A whole-second interval in the short form [`parse_interval`] reads back,
+/// such as `1h 30m`.
+pub fn format_interval(seconds: u64) -> Option<String> {
+    let seconds = i64::try_from(seconds).ok()?;
+    Some(format!("{:#}", jiff::SignedDuration::from_secs(seconds)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn typed_times_and_intervals_parse_or_say_why_not() {
+        let seconds = u64::from(crate::Id::new_v4().as_fields().1) * 60 + 60;
+        let shown = format_time(seconds).unwrap();
+        assert_eq!(parse_time(&format!(" {shown} ")).unwrap(), seconds);
+        assert!(matches!(
+            parse_time("1969-12-31T23:59:59Z"),
+            Err(InputError::BeforeEpoch)
+        ));
+        let typo = crate::Id::new_v4().to_string();
+        let error = parse_time(&typo).unwrap_err();
+        assert!(matches!(&error, InputError::Time { text, .. } if *text == typo));
+        assert!(std::error::Error::source(&error).is_some());
+
+        assert_eq!(parse_interval(&format!("{seconds}s")).unwrap(), seconds);
+        assert_eq!(parse_interval("1h 30m").unwrap(), 5_400);
+        assert_eq!(format_interval(5_400).as_deref(), Some("1h 30m"));
+        let shown = format_interval(seconds).unwrap();
+        assert_eq!(parse_interval(&shown).unwrap(), seconds);
+        assert!(matches!(
+            parse_interval("1.5s"),
+            Err(InputError::FractionalInterval)
+        ));
+        assert!(matches!(
+            parse_interval("0s"),
+            Err(InputError::NonPositiveInterval)
+        ));
+        assert!(matches!(
+            parse_interval("-5m"),
+            Err(InputError::NonPositiveInterval)
+        ));
+        assert!(matches!(
+            parse_interval(&typo),
+            Err(InputError::Interval { .. })
+        ));
+    }
+}

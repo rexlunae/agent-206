@@ -11,6 +11,7 @@ mod messengers;
 mod pages;
 mod prompts;
 mod route;
+mod schedules;
 mod search;
 mod settings;
 mod skills;
@@ -704,7 +705,7 @@ fn Sidebar() -> Element {
     let snapshot = state.data.read();
     rsx! { NavSidebar { class: "a206-sidebar", label: name!("Workspace navigation"), title: rsx! { "Workspace" }, collapsible: false,
         div { class: "a206-nav-group",
-            for item in [Route::Workspace {}, Route::Projects {}, Route::Conversations {}, Route::Activity {}] {
+            for item in [Route::Workspace {}, Route::Projects {}, Route::Conversations {}, Route::Schedules {}, Route::Activity {}] {
                 LinkButton { variant: ButtonVariant::Ghost, size: ButtonSize::Sm, class: if route == item { "a206-nav-active" } else { "" }, href: item.to_string(), Icon { name: item.icon(), size: IconSize::Sm } "{item.label()}" }
             }
         }

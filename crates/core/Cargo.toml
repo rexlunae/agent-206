@@ -9,6 +9,8 @@ serde.workspace = true
 serde_bytes = "0.11"
 a206-extension-abi.workspace = true
 thiserror.workspace = true
+# Parses the times and intervals people type for schedules; no time zone data.
+jiff = { version = "0.2", default-features = false, features = ["std"] }
 uuid.workspace = true
 url.workspace = true
 zeroize.workspace = true

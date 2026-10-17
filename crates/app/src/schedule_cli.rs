@@ -1,5 +1,6 @@
 //! `agent206 schedule`: messages the gateway sends to a conversation at set
 //! times. Each run is an ordinary message under the conversation's grants.
+use a206_core::schedule::{parse_interval, parse_time};
 use a206_core::{Command, Job, Reply, Schedule};
 use a206_runtime::client::Client;
 use anyhow::{Context, Result, bail};
@@ -45,13 +46,6 @@ pub enum ScheduleAction {
     Remove { id: uuid::Uuid },
 }
 
-fn unix(time: &str) -> Result<u64> {
-    let time: jiff::Timestamp = time
-        .parse()
-        .with_context(|| format!("{time} is not an RFC 3339 time"))?;
-    u64::try_from(time.as_second()).context("times before 1970 are not supported")
-}
-
 fn schedule(
     at: Option<String>,
     every: Option<String>,
@@ -60,18 +54,13 @@ fn schedule(
     zone: Option<String>,
 ) -> Result<Schedule> {
     Ok(match (at, every, cron) {
-        (Some(at), None, None) => Schedule::At { at: unix(&at)? },
+        (Some(at), None, None) => Schedule::At {
+            at: parse_time(&at)?,
+        },
         (None, Some(every), None) => {
-            let interval: jiff::SignedDuration = every
-                .parse()
-                .with_context(|| format!("{every} is not a duration"))?;
-            if interval.subsec_nanos() != 0 {
-                bail!("intervals are whole seconds; {every} is not");
-            }
-            let seconds =
-                u64::try_from(interval.as_secs()).context("the interval must be positive")?;
+            let seconds = parse_interval(&every)?;
             let anchor = match anchor {
-                Some(anchor) => unix(&anchor)?,
+                Some(anchor) => parse_time(&anchor)?,
                 None => u64::try_from(jiff::Timestamp::now().as_second())
                     .context("the system clock is before 1970")?,
             };

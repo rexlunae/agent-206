@@ -9,6 +9,7 @@ use crate::{
         Browser, Conversations, Documents, Downloads, Extensions, Joshua, Overview as Workspace,
         Projects, Security,
     },
+    schedules::Schedules,
     settings::{Appearance, Prompts, Providers},
 };
 use fc_dioxus::prelude::*;
@@ -33,6 +34,8 @@ pub(crate) enum Route {
     Projects {},
     #[route("/activity")]
     Activity {},
+    #[route("/schedules")]
+    Schedules {},
     #[route("/connections")]
     Providers {},
     #[route("/messengers")]
@@ -66,6 +69,7 @@ impl Route {
             Self::Chat { .. } | Self::Conversations {} => IconName::Sparkles,
             Self::Projects {} => IconName::Folder,
             Self::Activity {} => IconName::Clock,
+            Self::Schedules {} => IconName::Refresh,
             Self::Providers {} => IconName::Link,
             Self::Messengers {} => IconName::Send,
             Self::Downloads {} => IconName::Download,
@@ -85,6 +89,7 @@ impl Route {
             Self::Conversations {} => "Conversations",
             Self::Projects {} => "Projects",
             Self::Activity {} => "Activity",
+            Self::Schedules {} => "Schedules",
             Self::Providers {} => "Connections",
             Self::Messengers {} => "Messengers",
             Self::Downloads {} => "Downloads",
@@ -111,7 +116,7 @@ fn NotFound(segments: Vec<String>) -> Element {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use dioxus::history::{History, MemoryHistory};
     use std::rc::Rc;
@@ -294,7 +299,7 @@ mod tests {
     }
 
     /// Loaded, connected client state showing `snapshot`.
-    fn loaded_state(snapshot: a206_core::Snapshot) -> crate::State {
+    pub(crate) fn loaded_state(snapshot: a206_core::Snapshot) -> crate::State {
         crate::State {
             data: use_signal(|| snapshot),
             loaded: use_signal(|| true),
