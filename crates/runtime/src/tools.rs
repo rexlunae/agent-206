@@ -12,7 +12,8 @@
 //! adapter (`crate::mcp_tools`), native command execution
 //! (`crate::exec_tool`), approved skills (`crate::skill_tool`) and subagents
 //! (`crate::delegation_tool`) are registered by default, with `ask_user`
-//! (`crate::prompt_tool`) and `extension_propose` (`crate::propose_tool`).
+//! (`crate::prompt_tool`), `extension_propose` (`crate::propose_tool`) and
+//! `extension_list` (`crate::extension_list_tool`).
 use a206_core::{
     Capability, ErrorKind, ErrorReport, Id, Thread, ToolList, ToolOffer, ToolPermission,
     UnavailableTools,
