@@ -355,6 +355,17 @@ impl ExtensionHost {
         }
     }
 
+    /// Every installed extension and every package waiting for review, as
+    /// the user sees them on the Extensions page.
+    pub fn catalog(
+        &self,
+    ) -> Result<(Vec<PluginSummary>, Vec<a206_core::ExtensionProposal>), ExtensionError> {
+        let store = self.store.lock().map_err(|_| ExtensionError::Poisoned)?;
+        Ok((
+            store.state.plugins.clone(),
+            store.state.extension_proposals.clone(),
+        ))
+    }
     fn plugins(&self) -> Result<Vec<PluginSummary>, ExtensionError> {
         Ok(self
             .store

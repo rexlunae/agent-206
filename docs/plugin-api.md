@@ -95,6 +95,31 @@ it reads the two files under `read_workspace`, confined to the project root.
 
 Not yet: registry or URL installs, signatures, and a pre-install audit.
 
+### What agents see
+
+The native `extension_list` tool (RustyClaw's `plugin_list`) gives the agent
+what the Extensions page shows: each extension's id, name, version, source,
+enabled switch, requested and granted permissions, tools and panels, plus the
+packages waiting for review and whether this conversation prepared them. Each
+tool carries the name to call it by here (`call_as`), or `null`, and
+`blocked_by` lists what stands in the way: the extension is disabled, the user
+has not granted it a permission, or this conversation does not allow one. An
+extension whose package cannot be loaded lists its errors. Names and
+descriptions are written by each extension's author.
+
+The listing reads records and changes nothing, so it uses no capability; like
+every tool it is denied until the user permits it in the conversation. It is
+how an agent learns what to ask the user for; enabling and granting stay user
+operations.
+
+Extension state is not exposed to agents. RustyClaw's `plugin_state_get`,
+`plugin_state_set` and `plugin_state_patch` wrote a plugin's state directly;
+here state is the extension's private storage (`state_get`/`state_put`), and an
+agent changes it only by calling the extension's own tools, which validate what
+they store under the extension's grants. An extension that wants agents to feed
+a panel declares a tool that does so. RustyClaw's `plugin_create` corresponds to
+`extension_propose`.
+
 ### Manifest
 
 ```toml

@@ -87,6 +87,7 @@ pub(crate) fn classify(error: &(dyn Error + 'static)) -> Option<ErrorKind> {
         crate::control::ControlError,
         crate::exec_tool::ExecError,
         crate::prompt_tool::PromptError,
+        crate::extension_list_tool::ListError,
         crate::propose_tool::ProposeError,
         crate::gateway::GatewayError,
         crate::joshua::JoshuaError,

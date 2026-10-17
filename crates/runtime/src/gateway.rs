@@ -411,6 +411,10 @@ impl Gateway {
         // Proposing grants nothing; installing a proposal is a user operation.
         let propose_tools: Arc<dyn crate::tools::ToolHost> =
             Arc::new(crate::propose_tool::ProposeHost::new(extensions.clone()));
+        // Listing reads what the Extensions page shows and changes nothing.
+        let list_tools: Arc<dyn crate::tools::ToolHost> = Arc::new(
+            crate::extension_list_tool::ListHost::new(extensions.clone()),
+        );
         // So are tools of enabled MCP servers the conversation may use. The
         // host holds only the MCP client, not this gateway.
         let mcp = McpClient::new(store.clone());
@@ -442,6 +446,7 @@ impl Gateway {
                 Arc::new(crate::prompt_tool::PromptHost::new(prompts.clone())),
                 skill_tools,
                 propose_tools,
+                list_tools,
             ]),
             approvals: Arc::new(Mutex::new(BTreeMap::new())),
             prompts,

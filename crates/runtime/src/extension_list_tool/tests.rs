@@ -1,0 +1,232 @@
+//! What the listing reports for each extension and tool. A call through a
+//! native run is in `tests/extension_tools.rs`.
+use super::*;
+use crate::store::Store;
+use a206_core::Id;
+use std::sync::{Arc, Mutex};
+
+const WORKSPACE: &str = "agent206.workspace";
+
+struct Rig {
+    _dir: tempfile::TempDir,
+    store: Arc<Mutex<Store>>,
+    host: ListHost,
+    thread: Id,
+}
+fn rig() -> Rig {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(Mutex::new(Store::open(&dir.path().join("data")).unwrap()));
+    let host = ListHost::new(ExtensionHost::new(store.clone(), dir.path().into()));
+    Rig {
+        _dir: dir,
+        store,
+        host,
+        thread: Id::new_v4(),
+    }
+}
+impl Rig {
+    fn edit(&self, id: &str, change: impl FnOnce(&mut PluginSummary)) {
+        let mut store = self.store.lock().unwrap();
+        change(store.state.plugins.iter_mut().find(|p| p.id == id).unwrap());
+    }
+    fn plugin(&self, id: &str) -> PluginSummary {
+        let store = self.store.lock().unwrap();
+        store
+            .state
+            .plugins
+            .iter()
+            .find(|p| p.id == id)
+            .unwrap()
+            .clone()
+    }
+    async fn call(
+        &self,
+        arguments: Value,
+        capabilities: &[Capability],
+    ) -> Result<Value, ErrorReport> {
+        let Value::Object(arguments) = arguments else {
+            panic!("arguments are an object");
+        };
+        let scope = ToolScope {
+            thread: self.thread,
+            workspace: None,
+            capabilities: capabilities.iter().copied().collect(),
+        };
+        let request = ToolRequest {
+            call: Id::new_v4().to_string(),
+            name: NAME.into(),
+            arguments,
+            approved: false,
+        };
+        let output = self.host.call(&scope, request).await?;
+        assert!(!output.is_error);
+        Ok(serde_json::from_str(&output.text).unwrap())
+    }
+    async fn listed(&self, capabilities: &[Capability]) -> Value {
+        self.call(json!({}), capabilities).await.unwrap()
+    }
+}
+fn extension<'a>(listing: &'a Value, id: &str) -> &'a Value {
+    listing["extensions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["id"] == id)
+        .unwrap()
+}
+fn tool<'a>(listing: &'a Value, id: &str, name: &str) -> &'a Value {
+    extension(listing, id)["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["tool"] == name)
+        .unwrap()
+}
+fn blocked(tool: &Value) -> Vec<&str> {
+    tool["blocked_by"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r.as_str().unwrap())
+        .collect()
+}
+/// A workspace tool needing exactly `need`.
+fn needing(rig: &Rig, need: Capability) -> String {
+    rig.plugin(WORKSPACE)
+        .tools
+        .into_iter()
+        .find(|t| t.capabilities == [need].into())
+        .unwrap()
+        .name
+}
+
+#[tokio::test]
+async fn the_listing_uses_no_capability_and_takes_no_arguments() {
+    let rig = rig();
+    // Readable from any conversation the user permits it in.
+    assert!(rig.call(json!({}), &[]).await.is_ok());
+    let extra = rig.call(json!({"include_state": true}), &[]).await;
+    assert_eq!(extra.unwrap_err().kind, ErrorKind::InvalidRequest);
+    let spec = ListHost::spec();
+    assert!(spec.capabilities.is_empty());
+    assert!(spec.whole_output);
+}
+
+#[tokio::test]
+async fn each_tool_says_how_to_call_it_or_what_blocks_it() {
+    let rig = rig();
+    let (read, write) = (
+        needing(&rig, Capability::ReadWorkspace),
+        needing(&rig, Capability::WriteWorkspace),
+    );
+    rig.edit(WORKSPACE, |p| {
+        p.enabled = true;
+        p.granted = [Capability::ReadWorkspace].into();
+    });
+    let read_label = Capability::ReadWorkspace.label();
+    let write_label = Capability::WriteWorkspace.label();
+
+    // Granted to the extension, but this conversation does not allow it.
+    let listing = rig.listed(&[]).await;
+    let entry = tool(&listing, WORKSPACE, &read);
+    assert_eq!(
+        entry["call_as"],
+        crate::extension_tools::tool_name(WORKSPACE, &read)
+    );
+    assert_eq!(
+        blocked(entry),
+        [format!("This conversation does not allow: {read_label}.")]
+    );
+    let entry = tool(&listing, WORKSPACE, &write);
+    assert!(entry["call_as"].is_null());
+    assert_eq!(
+        blocked(entry),
+        [
+            format!("The user has not granted this extension: {write_label}."),
+            format!("This conversation does not allow: {write_label}."),
+        ]
+    );
+    assert_eq!(
+        extension(&listing, WORKSPACE)["permissions_granted"],
+        json!([read_label])
+    );
+
+    // Allowed here: nothing stands in the way.
+    let listing = rig.listed(&[Capability::ReadWorkspace]).await;
+    assert!(blocked(tool(&listing, WORKSPACE, &read)).is_empty());
+
+    // Disabled by the user: not callable, and the listing says why.
+    rig.edit(WORKSPACE, |p| p.enabled = false);
+    let listing = rig.listed(&[Capability::ReadWorkspace]).await;
+    let entry = tool(&listing, WORKSPACE, &read);
+    assert!(entry["call_as"].is_null());
+    assert_eq!(blocked(entry), ["The user has not enabled this extension."]);
+    assert_eq!(extension(&listing, WORKSPACE)["enabled"], false);
+}
+
+#[tokio::test]
+async fn an_extension_that_cannot_load_reports_its_failure() {
+    let rig = rig();
+    // Recorded as installed, but its package is missing from the store.
+    let id = format!("test.{}", Id::new_v4().simple());
+    let mut broken = rig.plugin(WORKSPACE);
+    broken.id = id.clone();
+    broken.enabled = true;
+    broken.granted = broken.capabilities.clone();
+    broken.source = PluginSource::Installed {
+        digest: "0".repeat(64),
+    };
+    rig.store.lock().unwrap().state.plugins.push(broken.clone());
+    let listing = rig.listed(&[Capability::ReadWorkspace]).await;
+    let entry = extension(&listing, &id);
+    assert_eq!(entry["source"], "installed by the user");
+    assert!(!entry["errors"].as_array().unwrap().is_empty(), "{entry}");
+    for tool in entry["tools"].as_array().unwrap() {
+        assert!(tool["call_as"].is_null(), "{tool}");
+    }
+    // The other extensions are still listed as usual.
+    assert!(extension(&listing, WORKSPACE).get("errors").is_none());
+}
+
+#[tokio::test]
+async fn proposals_say_which_conversation_prepared_them() {
+    let rig = rig();
+    let proposal = |thread| ExtensionProposal {
+        digest: Id::new_v4().simple().to_string(),
+        summary: PluginSummary {
+            id: format!("test.{}", Id::new_v4().simple()),
+            ..rig.plugin(WORKSPACE)
+        },
+        thread,
+        proposed_at: 0,
+    };
+    let (here, elsewhere) = (proposal(rig.thread), proposal(Id::new_v4()));
+    rig.store
+        .lock()
+        .unwrap()
+        .state
+        .extension_proposals
+        .extend([here.clone(), elsewhere.clone()]);
+    let listing = rig.listed(&[]).await;
+    let waiting = listing["waiting_for_review"].as_array().unwrap();
+    let flag = |p: &ExtensionProposal| {
+        waiting
+            .iter()
+            .find(|w| w["digest"] == p.digest)
+            .map(|w| (w["id"].clone(), w["prepared_in_this_conversation"].clone()))
+            .unwrap()
+    };
+    assert_eq!(flag(&here), (json!(here.summary.id), json!(true)));
+    assert_eq!(
+        flag(&elsewhere),
+        (json!(elsewhere.summary.id), json!(false))
+    );
+    // A proposal is never listed as an installed extension.
+    assert!(
+        listing["extensions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|e| e["id"] != here.summary.id)
+    );
+}
