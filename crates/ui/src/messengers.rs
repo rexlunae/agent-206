@@ -12,10 +12,31 @@ use uuid::Uuid;
 #[component]
 pub fn Messengers() -> Element {
     let state = use_context::<State>();
+    // Catalogs expire without the snapshot changing, so the page keeps its
+    // own clock: it wakes at the next expiry (at most a minute away) and
+    // renders the cards with the new time.
+    let mut clock = use_signal(now);
+    use_future(move || async move {
+        loop {
+            let at = *clock.peek();
+            let next = state
+                .data
+                .peek()
+                .catalogs
+                .iter()
+                .map(|c| c.expires_at)
+                .filter(|&expires| expires > at)
+                .min();
+            let wait = next.map_or(60, |expires| (expires - at).min(60));
+            futures_timer::Delay::new(std::time::Duration::from_secs(wait)).await;
+            clock.set(now());
+        }
+    });
+    let now = clock();
     let snapshot = state.data.read();
     rsx! { PageFrame { kicker: "Messengers", title: "Talk to a thread from chat.", description: "Each allowed chat gets its own conversation, which runs with that conversation's permissions and model. Bot tokens stay in the vault.",
         for messenger in &snapshot.settings.messengers {
-            MessengerCard { key: "{messenger.name}", config: messenger.clone(), status: snapshot.messengers.iter().find(|s| s.name == messenger.name).cloned().unwrap_or_default() }
+            MessengerCard { key: "{messenger.name}", now, config: messenger.clone(), status: snapshot.messengers.iter().find(|s| s.name == messenger.name).cloned().unwrap_or_default() }
         }
         AddMessenger {}
     } }
@@ -86,7 +107,8 @@ fn parse_model(value: &str) -> Option<ModelKey> {
 }
 
 #[component]
-fn MessengerCard(config: MessengerConfig, status: MessengerStatus) -> Element {
+/// `now` is the page clock, so choices and the warning agree on freshness.
+fn MessengerCard(now: u64, config: MessengerConfig, status: MessengerStatus) -> Element {
     let state = use_context::<State>();
     let name = config.name.clone();
     let enabled = config.enabled;
@@ -100,7 +122,6 @@ fn MessengerCard(config: MessengerConfig, status: MessengerStatus) -> Element {
     let mode = config.mode;
     let mode_selected = use_memo(use_reactive!(|mode| Some(mode.label().to_owned())));
     let snapshot = state.data.read();
-    let now = now();
     let models = model_choices(&snapshot, now);
     let model_known = config
         .model
