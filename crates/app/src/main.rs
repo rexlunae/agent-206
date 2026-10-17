@@ -17,7 +17,7 @@ mod vault_cli;
 mod native {
     use a206_core::{
         ApprovalDecision, ApprovalRequest, BackendConfig, Capability, CodingBackend, Command, Mode,
-        ProviderPreset, Reply, ToolBudget, ToolPermission,
+        PromptAnswer, ProviderPreset, Reply, ToolBudget, ToolPermission,
     };
     use clap::{Parser, Subcommand};
     use std::path::PathBuf;
@@ -149,6 +149,11 @@ mod native {
             #[command(subcommand)]
             command: ApprovalAction,
         },
+        /// Answer questions agents asked with `ask_user`.
+        Prompts {
+            #[command(subcommand)]
+            command: PromptAction,
+        },
         /// Export settings as TOML, or apply a reviewed TOML configuration.
         Settings {
             #[arg(long)]
@@ -254,6 +259,28 @@ mod native {
             thread: uuid::Uuid,
             approval: uuid::Uuid,
             digest: String,
+        },
+    }
+    #[derive(Subcommand)]
+    enum PromptAction {
+        /// Show the questions waiting for this conversation's user.
+        List { thread: uuid::Uuid },
+        /// Pick a suggested answer; CHOICE counts from 1 in the listed order.
+        Choose {
+            thread: uuid::Uuid,
+            prompt: uuid::Uuid,
+            choice: std::num::NonZeroU32,
+        },
+        /// Answer in your own words, if the question allows it.
+        Answer {
+            thread: uuid::Uuid,
+            prompt: uuid::Uuid,
+            text: String,
+        },
+        /// Tell the agent you will not answer.
+        Decline {
+            thread: uuid::Uuid,
+            prompt: uuid::Uuid,
         },
     }
     fn permission(value: &str) -> anyhow::Result<Option<ToolPermission>> {
@@ -938,6 +965,55 @@ mod native {
                             approval,
                             digest,
                             decision: ApprovalDecision::Deny,
+                        },
+                    },
+                    Action::Prompts { command } => match command {
+                        PromptAction::List { thread } => {
+                            let Reply::Snapshot(snapshot) = client.call(Command::Snapshot).await?
+                            else {
+                                anyhow::bail!("failed to read the conversation");
+                            };
+                            let thread = snapshot
+                                .threads
+                                .into_iter()
+                                .find(|t| t.id == thread)
+                                .ok_or_else(|| anyhow::anyhow!("conversation not found"))?;
+                            #[derive(serde::Serialize)]
+                            struct Pending {
+                                prompts: Vec<a206_core::UserPrompt>,
+                            }
+                            print!(
+                                "{}",
+                                toml::to_string_pretty(&Pending {
+                                    prompts: thread.prompts
+                                })?
+                            );
+                            return Ok(());
+                        }
+                        PromptAction::Choose {
+                            thread,
+                            prompt,
+                            choice,
+                        } => Command::AnswerPrompt {
+                            thread,
+                            prompt,
+                            answer: PromptAnswer::Choice {
+                                index: choice.get() - 1,
+                            },
+                        },
+                        PromptAction::Answer {
+                            thread,
+                            prompt,
+                            text,
+                        } => Command::AnswerPrompt {
+                            thread,
+                            prompt,
+                            answer: PromptAnswer::Text { text },
+                        },
+                        PromptAction::Decline { thread, prompt } => Command::AnswerPrompt {
+                            thread,
+                            prompt,
+                            answer: PromptAnswer::Decline,
                         },
                     },
                     Action::Settings { apply: Some(path) } => {
