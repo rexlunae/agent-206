@@ -1,9 +1,9 @@
 id = "agent206.workspace"
 name = "Workspace files"
-description = "Lists and reads files in a project workspace, and shows an overview panel."
-version = "0.2.0"
+description = "Lists, searches, reads and edits files in a project workspace, and shows an overview panel."
+version = "0.3.0"
 abi = 2
-capabilities = ["read_workspace"]
+capabilities = ["read_workspace", "write_workspace"]
 
 [[tools]]
 name = "list_directory"
@@ -24,6 +24,72 @@ capabilities = ["read_workspace"]
 name = "path"
 type = "string"
 description = "File path relative to the workspace root."
+required = true
+
+[[tools]]
+name = "search_text"
+description = "Find lines containing a literal, case-sensitive text in UTF-8 files of the project workspace. Skips .git and does not follow symlinks."
+capabilities = ["read_workspace"]
+
+[[tools.params]]
+name = "query"
+type = "string"
+description = "Text to find."
+required = true
+
+[[tools.params]]
+name = "path"
+type = "string"
+description = "Directory to search, relative to the workspace root. Defaults to the root."
+
+[[tools.params]]
+name = "max_matches"
+type = "integer"
+description = "Most matches to return, from 1 to 500. Defaults to 100."
+
+[[tools]]
+name = "write_text_file"
+description = "Write a UTF-8 text file in the project workspace, creating parent directories. Refuses to replace an existing file unless overwrite is true."
+capabilities = ["write_workspace"]
+
+[[tools.params]]
+name = "path"
+type = "string"
+description = "File path relative to the workspace root."
+required = true
+
+[[tools.params]]
+name = "text"
+type = "string"
+description = "The complete new contents."
+required = true
+
+[[tools.params]]
+name = "overwrite"
+type = "boolean"
+description = "Replace the file if it exists. Defaults to false."
+
+[[tools]]
+name = "edit_text_file"
+description = "Replace exactly one occurrence of a text in a UTF-8 file of the project workspace. Fails if the text is missing or occurs more than once."
+capabilities = ["write_workspace"]
+
+[[tools.params]]
+name = "path"
+type = "string"
+description = "File path relative to the workspace root."
+required = true
+
+[[tools.params]]
+name = "old_text"
+type = "string"
+description = "The exact text to replace."
+required = true
+
+[[tools.params]]
+name = "new_text"
+type = "string"
+description = "Its replacement."
 required = true
 
 [[panels]]

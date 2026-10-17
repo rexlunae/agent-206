@@ -148,7 +148,8 @@ printed authorization link first in each new browser session.
   destinations include the transfer library and `~/models`.
 - Owned local/SSH Joshua process start/stop, configurable API port, and API discovery.
 - UTF-8 document previews, scoped Git status and a sandboxed browser preview.
-- A compiled bundled WASM extension in a separate limited worker process.
+- A compiled bundled WASM extension in a separate limited worker process, confined
+  on Linux by bubblewrap + Landlock with no network.
 - A separate vault broker process holds the SecureStore-compatible vault, with
   RustyClaw's credential kinds and policies, TOTP two-factor and lockout. Provider
   API keys are attached by the broker only for origins you bind them to, so the

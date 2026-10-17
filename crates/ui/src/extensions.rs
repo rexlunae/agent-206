@@ -77,6 +77,7 @@ pub fn Extensions() -> Element {
                 }
             }
         }
+        crate::mcp::McpServers {}
     } }
 }
 

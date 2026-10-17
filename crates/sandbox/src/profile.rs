@@ -68,7 +68,9 @@ pub struct Profile<'a> {
     /// Paths that stay invisible even inside a granted directory.
     pub hidden: &'a [PathBuf],
     pub cwd: &'a Path,
-    pub port: u16,
+    /// Loopback port of the runtime's credential proxy; `None` leaves it
+    /// without any network.
+    pub port: Option<u16>,
 }
 
 impl Profile<'_> {
@@ -145,8 +147,10 @@ impl Profile<'_> {
         Ok(Spec {
             version: SPEC_VERSION,
             executable: self.executable.to_path_buf(),
-            port: self.port,
-            proxy: self.proxy_socket(),
+            proxy: self.port.map(|port| crate::Proxy {
+                port,
+                socket: self.proxy_socket(),
+            }),
             status: self.status_socket(),
             rules: self.rules()?,
         })
@@ -330,7 +334,7 @@ mod tests {
                 execute,
                 hidden,
                 cwd: &self.scratch,
-                port: 1,
+                port: Some(1),
             }
         }
     }
@@ -391,8 +395,13 @@ mod tests {
         assert!(args.iter().any(|arg| arg == "--unshare-all"));
         assert!(!args.iter().any(|arg| arg == "--share-net"));
         let spec = crate::Spec::decode(args.last().unwrap().to_str().unwrap()).unwrap();
-        assert_eq!(spec.port, 1);
-        assert_eq!(spec.proxy, layout.control.join("proxy.sock"));
+        assert_eq!(
+            spec.proxy,
+            Some(crate::Proxy {
+                port: 1,
+                socket: layout.control.join("proxy.sock")
+            })
+        );
         let none = layout.profile(None, &hidden, false).arguments().unwrap();
         assert!(!none.iter().any(|arg| arg == layout.project.as_os_str()));
         assert!(!none.iter().any(|arg| arg == hidden[0].as_os_str()));
@@ -438,5 +447,22 @@ mod tests {
         ));
         assert!(matches!(Spec::decode("!"), Err(SandboxError::Base64(_))));
         assert!(matches!(Spec::decode("AAAA"), Err(SandboxError::Decode(_))));
+    }
+
+    #[test]
+    fn a_single_executable_without_a_proxy_gets_no_network_and_no_directory() {
+        let layout = layout();
+        let profile = Profile {
+            root: &layout.executable,
+            port: None,
+            ..layout.profile(None, &[], false)
+        };
+        let rules = profile.rules().unwrap();
+        assert_eq!(access(&rules, &layout.executable), [Access::Execute]);
+        assert!(access(&rules, &layout.root).is_empty());
+        let args = profile.arguments().unwrap();
+        assert!(!args.iter().any(|arg| arg == layout.root.as_os_str()));
+        let spec = crate::Spec::decode(args.last().unwrap().to_str().unwrap()).unwrap();
+        assert_eq!(spec.proxy, None);
     }
 }

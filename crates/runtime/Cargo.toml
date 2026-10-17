@@ -8,6 +8,7 @@ license.workspace = true
 a206-core.workspace = true
 a206-protocol.workspace = true
 a206-extensions.workspace = true
+a206-mcp.workspace = true
 a206-vault.workspace = true
 a206-broker.workspace = true
 a206-sandbox.workspace = true
@@ -29,6 +30,7 @@ thiserror.workspace = true
 zeroize.workspace = true
 fs2 = "0.4"
 cap-std = "4"
+cap-fs-ext = "4"
 axum = "0.8"
 tower-http = { version = "0.6", features = ["fs", "set-header"] }
 tower = { version = "0.5", features = ["util"] }
