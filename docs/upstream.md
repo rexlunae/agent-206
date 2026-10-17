@@ -54,7 +54,7 @@ no upstream engine implementation was copied):
 - [Claude runtime license](https://github.com/anthropics/claude-code/blob/main/LICENSE.md):
   separate Anthropic terms; the ACP adapter's license does not license the runtime.
 
-The fc-dioxus dependency pins `6f479cf05cba78fd3ab60d82c2d961afd4b7dd25`
+The fc-dioxus dependency pins `de1b260ad551e2ec18db7043c96ba55e84f4a657`
 from the feature-surface-contrast fix branch. Its future-css pin is
 `63f52ccbc42c2f28d08b3c35e87f90d0b8fef6d9`. These revisions retain fixes for
 bottom-edge popup placement in the source toolkit and host bridge, with parity
