@@ -595,3 +595,25 @@ async fn web_controls_require_authority_and_deduplicate_restart() -> Result<()> 
     app.shutdown().await?;
     Ok(())
 }
+
+#[tokio::test]
+async fn activity_prints_journal_events_as_toml_pages() -> Result<()> {
+    let mut app = App::start(tempfile::tempdir()?, BTreeMap::new()).await?;
+    for _ in 0..2 {
+        let settings = app.snapshot().await?.settings;
+        let reply =
+            socket_request(&app, uuid::Uuid::new_v4(), Command::SaveSettings(settings)).await?;
+        ensure!(reply == Reply::Ok, "{reply:?}");
+    }
+    let first: a206_core::ActivityPage =
+        toml::from_str(&app.cli(&["activity", "--limit", "1"]).await?)?;
+    ensure!(first.more && first.events.len() == 1);
+    ensure!(first.events[0].kind == a206_core::EventKind::SettingsChanged);
+    let before = first.events[0].sequence.to_string();
+    let next: a206_core::ActivityPage = toml::from_str(
+        &app.cli(&["activity", "--before", &before, "--limit", "1"])
+            .await?,
+    )?;
+    ensure!(next.events.len() == 1 && next.events[0].sequence < first.events[0].sequence);
+    app.shutdown().await
+}

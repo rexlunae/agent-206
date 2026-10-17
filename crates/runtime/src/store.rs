@@ -246,6 +246,32 @@ impl Store {
         let rows = stmt.query_map([after], |row| row.get::<_, Vec<u8>>(0))?;
         rows.map(|r| Ok(rmp_serde::from_slice(&r?)?)).collect()
     }
+    /// See [`Command::Activity`](a206_core::Command::Activity). Only the
+    /// retained journal is read, so the oldest page ends where the journal does.
+    pub fn activity(&self, before: Option<u64>, limit: u32) -> Result<ActivityPage> {
+        // A page always holds at least one event, so a page that says older
+        // activity remains also carries the cursor to reach it.
+        let limit = usize::try_from(limit.clamp(1, MAX_ACTIVITY)).unwrap_or(1);
+        let before = before.unwrap_or(self.state.last_event.saturating_add(1));
+        let mut stmt = self
+            .db
+            .prepare("SELECT payload FROM events WHERE seq < ?1 ORDER BY seq DESC")?;
+        let mut rows = stmt.query([before])?;
+        let mut events = Vec::with_capacity(limit);
+        let mut more = false;
+        while let Some(row) = rows.next()? {
+            let event: Event = rmp_serde::from_slice(&row.get::<_, Vec<u8>>(0)?)?;
+            if event.kind.is_progress() {
+                continue;
+            }
+            if events.len() == limit {
+                more = true;
+                break;
+            }
+            events.push(event);
+        }
+        Ok(ActivityPage { events, more })
+    }
     /// A duplicate pending request is indeterminate, never silently executed a second time.
     pub fn begin(&mut self, id: Id, command: &Command) -> Result<Option<Reply>> {
         let body = rmp_serde::to_vec_named(command)?;

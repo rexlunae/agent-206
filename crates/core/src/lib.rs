@@ -676,6 +676,16 @@ pub struct Event {
     pub at: u64,
     pub kind: EventKind,
 }
+/// Most events one [`Command::Activity`] page holds.
+pub const MAX_ACTIVITY: u32 = 100;
+/// Journal events newest first, leaving out [progress
+/// notices](EventKind::is_progress).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ActivityPage {
+    pub events: Vec<Event>,
+    /// Older activity is still journaled before the last event here.
+    pub more: bool,
+}
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum EventKind {
     ThreadChanged {
@@ -726,6 +736,22 @@ pub enum EventKind {
     JobChanged {
         id: Id,
     },
+}
+
+impl EventKind {
+    /// Notices that only tell clients to re-read something that is still
+    /// changing: conversation updates (sent while replies stream) and
+    /// running-download progress. Activity views leave them out.
+    pub fn is_progress(&self) -> bool {
+        matches!(
+            self,
+            Self::ThreadChanged { .. }
+                | Self::DownloadChanged(Download {
+                    state: DownloadState::Running,
+                    ..
+                })
+        )
+    }
 }
 
 /// A capability the vault broker issues to the gateway for one unlock, so the
@@ -815,6 +841,12 @@ pub enum Command {
     /// The tools this conversation could use and how each is permitted.
     ListTools {
         thread: Id,
+    },
+    /// The newest [`ActivityPage`] of the event journal, or the page before
+    /// sequence `before`; `limit` events, between one and [`MAX_ACTIVITY`].
+    Activity {
+        before: Option<u64>,
+        limit: u32,
     },
     /// Set (or with `None`, clear back to deny) one tool's permission.
     SetToolPermission {
@@ -994,6 +1026,7 @@ impl Command {
             Self::Send { .. } => "send",
             Self::CancelRun { .. } => "cancel_run",
             Self::SearchMessages { .. } => "search_messages",
+            Self::Activity { .. } => "activity",
             Self::CompactThread { .. } => "compact_thread",
             Self::ListTools { .. } => "list_tools",
             Self::SetToolPermission { .. } => "set_tool_permission",
@@ -1050,6 +1083,7 @@ pub enum Reply {
     Skill(SkillText),
     Tools(ToolList),
     Messages(Vec<MessageHit>),
+    Activity(ActivityPage),
     Extension(Box<PluginSummary>),
     Job(Box<Job>),
 }
