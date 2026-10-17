@@ -271,8 +271,11 @@ fn steps(
 /// Steps that widen what Agent 206 can reach. None is needed to start, so they
 /// stay out of the checklist count.
 /// `skills` is the gateway's last skill listing: `None` until it answers.
+/// `running` is whether the gateway reports itself running now; otherwise the
+/// snapshot's messenger states are from before it stopped.
 fn extras(
     snapshot: &Snapshot,
+    running: bool,
     skills: Option<&Result<Vec<SkillSummary>, ErrorReport>>,
 ) -> [Step; 3] {
     let done_or = |done: bool, title, detail: String, hint: String| {
@@ -298,18 +301,17 @@ fn extras(
         .iter()
         .filter(|m| state(&m.name) == MessengerState::Connected)
         .count();
-    [
-        done_or(
-            projects > 0,
-            "Add a project",
-            format!("Projects: {projects}."),
-            "Point a project at a folder so its conversations share a root and a coordinator."
-                .into(),
+    const MESSENGER: &str = "Connect a messenger";
+    let messenger = if !running && !enabled.is_empty() {
+        Step::new(
+            MESSENGER,
+            Progress::Unknown,
+            "The gateway is not running, so whether a messenger is connected is unknown.",
         )
-        .on(Route::Projects {}),
+    } else {
         done_or(
             connected > 0,
-            "Connect a messenger",
+            MESSENGER,
             format!("Connected: {connected} of {}.", messengers.len()),
             if messengers.is_empty() {
                 let kinds: Vec<_> = MessengerKind::ALL.iter().map(|kind| kind.label()).collect();
@@ -333,7 +335,17 @@ fn extras(
                 )
             },
         )
-        .on(Route::Messengers {}),
+    };
+    [
+        done_or(
+            projects > 0,
+            "Add a project",
+            format!("Projects: {projects}."),
+            "Point a project at a folder so its conversations share a root and a coordinator."
+                .into(),
+        )
+        .on(Route::Projects {}),
+        messenger.on(Route::Messengers {}),
         skill_step(skills, done_or).on(Route::Extensions {}),
     ]
 }
@@ -424,7 +436,10 @@ pub(crate) fn Welcome() -> Element {
         .filter(|step| step.progress == Progress::Done)
         .count();
     let total = steps.len();
-    let extras = extras(&snapshot, skills.read().as_ref());
+    let gateway_running = gateway
+        .as_ref()
+        .is_some_and(|report| report.phase == GatewayPhase::Running);
+    let extras = extras(&snapshot, gateway_running, skills.read().as_ref());
     let skills_failed = skills
         .read()
         .as_ref()
@@ -671,7 +686,10 @@ mod tests {
     fn extras_are_recommended_until_the_snapshot_shows_them() {
         let none = Some(&Ok(vec![]));
         let mut snapshot = crate::empty_snapshot();
-        assert_eq!(progress(&extras(&snapshot, none)), [Progress::Optional; 3]);
+        assert_eq!(
+            progress(&extras(&snapshot, true, none)),
+            [Progress::Optional; 3]
+        );
         snapshot.projects.push(a206_core::Project {
             id: Uuid::new_v4(),
             name: text(),
@@ -680,7 +698,7 @@ mod tests {
         });
         let mut messenger = a206_core::MessengerConfig::new(text(), MessengerKind::ALL[0]);
         snapshot.settings.messengers.push(messenger.clone());
-        let [project, off, _] = extras(&snapshot, none);
+        let [project, off, _] = extras(&snapshot, true, none);
         assert_eq!(project.progress, Progress::Done);
         // Configured but off is not connected.
         assert_eq!(off.progress, Progress::Optional);
@@ -704,22 +722,38 @@ mod tests {
                 })
                 .into_iter()
                 .collect();
-            let [_, on, _] = extras(&snapshot, none);
+            let [_, on, _] = extras(&snapshot, true, none);
             assert_eq!(on.progress, Progress::Optional, "{state:?}");
             assert!(on.detail.contains(&messenger.name), "{}", on.detail);
         }
         // Another messenger's connection does not count for this one.
         snapshot.messengers[0].name = text();
         snapshot.messengers[0].state = MessengerState::Connected;
-        assert_eq!(extras(&snapshot, none)[1].progress, Progress::Optional);
+        assert_eq!(
+            extras(&snapshot, true, none)[1].progress,
+            Progress::Optional
+        );
         snapshot.messengers[0].name = messenger.name.clone();
+        // A stopped gateway's last report says nothing about now.
+        snapshot.messengers[0].state = MessengerState::Connected;
+        assert_eq!(
+            extras(&snapshot, false, none)[1].progress,
+            Progress::Unknown
+        );
+        // With nothing turned on there is nothing to be unsure about.
+        snapshot.settings.messengers[0].enabled = false;
+        assert_eq!(
+            extras(&snapshot, false, none)[1].progress,
+            Progress::Optional
+        );
+        snapshot.settings.messengers[0].enabled = true;
         let enabled = Ok(vec![SkillSummary {
             name: text(),
             enabled: true,
             ..Default::default()
         }]);
         assert_eq!(
-            progress(&extras(&snapshot, Some(&enabled))),
+            progress(&extras(&snapshot, true, Some(&enabled))),
             [Progress::Done; 3]
         );
     }
@@ -727,7 +761,7 @@ mod tests {
     #[test]
     fn a_skill_counts_only_while_the_gateway_offers_it() {
         let snapshot = crate::empty_snapshot();
-        let skill = |read| extras(&snapshot, read).into_iter().last().unwrap();
+        let skill = |read| extras(&snapshot, true, read).into_iter().last().unwrap();
         assert_eq!(skill(None).progress, Progress::Checking);
         let failed = Err(ErrorReport::new(ErrorKind::Protocol, text()));
         assert_eq!(skill(Some(&failed)).progress, Progress::Unknown);
