@@ -210,7 +210,7 @@ fn bounded_output(mut text: String, limit: usize) -> String {
 /// Most ancestors followed when combining delegated permissions.
 const MAX_LINEAGE: usize = 32;
 /// A thread followed by each of its ancestors, nearest first.
-fn lineage(store: &Store, id: Id) -> Result<Vec<&Thread>> {
+pub(super) fn lineage(store: &Store, id: Id) -> Result<Vec<&Thread>> {
     let mut lineage = vec![store.thread(id)?];
     while let Some(next) = lineage.last().and_then(|t| t.parent) {
         check(
@@ -479,6 +479,11 @@ impl Gateway {
             if run.cancel.is_cancelled() {
                 return Ok(Ended::Cancelled);
             }
+            // A paused conversation, or one whose ancestor is paused, waits
+            // here until resumed or cancelled.
+            if !self.wait_while_paused(run.thread, &run.cancel).await? {
+                return Ok(Ended::Cancelled);
+            }
             // Every round's reply must fit; refuse the round rather than
             // stream a reply the conversation could not store.
             if self.lock()?.remaining()? < NEXT_ROUND {
@@ -509,6 +514,12 @@ impl Gateway {
                 && offered
                     .iter()
                     .any(|spec| spec.name == memory_flush::save_tool());
+            // A pause that arrived while the round was prepared holds it
+            // before its first request; the round is prepared again after.
+            if self.pause_pending(run.thread)? {
+                round -= 1;
+                continue;
+            }
             if over && !flush {
                 let compacted = self
                     .compact(compaction::Request {
@@ -569,6 +580,12 @@ impl Gateway {
                 root: &run.root,
                 pairing: pairing.as_ref(),
             };
+            // The same, after compaction and the tools offered with it: the
+            // last look before the request, with nothing awaited in between.
+            if self.pause_pending(run.thread)? {
+                round -= 1;
+                continue;
+            }
             let (turn, message) = match self
                 .stream_round(run, &round_prompt, &view.thread, broker, &offered)
                 .await?

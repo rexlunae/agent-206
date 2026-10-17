@@ -310,6 +310,12 @@ async fn the_user_can_compact_without_a_known_limit() {
         let during = rig.thread();
         assert_eq!(during.state, RunState::Running);
         assert_eq!(during.compacting, Some(RunState::Complete));
+        // Summarizing is not a run that can be paused, so no pause is left
+        // to hold the next one.
+        let Reply::Error(report) = rig.run(Command::PauseRun { thread: rig.thread }).await else {
+            panic!("pausing a compaction must fail");
+        };
+        assert_eq!(report.kind, ErrorKind::Conflict);
         let summary = nonce();
         summary_request
             .respond(text_response_reporting(api, &summary, 1))
@@ -319,6 +325,7 @@ async fn the_user_can_compact_without_a_known_limit() {
         };
         assert_eq!(thread.state, RunState::Complete);
         assert_eq!(thread.compacting, None);
+        assert!(!thread.paused);
         assert_eq!(thread.backend_activity, None);
         let found = summaries(&thread);
         assert_eq!(found.len(), 1);

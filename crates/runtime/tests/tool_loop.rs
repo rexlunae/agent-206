@@ -64,6 +64,13 @@ struct TestHost {
     rescoped: Rescoped,
     /// Tools named `held_…` finish only when this is notified.
     release: Arc<tokio::sync::Notify>,
+    /// When set, the next listing waits until it is released.
+    listing: Arc<Mutex<Option<ListHold>>>,
+}
+/// Says when a listing has started, then holds it until told to finish.
+struct ListHold {
+    entered: tokio::sync::oneshot::Sender<()>,
+    release: tokio::sync::oneshot::Receiver<()>,
 }
 /// Conversations whose scope `rescope` records, with the capabilities it
 /// last saw for each (`None` before any rescope, or once one is gone).
@@ -78,6 +85,11 @@ impl Drop for DropFlag {
 impl ToolHost for TestHost {
     fn list<'a>(&'a self, _: &'a ToolScope) -> BoxFuture<'a, ToolListing> {
         Box::pin(async move {
+            let hold = self.listing.lock().unwrap().take();
+            if let Some(hold) = hold {
+                hold.entered.send(()).unwrap();
+                hold.release.await.unwrap();
+            }
             ToolListing {
                 tools: self.tools.clone(),
                 unavailable: vec![],
@@ -145,6 +157,7 @@ struct Rig {
     dropped: Arc<AtomicBool>,
     rescoped: Rescoped,
     release: Arc<tokio::sync::Notify>,
+    listing: Arc<Mutex<Option<ListHold>>>,
 }
 async fn rig(api: ProviderApi, tools: Vec<ToolSpec>, blocking: Option<String>) -> Rig {
     let (sender, calls) = mpsc::unbounded_channel();
@@ -152,6 +165,7 @@ async fn rig(api: ProviderApi, tools: Vec<ToolSpec>, blocking: Option<String>) -
     let dropped = Arc::new(AtomicBool::new(false));
     let rescoped = Rescoped::default();
     let release = Arc::new(tokio::sync::Notify::new());
+    let listing = Arc::new(Mutex::new(None));
     let state = tempfile::tempdir().unwrap();
     let gateway = Gateway::open(state.path())
         .unwrap()
@@ -163,6 +177,7 @@ async fn rig(api: ProviderApi, tools: Vec<ToolSpec>, blocking: Option<String>) -
             dropped: dropped.clone(),
             rescoped: rescoped.clone(),
             release: release.clone(),
+            listing: listing.clone(),
         }));
     let (model, requests) = connect(&gateway, api).await;
     let mut rig = Rig {
@@ -176,6 +191,7 @@ async fn rig(api: ProviderApi, tools: Vec<ToolSpec>, blocking: Option<String>) -
         dropped,
         rescoped,
         release,
+        listing,
     };
     let Reply::Thread(thread) = rig
         .run(Command::CreateThread {
@@ -2290,4 +2306,155 @@ async fn a_subagents_token_budget_stays_within_its_parents() {
         rig.token_budget(parent, Some(0)).await,
         ErrorKind::InvalidRequest,
     );
+}
+
+// ── Pausing ─────────────────────────────────────────────────────────────────
+
+impl Rig {
+    async fn pause(&self, thread: Id, paused: bool) -> Reply {
+        self.run(if paused {
+            Command::PauseRun { thread }
+        } else {
+            Command::ResumeRun { thread }
+        })
+        .await
+    }
+    /// Wait until `thread`'s run is waiting for a pause to end.
+    async fn held(&self, thread: Id) {
+        tokio::time::timeout(PATIENCE, async {
+            while !thread_of(self, thread).held {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(wait("the run to be held"));
+    }
+}
+
+#[tokio::test]
+async fn a_paused_run_finishes_its_round_and_waits_until_resumed() {
+    let api = ProviderApi::Anthropic;
+    let name = nonce();
+    let mut rig = rig(api, vec![tool(&name, ToolPermission::Allow, &[])], None).await;
+    rig.permit(&name, ToolPermission::Allow).await;
+    refused(rig.pause(rig.thread, true).await, ErrorKind::Conflict);
+    let task = rig.send();
+    let first = rig.next_request().await;
+    assert_eq!(rig.pause(rig.thread, true).await, Reply::Ok);
+    refused(rig.pause(rig.thread, true).await, ErrorKind::Conflict);
+    // The round in progress, with its tool call, still finishes.
+    let call = Call::new(&name, json!({"value": nonce()}));
+    first
+        .respond(calls_response(api, std::slice::from_ref(&call), ""))
+        .await;
+    rig.held(rig.thread).await;
+    let thread = rig.thread();
+    assert_eq!(calls_of(&thread)[0].state, ToolCallState::Succeeded);
+    assert_eq!(thread.state, RunState::Running);
+    // Held means no further request has been made.
+    assert!(rig.requests.try_recv().is_err());
+
+    assert_eq!(rig.pause(rig.thread, false).await, Reply::Ok);
+    let second = rig.next_request().await;
+    assert!(!rig.thread().held);
+    second.respond(text_response(api, &nonce())).await;
+    let thread = finished(task).await;
+    assert_eq!(thread.state, RunState::Complete, "{:?}", thread.error);
+    assert!(!thread.paused && !thread.held);
+    refused(rig.pause(rig.thread, false).await, ErrorKind::Conflict);
+}
+
+#[tokio::test]
+async fn a_pause_made_while_a_round_is_prepared_holds_its_request() {
+    let api = ProviderApi::Anthropic;
+    let name = nonce();
+    let mut rig = rig(api, vec![tool(&name, ToolPermission::Allow, &[])], None).await;
+    rig.permit(&name, ToolPermission::Allow).await;
+    let task = rig.send();
+    let first = rig.next_request().await;
+    // The next round's tool listing waits until released.
+    let (entered, listing) = tokio::sync::oneshot::channel();
+    let (release, waiting) = tokio::sync::oneshot::channel();
+    *rig.listing.lock().unwrap() = Some(ListHold {
+        entered,
+        release: waiting,
+    });
+    first
+        .respond(calls_response(api, &[Call::new(&name, json!({}))], ""))
+        .await;
+    tokio::time::timeout(PATIENCE, listing)
+        .await
+        .unwrap_or_else(wait("the next round's tool listing"))
+        .unwrap();
+    // The round has passed its first look; the pause still holds it.
+    assert_eq!(rig.pause(rig.thread, true).await, Reply::Ok);
+    release.send(()).unwrap();
+    rig.held(rig.thread).await;
+    assert!(rig.requests.try_recv().is_err());
+
+    assert_eq!(rig.pause(rig.thread, false).await, Reply::Ok);
+    rig.next_request()
+        .await
+        .respond(text_response(api, &nonce()))
+        .await;
+    assert_eq!(finished(task).await.state, RunState::Complete);
+}
+
+#[tokio::test]
+async fn cancelling_a_paused_run_ends_it_and_clears_the_pause() {
+    let api = ProviderApi::OpenAi;
+    let name = nonce();
+    let mut rig = rig(api, vec![tool(&name, ToolPermission::Allow, &[])], None).await;
+    rig.permit(&name, ToolPermission::Allow).await;
+    let task = rig.send();
+    let first = rig.next_request().await;
+    assert_eq!(rig.pause(rig.thread, true).await, Reply::Ok);
+    first
+        .respond(calls_response(api, &[Call::new(&name, json!({}))], ""))
+        .await;
+    rig.held(rig.thread).await;
+    assert_eq!(
+        rig.run(Command::CancelRun { thread: rig.thread }).await,
+        Reply::Ok
+    );
+    let thread = finished(task).await;
+    assert_eq!(thread.state, RunState::Cancelled);
+    assert!(!thread.paused && !thread.held);
+    assert!(rig.requests.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn pausing_a_conversation_holds_its_subagents_until_resumed() {
+    let api = ProviderApi::OpenAi;
+    let mut rig = rig(api, vec![], None).await;
+    rig.permit(subagents::SPAWN, ToolPermission::Allow).await;
+    let task = rig.send();
+    let first = rig.next_request().await;
+    let spawn = Call::new(subagents::SPAWN, json!({"task": nonce()}));
+    first
+        .respond(calls_response(api, std::slice::from_ref(&spawn), &nonce()))
+        .await;
+    let (parent, child) = parent_and_child(&mut rig, api, &spawn.id).await;
+    let id: Id = result_json(api, &parent.body, &spawn.id)["thread"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(rig.pause(rig.thread, true).await, Reply::Ok);
+    // The subagent's own conversation is not paused; its parent is.
+    refused(rig.pause(id, false).await, ErrorKind::Conflict);
+    // A steered message would start another round, which the pause holds.
+    let steered = nonce();
+    assert_eq!(rig.steer(id, &steered).await, Reply::Ok);
+    child.respond(text_response(api, &nonce())).await;
+    rig.held(id).await;
+    assert!(rig.requests.try_recv().is_err());
+
+    assert_eq!(rig.pause(rig.thread, false).await, Reply::Ok);
+    let again = rig.next_request().await;
+    assert!(again.body.to_string().contains(&steered));
+    again.respond(text_response(api, &nonce())).await;
+    parent.respond(text_response(api, &nonce())).await;
+    assert_eq!(finished(task).await.state, RunState::Complete);
+    assert!(!thread_of(&rig, id).held);
 }

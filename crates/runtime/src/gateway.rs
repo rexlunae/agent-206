@@ -30,6 +30,7 @@ mod delegation;
 mod plans;
 mod schedules;
 pub use plans::Plans;
+mod pause;
 mod skills;
 mod steering;
 pub use crate::skill_tool::SkillOffer;
@@ -336,6 +337,9 @@ pub struct Gateway {
     running: Arc<Mutex<BTreeMap<Id, tokio_util::sync::CancellationToken>>>,
     /// Native runs taking `Steer` messages; changed under the store lock.
     accepting: Arc<Mutex<BTreeSet<Id>>>,
+    /// Bumped whenever a conversation is paused or resumed, so paused runs
+    /// look again.
+    pauses: Arc<tokio::sync::watch::Sender<u64>>,
     /// Held only in memory: a restart needs a fresh pairing from the user.
     pairing: Arc<Mutex<Option<Paired>>>,
     /// Orders PairBroker commands, so a slow older verification never
@@ -451,6 +455,7 @@ impl Gateway {
             downloads: Arc::new(Mutex::new(BTreeMap::new())),
             running: Arc::new(Mutex::new(BTreeMap::new())),
             accepting: Arc::new(Mutex::new(BTreeSet::new())),
+            pauses: Arc::new(tokio::sync::watch::Sender::new(0)),
             pairing: Arc::new(Mutex::new(None)),
             pair_requests: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             refreshed: Arc::new(Mutex::new(BTreeMap::new())),
@@ -1219,6 +1224,10 @@ impl Gateway {
                     }
                     // After the outcome: the run never read these.
                     self.settle_steering(thread)?;
+                    // A pause holds a run; with the run over there is
+                    // nothing left to hold.
+                    thread.paused = false;
+                    thread.held = false;
                     let thread = thread.clone();
                     store.persist(Some(EventKind::RunEnded {
                         thread: id,
@@ -1567,6 +1576,8 @@ impl Gateway {
             Command::RemoveJob { id } => self.remove_job(id),
             Command::RunJob { id } => self.run_job(id),
             Command::Steer { thread, text } => self.steer(thread, text),
+            Command::PauseRun { thread } => self.set_paused(thread, true),
+            Command::ResumeRun { thread } => self.set_paused(thread, false),
             Command::InstallProposal { digest } => {
                 let summary = self.extensions.install_proposal(digest).await?;
                 self.policy_changed();

@@ -106,7 +106,7 @@ invocations and relays gateway-authorized host calls (`a206/docs/plugin-api.md`)
 | `subagent_create/run/list/delete` (`tools/subagent_tools.rs`, `gateway/subagent_runner.rs`) | partial: subagents run on the same native run engine as root threads (see above); no named, reusable subagent profiles | Profiles as TOML presets of mode, model and capabilities |
 | Named agent registry, `agents_create` (`agents.rs`) | missing | Profiles as TOML agent definitions |
 | Swarm orchestration + templates (`swarm/*`, `tools/swarm_tools.rs`, CLI `swarm`) | missing | Project coordinator thread + delegated task lifecycle |
-| Task fg/bg/pause/resume/input (`tasks/*`, `tools/task_tools.rs`) | missing | Task state machine with durable events |
+| Task fg/bg/pause/resume/input (`tasks/*`, `tools/task_tools.rs`; RustyClaw's task tools are gateway stubs) | partial: `PauseRun`/`ResumeRun` hold a native run, and its subagents' runs, before their next model round (composer, command palette, `agent206 pause/resume`), with a journaled `held` state; input is `Steer`; subagents already run in the background (`subagent_spawn`/`wait`) and shell sessions with `process` | A cross-conversation view of running work; pausing external coding engines |
 | `session_status` usage/cost (`tools/sessions_tools.rs`) | partial: per-request usage/cost/balance widgets from API (`docs/status.md` Usage) | Cumulative accounting, API-sourced only |
 | Concurrent model execution (`gateway/concurrent.rs`) | partial: two visible conversations; runs per thread | >2 views, saved layouts |
 
