@@ -128,6 +128,11 @@ pub async fn daemon(root: &Path, explicit: bool) -> Result<()> {
     // Repeat under the acquired store lock: an automatic starter can race stop.
     crate::error::check(explicit || !is_stopped(root), ServiceError::Stopped)?;
     let refresh = tokio::spawn(refresh_catalogs(gateway.clone()));
+    // Ends when the gateway's stop signal fires; awaited after the drain.
+    let messengers = tokio::spawn({
+        let gateway = gateway.clone();
+        async move { gateway.supervise_messengers().await }
+    });
     let path = root.join("gateway.sock");
     if path.exists() {
         std::fs::remove_file(&path).map_err(ServiceError::Socket)?;
@@ -196,6 +201,9 @@ pub async fn daemon(root: &Path, explicit: bool) -> Result<()> {
     .ignore();
     connections.abort_all();
     while connections.join_next().await.is_some() {}
+    if let Err(error) = messengers.await {
+        crate::error::handle("messenger", &error);
+    }
     Ok(())
 }
 #[cfg(unix)]

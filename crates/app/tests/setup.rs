@@ -33,6 +33,7 @@ base_url = "http://127.0.0.1:{port}/v1"
 
 [[messengers]]
 name = "bot"
+messenger_type = "telegram"
 token = "{token}"
 "#,
             token = random(),
@@ -98,9 +99,10 @@ async fn doctor_and_import_against_a_running_gateway() -> Result<()> {
     let preview = app.cli(&["import", "rustyclaw", source_arg]).await?;
     ensure!(preview.contains("will be added"), "{preview}");
     ensure!(
-        preview.contains("left inactive: 1 × messenger"),
+        preview.contains("messenger bot (telegram \"bot\") will be added, disabled"),
         "{preview}"
     );
+    ensure!(preview.contains("stays behind"), "{preview}");
     ensure!(
         preview.contains("not imported yet: workspace instructions"),
         "{preview}"
@@ -116,7 +118,20 @@ async fn doctor_and_import_against_a_running_gateway() -> Result<()> {
         applied.contains("vault add OPENAI_API_KEY --destination https://"),
         "{applied}"
     );
-    let providers = app.snapshot().await?.settings.providers;
+    ensure!(
+        applied.contains("messenger set bot --credential bot-token"),
+        "{applied}"
+    );
+    let settings = app.snapshot().await?.settings;
+    let messengers = &settings.messengers;
+    ensure!(messengers.len() == 1, "{messengers:?}");
+    ensure!(
+        messengers[0].name == "bot" && !messengers[0].enabled && messengers[0].credential.is_none(),
+        "{messengers:?}"
+    );
+    let listed = app.cli(&["messenger", "list"]).await?;
+    ensure!(listed.contains("state = \"stopped\""), "{listed}");
+    let providers = settings.providers;
     ensure!(providers.len() == 2, "{providers:?}");
     let openai = providers
         .iter()
@@ -128,6 +143,7 @@ async fn doctor_and_import_against_a_running_gateway() -> Result<()> {
         .await?;
     ensure!(again.contains("Nothing needed importing"), "{again}");
     ensure!(app.snapshot().await?.settings.providers.len() == 2);
+    ensure!(app.snapshot().await?.settings.messengers.len() == 1);
     ensure!(std::fs::read_dir(app.root.join("imports"))?.count() == 1);
     ensure!(std::fs::read(source.join("config.toml"))? == config);
     Ok(())

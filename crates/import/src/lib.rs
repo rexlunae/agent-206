@@ -9,8 +9,9 @@
 #![forbid(unsafe_code)]
 pub mod rustyclaw;
 
-use a206_core::{Id, ProviderConfig, Settings};
+use a206_core::{Id, MessengerConfig, MessengerKind, ProviderConfig, Settings};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 /// Version of the preview and receipt shapes below.
@@ -70,6 +71,8 @@ pub struct Preview {
     pub vault: Option<VaultSource>,
     #[serde(default)]
     pub providers: Vec<ProviderImport>,
+    #[serde(default)]
+    pub messengers: Vec<MessengerImport>,
     /// Present in the source and deliberately left inactive.
     #[serde(default)]
     pub inactive: Vec<Inactive>,
@@ -156,10 +159,60 @@ pub enum UnsupportedProvider {
     InvalidEndpoint,
 }
 
+/// A messenger account from the source. Imported entries are disabled, have
+/// no credential (tokens stay behind) and allow only the chats the source
+/// allowed, or none.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MessengerImport {
+    /// The account's name in the source tool, as display text.
+    pub source_name: String,
+    /// The service as the source names it.
+    pub source_kind: String,
+    /// The Agent 206 name it is (or would be) saved under.
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<MessengerKind>,
+    /// Chats the source allowed; carried over as this entry's allow-list.
+    #[serde(default)]
+    pub allowed_chats: BTreeSet<String>,
+    /// The source also allowed only certain users. Agent 206 allows by chat
+    /// alone, so no chat is allowed rather than widening the restriction.
+    #[serde(default)]
+    pub users_restricted: bool,
+    /// The source kept a token in its configuration in plain text. It is
+    /// not read; the user stores it in the vault.
+    #[serde(default)]
+    pub token_left_behind: bool,
+    pub action: MessengerAction,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum MessengerAction {
+    Add,
+    /// A messenger of the same kind already has this name.
+    AlreadyConfigured,
+    Unsupported {
+        reason: UnsupportedMessenger,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnsupportedMessenger {
+    /// Agent 206 has no adapter for this service yet.
+    UnknownKind,
+    /// The account's settings live in a separate file, which is not read.
+    ExternalConfig,
+    /// More allowed chats than Agent 206 accepts, or ids it would refuse.
+    InvalidChats,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InactiveCategory {
-    /// Messenger accounts (and any tokens in them) stay behind.
+    /// Messenger accounts. Previews now list them under `messengers`; kept
+    /// so earlier previews still read.
     Messengers,
     McpServers,
     /// Per-tool allow/ask/deny overrides. Agent 206 has no per-tool model
@@ -230,6 +283,28 @@ impl Preview {
         }
         added
     }
+
+    /// Add this preview's new messengers to `settings`, disabled and without
+    /// a credential, skipping names `settings` gained meanwhile. Returns the
+    /// names added.
+    pub fn apply_messengers(&self, settings: &mut Settings) -> Vec<String> {
+        let mut added = vec![];
+        for import in &self.messengers {
+            let (MessengerAction::Add, Some(kind)) = (&import.action, import.kind) else {
+                continue;
+            };
+            if settings.messengers.iter().any(|m| m.name == import.name) {
+                continue;
+            }
+            let mut config = MessengerConfig::new(import.name.clone(), kind);
+            if !import.users_restricted {
+                config.allowed_chats = import.allowed_chats.clone();
+            }
+            added.push(config.name.clone());
+            settings.messengers.push(config);
+        }
+        added
+    }
 }
 
 /// The account in `settings` with this API and endpoint, ignoring a
@@ -255,6 +330,8 @@ pub struct Receipt {
     pub config_sha256: Option<String>,
     pub applied_at: u64,
     pub providers_added: Vec<Id>,
+    #[serde(default)]
+    pub messengers_added: Vec<String>,
     pub vault_imported: bool,
 }
 

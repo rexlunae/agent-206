@@ -112,7 +112,8 @@ one tool, `rename_thread` (`a206/crates/runtime/src/mcp.rs`); the `Command` enum
 
 | RustyClaw capability | Agent 206 status | How it should land |
 | --- | --- | --- |
-| Telegram, Discord, Slack, Matrix, IRC, Signal/signal-cli, WhatsApp, Google Chat, Teams, iMessage, webhook, console (`messengers/kind.rs`, `gateway/messenger_handler/*`) | missing | Channel extensions in separate processes; inbound messages untrusted; per-channel grants |
+| Telegram (`messengers/telegram.rs`) | partial: Bot API long polling and replies in the gateway (`runtime/src/messengers`), token spent only by the vault broker (`AuthScheme::TelegramBot`, broker v6), disabled by default, per-entry chat allow-list with refused chats in the status, one thread per chat through ordinary `Send` turns, CLI and TOML configuration, RustyClaw import as disabled entries (docs/messengers.md); tested against a stand-in Bot API and a real broker | Desktop/TUI settings, attachments, persisted poll offset, per-user allow-lists |
+| Discord, Slack, Matrix, IRC, Signal/signal-cli, WhatsApp, Google Chat, Teams, iMessage, webhook, console (`messengers/kind.rs`, `gateway/messenger_handler/*`) | missing | Adapters behind the same `Host` interface; Discord and Slack Socket Mode need brokered WebSockets; inbound messages untrusted; per-channel grants |
 | `message` send/broadcast tool (`tools/gateway_tools`) | missing | Channel host call requiring approval |
 | Beeper/claw-me-maybe onboarding (`rustyclaw-onboard/src/messaging.rs`) | missing | Setup wizard step after extension system |
 

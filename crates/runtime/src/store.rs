@@ -116,6 +116,7 @@ impl Store {
                 ],
                 last_event: 0,
                 managed_joshua_provider: None,
+                messengers: vec![],
             }
         };
         let mut store = Self {

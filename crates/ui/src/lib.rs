@@ -101,6 +101,7 @@ fn empty_snapshot() -> Snapshot {
         catalogs: vec![],
         downloads: vec![],
         plugins: vec![],
+        messengers: vec![],
         last_event: 0,
         managed_joshua_provider: None,
     }
