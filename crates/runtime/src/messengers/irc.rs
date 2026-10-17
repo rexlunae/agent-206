@@ -346,9 +346,17 @@ async fn session(
     let mut check: Option<Check> = None;
     let mut sending = Sending::default();
     loop {
+        // Channel and direct lines share one pace: a direct line waits for
+        // the channel line before it, and channel lines wait while a direct
+        // line's `WHOIS` is open, since that line goes out on its answer.
         let until = check.as_ref().and_then(|check| check.until);
-        let ask_at = check.as_ref().and_then(|check| check.ask_at);
-        let next_line = sending.next.filter(|_| !sending.lines.is_empty());
+        let ask_at = check
+            .as_ref()
+            .and_then(|check| check.ask_at)
+            .map(|at| sending.next.map_or(at, |next| at.max(next)));
+        let next_line = sending
+            .next
+            .filter(|_| !sending.lines.is_empty() && until.is_none());
         tokio::select! {
             event = socket.next() => {
                 let text = match event.map_err(broker)? {
@@ -425,6 +433,7 @@ async fn session(
                                 }));
                             } else if let Some(line) = current.lines.pop_front() {
                                 socket.send(line).await.map_err(broker)?;
+                                sending.next = Some(tokio::time::Instant::now() + LINE_SPACING);
                                 if current.lines.is_empty() {
                                     answer(current.done, Ok(()));
                                 } else {
