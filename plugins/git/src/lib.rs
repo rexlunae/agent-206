@@ -1,5 +1,6 @@
-//! Bundled git extension. Every repository read is a host call that the
-//! gateway authorizes against the caller's `git_read` grant.
+//! Bundled git extension. Every repository read or commit is a host call
+//! that the gateway authorizes against the caller's `git_read` or
+//! `git_write` grant.
 use a206_extension_sdk::{
     Args, Extension, GitArea, GitChange, GuestError, ToolOutput, bool_arg, excerpt, host, int_arg,
     string_arg,
@@ -80,6 +81,21 @@ impl Extension for Git {
                     }
                     text
                 }
+            }
+            "git_commit" => {
+                let required = |name: &str| {
+                    string_arg(args, name)?.ok_or_else(|| {
+                        GuestError::new("invalid_argument", format!("`{name}` is required"))
+                    })
+                };
+                let message = required("message")?;
+                let paths: Vec<&str> = required("paths")?
+                    .lines()
+                    .map(str::trim)
+                    .filter(|path| !path.is_empty())
+                    .collect();
+                let commit = host::git_commit(message, &paths)?;
+                format!("committed {} {}", commit.id, commit.summary)
             }
             _ => return Err(GuestError::new("unknown_tool", format!("no tool `{name}`"))),
         };

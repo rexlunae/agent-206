@@ -558,6 +558,7 @@ impl ExtensionHost {
             Capability::ReadWorkspace,
             Capability::WriteWorkspace,
             Capability::GitRead,
+            Capability::GitWrite,
         ];
         if scope.workspace.is_none() && workspace_capabilities.iter().any(|c| declared.contains(c))
         {
@@ -571,6 +572,7 @@ impl ExtensionHost {
             store: Arc::clone(&self.store),
             hosts: manifest.hosts.clone(),
             net: Arc::clone(&self.net),
+            user_git: git_commit::UserGit::load,
             source,
             logs: 0,
             last_failure: None,
@@ -738,6 +740,8 @@ struct HostCalls {
     /// The manifest's network destinations.
     hosts: Vec<String>,
     net: Arc<dyn crate::network::Net>,
+    /// Reads the user's own git settings for a commit.
+    user_git: fn() -> Result<git_commit::UserGit, HostFailure>,
     /// The package this invocation runs; calls stop once it is replaced.
     source: PluginSource,
     logs: u32,
@@ -888,6 +892,14 @@ impl HostCalls {
                 let root = self.workspace()?;
                 git_call(move |interrupt| git::diff(root, &path, staged, &interrupt)).await
             }
+            HostRequest::GitCommit { message, paths } => {
+                let root = self.workspace()?;
+                let user = self.user_git;
+                git_write_call(move |interrupt| {
+                    git_commit::commit(root, &message, &paths, &user()?, &interrupt)
+                })
+                .await
+            }
             HostRequest::Fetch { url } => fetch::fetch(self.net.as_ref(), &self.hosts, &url).await,
             HostRequest::StateGet { key } => {
                 check_key(&key)?;
@@ -999,6 +1011,43 @@ async fn git_call_with_timeout(
     + 'static,
     timeout: Duration,
 ) -> Result<HostReply, HostFailure> {
+    run_git(work, timeout, Late::Refuse).await
+}
+/// Like [`git_call`], for a call that changes the repository. Once past its
+/// point of no return it finishes, and its outcome is reported as it is: a
+/// commit made after the deadline is still a commit. If this future is
+/// dropped, a call that has not reached that point stops without changing
+/// anything.
+async fn git_write_call(
+    work: impl FnOnce(Arc<std::sync::atomic::AtomicBool>) -> Result<HostReply, HostFailure>
+    + Send
+    + 'static,
+) -> Result<HostReply, HostFailure> {
+    git_write_call_with_timeout(work, GIT_TIMEOUT).await
+}
+async fn git_write_call_with_timeout(
+    work: impl FnOnce(Arc<std::sync::atomic::AtomicBool>) -> Result<HostReply, HostFailure>
+    + Send
+    + 'static,
+    timeout: Duration,
+) -> Result<HostReply, HostFailure> {
+    run_git(work, timeout, Late::Report).await
+}
+/// What a git call that returns after its deadline reports.
+#[derive(Clone, Copy)]
+enum Late {
+    /// A read: the deadline has expired, whatever the result.
+    Refuse,
+    /// A write: its own outcome, which says whether it changed anything.
+    Report,
+}
+async fn run_git(
+    work: impl FnOnce(Arc<std::sync::atomic::AtomicBool>) -> Result<HostReply, HostFailure>
+    + Send
+    + 'static,
+    timeout: Duration,
+    late: Late,
+) -> Result<HostReply, HostFailure> {
     let interrupt = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let stop = Interrupt(Arc::clone(&interrupt));
     let mut call = tokio::task::spawn_blocking(move || work(interrupt));
@@ -1006,10 +1055,13 @@ async fn git_call_with_timeout(
         Ok(joined) => joined_reply(joined),
         Err(_) => {
             stop.set();
-            // Join for cleanup and diagnostics, but a late success cannot undo
-            // the deadline that has already expired.
-            let _completed = joined_reply(call.await);
-            Err(failure(HostErrorCode::Budget, "the git call took too long"))
+            let completed = joined_reply(call.await);
+            match late {
+                Late::Report => completed,
+                // Joined for cleanup and diagnostics, but a late success
+                // cannot undo the deadline that has already expired.
+                Late::Refuse => Err(failure(HostErrorCode::Budget, "the git call took too long")),
+            }
         }
     }
 }
@@ -1027,6 +1079,7 @@ impl Drop for Interrupt {
 }
 mod fetch;
 mod git;
+mod git_commit;
 pub mod packages;
 mod proposals;
 mod workspace;

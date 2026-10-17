@@ -26,6 +26,7 @@ pub fn required_capability(request: &abi::HostRequest) -> Option<Capability> {
             Some(Capability::WriteWorkspace)
         }
         R::GitStatus | R::GitLog { .. } | R::GitDiff { .. } => Some(Capability::GitRead),
+        R::GitCommit { .. } => Some(Capability::GitWrite),
         R::Fetch { .. } => Some(Capability::Network),
         R::StateGet { .. }
         | R::StatePut { .. }

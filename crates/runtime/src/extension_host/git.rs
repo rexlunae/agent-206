@@ -22,13 +22,16 @@ const CONTEXT_LINES: u32 = 3;
 
 /// Record a gitoxide failure where it is handled; the guest gets a generic
 /// code because the message can name host paths.
-fn git_failure(operation: &'static str, error: &(dyn std::error::Error + 'static)) -> HostFailure {
+pub(super) fn git_failure(
+    operation: &'static str,
+    error: &(dyn std::error::Error + 'static),
+) -> HostFailure {
     tracing::warn!(error, operation, "extension git call failed");
     failure(HostErrorCode::Io, "the repository could not be read")
 }
 
 /// Stop once the call's deadline has passed or its caller has gone.
-fn check(interrupt: &AtomicBool) -> Result<(), HostFailure> {
+pub(super) fn check(interrupt: &AtomicBool) -> Result<(), HostFailure> {
     if interrupt.load(std::sync::atomic::Ordering::Relaxed) {
         Err(failure(HostErrorCode::Budget, "the git call took too long"))
     } else {
@@ -36,7 +39,7 @@ fn check(interrupt: &AtomicBool) -> Result<(), HostFailure> {
     }
 }
 
-fn unsupported(message: &'static str) -> HostFailure {
+pub(super) fn unsupported(message: &'static str) -> HostFailure {
     failure(HostErrorCode::Unsupported, message)
 }
 
@@ -82,7 +85,7 @@ pub(super) fn contained(
 /// Every piece of repository metadata must live inside the project, so a
 /// `.git` file or symlink, a linked worktree (`commondir`), an alternate
 /// object store or a configured worktree elsewhere is refused.
-fn open(root: PathBuf, interrupt: &AtomicBool) -> Result<gix::Repository, HostFailure> {
+pub(super) fn open(root: PathBuf, interrupt: &AtomicBool) -> Result<gix::Repository, HostFailure> {
     let dot_git = root.join(".git");
     let git_dir = match std::fs::symlink_metadata(&dot_git) {
         Ok(metadata) if metadata.is_dir() => dot_git,

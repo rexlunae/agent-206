@@ -18,7 +18,8 @@ offers the `list_directory`, `read_text_file`, `search_text`,
 `write_text_file` and `edit_text_file` tools and an `overview` panel. The
 write tools need a separate `write_workspace` grant. It also bundles
 `agent206.git` (`plugins/git`) with `git_status`, `git_log` and `git_diff`
-tools under the `git_read` grant, and `agent206.web` (`plugins/web`) with a
+tools under the `git_read` grant and a `git_commit` tool under its own
+`git_write` grant, and `agent206.web` (`plugins/web`) with a
 `fetch_url` tool under the `network` grant. Bundled tools cut text past
 192 KiB with a notice (the SDK's `excerpt`), so a long result never exceeds
 the outcome limit. Users can also install third-party packages (see
@@ -195,6 +196,7 @@ unsafe operation.
 | `git_status` | `git_read` + a project | branch, `HEAD` id, changed paths (staged, unstaged, untracked) | 1,000 entries; 5 s per git call; renames not tracked; submodules ignored |
 | `git_log { max }` | `git_read` + a project | commits from `HEAD`: id, summary, author name (no email), author time | 200 commits |
 | `git_diff { path, staged }` | `git_read` + a project | unified diff of one file (`HEAD`→index when `staged`, else index→working tree; a symbolic link compares its target text), or `binary` | 512 KiB per side (checked before a blob is read), 192 KiB of text, 3 context lines; at most 8,192 input lines combined and 1,000,000 line pairs, otherwise a budget failure |
+| `git_commit { message, paths }` | `git_write` + a project | the new commit: id, summary, author name, time | 1 to 100 paths, 16 KiB message, 512 KiB per file and 8 MiB together; 5 s, but once the commit is written it is reported, even past the deadline; see [Commits](#commits) |
 | `fetch { url }` | `network` + a declared host | final status (any, not only 2xx), `Content-Type`, body, whether it was cut | 512 KiB body; 8 s including redirects; 5 redirects |
 | `state_get { key }` | nothing | the extension's own value | — |
 | `state_put { key, value }` | nothing | done (`value = None` deletes) | 64 keys, 256 KiB per extension |
@@ -216,6 +218,32 @@ and `core.worktree` is ignored. They read no system or global git configuration 
 `GIT_*` environment, and nothing the repository configures can run: no hooks,
 filter, diff, textconv, fsmonitor or credential programs. The working-tree side
 of a diff is the raw file, without line-ending or filter conversion.
+
+### Commits
+
+`git_commit` works like `git commit --only <paths>`: it commits the
+working-tree content of exactly the named paths on top of `HEAD` (or as the
+first commit of an unborn branch), records a named path that no longer exists
+as removed, and updates those paths in the index so `git status` agrees.
+Other staged changes stay staged. Files are read like workspace writes are
+made, without following a symbolic link on the way; a symbolic link itself is
+committed as a link. A new path ignored by the repository's or the user's
+excludes is refused, as `git add` would without `--force`.
+
+Where `git commit` would run something or add a protection gitoxide cannot,
+the commit is refused as `unsupported` rather than made without it: signed
+commits (`commit.gpgSign`), commit hooks (`pre-commit`, `prepare-commit-msg`,
+`commit-msg`, `post-commit` in `.git/hooks` or `core.hooksPath`), files whose
+attributes ask for a `filter`, `ident` or `working-tree-encoding`, carriage
+returns in files git would convert (`text`, `eol`, `crlf` or `core.autocrlf`),
+a merge, rebase or similar in progress, conflicts, and split or sparse
+indexes. To decide this, and for `user.name` and `user.email` (required),
+commits read the user's system and global git configuration and excludes file
+as data, with repository settings taking precedence; nothing they name runs.
+The index lock is held throughout, so a concurrent git command makes the call
+fail with `conflict`, and so does `HEAD` moving underneath it; in both cases
+nothing is committed. If the index cannot be written after the commit, the
+failure names the commit that was made.
 
 A fetch is a `GET` through the same guard as downloads
 (`crates/runtime/src/network.rs`). The URL and every redirect must be
@@ -294,7 +322,7 @@ Tool text is extension output, never instructions.
 | Domain | Operations | Authority |
 | --- | --- | --- |
 | workspace | Multi-hunk patch | `write_workspace` |
-| git | Stage, commit | `git_write` |
+| git | Stage without committing, branches, push | `git_write` (push also needs a forge credential handle) |
 | forge | PRs, reviews, checks, logs | adapter-specific scoped credential handle |
 | network | Requests other than `GET`, headers, brokered credentials | `network` + destination + secret handle |
 | downloads | Enqueue, cancel, subscribe | destination and origin grants |
