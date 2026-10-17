@@ -94,7 +94,7 @@ invocations and relays gateway-authorized host calls (`a206/docs/plugin-api.md`)
 | Two-layer MEMORY/HISTORY consolidation (`memory_consolidation.rs`) | missing | Background task with user-visible budget |
 | Semantic vector memory, knowledge graph (`steel_memory.rs`, feature `semantic-memory`) | missing | Optional extension/service process |
 | Hierarchical ingest summary tree (`rc/crates/memory-tree`) | missing | Reusable crate behind memory extension |
-| `session_search`/`search_history` (`tools/session_search.rs`) | missing (UI conversation list search only, `ui/src/pages.rs`) | Gateway query over SQLite journal |
+| `session_search`/`search_history` (`tools/session_search.rs`) | partial (owner: web client thread): gateway `SearchMessages` over every conversation's message text (all words, case-insensitive, newest first, bounded query and hits, never journaled) with a snippet around the first match (`a206/crates/core/src/search.rs`); a Search messages card on the shared Conversations page and `agent206 search` (`a206/crates/ui/src/search.rs`); tested in core, the gateway and a card render; no agent-facing tool yet, attachments and tool output are not searched | Agent `session_search` tool scoped to conversations the agent may already read (its own lineage), decided before it is offered; jump to the matching message |
 | Memory vault / protected memory (`memory_vault.rs`) | missing | Through vault broker |
 
 ## Sessions, threads, subagents, swarm, tasks

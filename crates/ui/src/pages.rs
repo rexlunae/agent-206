@@ -60,6 +60,7 @@ pub fn Conversations() -> Element {
                 ConversationList { query: query() }
             }
         }
+        Card { CardHeader { CardTitle { "Search messages" } } CardBody { crate::search::MessageSearch {} } }
     } }
 }
 #[component]
