@@ -22,15 +22,25 @@ enum Fixture {
     Page {},
 }
 
+/// Whether the fixture's gateway is connected.
+#[derive(Clone, Copy)]
+struct Online(bool);
+
 #[component]
 fn Page() -> Element {
     let snapshot = use_context::<Snapshot>();
-    let state = crate::route::tests::loaded_state(snapshot);
+    let Online(online) = use_context::<Online>();
+    let mut state = crate::route::tests::loaded_state(snapshot);
+    state.connected = use_signal(|| online);
     use_context_provider(|| state);
     rsx! { Running {} }
 }
 
 fn render(threads: Vec<Thread>, jobs: Vec<Job>) -> String {
+    render_as(Online(true), threads, jobs)
+}
+
+fn render_as(online: Online, threads: Vec<Thread>, jobs: Vec<Job>) -> String {
     fn app() -> Element {
         rsx! { Router::<Fixture> {} }
     }
@@ -39,6 +49,7 @@ fn render(threads: Vec<Thread>, jobs: Vec<Job>) -> String {
     snapshot.jobs = jobs;
     let mut dom = VirtualDom::new(app);
     dom.provide_root_context(snapshot);
+    dom.provide_root_context(online);
     dom.provide_root_context(Rc::new(MemoryHistory::default()) as Rc<dyn History>);
     dom.rebuild_in_place();
     dioxus_ssr::render(&dom)
@@ -110,6 +121,35 @@ fn the_page_offers_pause_resume_and_stop_only_where_they_apply() {
     assert_eq!(html.matches(">Stop<").count(), 4, "{html}");
     assert!(html.contains("Pausing after this step"), "{html}");
     assert!(!html.contains("Nothing is running"), "{html}");
+}
+
+#[test]
+fn subagents_have_their_own_controls_and_an_offline_gateway_offers_none() {
+    let root = thread(RunState::Running, None);
+    let mut child = thread(RunState::Running, Some(root.id));
+    child.paused = true;
+    let grandchild = thread(RunState::Running, Some(child.id));
+    let threads = vec![root.clone(), child.clone(), grandchild.clone()];
+    let html = render(threads.clone(), vec![]);
+    assert_eq!(html.matches(">Stop<").count(), 3, "{html}");
+    assert_eq!(html.matches(">Pause<").count(), 2, "{html}");
+    assert_eq!(html.matches(">Resume<").count(), 1, "{html}");
+    assert!(
+        html.contains(&format!("Delegated by {}", root.title))
+            && html.contains(&format!("Delegated by {}", child.title)),
+        "{html}"
+    );
+    assert!(!html.contains("not connected"), "{html}");
+
+    let offline = render_as(Online(false), threads, vec![]);
+    assert!(
+        offline.contains("The gateway is not connected"),
+        "{offline}"
+    );
+    assert!(offline.contains(&grandchild.title), "{offline}");
+    for control in [">Stop<", ">Pause<", ">Resume<"] {
+        assert!(!offline.contains(control), "{offline}");
+    }
 }
 
 #[test]

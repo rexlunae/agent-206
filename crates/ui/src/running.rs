@@ -115,6 +115,7 @@ fn chat(id: Uuid) -> String {
 #[component]
 pub fn Running() -> Element {
     let state = use_context::<State>();
+    let connected = (state.connected)();
     let snapshot = state.data.read();
     let trees = running(&snapshot);
     let waiting: Vec<Thread> = waiting(&snapshot).into_iter().cloned().collect();
@@ -141,7 +142,10 @@ pub fn Running() -> Element {
         div { class: "a206-grid",
             Metric { label: name!("Running responses"), title: rsx! { "Running" }, value: Some(responses as f64), display: responses.to_string(), meta: rsx! { "Including subagents" } }
             Metric { label: name!("Waiting on you"), title: rsx! { "Waiting on you" }, value: Some(waiting.len() as f64), display: waiting.len().to_string(), meta: rsx! { "Conversations with approvals or questions" } }
-            Metric { label: name!("Paused"), title: rsx! { "Paused" }, value: Some(paused as f64), display: paused.to_string(), meta: rsx! { "Held before their next step" } }
+            Metric { label: name!("Paused"), title: rsx! { "Paused" }, value: Some(paused as f64), display: paused.to_string(), meta: rsx! { "Paused by you; their subagents wait too" } }
+        }
+        if !connected {
+            Alert { tone: AlertTone::Warning, title: rsx! { "The gateway is not connected" }, "This is the last state it reported, and these responses may have ended since. Controls return when it reconnects." }
         }
         if !waiting.is_empty() {
             Card { variant: CardVariant::Feature,
@@ -158,7 +162,7 @@ pub fn Running() -> Element {
             EmptyState { compact: true, title: rsx! { "Nothing is running" }, body: rsx! { "Responses in progress appear here, with their subagents, while they run." } }
         }
         for tree in trees {
-            RunCard { key: "{tree.thread.id}", node: tree }
+            RunCard { key: "{tree.thread.id}", node: tree, connected }
         }
         if !scheduled.is_empty() {
             Card {
@@ -181,8 +185,7 @@ pub fn Running() -> Element {
 /// One running conversation that no other running conversation delegated,
 /// with its actions and the running subagents below it.
 #[component]
-fn RunCard(node: Node) -> Element {
-    let state = use_context::<State>();
+fn RunCard(node: Node, connected: bool) -> Element {
     let thread = node.thread;
     let id = thread.id;
     let (lifecycle, status) = run_status(&thread);
@@ -192,6 +195,8 @@ fn RunCard(node: Node) -> Element {
         .filter(|step| step.status == PlanStatus::Done)
         .count();
     let added = plural(thread.steering.len(), "added message", "added messages");
+    let mut below = Vec::new();
+    flatten(&node.below, &thread.title, &mut below);
     rsx! { Card { variant: CardVariant::Elevated,
         CardHeader {
             CardTitle { LinkButton { variant: ButtonVariant::Ghost, href: chat(id), "{thread.title}" } }
@@ -203,33 +208,53 @@ fn RunCard(node: Node) -> Element {
                 if !thread.plan.is_empty() { Badge { tone: BadgeTone::Accent, "Plan {done} of {thread.plan.len()} done" } }
                 if !thread.steering.is_empty() { Badge { "{added} to answer" } }
             }
-            if !node.below.is_empty() {
+            if !below.is_empty() {
                 h3 { "Subagents" }
-                NavList { Branch { nodes: node.below } }
+                List { divided: true,
+                    for (delegator, child) in below {
+                        { let (_, status) = run_status(&child);
+                          let child_id = child.id;
+                          rsx! { ListItem { key: "{child_id}", action: ListAction::Link(chat(child_id)),
+                              overline: rsx! { "Delegated by {delegator}" },
+                              headline: rsx! { "{child.title}" },
+                              supporting: rsx! { "{status}" },
+                              trailing: connected.then(|| rsx! { RunControls { thread: child.clone(), small: true } }),
+                          } } }
+                    }
+                }
             }
         }
-        CardFooter {
-            if resumable(&thread) {
-                Button { variant: ButtonVariant::Secondary, onclick: move |_| dispatch(state, Command::ResumeRun { thread: id }), "Resume" }
-            }
-            if pausable(&thread) {
-                Button { variant: ButtonVariant::Secondary, onclick: move |_| dispatch(state, Command::PauseRun { thread: id }), "Pause" }
-            }
-            Button { variant: ButtonVariant::Ghost, onclick: move |_| dispatch(state, Command::CancelRun { thread: id }), "Stop" }
-        }
+        if connected { CardFooter { RunControls { thread: thread.clone(), small: false } } }
     } }
 }
 
+/// The subagents under a running conversation, depth first, each with the
+/// title of the conversation that delegated it.
+fn flatten(nodes: &[Node], delegator: &str, out: &mut Vec<(String, Thread)>) {
+    for node in nodes {
+        out.push((delegator.to_owned(), node.thread.clone()));
+        flatten(&node.below, &node.thread.title, out);
+    }
+}
+
+/// Pause or Resume where they apply, and Stop, for one running conversation.
 #[component]
-fn Branch(nodes: Vec<Node>) -> Element {
+fn RunControls(thread: Thread, small: bool) -> Element {
+    let state = use_context::<State>();
+    let id = thread.id;
+    let size = if small {
+        ButtonSize::Sm
+    } else {
+        ButtonSize::Md
+    };
     rsx! {
-        for node in nodes {
-            { let (_, status) = run_status(&node.thread);
-              rsx! { NavLink { key: "{node.thread.id}", label: node.thread.title.clone(), href: chat(node.thread.id),
-                  meta: rsx! { span { class: "a206-muted", "{status}" } },
-                  nested: (!node.below.is_empty()).then(|| rsx! { NavList { nested: true, Branch { nodes: node.below.clone() } } }),
-              } } }
+        if resumable(&thread) {
+            Button { size, variant: ButtonVariant::Secondary, onclick: move |_| dispatch(state, Command::ResumeRun { thread: id }), "Resume" }
         }
+        if pausable(&thread) {
+            Button { size, variant: ButtonVariant::Secondary, onclick: move |_| dispatch(state, Command::PauseRun { thread: id }), "Pause" }
+        }
+        Button { size, variant: ButtonVariant::Ghost, onclick: move |_| dispatch(state, Command::CancelRun { thread: id }), "Stop" }
     }
 }
 
