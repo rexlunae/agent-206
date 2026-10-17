@@ -490,22 +490,28 @@ impl Gateway {
                 };
                 // The next check uses what this round's request reports.
             }
-            let flushing;
-            let round_prompt = if flush {
-                flushing = format!(
-                    "{prompt}{}",
-                    memory_flush::instruction(&memory_flush::today())
-                );
-                &flushing
+            // A plan the history no longer shows is restored while the model
+            // may still update it.
+            let plan = if offered
+                .iter()
+                .any(|spec| spec.name == crate::plan_tool::UPDATE)
+            {
+                crate::plan_tool::reminder(&view.thread)
             } else {
-                &prompt
+                String::new()
             };
+            let flushing = if flush {
+                memory_flush::instruction(&memory_flush::today())
+            } else {
+                String::new()
+            };
+            let round_prompt = format!("{prompt}{plan}{flushing}");
             let broker = provider::Broker {
                 root: &run.root,
                 pairing: pairing.as_ref(),
             };
             let (turn, message) = match self
-                .stream_round(run, round_prompt, &view.thread, broker, &offered)
+                .stream_round(run, &round_prompt, &view.thread, broker, &offered)
                 .await?
             {
                 Some(Ok(turn)) => turn,
