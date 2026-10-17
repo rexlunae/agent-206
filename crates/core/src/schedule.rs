@@ -85,3 +85,113 @@ pub struct Job {
     #[serde(default)]
     pub author: JobAuthor,
 }
+
+/// Why a time or interval someone typed for a schedule cannot be used.
+#[derive(Debug, thiserror::Error)]
+pub enum ScheduleInputError {
+    #[error("`{input}` is not an RFC 3339 time such as 2026-10-18T09:00:00Z")]
+    Time {
+        input: String,
+        #[source]
+        cause: jiff::Error,
+    },
+    #[error("`{input}` is not a date and time")]
+    Local {
+        input: String,
+        #[source]
+        cause: jiff::Error,
+    },
+    #[error("unknown time zone `{zone}`")]
+    Zone {
+        zone: String,
+        #[source]
+        cause: jiff::Error,
+    },
+    #[error("`{input}` is not a duration such as 90m or 1d")]
+    Duration {
+        input: String,
+        #[source]
+        cause: jiff::Error,
+    },
+    #[error("intervals are whole seconds; `{0}` is not")]
+    Fraction(String),
+    #[error("times are whole seconds, so a message never arrives early; `{0}` is not")]
+    FractionalTime(String),
+    #[error("the interval must be positive")]
+    NotPositive,
+    #[error("times before 1970 are not supported")]
+    BeforeEpoch,
+}
+
+fn unix(time: jiff::Timestamp) -> Result<u64, ScheduleInputError> {
+    u64::try_from(time.as_second()).map_err(|_| ScheduleInputError::BeforeEpoch)
+}
+
+/// An RFC 3339 time, in Unix seconds. A fraction of a second is refused
+/// rather than cut, which would make the message early.
+pub fn parse_instant(input: &str) -> Result<u64, ScheduleInputError> {
+    let time =
+        input
+            .trim()
+            .parse::<jiff::Timestamp>()
+            .map_err(|cause| ScheduleInputError::Time {
+                input: input.to_owned(),
+                cause,
+            })?;
+    if time.subsec_nanosecond() != 0 {
+        return Err(ScheduleInputError::FractionalTime(input.to_owned()));
+    }
+    unix(time)
+}
+
+/// A wall-clock date (`2026-10-18`) and time (`09:00`) in an IANA time zone,
+/// in Unix seconds. A time a clock change skips moves forward by the gap
+/// (02:30 becomes 03:30), and one it repeats is the later of the two.
+pub fn parse_local(date: &str, time: &str, zone: &str) -> Result<u64, ScheduleInputError> {
+    let input = format!("{}T{}", date.trim(), time.trim());
+    let civil =
+        input
+            .parse::<jiff::civil::DateTime>()
+            .map_err(|cause| ScheduleInputError::Local {
+                input: input.clone(),
+                cause,
+            })?;
+    let zone = jiff::tz::TimeZone::get(zone.trim()).map_err(|cause| ScheduleInputError::Zone {
+        zone: zone.to_owned(),
+        cause,
+    })?;
+    let zoned = zone
+        .to_ambiguous_zoned(civil)
+        .later()
+        .map_err(|cause| ScheduleInputError::Local { input, cause })?;
+    unix(zoned.timestamp())
+}
+
+/// A positive whole-second interval such as `90m`, `1d` or `1h 30m`.
+pub fn parse_interval(input: &str) -> Result<u64, ScheduleInputError> {
+    let interval = input
+        .trim()
+        .parse::<jiff::SignedDuration>()
+        .map_err(|cause| ScheduleInputError::Duration {
+            input: input.to_owned(),
+            cause,
+        })?;
+    if interval.subsec_nanos() != 0 {
+        return Err(ScheduleInputError::Fraction(input.to_owned()));
+    }
+    u64::try_from(interval.as_secs())
+        .ok()
+        .filter(|seconds| *seconds > 0)
+        .ok_or(ScheduleInputError::NotPositive)
+}
+
+/// An interval in whole seconds as people write it, such as `1h 30m`.
+pub fn format_interval(seconds: u64) -> String {
+    match i64::try_from(seconds) {
+        Ok(seconds) => format!("{:#}", jiff::SignedDuration::from_secs(seconds)),
+        Err(_) => format!("{seconds}s"),
+    }
+}
+
+#[cfg(test)]
+mod tests;

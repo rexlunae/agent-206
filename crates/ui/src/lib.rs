@@ -11,6 +11,7 @@ mod messengers;
 mod pages;
 mod prompts;
 mod route;
+mod schedules;
 mod search;
 mod settings;
 mod skills;
@@ -724,7 +725,7 @@ fn Sidebar() -> Element {
         }
         div { class: "a206-nav-group",
             NavHeading { "Workbench" }
-            for item in [Route::Documents {}, Route::Browser {}, Route::Downloads {}, Route::Extensions {}] {
+            for item in [Route::Documents {}, Route::Browser {}, Route::Downloads {}, Route::Schedules {}, Route::Extensions {}] {
                 LinkButton { size: ButtonSize::Sm, variant: ButtonVariant::Ghost, class: if route == item { "a206-nav-active" } else { "" }, href: item.to_string(), Icon { name: item.icon(), size: IconSize::Sm } "{item.label()}" }
             }
         }
