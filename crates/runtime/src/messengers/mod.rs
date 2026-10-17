@@ -235,7 +235,9 @@ impl Adapter {
             MessengerKind::Matrix => {
                 Self::Matrix(matrix::Matrix::new(api, config.allowed_chats.clone()))
             }
-            MessengerKind::Discord => Self::Discord(discord::Discord::new(api)),
+            MessengerKind::Discord => {
+                Self::Discord(discord::Discord::new(api, config.allowed_chats.clone()))
+            }
         }
     }
     /// Check the credential and name the account.

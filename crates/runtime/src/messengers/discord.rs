@@ -10,7 +10,7 @@
 use super::{Account, Api, Batch, Event, Inbound, MessengerError, Result, split};
 use a206_broker::{AuthScheme, HttpMethod, SocketEvent, SocketScheme};
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::time::Duration;
 use tokio::sync::mpsc;
 
@@ -44,6 +44,8 @@ type Queued = Result<(String, Event)>;
 
 pub(crate) struct Discord {
     api: Api,
+    /// Only these channels are ever looked up.
+    allowed: BTreeSet<String>,
     gateway: Option<Gateway>,
     private: Private,
 }
@@ -115,9 +117,10 @@ fn malformed(source: serde_json::Error) -> MessengerError {
 }
 
 impl Discord {
-    pub(crate) fn new(api: Api) -> Self {
+    pub(crate) fn new(api: Api, allowed: BTreeSet<String>) -> Self {
         Self {
             api,
+            allowed,
             gateway: None,
             private: Private::default(),
         }
@@ -165,7 +168,9 @@ impl Discord {
     /// failure ends the adapter's session; the next connect starts another.
     ///
     /// Channels are classified here rather than in the socket task, so a
-    /// slow lookup never holds up heartbeats.
+    /// slow lookup never holds up heartbeats. Only allowed channels are
+    /// looked up: any other is refused whatever its kind, so a batch waits
+    /// at most on channels the user chose, each looked up once.
     pub(crate) async fn receive(&mut self, _cursor: Option<&str>) -> Result<Batch> {
         let mut batch = self.queued().await?;
         for (_, event) in &mut batch.events {
@@ -174,7 +179,8 @@ impl Discord {
             if let Event::Message(inbound) = event
                 && !inbound.group
             {
-                inbound.group = !self.private.check(&self.api, &inbound.chat).await;
+                inbound.group = !self.allowed.contains(&inbound.chat)
+                    || !self.private.check(&self.api, &inbound.chat).await;
             }
         }
         Ok(batch)
