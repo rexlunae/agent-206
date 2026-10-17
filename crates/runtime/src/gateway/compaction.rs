@@ -110,17 +110,31 @@ struct Plan {
     transcript: String,
 }
 
-/// Plan a compaction that keeps the last `keep_turns` turns (a turn starts
-/// at a user message) verbatim.
-fn plan(thread: &Thread, keep_turns: usize) -> Result<Plan, CompactionError> {
+/// The latest summary's position, and where each turn after it starts (a
+/// turn starts at a user message).
+fn turns(thread: &Thread) -> (Option<usize>, Vec<usize>) {
     let messages = &thread.messages;
     let previous = messages.iter().rposition(|m| m.compaction.is_some());
     let start = previous.map_or(0, |at| at + 1);
-    let turns: Vec<usize> = (start..messages.len())
+    let turns = (start..messages.len())
         .filter(|&at| messages[at].role == Role::User)
         .collect();
+    (previous, turns)
+}
+
+/// Whether a compaction keeping the last `keep_turns` turns would summarize
+/// anything.
+pub(super) fn compactable(thread: &Thread, keep_turns: usize) -> bool {
+    keep_turns > 0 && turns(thread).1.len() > keep_turns
+}
+
+/// Plan a compaction that keeps the last `keep_turns` turns verbatim.
+fn plan(thread: &Thread, keep_turns: usize) -> Result<Plan, CompactionError> {
+    let messages = &thread.messages;
+    let (previous, turns) = turns(thread);
+    let start = previous.map_or(0, |at| at + 1);
     check(
-        keep_turns > 0 && turns.len() > keep_turns,
+        compactable(thread, keep_turns),
         CompactionError::NothingToCompact,
     )?;
     let keep_from = turns[turns.len() - keep_turns];
@@ -242,16 +256,21 @@ impl Gateway {
             root: request.root,
             pairing: pairing.as_ref(),
         };
-        // The summary is not streamed to anyone: a closed receiver drops deltas.
-        let (sender, _) = tokio::sync::mpsc::channel(1);
+        // The summary is not streamed to anyone: with the receiver closed,
+        // deltas and retry notices are dropped instead of waiting for room.
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        drop(receiver);
         let operation = provider::complete(
             request.config,
             broker,
-            &thread,
-            SUMMARY_PROMPT,
-            request.info,
-            &[],
+            provider::Ask {
+                thread: &thread,
+                prompt: SUMMARY_PROMPT,
+                info: request.info,
+                tools: &[],
+            },
             &sender,
+            &self.retry,
         );
         let turn = tokio::select! {
             turn = operation => turn.map_err(CompactionError::Summary)?,

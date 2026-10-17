@@ -17,6 +17,7 @@ use std::{
 use tokio::io::AsyncWriteExt;
 mod compaction;
 mod mcp_servers;
+mod memory_flush;
 mod run;
 /// Snapshot bytes a user message needs beyond its text and attachments.
 const MESSAGE_OVERHEAD: usize = 4096;
@@ -30,6 +31,7 @@ mod schedules;
 mod skills;
 pub use crate::skill_tool::SkillOffer;
 pub use delegation::{Caller, Child, Delegator, DelegatorError, Reservation};
+pub use schedules::{Jobs, MAX_AGENT_JOBS};
 
 /// Streamed reply text that is not final yet. It is published as the
 /// thread's assistant message at most every [`PartialReply::INTERVAL`], so a
@@ -332,6 +334,8 @@ pub struct Gateway {
     refreshed: Arc<Mutex<BTreeMap<Id, u64>>>,
     paired: Arc<tokio::sync::Notify>,
     tool_hosts: Arc<Vec<Arc<dyn crate::tools::ToolHost>>>,
+    /// How model requests are retried.
+    retry: crate::retry::RetryPolicy,
     /// Runs waiting for the user, by approval ID. Only `ResolveApproval` answers them.
     approvals: Arc<Mutex<BTreeMap<Id, run::Waiter>>>,
     /// Questions `ask_user` calls are waiting on. Only `AnswerPrompt` answers them.
@@ -421,6 +425,10 @@ impl Gateway {
         // user permits them.
         let skill_tools: Arc<dyn crate::tools::ToolHost> =
             Arc::new(crate::skill_tool::SkillToolHost::new(store.clone(), root));
+        // Listing reads what the Extensions page shows and changes nothing.
+        let list_tools: Arc<dyn crate::tools::ToolHost> = Arc::new(
+            crate::extension_list_tool::ListHost::new(extensions.clone(), skill_tools.clone()),
+        );
         let mut gateway = Self {
             admission: Arc::new(Mutex::new(Admission::default())),
             shutdown_committed: Arc::new(tokio::sync::Mutex::new(false)),
@@ -435,6 +443,7 @@ impl Gateway {
             pair_requests: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             refreshed: Arc::new(Mutex::new(BTreeMap::new())),
             paired: Arc::new(tokio::sync::Notify::new()),
+            retry: crate::retry::RetryPolicy::DEFAULT,
             tool_hosts: Arc::new(vec![
                 extension_tools,
                 mcp_tools,
@@ -442,6 +451,7 @@ impl Gateway {
                 Arc::new(crate::prompt_tool::PromptHost::new(prompts.clone())),
                 skill_tools,
                 propose_tools,
+                list_tools,
             ]),
             approvals: Arc::new(Mutex::new(BTreeMap::new())),
             prompts,
@@ -454,6 +464,10 @@ impl Gateway {
             reserved: Arc::default(),
             jobs_changed: Arc::default(),
         };
+        // Schedule tools; each conversation still denies them until the user
+        // permits them, and each new job waits for the user's approval.
+        let schedule_tools = Arc::new(crate::schedule_tool::ScheduleHost::new(gateway.jobs()));
+        Arc::make_mut(&mut gateway.tool_hosts).push(schedule_tools);
         // Subagent tools; each conversation still denies them until the user
         // permits them, and they are offered only with subagent models.
         gateway.bind_delegation();
@@ -969,7 +983,9 @@ impl Gateway {
                     .collect();
                 let thread = thread.clone();
                 store.persist(Some(EventKind::ThreadChanged { id }))?;
+                drop(store);
                 self.policy_changed();
+                self.grants_changed()?;
                 Ok(Reply::Thread(Box::new(thread)))
             }
             Command::SetEffort { thread: id, effort } => {
@@ -1036,7 +1052,9 @@ impl Gateway {
                 thread.backend_activity = None;
                 thread.grant.capabilities = capabilities;
                 store.persist(Some(EventKind::ThreadChanged { id }))?;
+                drop(store);
                 self.policy_changed();
+                self.grants_changed()?;
                 Ok(Reply::Ok)
             }
             Command::Send {
@@ -1502,7 +1520,9 @@ impl Gateway {
                 thread,
                 text,
                 schedule,
-            } => self.schedule_job(name, thread, text, schedule, JobAuthor::User),
+            } => self
+                .schedule_job(name, thread, text, schedule, JobAuthor::User)
+                .map(|job| Reply::Job(Box::new(job))),
             Command::SetJobEnabled { id, enabled } => self.set_job_enabled(id, enabled),
             Command::RemoveJob { id } => self.remove_job(id),
             Command::RunJob { id } => self.run_job(id),

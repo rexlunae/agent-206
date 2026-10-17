@@ -12,7 +12,7 @@
 use super::{
     Gateway, GatewayError, PartialReply, Result,
     compaction::{self, CompactionError},
-    poisoned,
+    memory_flush, poisoned,
 };
 use crate::{
     error::check,
@@ -250,6 +250,12 @@ impl Gateway {
         self.bind_delegation();
         self
     }
+    /// Retry model requests under `retry` instead of
+    /// [`crate::retry::RetryPolicy::DEFAULT`].
+    pub fn with_retry_policy(mut self, retry: crate::retry::RetryPolicy) -> Self {
+        self.retry = retry;
+        self
+    }
     fn view(&self, id: Id) -> Result<View> {
         view(&*self.lock()?, id)
     }
@@ -298,6 +304,17 @@ impl Gateway {
         drop(store);
         self.policy_changed();
         Ok(Reply::Ok)
+    }
+    /// Let every tool host stop work, such as a background command, that a
+    /// conversation's grants no longer cover. Call without the state lock.
+    pub(super) fn grants_changed(&self) -> Result<()> {
+        let store = self.lock()?;
+        // A conversation that cannot be viewed no longer exists.
+        let scope = |id| view(&store, id).ok().map(|view| view.scope);
+        for host in self.tool_hosts.iter() {
+            host.rescope(&scope);
+        }
+        Ok(())
     }
     /// Make running calls and approval waits re-check their authority.
     pub(super) fn policy_changed(&self) {
@@ -421,7 +438,23 @@ impl Gateway {
             if self.lock()?.remaining()? < NEXT_ROUND {
                 return Ok(Ended::Failed(GatewayError::HistoryFull));
             }
-            if compaction::over_threshold(last_input, run.info.context_limit) {
+            let mut view = self.view(run.thread)?;
+            let Some((mut catalog, mut offered)) = self.offer(run, &view).await else {
+                return Ok(Ended::Cancelled);
+            };
+            let over = compaction::over_threshold(last_input, run.info.context_limit);
+            // Flush only before a compaction that will summarize something,
+            // with a save call and a round left after it to answer in.
+            let budget = effective_budget(&*self.lock()?, run.thread)?;
+            let flush = over
+                && memory_flush::due(&view.thread)
+                && compaction::compactable(&view.thread, compaction::KEEP_DURING_RUN)
+                && round < budget.rounds
+                && calls_used < budget.tool_calls
+                && offered
+                    .iter()
+                    .any(|spec| spec.name == memory_flush::save_tool());
+            if over && !flush {
                 let compacted = self
                     .compact(compaction::Request {
                         thread: run.thread,
@@ -449,35 +482,42 @@ impl Gateway {
                     }
                     Err(error) => return Ok(Ended::Failed(error)),
                 }
+                // Send what the compaction left, with the tools offered now.
+                view = self.view(run.thread)?;
+                (catalog, offered) = match self.offer(run, &view).await {
+                    Some(listed) => listed,
+                    None => return Ok(Ended::Cancelled),
+                };
                 // The next check uses what this round's request reports.
             }
-            let view = self.view(run.thread)?;
-            let catalog = tokio::select! {
-                catalog = tools::catalog(&self.tool_hosts, &view.scope) => catalog,
-                _ = run.cancel.cancelled() => return Ok(Ended::Cancelled),
+            let flushing;
+            let round_prompt = if flush {
+                flushing = format!(
+                    "{prompt}{}",
+                    memory_flush::instruction(&memory_flush::today())
+                );
+                &flushing
+            } else {
+                &prompt
             };
-            for unavailable in &catalog.unavailable {
-                let _source = tracing::warn_span!("tools", source = %unavailable.source).entered();
-                crate::error::record("list_tools", &unavailable.error);
-            }
-            let offered: Vec<ToolSpec> = catalog
-                .tools
-                .values()
-                .filter(|routed| view.decide(&routed.spec).0 != ToolPermission::Deny)
-                .map(|routed| routed.spec.clone())
-                .collect();
             let broker = provider::Broker {
                 root: &run.root,
                 pairing: pairing.as_ref(),
             };
             let (turn, message) = match self
-                .stream_round(run, &prompt, &view.thread, broker, &offered)
+                .stream_round(run, round_prompt, &view.thread, broker, &offered)
                 .await?
             {
                 Some(Ok(turn)) => turn,
                 Some(Err(error)) => return Ok(Ended::Failed(error.into())),
                 None => return Ok(Ended::Cancelled),
             };
+            // Only a flush round the model completed counts as offered.
+            if flush {
+                let mut store = self.lock()?;
+                memory_flush::mark(store.thread_mut(run.thread)?);
+                store.persist(Some(EventKind::ThreadChanged { id: run.thread }))?;
+            }
             let sum = match total.take() {
                 None => turn.usage.clone(),
                 Some(sum) => add_usage(sum, &turn.usage),
@@ -529,6 +569,25 @@ impl Gateway {
             }
         }
     }
+    /// List the tools a round may offer: every tool not denied to the
+    /// conversation. `None` when the run was cancelled meanwhile.
+    async fn offer(&self, run: &Native, view: &View) -> Option<(tools::Catalog, Vec<ToolSpec>)> {
+        let catalog = tokio::select! {
+            catalog = tools::catalog(&self.tool_hosts, &view.scope) => catalog,
+            _ = run.cancel.cancelled() => return None,
+        };
+        for unavailable in &catalog.unavailable {
+            let _source = tracing::warn_span!("tools", source = %unavailable.source).entered();
+            crate::error::record("list_tools", &unavailable.error);
+        }
+        let offered = catalog
+            .tools
+            .values()
+            .filter(|routed| view.decide(&routed.spec).0 != ToolPermission::Deny)
+            .map(|routed| routed.spec.clone())
+            .collect();
+        Some((catalog, offered))
+    }
     /// Stream one model response, publishing text as it arrives. `None` when
     /// the run was cancelled; partial text stays in the conversation.
     async fn stream_round(
@@ -543,14 +602,18 @@ impl Gateway {
         let operation = provider::complete(
             &run.config,
             broker,
-            thread,
-            prompt,
-            &run.info,
-            offered,
+            provider::Ask {
+                thread,
+                prompt,
+                info: &run.info,
+                tools: offered,
+            },
             &sender,
+            &self.retry,
         );
         let mut operation = std::pin::pin!(operation);
         let mut partial = PartialReply::default();
+        let mut noticed = false;
         let result = loop {
             let due = partial.due();
             tokio::select! {
@@ -561,7 +624,13 @@ impl Gateway {
                     partial.publish(&mut store, run.thread)?;
                 }
                 Some(update) = progress.recv() => {
-                    if partial.update(update) {
+                    // A retry notice, shown until the round ends.
+                    if let crate::backends::Progress::Activity(title) = update {
+                        noticed = true;
+                        let mut store = self.lock()?;
+                        store.thread_mut(run.thread)?.backend_activity = Some(title.clone());
+                        store.persist(Some(EventKind::BackendActivity { thread: run.thread, title }))?;
+                    } else if partial.update(update) {
                         let mut store = self.lock()?;
                         partial.publish(&mut store, run.thread)?;
                     }
@@ -574,6 +643,9 @@ impl Gateway {
         }
         let mut store = self.lock()?;
         let thread = store.thread_mut(run.thread)?;
+        if noticed {
+            thread.backend_activity = None;
+        }
         let result = match result {
             Some(Ok(turn)) => {
                 let message = partial.finish(thread, turn.text.clone());
@@ -821,6 +893,7 @@ impl Gateway {
         ));
         // Dropping the host's future stops the call, on cancellation and on
         // revocation alike.
+        let mut changed_meanwhile = false;
         let result = loop {
             tokio::select! {
                 result = &mut running => break result,
@@ -828,6 +901,7 @@ impl Gateway {
                 // The sender lives as long as the gateway, so this branch
                 // only runs for a change.
                 Ok(()) = policy.changed() => {
+                    changed_meanwhile = true;
                     if !self
                         .still_permits(id, &record.tool, &routed.spec, approved)
                         .await?
@@ -838,6 +912,12 @@ impl Gateway {
                 }
             }
         };
+        // The call ran with `scope`; work it left running (a background
+        // command) may hold a grant withdrawn since, after the rescope that
+        // withdrawal triggered had already looked. Look again.
+        if changed_meanwhile || policy.has_changed().unwrap_or(false) {
+            self.grants_changed()?;
+        }
         // Withdrawing a host's authority can end its call before the policy
         // change is seen here, as when a disconnected MCP server's session
         // closes: such a failure is the withdrawal, not the tool's. Hosts

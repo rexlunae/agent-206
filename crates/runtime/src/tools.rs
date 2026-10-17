@@ -12,7 +12,8 @@
 //! adapter (`crate::mcp_tools`), native command execution
 //! (`crate::exec_tool`), approved skills (`crate::skill_tool`) and subagents
 //! (`crate::delegation_tool`) are registered by default, with `ask_user`
-//! (`crate::prompt_tool`) and `extension_propose` (`crate::propose_tool`).
+//! (`crate::prompt_tool`), `extension_propose` (`crate::propose_tool`) and
+//! `extension_list` (`crate::extension_list_tool`).
 use a206_core::{
     Capability, ErrorKind, ErrorReport, Id, Thread, ToolList, ToolOffer, ToolPermission,
     UnavailableTools,
@@ -109,6 +110,12 @@ pub trait ToolHost: Send + Sync + 'static {
         scope: &'a ToolScope,
         request: ToolRequest,
     ) -> BoxFuture<'a, Result<ToolOutput, ErrorReport>>;
+    /// Grants changed. A host that keeps work running between calls stops
+    /// whatever a conversation's current scope, from `scope`, no longer
+    /// covers; `None` means the conversation is gone. Called under the
+    /// gateway's state lock, so it returns promptly and never calls back
+    /// into the gateway.
+    fn rescope(&self, _scope: &dyn Fn(Id) -> Option<ToolScope>) {}
 }
 
 /// Why a listed tool is not offered.

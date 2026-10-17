@@ -24,7 +24,7 @@ impl Gateway {
         text: String,
         schedule: Schedule,
         author: JobAuthor,
-    ) -> Result<Reply> {
+    ) -> Result<Job> {
         let name = name.trim().to_owned();
         check(
             !name.is_empty() && name.len() <= MAX_NAME,
@@ -42,6 +42,18 @@ impl Gateway {
             store.state.jobs.len() < MAX_JOBS,
             GatewayError::Invalid("remove a scheduled message before adding another"),
         )?;
+        if let JobAuthor::Agent { .. } = author {
+            let added = store
+                .state
+                .jobs
+                .iter()
+                .filter(|job| job.thread == thread && job.author == author)
+                .count();
+            check(
+                added < MAX_AGENT_JOBS,
+                GatewayError::Invalid("remove one of this conversation's scheduled messages first"),
+            )?;
+        }
         let job = Job {
             id: Id::new_v4(),
             name,
@@ -58,7 +70,7 @@ impl Gateway {
         store.persist(Some(EventKind::JobChanged { id: job.id }))?;
         drop(store);
         self.jobs_changed.notify_one();
-        Ok(Reply::Job(Box::new(job)))
+        Ok(job)
     }
 
     pub(super) fn set_job_enabled(&self, id: Id, enabled: bool) -> Result<Reply> {
@@ -229,6 +241,65 @@ impl Gateway {
                 () = tokio::time::sleep(Duration::from_secs(wait.clamp(1, RECHECK))) => {}
             }
         }
+    }
+}
+
+/// Most jobs a model may keep on one conversation.
+pub const MAX_AGENT_JOBS: usize = 16;
+
+/// What the schedule tools may do with one conversation's jobs: add one the
+/// user approved, list them and remove those a model added. It runs nothing
+/// and cannot change a grant, a permission or another conversation's jobs.
+#[derive(Clone)]
+pub struct Jobs {
+    /// The gateway without its tool hosts, so holding it forms no cycle.
+    base: Gateway,
+}
+impl Gateway {
+    pub(crate) fn jobs(&self) -> Jobs {
+        let mut base = self.clone();
+        base.tool_hosts = Default::default();
+        base.delegation = Default::default();
+        Jobs { base }
+    }
+}
+impl Jobs {
+    /// Schedule `text` to `thread` itself, as a job its model authored.
+    pub fn add(
+        &self,
+        thread: Id,
+        name: String,
+        text: String,
+        schedule: Schedule,
+    ) -> std::result::Result<Job, ErrorReport> {
+        self.base
+            .schedule_job(name, thread, text, schedule, JobAuthor::Agent { thread })
+            .map_err(|error| crate::error::report(&error))
+    }
+    /// The jobs that message `thread`.
+    pub fn list(&self, thread: Id) -> std::result::Result<Vec<Job>, ErrorReport> {
+        let store = self.base.lock().map_err(|e| crate::error::report(&e))?;
+        Ok(store
+            .state
+            .jobs
+            .iter()
+            .filter(|job| job.thread == thread)
+            .cloned()
+            .collect())
+    }
+    /// Remove a job a model of `thread` added; the user's own jobs stay.
+    pub fn remove(&self, thread: Id, id: Id) -> std::result::Result<(), ErrorReport> {
+        let removed = (|| {
+            let owned = self.base.lock()?.state.jobs.iter().any(|job| {
+                job.id == id && job.thread == thread && job.author == JobAuthor::Agent { thread }
+            });
+            check(
+                owned,
+                GatewayError::NotFound("no scheduled message this conversation added has that ID"),
+            )?;
+            self.base.remove_job(id)
+        })();
+        removed.map(drop).map_err(|e| crate::error::report(&e))
     }
 }
 

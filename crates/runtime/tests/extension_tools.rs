@@ -74,6 +74,10 @@ const TESTS: &[(&str, Test)] = &[
     ("git_tools_run_once_the_conversation_is_granted_git", || {
         Box::pin(git_tools_run_once_the_conversation_is_granted_git())
     }),
+    (
+        "the_agent_learns_what_it_can_call_and_what_to_ask_for",
+        || Box::pin(the_agent_learns_what_it_can_call_and_what_to_ask_for()),
+    ),
 ];
 
 fn main() {
@@ -1121,4 +1125,52 @@ async fn git_tools_run_once_the_conversation_is_granted_git() {
     assert_eq!(failure(reply).kind, ErrorKind::InvalidRequest);
     rig.grant_thread(&[Capability::GitRead, Capability::GitWrite])
         .await;
+}
+
+async fn the_agent_learns_what_it_can_call_and_what_to_ask_for() {
+    let mut rig = rig().await;
+    rig.tool = a206_runtime::extension_list_tool::NAME.into();
+    rig.permit(ToolPermission::Allow).await;
+    let list = || Call::new(a206_runtime::extension_list_tool::NAME, json!({}));
+    let read = |listing: &serde_json::Value| {
+        listing["extensions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["id"] == EXTENSION)
+            .and_then(|e| e["tools"].as_array())
+            .and_then(|tools| tools.iter().find(|t| t["tool"] == READ))
+            .cloned()
+            .unwrap()
+    };
+    let (thread, results) = rig.round_trip(&[list()]).await;
+    assert_eq!(thread.state, RunState::Complete, "{:?}", thread.error);
+    let listing: serde_json::Value = serde_json::from_str(results[0].as_deref().unwrap()).unwrap();
+    let entry = read(&listing);
+    assert_eq!(entry["name"], tool_name(EXTENSION, READ));
+    assert_eq!(entry["blocked_by"], json!([]));
+
+    // Once the user withdraws the grant, the agent is told what to ask for.
+    rig.grant_extension(&[]).await;
+    let (_, results) = rig.round_trip(&[list()]).await;
+    let listing: serde_json::Value = serde_json::from_str(results[0].as_deref().unwrap()).unwrap();
+    let entry = read(&listing);
+    assert!(entry["name"].is_null(), "{entry}");
+    assert_eq!(
+        entry["blocked_by"],
+        json!([format!(
+            "The user has not granted this extension: {}.",
+            Capability::ReadWorkspace.label()
+        )])
+    );
+    // Listing changed nothing the user decides.
+    let plugin = rig
+        .gateway
+        .snapshot()
+        .unwrap()
+        .plugins
+        .into_iter()
+        .find(|p| p.id == EXTENSION)
+        .unwrap();
+    assert!(plugin.granted.is_empty());
 }
