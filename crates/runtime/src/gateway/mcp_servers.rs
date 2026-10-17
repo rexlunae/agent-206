@@ -849,7 +849,7 @@ mod tests {
             .unwrap();
         g.watch_session("tools", &session);
         drop(claim);
-        (state, install, g, thread, cancelled, close)
+        (state, install, g, *thread, cancelled, close)
     }
 
     #[tokio::test]

@@ -3,14 +3,15 @@
 //! below are read; values that may hold secrets (messenger tokens, registry
 //! tokens, MCP commands) are counted with `IgnoredAny` and never kept.
 use crate::{
-    ImportError, Inactive, InactiveCategory, MAX_CONFIG_BYTES, PREVIEW_VERSION, Preview,
-    ProviderAction, ProviderImport, Result, Tool, Unsupported, UnsupportedProvider, VaultPlan,
-    VaultProtection, VaultSource,
+    ImportError, Inactive, InactiveCategory, MAX_CONFIG_BYTES, MessengerAction, MessengerImport,
+    PREVIEW_VERSION, Preview, ProviderAction, ProviderImport, Result, Tool, Unsupported,
+    UnsupportedMessenger, UnsupportedProvider, VaultPlan, VaultProtection, VaultSource,
 };
-use a206_core::{ProviderApi, ProviderPreset, Settings};
+use a206_core::messengers::{MAX_ALLOWED_CHATS, valid_field, valid_name};
+use a206_core::{MessengerKind, ProviderApi, ProviderPreset, Settings};
 use serde::Deserialize;
 use serde::de::IgnoredAny;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 /// RustyClaw's default settings directory under a home directory.
@@ -33,7 +34,7 @@ struct Config {
     #[serde(default)]
     custom_providers: Vec<CustomProvider>,
     #[serde(default)]
-    messengers: Vec<IgnoredAny>,
+    messengers: Vec<Messenger>,
     #[serde(default)]
     mcp: Mcp,
     #[serde(default)]
@@ -50,6 +51,25 @@ struct Config {
     clawhub_token: Option<IgnoredAny>,
     #[serde(default)]
     system_prompt: Option<IgnoredAny>,
+}
+
+/// The fields of a RustyClaw `[[messengers]]` entry this importer uses. Its
+/// secrets (tokens, passwords, app passwords) are not deserialized; `token`
+/// is only checked for presence.
+#[derive(Deserialize)]
+struct Messenger {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    messenger_type: String,
+    #[serde(default)]
+    config_path: Option<IgnoredAny>,
+    #[serde(default)]
+    token: Option<IgnoredAny>,
+    #[serde(default)]
+    allowed_chats: Vec<String>,
+    #[serde(default)]
+    allowed_users: Vec<String>,
 }
 
 #[derive(Default, Deserialize)]
@@ -166,6 +186,103 @@ fn plan(presets: &[ProviderPreset], settings: &Settings, source: Source) -> Prov
         model_reference: source.model_reference,
         action,
     }
+}
+
+fn messenger_kind(id: &str) -> Option<MessengerKind> {
+    match id {
+        "telegram" => Some(MessengerKind::Telegram),
+        _ => None,
+    }
+}
+
+/// `source` reduced to a valid messenger name, or `fallback` if nothing is left.
+fn base_name(source: &str, fallback: &str) -> String {
+    let mut name = String::new();
+    for c in source.chars().flat_map(char::to_lowercase) {
+        if c.is_ascii_lowercase() || c.is_ascii_digit() {
+            name.push(c);
+        } else if !name.is_empty() && !name.ends_with('-') {
+            name.push('-');
+        }
+    }
+    // Leave room for a `-N` suffix within the 64-byte limit.
+    name.truncate(56);
+    let name = name.trim_end_matches('-');
+    if name.is_empty() {
+        fallback.to_owned()
+    } else {
+        name.to_owned()
+    }
+}
+
+/// Plan each source messenger. Names are made unique; an entry whose name a
+/// same-kind messenger already has is taken to be an earlier import of it.
+fn plan_messengers(settings: &Settings, source: Vec<Messenger>) -> Vec<MessengerImport> {
+    let mut claimed = BTreeSet::new();
+    source
+        .into_iter()
+        .map(|messenger| {
+            let kind = messenger_kind(&messenger.messenger_type);
+            let fallback = base_name(&messenger.messenger_type, "messenger");
+            let base = base_name(&messenger.name, &fallback);
+            let mut action = MessengerAction::Add;
+            let mut name = base.clone();
+            for n in 1.. {
+                if n > 1 {
+                    name = format!("{base}-{n}");
+                }
+                if claimed.contains(&name) {
+                    continue;
+                }
+                match settings.messengers.iter().find(|m| m.name == name) {
+                    Some(existing) if Some(existing.kind) == kind => {
+                        action = MessengerAction::AlreadyConfigured;
+                        break;
+                    }
+                    Some(_) => continue,
+                    None => break,
+                }
+            }
+            claimed.insert(name.clone());
+            let allowed_chats: BTreeSet<String> = messenger.allowed_chats.into_iter().collect();
+            let allowed_users: BTreeSet<String> = messenger.allowed_users.into_iter().collect();
+            let valid = |ids: &BTreeSet<String>| {
+                ids.len() <= MAX_ALLOWED_CHATS && ids.iter().all(|id| valid_field(id))
+            };
+            let unsupported = if kind.is_none() {
+                Some(UnsupportedMessenger::UnknownKind)
+            } else if messenger.config_path.is_some() {
+                Some(UnsupportedMessenger::ExternalConfig)
+            } else if !valid(&allowed_chats) || !valid(&allowed_users) {
+                Some(UnsupportedMessenger::InvalidChats)
+            } else {
+                None
+            };
+            if let Some(reason) = unsupported {
+                action = MessengerAction::Unsupported { reason };
+            }
+            debug_assert!(valid_name(&name));
+            MessengerImport {
+                source_name: messenger.name,
+                source_kind: messenger.messenger_type,
+                name,
+                kind,
+                // Ids the gateway would refuse are not repeated in the preview.
+                allowed_chats: if unsupported.is_some() {
+                    BTreeSet::new()
+                } else {
+                    allowed_chats
+                },
+                allowed_users: if unsupported.is_some() {
+                    BTreeSet::new()
+                } else {
+                    allowed_users
+                },
+                token_left_behind: messenger.token.is_some(),
+                action,
+            }
+        })
+        .collect()
 }
 
 fn resolve(root: &Path, path: Option<&PathBuf>, default: PathBuf) -> PathBuf {
@@ -311,7 +428,6 @@ pub fn preview(root: &Path, settings: &Settings, vault_exists: Option<bool>) -> 
             inactive.push(Inactive { category, count });
         }
     };
-    leave(InactiveCategory::Messengers, config.messengers.len());
     leave(InactiveCategory::McpServers, config.mcp.servers.len());
     leave(
         InactiveCategory::ToolPermissions,
@@ -359,6 +475,7 @@ pub fn preview(root: &Path, settings: &Settings, vault_exists: Option<bool>) -> 
         config_sha256: bytes.as_deref().map(crate::sha256),
         vault,
         providers,
+        messengers: plan_messengers(settings, config.messengers),
         inactive,
         unsupported,
     })
@@ -450,8 +567,14 @@ execute_command = "Deny"
         assert_eq!(lab.api, ProviderApi::Anthropic);
         assert_eq!(lab.credential.as_deref(), Some("LAB_KEY"));
         assert_eq!(preview.vault.as_ref().unwrap().plan, VaultPlan::Import);
+        let bot = &preview.messengers[0];
+        assert_eq!(
+            (bot.name.as_str(), bot.kind),
+            ("bot", Some(MessengerKind::Telegram))
+        );
+        assert_eq!(bot.action, MessengerAction::Add);
+        assert!(bot.token_left_behind);
         for category in [
-            InactiveCategory::Messengers,
             InactiveCategory::McpServers,
             InactiveCategory::ToolPermissions,
             InactiveCategory::PlaintextToken,
@@ -498,6 +621,108 @@ execute_command = "Deny"
         assert_eq!(again.vault.unwrap().plan, VaultPlan::TargetExists);
         // Applying the stale first preview again also adds nothing.
         assert!(first.apply_providers(&mut settings).is_empty());
+    }
+
+    #[test]
+    fn messengers_arrive_disabled_without_tokens_and_never_widen_their_chats() {
+        let token = random();
+        let chat = random();
+        let user = random();
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            &dir.path().join("config.toml"),
+            &format!(
+                r#"
+[[messengers]]
+name = "Team Bot"
+messenger_type = "telegram"
+token = "{token}"
+allowed_chats = ["{chat}"]
+
+[[messengers]]
+name = "team bot"
+messenger_type = "telegram"
+allowed_chats = ["{chat}"]
+allowed_users = ["{user}"]
+
+[[messengers]]
+name = "{chat} matrix"
+messenger_type = "matrix"
+access_token = "{token}"
+
+[[messengers]]
+messenger_type = "telegram"
+config_path = "{token}.toml"
+
+[[messengers]]
+messenger_type = "telegram"
+allowed_chats = [""]
+"#
+            ),
+        );
+        let mut settings = Settings::default();
+        let preview = preview(dir.path(), &settings, None).unwrap();
+        let actions: Vec<_> = preview
+            .messengers
+            .iter()
+            .map(|m| (m.name.as_str(), m.action.clone()))
+            .collect();
+        let unsupported = |reason| MessengerAction::Unsupported { reason };
+        assert_eq!(actions[0], ("team-bot", MessengerAction::Add));
+        assert_eq!(actions[1], ("team-bot-2", MessengerAction::Add));
+        assert_eq!(actions[2].1, unsupported(UnsupportedMessenger::UnknownKind));
+        assert_eq!(
+            actions[3],
+            (
+                "telegram",
+                unsupported(UnsupportedMessenger::ExternalConfig)
+            )
+        );
+        assert_eq!(
+            actions[4],
+            (
+                "telegram-2",
+                unsupported(UnsupportedMessenger::InvalidChats)
+            )
+        );
+        assert!(preview.messengers.iter().all(|m| valid_name(&m.name)));
+        assert_eq!(
+            preview.messengers[1].allowed_users,
+            BTreeSet::from([user.clone()])
+        );
+        let text = toml::to_string(&preview).unwrap();
+        assert!(!text.contains(&token));
+
+        let added = preview.apply_messengers(&mut settings);
+        assert_eq!(added, ["team-bot", "team-bot-2"]);
+        for config in &settings.messengers {
+            assert!(!config.enabled);
+            assert!(config.credential.is_none());
+        }
+        assert_eq!(
+            settings.messengers[0].allowed_chats,
+            BTreeSet::from([chat.clone()])
+        );
+        // The source's restriction to some users still holds.
+        assert_eq!(
+            settings.messengers[1].allowed_chats,
+            BTreeSet::from([chat.clone()])
+        );
+        assert_eq!(settings.messengers[1].allowed_users, BTreeSet::from([user]));
+        assert!(settings.messengers[0].allowed_users.is_empty());
+
+        let again = super::preview(dir.path(), &settings, None).unwrap();
+        assert_eq!(
+            again.messengers[0].action,
+            MessengerAction::AlreadyConfigured
+        );
+        assert_eq!(
+            again.messengers[1].action,
+            MessengerAction::AlreadyConfigured
+        );
+        assert!(again.apply_messengers(&mut settings).is_empty());
+        assert!(preview.apply_messengers(&mut settings).is_empty());
+        assert_eq!(settings.messengers.len(), 2);
     }
 
     #[test]
@@ -604,6 +829,7 @@ execute_command = "Deny"
             config_sha256: Some(random()),
             applied_at: 0,
             providers_added: vec![uuid::Uuid::new_v4()],
+            messengers_added: vec![random()],
             vault_imported: true,
         };
         let path = crate::write_receipt(dir.path(), &receipt).unwrap();

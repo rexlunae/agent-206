@@ -2,7 +2,9 @@
 //! the host calls it relays.
 //!
 //! Every invocation runs in a fresh `agent206 extension-worker` child with a
-//! cleared environment. The worker holds no authority; each host call it
+//! cleared environment; on Linux that child is also confined by
+//! `a206_sandbox`, with no network, no project files and nothing to execute
+//! but itself. The worker holds no authority; each host call it
 //! relays is checked here against the call's effective grant, which is the
 //! intersection of the user's grant to the extension, the caller's scope and
 //! what the tool or panel declares.
@@ -14,8 +16,8 @@ use a206_core::{
 use a206_extensions::{
     ArgError, Limits, Manifest, ManifestError,
     abi::{
-        ABI, Call, DirEntry, EntryKind, HostErrorCode, HostFailure, HostReply, HostRequest,
-        Invocation, LogLevel, Outcome,
+        ABI, Call, HostErrorCode, HostFailure, HostReply, HostRequest, Invocation, LogLevel,
+        Outcome,
     },
     worker::{Frame, Start},
 };
@@ -68,6 +70,8 @@ pub enum ExtensionError {
     CurrentExe(#[source] std::io::Error),
     #[error("could not start the extension worker")]
     Spawn(#[source] std::io::Error),
+    #[error("could not confine the extension worker")]
+    Confine(#[from] crate::sandbox::ConfineError),
     #[error("the extension worker channel failed")]
     Channel(#[source] std::io::Error),
     #[error("the extension worker sent an invalid frame")]
@@ -101,6 +105,7 @@ impl crate::error::Classified for ExtensionError {
             }
             Self::NoProject => ErrorKind::InvalidRequest,
             Self::Builtins(_) | Self::Poisoned | Self::CurrentExe(_) => ErrorKind::Internal,
+            Self::Confine(error) => return classify(error),
             Self::Spawn(_) | Self::Channel(_) | Self::Exited => ErrorKind::Unavailable,
             Self::Frame(_) | Self::Unexpected => ErrorKind::Protocol,
             Self::Timeout(_) => ErrorKind::Timeout,
@@ -117,7 +122,9 @@ impl crate::error::Classified for HostFailure {
                 ErrorKind::InvalidRequest
             }
             HostErrorCode::NotFound => ErrorKind::NotFound,
-            HostErrorCode::Budget => ErrorKind::Conflict,
+            HostErrorCode::Budget | HostErrorCode::Exists | HostErrorCode::Conflict => {
+                ErrorKind::Conflict
+            }
             HostErrorCode::Unsupported | HostErrorCode::Other => return None,
             HostErrorCode::Io => ErrorKind::Storage,
         })
@@ -145,6 +152,8 @@ pub struct ExtensionTool {
 #[derive(Clone)]
 pub struct ExtensionHost {
     store: Arc<Mutex<Store>>,
+    /// Passed to unconfined workers; a Linux worker gets an empty one instead.
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
     data_dir: PathBuf,
 }
 impl ExtensionHost {
@@ -299,19 +308,8 @@ impl ExtensionHost {
         start: Start,
         mut host: HostCalls,
     ) -> Result<Outcome, ExtensionError> {
-        let mut child = tokio::process::Command::new(
-            std::env::current_exe().map_err(ExtensionError::CurrentExe)?,
-        )
-        .arg("--data-dir")
-        .arg(&self.data_dir)
-        .arg("extension-worker")
-        .env_clear()
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(ExtensionError::Spawn)?;
+        let mut worker = self.spawn_worker().await?;
+        let child = worker.child();
         let (Some(mut input), Some(mut output)) = (child.stdin.take(), child.stdout.take()) else {
             return Err(ExtensionError::Exited);
         };
@@ -330,6 +328,7 @@ impl ExtensionHost {
         if let Err(error) = child.wait().await {
             tracing::warn!(error = &error as &dyn std::error::Error, extension = %start.extension, "could not reap the extension worker");
         }
+        worker.stop().await;
         match result.map_err(ExtensionError::Failed)? {
             Outcome::Failed(guest) => Err(ExtensionError::Guest {
                 code: guest.code,
@@ -338,6 +337,59 @@ impl ExtensionHost {
             }),
             outcome => Ok(outcome),
         }
+    }
+}
+
+/// A running worker, confined on Linux.
+#[cfg(target_os = "linux")]
+struct Worker(crate::sandbox::Confined);
+#[cfg(not(target_os = "linux"))]
+struct Worker(tokio::process::Child);
+impl Worker {
+    fn child(&mut self) -> &mut tokio::process::Child {
+        #[cfg(target_os = "linux")]
+        return &mut self.0.child;
+        #[cfg(not(target_os = "linux"))]
+        return &mut self.0;
+    }
+    async fn stop(self) {
+        #[cfg(target_os = "linux")]
+        self.0.stop().await;
+    }
+}
+
+impl ExtensionHost {
+    #[cfg(not(target_os = "linux"))]
+    async fn spawn_worker(&self) -> Result<Worker, ExtensionError> {
+        let child = tokio::process::Command::new(
+            std::env::current_exe().map_err(ExtensionError::CurrentExe)?,
+        )
+        .arg("--data-dir")
+        .arg(&self.data_dir)
+        .arg("extension-worker")
+        .env_clear()
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(ExtensionError::Spawn)?;
+        Ok(Worker(child))
+    }
+
+    /// A missing sandbox layer is an error, never an unconfined worker.
+    #[cfg(target_os = "linux")]
+    async fn spawn_worker(&self) -> Result<Worker, ExtensionError> {
+        // The worker keeps nothing; its data directory is the empty scratch.
+        let confined = crate::sandbox::Confined::spawn_self(|scratch| {
+            vec![
+                "--data-dir".into(),
+                scratch.into(),
+                "extension-worker".into(),
+            ]
+        })
+        .await?;
+        Ok(Worker(confined))
     }
 }
 
@@ -414,11 +466,35 @@ impl HostCalls {
         match request {
             HostRequest::ReadFile { path } => {
                 let root = self.workspace()?;
-                blocking(move || read_file(root, &path)).await
+                blocking(move || workspace::read_file(root, &path)).await
             }
             HostRequest::ListDirectory { path } => {
                 let root = self.workspace()?;
-                blocking(move || list_directory(root, &path)).await
+                blocking(move || workspace::list_directory(root, &path)).await
+            }
+            HostRequest::Search {
+                path,
+                query,
+                max_matches,
+            } => {
+                let root = self.workspace()?;
+                blocking(move || workspace::search(root, &path, &query, max_matches)).await
+            }
+            HostRequest::WriteFile {
+                path,
+                contents,
+                overwrite,
+            } => {
+                let root = self.workspace()?;
+                blocking(move || workspace::write_file(root, &path, &contents, overwrite)).await
+            }
+            HostRequest::EditFile { path, old, new } => {
+                let root = self.workspace()?;
+                blocking(move || workspace::edit_file(root, &path, &old, &new)).await
+            }
+            HostRequest::CreateDirectory { path } => {
+                let root = self.workspace()?;
+                blocking(move || workspace::create_directory(root, &path)).await
             }
             HostRequest::StateGet { key } => {
                 check_key(&key)?;
@@ -510,85 +586,7 @@ async fn blocking(
             Err(failure(HostErrorCode::Io, "host call failed"))
         })
 }
-/// Host messages never include host paths: the guest sees only its own request.
-fn io_failure(error: &std::io::Error) -> HostFailure {
-    use std::io::ErrorKind as Io;
-    match error.kind() {
-        Io::NotFound => failure(HostErrorCode::NotFound, "no such file or directory"),
-        // cap-std refuses absolute paths, `..` escapes and symlinks that
-        // leave the workspace with PermissionDenied.
-        Io::PermissionDenied => failure(
-            HostErrorCode::Invalid,
-            "the path is outside the workspace or not readable",
-        ),
-        Io::InvalidInput => failure(HostErrorCode::Invalid, "invalid path"),
-        _ => failure(HostErrorCode::Io, "the workspace could not be read"),
-    }
-}
-fn open_workspace(root: PathBuf) -> Result<cap_std::fs::Dir, HostFailure> {
-    cap_std::fs::Dir::open_ambient_dir(root, cap_std::ambient_authority())
-        .map_err(|e| io_failure(&e))
-}
-fn read_file(root: PathBuf, path: &str) -> Result<HostReply, HostFailure> {
-    use std::io::Read;
-    let mut options = cap_std::fs::OpenOptions::new();
-    options.read(true);
-    // Open without blocking: opening a FIFO for reading otherwise waits for
-    // a writer forever. A regular file reads the same either way.
-    #[cfg(unix)]
-    {
-        use cap_std::fs::OpenOptionsExt;
-        options.custom_flags(nix::fcntl::OFlag::O_NONBLOCK.bits());
-    }
-    let file = open_workspace(root)?
-        .open_with(path, &options)
-        .map_err(|e| io_failure(&e))?;
-    if !file.metadata().map_err(|e| io_failure(&e))?.is_file() {
-        return Err(failure(HostErrorCode::Invalid, "not a regular file"));
-    }
-    let mut bytes = Vec::new();
-    file.take(MAX_FILE + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|e| io_failure(&e))?;
-    if bytes.len() as u64 > MAX_FILE {
-        return Err(failure(HostErrorCode::TooLarge, "the file exceeds 512 KiB"));
-    }
-    Ok(HostReply::File(bytes.into()))
-}
-fn list_directory(root: PathBuf, path: &str) -> Result<HostReply, HostFailure> {
-    let directory = open_workspace(root)?;
-    let directory = if path.is_empty() || path == "." {
-        directory
-    } else {
-        directory.open_dir(path).map_err(|e| io_failure(&e))?
-    };
-    let mut entries = Vec::new();
-    for entry in directory.entries().map_err(|e| io_failure(&e))? {
-        let entry = entry.map_err(|e| io_failure(&e))?;
-        if entries.len() == MAX_ENTRIES {
-            return Err(failure(
-                HostErrorCode::TooLarge,
-                "the directory has more than 1024 entries",
-            ));
-        }
-        let kind = match entry.file_type().map_err(|e| io_failure(&e))? {
-            kind if kind.is_dir() => EntryKind::Directory,
-            kind if kind.is_symlink() => EntryKind::Symlink,
-            kind if kind.is_file() => EntryKind::File,
-            _ => EntryKind::Other,
-        };
-        // A size that cannot be read is reported as unknown, never as zero.
-        let size = (kind == EntryKind::File)
-            .then(|| entry.metadata().ok().map(|m| m.len()))
-            .flatten();
-        entries.push(DirEntry {
-            name: entry.file_name().to_string_lossy().into_owned(),
-            kind,
-            size,
-        });
-    }
-    Ok(HostReply::Directory(entries))
-}
+mod workspace;
 
 #[cfg(test)]
 mod tests;

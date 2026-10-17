@@ -16,8 +16,13 @@ use std::{
 };
 use tokio::io::AsyncWriteExt;
 mod mcp_servers;
-mod skills;
+mod run;
+/// Snapshot bytes a user message needs beyond its text and attachments.
+const MESSAGE_OVERHEAD: usize = 4096;
+mod messengers;
 pub use mcp_servers::{McpOffer, McpOffers};
+pub use run::{RunError, ToolError};
+mod skills;
 pub use skills::SkillOffer;
 
 /// Streamed reply text that is not final yet. It is published as the
@@ -69,6 +74,7 @@ impl PartialReply {
                 attachments: vec![],
                 at: now(),
                 backend: thread.backend,
+                tool_calls: vec![],
             });
         }
     }
@@ -79,8 +85,9 @@ impl PartialReply {
         self.published = Some(tokio::time::Instant::now());
         Ok(())
     }
-    /// Replace streamed text with the final reply, which always gets a message.
-    fn finish(mut self, thread: &mut Thread, text: String) {
+    /// Replace streamed text with the final reply, which always gets a
+    /// message; returns that message's ID.
+    fn finish(mut self, thread: &mut Thread, text: String) -> Id {
         self.text = text;
         let id = *self.message.get_or_insert_with(Id::new_v4);
         if !thread.messages.iter().any(|m| m.id == id) {
@@ -91,9 +98,11 @@ impl PartialReply {
                 attachments: vec![],
                 at: now(),
                 backend: thread.backend,
+                tool_calls: vec![],
             });
         }
         self.apply(thread);
+        id
     }
 }
 /// Why a gateway command failed. Validation reasons are static so clients can
@@ -146,6 +155,8 @@ pub enum GatewayError {
     Skill(#[from] a206_skills::SkillError),
     #[error(transparent)]
     Frame(#[from] transport::FrameError),
+    #[error(transparent)]
+    Run(#[from] run::RunError),
     #[error("state could not be encoded")]
     Encode(#[from] rmp_serde::encode::Error),
     #[error("settings could not be encoded")]
@@ -218,6 +229,7 @@ impl crate::error::Classified for GatewayError {
             Self::Mcp(error) => return classify(error),
             Self::Skill(error) => return classify(error),
             Self::Frame(error) => return classify(error),
+            Self::Run(error) => return classify(error),
             // The cause's own kind (missing, denied, invalid data) is the useful one.
             Self::Receipt(_)
             | Self::Workspace(_)
@@ -300,6 +312,18 @@ pub struct Gateway {
     /// Last automatic catalog attempt per provider, reset by a new pairing.
     refreshed: Arc<Mutex<BTreeMap<Id, u64>>>,
     paired: Arc<tokio::sync::Notify>,
+    tool_hosts: Arc<Vec<Arc<dyn crate::tools::ToolHost>>>,
+    /// Runs waiting for the user, by approval ID. Only `ResolveApproval` answers them.
+    approvals: Arc<Mutex<BTreeMap<Id, run::Waiter>>>,
+    /// Bumped whenever a tool permission, grant or mode changes, so running
+    /// tool calls and approval waits re-check their authority at once.
+    policy: Arc<tokio::sync::watch::Sender<u64>>,
+    /// Counts pairings, so messengers waiting for the vault wake on a new one.
+    pairings: tokio::sync::watch::Sender<u64>,
+    /// What the messenger supervisor should run.
+    messengers: tokio::sync::watch::Sender<Vec<crate::messengers::Desired>>,
+    /// Messengers the user disconnected; they connect again only on request.
+    messengers_stopped: Arc<Mutex<BTreeSet<String>>>,
     mcp: Arc<mcp_servers::McpServers>,
 }
 /// The broker pairing this gateway holds, with the connection that anchors it.
@@ -312,7 +336,30 @@ struct Paired {
 const REFRESH_RETRY: u64 = 300;
 impl Gateway {
     pub fn open(root: &Path) -> Result<Self, StoreError> {
-        let store = Arc::new(Mutex::new(Store::open(root)?));
+        let mut store = Store::open(root)?;
+        // Messenger state is runtime state: nothing is connected yet.
+        store.state.messengers =
+            Self::messenger_statuses(&store.state.messengers, &store.state.settings.messengers)
+                .into_iter()
+                .map(|status| MessengerStatus {
+                    state: MessengerState::Stopped,
+                    account: None,
+                    failure: None,
+                    ..status
+                })
+                .collect();
+        // Nobody has disconnected anything yet, so enabled entries run.
+        let desired = store
+            .state
+            .settings
+            .messengers
+            .iter()
+            .map(|config| crate::messengers::Desired {
+                run: config.enabled,
+                config: config.clone(),
+            })
+            .collect();
+        let store = Arc::new(Mutex::new(store));
         Ok(Self {
             admission: Arc::new(Mutex::new(Admission::default())),
             shutdown_committed: Arc::new(tokio::sync::Mutex::new(false)),
@@ -327,6 +374,12 @@ impl Gateway {
             pair_requests: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             refreshed: Arc::new(Mutex::new(BTreeMap::new())),
             paired: Arc::new(tokio::sync::Notify::new()),
+            tool_hosts: Arc::new(vec![]),
+            approvals: Arc::new(Mutex::new(BTreeMap::new())),
+            policy: Arc::new(tokio::sync::watch::Sender::new(0)),
+            pairings: tokio::sync::watch::Sender::new(0),
+            messengers: tokio::sync::watch::Sender::new(desired),
+            messengers_stopped: Arc::new(Mutex::new(BTreeSet::new())),
             mcp: Arc::default(),
         })
     }
@@ -466,6 +519,7 @@ impl Gateway {
                 | Command::CallTool { .. }
                 | Command::Skills
                 | Command::ReadSkill { .. }
+                | Command::ListTools { .. }
                 // Never journal a pairing: request bodies are persisted.
                 | Command::PairBroker { .. }
         );
@@ -562,6 +616,8 @@ impl Gateway {
                     .map_err(poisoned("catalog refresh"))?
                     .clear();
                 self.paired.notify_one();
+                self.pairings
+                    .send_modify(|count| *count = count.wrapping_add(1));
                 Ok(Reply::Ok)
             }
             Command::JoshuaStatus => {
@@ -617,6 +673,7 @@ impl Gateway {
             Command::Events { after } => Ok(Reply::Events(self.lock()?.events(after)?)),
             Command::SaveSettings(mut settings) => {
                 provider::validate_presets(&settings.provider_presets)?;
+                messengers::validate(&settings.messengers)?;
                 let mut backend_kinds = BTreeSet::new();
                 for backend in &settings.backends {
                     crate::backends::validate_config(backend)?;
@@ -706,12 +763,18 @@ impl Gateway {
                         .iter()
                         .any(|p| p.id == c.provider && old.contains(p))
                 });
+                store.state.messengers =
+                    Self::messenger_statuses(&store.state.messengers, &settings.messengers);
                 let previous = std::mem::replace(&mut store.state.settings, settings);
                 store.state.mcp_servers = mcp_servers;
                 store.persist(Some(EventKind::SettingsChanged))?;
                 self.stop_changed_mcp(&previous.mcp_servers, &store.state.settings.mcp_servers)?;
+                drop(store);
+                self.publish_messengers()?;
                 Ok(Reply::Ok)
             }
+            Command::ConnectMessenger { name } => self.connect_messenger(&name, true),
+            Command::DisconnectMessenger { name } => self.connect_messenger(&name, false),
             Command::RefreshCatalog { provider } => {
                 let config = self
                     .lock()?
@@ -748,7 +811,7 @@ impl Gateway {
                 let mut store = self.lock()?;
                 store.state.threads.push(thread.clone());
                 store.persist(Some(EventKind::ThreadChanged { id: thread.id }))?;
-                Ok(Reply::Thread(thread))
+                Ok(Reply::Thread(Box::new(thread)))
             }
             Command::SetSubagentModel { id, model, allowed } => {
                 let mut store = self.lock()?;
@@ -809,6 +872,7 @@ impl Gateway {
                 if thread.model != model {
                     thread.effort = None;
                     thread.usage = None;
+                    thread.run_usage = None;
                 }
                 thread.model = model;
                 thread.subagent_models = subagent_models;
@@ -824,7 +888,8 @@ impl Gateway {
                     .collect();
                 let thread = thread.clone();
                 store.persist(Some(EventKind::ThreadChanged { id }))?;
-                Ok(Reply::Thread(thread))
+                self.policy_changed();
+                Ok(Reply::Thread(Box::new(thread)))
             }
             Command::SetEffort { thread: id, effort } => {
                 let mut store = self.lock()?;
@@ -889,6 +954,7 @@ impl Gateway {
                 thread.backend_activity = None;
                 thread.grant.capabilities = capabilities;
                 store.persist(Some(EventKind::ThreadChanged { id }))?;
+                self.policy_changed();
                 Ok(Reply::Ok)
             }
             Command::Send {
@@ -925,12 +991,13 @@ impl Gateway {
                 let token = tokio_util::sync::CancellationToken::new();
                 let (config, thread, prompt, info, backend, workspace, root) = {
                     let mut store = self.lock()?;
+                    // Admit the message only with room for it and for the
+                    // run's first round, which applies the same bound, so an
+                    // accepted message is never left without a reply for lack
+                    // of storage.
                     check(
-                        rmp_serde::to_vec_named(&store.state)?.len()
-                            + text.len()
-                            + attachment_size
-                            + 262_144
-                            < a206_protocol::MAX_FRAME,
+                        store.remaining()?
+                            >= text.len() + attachment_size + MESSAGE_OVERHEAD + run::NEXT_ROUND,
                         GatewayError::HistoryFull,
                     )?;
                     let current = store.thread(id)?;
@@ -1000,10 +1067,13 @@ impl Gateway {
                         attachments,
                         at: now(),
                         backend: thread.backend,
+                        tool_calls: vec![],
                     });
                     thread.state = RunState::Running;
                     thread.backend_activity = None;
                     thread.error = None;
+                    // The previous run's cost is not this run's.
+                    thread.run_usage = None;
                     let copy = thread.clone();
                     self.running
                         .lock()
@@ -1012,36 +1082,51 @@ impl Gateway {
                     store.persist(Some(EventKind::ThreadChanged { id }))?;
                     (config, copy, prompt, info, backend, workspace, root)
                 };
+                let Some(backend) = backend else {
+                    let ended = self
+                        .native_run(&run::Native {
+                            thread: id,
+                            config,
+                            info,
+                            prompt,
+                            root,
+                            cancel: token.clone(),
+                        })
+                        .await;
+                    self.running.lock().map_err(poisoned("run"))?.remove(&id);
+                    self.expire_approvals(id)?;
+                    let mut store = self.lock()?;
+                    let thread = store.thread_mut(id)?;
+                    run::settle_unfinished(thread);
+                    match ended {
+                        run::Ended::Complete { last, total } => {
+                            thread.usage = Some(last);
+                            thread.run_usage = Some(total);
+                            thread.state = RunState::Complete;
+                        }
+                        run::Ended::Failed(error) => fail_run(thread, id, &error),
+                        run::Ended::Cancelled => thread.state = RunState::Cancelled,
+                    }
+                    let thread = thread.clone();
+                    store.persist(Some(EventKind::ThreadChanged { id }))?;
+                    return Ok(Reply::Thread(Box::new(thread)));
+                };
                 let (sender, mut progress) = tokio::sync::mpsc::channel(32);
-                let pairing = self.pairing()?;
                 let operation = async {
-                    Ok::<_, GatewayError>(if let Some(backend) = &backend {
+                    Ok::<_, GatewayError>(
                         crate::backends::complete(crate::backends::Run {
                             config: &config,
                             thread: &thread,
                             prompt: &prompt,
                             info: &info,
-                            backend,
+                            backend: &backend,
                             workspace: workspace.as_deref(),
                             state_root: &root,
                             progress: sender,
                             cancel: token.clone(),
                         })
-                        .await?
-                    } else {
-                        provider::complete(
-                            &config,
-                            provider::Broker {
-                                root: &root,
-                                pairing: pairing.as_ref(),
-                            },
-                            &thread,
-                            &prompt,
-                            &info,
-                            &sender,
-                        )
-                        .await?
-                    })
+                        .await?,
+                    )
                 };
                 let mut operation = Box::pin(operation);
                 let mut progress_open = true;
@@ -1051,7 +1136,6 @@ impl Gateway {
                     let due = partial.due();
                     tokio::select! {
                         result = &mut operation => break (!token.is_cancelled()).then_some(result),
-                        _ = token.cancelled(), if backend.is_none() => break None,
                         _ = tokio::time::sleep_until(due.unwrap_or_else(tokio::time::Instant::now)), if due.is_some() => {
                             let mut store = self.lock()?;
                             partial.publish(&mut store, id)?;
@@ -1085,6 +1169,8 @@ impl Gateway {
                 match result {
                     Some(Ok((text, usage))) => {
                         partial.finish(thread, text);
+                        // A backend reports one total for its whole run.
+                        thread.run_usage = Some(usage.clone());
                         thread.usage = Some(usage);
                         thread.state = RunState::Complete;
                     }
@@ -1092,17 +1178,7 @@ impl Gateway {
                         // Partial text stays visible, followed by the failure;
                         // the run is Failed, never Complete.
                         partial.apply(thread);
-                        let report = crate::error::correlated("run", id, &e);
-                        thread.state = RunState::Failed;
-                        thread.messages.push(Message {
-                            id: Id::new_v4(),
-                            role: Role::System,
-                            attachments: vec![],
-                            text: report.detail(),
-                            at: now(),
-                            backend: thread.backend,
-                        });
-                        thread.error = Some(report);
+                        fail_run(thread, id, &e);
                     }
                     None => {
                         partial.apply(thread);
@@ -1111,8 +1187,21 @@ impl Gateway {
                 }
                 let thread = thread.clone();
                 store.persist(Some(EventKind::ThreadChanged { id }))?;
-                Ok(Reply::Thread(thread))
+                Ok(Reply::Thread(Box::new(thread)))
             }
+            Command::ListTools { thread } => self.list_tools(thread).await,
+            Command::SetToolPermission {
+                thread,
+                tool,
+                permission,
+            } => self.set_tool_permission(thread, tool, permission),
+            Command::SetToolBudget { thread, budget } => self.set_tool_budget(thread, budget),
+            Command::ResolveApproval {
+                thread,
+                approval,
+                digest,
+                decision,
+            } => self.resolve_approval(thread, approval, &digest, decision),
             Command::CancelRun { thread } => {
                 let running = self.running.lock().map_err(poisoned("run"))?;
                 let token = running
@@ -1174,7 +1263,7 @@ impl Gateway {
                 );
                 store.state.threads.push(thread.clone());
                 store.persist(Some(EventKind::ThreadChanged { id: thread.id }))?;
-                Ok(Reply::Thread(thread))
+                Ok(Reply::Thread(Box::new(thread)))
             }
             Command::Download {
                 url,
@@ -1625,6 +1714,18 @@ fn write_settings(root: &Path, settings: &Settings) -> Result<()> {
         .and_then(|()| std::fs::File::open(&temporary)?.sync_all())
         .and_then(|()| std::fs::rename(&temporary, root.join("settings.toml")))
         .map_err(GatewayError::WriteSettings)
+}
+/// Mark a run Failed with its structured report, shown after any partial text.
+fn fail_run(thread: &mut Thread, id: Id, error: &(dyn std::error::Error + 'static)) {
+    let report = crate::error::correlated("run", id, error);
+    thread.state = RunState::Failed;
+    thread.messages.push(Message::new(
+        Role::System,
+        report.detail(),
+        now(),
+        thread.backend,
+    ));
+    thread.error = Some(report);
 }
 fn validate_model(snapshot: &Snapshot, key: &ModelKey) -> Result<()> {
     check(

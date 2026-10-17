@@ -1,14 +1,19 @@
 //! Renderer-independent state, authority and command contracts.
 #![forbid(unsafe_code)]
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use uuid::Uuid;
 
 pub mod error;
 pub mod extension;
 pub mod ignore;
+pub mod tools;
 pub use error::{ErrorKind, ErrorReport};
 pub use ignore::Ignore;
+pub use tools::{
+    ApprovalDecision, ApprovalOutcome, ApprovalRequest, ToolBudget, ToolCall, ToolCallState,
+    ToolList, ToolOffer, ToolPermission, UnavailableTools,
+};
 
 pub type Id = Uuid;
 
@@ -159,8 +164,12 @@ pub struct ModelKey {
     pub model: String,
 }
 
-pub mod mcp;
+pub mod messengers;
 pub mod providers;
+pub use messengers::{
+    ChatBinding, MessengerConfig, MessengerKind, MessengerState, MessengerStatus, RefusedChat,
+};
+pub mod mcp;
 pub use mcp::{McpServerConfig, McpServerState, McpServerStatus, McpToolInfo, ToolPolicy};
 pub use providers::{ProviderApi, ProviderPreset, ProviderPresetList};
 
@@ -249,6 +258,8 @@ pub struct Settings {
     #[serde(default)]
     pub backends: Vec<BackendConfig>,
     #[serde(default)]
+    pub messengers: Vec<MessengerConfig>,
+    #[serde(default)]
     pub mcp_servers: Vec<McpServerConfig>,
     /// Enabled skills by name, each pinned to the SHA-256 of the `SKILL.md`
     /// the user approved. Any edit to a skill disables it until re-approved.
@@ -267,6 +278,7 @@ impl Default for Settings {
             providers: vec![],
             provider_presets: ProviderPresetList::default(),
             backends: vec![],
+            messengers: vec![],
             mcp_servers: vec![],
             enabled_skills: Default::default(),
             prompts: Mode::ALL
@@ -313,6 +325,22 @@ pub struct Message {
     pub at: u64,
     #[serde(default)]
     pub backend: CodingBackend,
+    /// Tool calls an assistant message requested, with their outcomes.
+    #[serde(default)]
+    pub tool_calls: Vec<ToolCall>,
+}
+impl Message {
+    pub fn new(role: Role, text: String, at: u64, backend: CodingBackend) -> Self {
+        Self {
+            id: Id::new_v4(),
+            role,
+            text,
+            attachments: vec![],
+            at,
+            backend,
+            tool_calls: vec![],
+        }
+    }
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Usage {
@@ -332,7 +360,12 @@ pub struct Thread {
     pub grant: Grant,
     pub messages: Vec<Message>,
     pub state: RunState,
+    /// The latest model request alone: what the context window holds.
     pub usage: Option<Usage>,
+    /// Every model request of the latest run summed: what the run cost. A
+    /// count any request did not report makes its total unknown.
+    #[serde(default)]
+    pub run_usage: Option<Usage>,
     #[serde(default)]
     pub effort: Option<String>,
     #[serde(default)]
@@ -342,6 +375,17 @@ pub struct Thread {
     /// Why the most recent run failed, cleared when a new run starts.
     #[serde(default)]
     pub error: Option<ErrorReport>,
+    /// The user's per-tool permissions; a tool not listed is denied.
+    #[serde(default)]
+    pub tool_permissions: BTreeMap<String, ToolPermission>,
+    #[serde(default)]
+    pub tool_budget: ToolBudget,
+    /// Tool calls of the current run waiting for the user.
+    #[serde(default)]
+    pub approvals: Vec<ApprovalRequest>,
+    /// The messenger chat this thread converses with, if any.
+    #[serde(default)]
+    pub chat: Option<Box<ChatBinding>>,
 }
 impl Thread {
     pub fn new(title: String, mode: Mode) -> Self {
@@ -357,10 +401,15 @@ impl Thread {
             messages: vec![],
             state: RunState::Idle,
             usage: None,
+            run_usage: None,
             effort: None,
             backend: CodingBackend::Native,
             backend_activity: None,
             error: None,
+            tool_permissions: BTreeMap::new(),
+            tool_budget: ToolBudget::default(),
+            approvals: vec![],
+            chat: None,
         }
     }
 }
@@ -452,6 +501,9 @@ pub struct Snapshot {
     pub last_event: u64,
     #[serde(default)]
     pub managed_joshua_provider: Option<Id>,
+    /// Runtime state of configured messengers; never a grant.
+    #[serde(default)]
+    pub messengers: Vec<MessengerStatus>,
     /// Runtime state of configured MCP servers; never a grant.
     #[serde(default)]
     pub mcp_servers: Vec<McpServerStatus>,
@@ -471,6 +523,7 @@ impl Snapshot {
                 thread.model = None;
                 thread.effort = None;
                 thread.usage = None;
+                thread.run_usage = None;
             }
             thread
                 .subagent_models
@@ -489,14 +542,40 @@ pub struct Event {
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum EventKind {
-    ThreadChanged { id: Id },
-    CatalogChanged { provider: Id },
+    ThreadChanged {
+        id: Id,
+    },
+    CatalogChanged {
+        provider: Id,
+    },
     DownloadChanged(Download),
     SettingsChanged,
-    BackendActivity { thread: Id, title: String },
-    ProjectChanged { id: Id },
-    McpServerChanged { name: String },
-    ExtensionChanged { id: String },
+    BackendActivity {
+        thread: Id,
+        title: String,
+    },
+    ProjectChanged {
+        id: Id,
+    },
+    MessengerChanged {
+        name: String,
+    },
+    McpServerChanged {
+        name: String,
+    },
+    ExtensionChanged {
+        id: String,
+    },
+    /// A tool call is waiting for the user; the request is in the thread.
+    ApprovalRequested {
+        thread: Id,
+        approval: Id,
+    },
+    ApprovalResolved {
+        thread: Id,
+        approval: Id,
+        outcome: ApprovalOutcome,
+    },
 }
 
 /// A capability the vault broker issues to the gateway for one unlock, so the
@@ -572,6 +651,28 @@ pub enum Command {
     CancelRun {
         thread: Id,
     },
+    /// The tools this conversation could use and how each is permitted.
+    ListTools {
+        thread: Id,
+    },
+    /// Set (or with `None`, clear back to deny) one tool's permission.
+    SetToolPermission {
+        thread: Id,
+        tool: String,
+        permission: Option<ToolPermission>,
+    },
+    SetToolBudget {
+        thread: Id,
+        budget: ToolBudget,
+    },
+    /// Answer a pending approval. `digest` must be the one the user was
+    /// shown, so a decision applies only to that exact call.
+    ResolveApproval {
+        thread: Id,
+        approval: Id,
+        digest: String,
+        decision: ApprovalDecision,
+    },
     CreateProject {
         name: String,
         root: String,
@@ -634,6 +735,14 @@ pub enum Command {
     PairBroker {
         pairing: BrokerPairing,
     },
+    /// Connect an enabled messenger the user disconnected (user operation).
+    ConnectMessenger {
+        name: String,
+    },
+    /// Disconnect a messenger; it stays stopped until the user connects it.
+    DisconnectMessenger {
+        name: String,
+    },
     /// Start an enabled MCP server and list its tools (user operation).
     ConnectMcpServer {
         name: String,
@@ -672,6 +781,10 @@ impl Command {
             Self::SetEffort { .. } => "set_effort",
             Self::Send { .. } => "send",
             Self::CancelRun { .. } => "cancel_run",
+            Self::ListTools { .. } => "list_tools",
+            Self::SetToolPermission { .. } => "set_tool_permission",
+            Self::SetToolBudget { .. } => "set_tool_budget",
+            Self::ResolveApproval { .. } => "resolve_approval",
             Self::CreateProject { .. } => "create_project",
             Self::CreateSubagent { .. } => "create_subagent",
             Self::Events { .. } => "events",
@@ -686,6 +799,8 @@ impl Command {
             Self::Shutdown => "shutdown",
             Self::GatewayStatus => "gateway_status",
             Self::PairBroker { .. } => "pair_broker",
+            Self::ConnectMessenger { .. } => "connect_messenger",
+            Self::DisconnectMessenger { .. } => "disconnect_messenger",
             Self::ConnectMcpServer { .. } => "connect_mcp_server",
             Self::DisconnectMcpServer { .. } => "disconnect_mcp_server",
             Self::Skills => "skills",
@@ -697,7 +812,7 @@ impl Command {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Reply {
     Snapshot(Box<Snapshot>),
-    Thread(Thread),
+    Thread(Box<Thread>),
     Project(Project),
     Catalog(Catalog),
     Events(Vec<Event>),
@@ -709,6 +824,7 @@ pub enum Reply {
     Error(ErrorReport),
     Gateway(GatewayInfo),
     Skills(Vec<SkillSummary>),
+    Tools(ToolList),
 }
 impl Reply {
     /// Separate a gateway-reported failure from a successful reply.
@@ -839,9 +955,83 @@ pub struct HostKey {
     pub entry: String,
 }
 
+/// The outcome of checking an SSH gateway during setup.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GatewayProbe {
+    /// The host key is trusted and the remote reports this `agent206 --version`.
+    Reachable { version: String },
+    /// The host is not in known_hosts; it offers these keys for the user to verify.
+    Unverified { keys: Vec<HostKey> },
+}
+
+/// A client's gateway setup request to the web bridge, which runs SSH and owns
+/// known_hosts on the browser's behalf.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SetupRequest {
+    Status,
+    /// Check an SSH endpoint with strict host key checking.
+    Probe {
+        endpoint: String,
+    },
+    /// Trust the key with this fingerprint, if the host still offers it, then check again.
+    Trust {
+        endpoint: String,
+        fingerprint: String,
+    },
+    /// Verify, save and switch to a gateway.
+    Save {
+        target: GatewayTarget,
+    },
+}
+
+/// What a client needs to show gateway setup.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetupStatus {
+    /// The gateway this client is using now: the saved one, or `--remote`.
+    /// Setup saved by another client takes effect when this one restarts.
+    pub active: Option<GatewayTarget>,
+    /// True when `active` came from `--remote` rather than the saved setup.
+    pub pinned: bool,
+    /// Why no gateway is active, such as a damaged saved setup.
+    pub problem: Option<ErrorReport>,
+}
+impl SetupStatus {
+    /// True until this client has a gateway to use.
+    pub fn required(&self) -> bool {
+        self.active.is_none()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SetupReply {
+    Status(SetupStatus),
+    Probe(GatewayProbe),
+    Saved,
+    Error(ErrorReport),
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn settings_saved_before_later_sections_still_load() {
+        let mut table: toml::Table = toml::from_str(
+            &toml::to_string(&Settings {
+                messengers: vec![MessengerConfig::new(
+                    format!("m-{}", Id::new_v4().simple()),
+                    MessengerKind::Telegram,
+                )],
+                ..Settings::default()
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        for section in ["backends", "messengers", "mcp_servers"] {
+            table.remove(section);
+        }
+        let settings: Settings = toml::from_str(&toml::to_string(&table).unwrap()).unwrap();
+        assert!(settings.messengers.is_empty() && settings.mcp_servers.is_empty());
+    }
     #[test]
     fn delegation_never_increases_authority() {
         use Capability::*;

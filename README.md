@@ -58,8 +58,8 @@ Don't edit `state.sqlite3` while it is running.
 # Stop the shared gateway (interrupts active work).
 ./target/debug/agent206 stop-gateway
 
-# Choose the gateway once per profile (the desktop and terminal clients ask on
-# first launch). Unknown SSH hosts print fingerprints to verify, then --trust one.
+# Choose the gateway once per profile (the desktop, terminal and web clients ask
+# on first launch). Unknown SSH hosts print fingerprints to verify, then --trust one.
 ./target/debug/agent206 gateway setup --local
 ./target/debug/agent206 gateway setup --ssh ssh://user@host --trust SHA256:...
 
@@ -109,9 +109,13 @@ authorization URL after restarting so the browser uses the new session.
 rustup target add wasm32-unknown-unknown
 dx build --platform web -p agent206 --release --no-default-features --features web
 cargo build -p agent206 --no-default-features
-./target/debug/agent206 gateway setup --local   # or --ssh; the bridge connects for the browser
 ./target/debug/agent206 web --static-dir target/dx/agent206/release/web/public
 ```
+
+On a profile without a saved gateway the browser shows the same setup screen as
+desktop. The bridge runs SSH with its own OpenSSH keys, agent and known hosts;
+the browser only sees host key fingerprints and picks the one you verified, and
+the bridge scans the host again and records only a key with that fingerprint.
 
 Open the one-session authorization URL printed by the server. It binds only to
 127.0.0.1 and establishes an origin-scoped bearer session through a one-use link.
@@ -144,7 +148,8 @@ printed authorization link first in each new browser session.
   destinations include the transfer library and `~/models`.
 - Owned local/SSH Joshua process start/stop, configurable API port, and API discovery.
 - UTF-8 document previews, scoped Git status and a sandboxed browser preview.
-- A compiled bundled WASM extension in a separate limited worker process.
+- A compiled bundled WASM extension in a separate limited worker process, confined
+  on Linux by bubblewrap + Landlock with no network.
 - A separate vault broker process holds the SecureStore-compatible vault, with
   RustyClaw's credential kinds and policies, TOTP two-factor and lockout. Provider
   API keys are attached by the broker only for origins you bind them to, so the

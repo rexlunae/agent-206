@@ -12,19 +12,21 @@ use zeroize::Zeroizing;
 /// `Reply::Ok`/`Reply::Error` must stay compatible across versions; variants
 /// are encoded by name.
 ///
-/// Version 4 adds [`Request::ProviderStream`] and version 5
-/// [`Request::ImportVault`]. A broker accepts greetings from
+/// Version 4 adds [`Request::ProviderStream`], version 5
+/// [`Request::ImportVault`] and version 6 [`AuthScheme::TelegramBot`]. A broker accepts greetings from
 /// [`MIN_BROKER_VERSION`] up to this version, and a client falls back to the
 /// newest version an older broker accepts (see `Client::version`), so streams
 /// are only requested from brokers that understand them.
-pub const BROKER_VERSION: u16 = 5;
+pub const BROKER_VERSION: u16 = 6;
 /// The oldest protocol version this broker still serves and this client still
-/// speaks. Versions 3 to 5 differ only by the requests they add.
+/// speaks. Versions 3 to 6 differ only by the requests and schemes they add.
 pub const MIN_BROKER_VERSION: u16 = 3;
 /// The first version that serves [`Request::ProviderStream`].
 pub const STREAM_VERSION: u16 = 4;
 /// The first version that serves [`Request::ImportVault`].
 pub const IMPORT_VERSION: u16 = 5;
+/// The first version that attaches messenger credentials ([`AuthScheme::TelegramBot`]).
+pub const MESSENGER_VERSION: u16 = 6;
 /// Largest response body slice carried by one [`Reply::ProviderChunk`]. Small
 /// frames keep a stream responsive and bound what either side buffers.
 pub const MAX_STREAM_CHUNK: usize = 64 * 1024;
@@ -179,6 +181,9 @@ pub enum AuthScheme {
     ApiKeyHeader,
     /// `x-goog-api-key: …` (Gemini)
     GoogleApiKey,
+    /// `/bot…` prefixed to the request path (Telegram Bot API). Since
+    /// [`MESSENGER_VERSION`].
+    TelegramBot,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -400,6 +405,8 @@ pub enum UpstreamFailure {
     TooLarge,
     #[error("the stored credential is not a valid header value")]
     InvalidHeader,
+    #[error("the stored credential is not a valid bot token")]
+    InvalidBotToken,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

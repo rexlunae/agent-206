@@ -9,9 +9,10 @@
 //!    limits reads, writes and execution to the same allowlist, so a mistake in
 //!    one layer does not open the filesystem.
 //!
-//! The new network namespace has only loopback. The helper listens on the
-//! runtime's proxy port there and relays each connection over a Unix socket to
-//! the gateway, so the runtime reaches its credential proxy and nothing else.
+//! The new network namespace has only loopback. When the runtime needs its
+//! credential proxy, the helper listens on the proxy port there and relays each
+//! connection over a Unix socket to the gateway, so the runtime reaches that
+//! proxy and nothing else. Without a proxy the runtime has no network at all.
 //!
 //! Nothing here downgrades: a missing bubblewrap, a kernel without Landlock or a
 //! policy the layers cannot express is an error, never a weaker sandbox.
@@ -40,7 +41,7 @@ pub use profile::{HIDDEN_HOME_PATHS, Profile};
 pub const HELPER_COMMAND: &str = "__a206-sandbox-helper";
 /// Version of [`Spec`] and [`Status`]; the helper and the gateway are the same
 /// executable, so a mismatch means a corrupted or foreign invocation.
-pub const SPEC_VERSION: u32 = 1;
+pub const SPEC_VERSION: u32 = 2;
 /// Bubblewrap is resolved from this fixed system path, never from `PATH`.
 pub const BUBBLEWRAP: &str = "/usr/bin/bwrap";
 /// Largest status message the gateway accepts from a helper.
@@ -66,16 +67,23 @@ pub struct Rule {
     pub access: Access,
 }
 
+/// The one network destination a runtime may reach: its credential proxy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Proxy {
+    /// Loopback port the runtime expects the proxy on.
+    pub port: u16,
+    /// Unix socket that reaches the proxy from inside the sandbox.
+    pub socket: PathBuf,
+}
+
 /// What the gateway tells its helper, passed as one MessagePack argument.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Spec {
     pub version: u32,
     /// The runtime to start once both layers are in place.
     pub executable: PathBuf,
-    /// Loopback port the runtime expects its credential proxy on.
-    pub port: u16,
-    /// Unix socket that reaches the proxy from inside the sandbox.
-    pub proxy: PathBuf,
+    /// `None` leaves the runtime without any network.
+    pub proxy: Option<Proxy>,
     /// Unix socket on which the helper reports [`Status`].
     pub status: PathBuf,
     pub rules: Vec<Rule>,

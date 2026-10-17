@@ -228,6 +228,7 @@ async fn paginates_native_catalogs_and_dispatches_protocol_specific_text() {
             attachments: vec![],
             at: provider::now(),
             backend: CodingBackend::Native,
+            tool_calls: vec![],
         });
         if protocol == ProviderApi::Anthropic {
             thread.effort = Some(api.effort.clone());
@@ -235,9 +236,10 @@ async fn paginates_native_catalogs_and_dispatches_protocol_specific_text() {
         }
         let prompt = Id::new_v4().to_string();
         let (progress, mut deltas) = tokio::sync::mpsc::channel(64);
-        let (text, usage) = provider::complete(&config, broker, &thread, &prompt, model, &progress)
-            .await
-            .unwrap();
+        let provider::Turn { text, usage, .. } =
+            provider::complete(&config, broker, &thread, &prompt, model, &[], &progress)
+                .await
+                .unwrap();
         assert_eq!(text, api.text);
         let mut streamed = String::new();
         while let Ok(update) = deltas.try_recv() {
@@ -657,6 +659,7 @@ fn conversation(info: &ModelInfo) -> Thread {
         attachments: vec![],
         at: provider::now(),
         backend: CodingBackend::Native,
+        tool_calls: vec![],
     });
     thread
 }
@@ -736,7 +739,9 @@ fn spawn_complete(
             pairing: pairing.as_ref(),
         };
         let prompt = Id::new_v4().to_string();
-        provider::complete(&config, broker, &thread, &prompt, &info, &progress).await
+        provider::complete(&config, broker, &thread, &prompt, &info, &[], &progress)
+            .await
+            .map(|turn| (turn.text, turn.usage))
     });
     (task, deltas)
 }
@@ -1193,7 +1198,9 @@ async fn an_older_broker_is_used_without_streaming() {
     };
     let (progress, mut deltas) = tokio::sync::mpsc::channel(8);
     let thread = conversation(&info);
-    let (got, usage) = provider::complete(&config, broker, &thread, "", &info, &progress)
+    let provider::Turn {
+        text: got, usage, ..
+    } = provider::complete(&config, broker, &thread, "", &info, &[], &progress)
         .await
         .unwrap();
     assert_eq!(got, text);

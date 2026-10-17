@@ -6,6 +6,8 @@ status changes; `docs/status.md` remains the authoritative implementation ledger
 Scope decisions (2026-10-16): gateway communication keeps RustyClaw's SSH-based
 protocol, and parity work targets desktop and TUI first. Web-client parity is
 deferred; existing web support is kept but new gateway features need not reach it.
+The web client reaches gateways, local or SSH, through its server-side bridge
+(2026-10-17), not through SSH in the browser.
 
 Reference: [RustyClaw `481a428c`](https://github.com/rexlunae/RustyClaw/tree/481a428cb7a3b82d1a5e556ffef40e3dd9f52ce3) (`rc/` below).
 Agent 206 paths are prefixed `a206/`; the survey was taken at `1666303`. Parity = equivalent user-facing
@@ -13,8 +15,9 @@ capability under Agent 206's architecture (gateway-owned policy, separate vault/
 WASM tools, MessagePack APIs, API-only model facts, fc-dioxus shared UI). Status words:
 **present** (works end to end in a206), **partial** (structure or subset exists), **missing**.
 
-Key a206 facts that drive most rows: the native engine is text-only, no tool-call loop
-(`a206/crates/runtime/src/provider.rs` streams text but sends no `tools`); credentialed providers
+Key a206 facts that drive most rows: the native engine streams text and runs a gateway-owned
+tool-call loop with user approvals (`a206/crates/runtime/src/gateway/run.rs`), but no MCP or
+extension tool host is connected to it yet; credentialed providers
 now go through the vault broker (survey time: refused); the agent-facing surface is the MCP harness with
 one tool, `rename_thread` (`a206/crates/runtime/src/mcp.rs`); the `Command` enum
 (`a206/crates/core/src/lib.rs:418`) is the entire gateway API; WASM ABI v2 (survey time: v1, no inputs or host calls) takes MessagePack
@@ -42,12 +45,12 @@ invocations and relays gateway-authorized host calls (`a206/docs/plugin-api.md`)
 
 | RustyClaw capability | Agent 206 status | How it should land |
 | --- | --- | --- |
-| Multi-round tool loop, rate-paced rounds (`rustyclaw-gateway/src/dispatch.rs`, `tool_executor.rs`, `tool_limits.rs`) | missing for native engine; external Codex/Claude Agent backends run their own loops (`a206/crates/runtime/src/backends/`) | Gateway run engine: model → tool request → policy check vs. `Grant` → WASM/host exec → result; budgets per thread |
-| Tool approval Allow/Ask/Deny per tool (`tools/mod.rs:249` ToolPermission, desktop `components/tool_approval.rs`) | missing (grants are static capability sets, `core/src/lib.rs` Grant) | Approval requests as gateway events; fc-dioxus approval component; agent cannot self-approve |
+| Multi-round tool loop, rate-paced rounds (`rustyclaw-gateway/src/dispatch.rs`, `tool_executor.rs`, `tool_limits.rs`) | partial: gateway run engine for native providers (`a206/crates/runtime/src/gateway/run.rs`): model → tool calls → policy (per-tool permission ∩ host policy ∩ ancestors ∩ every ancestor's current `Grant` within its mode ceiling, re-checked per call and for running calls and approval waits when a permission or grant changes) → approval if Ask → `ToolHost` execution → results fed back, until the model stops; per-thread round/tool-call budgets (`ToolBudget`, bounded by every ancestor's), cancellation during streaming, tool calls and approval waits; no tool host is connected by default (MCP and WASM adapters pending), no rate pacing; external Codex/Claude Agent backends run their own loops | Connect the MCP client and WASM extension host as `ToolHost`s (`a206/docs/run-engine.md`); rate pacing if a provider needs it |
+| Tool approval Allow/Ask/Deny per tool (`tools/mod.rs:249` ToolPermission, desktop `components/tool_approval.rs`) | partial: `ToolPermission` per thread (unset = deny), set by `SetToolPermission` from the desktop/TUI inspector or `agent206 tools permit`; Ask publishes a journaled `ApprovalRequested` event and pending request, answered only by `ResolveApproval` bound to the call's argument digest (single-use, expires on cancel/restart; the model never sees approval IDs); fc-dioxus `Approval` card with Deny/Allow once buttons and `agent206 approvals`; delegated threads cannot exceed their parent | "Always allow" shortcuts and per-argument scopes, approval-card interaction tests, mobile/web parity |
 | `ask_user` structured prompts (`user_prompt_types.rs`, desktop `user_prompt.rs`) | missing | Typed prompt event + UI response command |
-| Tool-call healing: malformed JSON, dupes, leaked markup (`tool_healing.rs`) | missing | Part of run engine's parse stage |
+| Tool-call healing: malformed JSON, dupes, leaked markup (`tool_healing.rs`) | partial: meaning-preserving repair of fenced/prose-wrapped arguments and trailing commas, in-response duplicate calls run once, missing/repeated call IDs replaced (`a206/crates/runtime/src/tool_calls.rs`); truncated arguments are refused back to the model rather than completed; leaked-markup stripping, schema type coercion and repeat-call warnings are not implemented | Leaked tool markup filter on streamed text; schema coercion once tools carry typed parameters |
 | Tool-output compression rules (`rc/crates/tokenjuice`, `tool_pipeline.rs`) | missing | Reusable crate (MIT attribution); TOML rule overlays |
-| Provider SSE streaming OpenAI/Anthropic (`streaming.rs`, `gateway/providers/mod.rs`) | present for text: native OpenAI-compatible, Anthropic and Gemini replies stream; the broker relays credentialed bodies in bounded, ordered frames (protocol v4, negotiated down to v3 brokers, which answer buffered); bounded incremental SSE decoding (`a206/crates/runtime/src/sse.rs`); deltas published as journaled `ThreadChanged` events at most every 100 ms; lock, pairing revocation, cancellation and client disconnect stop the upstream request; mid-stream failures keep partial text in a Failed run with a structured report. Streamed tool calls, reasoning/thinking display and retries are not implemented | Streamed tool-call deltas with the run engine; per-delta event payloads if snapshot republishing becomes too costly |
+| Provider SSE streaming OpenAI/Anthropic (`streaming.rs`, `gateway/providers/mod.rs`) | present for text: native OpenAI-compatible, Anthropic and Gemini replies stream; the broker relays credentialed bodies in bounded, ordered frames (protocol v4, negotiated down to v3 brokers, which answer buffered); bounded incremental SSE decoding (`a206/crates/runtime/src/sse.rs`); deltas published as journaled `ThreadChanged` events at most every 100 ms; lock, pairing revocation, cancellation and client disconnect stop the upstream request; mid-stream failures keep partial text in a Failed run with a structured report. Streamed tool calls (with incremental argument deltas) feed the run engine; reasoning/thinking display and retries are not implemented | Per-delta event payloads if snapshot republishing becomes too costly |
 | Context compaction at 75% window + pre-compaction memory flush (`gateway/helpers.rs`, `memory_flush.rs`) | missing (context used/limit widget only) | Use API-reported context limit; unknown limit ⇒ no auto-compaction, user control |
 | Retry policy + model/auth-profile failover (`retry/policy.rs`, `models/failover.rs`) | missing | Retries with explicit external-effect semantics; **no silent model fallback** (thread allowlist) |
 | System prompt + workspace files SOUL/AGENTS/TOOLS/MEMORY (`soul.rs`, `workspace_context.rs`, `gateway/system_prompt.rs`) | partial: editable per-mode prompts (`ui/src/settings.rs` PromptEditor) | Project-scoped instruction files read via ReadWorkspace grant |
@@ -58,7 +61,7 @@ invocations and relays gateway-authorized host calls (`a206/docs/plugin-api.md`)
 
 | RustyClaw capability | Agent 206 status | How it should land |
 | --- | --- | --- |
-| read/write/edit/list/search/find files (`tools/file.rs`) | partial: read-only text `ReadDocument` scoped by cap-std; `list_directory`/`read_text_file` ship as WASM tools in the bundled `agent206.workspace` extension (`a206/plugins/workspace`); write/edit/search missing | `workspace` host domain: read/patch/search under ReadWorkspace/WriteWorkspace |
+| read/write/edit/list/search/find files (`tools/file.rs`) | partial: read-only text `ReadDocument` scoped by cap-std; the bundled `agent206.workspace` WASM extension (`a206/plugins/workspace`) has `list_directory`, `read_text_file`, `search_text` (literal, bounded) under ReadWorkspace and `write_text_file`/`edit_text_file` (atomic, single-occurrence edit) under WriteWorkspace; glob/find and regex search missing; agents cannot call them until the run engine's tool loop lands | Remaining: glob/find, regex search, multi-hunk patch as workspace host calls |
 | `apply_patch` multi-hunk (`tools/patch.rs`), `ast_grep_manage` (`ast_grep.rs`) | missing | Workspace patch host call; ast-grep as extension |
 | `execute_command`, `process` bg/poll/send_keys/kill (`tools/runtime.rs`, `process_manager.rs`) | missing natively (Execute grant only for external backends, macOS) | Brokered exec in OS sandbox, bounded output, process-group teardown (reuse `runtime/src/process.rs`) |
 | `web_fetch`, `web_extract` (`tools/web.rs`, `web_extract.rs`) | missing (only download fetch) | Network host call through SSRF guard; readability in WASM |
@@ -112,7 +115,8 @@ invocations and relays gateway-authorized host calls (`a206/docs/plugin-api.md`)
 
 | RustyClaw capability | Agent 206 status | How it should land |
 | --- | --- | --- |
-| Telegram, Discord, Slack, Matrix, IRC, Signal/signal-cli, WhatsApp, Google Chat, Teams, iMessage, webhook, console (`messengers/kind.rs`, `gateway/messenger_handler/*`) | missing | Channel extensions in separate processes; inbound messages untrusted; per-channel grants |
+| Telegram (`messengers/telegram.rs`) | partial: Bot API long polling and replies in the gateway (`runtime/src/messengers`), token spent only by the vault broker (`AuthScheme::TelegramBot`, broker v6), disabled by default, per-entry chat and sender allow-lists (groups need listed senders) with refused chats and senders in the status, one thread per chat through ordinary `Send` turns, CLI and TOML configuration, RustyClaw import as disabled entries (docs/messengers.md); tested against a stand-in Bot API and a real broker | Desktop/TUI settings, attachments, persisted poll offset |
+| Discord, Slack, Matrix, IRC, Signal/signal-cli, WhatsApp, Google Chat, Teams, iMessage, webhook, console (`messengers/kind.rs`, `gateway/messenger_handler/*`) | missing | Adapters behind the same `Host` interface; Discord and Slack Socket Mode need brokered WebSockets; inbound messages untrusted; per-channel grants |
 | `message` send/broadcast tool (`tools/gateway_tools`) | missing | Channel host call requiring approval |
 | Beeper/claw-me-maybe onboarding (`rustyclaw-onboard/src/messaging.rs`) | missing | Setup wizard step after extension system |
 
@@ -168,9 +172,9 @@ invocations and relays gateway-authorized host calls (`a206/docs/plugin-api.md`)
 
 | RustyClaw capability | Agent 206 status | How it should land |
 | --- | --- | --- |
-| Landlock, Bubblewrap, Landlock+Bwrap, Docker, macOS sandbox-exec, path validation (`sandbox/*`, `runtime/docker.rs`) | partial: external backends and MCP servers (`a206/crates/mcp/src/sandbox.rs`) run under macOS sandbox-exec; external backends also or on Linux under bubblewrap namespaces plus Landlock applied inside, with a loopback-only proxy relay (`crates/sandbox`, `runtime/src/backends/isolation.rs`); missing bwrap or Landlock is an error, never a fallback. Docker and path-validation modes are deliberately not ported (they are downgrades); native exec and the WASM worker are not sandboxed yet | Reuse `a206-sandbox` profiles for MCP servers, native exec and the extension worker |
+| Landlock, Bubblewrap, Landlock+Bwrap, Docker, macOS sandbox-exec, path validation (`sandbox/*`, `runtime/docker.rs`) | partial: external backends and MCP servers (`a206/crates/mcp/src/sandbox.rs`) run under macOS sandbox-exec; external backends also run on Linux under bubblewrap namespaces plus Landlock applied inside, with a loopback-only proxy relay (`crates/sandbox`, `runtime/src/backends/isolation.rs`); missing bwrap or Landlock is an error, never a fallback. On Linux the WASM extension worker also runs confined (no network, no project files, nothing executable but itself; `runtime/src/sandbox.rs`). Docker and path-validation modes are deliberately not ported (they are downgrades). Native exec does not exist yet; the worker is unconfined on macOS | Reuse `a206-sandbox` for Linux MCP servers and for native exec when the run engine adds it; Seatbelt profile for the macOS worker |
 | SSH runtime adapter for remote exec (`runtime/ssh.rs`) | missing (remote gateway via SSH exists) | Execute on remote gateway rather than per-command SSH |
-| WASM tool sandbox | present (a206 extra): fuel/memory/time-bounded worker process, no WASI, only the two ABI host imports, each call re-authorized by the gateway (`a206/crates/extensions`) | Add OS profile to worker |
+| WASM tool sandbox | present (a206 extra): fuel/memory/time-bounded worker process, no WASI, only the two ABI host imports, each call re-authorized by the gateway (`a206/crates/extensions`); on Linux the worker runs under bubblewrap + Landlock with no network | Add the macOS OS profile to the worker |
 
 ## Observability, deployment
 
@@ -193,8 +197,9 @@ invocations and relays gateway-authorized host calls (`a206/docs/plugin-api.md`)
 3. **Extension ABI v2** (MessagePack input, scoped host calls for workspace/exec/network/git, typed
    UI contributions, reviewed install). Partial: the ABI, SDK, workspace read/list and state host
    calls, typed panels and user grants are in; exec/network/git host calls and package install remain. Every RustyClaw tool family is meant to ship as a WASM builtin.
-4. **OS sandbox for native exec and the WASM worker.** External backends are isolated on macOS and
-   Linux; native Execute/WriteWorkspace grants still need the same profiles (`crates/sandbox`).
+4. **OS sandbox for native exec and the macOS worker.** External backends are isolated on macOS and
+   Linux, and the WASM worker on Linux; native Execute/WriteWorkspace grants (when the run engine
+   adds native exec) and the macOS worker still need profiles (`crates/sandbox`, `runtime/src/sandbox.rs`).
 5. **Context management**: compaction keyed to API-reported limits, workspace instruction files,
    memory extension. Needed for long-running and scheduled agents.
 6. **Delegation/task lifecycle** (agent-requested spawn, steering, hierarchical cancel, budgets) →
