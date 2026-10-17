@@ -1,6 +1,6 @@
 //! Native protocol contracts against a live API with generated model facts.
 use a206_core::*;
-use a206_runtime::{backends::Progress, provider};
+use a206_runtime::{backends::Progress, provider, retry::RetryPolicy};
 use axum::{
     Json, Router,
     extract::{Query, State},
@@ -237,10 +237,20 @@ async fn paginates_native_catalogs_and_dispatches_protocol_specific_text() {
         }
         let prompt = Id::new_v4().to_string();
         let (progress, mut deltas) = tokio::sync::mpsc::channel(64);
-        let provider::Turn { text, usage, .. } =
-            provider::complete(&config, broker, &thread, &prompt, model, &[], &progress)
-                .await
-                .unwrap();
+        let provider::Turn { text, usage, .. } = provider::complete(
+            &config,
+            broker,
+            provider::Ask {
+                thread: &thread,
+                prompt: &prompt,
+                info: model,
+                tools: &[],
+            },
+            &progress,
+            &RetryPolicy::NONE,
+        )
+        .await
+        .unwrap();
         assert_eq!(text, api.text);
         let mut streamed = String::new();
         while let Ok(update) = deltas.try_recv() {
@@ -741,9 +751,20 @@ fn spawn_complete(
             pairing: pairing.as_ref(),
         };
         let prompt = Id::new_v4().to_string();
-        provider::complete(&config, broker, &thread, &prompt, &info, &[], &progress)
-            .await
-            .map(|turn| (turn.text, turn.usage))
+        provider::complete(
+            &config,
+            broker,
+            provider::Ask {
+                thread: &thread,
+                prompt: &prompt,
+                info: &info,
+                tools: &[],
+            },
+            &progress,
+            &RetryPolicy::NONE,
+        )
+        .await
+        .map(|turn| (turn.text, turn.usage))
     });
     (task, deltas)
 }
@@ -1218,9 +1239,20 @@ async fn an_older_broker_is_used_without_streaming() {
     let thread = conversation(&info);
     let provider::Turn {
         text: got, usage, ..
-    } = provider::complete(&config, broker, &thread, "", &info, &[], &progress)
-        .await
-        .unwrap();
+    } = provider::complete(
+        &config,
+        broker,
+        provider::Ask {
+            thread: &thread,
+            prompt: "",
+            info: &info,
+            tools: &[],
+        },
+        &progress,
+        &RetryPolicy::NONE,
+    )
+    .await
+    .unwrap();
     assert_eq!(got, text);
     assert_eq!(next_delta(&mut deltas).await, text);
     assert_eq!(usage.input_tokens, Some(input));
@@ -1233,4 +1265,69 @@ async fn an_older_broker_is_used_without_streaming() {
         .collect();
     expected.extend(["pair".into(), "provider".into()]);
     assert_eq!(seen, expected);
+}
+
+/// A credentialed request whose connection the broker could not open is
+/// retried like a direct one, and the broker's typed failure is returned
+/// once the attempts run out.
+#[tokio::test]
+async fn brokered_connection_failures_are_retried() {
+    // Port 0 can never be listened on, so every connection is refused.
+    let origin = "http://127.0.0.1:0".to_owned();
+    let (dir, credential, pairing) = start_broker(&origin, &Id::new_v4().to_string()).await;
+    let _anchor = provider::verify_pairing(dir.path(), &pairing)
+        .await
+        .unwrap();
+    let api = ProviderApi::OpenAi;
+    let config = ProviderConfig {
+        id: Id::new_v4(),
+        label: Id::new_v4().to_string(),
+        base_url: format!("{origin}/v1"),
+        credential: Some(credential),
+        api,
+    };
+    let info = model_info(api, config.id);
+    let thread = conversation(&info);
+    let (progress, mut notices) = tokio::sync::mpsc::channel(64);
+    let retry = RetryPolicy {
+        attempts: 2,
+        base: std::time::Duration::ZERO,
+        max: std::time::Duration::ZERO,
+        max_retry_after: std::time::Duration::ZERO,
+    };
+    let error = provider::complete(
+        &config,
+        provider::Broker {
+            root: dir.path(),
+            pairing: Some(&pairing),
+        },
+        provider::Ask {
+            thread: &thread,
+            prompt: "",
+            info: &info,
+            tools: &[],
+        },
+        &progress,
+        &retry,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            provider::ProviderError::Broker(a206_broker::ClientError::Broker(
+                a206_broker::BrokerError::Upstream(a206_broker::UpstreamFailure::Connect)
+            ))
+        ),
+        "{error:?}"
+    );
+    drop(progress);
+    let mut retries = vec![];
+    while let Some(notice) = notices.recv().await {
+        if let Progress::Activity(text) = notice {
+            retries.push(text);
+        }
+    }
+    assert_eq!(retries.len(), 1, "{retries:?}");
+    assert!(retries[0].contains("2 of 2"), "{retries:?}");
 }

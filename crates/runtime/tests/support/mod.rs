@@ -28,11 +28,23 @@ pub const PATIENCE: Duration = Duration::from_secs(10);
 pub struct Opened {
     pub body: Value,
     pub feed: mpsc::Sender<Vec<u8>>,
+    /// A refusing status and `Retry-After` seconds; dropped unsent, the
+    /// response is a `200` stream of what `feed` carries.
+    pub refusal: tokio::sync::oneshot::Sender<(u16, Option<u64>)>,
 }
 impl Opened {
     pub async fn respond(self, events: String) {
         self.feed.send(events.into_bytes()).await.unwrap();
         // Dropping the feed ends the response body.
+    }
+    /// Send `events`, then break the connection.
+    pub async fn abort_after(self, events: String) {
+        self.feed.send(events.into_bytes()).await.unwrap();
+        self.feed.send(vec![]).await.unwrap();
+    }
+    /// Answer with `status` and no body.
+    pub fn refuse(self, status: u16, retry_after: Option<u64>) {
+        self.refusal.send((status, retry_after)).unwrap();
     }
 }
 #[derive(Clone)]
@@ -50,14 +62,31 @@ pub async fn handle(
         return Json(api.catalog).into_response();
     }
     let (feed, pieces) = mpsc::channel::<Vec<u8>>(8);
+    let (refusal, refused) = tokio::sync::oneshot::channel();
     let opened = Opened {
         body: serde_json::from_slice(&body).unwrap(),
         feed,
+        refusal,
     };
     api.opened.send(opened).await.unwrap();
+    if let Ok((status, retry_after)) = refused.await {
+        let mut response = axum::http::StatusCode::from_u16(status)
+            .unwrap()
+            .into_response();
+        if let Some(seconds) = retry_after {
+            response
+                .headers_mut()
+                .insert("retry-after", seconds.to_string().parse().unwrap());
+        }
+        return response;
+    }
     let body = futures_util::stream::unfold(pieces, |mut pieces| async move {
         let piece = pieces.recv().await?;
-        Some((Ok::<_, std::io::Error>(piece), pieces))
+        // An empty piece breaks the connection mid-response.
+        if piece.is_empty() {
+            return Some((Err(std::io::Error::other("aborted")), pieces));
+        }
+        Some((Ok(piece), pieces))
     });
     (
         [("content-type", "text/event-stream")],
