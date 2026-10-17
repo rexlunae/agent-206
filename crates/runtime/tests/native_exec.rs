@@ -97,12 +97,38 @@ async fn process(
     .await
 }
 
+/// Wait, without polling its output, until the session has finished.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+async fn idle(host: &ExecHost, scope: &ToolScope, session: &str) {
+    for _ in 0..200 {
+        let listed = call(
+            host,
+            scope,
+            PROCESS,
+            serde_json::json!({ "action": "list" }),
+        )
+        .await
+        .unwrap();
+        let line = listed
+            .text
+            .lines()
+            .find(|line| line.starts_with(session))
+            .unwrap_or_else(|| panic!("{session} is not listed: {}", listed.text));
+        if !line.contains("  running  ") {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!("session {session} did not finish")
+}
+
 /// Poll until the session has finished, collecting its output.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 async fn finish(host: &ExecHost, scope: &ToolScope, session: &str) -> ToolOutput {
     let mut text = String::new();
     for _ in 0..200 {
         let output = process(host, scope, "poll", session).await.unwrap();
+        assert!(output.text.len() < 2 * MAX_STREAM, "{}", output.text.len());
         text.push_str(&output.text);
         if !output.text.starts_with("running") {
             return ToolOutput {
@@ -370,13 +396,11 @@ async fn background_sessions_follow_their_conversation() {
         serde_json::json!({ "command": "yes | head -c 1000000" }),
     )
     .await;
-    let finished = finish(&host, &scope, &session).await;
-    assert!(finished.text.contains("earlier stdout bytes dropped"));
-    assert!(
-        finished.text.len() < 2 * MAX_STREAM,
-        "{}",
-        finished.text.len()
-    );
+    // Listing does not drain, so the whole output waits for one poll.
+    idle(&host, &scope, &session).await;
+    let polled = process(&host, &scope, "poll", &session).await.unwrap();
+    assert!(polled.text.contains("earlier stdout bytes dropped"));
+    assert!(polled.text.len() < 2 * MAX_STREAM, "{}", polled.text.len());
 
     // Kill and the timeout both stop a command.
     let session = spawn(&host, &scope, serde_json::json!({ "command": "sleep 600" })).await;
