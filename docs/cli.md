@@ -30,7 +30,7 @@ without launching a gateway. With no subcommand, the app launches the desktop; `
 | mcp | mcp-servers list/enable/disable/connect/disconnect; entries added through settings --apply (docs/mcp.md) | Field-level add/edit commands; HTTP servers |
 | skills / registries | skills list/show/enable/disable (approval pinned to content, docs/skills.md); extension list, grant ID [--capability C…], enable/disable ID, panel ID PANEL [--project P] [--press BUTTON], tool ID TOOL [--project P] [--args TOML], all through the gateway's extension policy | Reviewed install/update/list/export |
 | swarm / projects | project NAME ROOT creates a coordinator; snapshots retain linked threads | Delegation/task/project orchestration and scoped steering/control commands |
-| messenger | messenger list/add/set/remove/enable/disable/allow/disallow/allow-sender/disallow-sender/connect/disconnect: entries are added disabled with no chat allowed; the token is a vault credential name; edits go through the revision-checked settings API (docs/messengers.md) | Desktop/TUI settings; more services |
+| messenger | messenger list/add/set/remove/enable/disable/allow/disallow/allow-sender/disallow-sender/connect/disconnect: entries are added disabled with no chat allowed; the token is a vault credential name; edits go through the revision-checked settings API (docs/messengers.md); the GUI Messengers page uses the same settings and commands | More services |
 | doctor | doctor [--toml]: non-mutating checks of the profile, gateway, vault broker, pairing and provider credentials/catalogs; exits non-zero when something must be fixed; never starts the gateway or broker | Explicit reviewed fixes (--repair) |
 
 Other current commands include Joshua start/stop/status, backend configure/select,

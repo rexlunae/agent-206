@@ -9,10 +9,11 @@
 //!    limits reads, writes and execution to the same allowlist, so a mistake in
 //!    one layer does not open the filesystem.
 //!
-//! The new network namespace has only loopback. When the runtime needs its
-//! credential proxy, the helper listens on the proxy port there and relays each
-//! connection over a Unix socket to the gateway, so the runtime reaches that
-//! proxy and nothing else. Without a proxy the runtime has no network at all.
+//! By default the new network namespace has only loopback. When the runtime
+//! needs its credential proxy, the helper listens on the proxy port there and
+//! relays each connection over a Unix socket to the gateway, so the runtime
+//! reaches that proxy and nothing else. Without a proxy it has no network at
+//! all. Only a runtime the user granted network access shares the host's.
 //!
 //! Nothing here downgrades: a missing bubblewrap, a kernel without Landlock or a
 //! policy the layers cannot express is an error, never a weaker sandbox.
@@ -27,6 +28,7 @@ use std::path::PathBuf;
 
 #[cfg(unix)]
 mod elf;
+mod gateway;
 #[cfg(target_os = "linux")]
 mod helper;
 #[cfg(unix)]
@@ -34,14 +36,17 @@ mod profile;
 
 #[cfg(unix)]
 pub use elf::interpreter;
+#[cfg(target_os = "linux")]
+pub use gateway::Control;
+pub use gateway::StartError;
 #[cfg(unix)]
-pub use profile::{HIDDEN_HOME_PATHS, Profile};
+pub use profile::{HIDDEN_HOME_PATHS, NetworkAccess, Profile};
 
 /// First argument that turns a process into the in-sandbox helper.
 pub const HELPER_COMMAND: &str = "__a206-sandbox-helper";
 /// Version of [`Spec`] and [`Status`]; the helper and the gateway are the same
 /// executable, so a mismatch means a corrupted or foreign invocation.
-pub const SPEC_VERSION: u32 = 2;
+pub const SPEC_VERSION: u32 = 3;
 /// Bubblewrap is resolved from this fixed system path, never from `PATH`.
 pub const BUBBLEWRAP: &str = "/usr/bin/bwrap";
 /// Largest status message the gateway accepts from a helper.
@@ -76,14 +81,24 @@ pub struct Proxy {
     pub socket: PathBuf,
 }
 
+/// The network a runtime has inside the sandbox.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Network {
+    /// An empty loopback; no TCP connection is allowed.
+    None,
+    /// Only its credential proxy, relayed from the private loopback.
+    Proxy(Proxy),
+    /// The host's network, for a runtime the user granted it.
+    Host,
+}
+
 /// What the gateway tells its helper, passed as one MessagePack argument.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Spec {
     pub version: u32,
     /// The runtime to start once both layers are in place.
     pub executable: PathBuf,
-    /// `None` leaves the runtime without any network.
-    pub proxy: Option<Proxy>,
+    pub network: Network,
     /// Unix socket on which the helper reports [`Status`].
     pub status: PathBuf,
     pub rules: Vec<Rule>,

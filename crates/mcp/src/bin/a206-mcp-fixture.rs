@@ -16,6 +16,14 @@ struct File {
     path: String,
 }
 #[derive(serde::Deserialize, schemars::JsonSchema)]
+struct Address {
+    address: String,
+}
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+struct Program {
+    program: String,
+}
+#[derive(serde::Deserialize, schemars::JsonSchema)]
 struct Size {
     bytes: usize,
 }
@@ -33,6 +41,22 @@ impl Fixture {
     #[tool(description = "Read a UTF-8 file.")]
     async fn read_file(&self, params: Parameters<File>) -> Result<String, String> {
         std::fs::read_to_string(&params.0.path).map_err(|error| error.kind().to_string())
+    }
+    #[tool(description = "Open a TCP connection, then close it.")]
+    async fn connect(&self, params: Parameters<Address>) -> Result<String, String> {
+        std::net::TcpStream::connect(&params.0.address)
+            .map(|_| "connected".to_owned())
+            .map_err(|error| error.kind().to_string())
+    }
+    #[tool(description = "Run a program without arguments and report its exit status.")]
+    async fn run(&self, params: Parameters<Program>) -> Result<String, String> {
+        std::process::Command::new(&params.0.program)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|status| status.to_string())
+            .map_err(|error| error.kind().to_string())
     }
     #[tool(description = "Return a string of the requested length.")]
     async fn flood(&self, params: Parameters<Size>) -> String {

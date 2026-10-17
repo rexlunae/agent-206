@@ -93,7 +93,6 @@ pub(crate) fn classify(error: &(dyn Error + 'static)) -> Option<ErrorKind> {
         crate::provider::EndpointError,
         crate::provider::PresetError,
         crate::provider::ProviderError,
-        crate::sandbox::StartError,
         crate::service::ServiceError,
         crate::store::StoreError,
         crate::tool_calls::ArgumentError,
@@ -113,6 +112,7 @@ pub(crate) fn classify(error: &(dyn Error + 'static)) -> Option<ErrorKind> {
         a206_skills::SkillError,
         a206_protocol::Error,
         a206_sandbox::SandboxError,
+        a206_sandbox::StartError,
         reqwest::Error,
     );
     if let Some(kind) = a206_extensions::classify(error) {
@@ -150,7 +150,9 @@ impl Classified for a206_mcp::McpError {
             | UnknownTool => ErrorKind::InvalidRequest,
             // Absent and unreadable paths need different recovery; the I/O cause decides.
             Missing { .. } => return None,
-            Setup(_) | ProcessId => ErrorKind::Internal,
+            Setup(_) | Helper(_) | ProcessId => ErrorKind::Internal,
+            // The sandbox's own errors know their kinds.
+            Sandbox(_) | SandboxStart(_) => return None,
             Unsupported | Spawn(_) | NotConnected | Exited => ErrorKind::Unavailable,
             Initialize(_)
             | Service(_)
@@ -189,6 +191,11 @@ impl Classified for a206_skills::SkillError {
 impl Classified for a206_sandbox::SandboxError {
     fn kind(&self) -> Option<ErrorKind> {
         a206_sandbox::SandboxError::kind(self)
+    }
+}
+impl Classified for a206_sandbox::StartError {
+    fn kind(&self) -> Option<ErrorKind> {
+        a206_sandbox::StartError::kind(self)
     }
 }
 

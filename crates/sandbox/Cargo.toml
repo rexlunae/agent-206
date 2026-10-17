@@ -11,10 +11,12 @@ serde.workspace = true
 rmp-serde.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+tokio.workspace = true
 base64 = "0.22"
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = "0.4.4"
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 tempfile.workspace = true
 uuid.workspace = true
 [lints]
