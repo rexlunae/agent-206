@@ -8,6 +8,7 @@
 //! held as a zeroizing [`WireSecret`], never rendered. The enrollment key is
 //! shown as text content so it can be copied into an authenticator app.
 use crate::error::{ErrorNotice, record};
+use crate::welcome::{VaultFacts, VaultProgress, VaultSeen};
 use a206_broker::{BrokerError, BrokerStatus, ClientError, Reply, Request, WireSecret};
 use a206_core::{ErrorReport, GatewayTarget};
 use a206_runtime::vault::{Session, VaultError};
@@ -108,6 +109,8 @@ struct Panel {
     flow: Signal<Flow>,
     held: Signal<Option<WireSecret>>,
     enrollment: Signal<Option<Enrollment>>,
+    /// The Get started checklist, when this panel is on that page.
+    progress: Option<VaultProgress>,
 }
 fn broker_refused(error: &VaultError, expected: BrokerError) -> bool {
     matches!(error, VaultError::Broker(ClientError::Broker(refusal)) if *refusal == expected)
@@ -151,10 +154,24 @@ impl Panel {
         self.refresh().await;
         self.busy.set(false);
     }
+    fn report(self, seen: VaultSeen) {
+        if let Some(progress) = self.progress {
+            progress.report(seen);
+        }
+    }
     async fn refresh(mut self) {
         match self.session().status().await {
-            Ok(status) => self.status.set(Some(status)),
+            Ok(status) => {
+                self.report(VaultSeen::Facts(VaultFacts {
+                    exists: status.exists,
+                    unlocked: status.unlocked,
+                    totp_enrolled: status.totp_enrolled,
+                    paired: status.gateway_paired,
+                }));
+                self.status.set(Some(status));
+            }
             Err(error) => {
+                self.report(VaultSeen::Unreadable);
                 self.status.set(None);
                 let status = failure("vault_status", "Could not read the vault state", &error);
                 let (mut primary, mut secondary) = (self.failure.write(), self.warning.write());
@@ -412,6 +429,7 @@ fn VaultPanel(root: PathBuf) -> Element {
         flow: use_signal(|| Flow::Idle),
         held: use_signal(|| None),
         enrollment: use_signal(|| None),
+        progress: VaultProgress::listener(),
     };
     // Reads only through `peek`, so this runs once, after the first render.
     use_effect(move || panel.check());

@@ -3,6 +3,7 @@
 //! browser, so this card shows the vault's state and can lock it; unlocking,
 //! creating, enrolling and pairing stay with the desktop and terminal apps.
 use crate::error::{ErrorNotice, record};
+use crate::welcome::{VaultFacts, VaultProgress, VaultSeen};
 use a206_core::{ErrorReport, VaultReply, VaultRequest, VaultState};
 use fc_dioxus::prelude::*;
 
@@ -11,6 +12,17 @@ fn known(value: Option<bool>) -> &'static str {
         Some(true) => "Yes",
         Some(false) => "No",
         None => "Unknown while locked",
+    }
+}
+
+/// The checklist's view of the vault. The bridge's state does not say
+/// whether the gateway is paired; the gateway's own report fills that in.
+fn facts(state: &VaultState) -> VaultFacts {
+    VaultFacts {
+        exists: state.exists,
+        unlocked: state.unlocked,
+        totp_enrolled: state.totp_enrolled,
+        paired: None,
     }
 }
 
@@ -34,6 +46,12 @@ pub(crate) fn WebVault() -> Element {
     let mut failure = use_signal(|| None::<(&'static str, ErrorReport)>);
     let mut notice = use_signal(|| None::<&'static str>);
     let mut busy = use_signal(|| false);
+    let progress = VaultProgress::listener();
+    let report = move |seen| {
+        if let Some(progress) = progress {
+            progress.report(seen);
+        }
+    };
     let mut run = move |request: VaultRequest| {
         if *busy.peek() {
             return;
@@ -46,7 +64,29 @@ pub(crate) fn WebVault() -> Element {
                 VaultRequest::Status => "Could not read the vault state",
                 VaultRequest::Lock => "Could not lock the vault",
             };
-            match ask(request).await {
+            let reply = ask(request).await;
+            match &reply {
+                Ok(
+                    VaultReply::State(state)
+                    | VaultReply::Locked {
+                        state: Some(state), ..
+                    },
+                ) => {
+                    report(VaultSeen::Facts(facts(state)));
+                }
+                // Locked just now: it exists, and nothing inside it is known.
+                Ok(VaultReply::Locked { state: None, .. }) => {
+                    report(VaultSeen::Facts(VaultFacts {
+                        exists: true,
+                        unlocked: false,
+                        totp_enrolled: None,
+                        paired: None,
+                    }))
+                }
+                Ok(VaultReply::Error(_)) | Err(_) => report(VaultSeen::Unreadable),
+                Ok(VaultReply::Remote { .. }) => report(VaultSeen::Remote),
+            }
+            match reply {
                 Ok(VaultReply::State(state)) => shown.set(Shown::State(state)),
                 Ok(VaultReply::Locked { state, refresh }) => {
                     notice.set(Some("Vault locked."));

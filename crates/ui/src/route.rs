@@ -10,6 +10,7 @@ use crate::{
         Projects, Security,
     },
     settings::{Appearance, Prompts, Providers},
+    welcome::Welcome,
 };
 use fc_dioxus::prelude::*;
 use uuid::Uuid;
@@ -55,6 +56,8 @@ pub(crate) enum Route {
     Joshua {},
     #[route("/gateway")]
     Gateway {},
+    #[route("/welcome")]
+    Welcome {},
     #[route("/:..segments")]
     NotFound { segments: Vec<String> },
 }
@@ -76,6 +79,7 @@ impl Route {
             Self::Prompts {} => IconName::Edit,
             Self::Security {} => IconName::Lock,
             Self::Joshua {} | Self::Gateway {} => IconName::Terminal,
+            Self::Welcome {} => IconName::Check,
         }
     }
     pub(crate) fn label(&self) -> &'static str {
@@ -96,6 +100,7 @@ impl Route {
             Self::Security {} => "Security",
             Self::Joshua {} => "Joshua",
             Self::Gateway {} => "Gateway",
+            Self::Welcome {} => "Get started",
             Self::NotFound { .. } => "Page not found",
         }
     }
@@ -111,7 +116,7 @@ fn NotFound(segments: Vec<String>) -> Element {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use dioxus::history::{History, MemoryHistory};
     use std::rc::Rc;
@@ -294,7 +299,7 @@ mod tests {
     }
 
     /// Loaded, connected client state showing `snapshot`.
-    fn loaded_state(snapshot: a206_core::Snapshot) -> crate::State {
+    pub(crate) fn loaded_state(snapshot: a206_core::Snapshot) -> crate::State {
         crate::State {
             data: use_signal(|| snapshot),
             loaded: use_signal(|| true),

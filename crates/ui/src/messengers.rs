@@ -70,7 +70,10 @@ pub(crate) fn now() -> u64 {
 
 /// Models of catalogs that have not expired at `now`: the gateway creates a
 /// chat thread only for one of these.
-fn current_models(snapshot: &Snapshot, now: u64) -> impl Iterator<Item = &a206_core::ModelInfo> {
+pub(crate) fn current_models(
+    snapshot: &Snapshot,
+    now: u64,
+) -> impl Iterator<Item = &a206_core::ModelInfo> {
     snapshot
         .catalogs
         .iter()
