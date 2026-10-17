@@ -373,7 +373,7 @@ impl State<'_> {
             "td" | "th" => self.emit(|out| out.space()),
             "a" if markdown && self.link.is_none() => {
                 if let Some(target) =
-                    attribute(attributes, "href").and_then(|href| self.absolute(&href))
+                    attribute(attributes, "href").and_then(|href| self.absolute(&href).map(escape))
                 {
                     self.emit(|out| out.inline("["));
                     self.link = Some(target);
@@ -579,6 +579,30 @@ fn origin(url: &str) -> Option<&str> {
         .find(['/', '?', '#'])
         .map_or(url.len(), |end| after + end);
     url.starts_with("http").then(|| &url[..end])
+}
+
+/// A URL as a Markdown link destination: bytes that would end or break it
+/// (whitespace, controls, brackets, quotes) are percent-encoded, as a
+/// browser encodes them in a request.
+fn escape(url: String) -> String {
+    let unsafe_byte =
+        |byte: u8| byte <= b' ' || matches!(byte, b'<' | b'>' | b'(' | b')' | b'"' | b'`' | 0x7f);
+    if !url.bytes().any(unsafe_byte) {
+        return url;
+    }
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(url.len() + 8);
+    for c in url.chars() {
+        match u8::try_from(c) {
+            Ok(byte) if unsafe_byte(byte) => {
+                out.push('%');
+                out.push(char::from(HEX[usize::from(byte >> 4)]));
+                out.push(char::from(HEX[usize::from(byte & 15)]));
+            }
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 /// An absolute path (with any query or fragment) with its `.` and `..`
@@ -877,6 +901,14 @@ See the other, x, no and rel.\n\nUse cargo:\n\nfn  main() {\n    x();\n}\n\nafte
             ("..", "https://site.example/"),
             ("?page=2", "https://site.example/docs/page?page=2"),
             ("/x/./y/..", "https://site.example/x/"),
+            (
+                "next page (2)",
+                "https://site.example/docs/next%20page%20%282%29",
+            ),
+            (
+                "https://x.example/a&quot;b<c>",
+                "https://x.example/a%22b%3Cc%3E",
+            ),
         ] {
             assert_eq!(link(href, Some(BASE)), format!("[t]({expected})"), "{href}");
         }
