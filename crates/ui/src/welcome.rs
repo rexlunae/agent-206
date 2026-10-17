@@ -306,7 +306,9 @@ fn extras(
                     }
                     _ => kinds.concat(),
                 };
-                format!("Reach your agent from {kinds}. Its token stays in the vault.")
+                format!(
+                    "Reach your agent from {kinds}. Any token it signs in with stays in the vault."
+                )
             } else {
                 "Configured but turned off; a messenger connects only once you turn it on.".into()
             },
