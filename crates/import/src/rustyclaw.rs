@@ -54,8 +54,8 @@ struct Config {
 }
 
 /// The fields of a RustyClaw `[[messengers]]` entry this importer uses. Its
-/// secrets (tokens, passwords, app passwords) are not deserialized; `token`
-/// is only checked for presence.
+/// secrets (tokens, passwords, app passwords) are not deserialized; `token`,
+/// `access_token` and `password` are only checked for presence.
 #[derive(Deserialize)]
 struct Messenger {
     #[serde(default)]
@@ -66,6 +66,13 @@ struct Messenger {
     config_path: Option<IgnoredAny>,
     #[serde(default)]
     token: Option<IgnoredAny>,
+    #[serde(default)]
+    access_token: Option<IgnoredAny>,
+    #[serde(default)]
+    password: Option<IgnoredAny>,
+    /// Matrix homeserver URL.
+    #[serde(default)]
+    homeserver: Option<String>,
     #[serde(default)]
     allowed_chats: Vec<String>,
     #[serde(default)]
@@ -191,6 +198,7 @@ fn plan(presets: &[ProviderPreset], settings: &Settings, source: Source) -> Prov
 fn messenger_kind(id: &str) -> Option<MessengerKind> {
     match id {
         "telegram" => Some(MessengerKind::Telegram),
+        "matrix" => Some(MessengerKind::Matrix),
         _ => None,
     }
 }
@@ -249,6 +257,18 @@ fn plan_messengers(settings: &Settings, source: Vec<Messenger>) -> Vec<Messenger
             let valid = |ids: &BTreeSet<String>| {
                 ids.len() <= MAX_ALLOWED_CHATS && ids.iter().all(|id| valid_field(id))
             };
+            // A federated service's server, as the origin the gateway would
+            // accept; other kinds keep their official endpoint.
+            let endpoint = match kind {
+                Some(kind) if kind.default_endpoint().is_none() => messenger
+                    .homeserver
+                    .as_deref()
+                    .and_then(|url| a206_core::providers::base_url(url).ok())
+                    .filter(|url| url.path() == "/")
+                    .map(|url| Some(url.origin().ascii_serialization()))
+                    .ok_or(UnsupportedMessenger::InvalidEndpoint),
+                _ => Ok(None),
+            };
             let unsupported = if kind.is_none() {
                 Some(UnsupportedMessenger::UnknownKind)
             } else if messenger.config_path.is_some() {
@@ -256,7 +276,7 @@ fn plan_messengers(settings: &Settings, source: Vec<Messenger>) -> Vec<Messenger
             } else if !valid(&allowed_chats) || !valid(&allowed_users) {
                 Some(UnsupportedMessenger::InvalidChats)
             } else {
-                None
+                endpoint.as_ref().err().copied()
             };
             if let Some(reason) = unsupported {
                 action = MessengerAction::Unsupported { reason };
@@ -267,6 +287,7 @@ fn plan_messengers(settings: &Settings, source: Vec<Messenger>) -> Vec<Messenger
                 source_kind: messenger.messenger_type,
                 name,
                 kind,
+                endpoint: endpoint.ok().flatten(),
                 // Ids the gateway would refuse are not repeated in the preview.
                 allowed_chats: if unsupported.is_some() {
                     BTreeSet::new()
@@ -278,7 +299,9 @@ fn plan_messengers(settings: &Settings, source: Vec<Messenger>) -> Vec<Messenger
                 } else {
                     allowed_users
                 },
-                token_left_behind: messenger.token.is_some(),
+                token_left_behind: messenger.token.is_some()
+                    || messenger.access_token.is_some()
+                    || messenger.password.is_some(),
                 action,
             }
         })
@@ -646,8 +669,8 @@ allowed_chats = ["{chat}"]
 allowed_users = ["{user}"]
 
 [[messengers]]
-name = "{chat} matrix"
-messenger_type = "matrix"
+name = "{chat} other"
+messenger_type = "other-{chat}"
 access_token = "{token}"
 
 [[messengers]]
@@ -723,6 +746,86 @@ allowed_chats = [""]
         assert!(again.apply_messengers(&mut settings).is_empty());
         assert!(preview.apply_messengers(&mut settings).is_empty());
         assert_eq!(settings.messengers.len(), 2);
+    }
+
+    #[test]
+    fn matrix_accounts_keep_their_homeserver_and_leave_secrets_behind() {
+        let (token, password, room) = (random(), random(), random());
+        let host = format!("{}.test", uuid::Uuid::new_v4().simple());
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            &dir.path().join("config.toml"),
+            &format!(
+                r#"
+[[messengers]]
+name = "home"
+messenger_type = "matrix"
+homeserver = "https://{host}/"
+user_id = "@bot:{host}"
+access_token = "{token}"
+allowed_chats = ["!{room}:{host}"]
+
+[[messengers]]
+name = "password"
+messenger_type = "matrix"
+homeserver = "https://{host}"
+password = "{password}"
+
+[[messengers]]
+name = "nowhere"
+messenger_type = "matrix"
+access_token = "{token}"
+
+[[messengers]]
+name = "plain"
+messenger_type = "matrix"
+homeserver = "http://{host}"
+
+[[messengers]]
+name = "path"
+messenger_type = "matrix"
+homeserver = "https://{host}/matrix"
+"#
+            ),
+        );
+        let mut settings = Settings::default();
+        let preview = preview(dir.path(), &settings, None).unwrap();
+        let origin = format!("https://{host}");
+        let [home, password_entry, rest @ ..] = &preview.messengers[..] else {
+            panic!("{:?}", preview.messengers)
+        };
+        assert_eq!(home.action, MessengerAction::Add);
+        assert_eq!(home.endpoint.as_deref(), Some(origin.as_str()));
+        assert!(home.token_left_behind && password_entry.token_left_behind);
+        assert_eq!(password_entry.action, MessengerAction::Add);
+        // No homeserver, plain HTTP to a remote host, or a path: nothing is
+        // guessed.
+        for entry in rest {
+            assert_eq!(
+                entry.action,
+                MessengerAction::Unsupported {
+                    reason: UnsupportedMessenger::InvalidEndpoint
+                },
+                "{}",
+                entry.source_name
+            );
+            assert!(entry.endpoint.is_none());
+        }
+        let text = toml::to_string(&preview).unwrap();
+        assert!(!text.contains(&token) && !text.contains(&password));
+
+        assert_eq!(
+            preview.apply_messengers(&mut settings),
+            ["home", "password"]
+        );
+        let home = &settings.messengers[0];
+        assert_eq!(home.kind, MessengerKind::Matrix);
+        assert_eq!(home.endpoint(), Some(origin.as_str()));
+        assert!(!home.enabled && home.credential.is_none());
+        assert_eq!(
+            home.allowed_chats,
+            BTreeSet::from([format!("!{room}:{host}")])
+        );
     }
 
     #[test]

@@ -6,7 +6,7 @@
 //! offset across reconnects, so while the gateway runs a message is handled
 //! at most once; the offset is not persisted, so if the gateway stops before
 //! the next poll, Telegram delivers that batch again after a restart.
-use super::{Api, Inbound, MessengerError, Result};
+use super::{Account, Api, Batch, Event, Inbound, MessengerError, Result, split};
 use a206_broker::{AuthScheme, HttpMethod};
 use serde::Deserialize;
 
@@ -18,19 +18,6 @@ const MAX_MESSAGE_UNITS: usize = 4096;
 
 pub(crate) struct Telegram {
     api: Api,
-}
-
-/// The bot the credential currently names. Update ids belong to one bot, so
-/// an offset is only meaningful for the same `id`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Account {
-    pub id: i64,
-    pub name: Option<String>,
-}
-
-/// One poll's updates in order, each with its text message if it has one.
-pub(crate) struct Batch {
-    pub updates: Vec<(i64, Option<Inbound>)>,
 }
 
 #[derive(Deserialize)]
@@ -83,10 +70,9 @@ impl Telegram {
     async fn request<T: for<'de> Deserialize<'de>>(
         &self,
         method: HttpMethod,
-        path: &str,
+        url: url::Url,
         body: Option<serde_json::Value>,
     ) -> Result<T> {
-        let url = self.api.url(path)?;
         let body = body
             .map(|body| serde_json::to_vec(&body))
             .transpose()
@@ -125,30 +111,46 @@ impl Telegram {
 
     /// Check the token and name the bot account.
     pub(crate) async fn connect(&mut self) -> Result<Account> {
-        let me: User = self.request(HttpMethod::Get, "getMe", None).await?;
+        let me: User = self
+            .request(HttpMethod::Get, self.api.url("getMe")?, None)
+            .await?;
         Ok(Account {
             id: me
                 .id
-                .ok_or(MessengerError::NoAccountId { service: SERVICE })?,
+                .ok_or(MessengerError::NoAccountId { service: SERVICE })?
+                .to_string(),
             name: me.username.map(|name| format!("@{name}")).or(me.first_name),
         })
     }
 
     /// Wait for the next batch of updates after `offset`, which confirms
-    /// every earlier one.
-    pub(crate) async fn receive(&mut self, offset: Option<i64>) -> Result<Batch> {
-        let mut path =
-            format!("getUpdates?timeout={POLL_SECONDS}&allowed_updates=%5B%22message%22%5D");
+    /// every earlier one. The batch's cursor is the offset past its last
+    /// update.
+    pub(crate) async fn receive(&mut self, offset: Option<&str>) -> Result<Batch> {
+        let mut url = self.api.url("getUpdates")?;
+        url.query_pairs_mut()
+            .append_pair("timeout", &POLL_SECONDS.to_string())
+            .append_pair("allowed_updates", r#"["message"]"#);
         if let Some(offset) = offset {
-            path.push_str(&format!("&offset={offset}"));
+            url.query_pairs_mut().append_pair("offset", offset);
         }
-        let mut updates: Vec<Update> = self.request(HttpMethod::Get, &path, None).await?;
+        let mut updates: Vec<Update> = self.request(HttpMethod::Get, url, None).await?;
         updates.sort_by_key(|u| u.update_id);
-        let updates = updates
+        let next = updates
+            .last()
+            .map(|last| last.update_id.saturating_add(1).to_string())
+            .or_else(|| offset.map(str::to_owned));
+        let events = updates
             .into_iter()
-            .map(|update| (update.update_id, update.message.and_then(inbound)))
+            .map(|update| {
+                let event = update
+                    .message
+                    .and_then(inbound)
+                    .map_or(Event::Ignored, Event::Message);
+                (update.update_id.to_string(), event)
+            })
             .collect();
-        Ok(Batch { updates })
+        Ok(Batch { events, next })
     }
 
     /// Send `text` to `chat`, split to Telegram's message limit.
@@ -157,7 +159,7 @@ impl Telegram {
             let _: serde_json::Value = self
                 .request(
                     HttpMethod::Post,
-                    "sendMessage",
+                    self.api.url("sendMessage")?,
                     Some(serde_json::json!({ "chat_id": chat, "text": part })),
                 )
                 .await?;
@@ -185,60 +187,6 @@ fn inbound(message: Message) -> Option<Inbound> {
         group: message.chat.kind.as_deref() != Some("private"),
         title,
         text,
+        encrypted: false,
     })
-}
-
-/// Split `text` into parts of at most `limit` UTF-16 code units, preferring
-/// to break after a newline, never inside a character.
-fn split(text: &str, limit: usize) -> Vec<&str> {
-    let mut parts = vec![];
-    let mut rest = text;
-    while !rest.is_empty() {
-        let mut units = 0;
-        let mut end = rest.len();
-        let mut newline = None;
-        for (index, c) in rest.char_indices() {
-            if units + c.len_utf16() > limit {
-                end = index;
-                break;
-            }
-            units += c.len_utf16();
-            if c == '\n' {
-                newline = Some(index + 1);
-            }
-        }
-        if end < rest.len()
-            && let Some(newline) = newline
-        {
-            end = newline;
-        }
-        let (part, tail) = rest.split_at(end);
-        parts.push(part);
-        rest = tail;
-    }
-    parts
-}
-
-#[cfg(test)]
-mod tests {
-    use super::split;
-
-    #[test]
-    fn long_replies_split_at_newlines_within_the_limit() {
-        let line = "x".repeat(7);
-        let text = format!("{line}\n{line}\n{line}");
-        let parts = split(&text, 10);
-        assert_eq!(parts.concat(), text);
-        assert_eq!(
-            parts,
-            [format!("{line}\n"), format!("{line}\n"), line.clone()]
-        );
-        // No newline: a hard split that never cuts a character, counting
-        // UTF-16 units (an emoji is two).
-        let wide = "😀".repeat(6);
-        let parts = split(&wide, 5);
-        assert_eq!(parts.concat(), wide);
-        assert!(parts.iter().all(|p| p.encode_utf16().count() <= 5));
-        assert!(split("", 5).is_empty());
-    }
 }

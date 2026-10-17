@@ -131,10 +131,7 @@ fn MessengerCard(now: u64, config: MessengerConfig, status: MessengerStatus) -> 
         status.state,
         MessengerState::Connected | MessengerState::Connecting | MessengerState::WaitingForVault
     );
-    let endpoint = config
-        .endpoint
-        .clone()
-        .unwrap_or_else(|| config.kind.default_endpoint().to_owned());
+    let endpoint = config.endpoint().unwrap_or("no server chosen").to_owned();
     rsx! { Card {
         CardHeader { CardTitle { "{config.name}" } CardSubtitle { "{config.kind.label()} · {endpoint}" } }
         CardBody {
@@ -142,7 +139,7 @@ fn MessengerCard(now: u64, config: MessengerConfig, status: MessengerStatus) -> 
                 Badge { tone: tone(status.state), "{status.state.label()}" }
                 if let Some(account) = &status.account { span { class: "a206-muted", "Bot account {account}" } }
             }
-            p { class: "a206-muted", match &config.credential { Some(credential) => format!("Bot token: vault credential {credential}"), None => "No vault credential chosen; it cannot connect.".to_owned() } }
+            p { class: "a206-muted", match &config.credential { Some(credential) => format!("Token: vault credential {credential}"), None => "No vault credential chosen; it cannot connect.".to_owned() } }
             Checkbox { label: rsx! { "Enabled" }, checked: ReadSignal::from(enabled), onchange: { let name = name.clone(); move |on: bool| save_messenger(state, &name, |m| m.enabled = on) } }
             if let Some(report) = status.failure.clone() { ErrorNotice { report, title: "Messenger failed".to_string() } }
             div { class: "a206-grid",
@@ -297,7 +294,17 @@ fn AddMessenger() -> Element {
     let selected = MessengerKind::ALL
         .into_iter()
         .find(|k| Some(k.label()) == kind().as_deref());
-    let ready = selected.is_some() && !name().trim().is_empty() && !credential().trim().is_empty();
+    // A federated service has no official server to fall back on.
+    let needs_endpoint = selected.is_some_and(|k| k.default_endpoint().is_none());
+    let ready = selected.is_some()
+        && !name().trim().is_empty()
+        && !credential().trim().is_empty()
+        && (!needs_endpoint || !endpoint().trim().is_empty());
+    let endpoint_hint = if needs_endpoint {
+        "Required: your homeserver's client API origin, with no path."
+    } else {
+        "Leave empty for the service's official API. An origin only, with no path."
+    };
     rsx! { Card { variant: CardVariant::Elevated,
         CardHeader { CardTitle { "Add a messenger" } CardSubtitle { "It stays off and allows no chat until you say so." } }
         CardBody {
@@ -308,8 +315,8 @@ fn AddMessenger() -> Element {
                     options: MessengerKind::ALL.into_iter().map(|k| SelectChoice::new(k.label(), k.label())).collect(),
                     onchange: move |value: String| kind.set(Some(value))
                 } }
-                Field { label: rsx! { "Vault credential" }, hint: rsx! { "The name of the vault entry holding the bot token, never the token itself." }, Input { value: ReadSignal::from(credential), oninput: move |v| credential.set(v), placeholder: "Credential name" } }
-                Field { label: rsx! { "API endpoint" }, hint: rsx! { "Leave empty for the service's official API. An origin only, with no path." }, Input { value: ReadSignal::from(endpoint), oninput: move |v| endpoint.set(v), placeholder: selected.map(|k| k.default_endpoint()).unwrap_or_default() } }
+                Field { label: rsx! { "Vault credential" }, hint: rsx! { "The name of the vault entry holding the token, never the token itself." }, Input { value: ReadSignal::from(credential), oninput: move |v| credential.set(v), placeholder: "Credential name" } }
+                Field { label: rsx! { "API endpoint" }, hint: rsx! { "{endpoint_hint}" }, Input { value: ReadSignal::from(endpoint), oninput: move |v| endpoint.set(v), placeholder: selected.and_then(|k| k.default_endpoint()).unwrap_or("https://homeserver.example") } }
             }
         }
         CardFooter { Button { variant: ButtonVariant::Primary, availability: if ready { Availability::Enabled } else { Availability::Disabled }, onclick: move |_| {

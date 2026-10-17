@@ -22,9 +22,12 @@ pub(super) fn validate(messengers: &[MessengerConfig]) -> Result<()> {
             names.insert(messenger.name.as_str()),
             GatewayError::Invalid("messenger names must be unique"),
         )?;
-        let endpoint = a206_core::providers::base_url(messenger.endpoint())?;
-        // The broker puts the token in the first path segment, so a base
-        // path would move behind it.
+        let endpoint = messenger.endpoint().ok_or(GatewayError::Invalid(
+            "this messenger needs the URL of its server (for Matrix, the homeserver)",
+        ))?;
+        let endpoint = a206_core::providers::base_url(endpoint)?;
+        // The broker puts a Telegram token in the first path segment, so a
+        // base path would move behind it; every kind keeps to an origin.
         check(
             endpoint.path() == "/",
             GatewayError::Invalid("a messenger endpoint is an origin, without a path"),

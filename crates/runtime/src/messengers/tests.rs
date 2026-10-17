@@ -539,3 +539,360 @@ async fn a_chat_without_a_model_is_told_why() {
     stop.cancel();
     supervisor.await.unwrap();
 }
+
+#[test]
+fn long_replies_split_at_newlines_within_the_limit() {
+    let line = "x".repeat(7);
+    let text = format!("{line}\n{line}\n{line}");
+    let parts = split(&text, 10);
+    assert_eq!(parts.concat(), text);
+    assert_eq!(
+        parts,
+        [format!("{line}\n"), format!("{line}\n"), line.clone()]
+    );
+    // No newline: a hard split that never cuts a character, counting
+    // UTF-16 units (an emoji is two).
+    let wide = "😀".repeat(6);
+    let parts = split(&wide, 5);
+    assert_eq!(parts.concat(), wide);
+    assert!(parts.iter().all(|p| p.encode_utf16().count() <= 5));
+    assert!(split("", 5).is_empty());
+}
+
+/// What the stand-in Matrix homeserver serves and records.
+#[derive(Clone, Default)]
+struct Homeserver {
+    token: String,
+    user: String,
+    /// `rooms` objects the syncs return in order; then empty ones.
+    syncs: Arc<Mutex<VecDeque<Value>>>,
+    sync_queries: Arc<Mutex<Vec<HashMap<String, String>>>>,
+    /// Rooms that are encrypted from their Nth encryption check on (0 for
+    /// always), and how often each was checked.
+    encrypted_from: Arc<Mutex<HashMap<String, u32>>>,
+    checks: Arc<Mutex<HashMap<String, u32>>>,
+    joined: Arc<Mutex<Vec<String>>>,
+    /// Room, transaction id and content of each sent event.
+    sent: Arc<Mutex<Vec<(String, String, Value)>>>,
+}
+
+fn check_bearer(server: &Homeserver, headers: &axum::http::HeaderMap) {
+    assert_eq!(
+        headers.get("authorization").and_then(|v| v.to_str().ok()),
+        Some(format!("Bearer {}", server.token).as_str()),
+        "no access token"
+    );
+}
+
+async fn serve_homeserver(server: Homeserver) -> String {
+    use axum::http::{HeaderMap, StatusCode};
+    use axum::routing::put;
+    let whoami = |State(server): State<Homeserver>, headers: HeaderMap| async move {
+        check_bearer(&server, &headers);
+        Json(json!({ "user_id": server.user }))
+    };
+    let sync = |State(server): State<Homeserver>,
+                headers: HeaderMap,
+                Query(query): Query<HashMap<String, String>>| async move {
+        check_bearer(&server, &headers);
+        let count = {
+            let mut queries = server.sync_queries.lock().unwrap();
+            queries.push(query);
+            queries.len()
+        };
+        let next = server.syncs.lock().unwrap().pop_front();
+        let rooms = match next {
+            Some(rooms) => rooms,
+            None => {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                json!({})
+            }
+        };
+        Json(json!({ "next_batch": format!("s{count}"), "rooms": rooms }))
+    };
+    let encryption = |State(server): State<Homeserver>,
+                      headers: HeaderMap,
+                      Path(room): Path<String>| async move {
+        check_bearer(&server, &headers);
+        let mut checks = server.checks.lock().unwrap();
+        let check = checks.entry(room.clone()).or_default();
+        let encrypted = server
+            .encrypted_from
+            .lock()
+            .unwrap()
+            .get(&room)
+            .is_some_and(|from| *check >= *from);
+        *check += 1;
+        if encrypted {
+            (StatusCode::OK, Json(json!({"algorithm": random()})))
+        } else {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({"errcode": "M_NOT_FOUND"})),
+            )
+        }
+    };
+    let join = |State(server): State<Homeserver>, headers: HeaderMap, Path(room): Path<String>| async move {
+        check_bearer(&server, &headers);
+        server.joined.lock().unwrap().push(room.clone());
+        Json(json!({ "room_id": room }))
+    };
+    let send = |State(server): State<Homeserver>,
+                headers: HeaderMap,
+                Path((room, transaction)): Path<(String, String)>,
+                Json(content): Json<Value>| async move {
+        check_bearer(&server, &headers);
+        server
+            .sent
+            .lock()
+            .unwrap()
+            .push((room, transaction, content));
+        Json(json!({ "event_id": format!("${}", random()) }))
+    };
+    let router = Router::new()
+        .route("/_matrix/client/v3/account/whoami", get(whoami))
+        .route("/_matrix/client/v3/sync", get(sync))
+        .route(
+            "/_matrix/client/v3/rooms/{room}/state/m.room.encryption",
+            get(encryption),
+        )
+        .route("/_matrix/client/v3/rooms/{room}/join", post(join))
+        .route(
+            "/_matrix/client/v3/rooms/{room}/send/m.room.message/{transaction}",
+            put(send),
+        )
+        .with_state(server);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    origin
+}
+
+fn matrix_id(sigil: char, host: &str) -> String {
+    format!("{sigil}{}:{host}", Id::new_v4().simple())
+}
+
+fn text_event(sender: &str, msgtype: &str, body: &str) -> Value {
+    json!({
+        "type": "m.room.message",
+        "event_id": format!("${}", random()),
+        "sender": sender,
+        "content": {"msgtype": msgtype, "body": body},
+    })
+}
+
+fn timeline(rooms: Vec<(&str, Vec<Value>)>) -> Value {
+    let join: serde_json::Map<String, Value> = rooms
+        .into_iter()
+        .map(|(room, events)| (room.to_owned(), json!({"timeline": {"events": events}})))
+        .collect();
+    json!({ "join": join })
+}
+
+async fn matrix_setup() -> (
+    Homeserver,
+    String,
+    tempfile::TempDir,
+    String,
+    Recorder,
+    crate::provider::PairingAnchor,
+) {
+    let host = format!("{}.test", Id::new_v4().simple());
+    let server = Homeserver {
+        token: random(),
+        user: matrix_id('@', &host),
+        ..Homeserver::default()
+    };
+    let origin = serve_homeserver(server.clone()).await;
+    let (dir, credential, pairing, anchor) = broker(&origin, &server.token).await;
+    let host = Recorder {
+        root: dir.path().to_owned(),
+        pairing,
+        pairings: Arc::new(watch::Sender::new(0)),
+        threads: Arc::default(),
+        turns: Arc::default(),
+        statuses: Arc::default(),
+        connects: Arc::default(),
+        changed: Arc::default(),
+    };
+    (server, origin, dir, credential, host, anchor)
+}
+
+fn matrix_config(name: &str, origin: &str, credential: &str, rooms: &[&str]) -> MessengerConfig {
+    MessengerConfig {
+        kind: MessengerKind::Matrix,
+        allowed_chats: rooms.iter().map(|room| (*room).to_owned()).collect(),
+        ..config(name, origin, credential, 0)
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn matrix_answers_listed_senders_in_allowed_rooms_and_never_history() {
+    let (server, origin, _dir, credential, host, _anchor) = matrix_setup().await;
+    let name = "matrix";
+    let domain = server.user.split_once(':').unwrap().1.to_owned();
+    let (room, invited, other) = (
+        matrix_id('!', &domain),
+        matrix_id('!', &domain),
+        matrix_id('!', &domain),
+    );
+    let (member, stranger) = (matrix_id('@', &domain), matrix_id('@', &domain));
+    let (history, text, other_title) = (random(), random(), random());
+    {
+        let mut syncs = server.syncs.lock().unwrap();
+        // The first sync: history and invitations.
+        let mut first = timeline(vec![(&room, vec![text_event(&member, "m.text", &history)])]);
+        first["invite"] = json!({
+            &invited: {"invite_state": {"events": []}},
+            &other: {"invite_state": {"events": [
+                {"type": "m.room.name", "state_key": "", "sender": stranger, "content": {"name": other_title}},
+            ]}},
+        });
+        syncs.push_back(first);
+        syncs.push_back(timeline(vec![(
+            &room,
+            vec![
+                text_event(&stranger, "m.text", &random()),
+                text_event(&server.user, "m.text", &random()),
+                text_event(&member, "m.notice", &random()),
+                text_event(&member, "m.text", &text),
+            ],
+        )]));
+    }
+    let mut entry = matrix_config(name, &origin, &credential, &[&room, &invited]);
+    entry.allowed_users.insert(member.clone());
+    let (_desired, receiver) = watch::channel(vec![Desired {
+        config: entry,
+        run: true,
+    }]);
+    let stop = CancellationToken::new();
+    let supervisor = tokio::spawn(supervise(host.clone(), receiver, FAST, stop.clone()));
+    host.until(|h| !server.sent.lock().unwrap().is_empty() && h.status(name).refused.len() == 2)
+        .await;
+
+    let status = host.status(name);
+    assert_eq!(status.state, MessengerState::Connected);
+    assert_eq!(status.account.as_ref(), Some(&server.user));
+    // Only the allowed invitation was accepted.
+    assert_eq!(
+        *server.joined.lock().unwrap(),
+        std::slice::from_ref(&invited)
+    );
+    assert_eq!(status.refused[0].chat, other);
+    assert_eq!(
+        status.refused[0].title.as_deref(),
+        Some(other_title.as_str())
+    );
+    assert_eq!(status.refused[1].chat, room);
+    assert_eq!(status.refused[1].sender.as_ref(), Some(&stranger));
+    // History, the bot's own message and a notice were not answered.
+    let turns = host.turns.lock().unwrap().clone();
+    assert_eq!(turns.len(), 1);
+    assert_eq!(turns[0].1, text);
+    let sent = server.sent.lock().unwrap().clone();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].0, room);
+    assert_eq!(
+        sent[0].2,
+        json!({"msgtype": "m.notice", "body": format!("reply to {text}")})
+    );
+    let queries = server.sync_queries.lock().unwrap().clone();
+    assert_eq!(queries[0].get("timeout").map(String::as_str), Some("0"));
+    assert!(!queries[0].contains_key("since"));
+    assert_eq!(queries[1].get("since").map(String::as_str), Some("s1"));
+    stop.cancel();
+    supervisor.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn nothing_is_sent_in_plain_text_to_an_encrypted_room() {
+    let (server, origin, _dir, credential, host, _anchor) = matrix_setup().await;
+    let name = "encrypted";
+    let domain = server.user.split_once(':').unwrap().1.to_owned();
+    let member = matrix_id('@', &domain);
+    let (always, later, ciphertext) = (
+        matrix_id('!', &domain),
+        matrix_id('!', &domain),
+        matrix_id('!', &domain),
+    );
+    {
+        let mut from = server.encrypted_from.lock().unwrap();
+        from.insert(always.clone(), 0);
+        // Encrypted after the check before the turn: before its reply.
+        from.insert(later.clone(), 1);
+    }
+    {
+        let mut syncs = server.syncs.lock().unwrap();
+        syncs.push_back(json!({}));
+        syncs.push_back(timeline(vec![
+            (&always, vec![text_event(&member, "m.text", &random())]),
+            (&later, vec![text_event(&member, "m.text", &random())]),
+            (
+                &ciphertext,
+                vec![json!({
+                    "type": "m.room.encrypted",
+                    "event_id": format!("${}", random()),
+                    "sender": member,
+                    "content": {"algorithm": random(), "ciphertext": random()},
+                })],
+            ),
+        ]));
+    }
+    let mut entry = matrix_config(name, &origin, &credential, &[&always, &later, &ciphertext]);
+    entry.allowed_users.insert(member.clone());
+    // Without a model, a turn fails, and its notice must not go out either.
+    entry.model = None;
+    let (_desired, receiver) = watch::channel(vec![Desired {
+        config: entry,
+        run: true,
+    }]);
+    let stop = CancellationToken::new();
+    let supervisor = tokio::spawn(supervise(host.clone(), receiver, FAST, stop.clone()));
+    host.until(|_| server.sync_queries.lock().unwrap().len() >= 3)
+        .await;
+
+    assert!(server.sent.lock().unwrap().is_empty());
+    assert!(host.turns.lock().unwrap().is_empty());
+    let status = host.status(name);
+    // Each case was reported in the status and the messenger kept running.
+    assert_eq!(status.state, MessengerState::Connected);
+    let failure = status.failure.unwrap();
+    assert_eq!(failure.kind, ErrorKind::PermissionDenied);
+    assert!(
+        failure.detail().contains("encrypted"),
+        "{}",
+        failure.detail()
+    );
+    let checks = server.checks.lock().unwrap().clone();
+    assert_eq!(checks.get(&always), Some(&1));
+    assert_eq!(checks.get(&later), Some(&2));
+    // An encrypted message is never answered, so its room is not checked.
+    assert_eq!(checks.get(&ciphertext), None);
+    stop.cancel();
+    supervisor.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_matrix_messenger_without_a_homeserver_waits_for_the_user() {
+    let (server, _origin, _dir, credential, host, _anchor) = matrix_setup().await;
+    let name = "no-server";
+    let mut entry = matrix_config(name, "", &credential, &[]);
+    entry.endpoint = None;
+    let (_desired, receiver) = watch::channel(vec![Desired {
+        config: entry,
+        run: true,
+    }]);
+    let stop = CancellationToken::new();
+    let supervisor = tokio::spawn(supervise(host.clone(), receiver, FAST, stop.clone()));
+    host.until(|h| h.status(name).state == MessengerState::Failed)
+        .await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(host.connects(name), 1);
+    assert_eq!(
+        host.status(name).failure.map(|f| f.kind),
+        Some(ErrorKind::InvalidRequest)
+    );
+    assert!(server.sync_queries.lock().unwrap().is_empty());
+    stop.cancel();
+    supervisor.await.unwrap();
+}
