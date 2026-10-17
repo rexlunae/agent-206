@@ -4,7 +4,10 @@ use crate::{
     State, dispatch,
     palette::{self, Action},
 };
-use a206_core::{Command, ErrorKind, ErrorReport, Mode, ModelInfo, RunState, Snapshot, Thread};
+use a206_core::{
+    Command, ErrorKind, ErrorReport, Mode, ModelInfo, RunState, Schedule, Snapshot, Thread,
+    schedule::parse_interval,
+};
 
 /// One command the composer understands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,7 +43,7 @@ impl Spec {
     }
 }
 
-pub(crate) const COMMANDS: [Spec; 7] = [
+pub(crate) const COMMANDS: [Spec; 9] = [
     Spec {
         name: "new",
         argument: Argument::None,
@@ -76,6 +79,16 @@ pub(crate) const COMMANDS: [Spec; 7] = [
         argument: Argument::Optional("level"),
         about: "Set reasoning effort; alone, the automatic effort",
     },
+    Spec {
+        name: "in",
+        argument: Argument::Required("interval message"),
+        about: "Send a message to this conversation once, after an interval such as 30m",
+    },
+    Spec {
+        name: "every",
+        argument: Argument::Required("interval message"),
+        about: "Send a message to this conversation repeatedly, such as every 24h",
+    },
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,6 +101,17 @@ pub(crate) enum Slash {
     Model(String),
     /// `None` is the automatic effort the selector calls Auto.
     Effort(Option<String>),
+    /// Schedule `text` once, `interval` from now.
+    In(Timed),
+    /// Schedule `text` every `interval`, starting `interval` from now.
+    Every(Timed),
+}
+
+/// A scheduled message: an interval as typed, then the message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Timed {
+    pub(crate) interval: String,
+    pub(crate) text: String,
 }
 
 /// What Enter does with a draft.
@@ -137,6 +161,24 @@ pub(crate) fn parse(draft: &str) -> Result<Typed, ErrorReport> {
         "mode" => Slash::Mode(argument),
         "model" => Slash::Model(argument),
         "effort" => Slash::Effort((!argument.is_empty()).then_some(argument)),
+        "in" | "every" => {
+            // The interval is one word, such as `90m` or `1h30m`.
+            let Some((interval, text)) = argument.split_once(char::is_whitespace) else {
+                return Err(refused(&format!(
+                    "Give the message after the interval: /{} 30m message",
+                    spec.name
+                )));
+            };
+            let timed = Timed {
+                interval: interval.to_owned(),
+                text: text.trim().to_owned(),
+            };
+            if spec.name == "in" {
+                Slash::In(timed)
+            } else {
+                Slash::Every(timed)
+            }
+        }
         _ => return Ok(Typed::Send(draft.to_owned())),
     };
     Ok(Typed::Run(slash))
@@ -234,13 +276,53 @@ fn find_model<'a>(snapshot: &'a Snapshot, query: &str) -> Result<&'a ModelInfo, 
     }
 }
 
+/// A scheduled message to `thread`, named by its message as the Schedules
+/// page shows it. The gateway checks the interval's limits and the
+/// conversation when it receives the job.
+fn schedule(
+    thread: &Thread,
+    timed: Timed,
+    schedule: impl FnOnce(u64) -> Schedule,
+) -> Result<Command, ErrorReport> {
+    let seconds = parse_interval(&timed.interval).map_err(|error| {
+        refused("Give the interval as one word, such as 30m, 6h or 1h30m").caused_by(
+            ErrorReport::capture(&error, |_| Some(ErrorKind::InvalidRequest)),
+        )
+    })?;
+    // Short to read, and well inside the gateway's 200-byte name limit
+    // whatever the characters.
+    const CHARS: usize = 60;
+    const BYTES: usize = 120;
+    let line = timed.text.lines().next().unwrap_or_default();
+    let end = line
+        .char_indices()
+        .take(CHARS)
+        .map(|(start, c)| start + c.len_utf8())
+        .take_while(|&end| end <= BYTES)
+        .last()
+        .unwrap_or_default();
+    let name = if end < line.len() {
+        format!("{}…", &line[..end])
+    } else {
+        line.to_owned()
+    };
+    Ok(Command::ScheduleJob {
+        name,
+        thread: thread.id,
+        text: timed.text,
+        schedule: schedule(seconds),
+    })
+}
+
 /// What running `slash` in `thread` does, or why it cannot run now.
-/// `can_create` is whether the gateway can take a new conversation.
+/// `can_create` is whether the gateway can take a new conversation, and
+/// `now` this client's clock in Unix seconds, which scheduled messages count from.
 pub(crate) fn resolve(
     slash: Slash,
     thread: &Thread,
     snapshot: &Snapshot,
     can_create: bool,
+    now: u64,
 ) -> Result<Command, ErrorReport> {
     let running = thread.state == RunState::Running;
     // The mode, model and effort selectors are disabled while a response runs.
@@ -333,6 +415,15 @@ pub(crate) fn resolve(
                 effort,
             })
         }
+        Slash::In(timed) => schedule(thread, timed, |seconds| Schedule::At {
+            at: now.saturating_add(seconds),
+        }),
+        // The first run is one interval away even when the gateway's clock
+        // is behind this one: a future anchor is itself the first run.
+        Slash::Every(timed) => schedule(thread, timed, |seconds| Schedule::Every {
+            seconds,
+            anchor: now.saturating_add(seconds),
+        }),
     }
 }
 
@@ -349,6 +440,9 @@ mod tests {
     use super::*;
     use a206_core::{Catalog, CodingBackend, Mode, ModelKey, ProviderApi, ProviderConfig};
     use uuid::Uuid;
+
+    /// The client's clock in these tests; nothing reads the real one.
+    const NOW: u64 = 1_800_000_000;
 
     fn text() -> String {
         format!("t-{}", Uuid::new_v4().simple())
@@ -398,7 +492,7 @@ mod tests {
         assert_eq!(
             names("/"),
             [
-                "new", "rename", "compact", "stop", "mode", "model", "effort"
+                "new", "rename", "compact", "stop", "mode", "model", "effort", "in", "every"
             ]
         );
         assert_eq!(names("/mod"), ["mode", "model"]);
@@ -417,16 +511,16 @@ mod tests {
     fn a_command_runs_only_when_the_conversation_allows_it() {
         let snapshot = crate::empty_snapshot();
         let mut thread = Thread::new(text(), Mode::Chat);
-        assert!(resolve(Slash::Stop, &thread, &snapshot, true).is_err());
-        assert!(resolve(Slash::Compact, &thread, &snapshot, true).is_err());
-        assert!(resolve(Slash::New, &thread, &snapshot, false).is_err());
+        assert!(resolve(Slash::Stop, &thread, &snapshot, true, NOW).is_err());
+        assert!(resolve(Slash::Compact, &thread, &snapshot, true, NOW).is_err());
+        assert!(resolve(Slash::New, &thread, &snapshot, false, NOW).is_err());
         assert!(matches!(
-            resolve(Slash::New, &thread, &snapshot, true),
+            resolve(Slash::New, &thread, &snapshot, true, NOW),
             Ok(Command::CreateThread { .. })
         ));
         let title = text();
         assert_eq!(
-            resolve(Slash::Rename(title.clone()), &thread, &snapshot, true),
+            resolve(Slash::Rename(title.clone()), &thread, &snapshot, true, NOW),
             Ok(Command::RenameThread {
                 id: thread.id,
                 title
@@ -437,18 +531,18 @@ mod tests {
             model: text(),
         });
         assert_eq!(
-            resolve(Slash::Compact, &thread, &snapshot, true),
+            resolve(Slash::Compact, &thread, &snapshot, true, NOW),
             Ok(Command::CompactThread { thread: thread.id })
         );
         thread.state = RunState::Running;
         assert_eq!(
-            resolve(Slash::Stop, &thread, &snapshot, true),
+            resolve(Slash::Stop, &thread, &snapshot, true, NOW),
             Ok(Command::CancelRun { thread: thread.id })
         );
-        assert!(resolve(Slash::Compact, &thread, &snapshot, true).is_err());
+        assert!(resolve(Slash::Compact, &thread, &snapshot, true, NOW).is_err());
         thread.state = RunState::Idle;
         thread.backend = CodingBackend::Codex;
-        assert!(resolve(Slash::Compact, &thread, &snapshot, true).is_err());
+        assert!(resolve(Slash::Compact, &thread, &snapshot, true, NOW).is_err());
     }
 
     fn model(efforts: Vec<String>) -> ModelInfo {
@@ -497,14 +591,14 @@ mod tests {
         for mode in Mode::ALL {
             let typed = mode.label().to_uppercase();
             assert_eq!(
-                configured(resolve(Slash::Mode(typed), &thread, &snapshot, true)),
+                configured(resolve(Slash::Mode(typed), &thread, &snapshot, true, NOW)),
                 (mode, thread.model.clone())
             );
         }
-        assert!(resolve(Slash::Mode(text()), &thread, &snapshot, true).is_err());
+        assert!(resolve(Slash::Mode(text()), &thread, &snapshot, true, NOW).is_err());
         thread.state = RunState::Running;
         let label = Mode::ALL[0].label().to_owned();
-        assert!(resolve(Slash::Mode(label), &thread, &snapshot, true).is_err());
+        assert!(resolve(Slash::Mode(label), &thread, &snapshot, true, NOW).is_err());
     }
 
     #[test]
@@ -519,6 +613,7 @@ mod tests {
                 &thread,
                 &snapshot,
                 true,
+                NOW,
             ))
             .1
         };
@@ -527,15 +622,16 @@ mod tests {
         // Generated names share the "t-" prefix, so it names both; a tail names one.
         let tail = &first.name[first.name.len() - 12..];
         assert_eq!(chosen(tail), Some(first.key.clone()));
-        assert!(resolve(Slash::Model("t-".into()), &thread, &snapshot, true).is_err());
-        assert!(resolve(Slash::Model(text()), &thread, &snapshot, true).is_err());
+        assert!(resolve(Slash::Model("t-".into()), &thread, &snapshot, true, NOW).is_err());
+        assert!(resolve(Slash::Model(text()), &thread, &snapshot, true, NOW).is_err());
         // The mode is kept.
         assert_eq!(
             configured(resolve(
                 Slash::Model(first.name.clone()),
                 &thread,
                 &snapshot,
-                true
+                true,
+                NOW
             ))
             .0,
             thread.mode
@@ -555,6 +651,7 @@ mod tests {
                 thread,
                 &snapshot,
                 true,
+                NOW,
             )
         };
         // No model selected, or one whose listing has no effort choices.
@@ -600,7 +697,7 @@ mod tests {
             });
         }
         let thread = Thread::new(text(), Mode::Chat);
-        let chosen = |query: String| resolve(Slash::Model(query), &thread, &snapshot, true);
+        let chosen = |query: String| resolve(Slash::Model(query), &thread, &snapshot, true, NOW);
         let shared = chosen(first.name.clone()).expect_err("two connections list it");
         assert!(
             shared
@@ -629,6 +726,7 @@ mod tests {
                 &thread,
                 &snapshot,
                 true,
+                NOW,
             )
         };
         for level in ["auto", "default"] {
@@ -666,10 +764,97 @@ mod tests {
             });
         }
         let thread = Thread::new(text(), Mode::Chat);
-        let chosen = |query: String| resolve(Slash::Model(query), &thread, &snapshot, true);
+        let chosen = |query: String| resolve(Slash::Model(query), &thread, &snapshot, true, NOW);
         let shared = chosen(format!("{label}/{}", first.name)).expect_err("both match");
         let key = format!("{}:{}", second.key.provider, second.key.model);
         assert!(shared.message.contains(&key));
         assert_eq!(configured(chosen(key)).1, Some(second.key.clone()));
+    }
+
+    #[test]
+    fn a_message_is_scheduled_for_this_conversation_from_now() {
+        let snapshot = crate::empty_snapshot();
+        let thread = Thread::new(text(), Mode::Chat);
+        // Short enough to be its own name.
+        let message = format!("{} {}", text(), "y".repeat(8));
+        let Ok(Typed::Run(once)) = parse(&format!("/in 90m {message}")) else {
+            panic!("/in parses");
+        };
+        assert_eq!(
+            resolve(once, &thread, &snapshot, true, NOW),
+            Ok(Command::ScheduleJob {
+                name: message.clone(),
+                thread: thread.id,
+                text: message.clone(),
+                schedule: Schedule::At { at: NOW + 90 * 60 },
+            })
+        );
+        let Ok(Typed::Run(repeating)) = parse(&format!("/every 24h {message}")) else {
+            panic!("/every parses");
+        };
+        // The first run is one interval from now, not now.
+        assert!(matches!(
+            resolve(repeating, &thread, &snapshot, true, NOW),
+            Ok(Command::ScheduleJob {
+                schedule: Schedule::Every { seconds: 86_400, anchor },
+                ..
+            }) if anchor == NOW + 86_400
+        ));
+        // A long message is named by the start of its first line.
+        let long = "x".repeat(200);
+        let Ok(Command::ScheduleJob {
+            name, text: sent, ..
+        }) = resolve(
+            Slash::In(Timed {
+                interval: "1h".into(),
+                text: format!("{long}\n{}", text()),
+            }),
+            &thread,
+            &snapshot,
+            true,
+            NOW,
+        )
+        else {
+            panic!("a long message schedules");
+        };
+        assert_eq!(name, format!("{}…", &long[..60]));
+        assert!(sent.starts_with(&long));
+        // Wide characters are cut by bytes as well, at a character boundary.
+        let wide = "é".repeat(100);
+        let Ok(Command::ScheduleJob { name, .. }) = resolve(
+            Slash::In(Timed {
+                interval: "1h".into(),
+                text: wide.clone(),
+            }),
+            &thread,
+            &snapshot,
+            true,
+            NOW,
+        ) else {
+            panic!("a wide message schedules");
+        };
+        assert_eq!(name, format!("{}…", &wide[..120]));
+    }
+
+    #[test]
+    fn a_schedule_needs_a_readable_interval_and_a_message() {
+        let snapshot = crate::empty_snapshot();
+        let thread = Thread::new(text(), Mode::Chat);
+        assert!(parse("/in 30m").is_err());
+        assert!(parse("/every").is_err());
+        let unreadable = resolve(
+            Slash::Every(Timed {
+                interval: text(),
+                text: text(),
+            }),
+            &thread,
+            &snapshot,
+            true,
+            NOW,
+        )
+        .expect_err("not an interval");
+        assert_eq!(unreadable.kind, ErrorKind::InvalidRequest);
+        // The cause stays inspectable rather than folded into the message.
+        assert!(unreadable.causes().next().is_some());
     }
 }

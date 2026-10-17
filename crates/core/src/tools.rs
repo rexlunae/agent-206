@@ -124,6 +124,32 @@ pub struct ToolCall {
     /// conversation is sent back to the same provider.
     #[serde(default)]
     pub signature: Option<String>,
+    /// How an output rule reduced `output` before the model saw it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reduction: Option<OutputReduction>,
+}
+
+/// How an output rule reduced a tool result. The reduced text is the call's
+/// `output`; the original is not kept.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutputReduction {
+    /// The id of the rule that applied.
+    pub rule: String,
+    /// The rule came from the user's output rules rather than shipping with
+    /// the application.
+    pub user_rule: bool,
+    /// The size of the result before the rule applied.
+    pub original_bytes: u64,
+    /// The rule's named counts over the lines the model is shown.
+    #[serde(default)]
+    pub counts: Vec<OutputCount>,
+}
+
+/// One named count an output rule reported.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutputCount {
+    pub name: String,
+    pub count: u64,
 }
 
 /// A pending request for the user to approve one tool call. It is bound to

@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/core", "crates/audit", "crates/protocol", "crates/vault", "crates/broker", "crates/import", "crates/extension-abi", "crates/extension-sdk", "crates/extensions", "crates/sandbox", "crates/mcp", "crates/skills", "plugins/workspace", "plugins/git", "plugins/skills", "plugins/web", "plugins/memory", "crates/runtime", "crates/ui", "crates/app"]
+members = ["crates/core", "crates/audit", "crates/protocol", "crates/vault", "crates/broker", "crates/import", "crates/extension-abi", "crates/extension-sdk", "crates/extensions", "crates/sandbox", "crates/mcp", "crates/skills", "crates/output-rules", "plugins/workspace", "plugins/git", "plugins/skills", "plugins/web", "plugins/memory", "crates/runtime", "crates/ui", "crates/app"]
 default-members = ["crates/app"]
 resolver = "3"
 
@@ -21,6 +21,7 @@ a206-extensions = { path = "crates/extensions" }
 a206-mcp = { path = "crates/mcp" }
 a206-sandbox = { path = "crates/sandbox" }
 a206-skills = { path = "crates/skills" }
+a206-output-rules = { path = "crates/output-rules" }
 a206-runtime = { path = "crates/runtime" }
 a206-ui = { path = "crates/ui" }
 serde = { version = "1", features = ["derive"] }
@@ -32,6 +33,7 @@ anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "ansi", "std"] }
 uuid = { version = "1", features = ["v4", "serde", "js"] }
+globset = { version = "0.4.20", default-features = false }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "io-std", "sync", "time", "fs", "net"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 futures-util = { version = "0.3", features = ["sink"] }

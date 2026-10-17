@@ -249,6 +249,7 @@ fn write_tool_creates_parents_then_writes() {
 #[test]
 fn search_tool_reports_matches_and_truncation() {
     let (path, text, query) = (unique("src/f"), unique("line"), unique("q"));
+    let include = unique("*.");
     let reply = SearchResult {
         matches: vec![SearchMatch {
             path: path.clone(),
@@ -265,6 +266,8 @@ fn search_tool_reports_matches_and_truncation() {
             &[
                 ("query", Value::Str(query.clone())),
                 ("max_matches", Value::Int(9000)),
+                ("regex", Value::Bool(true)),
+                ("include", Value::Str(include.clone())),
             ],
         ),
         Limits::default(),
@@ -277,10 +280,69 @@ fn search_tool_reports_matches_and_truncation() {
     assert!(output.text.contains("limit"));
     assert_eq!(
         *seen.borrow(),
-        vec![HostRequest::Search {
+        vec![HostRequest::SearchPattern {
             path: ".".into(),
-            query,
+            pattern: query,
+            regex: true,
+            ignore_case: false,
+            include: Some(include),
             max_matches: 500,
+        }]
+    );
+}
+
+#[test]
+fn find_tool_lists_entries_and_truncation() {
+    let (file, directory, link) = (unique("src/f"), unique("src/d"), unique("l"));
+    let (glob, within) = (unique("*"), unique("src"));
+    let reply = FindResult {
+        entries: vec![
+            FoundEntry {
+                path: file.clone(),
+                kind: EntryKind::File,
+            },
+            FoundEntry {
+                path: directory.clone(),
+                kind: EntryKind::Directory,
+            },
+            FoundEntry {
+                path: link.clone(),
+                kind: EntryKind::Symlink,
+            },
+        ],
+        truncated: true,
+    };
+    let (bridge, seen) = mock(move |_| HostReply::Found(reply.clone()));
+    let (outcome, _) = engine::run(
+        workspace().wasm,
+        &tool(
+            "find_files",
+            &[
+                ("pattern", Value::Str(glob.clone())),
+                ("path", Value::Str(within.clone())),
+                ("max_results", Value::Int(0)),
+            ],
+        ),
+        Limits::default(),
+        bridge,
+    );
+    let Ok(Outcome::Tool(output)) = outcome else {
+        panic!("expected tool output, got {outcome:?}");
+    };
+    assert!(
+        output
+            .text
+            .starts_with(&format!("{file}\n{directory}/\n{link} (link)\n")),
+        "{}",
+        output.text
+    );
+    assert!(output.text.contains("limit"));
+    assert_eq!(
+        *seen.borrow(),
+        vec![HostRequest::Find {
+            path: within,
+            glob,
+            max_results: 1,
         }]
     );
 }

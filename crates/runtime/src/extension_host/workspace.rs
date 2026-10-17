@@ -3,7 +3,8 @@
 //! never include host paths; the guest sees only its own request.
 use super::{MAX_ENTRIES, MAX_FILE, failure};
 use a206_extensions::abi::{
-    DirEntry, EntryKind, HostErrorCode, HostFailure, HostReply, SearchMatch, SearchResult,
+    DirEntry, EntryKind, FindResult, FoundEntry, HostErrorCode, HostFailure, HostReply,
+    SearchMatch, SearchResult,
 };
 use cap_std::fs::{Dir, File, OpenOptions};
 use std::{
@@ -22,6 +23,15 @@ pub const MAX_SEARCH_DEPTH: usize = 64;
 /// Longest query, and the longest line text a match carries.
 pub const MAX_QUERY: usize = 1024;
 pub const MAX_MATCH_TEXT: usize = 256;
+/// Compiled size a search's regular expression may reach.
+pub const MAX_REGEX_SIZE: usize = 1024 * 1024;
+/// Most entries one find returns, and directory entries any walk may read.
+pub const MAX_FOUND: u32 = 1_000;
+pub const MAX_WALK_ENTRIES: usize = 100_000;
+/// Encoded size a search or find reply may reach, below the worker's 1 MiB
+/// reply bound; [`ENTRY_OVERHEAD`] is the most framing one result adds.
+pub const MAX_RESULT_BYTES: usize = 768 * 1024;
+const ENTRY_OVERHEAD: usize = 64;
 
 fn io_failure(error: &std::io::Error) -> HostFailure {
     use std::io::ErrorKind as Io;
@@ -143,102 +153,298 @@ pub(super) fn search(
     query: &str,
     max_matches: u32,
 ) -> Result<HostReply, HostFailure> {
-    if query.is_empty() || query.len() > MAX_QUERY {
+    search_pattern(root, path, query, Pattern::default(), max_matches)
+}
+
+/// How [`search_pattern`] matches lines and chooses files.
+#[derive(Debug, Default)]
+pub(super) struct Pattern<'a> {
+    pub regex: bool,
+    pub ignore_case: bool,
+    pub include: Option<&'a str>,
+}
+
+/// [`search`] with a regular expression or letter-case-blind text, and an
+/// optional glob choosing the files.
+pub(super) fn search_pattern(
+    root: PathBuf,
+    path: &str,
+    pattern: &str,
+    options: Pattern<'_>,
+    max_matches: u32,
+) -> Result<HostReply, HostFailure> {
+    if pattern.is_empty() || pattern.len() > MAX_QUERY {
         return Err(failure(
             HostErrorCode::Invalid,
             "the query must be 1 to 1024 bytes",
         ));
     }
-    let prefix = match path {
-        "" | "." => String::new(),
-        path => format!("{}/", path.trim_end_matches('/')),
+    let lines = if !options.regex && !options.ignore_case {
+        Lines::Literal(pattern)
+    } else {
+        let source = if options.regex {
+            pattern.to_owned()
+        } else {
+            regex::escape(pattern)
+        };
+        let compiled = regex::RegexBuilder::new(&source)
+            .case_insensitive(options.ignore_case)
+            .size_limit(MAX_REGEX_SIZE)
+            .dfa_size_limit(MAX_REGEX_SIZE)
+            .build()
+            .map_err(|error| match error {
+                regex::Error::CompiledTooBig(_) => failure(
+                    HostErrorCode::TooLarge,
+                    "the regular expression is too large",
+                ),
+                _ => failure(HostErrorCode::Invalid, "the regular expression is invalid"),
+            })?;
+        Lines::Regex(compiled)
     };
-    let mut search = Search {
-        query,
-        limit: max_matches.clamp(1, MAX_MATCHES) as usize,
-        files: 0,
-        directories: 0,
-        bytes: 0,
-        result: SearchResult::default(),
-    };
+    let include = options.include.map(glob).transpose()?;
+    let prefix = prefix(path);
+    let limit = max_matches.clamp(1, MAX_MATCHES) as usize;
+    let (mut files, mut bytes, mut reply) = (0, 0u64, 0);
+    let mut result = SearchResult::default();
+    let mut walk = Walk::default();
+    let flow = walk.walk(
+        &open_directory(root, path)?,
+        "",
+        0,
+        &mut |directory, entry| {
+            use std::ops::ControlFlow::{Break, Continue};
+            if entry.kind != EntryKind::File
+                || include
+                    .as_ref()
+                    .is_some_and(|glob| !glob.is_match(entry.below))
+            {
+                return Ok(Continue(()));
+            }
+            if files == MAX_SEARCH_FILES || bytes >= MAX_SEARCH_BYTES {
+                return Ok(Break(()));
+            }
+            files += 1;
+            let Some(contents) = read_bounded(open_regular(directory, entry.name)?)? else {
+                return Ok(Continue(()));
+            };
+            bytes += contents.len() as u64;
+            let Ok(text) = String::from_utf8(contents) else {
+                return Ok(Continue(()));
+            };
+            for (index, line) in text.lines().enumerate() {
+                if !lines.is_match(line) {
+                    continue;
+                }
+                let found = SearchMatch {
+                    path: format!("{prefix}{}", entry.below),
+                    line: u32::try_from(index + 1).unwrap_or(u32::MAX),
+                    text: super::bounded(line, MAX_MATCH_TEXT).to_string(),
+                };
+                let size = found.path.len() + found.text.len() + ENTRY_OVERHEAD;
+                if result.matches.len() == limit || reply + size > MAX_RESULT_BYTES {
+                    return Ok(Break(()));
+                }
+                reply += size;
+                result.matches.push(found);
+            }
+            Ok(Continue(()))
+        },
+    )?;
     // A bound was reached: the result is complete up to that point.
-    if search
-        .walk(&open_directory(root, path)?, &prefix, 0)?
-        .is_break()
-    {
-        search.result.truncated = true;
-    }
-    Ok(HostReply::Matches(search.result))
+    result.truncated = flow.is_break();
+    Ok(HostReply::Matches(result))
 }
 
-/// One search's progress. The walk is depth-first in name order, so results
-/// are in global path order, and it holds only one open directory per level.
-struct Search<'a> {
-    query: &'a str,
-    limit: usize,
-    files: usize,
-    directories: usize,
-    bytes: u64,
-    result: SearchResult,
+/// Entries under `path` whose path matches `pattern`, in path order.
+pub(super) fn find(
+    root: PathBuf,
+    path: &str,
+    pattern: &str,
+    max_results: u32,
+) -> Result<HostReply, HostFailure> {
+    let matcher = glob(pattern)?;
+    let prefix = prefix(path);
+    let limit = max_results.clamp(1, MAX_FOUND) as usize;
+    let mut reply = 0;
+    let mut result = FindResult::default();
+    let mut walk = Walk::default();
+    let flow = walk.walk(&open_directory(root, path)?, "", 0, &mut |_, entry| {
+        use std::ops::ControlFlow::{Break, Continue};
+        if !matcher.is_match(entry.below) {
+            return Ok(Continue(()));
+        }
+        let path = format!("{prefix}{}", entry.below);
+        let size = path.len() + ENTRY_OVERHEAD;
+        if result.entries.len() == limit || reply + size > MAX_RESULT_BYTES {
+            return Ok(Break(()));
+        }
+        reply += size;
+        result.entries.push(FoundEntry {
+            path,
+            kind: entry.kind,
+        });
+        Ok(Continue(()))
+    })?;
+    result.truncated = flow.is_break();
+    Ok(HostReply::Found(result))
 }
-impl Search<'_> {
+
+/// The workspace-relative prefix of paths found below `path`.
+fn prefix(path: &str) -> String {
+    match path {
+        "" | "." => String::new(),
+        path => format!("{}/", path.trim_end_matches('/')),
+    }
+}
+
+/// A glob as [`HostRequest::Find`](a206_extensions::abi::HostRequest::Find)
+/// reads it: without `/` it matches an entry's name at any depth.
+fn glob(pattern: &str) -> Result<globset::GlobMatcher, HostFailure> {
+    if pattern.is_empty() || pattern.len() > MAX_QUERY {
+        return Err(failure(
+            HostErrorCode::Invalid,
+            "the glob must be 1 to 1024 bytes",
+        ));
+    }
+    let anchored = if pattern.contains('/') {
+        pattern.trim_start_matches('/').to_owned()
+    } else {
+        format!("**/{pattern}")
+    };
+    globset::GlobBuilder::new(&anchored)
+        .literal_separator(true)
+        .backslash_escape(true)
+        .build()
+        .map(|glob| glob.compile_matcher())
+        .map_err(|_| failure(HostErrorCode::Invalid, "the glob is invalid"))
+}
+
+/// How a search compares lines.
+enum Lines<'a> {
+    Literal(&'a str),
+    Regex(regex::Regex),
+}
+impl Lines<'_> {
+    fn is_match(&self, line: &str) -> bool {
+        match self {
+            Self::Literal(text) => line.contains(text),
+            Self::Regex(regex) => regex.is_match(line),
+        }
+    }
+}
+
+/// One entry a [`Walk`] reaches.
+struct Entry<'a> {
+    name: &'a str,
+    /// `/`-separated, relative to where the walk started.
+    below: &'a str,
+    kind: EntryKind,
+}
+type Visit<'a> = dyn FnMut(&Dir, &Entry<'_>) -> Result<std::ops::ControlFlow<()>, HostFailure> + 'a;
+
+/// A bounded walk shared by searches. Entries arrive in global path order
+/// (byte order of the whole `/`-separated path, so `a.rs` comes before
+/// `a/child.rs`), it holds only one open directory per level, and it never
+/// follows symlinks or enters `.git`. A directory is visited before its
+/// contents.
+struct Walk {
+    directories: usize,
+    /// Directory entries read so far, and how many the walk may read.
+    entries: usize,
+    limit: usize,
+}
+impl Default for Walk {
+    fn default() -> Self {
+        Self {
+            directories: 0,
+            entries: 0,
+            limit: MAX_WALK_ENTRIES,
+        }
+    }
+}
+/// One step of a directory's walk.
+enum Step {
+    Visit(String, EntryKind),
+    /// Walk the named directory's contents.
+    Descend(String),
+}
+impl Step {
+    /// Where the step falls in path order: a directory's contents sort as
+    /// `name/`, after `name.rs` and before `name0`.
+    fn key(&self) -> std::borrow::Cow<'_, str> {
+        match self {
+            Self::Visit(name, _) => name.into(),
+            Self::Descend(name) => format!("{name}/").into(),
+        }
+    }
+}
+impl Walk {
     fn walk(
         &mut self,
         directory: &Dir,
         prefix: &str,
         depth: usize,
+        visit: &mut Visit<'_>,
     ) -> Result<std::ops::ControlFlow<()>, HostFailure> {
         use std::ops::ControlFlow::{Break, Continue};
-        let mut entries = Vec::new();
+        // The whole directory is read before anything in it is visited: the
+        // file system lists entries in no particular order, so stopping part
+        // way through would leave an arbitrary prefix, not a sorted one.
+        // A directory that cannot be read whole within the walk's budget ends
+        // the walk before any of its entries, so what was found stays a
+        // sorted prefix; if it is where the walk started, nothing can be.
+        let first = self.entries == 0;
+        let mut steps = Vec::new();
         for entry in directory.entries().map_err(|e| io_failure(&e))? {
+            if self.entries == self.limit {
+                return if first {
+                    Err(failure(
+                        HostErrorCode::TooLarge,
+                        "the directory has more than 100,000 entries",
+                    ))
+                } else {
+                    Ok(Break(()))
+                };
+            }
+            self.entries += 1;
             let entry = entry.map_err(|e| io_failure(&e))?;
-            let file_type = entry.file_type().map_err(|e| io_failure(&e))?;
-            entries.push((entry.file_name().to_string_lossy().into_owned(), file_type));
+            let kind = kind(entry.file_type().map_err(|e| io_failure(&e))?);
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if kind == EntryKind::Directory {
+                if is_git(&name) {
+                    continue;
+                }
+                steps.push(Step::Descend(name.clone()));
+            }
+            steps.push(Step::Visit(name, kind));
         }
-        entries.sort_by(|a, b| a.0.cmp(&b.0));
-        for (name, file_type) in entries {
-            let relative = format!("{prefix}{name}");
-            match kind(file_type) {
-                EntryKind::Directory if !is_git(&name) => {
+        steps.sort_by(|a, b| a.key().cmp(&b.key()));
+        for step in steps {
+            match step {
+                Step::Visit(name, kind) => {
+                    let below = format!("{prefix}{name}");
+                    let entry = Entry {
+                        name: &name,
+                        below: &below,
+                        kind,
+                    };
+                    if visit(directory, &entry)?.is_break() {
+                        return Ok(Break(()));
+                    }
+                }
+                Step::Descend(name) => {
                     if depth == MAX_SEARCH_DEPTH || self.directories == MAX_SEARCH_DIRECTORIES {
                         return Ok(Break(()));
                     }
                     self.directories += 1;
                     let child = directory.open_dir(&name).map_err(|e| io_failure(&e))?;
                     if self
-                        .walk(&child, &format!("{relative}/"), depth + 1)?
+                        .walk(&child, &format!("{prefix}{name}/"), depth + 1, visit)?
                         .is_break()
                     {
                         return Ok(Break(()));
                     }
                 }
-                EntryKind::File => {
-                    if self.files == MAX_SEARCH_FILES || self.bytes >= MAX_SEARCH_BYTES {
-                        return Ok(Break(()));
-                    }
-                    self.files += 1;
-                    let Some(contents) = read_bounded(open_regular(directory, &name)?)? else {
-                        continue;
-                    };
-                    self.bytes += contents.len() as u64;
-                    let Ok(text) = String::from_utf8(contents) else {
-                        continue;
-                    };
-                    for (index, line) in text.lines().enumerate() {
-                        if !line.contains(self.query) {
-                            continue;
-                        }
-                        if self.result.matches.len() == self.limit {
-                            return Ok(Break(()));
-                        }
-                        self.result.matches.push(SearchMatch {
-                            path: relative.clone(),
-                            line: u32::try_from(index + 1).unwrap_or(u32::MAX),
-                            text: super::bounded(line, MAX_MATCH_TEXT).to_string(),
-                        });
-                    }
-                }
-                _ => {}
             }
         }
         Ok(Continue(()))
@@ -641,6 +847,48 @@ mod tests {
             std::fs::read_to_string(dir.path().join(&name)).unwrap(),
             contents
         );
+    }
+
+    #[test]
+    fn a_walk_stops_before_a_directory_it_cannot_read_within_its_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        // `a` and its contents sort before the two root files.
+        std::fs::create_dir(dir.path().join("a")).unwrap();
+        for name in ["a/1", "a/2", "a/3", "a/4", "b", "c"] {
+            std::fs::write(dir.path().join(name), "").unwrap();
+        }
+        let mut walk = Walk {
+            limit: 5,
+            ..Walk::default()
+        };
+        let mut seen = Vec::new();
+        let flow = walk
+            .walk(
+                &open_workspace(dir.path().into()).unwrap(),
+                "",
+                0,
+                &mut |_, entry| {
+                    seen.push(entry.below.to_owned());
+                    Ok(std::ops::ControlFlow::Continue(()))
+                },
+            )
+            .unwrap();
+        assert!(flow.is_break());
+        // Reading stopped at the budget, inside `a`, before visiting any of it.
+        assert_eq!(walk.entries, 5);
+        assert_eq!(seen, ["a"]);
+        // A starting directory larger than the budget is refused outright.
+        let mut small = Walk {
+            limit: 2,
+            ..Walk::default()
+        };
+        let refused = small.walk(
+            &open_workspace(dir.path().into()).unwrap(),
+            "",
+            0,
+            &mut |_, _| Ok(std::ops::ControlFlow::Continue(())),
+        );
+        assert_eq!(refused.unwrap_err().code, HostErrorCode::TooLarge);
     }
 
     #[cfg(unix)]

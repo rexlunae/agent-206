@@ -17,7 +17,7 @@ use std::sync::{MutexGuard, PoisonError};
 const MAX_TEXT: usize = 128 * 1024;
 
 impl Gateway {
-    fn accepting(&self) -> Result<MutexGuard<'_, std::collections::BTreeSet<Id>>> {
+    pub(super) fn accepting(&self) -> Result<MutexGuard<'_, std::collections::BTreeSet<Id>>> {
         self.accepting.lock().map_err(poisoned("steering"))
     }
     /// Start taking messages for `thread`'s native run. The caller holds the
