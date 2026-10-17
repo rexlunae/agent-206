@@ -119,7 +119,9 @@ fn worker(args: &[String]) {
         a206_extensions::worker::read_frame(&mut input).unwrap();
     if format!("{:?}", start.invocation).contains(STALL) {
         let pending = data_dir.join(format!("{STALLED}.tmp"));
-        std::fs::write(&pending, std::process::id().to_string()).unwrap();
+        // The ID, then the invocation, so a test finds only its own call's worker.
+        let record = format!("{}\n{:?}", std::process::id(), start.invocation);
+        std::fs::write(&pending, record).unwrap();
         std::fs::rename(pending, data_dir.join(STALLED)).unwrap();
         // A guest still computing: only being killed ends this early.
         std::thread::sleep(Duration::from_secs(60));
@@ -452,20 +454,12 @@ async fn cancelling_during_an_extension_call_kills_the_worker() {
     rig.permit(ToolPermission::Allow).await;
     let task = rig.send();
     let first = rig.next_request().await;
-    let call = Call::new(&rig.tool, json!({"path": format!("{STALL}-{}", nonce())}));
+    let marker = format!("{STALL}-{}", nonce());
+    let call = Call::new(&rig.tool, json!({"path": &marker}));
     first
         .respond(calls_response(API, std::slice::from_ref(&call), ""))
         .await;
-    let pid: u32 = tokio::time::timeout(PATIENCE, async {
-        loop {
-            if let Some(pid) = stalled_worker(rig.state.path()) {
-                return pid;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    })
-    .await
-    .unwrap_or_else(wait("the extension worker to start"));
+    let pid = stalled(&rig, &marker).await;
     assert!(alive(pid), "the worker is running the call");
     assert_eq!(calls_of(&rig.thread())[0].state, ToolCallState::Running);
     rig.ok(Command::CancelRun { thread: rig.thread }).await;
@@ -491,11 +485,12 @@ async fn withdrawing_the_extension_stops_its_running_call() {
         rig.permit(ToolPermission::Allow).await;
         let task = rig.send();
         let first = rig.next_request().await;
-        let call = Call::new(&rig.tool, json!({"path": format!("{STALL}-{}", nonce())}));
+        let marker = format!("{STALL}-{}", nonce());
+        let call = Call::new(&rig.tool, json!({"path": &marker}));
         first
             .respond(calls_response(API, std::slice::from_ref(&call), ""))
             .await;
-        let pid = stalled(&rig).await;
+        let pid = stalled(&rig, &marker).await;
         // The conversation still permits the tool; only the user's authority
         // over the extension itself is withdrawn.
         if disable {
@@ -519,11 +514,12 @@ async fn withdrawing_the_extension_stops_its_running_call() {
         gone(pid).await;
     }
 }
-/// Wait for the worker of a stalled call; its host process ID.
-async fn stalled(rig: &Rig) -> u32 {
+/// Wait for the worker of the stalled call carrying `marker`; its host
+/// process ID.
+async fn stalled(rig: &Rig, marker: &str) -> u32 {
     tokio::time::timeout(PATIENCE, async {
         loop {
-            if let Some(pid) = stalled_worker(rig.state.path()) {
+            if let Some(pid) = stalled_worker(rig.state.path(), marker) {
                 return pid;
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
@@ -546,10 +542,12 @@ async fn gone(pid: u32) {
 /// The host process ID of a worker that announced it stalled. Linux workers
 /// run confined, with the sandbox's scratch directory as their data directory
 /// and their own PID namespace, so the process found is this process's child
-/// whose arguments name that directory; elsewhere the worker shares the
-/// gateway's data directory and writes its own ID.
+/// whose arguments name that directory. macOS workers are confined too but
+/// share the host's PIDs, so the ID they write in their scratch directory is
+/// the host's. Elsewhere the worker shares the gateway's data directory. Only
+/// a record naming `marker`, unique to the test's call, counts.
 #[cfg(target_os = "linux")]
-fn stalled_worker(_state: &Path) -> Option<u32> {
+fn stalled_worker(_state: &Path, marker: &str) -> Option<u32> {
     let tasks = std::fs::read_dir("/proc/self/task").ok()?;
     let children = tasks
         .flatten()
@@ -572,18 +570,41 @@ fn stalled_worker(_state: &Path) -> Option<u32> {
             continue;
         };
         let data_dir = Path::new(std::str::from_utf8(data_dir).ok()?);
-        if args.iter().any(|a| *a == b"extension-worker") && data_dir.join(STALLED).exists() {
+        if args.iter().any(|a| *a == b"extension-worker")
+            && stalled_record(&data_dir.join(STALLED), marker).is_some()
+        {
             return Some(pid);
         }
     }
     None
 }
-#[cfg(not(target_os = "linux"))]
-fn stalled_worker(state: &Path) -> Option<u32> {
-    std::fs::read_to_string(state.join(STALLED))
+#[cfg(target_os = "macos")]
+fn stalled_worker(_state: &Path, marker: &str) -> Option<u32> {
+    // Each confined worker's scratch directory is a fresh `a206-confined-`
+    // directory in the temporary directory; only this binary stalls workers.
+    std::fs::read_dir(std::env::temp_dir())
         .ok()?
-        .parse()
-        .ok()
+        .flatten()
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("a206-confined-")
+        })
+        .find_map(|entry| stalled_record(&entry.path().join(STALLED), marker))
+}
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn stalled_worker(state: &Path, marker: &str) -> Option<u32> {
+    stalled_record(&state.join(STALLED), marker)
+}
+/// The process ID in the stall record at `path`, if it is `marker`'s call.
+fn stalled_record(path: &Path, marker: &str) -> Option<u32> {
+    let record = std::fs::read_to_string(path).ok()?;
+    let (pid, invocation) = record.split_once('\n')?;
+    invocation
+        .contains(marker)
+        .then(|| pid.parse().ok())
+        .flatten()
 }
 
 /// Whether `pid` is still running; an exited, unreaped child is not.
