@@ -11,6 +11,7 @@ a206-extensions.workspace = true
 a206-mcp.workspace = true
 a206-vault.workspace = true
 a206-broker.workspace = true
+a206-sandbox.workspace = true
 serde.workspace = true
 schemars = "1"
 serde_json.workspace = true
@@ -44,5 +45,9 @@ tracing-subscriber.workspace = true
 tempfile.workspace = true
 a206-broker.workspace = true
 a206-vault.workspace = true
+[[test]]
+name = "coding_backends"
+path = "tests/coding_backends/main.rs"
+harness = false
 [lints]
 workspace = true

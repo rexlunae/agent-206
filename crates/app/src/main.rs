@@ -782,9 +782,20 @@ mod native {
     }
 }
 #[cfg(not(target_arch = "wasm32"))]
-fn main() {
+fn main() -> std::process::ExitCode {
+    // The gateway re-runs this executable as its Linux sandbox helper; that
+    // must happen before anything else starts threads.
+    match a206_sandbox::dispatch() {
+        None => {}
+        Some(Ok(code)) => return code,
+        Some(Err(error)) => {
+            eprintln!("Agent 206 sandbox: {:#}", anyhow::Error::new(error));
+            return std::process::ExitCode::FAILURE;
+        }
+    }
     if let Err(error) = native::run() {
         eprintln!("Agent 206: {error:#}");
-        std::process::exit(1);
+        return std::process::ExitCode::FAILURE;
     }
+    std::process::ExitCode::SUCCESS
 }

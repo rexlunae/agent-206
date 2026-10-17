@@ -135,6 +135,7 @@ dependencies = [
  "a206-extensions",
  "a206-mcp",
  "a206-protocol",
+ "a206-sandbox",
  "a206-vault",
  "agent-client-protocol",
  "async-io",
@@ -164,6 +165,21 @@ dependencies = [
  "url",
  "uuid",
  "zeroize",
+]
+
+[[package]]
+name = "a206-sandbox"
+version = "0.1.0"
+dependencies = [
+ "a206-core",
+ "base64 0.22.1",
+ "landlock",
+ "rmp-serde",
+ "serde",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -278,6 +294,7 @@ dependencies = [
  "a206-import",
  "a206-protocol",
  "a206-runtime",
+ "a206-sandbox",
  "a206-ui",
  "a206-vault",
  "anyhow",
@@ -2626,6 +2643,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "enumflags2"
+version = "0.7.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1027f7680c853e056ebcec683615fb6fbbc07dbaa13b4d5d9442b146ded4ecef"
+dependencies = [
+ "enumflags2_derive",
+]
+
+[[package]]
+name = "enumflags2_derive"
+version = "0.7.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "67c78a4d8fdf9953a5c9d458f9efe940fd97a0cab0941c075a813ac594733827"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "enumset"
 version = "1.1.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4491,6 +4528,17 @@ name = "lab"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bf36173d4167ed999940f804952e6b08197cae5ad5d572eb4db150ce8ad5d58f"
+
+[[package]]
+name = "landlock"
+version = "0.4.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4cca98e95f35b29d469dade6724c6f96cec9236640f745a0e99b0334ec320ab1"
+dependencies = [
+ "enumflags2",
+ "libc",
+ "thiserror 2.0.21",
+]
 
 [[package]]
 name = "lazy-js-bundle"

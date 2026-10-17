@@ -104,6 +104,7 @@ pub(crate) fn classify(error: &(dyn Error + 'static)) -> Option<ErrorKind> {
         a206_extensions::abi::HostFailure,
         a206_mcp::McpError,
         a206_protocol::Error,
+        a206_sandbox::SandboxError,
         reqwest::Error,
     );
     if let Some(kind) = a206_extensions::classify(error) {
@@ -157,6 +158,12 @@ impl Classified for a206_mcp::McpError {
             | ProjectMismatch
             | Revoked => ErrorKind::PermissionDenied,
         })
+    }
+}
+
+impl Classified for a206_sandbox::SandboxError {
+    fn kind(&self) -> Option<ErrorKind> {
+        a206_sandbox::SandboxError::kind(self)
     }
 }
 
