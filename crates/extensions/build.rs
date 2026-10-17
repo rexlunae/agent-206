@@ -2,7 +2,10 @@
 //! genuine `wasm32-unknown-unknown` modules rather than native code.
 use std::{path::PathBuf, process::Command};
 
-const BUILTINS: &[(&str, &str)] = &[("a206-plugin-workspace", "a206_plugin_workspace")];
+const BUILTINS: &[(&str, &str)] = &[
+    ("a206-plugin-workspace", "a206_plugin_workspace"),
+    ("a206-plugin-git", "a206_plugin_git"),
+];
 
 fn main() {
     for path in [

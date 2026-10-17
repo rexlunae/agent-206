@@ -286,6 +286,63 @@ fn search_tool_reports_matches_and_truncation() {
 }
 
 #[test]
+fn git_tool_renders_status_from_host_calls() {
+    let builtin = builtin("agent206.git").unwrap().unwrap();
+    let (branch, path) = (unique("branch"), unique("file"));
+    let status = GitStatus {
+        branch: Some(branch.clone()),
+        head: None,
+        entries: vec![GitEntry {
+            path: path.clone(),
+            area: GitArea::Staged,
+            change: GitChange::Added,
+        }],
+        truncated: false,
+    };
+    let (bridge, seen) = mock(move |_| HostReply::GitStatus(status.clone()));
+    let (outcome, _) = engine::run(
+        builtin.wasm,
+        &tool("git_status", &[]),
+        Limits::default(),
+        bridge,
+    );
+    let Ok(Outcome::Tool(output)) = outcome else {
+        panic!("expected tool output, got {outcome:?}");
+    };
+    assert_eq!(
+        output.text,
+        format!("on {branch}, no commits yet\nstaged added {path}")
+    );
+    assert_eq!(*seen.borrow(), vec![HostRequest::GitStatus]);
+}
+
+/// A diff at the host's limit still fits the outcome limit once the guest
+/// adds its headers, however long the path.
+#[test]
+fn long_diffs_fit_the_outcome_limit() {
+    let builtin = builtin("agent206.git").unwrap().unwrap();
+    let limits = Limits::default();
+    let path = unique("p").repeat(limits.output_bytes / 16);
+    let reply = GitDiff {
+        text: "+x\n".repeat(limits.output_bytes / 4),
+        binary: false,
+        truncated: true,
+    };
+    let (bridge, _) = mock(move |_| HostReply::Diff(reply.clone()));
+    let (outcome, _) = engine::run(
+        builtin.wasm,
+        &tool("git_diff", &[("path", Value::Str(path.clone()))]),
+        limits,
+        bridge,
+    );
+    let Ok(Outcome::Tool(output)) = outcome else {
+        panic!("expected tool output, got {outcome:?}");
+    };
+    assert!(output.text.starts_with(&format!("--- a/{path}\n")));
+    assert!(output.text.ends_with(" bytes]"));
+}
+
+#[test]
 fn budgets_stop_the_guest() {
     let reply = |_: &HostRequest| HostReply::Directory(vec![]);
     let (fuel, _) = engine::run(

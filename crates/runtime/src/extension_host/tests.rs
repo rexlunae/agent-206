@@ -1,6 +1,8 @@
 //! Policy and host calls, exercised without a worker process. The end-to-end
 //! path through the real worker is covered by the app's smoke test.
 use super::*;
+
+mod git;
 use a206_extensions::abi::{EntryKind, SearchMatch};
 
 fn store() -> (tempfile::TempDir, Arc<Mutex<Store>>) {
