@@ -2,7 +2,7 @@
 //! gateway authorizes against the caller's `read_workspace` grant.
 use a206_extension_sdk::{
     Args, DirEntry, EntryKind, Extension, Field, GuestError, Node, Tone, ToolOutput, UiEvent, View,
-    host, string_arg,
+    bool_arg, host, int_arg, string_arg,
 };
 
 struct Workspace;
@@ -12,6 +12,7 @@ a206_extension_sdk::export!(Workspace);
 const SHOW_HIDDEN: &str = "show_hidden";
 const TOGGLE_HIDDEN: &str = "toggle-hidden";
 const README_LINES: usize = 40;
+const DEFAULT_MATCHES: i64 = 100;
 /// Text a tool returns, kept well inside the host's 256 KiB outcome limit.
 const MAX_TOOL_TEXT: usize = 192 * 1024;
 
@@ -27,10 +28,55 @@ impl Extension for Workspace {
                 })
             }
             "read_text_file" => {
-                let path = string_arg(args, "path")?
-                    .ok_or_else(|| GuestError::new("invalid_argument", "`path` is required"))?;
+                let path = required(args, "path")?;
                 Ok(ToolOutput {
                     text: excerpt(text(host::read_file(path)?)?),
+                })
+            }
+            "search_text" => {
+                let query = required(args, "query")?;
+                let path = string_arg(args, "path")?.unwrap_or(".");
+                let max = int_arg(args, "max_matches")?.unwrap_or(DEFAULT_MATCHES);
+                let max = u32::try_from(max.clamp(1, 500)).unwrap_or(1);
+                let found = host::search(path, query, max)?;
+                let mut lines: Vec<String> = found
+                    .matches
+                    .iter()
+                    .map(|m| format!("{}:{}: {}", m.path, m.line, m.text))
+                    .collect();
+                if lines.is_empty() {
+                    lines.push("no matches".into());
+                }
+                if found.truncated {
+                    lines.push("[more matches may exist; the search stopped at a limit]".into());
+                }
+                Ok(ToolOutput {
+                    text: excerpt(lines.join("\n")),
+                })
+            }
+            "write_text_file" => {
+                let path = required(args, "path")?;
+                let text = required(args, "text")?;
+                let overwrite = bool_arg(args, "overwrite")?.unwrap_or(false);
+                if let Some((parent, _)) = path.rsplit_once('/')
+                    && !parent.is_empty()
+                {
+                    host::create_directory(parent)?;
+                }
+                host::write_file(path, text.as_bytes(), overwrite)?;
+                Ok(ToolOutput {
+                    text: format!("wrote {} bytes to {path}", text.len()),
+                })
+            }
+            "edit_text_file" => {
+                let path = required(args, "path")?;
+                host::edit_file(
+                    path,
+                    required(args, "old_text")?,
+                    required(args, "new_text")?,
+                )?;
+                Ok(ToolOutput {
+                    text: format!("edited {path}"),
                 })
             }
             _ => Err(GuestError::new("unknown_tool", format!("no tool `{name}`"))),
@@ -144,4 +190,8 @@ fn excerpt(mut text: String) -> String {
         "\n\n[truncated: showing the first {end} of {total} bytes]"
     ));
     text
+}
+fn required<'a>(args: &'a Args, name: &str) -> Result<&'a str, GuestError> {
+    string_arg(args, name)?
+        .ok_or_else(|| GuestError::new("invalid_argument", format!("`{name}` is required")))
 }

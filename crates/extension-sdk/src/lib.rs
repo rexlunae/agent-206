@@ -62,6 +62,29 @@ pub fn string_arg<'a>(args: &'a Args, name: &str) -> Result<Option<&'a str>, Gue
     }
 }
 
+/// An optional boolean argument; the host already checked its declared kind.
+pub fn bool_arg(args: &Args, name: &str) -> Result<Option<bool>, GuestError> {
+    match args.get(name) {
+        None | Some(Value::Nil) => Ok(None),
+        Some(Value::Bool(value)) => Ok(Some(*value)),
+        Some(_) => Err(GuestError::new(
+            "invalid_argument",
+            format!("`{name}` must be a boolean"),
+        )),
+    }
+}
+/// An optional integer argument; the host already checked its declared kind.
+pub fn int_arg(args: &Args, name: &str) -> Result<Option<i64>, GuestError> {
+    match args.get(name) {
+        None | Some(Value::Nil) => Ok(None),
+        Some(Value::Int(value)) => Ok(Some(*value)),
+        Some(_) => Err(GuestError::new(
+            "invalid_argument",
+            format!("`{name}` must be an integer"),
+        )),
+    }
+}
+
 thread_local! {
     static INPUT: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
     static OUTPUT: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
@@ -187,6 +210,43 @@ pub mod host {
     pub fn list_directory(path: &str) -> Result<Vec<DirEntry>, HostFailure> {
         match call(&HostRequest::ListDirectory { path: path.into() })? {
             HostReply::Directory(entries) => Ok(entries),
+            _ => Err(unexpected()),
+        }
+    }
+    /// Lines containing `query` in UTF-8 files under `path`.
+    pub fn search(path: &str, query: &str, max_matches: u32) -> Result<SearchResult, HostFailure> {
+        match call(&HostRequest::Search {
+            path: path.into(),
+            query: query.into(),
+            max_matches,
+        })? {
+            HostReply::Matches(result) => Ok(result),
+            _ => Err(unexpected()),
+        }
+    }
+    /// Write a whole file atomically; `overwrite` allows replacing one.
+    pub fn write_file(path: &str, contents: &[u8], overwrite: bool) -> Result<(), HostFailure> {
+        done(call(&HostRequest::WriteFile {
+            path: path.into(),
+            contents: ByteBuf::from(contents.to_vec()),
+            overwrite,
+        })?)
+    }
+    /// Replace the only occurrence of `old` with `new` in a text file.
+    pub fn edit_file(path: &str, old: &str, new: &str) -> Result<(), HostFailure> {
+        done(call(&HostRequest::EditFile {
+            path: path.into(),
+            old: old.into(),
+            new: new.into(),
+        })?)
+    }
+    /// Create a directory and any missing parents.
+    pub fn create_directory(path: &str) -> Result<(), HostFailure> {
+        done(call(&HostRequest::CreateDirectory { path: path.into() })?)
+    }
+    fn done(reply: HostReply) -> Result<(), HostFailure> {
+        match reply {
+            HostReply::Done => Ok(()),
             _ => Err(unexpected()),
         }
     }

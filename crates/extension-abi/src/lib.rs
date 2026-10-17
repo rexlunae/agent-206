@@ -157,6 +157,29 @@ pub enum HostRequest {
     ReadFile { path: String },
     /// List a directory, relative to the invocation's workspace.
     ListDirectory { path: String },
+    /// Find lines containing `query` (literal, case-sensitive) in UTF-8 files
+    /// under `path`, without following symlinks.
+    Search {
+        path: String,
+        query: String,
+        max_matches: u32,
+    },
+    /// Write a whole file atomically. Without `overwrite`, an existing file
+    /// is refused with [`HostErrorCode::Exists`].
+    WriteFile {
+        path: String,
+        contents: ByteBuf,
+        overwrite: bool,
+    },
+    /// Replace the only occurrence of `old` with `new` in a UTF-8 file. No
+    /// occurrence, or more than one, is [`HostErrorCode::Conflict`].
+    EditFile {
+        path: String,
+        old: String,
+        new: String,
+    },
+    /// Create a directory and any missing parents.
+    CreateDirectory { path: String },
     /// Read this extension's own persisted state.
     StateGet { key: String },
     /// Replace (`Some`) or delete (`None`) this extension's state entry.
@@ -176,6 +199,7 @@ pub enum LogLevel {
 pub enum HostReply {
     File(ByteBuf),
     Directory(Vec<DirEntry>),
+    Matches(SearchResult),
     State(Option<ByteBuf>),
     Done,
     Failed(HostFailure),
@@ -186,6 +210,21 @@ pub struct DirEntry {
     pub kind: EntryKind,
     /// File size in bytes; absent for directories and unknown sizes.
     pub size: Option<u64>,
+}
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SearchResult {
+    pub matches: Vec<SearchMatch>,
+    /// The search stopped early at a bound; more matches may exist.
+    pub truncated: bool,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SearchMatch {
+    /// Workspace-relative, `/`-separated.
+    pub path: String,
+    /// 1-based.
+    pub line: u32,
+    /// The matching line, possibly shortened.
+    pub text: String,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -214,6 +253,10 @@ pub enum HostErrorCode {
     /// The request was malformed, e.g. an absolute or escaping path.
     Invalid,
     TooLarge,
+    /// The target already exists and the request did not allow replacing it.
+    Exists,
+    /// The file does not hold what the edit expected.
+    Conflict,
     /// The invocation's host-call or state budget is spent.
     Budget,
     /// This host does not implement the request.
@@ -231,6 +274,8 @@ impl HostErrorCode {
             Self::NotFound => "not_found",
             Self::Invalid => "invalid",
             Self::TooLarge => "too_large",
+            Self::Exists => "exists",
+            Self::Conflict => "conflict",
             Self::Budget => "budget",
             Self::Unsupported => "unsupported",
             Self::Io => "io",

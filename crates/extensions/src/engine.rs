@@ -35,7 +35,7 @@ impl Default for Limits {
             input_bytes: 1024 * 1024,
             output_bytes: 256 * 1024,
             host_calls: 256,
-            host_request_bytes: 128 * 1024,
+            host_request_bytes: 1024 * 1024,
             host_reply_bytes: 1024 * 1024,
         }
     }
