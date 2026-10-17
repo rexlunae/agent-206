@@ -31,6 +31,39 @@ fn unsupported(message: &'static str) -> HostFailure {
     failure(HostErrorCode::Unsupported, message)
 }
 
+/// Most entries a repository's metadata may hold for it to be checked.
+const MAX_METADATA_ENTRIES: usize = 200_000;
+
+/// Refuse a repository whose metadata holds a symbolic link anywhere, such
+/// as a pack directory or loose object pointing outside the project.
+fn contained(git_dir: &std::path::Path) -> Result<(), HostFailure> {
+    let mut pending = vec![git_dir.to_path_buf()];
+    let mut seen = 0usize;
+    while let Some(directory) = pending.pop() {
+        let entries = std::fs::read_dir(&directory).map_err(|e| git_failure("open", &e))?;
+        for entry in entries {
+            let entry = entry.map_err(|e| git_failure("open", &e))?;
+            seen += 1;
+            if seen > MAX_METADATA_ENTRIES {
+                return Err(unsupported(
+                    "the repository has too many loose files to check; pack it with `git gc`",
+                ));
+            }
+            // `DirEntry::file_type` describes the entry itself, not a link target.
+            let kind = entry.file_type().map_err(|e| git_failure("open", &e))?;
+            if kind.is_symlink() {
+                return Err(unsupported(
+                    "repository metadata that is a symbolic link is not supported",
+                ));
+            }
+            if kind.is_dir() {
+                pending.push(entry.path());
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Open the repository at exactly the workspace root, never a parent: either
 /// a `.git` directory there or a bare repository that is the root itself.
 /// Every piece of repository metadata must live inside the project, so a
@@ -54,14 +87,7 @@ fn open(root: PathBuf) -> Result<gix::Repository, HostFailure> {
             ));
         }
     };
-    let linked = ["HEAD", "config", "index", "packed-refs", "objects", "refs"]
-        .iter()
-        .any(|name| std::fs::symlink_metadata(git_dir.join(name)).is_ok_and(|m| m.is_symlink()));
-    if linked {
-        return Err(unsupported(
-            "repository metadata that is a symbolic link is not supported",
-        ));
-    }
+    contained(&git_dir)?;
     let shared = ["commondir", "objects/info/alternates"]
         .iter()
         .any(|name| std::fs::symlink_metadata(git_dir.join(name)).is_ok());

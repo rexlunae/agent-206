@@ -257,6 +257,16 @@ async fn repository_metadata_outside_the_project_is_refused() {
         assert_eq!(status(linked).await, Some(HostErrorCode::Unsupported));
     }
 
+    #[cfg(unix)]
+    {
+        let packs = project("packs");
+        repository(&packs, &[("a.txt", "a\n")]);
+        let pack = packs.join(".git/objects/pack");
+        std::fs::remove_dir_all(&pack).unwrap();
+        std::os::unix::fs::symlink(outside_git.join("objects/pack"), &pack).unwrap();
+        assert_eq!(status(packs).await, Some(HostErrorCode::Unsupported));
+    }
+
     let alternates = project("alternates");
     repository(&alternates, &[("a.txt", "a\n")]);
     std::fs::write(
@@ -338,7 +348,8 @@ async fn oversized_blobs_are_refused() {
     let (dir, store) = store();
     let root = dir.path().join("repo");
     std::fs::create_dir(&root).unwrap();
-    let big = "x".repeat(MAX_FILE as usize + 1);
+    // The documented per-side limit, written out so the test pins it.
+    let big = "x".repeat(512 * 1024 + 1);
     repository(&root, &[("big.txt", big.as_str())]);
     let mut host = workspace_calls(&store, Some(root), &[Capability::GitRead]);
     assert_eq!(

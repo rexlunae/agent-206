@@ -132,7 +132,7 @@ Git calls use gitoxide on the repository at exactly the project root (never a
 parent directory): a `.git` directory there, or a bare repository that is the
 root itself. All repository metadata must be inside the project, so a `.git`
 file or symlink (linked worktrees, submodule checkouts), a `commondir`,
-`objects/info/alternates` or symlinked metadata is refused as `unsupported`,
+`objects/info/alternates` or a symbolic link anywhere in the metadata is refused as `unsupported`,
 and `core.worktree` is ignored. They read no system or global git configuration and no
 `GIT_*` environment, and nothing the repository configures can run: no hooks,
 filter, diff, textconv, fsmonitor or credential programs. The working-tree side
