@@ -127,6 +127,10 @@ pub struct ToolCall {
     /// How an output rule reduced `output` before the model saw it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reduction: Option<OutputReduction>,
+    /// Credentials removed from the result before the model saw it, by
+    /// kind. The removed text is not kept.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub redactions: Vec<OutputCount>,
 }
 
 /// How an output rule reduced a tool result. The reduced text is the call's

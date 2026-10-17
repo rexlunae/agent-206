@@ -826,6 +826,7 @@ impl Gateway {
                 error: None,
                 signature: streamed.signature,
                 reduction: None,
+                redactions: Vec::new(),
             };
             let usable = match parsed {
                 Err(error) => {
@@ -1050,9 +1051,21 @@ impl Gateway {
             return Ok(true);
         }
         let whole = routed.spec.whole_output;
+        // Credentials are removed first, so no rule counts or keeps them,
+        // and again afterwards, since a rule can join a credential's parts
+        // (stripping terminal escapes from inside it).
         let reduce = |record: &mut ToolCall, text: String| {
+            let (text, mut redactions) = redact_output(&record.tool, text);
             let (text, reduction) =
                 reduce_output(rules, &record.tool, command.as_deref(), text, whole);
+            let text = if reduction.is_some() {
+                let (text, more) = redact_output(&record.tool, text);
+                merge_counts(&mut redactions, more);
+                text
+            } else {
+                text
+            };
+            record.redactions = redactions;
             record.reduction = reduction;
             text
         };
@@ -1083,14 +1096,19 @@ impl Gateway {
                     });
                     record.output = Some(text);
                 }
-                Err(cause) => settle(
-                    record,
-                    ToolCallState::Failed,
-                    &ToolError::Host {
-                        tool: record.tool.clone(),
-                        cause,
-                    },
-                ),
+                Err(cause) => {
+                    settle(
+                        record,
+                        ToolCallState::Failed,
+                        &ToolError::Host {
+                            tool: record.tool.clone(),
+                            cause,
+                        },
+                    );
+                    // A host's failure can quote what the tool returned,
+                    // such as an MCP server's error message.
+                    redact_failure(record);
+                }
             },
         )?;
         Ok(true)
@@ -1235,6 +1253,56 @@ fn settle(call: &mut ToolCall, state: ToolCallState, why: &ToolError) {
     call.error = Some(report);
 }
 
+/// A tool result without the credential-shaped text it contained, and how
+/// often each kind was removed. Applies to every result, whole ones too.
+fn redact_output(tool: &str, text: String) -> (String, Vec<OutputCount>) {
+    let Some(redacted) = a206_leak_scan::redact(&text) else {
+        return (text, Vec::new());
+    };
+    let found: Vec<_> = redacted
+        .found
+        .into_iter()
+        .map(|found| OutputCount {
+            name: found.kind.to_owned(),
+            count: found.count,
+        })
+        .collect();
+    tracing::info!(
+        tool,
+        kinds = ?found.iter().map(|count| count.name.as_str()).collect::<Vec<_>>(),
+        "removed credentials from a tool result"
+    );
+    (redacted.text, found)
+}
+
+/// Add `more` to `counts`, keeping one entry per name in name order.
+fn merge_counts(counts: &mut Vec<OutputCount>, more: Vec<OutputCount>) {
+    for count in more {
+        match counts.iter_mut().find(|known| known.name == count.name) {
+            Some(known) => known.count += count.count,
+            None => counts.push(count),
+        }
+    }
+    counts.sort_by(|a, b| a.name.cmp(&b.name));
+}
+
+/// Remove credentials from a failed call's model text and from every link
+/// of its report, recording the kinds removed from the model text.
+fn redact_failure(record: &mut ToolCall) {
+    if let Some(output) = record.output.take() {
+        let (output, redactions) = redact_output(&record.tool, output);
+        record.output = Some(output);
+        record.redactions = redactions;
+    }
+    let mut link = record.error.as_mut();
+    while let Some(report) = link {
+        if let Some(redacted) = a206_leak_scan::redact(&report.message) {
+            report.message = redacted.text;
+        }
+        link = report.source.as_deref_mut();
+    }
+}
+
 /// The result the model receives after the output rules, and how a rule
 /// changed it. Results only useful whole are never reduced.
 fn reduce_output(
@@ -1372,6 +1440,7 @@ mod output_tests {
             error: None,
             signature: None,
             reduction: None,
+            redactions: Vec::new(),
         }
     }
     #[test]
