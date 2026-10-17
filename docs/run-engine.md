@@ -64,10 +64,13 @@ ceiling. A delegated conversation cannot be set above its parent, and a parent
 narrowed later narrows its descendants at their next decision.
 
 Withdrawn authority also stops work in flight. `SetToolPermission`,
-`ConfigureThread` and `SetBackend` wake every run, which re-decides its running
-call and its pending approval against the conversation and its ancestors. A
-running call that is no longer permitted (Deny, or Ask for a call the user did
-not approve) is dropped, which stops it, and is settled `Denied` with a
+`ConfigureThread`, `SetBackend`, `GrantExtension` and `EnableExtension` wake
+every run, which re-decides its running call and its pending approval against
+the conversation and its ancestors, and lists the tools again to confirm the
+call's host still offers that tool with the same capabilities (an extension
+the user disabled or ungranted no longer does). A running call that is no
+longer permitted (Deny, or Ask for a call the user did not approve, or a tool
+its host withdrew) is dropped, which stops it, and is settled `Denied` with a
 `PermissionDenied` report; a pending approval whose tool is now denied ends with
 `ApprovalResolved { outcome: Revoked }`. The run continues with the refusal as
 that call's result.
@@ -128,6 +131,59 @@ so its kind and causes survive the process boundary.
 capabilities. `ToolRequest::approved` is true only after the user approved that
 exact call.
 
+### WASM extensions
+
+`ExtensionToolHost` (`crates/runtime/src/extension_tools.rs`) is registered by
+`Gateway::open`, so every gateway offers extension tools; it needs only the
+`ExtensionHost` it wraps.
+
+- **Listing.** `ExtensionHost::tool_sources()` returns each enabled
+  extension's tools from its validated manifest, keeping only tools whose
+  declared capabilities the user granted to the extension. Disabled or
+  ungranted tools are never listed, and nothing here can enable an extension
+  or change a grant. An extension whose manifest cannot be loaded is reported
+  in `unavailable` (source: its id) with a structured report; if the
+  extensions cannot be read at all, the source is `extensions`.
+- **Names.** `ext__<extension id>__<tool>`, every `.` of the id written as
+  `_` (`ext__agent206_workspace__read_text_file`). Because that mapping can
+  merge ids, a name derived for more than one tool is offered for none of them
+  (`Conflict` per claimant), and a name over 64 characters is refused
+  (`InvalidRequest`); names are never truncated. Listing and calling derive
+  names the same way, and a call re-reads the extensions, so a tool disabled
+  or ungranted after the listing is `NotFound`.
+- **Spec.** The schema is `{"type": "object", "properties": {<param>: {"type",
+  "description"}}, "required": [...], "additionalProperties": false}` from
+  the `ParamSpec`s; `capabilities` are the tool's manifest declaration; the
+  host policy is Allow, so the conversation's setting (deny when unset)
+  decides.
+- **Arguments.** JSON values convert kind for kind (`null` → nil, integers that
+  fit `i64` → integer, other numbers → float, arrays, objects). An integer
+  beyond `i64` is refused; nothing is coerced. `call_tool` then checks them
+  against the declaration (unknown, missing or mistyped parameters) before a
+  worker starts. Every failure is an `ErrorReport` (`InvalidRequest` for
+  arguments) the model receives as `tool … failed: …` text.
+- **Authority.** `call_tool(extension, tool, args, Scope { workspace, ceiling:
+  Some(scope.capabilities) })`. The gateway already denies a tool whose
+  declaration exceeds the conversation's grant within its mode ceiling
+  (ancestors attenuated it); the extension host checks the declaration again
+  against the user's grant to the extension and that ceiling, and relayed
+  host calls are re-checked against the same intersection. The extension never
+  receives more than user grant ∩ mode ∩ thread (∩ parent) ∩ manifest.
+- **Results.** A successful outcome is `ToolOutput { is_error: false }`. A
+  guest's own `failed` outcome stays an `ExtensionError::Guest` report, so the
+  last host call the gateway refused remains its cause rather than flattened
+  text.
+- **Bounds and cancellation.** Each call is one worker child with the
+  plugin-api limits (fuel, memory, input/output, host calls, 10 s wall time).
+  Dropping the call future kills the worker (`kill_on_drop`); a bounded
+  workspace read already on the blocking pool finishes and is discarded, and
+  extension state written before the drop stays. The call is therefore safe to
+  cancel but does not resume.
+
+Tests: `crates/runtime/src/extension_tools/tests.rs` (listing, naming,
+conversion, checks before the worker) and `crates/runtime/tests/extension_tools.rs`
+(native runs through the real worker; the test binary doubles as the worker).
+
 ### Adapters still to write
 
 - MCP client (PR #16): `list` maps `Gateway::mcp_offers(thread)` to specs named
@@ -136,12 +192,8 @@ exact call.
   `ToolSpec::capabilities`, and `unavailable` servers to `UnavailableTools`.
   `call` passes `Approval::Approved` when `request.approved` and flattens
   `a206_mcp::ToolOutput` content blocks to text, keeping `is_error`.
-- WASM extensions (PR #18): `list` maps `Gateway::extensions().tools()` to specs
-  named per extension, converting `ParamSpec` lists to a JSON Schema object;
-  `call` converts the JSON arguments to `a206_core::extension::Args` and calls
-  `call_tool(extension, tool, args, Scope { workspace, ceiling: Some(scope.capabilities) })`.
 
-Both adapters need only the gateway handle they wrap; the run engine is unchanged.
+It needs only the gateway handle it wraps; the run engine is unchanged.
 
 ## Not implemented
 

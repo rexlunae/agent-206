@@ -110,6 +110,7 @@ pub(crate) fn classify(error: &(dyn Error + 'static)) -> Option<ErrorKind> {
         a206_broker::BrokerError,
         a206_broker::ClientError,
         crate::extension_host::ExtensionError,
+        crate::extension_tools::ExtensionToolError,
         a206_extensions::abi::HostFailure,
         a206_mcp::McpError,
         a206_protocol::Error,
