@@ -3,6 +3,40 @@
 use super::*;
 use a206_extensions::abi::{GitArea, GitChange, GitDiff};
 
+#[tokio::test]
+async fn success_after_the_deadline_remains_a_budget_failure() {
+    let reply = super::super::git_call_with_timeout(
+        |interrupt| {
+            while !interrupt.load(std::sync::atomic::Ordering::Relaxed) {
+                std::thread::yield_now();
+            }
+            Ok(HostReply::Commits(Vec::new()))
+        },
+        std::time::Duration::ZERO,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(reply.code, HostErrorCode::Budget);
+}
+
+#[tokio::test]
+async fn pathological_line_counts_are_refused_before_diff_computation() {
+    let (dir, store) = store();
+    repository(dir.path(), &[("many.txt", &"a\n".repeat(10_000))]);
+    std::fs::write(dir.path().join("many.txt"), "b\n".repeat(10_000)).unwrap();
+    let mut host = workspace_calls(&store, Some(dir.path().into()), &[Capability::GitRead]);
+    assert_eq!(
+        code(
+            host.handle(HostRequest::GitDiff {
+                path: "many.txt".into(),
+                staged: false,
+            })
+            .await
+        ),
+        Some(HostErrorCode::Budget)
+    );
+}
+
 /// A repository at `root` whose single commit holds `files`, with a matching
 /// index and working tree.
 fn repository(root: &std::path::Path, files: &[(&str, &str)]) -> (String, String) {

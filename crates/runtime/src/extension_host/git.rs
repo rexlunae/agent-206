@@ -146,6 +146,7 @@ pub(super) fn status(root: PathBuf, interrupt: Arc<AtomicBool>) -> Result<HostRe
         ..GitStatus::default()
     };
     if repo.workdir().is_none() {
+        check(&interrupt)?;
         return Ok(HostReply::GitStatus(status));
     }
     let changes = repo
@@ -168,14 +169,11 @@ pub(super) fn status(root: PathBuf, interrupt: Arc<AtomicBool>) -> Result<HostRe
         };
         if status.entries.len() == MAX_STATUS_ENTRIES {
             status.truncated = true;
-            interrupt.store(true, std::sync::atomic::Ordering::Relaxed);
             break;
         }
         status.entries.push(entry);
     }
-    if !status.truncated {
-        check(&interrupt)?;
-    }
+    check(&interrupt)?;
     status
         .entries
         .sort_by(|a, b| (&a.path, a.area).cmp(&(&b.path, b.area)));
@@ -226,6 +224,7 @@ pub(super) fn log(
     let repo = open(root, interrupt)?;
     let head = repo.head().map_err(|e| git_failure("head", &e))?;
     let Some(id) = head.id() else {
+        check(interrupt)?;
         return Ok(HostReply::Commits(Vec::new()));
     };
     let walk = id.ancestors().all().map_err(|e| git_failure("log", &e))?;
@@ -243,6 +242,7 @@ pub(super) fn log(
             time: author.time().map_err(|e| git_failure("log", &e))?.seconds,
         });
     }
+    check(interrupt)?;
     Ok(HostReply::Commits(commits))
 }
 
@@ -280,6 +280,7 @@ pub(super) fn diff(
         (indexed, super::workspace::read_worktree(root, path)?)
     };
     let (before, after) = (before.unwrap_or_default(), after.unwrap_or_default());
+    check(interrupt)?;
     if before == after {
         return Ok(HostReply::Diff(GitDiff::default()));
     }
@@ -291,6 +292,7 @@ pub(super) fn diff(
     }
     check(interrupt)?;
     let text = unified(&before, &after)?;
+    check(interrupt)?;
     let truncated = text.len() > MAX_DIFF;
     Ok(HostReply::Diff(GitDiff {
         text: super::bounded(&text, MAX_DIFF).to_string(),
@@ -316,6 +318,17 @@ fn unified(before: &[u8], after: &[u8]) -> Result<String, HostFailure> {
         unified_diff::{ConsumeBinaryHunk, ContextSize},
     };
     let input = InternedInput::new(before, after);
+    // gitoxide's diff/postprocessing have no cancellation API. Bound their
+    // worst-case work before entering them, in addition to the byte limit.
+    // Reject rather than keep a blocking worker alive on pathological input.
+    if input.before.len().saturating_mul(input.after.len()) > 1_000_000
+        || input.before.len().saturating_add(input.after.len()) > 8_192
+    {
+        return Err(failure(
+            HostErrorCode::Budget,
+            "the diff exceeds the line comparison budget",
+        ));
+    }
     let mut diff = Diff::compute(Algorithm::Histogram, &input);
     diff.postprocess_lines(&input);
     UnifiedDiff::new(

@@ -123,7 +123,7 @@ unsafe operation.
 | `create_directory { path }` | `write_workspace` + a project | done, also when it exists | missing parents are created |
 | `git_status` | `git_read` + a project | branch, `HEAD` id, changed paths (staged, unstaged, untracked) | 1,000 entries; 5 s per git call; renames not tracked; submodules ignored |
 | `git_log { max }` | `git_read` + a project | commits from `HEAD`: id, summary, author name (no email), author time | 200 commits |
-| `git_diff { path, staged }` | `git_read` + a project | unified diff of one file (`HEAD`→index when `staged`, else index→working tree; a symbolic link compares its target text), or `binary` | 512 KiB per side (checked before a blob is read), 192 KiB of text, 3 context lines |
+| `git_diff { path, staged }` | `git_read` + a project | unified diff of one file (`HEAD`→index when `staged`, else index→working tree; a symbolic link compares its target text), or `binary` | 512 KiB per side (checked before a blob is read), 192 KiB of text, 3 context lines; at most 8,192 input lines combined and 1,000,000 line pairs, otherwise a budget failure |
 | `state_get { key }` | nothing | the extension's own value | — |
 | `state_put { key, value }` | nothing | done (`value = None` deletes) | 64 keys, 256 KiB per extension |
 | `log { level, message }` | nothing | done; recorded through tracing | 32 per call, 1 KiB each |
@@ -193,14 +193,13 @@ extension, tool, args, project }`, `GrantExtension { extension, capabilities }`
 and `EnableExtension { extension, enabled }`. The CLI wraps them as
 `agent206 extension list|grant|enable|disable|panel|tool`.
 
-Agents do not call extension tools yet. The interface the native run engine
-will use is in place: `Gateway::extensions()` returns the `ExtensionHost`,
-whose `tools()` lists enabled tools whose declared capabilities the user
-granted, and `call_tool(extension, tool, args, Scope { workspace, ceiling:
-Some(thread grant) })` runs one. Tool arguments are `a206_core::extension::Args`.
-The run engine will need to convert provider JSON to and from these values and
-expose `ParamSpec` lists as JSON Schema at the provider edge; no such bridge
-exists yet. Tool text is extension output, never instructions.
+Native runs call extension tools through the default `ExtensionToolHost`
+(see `docs/run-engine.md`): enabled extensions' granted tools are offered as
+`ext__<extension id>__<tool>` with their `ParamSpec`s as a JSON Schema object,
+and each call runs `call_tool(extension, tool, args, Scope { workspace,
+ceiling: Some(thread grant) })` after the conversation permits the tool.
+Provider JSON arguments convert kind for kind to `a206_core::extension::Args`.
+Tool text is extension output, never instructions.
 
 ## Planned
 

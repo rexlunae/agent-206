@@ -34,6 +34,10 @@ cap-fs-ext = "4"
 # Pure-Rust git: no hooks, filters or other repository-configured programs run.
 gix = { version = "0.89", default-features = false, features = ["status", "blob-diff", "sha1", "parallel"] }
 axum = "0.8"
+axum-server = { version = "0.8", features = ["tls-rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
+time = "0.3"
 tower-http = { version = "0.6", features = ["fs", "set-header"] }
 tower = { version = "0.5", features = ["util"] }
 rmcp = { version = "3.5", features = ["transport-io"] }
@@ -44,6 +48,7 @@ tempfile.workspace = true
 async-io = "2"
 nix = { version = "0.31", features = ["signal", "process", "fs", "user"] }
 [dev-dependencies]
+totp-rs = { version = "5.7", default-features = false }
 tracing-subscriber.workspace = true
 tempfile.workspace = true
 a206-broker.workspace = true
@@ -51,6 +56,10 @@ a206-vault.workspace = true
 [[test]]
 name = "coding_backends"
 path = "tests/coding_backends/main.rs"
+harness = false
+# Its own `main` also serves as the extension worker the gateway starts.
+[[test]]
+name = "extension_tools"
 harness = false
 [lints]
 workspace = true
