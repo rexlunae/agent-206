@@ -870,8 +870,8 @@ async fn tool_call_markup_written_as_text_is_removed_from_the_reply() {
             streamed.push_str(&delta);
         }
         assert!(!streamed.contains(&call), "{api:?}: {streamed}");
-        // The held `<` arrives with the final reply text, not as a delta.
-        assert_eq!(format!("{streamed}<"), text, "{api:?}");
+        // The held `<` is the last delta.
+        assert_eq!(streamed, text, "{api:?}");
 
         // A reply that was nothing but a leaked call is a failed reply.
         let (task, _deltas) = spawn_complete(&rig, &info);

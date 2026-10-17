@@ -732,7 +732,7 @@ pub async fn complete(
             }
         };
         let error = match streamed {
-            Ok(()) => return sink.reply.finish(),
+            Ok(()) => return sink.finish().await,
             Err(error) => error,
         };
         // Once anything arrived the failure is final: a retry would stream
@@ -938,6 +938,18 @@ impl Sink<'_> {
             }
         }
         decoded.map_err(ProviderError::Sse)
+    }
+    /// The stream ended: text the markup filter held back is the last delta.
+    async fn finish(mut self) -> Result<Turn> {
+        let held = self.reply.markup.finish();
+        if !held.is_empty() {
+            self.reply.append(&held)?;
+            self.progress
+                .send(crate::backends::Progress::Delta(held))
+                .await
+                .ignore();
+        }
+        self.reply.finish()
     }
 }
 /// A provider without a credential (a local or SSH-forwarded endpoint).
@@ -1260,9 +1272,8 @@ impl StreamedReply {
         self.text.push_str(text);
         Ok(())
     }
-    /// The reply once its stream ended. Text the markup filter still held is
-    /// appended here; it reaches clients with the final reply text.
-    fn finish(mut self) -> Result<Turn> {
+    /// The reply once its stream ended.
+    fn finish(self) -> Result<Turn> {
         let complete = match self.api {
             ProviderApi::Anthropic => self.ended,
             // `[DONE]` closes the stream; a finish reason alone may be followed
@@ -1271,8 +1282,6 @@ impl StreamedReply {
             ProviderApi::Gemini => self.finished,
         };
         check(complete, ProviderError::Incomplete)?;
-        let held = self.markup.finish();
-        self.append(&held)?;
         let removed = self.markup.removed();
         if removed > 0 {
             tracing::warn!(

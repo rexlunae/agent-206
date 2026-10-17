@@ -569,10 +569,11 @@ replies pass through a streaming filter (`runtime/src/markup.rs`, after
 RustyClaw's `StreamSanitizer`) that removes each block, tags included, before
 clients or the stored conversation see it. A tag split across deltas is still
 found: text that could begin a tag is held until the next delta decides it,
-and held text that never became a tag arrives with the final reply text. A
-block the stream never closes is dropped. Markup inside fenced code blocks
-and inline code is left alone, since a reply that explains tool calls quotes
-it there. A reply that held nothing but such markup fails with "the model
+and held text that never became a tag is the stream's last delta. A block
+the stream never closes is dropped. Markup inside fenced code blocks (closed
+only by a line of nothing but the fence) and inline code (a backtick run
+matched later on its line) is left alone, since a reply that explains tool
+calls quotes it there. A reply that held nothing but such markup fails with "the model
 wrote its tool call as text instead of calling the tool" instead of appearing
 empty, and each removal is logged with the number of blocks.
 

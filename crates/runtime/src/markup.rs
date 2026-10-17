@@ -19,9 +19,11 @@ const TAGS: [(&str, &str); 6] = [
 /// Removes leaked tool-call blocks from streamed text.
 ///
 /// Chunks split tags anywhere, so text that could still become a tag, a code
-/// fence or a backtick run is held until the next chunk decides it; at most a
-/// tag's length is held, and only when a chunk ends in something tag-shaped.
-/// [`Filter::finish`] releases held text and drops an unterminated block.
+/// fence or a backtick run is held until a later chunk decides it. Held text
+/// is short except in two cases, both bounded by the line: a tag after an
+/// unclosed backtick run waits for the run's close or the line's end, and a
+/// possible closing fence waits for its line to end. [`Filter::finish`]
+/// releases held text and drops an unterminated block.
 #[derive(Debug, Default)]
 pub struct Filter {
     /// Text not decided yet, or inside a block the tail that could begin its
@@ -36,6 +38,8 @@ pub struct Filter {
     /// Length of the backtick run that opened the inline code on this line.
     code: Option<usize>,
     removed: usize,
+    /// The stream ended: nothing more can complete held text.
+    ended: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -52,7 +56,9 @@ enum Step {
 }
 
 enum Mark {
-    Fence(Fence),
+    /// A fence, and whether only spaces or tabs follow it on its line
+    /// (`None` until the line ends); only such a line can close a block.
+    Fence(Fence, Option<bool>),
     None,
     /// The chunk ended before the line showed whether it is a fence.
     Undecided,
@@ -80,12 +86,12 @@ impl Filter {
     /// The stream ended: held text was ordinary text, an unterminated block
     /// was markup.
     pub fn finish(&mut self) -> String {
-        let held = std::mem::take(&mut self.held);
-        if self.closing.take().is_some() {
-            String::new()
-        } else {
-            held
-        }
+        self.ended = true;
+        let out = self.feed("");
+        // Only the tail of an unterminated block can remain.
+        self.held.clear();
+        self.closing = None;
+        out
     }
 
     /// Leaked blocks removed so far.
@@ -109,13 +115,21 @@ impl Filter {
         }
         if !self.mid_line {
             match fence_mark(rest) {
+                Mark::Undecided if self.ended => return self.pass_line(text, at, out),
                 Mark::Undecided => return Step::Hold(at),
-                Mark::Fence(mark) => {
-                    self.fence = match self.fence {
-                        None => Some(mark),
-                        Some(open) if mark.mark == open.mark && mark.len >= open.len => None,
-                        open => open,
-                    };
+                Mark::Fence(mark, bare) => {
+                    match self.fence {
+                        None => self.fence = Some(mark),
+                        Some(open) if mark.mark == open.mark && mark.len >= open.len => {
+                            match bare {
+                                Some(true) => self.fence = None,
+                                Some(false) => {}
+                                None if self.ended => {}
+                                None => return Step::Hold(at),
+                            }
+                        }
+                        Some(_) => {}
+                    }
                     return self.pass_line(text, at, out);
                 }
                 Mark::None => {}
@@ -124,6 +138,7 @@ impl Filter {
         if self.fence.is_some() {
             return self.pass_line(text, at, out);
         }
+        let line_start = !self.mid_line;
         self.mid_line = true;
         let bytes = text.as_bytes();
         let mut i = at;
@@ -138,9 +153,9 @@ impl Filter {
                 }
                 b'`' => {
                     let run = bytes[i..].iter().take_while(|&&b| b == b'`').count();
-                    if i + run == bytes.len() {
+                    if i + run == bytes.len() && !self.ended {
                         out.push_str(&text[at..i]);
-                        return Step::Hold(i);
+                        return self.hold(line_start && i == at, i);
                     }
                     self.code = match self.code {
                         None => Some(run),
@@ -149,22 +164,41 @@ impl Filter {
                     };
                     i += run;
                 }
-                b'<' if self.code.is_none() => {
+                b'<' => {
                     let tail = &text[i..];
                     if let Some((open, close)) =
                         TAGS.iter().find(|(open, _)| tail.starts_with(open))
                     {
+                        // An opening backtick run is code only once a run of
+                        // the same length closes it on this line.
+                        if let Some(run) = self.code {
+                            match closes(tail, run).or(self.ended.then_some(false)) {
+                                Some(true) => {
+                                    i += 1;
+                                    continue;
+                                }
+                                Some(false) => self.code = None,
+                                None => {
+                                    out.push_str(&text[at..i]);
+                                    return self.hold(line_start && i == at, i);
+                                }
+                            }
+                        }
                         out.push_str(&text[at..i]);
                         self.closing = Some(close);
                         self.removed += 1;
+                        // What follows the block continues the line the
+                        // block started on.
+                        self.mid_line = !(line_start && i == at);
                         return Step::At(i + open.len());
                     }
-                    if TAGS
-                        .iter()
-                        .any(|(open, _)| open.len() > tail.len() && open.starts_with(tail))
+                    if !self.ended
+                        && TAGS
+                            .iter()
+                            .any(|(open, _)| open.len() > tail.len() && open.starts_with(tail))
                     {
                         out.push_str(&text[at..i]);
-                        return Step::Hold(i);
+                        return self.hold(line_start && i == at, i);
                     }
                     i += 1;
                 }
@@ -173,6 +207,12 @@ impl Filter {
         }
         out.push_str(rest);
         Step::At(text.len())
+    }
+
+    /// Hold the text from `from`, which starts a line when `line_start`.
+    fn hold(&mut self, line_start: bool, from: usize) -> Step {
+        self.mid_line = !line_start;
+        Step::Hold(from)
     }
 
     /// Pass the rest of a line through unchanged.
@@ -209,12 +249,44 @@ fn fence_mark(line: &str) -> Mark {
     }
     let len = bytes[indent..].iter().take_while(|&&b| b == mark).count();
     if indent + len == bytes.len() {
-        Mark::Undecided
-    } else if len < 3 {
-        Mark::None
-    } else {
-        Mark::Fence(Fence { mark, len })
+        return Mark::Undecided;
     }
+    if len < 3 {
+        return Mark::None;
+    }
+    let after = &bytes[indent + len..];
+    let end = after.iter().position(|&b| b == b'\n');
+    let bare = after[..end.unwrap_or(after.len())]
+        .iter()
+        .all(|&b| b == b' ' || b == b'\t');
+    Mark::Fence(
+        Fence { mark, len },
+        (end.is_some() || !bare).then_some(bare),
+    )
+}
+
+/// Whether a backtick run of `run` closes inline code later on this line
+/// (`None` when the text ends first).
+fn closes(text: &str, run: usize) -> Option<bool> {
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\n' => return Some(false),
+            b'`' => {
+                let len = bytes[i..].iter().take_while(|&&b| b == b'`').count();
+                if i + len == bytes.len() {
+                    return None;
+                }
+                if len == run {
+                    return Some(true);
+                }
+                i += len;
+            }
+            _ => i += 1,
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -293,6 +365,37 @@ mod tests {
         assert_eq!(
             every_split("```\ncode\n```\nprose<tool_call>x</tool_call>!"),
             ("```\ncode\n```\nprose!".to_owned(), 1)
+        );
+        // A fence closes only on a line of nothing but its marker.
+        let text = "```\n```rust\n<tool_call>example</tool_call>\n```  \n<tool_call>x</tool_call>";
+        assert_eq!(
+            every_split(text),
+            (
+                "```\n```rust\n<tool_call>example</tool_call>\n```  \n".to_owned(),
+                1
+            )
+        );
+        // A removed block that began a line leaves the next text at a line start.
+        let text = "Intro\n<tool_call>x\n</tool_call>```xml\n<tool_call>example</tool_call>\n```\n";
+        assert_eq!(
+            every_split(text),
+            (
+                "Intro\n```xml\n<tool_call>example</tool_call>\n```\n".to_owned(),
+                1
+            )
+        );
+        assert_eq!(
+            every_split("a <tool_call>x</tool_call>```\n<tool_call>y</tool_call>"),
+            ("a ```\n".to_owned(), 2)
+        );
+        // An unmatched backtick is literal text.
+        assert_eq!(
+            every_split("Use `oops <tool_call>{}</tool_call> here\nnext"),
+            ("Use `oops  here\nnext".to_owned(), 1)
+        );
+        assert_eq!(
+            every_split("``a` <tool_call>{}</tool_call>`"),
+            ("``a` `".to_owned(), 1)
         );
         // Four spaces is indented text, not a fence.
         assert_eq!(
