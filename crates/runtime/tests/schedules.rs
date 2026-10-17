@@ -301,8 +301,13 @@ async fn a_heartbeat_sends_heartbeat_md_and_a_heartbeat_ok_reply_is_quiet() {
     );
     // An empty checklist has nothing to check, so nothing is sent either.
     let path = project.path().join("HEARTBEAT.md");
-    std::fs::write(&path, " \n").unwrap();
-    assert_eq!(run_now(&gateway, job.id).await.outcome, JobOutcome::Quiet);
+    for blank in [
+        " \n".to_owned(),
+        " ".repeat(2 * a206_runtime::instructions::MAX_FILE),
+    ] {
+        std::fs::write(&path, blank).unwrap();
+        assert_eq!(run_now(&gateway, job.id).await.outcome, JobOutcome::Quiet);
+    }
     assert!(messages(&gateway).is_empty());
     assert!(requests.try_recv().is_err(), "a model was asked");
 
@@ -323,7 +328,19 @@ async fn a_heartbeat_sends_heartbeat_md_and_a_heartbeat_ok_reply_is_quiet() {
         ))
         .await;
     assert_eq!(run.await.unwrap().outcome, JobOutcome::Quiet);
-    assert!(schedule::is_heartbeat_message(&messages(&gateway)[0].text));
+    let sent = &messages(&gateway)[0].text;
+    let Some(JobRun { id: run, .. }) = gateway
+        .snapshot()
+        .unwrap()
+        .jobs
+        .into_iter()
+        .find(|j| j.id == id)
+        .unwrap()
+        .last
+    else {
+        panic!("the run was recorded");
+    };
+    assert_eq!(schedule::heartbeat_run(sent), Some(run), "{sent}");
 
     // Anything else is a reply that needs attention.
     let run = tokio::spawn({

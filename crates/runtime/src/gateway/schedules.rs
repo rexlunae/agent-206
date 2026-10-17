@@ -5,7 +5,7 @@
 //! A heartbeat check reads the project's `HEARTBEAT.md` when it runs and sends
 //! it the same way; a reply of exactly `HEARTBEAT_OK` ends it as quiet.
 use super::{Gateway, GatewayError, Result};
-use crate::{error::check, provider::now, schedule};
+use crate::{error::check, provider::now, schedule, tools::ToolScope};
 use a206_core::{
     schedule::{heartbeat_message, is_heartbeat_ok},
     *,
@@ -201,7 +201,7 @@ impl Gateway {
         drop(tokio::spawn(async move {
             let text = match kind {
                 JobKind::Message => Ok(Some(text)),
-                JobKind::Heartbeat => gateway.heartbeat(thread).await,
+                JobKind::Heartbeat => gateway.heartbeat(thread, run).await,
             };
             let outcome = match text {
                 Err(error) => JobOutcome::Refused(crate::error::handle("schedule_job", &error)),
@@ -229,19 +229,7 @@ impl Gateway {
             })
             .await;
         match reply.body {
-            Reply::Thread(thread) => match thread.state {
-                RunState::Complete
-                    if kind == JobKind::Heartbeat
-                        && thread.messages.last().is_some_and(|m| {
-                            m.role == Role::Assistant && is_heartbeat_ok(&m.text)
-                        }) =>
-                {
-                    JobOutcome::Quiet
-                }
-                RunState::Complete => JobOutcome::Complete,
-                RunState::Cancelled => JobOutcome::Cancelled,
-                _ => JobOutcome::Failed,
-            },
+            Reply::Thread(thread) => ended(kind, &thread),
             Reply::Error(report) => JobOutcome::Refused(report),
             _ => JobOutcome::Failed,
         }
@@ -249,21 +237,28 @@ impl Gateway {
     /// The heartbeat check message for `thread`, from `HEARTBEAT.md` at its
     /// project root as the conversation's grants allow reading it now, or
     /// `None` when the checklist is empty.
-    async fn heartbeat(&self, thread: Id) -> Result<Option<String>> {
+    async fn heartbeat(&self, thread: Id, run: Id) -> Result<Option<String>> {
+        let readable = |scope: &ToolScope| {
+            check(
+                crate::instructions::permitted(&scope.capabilities),
+                GatewayError::Denied(
+                    "this conversation may not read its project, so not HEARTBEAT.md",
+                ),
+            )
+        };
         let scope = self.scope(thread)?;
-        let root = scope.workspace.ok_or(GatewayError::NotFound(
+        let root = scope.workspace.clone().ok_or(GatewayError::NotFound(
             "a heartbeat check needs a conversation with a project folder",
         ))?;
-        check(
-            crate::instructions::permitted(&scope.capabilities),
-            GatewayError::Denied("this conversation may not read its project, so not HEARTBEAT.md"),
-        )?;
+        readable(&scope)?;
         let checklist =
             tokio::task::spawn_blocking(move || crate::instructions::heartbeat(root)).await?;
+        // The grant may have been withdrawn while the file was read.
+        readable(&self.scope(thread)?)?;
         match checklist.map_err(GatewayError::Heartbeat)? {
             None => Err(GatewayError::NotFound("the project has no HEARTBEAT.md")),
             Some(checklist) if checklist.trim().is_empty() => Ok(None),
-            Some(checklist) => Ok(Some(heartbeat_message(&checklist))),
+            Some(checklist) => Ok(Some(heartbeat_message(&checklist, run))),
         }
     }
     fn finish_job(&self, id: Id, run: Id, outcome: JobOutcome) -> Result<()> {
@@ -363,6 +358,27 @@ impl Jobs {
             self.base.remove_job(id)
         })();
         removed.map(drop).map_err(|e| crate::error::report(&e))
+    }
+}
+
+/// How a job's run ended, from its conversation once the run returned.
+fn ended(kind: JobKind, thread: &Thread) -> JobOutcome {
+    match thread.state {
+        // Messages steered too late for the run follow its reply.
+        RunState::Complete
+            if kind == JobKind::Heartbeat
+                && thread
+                    .messages
+                    .iter()
+                    .rev()
+                    .find(|m| m.role == Role::Assistant)
+                    .is_some_and(|m| is_heartbeat_ok(&m.text)) =>
+        {
+            JobOutcome::Quiet
+        }
+        RunState::Complete => JobOutcome::Complete,
+        RunState::Cancelled => JobOutcome::Cancelled,
+        _ => JobOutcome::Failed,
     }
 }
 

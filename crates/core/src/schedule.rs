@@ -56,20 +56,24 @@ pub enum JobKind {
 
 /// The whole reply to a heartbeat check when nothing needs attention.
 pub const HEARTBEAT_OK: &str = "HEARTBEAT_OK";
-/// The first line of every heartbeat check message.
-pub const HEARTBEAT_HEADER: &str = "Scheduled heartbeat check.";
+/// How every heartbeat check message begins, followed by its run's ID.
+pub const HEARTBEAT_HEADER: &str = "Scheduled heartbeat check ";
 
-/// The message a heartbeat check sends, around the `HEARTBEAT.md` checklist.
-pub fn heartbeat_message(checklist: &str) -> String {
+/// The message run `run` of a heartbeat check sends, around the
+/// `HEARTBEAT.md` checklist. The run's ID identifies the message after a
+/// restart.
+pub fn heartbeat_message(checklist: &str, run: Id) -> String {
     format!(
-        "{HEARTBEAT_HEADER} Work through this checklist from HEARTBEAT.md now. Do not repeat tasks from earlier conversations that it does not list. If nothing needs attention, reply with exactly {HEARTBEAT_OK} and nothing else; otherwise reply with what needs attention and leave {HEARTBEAT_OK} out.\n\n{}",
+        "{HEARTBEAT_HEADER}{run}. Work through this checklist from HEARTBEAT.md now. Do not repeat tasks from earlier conversations that it does not list. If nothing needs attention, reply with exactly {HEARTBEAT_OK} and nothing else; otherwise reply with what needs attention and leave {HEARTBEAT_OK} out.\n\n{}",
         checklist.trim()
     )
 }
 
-/// Whether `text` is a heartbeat check message.
-pub fn is_heartbeat_message(text: &str) -> bool {
-    text.starts_with(HEARTBEAT_HEADER)
+/// The run that sent `text`, when it is a heartbeat check message.
+pub fn heartbeat_run(text: &str) -> Option<Id> {
+    let rest = text.strip_prefix(HEARTBEAT_HEADER)?;
+    let (run, _) = rest.split_once('.')?;
+    run.parse().ok()
 }
 
 /// Whether a reply to a heartbeat check says nothing needs attention.

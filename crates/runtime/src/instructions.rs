@@ -176,6 +176,10 @@ pub fn heartbeat(root: PathBuf) -> Result<Option<String>, InstructionError> {
         return Ok(None);
     };
     let text = text_within(&bytes, MAX_FILE).ok_or(InstructionError::NotText)?;
+    // A blank checklist stays blank, however long.
+    if text.trim().is_empty() {
+        return Ok(Some(String::new()));
+    }
     let mut checklist = text.to_owned();
     if text.len() < bytes.len() {
         checklist.push_str(&format!(

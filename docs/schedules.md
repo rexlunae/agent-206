@@ -14,15 +14,18 @@ project root (at most 32 KiB, through the same confined reader as the project
 instruction files, and only if the conversation's grants include reading the
 project at that moment) and sends it as one message asking the model to work
 through the checklist and reply with exactly `HEARTBEAT_OK` when nothing needs
-attention. The checklist is read only there: instruction files never include it.
+attention. The message names the run's ID, so a restart can tell which run sent
+it. The grant is checked again after the file is read. The checklist is read
+only there: instruction files never include it.
 
 - No project, no read grant, or no `HEARTBEAT.md`: the run is `Refused` with
   the reason (`NotFound` or `PermissionDenied`) and nothing is sent.
-- An empty `HEARTBEAT.md`: the run is `Quiet` and nothing is sent, so a
+- An empty or blank `HEARTBEAT.md`: the run is `Quiet` and nothing is sent, so a
   checklist can be paused by emptying it.
 - A reply of exactly `HEARTBEAT_OK` (surrounding whitespace aside): `Quiet`.
   Any other reply is `Complete` and shown as needing attention; the reply is in
-  the conversation.
+  the conversation. Messages steered in after the run's last round do not
+  count as its reply.
 
 Heartbeat jobs take no text (`text` must be empty). The conversation keeps the
 check and its reply like any other turn; compaction keeps long-running ones
@@ -45,8 +48,8 @@ are 24 and 168 hours, and months and years, which have no fixed length, are
 refused.
 
 If the gateway stops while a job's run is starting, the next start settles it:
-when the conversation received the message (for a heartbeat, a check message
-sent after the run started), the run ends as the conversation
+when the conversation received the message (for a heartbeat, the check message
+naming that run's ID), the run ends as the conversation
 shows (its current run's state while that message is the latest, otherwise
 complete if a reply followed it); when it did not, the job is due again at once, so the message is sent
 exactly once.

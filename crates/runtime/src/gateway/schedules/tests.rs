@@ -289,3 +289,34 @@ async fn relative_schedules_count_from_when_the_gateway_accepts_them() {
         );
     }
 }
+
+#[test]
+fn a_heartbeat_is_quiet_by_its_reply_even_when_steering_follows_it() {
+    let mut thread = Thread::new(nonce(), Mode::Chat);
+    thread.state = RunState::Complete;
+    let say = |role, text: &str| Message::new(role, text.into(), 0, CodingBackend::default());
+    thread.messages = vec![
+        say(Role::User, &nonce()),
+        say(
+            Role::Assistant,
+            &format!("{}\n", a206_core::schedule::HEARTBEAT_OK),
+        ),
+        // Steered after the run's last round, so the run did not answer it.
+        say(Role::User, &nonce()),
+    ];
+    assert_eq!(super::ended(JobKind::Heartbeat, &thread), JobOutcome::Quiet);
+    assert_eq!(
+        super::ended(JobKind::Message, &thread),
+        JobOutcome::Complete
+    );
+    thread.messages[1].text = nonce();
+    assert_eq!(
+        super::ended(JobKind::Heartbeat, &thread),
+        JobOutcome::Complete
+    );
+    thread.state = RunState::Failed;
+    assert_eq!(
+        super::ended(JobKind::Heartbeat, &thread),
+        JobOutcome::Failed
+    );
+}

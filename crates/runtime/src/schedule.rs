@@ -2,7 +2,7 @@
 //! so the scheduler's decisions are tested without a clock.
 use a206_core::{
     ErrorKind, ErrorReport, Job, JobKind, JobOutcome, Role, RunState, Schedule, Thread,
-    schedule::{is_heartbeat_message, is_heartbeat_ok},
+    schedule::{heartbeat_run, is_heartbeat_ok},
 };
 use jiff::{Timestamp, tz::TimeZone};
 use std::str::FromStr;
@@ -142,8 +142,9 @@ pub fn recover(jobs: &mut [Job], threads: &[Thread]) {
                 && m.at >= run.at
                 && match job.kind {
                     JobKind::Message => m.text == job.text,
-                    // Its text is built from HEARTBEAT.md when it runs.
-                    JobKind::Heartbeat => is_heartbeat_message(&m.text),
+                    // Its text is built from HEARTBEAT.md when it runs,
+                    // and names the run that sent it.
+                    JobKind::Heartbeat => heartbeat_run(&m.text) == Some(run.id),
                 }
         });
         // The run's own outcome is the conversation's only while its message

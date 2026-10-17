@@ -143,9 +143,12 @@ fn jobs_stored_before_heartbeats_are_messages_and_only_an_exact_ok_is_quiet() {
     assert_eq!(job.text, stored.text);
 
     let checklist = Id::new_v4().to_string();
-    let message = heartbeat_message(&format!("\n{checklist}\n"));
-    assert!(is_heartbeat_message(&message) && message.contains(&checklist));
-    assert!(!is_heartbeat_message(&checklist));
+    let run = Id::new_v4();
+    let message = heartbeat_message(&format!("\n{checklist}\n"), run);
+    assert_eq!(heartbeat_run(&message), Some(run));
+    assert!(message.contains(&checklist));
+    assert_eq!(heartbeat_run(&checklist), None);
+    assert_eq!(heartbeat_run(&format!("{HEARTBEAT_HEADER}soon.")), None);
     assert!(is_heartbeat_ok(&format!(" {HEARTBEAT_OK}\n")));
     for reply in [
         format!("{HEARTBEAT_OK} {checklist}"),

@@ -239,9 +239,10 @@ fn a_restart_settles_a_heartbeat_by_its_reply() {
         last: Some(JobRun::start(started)),
         author: Default::default(),
     };
-    let conversation = |reply: &str| {
+    // A conversation that received run `run`'s check, answered with `reply`.
+    let conversation = |run: Id, reply: &str| {
         let mut thread = Thread::new(Id::new_v4().to_string(), Mode::Chat);
-        let checklist = heartbeat_message(&Id::new_v4().to_string());
+        let checklist = heartbeat_message(&Id::new_v4().to_string(), run);
         for (role, text) in [(Role::User, checklist.as_str()), (Role::Assistant, reply)] {
             thread.messages.push(Message::new(
                 role,
@@ -253,22 +254,16 @@ fn a_restart_settles_a_heartbeat_by_its_reply() {
         thread.state = RunState::Complete;
         thread
     };
-    let quiet = conversation(&format!("{HEARTBEAT_OK}\n"));
-    let alert = conversation(&format!("{HEARTBEAT_OK} {}", Id::new_v4()));
-    // Its message is built when it runs, so an older plain message in the
-    // conversation does not count as sent.
-    let mut unsent = Thread::new(Id::new_v4().to_string(), Mode::Chat);
-    unsent.messages.push(Message::new(
-        Role::User,
-        Id::new_v4().to_string(),
-        started,
-        CodingBackend::default(),
-    ));
-    let mut jobs = vec![
-        heartbeat(quiet.id),
-        heartbeat(alert.id),
-        heartbeat(unsent.id),
-    ];
+    let run = |job: &Job| job.last.as_ref().unwrap().id;
+    let mut jobs: Vec<Job> = (0..3).map(|_| heartbeat(Id::new_v4())).collect();
+    let quiet = conversation(run(&jobs[0]), &format!("{HEARTBEAT_OK}\n"));
+    let alert = conversation(run(&jobs[1]), &format!("{HEARTBEAT_OK} {}", Id::new_v4()));
+    // An earlier run's check in the same second is not this run's: the run
+    // never sent its own, so it is due again.
+    let unsent = conversation(Id::new_v4(), HEARTBEAT_OK);
+    for (job, thread) in jobs.iter_mut().zip([&quiet, &alert, &unsent]) {
+        job.thread = thread.id;
+    }
     recover(&mut jobs, &[quiet, alert, unsent]);
     let outcome = |job: &Job| job.last.as_ref().unwrap().outcome.clone();
     assert_eq!(outcome(&jobs[0]), JobOutcome::Quiet);
