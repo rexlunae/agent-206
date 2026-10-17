@@ -38,7 +38,10 @@ pub(crate) fn Subagents(thread: Uuid) -> Element {
     let parent = current
         .and_then(|t| t.parent)
         .map(|id| (id, snapshot.threads.iter().find(|t| t.id == id)));
-    let below = children(&snapshot, thread);
+    let below: Vec<Thread> = children(&snapshot, thread)
+        .into_iter()
+        .filter(|child| child.id != thread)
+        .collect();
     rsx! { div { class: "a206-stack",
         h3 { "Subagents" }
         match parent {
@@ -62,11 +65,15 @@ pub(crate) fn Subagents(thread: Uuid) -> Element {
 fn Branch(threads: Vec<Thread>, level: usize, seen: BTreeSet<Uuid>) -> Element {
     let state = use_context::<State>();
     rsx! {
-        for thread in threads.into_iter().filter(|t| !seen.contains(&t.id)) {
-            { let below = children(&state.data.read(), thread.id);
-              let (tone, label) = self::state(&thread.state);
+        for thread in threads {
+            { let (tone, label) = self::state(&thread.state);
               let mut seen = seen.clone();
               seen.insert(thread.id);
+              // Children already shown above (a malformed cycle) are not "more".
+              let below: Vec<Thread> = children(&state.data.read(), thread.id)
+                  .into_iter()
+                  .filter(|child| !seen.contains(&child.id))
+                  .collect();
               let more = !below.is_empty() && level >= LEVELS;
               rsx! { NavLink { key: "{thread.id}", label: thread.title.clone(), href: Route::Chat { id: thread.id, split: None, message: None }.to_string(),
                   meta: rsx! { Badge { tone, "{label}" } " " Badge { tone: BadgeTone::Accent, "{thread.mode.label()}" }

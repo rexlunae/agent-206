@@ -79,6 +79,19 @@ fn a_cycle_in_parent_links_ends_instead_of_recursing() {
     first.parent = Some(second.id);
     let html = render(vec![first.clone(), second.clone()], first.id);
     assert_eq!(html.matches(&second.title).count(), 2, "{html}");
+
+    // A cycle at the depth limit is not reported as further subagents.
+    let mut chain = vec![thread(None, RunState::Idle)];
+    for _ in 0..6 {
+        let parent = chain.last().map(|t| t.id);
+        chain.push(thread(parent, RunState::Idle));
+    }
+    chain[0].parent = chain.last().map(|t| t.id);
+    let html = render(chain.clone(), chain[0].id);
+    assert!(!html.contains("More subagents inside"), "{html}");
+    chain.push(thread(chain.last().map(|t| t.id), RunState::Idle));
+    let html = render(chain.clone(), chain[0].id);
+    assert!(html.contains("More subagents inside"), "{html}");
 }
 
 #[test]
@@ -90,13 +103,13 @@ fn a_long_chain_shows_its_first_levels_and_continues_from_the_last() {
         chain.push(thread(parent, RunState::Idle));
     }
     let linked = |html: &str, t: &Thread| html.contains(&format!("/conversations/{}", t.id));
-    // From any conversation, the next LEVELS levels are shown, the last of
+    // From any conversation, the next six levels are shown, the last of
     // them marked as having more; opening it shows the following ones.
-    for start in [0, LEVELS, chain.len() - 2] {
+    for start in [0, 6, chain.len() - 2] {
         let html = render(chain.clone(), chain[start].id);
-        let shown = &chain[start + 1..chain.len().min(start + 1 + LEVELS)];
+        let shown = &chain[start + 1..chain.len().min(start + 7)];
         assert!(shown.iter().all(|t| linked(&html, t)), "{html}");
-        let rest = &chain[(start + 1 + LEVELS).min(chain.len())..];
+        let rest = &chain[(start + 7).min(chain.len())..];
         assert!(rest.iter().all(|t| !linked(&html, t)));
         assert_eq!(html.contains("More subagents inside"), !rest.is_empty());
     }
