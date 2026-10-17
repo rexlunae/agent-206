@@ -117,7 +117,16 @@ impl ListHost {
             }
         }
         let (names, unavailable) = crate::extension_tools::offered_names(&self.extensions);
-        let skills = self.skills.list(scope).await;
+        // Only a listing that includes the skills builtin waits on its scan.
+        let skills = if catalog
+            .plugins
+            .iter()
+            .any(|plugin| plugin.id == crate::skill_tool::EXTENSION)
+        {
+            self.skills.list(scope).await
+        } else {
+            ToolListing::default()
+        };
         let context = Context {
             scope,
             names: &names,
@@ -225,6 +234,12 @@ fn extension(context: &Context<'_>, plugin: &PluginSummary, detailed: bool) -> V
                                 .into(),
                         );
                     }
+                } else if !offered {
+                    // The skill host checks approvals only once nothing else
+                    // blocks its tools, so state the requirement, not a verdict.
+                    blocked.push(
+                        "It also needs a skill the user approved and has not changed since.".into(),
+                    );
                 }
                 offered.then(|| tool.name.clone())
             } else {

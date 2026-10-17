@@ -299,6 +299,22 @@ async fn project_and_skill_requirements_are_reported() {
             ["The user has no approved skill that is unchanged since approval."]
         );
     }
+    // Disabled as well: both obstacles are named, the second as a requirement.
+    rig.edit(crate::skill_tool::EXTENSION, |p| p.enabled = false);
+    let listing = rig.listed(&all).await;
+    let entry = tool(
+        &listing,
+        crate::skill_tool::EXTENSION,
+        &skills.tools[0].name,
+    );
+    assert_eq!(
+        blocked(entry),
+        [
+            "The user has not enabled this extension.",
+            "It also needs a skill the user approved and has not changed since."
+        ]
+    );
+    rig.edit(crate::skill_tool::EXTENSION, |p| p.enabled = true);
     let failure = format!("skills unreadable {}", Id::new_v4().simple());
     rig.skills.0.lock().unwrap().unavailable = vec![UnavailableTools {
         source: crate::skill_tool::SOURCE.into(),
