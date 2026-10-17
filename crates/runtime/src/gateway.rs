@@ -707,6 +707,8 @@ impl Gateway {
                         "settings changed in another operation; refresh and retry your change",
                     ),
                 )?;
+                // Skill approval is its own user operation, never a settings edit.
+                settings.enabled_skills = store.state.settings.enabled_skills.clone();
                 let mcp_servers = Self::mcp_statuses(&store.state, &settings.mcp_servers)?;
                 if let Some(id) = store.state.managed_joshua_provider {
                     let owned = store.state.settings.providers.iter().find(|provider| provider.id == id)
@@ -1406,9 +1408,13 @@ impl Gateway {
                 Ok(Reply::Ok)
             }
             Command::Skills => Ok(Reply::Skills(self.skills()?)),
-            Command::ReadSkill { name } => Ok(Reply::Text(self.read_skill(&name)?)),
-            Command::SetSkillEnabled { name, enabled } => {
-                self.set_skill_enabled(&name, enabled)?;
+            Command::ReadSkill { name } => Ok(Reply::Skill(self.read_skill(&name)?)),
+            Command::SetSkillEnabled {
+                name,
+                enabled,
+                digest,
+            } => {
+                self.set_skill_enabled(&name, enabled, digest.as_deref())?;
                 Ok(Reply::Ok)
             }
             Command::ConnectMcpServer { name } => {

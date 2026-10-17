@@ -11,7 +11,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::{
     io::Read,
-    path::{Component, Path, PathBuf},
+    path::{Component, Path},
 };
 
 /// Largest `SKILL.md` that is read.
@@ -50,6 +50,8 @@ pub enum SkillError {
     Path,
     #[error("skill file exceeds {limit} bytes")]
     FileTooLarge { limit: u64 },
+    #[error("approve a skill by the digest of the text you reviewed")]
+    Unreviewed,
     #[error("this skill is not enabled")]
     Disabled,
     #[error("this skill changed after it was enabled; review and enable it again")]
@@ -107,9 +109,21 @@ impl Requirements {
     }
 }
 fn on_path(name: &str) -> bool {
+    std::env::var_os("PATH").is_some_and(|path| in_search_path(name, &path))
+}
+fn in_search_path(name: &str, path: &std::ffi::OsStr) -> bool {
     !name.contains(['/', '\\'])
-        && std::env::var_os("PATH")
-            .is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join(name).is_file()))
+        && std::env::split_paths(path).any(|dir| executable(&dir.join(name)))
+}
+/// A regular file this process may run; Windows has no execute bit.
+fn executable(path: &Path) -> bool {
+    std::fs::metadata(path).is_ok_and(|meta| {
+        #[cfg(unix)]
+        let runnable = std::os::unix::fs::PermissionsExt::mode(&meta.permissions()) & 0o111 != 0;
+        #[cfg(not(unix))]
+        let runnable = true;
+        meta.is_file() && runnable
+    })
 }
 
 #[derive(Deserialize)]
@@ -186,9 +200,22 @@ pub fn parse(text: &str, directory: &str) -> Result<Skill, SkillError> {
         emoji: openclaw.emoji,
         homepage: openclaw.homepage,
         requires,
-        instructions: instructions.trim_start().to_owned(),
+        instructions: without_leading_blank_lines(instructions).to_owned(),
         digest,
     })
+}
+
+/// `text` from its first line with content, keeping that line's indentation
+/// (an indented first line is a Markdown code block).
+fn without_leading_blank_lines(text: &str) -> &str {
+    let mut rest = text;
+    while let Some((line, next)) = rest.split_once('\n') {
+        if !line.trim().is_empty() {
+            break;
+        }
+        rest = next;
+    }
+    if rest.trim().is_empty() { "" } else { rest }
 }
 
 /// Lowercase ASCII letters and digits separated by single hyphens, as the
@@ -244,14 +271,18 @@ pub fn load(root: &Path, name: &str) -> Result<(Skill, String), SkillError> {
     if !valid_name(name) {
         return Err(SkillError::Name);
     }
-    let path = unlinked(&root.join(name), Path::new("SKILL.md"))?;
-    let bytes = read_bounded(&path, MAX_SKILL_BYTES).map_err(|error| match error {
-        Bounded::Io(error) if error.kind() == std::io::ErrorKind::NotFound => SkillError::NotFound,
-        Bounded::Io(error) => SkillError::Read(error),
-        Bounded::TooLarge => SkillError::TooLarge {
-            limit: MAX_SKILL_BYTES,
-        },
-    })?;
+    let relative = Path::new("SKILL.md");
+    unlinked(&root.join(name), relative)?;
+    let bytes =
+        read_bounded(root, name, relative, MAX_SKILL_BYTES).map_err(|error| match error {
+            Bounded::Io(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                SkillError::NotFound
+            }
+            Bounded::Io(error) => SkillError::Read(error),
+            Bounded::TooLarge => SkillError::TooLarge {
+                limit: MAX_SKILL_BYTES,
+            },
+        })?;
     let text = std::str::from_utf8(&bytes).map_err(SkillError::NotText)?;
     Ok((parse(text, name)?, text.to_owned()))
 }
@@ -271,8 +302,8 @@ pub fn read_file(root: &Path, name: &str, relative: &str) -> Result<Vec<u8>, Ski
     {
         return Err(SkillError::Path);
     }
-    let path = unlinked(&root.join(name), relative)?;
-    read_bounded(&path, MAX_FILE_BYTES).map_err(|error| match error {
+    unlinked(&root.join(name), relative)?;
+    read_bounded(root, name, relative, MAX_FILE_BYTES).map_err(|error| match error {
         Bounded::Io(error) => SkillError::Read(error),
         Bounded::TooLarge => SkillError::FileTooLarge {
             limit: MAX_FILE_BYTES,
@@ -280,9 +311,10 @@ pub fn read_file(root: &Path, name: &str, relative: &str) -> Result<Vec<u8>, Ski
     })
 }
 
-/// `base` joined with `relative`, refusing a symlink at the skill directory
-/// or at any component below it.
-fn unlinked(base: &Path, relative: &Path) -> Result<PathBuf, SkillError> {
+/// Refuse a symlink at the skill directory or any component of `relative`
+/// below it, with a typed error. [`read_bounded`] opens the file again without
+/// following symlinks, so a link swapped in after this check fails to open.
+fn unlinked(base: &Path, relative: &Path) -> Result<(), SkillError> {
     let mut path = base.to_path_buf();
     let check = |path: &Path| {
         let meta = std::fs::symlink_metadata(path).map_err(|error| match error.kind() {
@@ -299,15 +331,33 @@ fn unlinked(base: &Path, relative: &Path) -> Result<PathBuf, SkillError> {
         path.push(component);
         check(&path)?;
     }
-    Ok(path)
+    Ok(())
 }
 
 enum Bounded {
     Io(std::io::Error),
     TooLarge,
 }
-fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>, Bounded> {
-    let file = std::fs::File::open(path).map_err(Bounded::Io)?;
+/// Read `<root>/<name>/<relative>` without following a symlink at any
+/// component, so nothing outside the skill can be read even if the tree
+/// changes while it is read.
+fn read_bounded(root: &Path, name: &str, relative: &Path, limit: u64) -> Result<Vec<u8>, Bounded> {
+    use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
+    let open = || -> std::io::Result<std::fs::File> {
+        let mut dir = cap_std::fs::Dir::open_ambient_dir(root, cap_std::ambient_authority())?
+            .open_dir_nofollow(name)?;
+        let mut components = relative.components().peekable();
+        while let Some(component) = components.next() {
+            if components.peek().is_none() {
+                let mut options = cap_std::fs::OpenOptions::new();
+                options.read(true).follow(FollowSymlinks::No);
+                return Ok(dir.open_with(component, &options)?.into_std());
+            }
+            dir = dir.open_dir_nofollow(component)?;
+        }
+        Err(std::io::ErrorKind::InvalidInput.into())
+    };
+    let file = open().map_err(Bounded::Io)?;
     let mut bytes = vec![];
     file.take(limit + 1)
         .read_to_end(&mut bytes)

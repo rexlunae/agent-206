@@ -10,6 +10,8 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 sha2.workspace = true
+cap-std = "4"
+cap-fs-ext = "4"
 serde-saphyr = { version = "2", default-features = false, features = ["deserialize"] }
 [dev-dependencies]
 tempfile.workspace = true

@@ -274,10 +274,14 @@ mod native {
     enum SkillAction {
         /// Show installed skills, whether each is approved, and problems.
         List,
-        /// Print a skill's SKILL.md for review.
+        /// Print a skill's SKILL.md for review, followed by its digest.
         Show { name: String },
-        /// Approve the skill exactly as it is now.
-        Enable { name: String },
+        /// Approve the skill exactly as reviewed: pass the digest `show` printed.
+        Enable {
+            name: String,
+            #[arg(long)]
+            digest: String,
+        },
         /// Withdraw approval.
         Disable { name: String },
     }
@@ -754,14 +758,29 @@ mod native {
                                 _ => anyhow::bail!("gateway did not list skills"),
                             }
                         }
-                        SkillAction::Show { name } => Command::ReadSkill { name },
-                        SkillAction::Enable { name } => Command::SetSkillEnabled {
+                        SkillAction::Show { name } => {
+                            match client.call(Command::ReadSkill { name }).await? {
+                                Reply::Skill(skill) => {
+                                    print!("{}", skill.text);
+                                    eprintln!(
+                                        "\nTo approve exactly this text: agent206 skills enable {} --digest {}",
+                                        skill.name, skill.digest
+                                    );
+                                    return Ok(());
+                                }
+                                Reply::Error(report) => return Err(report.into()),
+                                _ => anyhow::bail!("gateway did not return the skill"),
+                            }
+                        }
+                        SkillAction::Enable { name, digest } => Command::SetSkillEnabled {
                             name,
                             enabled: true,
+                            digest: Some(digest),
                         },
                         SkillAction::Disable { name } => Command::SetSkillEnabled {
                             name,
                             enabled: false,
+                            digest: None,
                         },
                     },
                     Action::McpServers { command } => match command {

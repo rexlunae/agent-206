@@ -1,6 +1,6 @@
 //! Skills installed in the gateway's profile, reviewed and approved here.
 use crate::{State, call, error::ErrorNotice};
-use a206_core::{Command, ErrorReport, Reply, SkillSummary};
+use a206_core::{Command, ErrorReport, Reply, SkillSummary, SkillText};
 use fc_dioxus::prelude::*;
 
 #[component]
@@ -8,7 +8,7 @@ pub fn Skills() -> Element {
     let state = use_context::<State>();
     let mut skills = use_signal(Vec::<SkillSummary>::new);
     let mut failure = use_signal(|| None::<ErrorReport>);
-    let mut review = use_signal(|| None::<(String, String)>);
+    let mut review = use_signal(|| None::<SkillText>);
     let reload = move || {
         spawn(async move {
             match call(Command::Skills).await {
@@ -27,18 +27,29 @@ pub fn Skills() -> Element {
         let _ = revision;
         reload();
     }));
-    let toggle = move |name: String, enabled: bool| {
+    // Enabling pins the digest of the text shown in the review card, so an
+    // edit made after the review is never approved by this click.
+    let toggle = move |name: String, enabled: bool, digest: Option<String>| {
         spawn(async move {
-            match call(Command::SetSkillEnabled { name, enabled }).await {
-                Ok(_) => reload(),
+            match call(Command::SetSkillEnabled {
+                name,
+                enabled,
+                digest,
+            })
+            .await
+            {
+                Ok(_) => {
+                    review.set(None);
+                    reload();
+                }
                 Err(report) => failure.set(Some(report)),
             }
         });
     };
     let open = move |name: String| {
         spawn(async move {
-            match call(Command::ReadSkill { name: name.clone() }).await {
-                Ok(Reply::Text(text)) => review.set(Some((name, text))),
+            match call(Command::ReadSkill { name }).await {
+                Ok(Reply::Skill(text)) => review.set(Some(text)),
                 Ok(_) => {}
                 Err(report) => failure.set(Some(report)),
             }
@@ -47,6 +58,9 @@ pub fn Skills() -> Element {
     rsx! {
         h2 { "Skills" }
         p { class: "a206-muted", "Instruction folders in your profile's skills directory. Review one before enabling it; any later edit turns it off until you approve it again. Skills never add permissions." }
+        // Installing or editing a skill changes files, not settings, so the
+        // list is re-read on request.
+        div { class: "a206-row", Button { variant: ButtonVariant::Secondary, onclick: move |_| reload(), "Refresh" } }
         if let Some(report) = failure() { ErrorNotice { report, title: "Skills unavailable".to_string(), dismiss: move |_| failure.set(None) } }
         if skills.read().is_empty() { EmptyState { compact: true, title: rsx! { "No skills installed" }, body: rsx! { "Copy a skill folder containing SKILL.md into the skills directory of the gateway's profile." } } }
         div { class: "a206-grid",
@@ -63,20 +77,23 @@ pub fn Skills() -> Element {
                     }
                     CardFooter {
                         if skill.failure.is_none() {
-                            Button { variant: ButtonVariant::Secondary, onclick: { let name = skill.name.clone(); move |_| open(name.clone()) }, "Review" }
-                            Button { variant: if skill.enabled { ButtonVariant::Ghost } else { ButtonVariant::Primary }, onclick: { let name = skill.name.clone(); let enabled = !skill.enabled; move |_| toggle(name.clone(), enabled) }, if skill.enabled { "Disable" } else { "Approve and enable" } }
+                            Button { variant: if skill.enabled { ButtonVariant::Secondary } else { ButtonVariant::Primary }, onclick: { let name = skill.name.clone(); move |_| open(name.clone()) }, "Review" }
+                            if skill.enabled || skill.changed { Button { variant: ButtonVariant::Ghost, onclick: { let name = skill.name.clone(); move |_| toggle(name.clone(), false, None) }, "Disable" } }
                         } else if skill.changed {
-                            Button { variant: ButtonVariant::Ghost, onclick: { let name = skill.name.clone(); move |_| toggle(name.clone(), false) }, "Disable" }
+                            Button { variant: ButtonVariant::Ghost, onclick: { let name = skill.name.clone(); move |_| toggle(name.clone(), false, None) }, "Disable" }
                         }
                     }
                 }
             }
         }
-        if let Some((name, text)) = review() {
+        if let Some(reviewed) = review() {
             Card { variant: CardVariant::Elevated,
-                CardHeader { CardTitle { "{name}" } CardSubtitle { "SKILL.md as it is now" } }
-                CardBody { pre { class: "a206-message-text", "{text}" } }
-                CardFooter { Button { variant: ButtonVariant::Ghost, onclick: move |_| review.set(None), "Close" } }
+                CardHeader { CardTitle { "{reviewed.name}" } CardSubtitle { "SKILL.md as it was read for this review" } }
+                CardBody { pre { class: "a206-message-text", "{reviewed.text}" } }
+                CardFooter {
+                    Button { variant: ButtonVariant::Primary, onclick: { let reviewed = reviewed.clone(); move |_| toggle(reviewed.name.clone(), true, Some(reviewed.digest.clone())) }, "Approve this text and enable" }
+                    Button { variant: ButtonVariant::Ghost, onclick: move |_| review.set(None), "Close" }
+                }
             }
         }
     }

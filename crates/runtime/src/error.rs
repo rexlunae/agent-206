@@ -180,9 +180,8 @@ impl Classified for a206_skills::SkillError {
             Name | Path | TooMany { .. } | TooLarge { .. } | FileTooLarge { .. } => {
                 ErrorKind::InvalidRequest
             }
-            NotText(_) | NoFrontmatter | Frontmatter(_) | Metadata(_) | NameMismatch => {
-                ErrorKind::InvalidRequest
-            }
+            NotText(_) | NoFrontmatter | Frontmatter(_) | Metadata(_) | NameMismatch
+            | Unreviewed => ErrorKind::InvalidRequest,
             Disabled | Changed => ErrorKind::PermissionDenied,
         })
     }

@@ -29,6 +29,7 @@ impl Gateway {
                     Ok(skill) => SkillSummary {
                         enabled: pinned == Some(&skill.digest),
                         changed: pinned.is_some_and(|digest| *digest != skill.digest),
+                        digest: Some(skill.digest),
                         unmet: skill.requires.unmet(),
                         expects_env: skill.requires.env.clone(),
                         name: skill.name,
@@ -47,14 +48,31 @@ impl Gateway {
             .collect())
     }
 
-    pub(super) fn read_skill(&self, name: &str) -> Result<String> {
-        Ok(a206_skills::load(&self.skills_root()?, name)?.1)
+    pub(super) fn read_skill(&self, name: &str) -> Result<SkillText> {
+        let (skill, text) = a206_skills::load(&self.skills_root()?, name)?;
+        Ok(SkillText {
+            name: skill.name,
+            text,
+            digest: skill.digest,
+        })
     }
 
-    /// Approve the skill as it is now, or withdraw approval.
-    pub(super) fn set_skill_enabled(&self, name: &str, enabled: bool) -> Result<()> {
+    /// Approve the version of the skill the user reviewed, identified by its
+    /// `reviewed` digest, or withdraw approval. The reviewed digest is pinned,
+    /// so a file that changes after this check is never offered.
+    pub(super) fn set_skill_enabled(
+        &self,
+        name: &str,
+        enabled: bool,
+        reviewed: Option<&str>,
+    ) -> Result<()> {
         let digest = if enabled {
-            Some(a206_skills::load(&self.skills_root()?, name)?.0.digest)
+            let reviewed = reviewed.ok_or(SkillError::Unreviewed)?;
+            let (skill, _) = a206_skills::load(&self.skills_root()?, name)?;
+            if skill.digest != reviewed {
+                return Err(SkillError::Changed.into());
+            }
+            Some(skill.digest)
         } else {
             None
         };
@@ -188,11 +206,50 @@ mod tests {
             Err(GatewayError::Skill(SkillError::Disabled))
         ));
 
-        let enable = |enabled| Command::SetSkillEnabled {
+        let enable = |enabled, digest| Command::SetSkillEnabled {
             name: "notes".into(),
             enabled,
+            digest,
         };
-        assert_eq!(send(&g, enable(true)).await, Reply::Ok);
+        // Settings edits cannot approve a skill, even with the right digest.
+        let Reply::Skill(reviewed) = send(
+            &g,
+            Command::ReadSkill {
+                name: "notes".into(),
+            },
+        )
+        .await
+        else {
+            panic!("skill read for review");
+        };
+        let mut settings = g.lock().unwrap().state.settings.clone();
+        settings
+            .enabled_skills
+            .insert("notes".into(), reviewed.digest.clone());
+        assert_eq!(send(&g, Command::SaveSettings(settings)).await, Reply::Ok);
+        assert!(g.skill_offers(thread.id).unwrap().is_empty());
+        // Approval needs the reviewed text's digest, and refuses a file that
+        // changed since that review.
+        let Reply::Error(report) = send(&g, enable(true, None)).await else {
+            panic!("approval without a review is refused");
+        };
+        assert_eq!(report.kind, ErrorKind::InvalidRequest);
+        write(&g, "notes", "unreviewed");
+        let Reply::Error(report) = send(&g, enable(true, Some(reviewed.digest.clone()))).await
+        else {
+            panic!("approval of changed text is refused");
+        };
+        assert_eq!(report.kind, ErrorKind::PermissionDenied);
+        assert!(g.skill_offers(thread.id).unwrap().is_empty());
+        write(&g, "notes", &body);
+        assert_eq!(
+            reviewed.text,
+            std::fs::read_to_string(g.skills_root().unwrap().join("notes/SKILL.md")).unwrap()
+        );
+        assert_eq!(
+            send(&g, enable(true, Some(reviewed.digest))).await,
+            Reply::Ok
+        );
         assert_eq!(
             g.skill_offers(thread.id).unwrap(),
             [SkillOffer {
@@ -219,12 +276,13 @@ mod tests {
         };
         assert!(skills[1].changed && !skills[1].enabled);
 
-        assert_eq!(send(&g, enable(false)).await, Reply::Ok);
+        assert_eq!(send(&g, enable(false, None)).await, Reply::Ok);
         let Reply::Error(report) = send(
             &g,
             Command::SetSkillEnabled {
                 name: "missing".into(),
                 enabled: true,
+                digest: Some("0".repeat(64)),
             },
         )
         .await
@@ -237,6 +295,7 @@ mod tests {
             Command::SetSkillEnabled {
                 name: "broken".into(),
                 enabled: true,
+                digest: Some("0".repeat(64)),
             },
         )
         .await
@@ -265,7 +324,8 @@ mod tests {
         let text = Id::new_v4().to_string();
         std::fs::write(g.skills_root().unwrap().join("notes/ref.md"), &text).unwrap();
         assert!(g.skill_file(thread.id, "notes", "ref.md").is_err());
-        g.set_skill_enabled("notes", true).unwrap();
+        let digest = g.read_skill("notes").unwrap().digest;
+        g.set_skill_enabled("notes", true, Some(&digest)).unwrap();
         assert_eq!(
             g.skill_file(thread.id, "notes", "ref.md").unwrap(),
             text.as_bytes()

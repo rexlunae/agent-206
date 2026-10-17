@@ -128,7 +128,49 @@ fn supporting_files_stay_inside_the_skill() {
         ));
         std::os::unix::fs::symlink(root.path().join("one"), root.path().join("alias")).unwrap();
         assert!(matches!(load(root.path(), "alias"), Err(SkillError::Path)));
+        std::os::unix::fs::symlink(root.path(), root.path().join("one/up")).unwrap();
+        // A link swapped in after the typed check still cannot be opened,
+        // whether it replaces the file, a directory or the skill itself.
+        for (name, path) in [("one", "link"), ("one", "up/secret"), ("alias", "SKILL.md")] {
+            assert!(
+                read_bounded(root.path(), name, Path::new(path), MAX_FILE_BYTES).is_err(),
+                "{name}/{path}"
+            );
+        }
+        assert!(
+            read_bounded(
+                root.path(),
+                "one",
+                Path::new("ref/notes.md"),
+                MAX_FILE_BYTES
+            )
+            .is_ok()
+        );
     }
+}
+
+#[test]
+fn instructions_keep_an_indented_first_line() {
+    let skill = parse("---\nname: one\n---\n\n \n    cargo test\n", "one").unwrap();
+    assert_eq!(skill.instructions, "    cargo test\n");
+    let skill = parse("---\nname: one\n---\n\n \n", "one").unwrap();
+    assert_eq!(skill.instructions, "");
+}
+
+#[cfg(unix)]
+#[test]
+fn only_executable_files_meet_program_requirements() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let name = format!("tool{}", uuid::Uuid::new_v4().simple());
+    let program = dir.path().join(&name);
+    std::fs::write(&program, "").unwrap();
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(!in_search_path(&name, dir.path().as_os_str()));
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(in_search_path(&name, dir.path().as_os_str()));
+    std::fs::create_dir(dir.path().join("folder")).unwrap();
+    assert!(!in_search_path("folder", dir.path().as_os_str()));
 }
 
 #[test]

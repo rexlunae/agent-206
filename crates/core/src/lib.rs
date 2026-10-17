@@ -483,12 +483,22 @@ pub struct SkillSummary {
     pub enabled: bool,
     /// Enabled once, but `SKILL.md` changed since; it is not offered until re-enabled.
     pub changed: bool,
+    /// SHA-256 of `SKILL.md` as it is now; approving requires it.
+    pub digest: Option<String>,
     /// Requirements this gateway's computer does not meet.
     pub unmet: Vec<String>,
     /// Environment variables the author expects; tools never inherit them.
     pub expects_env: Vec<String>,
     /// Why the skill could not be read.
     pub failure: Option<ErrorReport>,
+}
+/// The exact `SKILL.md` a user reviews, with the digest that approves it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillText {
+    pub name: String,
+    pub text: String,
+    /// SHA-256 of `text`; pass it to [`Command::SetSkillEnabled`].
+    pub digest: String,
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Snapshot {
@@ -757,10 +767,14 @@ pub enum Command {
     ReadSkill {
         name: String,
     },
-    /// Approve a skill as it is now, or withdraw approval (user operation).
+    /// Approve a skill, or withdraw approval (user operation). Enabling
+    /// requires the `digest` of the text the user reviewed; it fails with
+    /// `Changed` if `SKILL.md` no longer matches it.
     SetSkillEnabled {
         name: String,
         enabled: bool,
+        #[serde(default)]
+        digest: Option<String>,
     },
 }
 impl Command {
@@ -824,6 +838,7 @@ pub enum Reply {
     Error(ErrorReport),
     Gateway(GatewayInfo),
     Skills(Vec<SkillSummary>),
+    Skill(SkillText),
     Tools(ToolList),
 }
 impl Reply {

@@ -37,17 +37,25 @@ environment, so credentials must come through the vault.
 
 ## Approval
 
-Installed skills start **off**. Enabling a skill (`agent206 skills enable NAME`
-or **Approve and enable**) records the SHA-256 of its `SKILL.md` in
-`settings.toml` (`enabled_skills`). Any later edit makes the skill "changed": it
-is withheld from models until the user reviews and enables it again. A skill that
-fails to parse is listed with its error, never silently dropped.
+Installed skills start **off**. Approval names the text the user reviewed:
+`agent206 skills show NAME` prints `SKILL.md` and its SHA-256 digest, and
+`agent206 skills enable NAME --digest HEX` approves it; on the Extensions page,
+**Review** opens the text and **Approve this text and enable** approves what is
+shown. If the file changed after that review, approval is refused. The digest is
+recorded in `settings.toml` (`enabled_skills`); saving settings never changes
+it, so approval stays a separate user operation. Any later edit makes the skill
+"changed": it is withheld from models until the user reviews and enables it
+again. A skill that fails to parse is listed with its error, never silently
+dropped. Installing or editing a skill changes files only, so the page's
+**Refresh** re-reads the folder.
 
 Bounds: 256 skill folders, 256 KiB per `SKILL.md`, 1 MiB per supporting file.
 Supporting files are read only by relative path inside the skill; absolute paths,
-`..` and symlinks are refused.
+`..` and symlinks are refused, and files are opened without following symlinks
+at any step, so a link swapped in during a read cannot reach outside the skill.
+A program requirement is met only by an executable file on `PATH`.
 
-CLI: `agent206 skills list | show NAME | enable NAME | disable NAME`.
+CLI: `agent206 skills list | show NAME | enable NAME --digest HEX | disable NAME`.
 
 ## Run engine interface
 

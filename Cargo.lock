@@ -191,6 +191,8 @@ name = "a206-skills"
 version = "0.1.0"
 dependencies = [
  "a206-core",
+ "cap-fs-ext",
+ "cap-std",
  "serde",
  "serde-saphyr",
  "serde_json",
