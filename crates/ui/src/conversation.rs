@@ -136,7 +136,9 @@ fn Conversation(thread: Thread, target: Option<Uuid>) -> Element {
     let can_create = (state.connected)() && state.gateway_busy.read().is_none();
     let mut submit = move || {
         // A slash command runs instead of sending; anything else is a message.
-        let text = match crate::slash::parse(draft().trim()) {
+        // A failed send restores what was typed, so `//new` stays escaped.
+        let typed = draft().trim().to_owned();
+        let text = match crate::slash::parse(&typed) {
             Ok(crate::slash::Typed::Send(text)) => text,
             Ok(crate::slash::Typed::Run(slash)) => {
                 // The conversation as the gateway last reported it.
@@ -156,11 +158,15 @@ fn Conversation(thread: Thread, target: Option<Uuid>) -> Element {
                         command_error.set(None);
                         crate::slash::run(state, command);
                     }
-                    Err(report) => command_error.set(Some(report)),
+                    Err(report) => {
+                        crate::error::record("slash_command", &report);
+                        command_error.set(Some(report));
+                    }
                 }
                 return;
             }
             Err(report) => {
+                crate::error::record("slash_command", &report);
                 command_error.set(Some(report));
                 return;
             }
@@ -168,6 +174,7 @@ fn Conversation(thread: Thread, target: Option<Uuid>) -> Element {
         if steerable && !text.is_empty() {
             steering.set(true);
             draft.set(String::new());
+            let typed = typed.clone();
             spawn(async move {
                 match crate::call(Command::Steer {
                     thread: id,
@@ -177,7 +184,7 @@ fn Conversation(thread: Thread, target: Option<Uuid>) -> Element {
                 {
                     Ok(_) => state.error.set(None),
                     Err(error) => {
-                        draft.set(text);
+                        draft.set(typed);
                         state.error.set(Some(error));
                     }
                 }
@@ -212,7 +219,7 @@ fn Conversation(thread: Thread, target: Option<Uuid>) -> Element {
                         state.error.set(None);
                     }
                     other => {
-                        draft.set(text);
+                        draft.set(typed);
                         attachments.set(files);
                         state.error.set(Some(match other {
                             Err(error) => error,
@@ -312,6 +319,11 @@ fn Conversation(thread: Thread, target: Option<Uuid>) -> Element {
     };
     let effort_unavailable = effort_options.is_empty() || running;
     let commands = crate::slash::suggestions(&draft());
+    // A command needs no model; Send runs it (or says why it cannot run).
+    let typed_command = !matches!(
+        crate::slash::parse(draft().trim()),
+        Ok(crate::slash::Typed::Send(_))
+    );
     let tool_count = thread.grant.capabilities.len();
     let availability = if running {
         Availability::Disabled
@@ -484,7 +496,7 @@ fn Conversation(thread: Thread, target: Option<Uuid>) -> Element {
                         IconButton { icon: if running { IconName::Stop } else { IconName::ArrowUp }, label: if running { name!("Stop response") } else { name!("Send message") },
                             title: if running { "Stop response" } else { "Send · Enter (Shift+Enter for a new line)" },
                             class: "a206-compose-send", size: ButtonSize::Sm, variant: ButtonVariant::Primary,
-                            availability: if running || (has_model && !reading_files() && (!draft().trim().is_empty() || !attachments.read().is_empty())) { Availability::Enabled } else { Availability::Disabled },
+                            availability: if running || typed_command || (has_model && !reading_files() && (!draft().trim().is_empty() || !attachments.read().is_empty())) { Availability::Enabled } else { Availability::Disabled },
                             onclick: move |_| { if running { dispatch(state, Command::CancelRun { thread: id }); } else { submit(); } }
                         }
                     }
