@@ -129,6 +129,7 @@ impl crate::error::Classified for HostFailure {
             }
             HostErrorCode::Unsupported | HostErrorCode::Other => return None,
             HostErrorCode::Io => ErrorKind::Storage,
+            HostErrorCode::Timeout => ErrorKind::Timeout,
         })
     }
 }
@@ -176,7 +177,8 @@ impl ExtensionHost {
         Ok(self
             .plugins()?
             .into_iter()
-            .filter(|plugin| plugin.enabled)
+            // SkillToolHost exposes this builtin under its stable legacy names.
+            .filter(|plugin| plugin.enabled && plugin.id != crate::skill_tool::EXTENSION)
             .flat_map(|plugin| {
                 let granted = plugin.granted;
                 let extension = plugin.id;
@@ -200,7 +202,7 @@ impl ExtensionHost {
         Ok(self
             .plugins()?
             .into_iter()
-            .filter(|plugin| plugin.enabled)
+            .filter(|plugin| plugin.enabled && plugin.id != crate::skill_tool::EXTENSION)
             .map(|plugin| {
                 let tools = self.manifest(&plugin.id).map(|manifest| {
                     manifest
@@ -330,6 +332,7 @@ impl ExtensionHost {
             extension: manifest.id.clone(),
             effective: declared.clone(),
             workspace: scope.workspace,
+            skills_root: self.data_dir.join("skills"),
             store: Arc::clone(&self.store),
             logs: 0,
             last_failure: None,
@@ -467,6 +470,7 @@ async fn read_frame<T: serde::de::DeserializeOwned>(
 
 /// Executes relayed host calls for one invocation.
 struct HostCalls {
+    skills_root: PathBuf,
     extension: String,
     effective: BTreeSet<Capability>,
     workspace: Option<PathBuf>,
@@ -490,6 +494,60 @@ impl HostCalls {
             }
         }
     }
+    async fn skill_reply(
+        &self,
+        name: &str,
+        arguments: serde_json::Map<String, serde_json::Value>,
+    ) -> Result<HostReply, HostFailure> {
+        if self.extension != crate::skill_tool::EXTENSION {
+            return Err(failure(
+                HostErrorCode::Denied,
+                "skill reads are restricted to the skills builtin",
+            ));
+        }
+        let pins = self.lock()?.state.settings.enabled_skills.clone();
+        let approved = pins.clone();
+        let root = self.skills_root.clone();
+        let request = crate::tools::ToolRequest {
+            call: String::new(),
+            name: name.into(),
+            arguments,
+            approved: false,
+        };
+        let text =
+            crate::skill_tool::io(move || crate::skill_tool::read(&root, &approved, &request))
+                .await
+                .map_err(|error| {
+                    let report = crate::error::handle("skill_host_read", &error);
+                    let code =
+                        if matches!(&error, crate::skill_tool::SkillToolError::TooLarge { .. }) {
+                            HostErrorCode::TooLarge
+                        } else {
+                            match report.kind {
+                                ErrorKind::PermissionDenied => HostErrorCode::Denied,
+                                ErrorKind::NotFound => HostErrorCode::NotFound,
+                                ErrorKind::InvalidRequest => HostErrorCode::Invalid,
+                                ErrorKind::Timeout => HostErrorCode::Timeout,
+                                _ => HostErrorCode::Io,
+                            }
+                        };
+                    failure(code, &report.message)
+                })?;
+        let store = self.lock()?;
+        if store.state.settings.enabled_skills != pins
+            || !store
+                .state
+                .plugins
+                .iter()
+                .any(|p| p.id == self.extension && p.enabled)
+        {
+            return Err(failure(
+                HostErrorCode::Denied,
+                "skill approval or extension permission changed during the read",
+            ));
+        }
+        Ok(HostReply::File(text.into_bytes().into()))
+    }
     async fn execute(&mut self, request: HostRequest) -> Result<HostReply, HostFailure> {
         // The stored plugin is read again for every call, so disabling or
         // revoking takes effect inside an invocation already running.
@@ -507,6 +565,18 @@ impl HostCalls {
             return Err(failure(HostErrorCode::Denied, &message));
         }
         match request {
+            HostRequest::SkillList => {
+                self.skill_reply(crate::skill_tool::LIST, serde_json::Map::new())
+                    .await
+            }
+            HostRequest::SkillRead { name, path } => {
+                let mut args = serde_json::Map::new();
+                args.insert("name".into(), serde_json::Value::String(name));
+                if let Some(path) = path {
+                    args.insert("path".into(), serde_json::Value::String(path));
+                }
+                self.skill_reply(crate::skill_tool::INFO, args).await
+            }
             HostRequest::ReadFile { path } => {
                 let root = self.workspace()?;
                 blocking(move || workspace::read_file(root, &path)).await

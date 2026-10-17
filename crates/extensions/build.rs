@@ -3,6 +3,7 @@
 use std::{path::PathBuf, process::Command};
 
 const BUILTINS: &[(&str, &str)] = &[
+    ("a206-plugin-skills", "a206_plugin_skills"),
     ("a206-plugin-workspace", "a206_plugin_workspace"),
     ("a206-plugin-git", "a206_plugin_git"),
 ];

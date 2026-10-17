@@ -1,5 +1,6 @@
 use super::*;
 use a206_core::Id;
+use serde_json::json;
 
 fn write(root: &Path, name: &str, body: &str) -> String {
     let dir = root.join("skills").join(name);
@@ -23,16 +24,21 @@ async fn call(
     let Value::Object(arguments) = arguments else {
         panic!("arguments are an object")
     };
-    host.call(
-        &scope(),
-        ToolRequest {
-            call: Id::new_v4().to_string(),
-            name: name.into(),
-            arguments,
-            approved: false,
-        },
-    )
-    .await
+    let root = host.root.clone();
+    let pins = host.pins().map_err(|error| crate::error::report(&error))?;
+    let request = ToolRequest {
+        call: Id::new_v4().to_string(),
+        name: name.into(),
+        arguments,
+        approved: false,
+    };
+    io(move || read(&root, &pins, &request))
+        .await
+        .map(|text| ToolOutput {
+            text,
+            is_error: false,
+        })
+        .map_err(|error| crate::error::report(&error))
 }
 
 #[tokio::test]
@@ -134,6 +140,61 @@ async fn supporting_files_and_arguments_are_checked() {
             .kind,
         ErrorKind::InvalidRequest
     );
+}
+
+#[tokio::test]
+async fn oversized_index_is_refused_instead_of_returning_partial_entries() {
+    let profile = tempfile::tempdir().unwrap();
+    let store = Arc::new(Mutex::new(Store::open(profile.path()).unwrap()));
+    let host = SkillToolHost::new(store.clone(), profile.path());
+    let dir = profile.path().join("skills/notes");
+    std::fs::create_dir_all(&dir).unwrap();
+    let source = format!(
+        "---\nname: notes\ndescription: {}\n---\nInstructions",
+        "x".repeat(tools::MAX_OUTPUT)
+    );
+    std::fs::write(dir.join("SKILL.md"), &source).unwrap();
+    let digest = a206_skills::parse(&source, "notes").unwrap().digest;
+    store
+        .lock()
+        .unwrap()
+        .state
+        .settings
+        .enabled_skills
+        .insert("notes".into(), digest);
+    assert_eq!(
+        call(&host, LIST, json!({})).await.unwrap_err().kind,
+        ErrorKind::InvalidRequest
+    );
+}
+
+#[tokio::test]
+async fn empty_approvals_still_surface_a_broken_skill_directory() {
+    let profile = tempfile::tempdir().unwrap();
+    std::fs::write(profile.path().join("skills"), "not a directory").unwrap();
+    let store = Arc::new(Mutex::new(Store::open(profile.path()).unwrap()));
+    let host = SkillToolHost::new(store, profile.path());
+    let listing = host.list(&scope()).await;
+    assert!(listing.tools.is_empty());
+    assert_eq!(listing.unavailable.len(), 1);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn stalled_reads_do_not_block_the_async_executor() {
+    let (started, ready) = tokio::sync::oneshot::channel();
+    let (release, wait) = std::sync::mpsc::channel();
+    let task = tokio::spawn(io(move || {
+        started.send(()).unwrap();
+        wait.recv().unwrap();
+        Ok(())
+    }));
+    ready.await.unwrap();
+    // This runs on the same single async worker while the filesystem stand-in
+    // is blocked. A direct synchronous read would prevent it from running.
+    tokio::task::yield_now().await;
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    release.send(()).unwrap();
 }
 
 #[tokio::test]

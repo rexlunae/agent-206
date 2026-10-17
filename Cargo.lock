@@ -117,6 +117,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "a206-plugin-skills"
+version = "0.1.0"
+dependencies = [
+ "a206-extension-sdk",
+]
+
+[[package]]
 name = "a206-plugin-workspace"
 version = "0.1.0"
 dependencies = [

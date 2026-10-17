@@ -59,8 +59,9 @@ CLI: `agent206 skills list | show NAME | enable NAME --digest HEX | disable NAME
 
 ## Model access
 
-Native runs get two tools, named as in RustyClaw, from
-`crates/runtime/src/skill_tool.rs`:
+Native runs get two tools, named as in RustyClaw, from the bundled
+`agent206.skills` WASM extension. `crates/runtime/src/skill_tool.rs` adapts the
+manifest and retains those names; it does not execute the tools natively:
 
 - `skill_list` returns the `<available_skills>` block: names and descriptions of
   approved, unchanged skills, escaped as author text.
@@ -73,6 +74,19 @@ tool they stay denied in a conversation until the user permits them there. Each
 call re-reads the file and checks it against its approval, so an edit withdraws
 it at once. A result longer than the tool output limit (64 KiB) is refused
 rather than cut, because a cut skill would be followed as if it were whole.
+The complete index has the same bound. At settlement the run engine also checks
+the conversation’s actual remaining output space; a complete result that cannot
+fit becomes a typed storage failure, with none of the partial instructions.
+
+Skill host imports are restricted to this builtin and current approval pins.
+They confer no general filesystem access. Disabling the builtin withdraws its
+tools too. Every invocation uses the standard WASM worker process, fuel/memory
+bounds, timeout and cancellation. File reads run off the async executor in a
+shared pool capped at two outstanding operations. A stalled OS filesystem call
+cannot be forcibly interrupted; a cancelled caller discards its result and
+kills its WASM worker, while the read retains its pool permit until it exits.
+Read/queue waits expire after ten seconds. Directory failures are surfaced even
+when there are no approval pins.
 
 The gateway methods `skill_index`, `skill_offers`, `skill_instructions` and
 `skill_file` share the same checks. Failures are typed: `Disabled` and `Changed`
