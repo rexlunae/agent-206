@@ -10,6 +10,7 @@
 use super::{Account, Api, Batch, Event, Inbound, MessengerError, Result, split};
 use a206_broker::{AuthScheme, HttpMethod, SocketEvent, SocketScheme};
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
@@ -30,6 +31,12 @@ const MIN_HEARTBEAT: Duration = Duration::from_secs(1);
 const MAX_HEARTBEAT: Duration = Duration::from_secs(600);
 /// Close codes after which reconnecting with the same settings cannot help.
 const CLOSE_AUTHENTICATION: u16 = 4004;
+/// Discord's channel type for a direct message.
+const DIRECT_MESSAGE: u8 = 1;
+/// How long a channel lookup may hold up the session's heartbeats.
+const LOOKUP_TIMEOUT: Duration = Duration::from_secs(10);
+/// Most channel types remembered at once.
+const MAX_KNOWN_CHANNELS: usize = 4096;
 const CLOSE_INVALID_INTENTS: u16 = 4013;
 const CLOSE_DISALLOWED_INTENTS: u16 = 4014;
 
@@ -273,6 +280,7 @@ async fn session(api: &Api, sender: &mpsc::Sender<Queued>) -> Result<std::conver
     let mut seq: Option<u64> = None;
     let mut acknowledged = true;
     let mut own: Option<String> = None;
+    let mut private = Private::default();
     loop {
         let event = tokio::select! {
             _ = heartbeat.tick() => {
@@ -308,7 +316,14 @@ async fn session(api: &Api, sender: &mpsc::Sender<Queued>) -> Result<std::conver
                 Some("MESSAGE_CREATE") => {
                     let message: Message = serde_json::from_value(payload.d).map_err(malformed)?;
                     let key = message.id.clone();
-                    let event = message_event(message, own.as_deref());
+                    let mut event = message_event(message, own.as_deref());
+                    // Without a guild id, only a channel Discord itself calls a
+                    // direct message is private.
+                    if let Event::Message(inbound) = &mut event
+                        && !inbound.group
+                    {
+                        inbound.group = !private.check(api, &inbound.chat).await;
+                    }
                     match sender.try_send(Ok((key, event))) {
                         Ok(()) => {}
                         Err(mpsc::error::TrySendError::Full(_)) => {
@@ -325,6 +340,60 @@ async fn session(api: &Api, sender: &mpsc::Sender<Queued>) -> Result<std::conver
             _ => {}
         }
     }
+}
+
+/// Channels known to be direct messages, looked up once each.
+#[derive(Default)]
+struct Private {
+    known: HashMap<String, bool>,
+}
+impl Private {
+    /// Whether `channel` is a direct message (type 1). Anything else, or a
+    /// lookup that fails or takes too long, counts as a group, so a sender
+    /// list is never skipped by mistake. Only answers are remembered.
+    async fn check(&mut self, api: &Api, channel: &str) -> bool {
+        if let Some(&private) = self.known.get(channel) {
+            return private;
+        }
+        let looked_up = tokio::time::timeout(LOOKUP_TIMEOUT, channel_type(api, channel)).await;
+        match looked_up {
+            Ok(Ok(kind)) => {
+                let private = kind == DIRECT_MESSAGE;
+                if self.known.len() >= MAX_KNOWN_CHANNELS {
+                    self.known.clear();
+                }
+                self.known.insert(channel.to_owned(), private);
+                private
+            }
+            Ok(Err(error)) => {
+                tracing::warn!(
+                    error = &error as &dyn std::error::Error,
+                    "could not look up a Discord channel; treating it as a group"
+                );
+                false
+            }
+            Err(_) => {
+                tracing::warn!("a Discord channel lookup timed out; treating it as a group");
+                false
+            }
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct Channel {
+    #[serde(rename = "type")]
+    kind: u8,
+}
+
+async fn channel_type(api: &Api, channel: &str) -> Result<u8> {
+    let url = api.url_segments(&["api", "v10", "channels", channel])?;
+    let (status, body) = api
+        .call(AuthScheme::DiscordBot, HttpMethod::Get, url, None)
+        .await?;
+    check(status)?;
+    let channel: Channel = serde_json::from_slice(&body).map_err(malformed)?;
+    Ok(channel.kind)
 }
 
 fn beat(seq: Option<u64>) -> String {

@@ -417,9 +417,7 @@ async fn run<H: Host>(
     let span = tracing::info_span!("messenger", messenger = %name);
     let work = async {
         let mut delay = backoff.initial;
-        // Updates up to here are handled; kept across sessions so a retry
-        // does not ask the service to deliver them again.
-        let mut cursor = None;
+        let mut carried = Carried::default();
         let mut pairings = host.pairings();
         loop {
             // Mark the pairing in hand as seen, so waiting below wakes only
@@ -433,7 +431,7 @@ async fn run<H: Host>(
                 continue;
             };
             host.update(&name, |s| s.state = MessengerState::Connecting);
-            let result = session(&host, &config, pairing, &mut delay, &mut cursor, backoff).await;
+            let result = session(&host, &config, pairing, &mut delay, &mut carried, backoff).await;
             let Err(error) = result else { return };
             let report = crate::error::handle("messenger", &error);
             host.update(&name, |s| {
@@ -489,6 +487,17 @@ impl Cursor {
     }
 }
 
+/// What one messenger's sessions hand on to the next.
+#[derive(Default)]
+struct Carried {
+    /// Updates up to here are handled; kept across sessions so a retry
+    /// does not ask the service to deliver them again.
+    cursor: Option<Cursor>,
+    /// The adapter, while the pairing it was made for is current, so a
+    /// socket's queued events survive a failed account check or reply.
+    adapter: Option<(BrokerPairing, Adapter)>,
+}
+
 /// Connect and serve until an error. Resets `delay` once connected and marks
 /// each event handled as its handling starts, so a message is handled at
 /// most once while the gateway runs, even if its batch arrives again.
@@ -502,11 +511,18 @@ async fn session<H: Host>(
     config: &MessengerConfig,
     pairing: BrokerPairing,
     delay: &mut Duration,
-    cursor: &mut Option<Cursor>,
+    carried: &mut Carried,
     backoff: Backoff,
 ) -> Result<()> {
-    let api = Api::new(host.root(), pairing, config)?;
-    let mut adapter = Adapter::new(config, api);
+    let Carried { cursor, adapter } = carried;
+    let adapter = match adapter.take() {
+        Some((current, kept)) if current == pairing => adapter.insert((current, kept)),
+        _ => {
+            let api = Api::new(host.root(), pairing.clone(), config)?;
+            adapter.insert((pairing, Adapter::new(config, api)))
+        }
+    };
+    let adapter = &mut adapter.1;
     let mut account = adapter.connect().await?;
     host.update(&config.name, |s| {
         s.state = MessengerState::Connected;
@@ -532,7 +548,7 @@ async fn session<H: Host>(
         let batch = adapter.receive(position.next.as_deref()).await?;
         for (key, event) in batch.events {
             if position.handled.insert(key) {
-                deliver(host, config, &adapter, event).await?;
+                deliver(host, config, adapter, event).await?;
             }
         }
         if batch.complete {

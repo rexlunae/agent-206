@@ -1229,6 +1229,8 @@ struct DiscordApi {
     heartbeats: Arc<Mutex<u32>>,
     /// Channel and body of each sent message.
     sent: Arc<Mutex<Vec<(String, Value)>>>,
+    /// Channels that are direct messages; every other channel is a server's.
+    direct: Arc<Mutex<BTreeSet<String>>>,
 }
 
 fn check_bot(api: &DiscordApi, headers: &axum::http::HeaderMap) {
@@ -1259,6 +1261,17 @@ async fn serve_discord(api: DiscordApi) -> String {
         check_bot(&api, &headers);
         api.sent.lock().unwrap().push((channel, body));
         Json(json!({"id": random()}))
+    };
+    let channel = |State(api): State<DiscordApi>,
+                   headers: HeaderMap,
+                   Path(channel): Path<String>| async move {
+        check_bot(&api, &headers);
+        let kind = if api.direct.lock().unwrap().contains(&channel) {
+            1
+        } else {
+            0
+        };
+        Json(json!({"id": channel, "type": kind}))
     };
     let socket = |State(api): State<DiscordApi>, upgrade: WebSocketUpgrade| async move {
         upgrade.on_upgrade(move |mut socket| async move {
@@ -1316,6 +1329,7 @@ async fn serve_discord(api: DiscordApi) -> String {
     let router = Router::new()
         .route("/api/v10/users/@me", get(me))
         .route("/api/v10/gateway/bot", get(gateway))
+        .route("/api/v10/channels/{channel}", get(channel))
         .route("/api/v10/channels/{channel}/messages", post(send))
         .route("/gateway", any(socket))
         .with_state(api.clone());
@@ -1388,6 +1402,7 @@ async fn discord_answers_allowed_channels_and_ignores_itself_and_webhooks() {
     let name = "discord";
     let (dm, channel, other, guild) = (random(), random(), random(), random());
     let (member, stranger, friend) = (random(), random(), random());
+    api.direct.lock().unwrap().insert(dm.clone());
     let mut entry = discord_config(name, &origin, &credential, &[&dm, &channel]);
     entry.allowed_users.extend([member.clone(), friend.clone()]);
     let (dm_text, group_text) = (random(), random());
@@ -1449,8 +1464,10 @@ async fn discord_answers_allowed_channels_and_ignores_itself_and_webhooks() {
 async fn discord_reconnects_when_asked_or_unacknowledged_and_stops_on_intents() {
     let (api, origin, _dir, credential, host, _anchor) = discord_setup().await;
     let name = "discord";
-    let channel = random();
-    let entry = discord_config(name, &origin, &credential, &[&channel]);
+    let (channel, server) = (random(), random());
+    api.direct.lock().unwrap().insert(channel.clone());
+    // No senders are listed, so only direct messages are accepted.
+    let entry = discord_config(name, &origin, &credential, &[&channel, &server]);
     let (desired, receiver) = watch::channel(vec![Desired {
         config: entry.clone(),
         run: true,
@@ -1469,11 +1486,18 @@ async fn discord_reconnects_when_asked_or_unacknowledged_and_stops_on_intents() 
         .await;
     let text = random();
     let author = random();
-    api.dispatches
-        .lock()
-        .unwrap()
-        .push_back(discord_message(&channel, None, &author, &text));
+    // A server channel's message without a guild id is still a group's.
+    let stranger = random();
+    api.dispatches.lock().unwrap().extend([
+        discord_message(&server, None, &stranger, &random()),
+        discord_message(&channel, None, &author, &text),
+    ]);
     host.until(|_| api.sent.lock().unwrap().len() == 1).await;
+    assert_eq!(api.sent.lock().unwrap()[0].0, channel);
+    let refused = host.status(name).refused;
+    assert_eq!(refused.len(), 1);
+    assert_eq!(refused[0].chat, server);
+    assert_eq!(refused[0].sender.as_deref(), Some(stranger.as_str()));
 
     // A gateway that stops acknowledging heartbeats is left for a new one.
     *api.silent.lock().unwrap() = true;

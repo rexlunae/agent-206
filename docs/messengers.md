@@ -174,7 +174,10 @@ agent206 messenger enable guild
 - **Ids.** Chats are channel ids (a direct message has its own channel id,
   shown as refused on first contact) and senders are user ids, as Discord's
   "Copy ID" (developer mode) gives them. Server channels are groups, so
-  their senders must be listed; a direct message is private.
+  their senders must be listed; a direct message is private. A message
+  without a server id counts as private only once Discord reports its
+  channel as a direct message (`GET /channels/{id}`, remembered per
+  channel); a lookup that fails counts it as a group.
 - **Brokered socket.** Messages arrive over the
   [Gateway](https://discord.com/developers/docs/events/gateway) WebSocket.
   The gateway asks the broker to open it (`Request::SocketOpen`,
@@ -203,7 +206,10 @@ agent206 messenger enable guild
   answered. A rejected token (HTTP 401 or close code 4004) or refused intents
   (4013, 4014) stop the messenger until the user acts. The account is
   checked (`/users/@me`) before each batch; another bot behind the
-  credential gets its own session.
+  credential gets its own session. A failed check or reply keeps the
+  running socket and its queued messages for the retry. A token reset in
+  the developer portal ends Discord's session (close code 4004), so the
+  next session identifies with the token the vault holds then.
 
 ## Interface for the run engine
 
