@@ -425,6 +425,10 @@ impl Gateway {
         // user permits them.
         let skill_tools: Arc<dyn crate::tools::ToolHost> =
             Arc::new(crate::skill_tool::SkillToolHost::new(store.clone(), root));
+        // Listing reads what the Extensions page shows and changes nothing.
+        let list_tools: Arc<dyn crate::tools::ToolHost> = Arc::new(
+            crate::extension_list_tool::ListHost::new(extensions.clone(), skill_tools.clone()),
+        );
         let mut gateway = Self {
             admission: Arc::new(Mutex::new(Admission::default())),
             shutdown_committed: Arc::new(tokio::sync::Mutex::new(false)),
@@ -447,6 +451,7 @@ impl Gateway {
                 Arc::new(crate::prompt_tool::PromptHost::new(prompts.clone())),
                 skill_tools,
                 propose_tools,
+                list_tools,
             ]),
             approvals: Arc::new(Mutex::new(BTreeMap::new())),
             prompts,
