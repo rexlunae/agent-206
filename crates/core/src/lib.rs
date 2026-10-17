@@ -498,6 +498,21 @@ pub enum PluginSource {
     /// which the gateway verifies before every run.
     Installed { digest: String },
 }
+/// Most packages agents may leave waiting for review at once.
+pub const MAX_EXTENSION_PROPOSALS: usize = 8;
+/// A package an agent prepared, waiting for the user's review. It grants
+/// nothing and never runs; installing it is a user operation, and it arrives
+/// disabled with nothing granted, even when it updates an installed extension.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExtensionProposal {
+    /// SHA-256 of the stored package; pass it to [`Command::InstallProposal`].
+    pub digest: String,
+    /// What the package declares. Text fields are written by its author.
+    pub summary: PluginSummary,
+    /// The conversation whose agent prepared it.
+    pub thread: Id,
+    pub proposed_at: u64,
+}
 /// A skill installed in the gateway's profile, as the user reviews it.
 /// Text fields are written by the skill's author.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -544,6 +559,9 @@ pub struct Snapshot {
     /// Runtime state of configured MCP servers; never a grant.
     #[serde(default)]
     pub mcp_servers: Vec<McpServerStatus>,
+    /// Extension packages agents prepared, waiting for the user.
+    #[serde(default)]
+    pub extension_proposals: Vec<ExtensionProposal>,
 }
 impl Snapshot {
     /// Retire only the connection owned by the managed process, including its model grants.
@@ -795,6 +813,15 @@ pub enum Command {
     UninstallExtension {
         extension: String,
     },
+    /// Install a package an agent prepared (user operation). It arrives
+    /// disabled with nothing granted, also when it updates an extension.
+    InstallProposal {
+        digest: String,
+    },
+    /// Discard a package an agent prepared, and its files.
+    DismissProposal {
+        digest: String,
+    },
     Shutdown,
     GatewayStatus,
     /// Hand the gateway a vault broker pairing minted by a trusted client.
@@ -869,6 +896,8 @@ impl Command {
             Self::EnableExtension { .. } => "enable_extension",
             Self::InstallExtension { .. } => "install_extension",
             Self::UninstallExtension { .. } => "uninstall_extension",
+            Self::InstallProposal { .. } => "install_proposal",
+            Self::DismissProposal { .. } => "dismiss_proposal",
             Self::Shutdown => "shutdown",
             Self::GatewayStatus => "gateway_status",
             Self::PairBroker { .. } => "pair_broker",

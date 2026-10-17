@@ -1058,11 +1058,14 @@ mod native {
                                 #[derive(serde::Serialize)]
                                 struct Extensions {
                                     extensions: Vec<a206_core::PluginSummary>,
+                                    #[serde(skip_serializing_if = "Vec::is_empty")]
+                                    proposals: Vec<a206_core::ExtensionProposal>,
                                 }
                                 print!(
                                     "{}",
                                     toml::to_string_pretty(&Extensions {
-                                        extensions: snapshot.plugins
+                                        extensions: snapshot.plugins,
+                                        proposals: snapshot.extension_proposals,
                                     })?
                                 );
                                 return Ok(());

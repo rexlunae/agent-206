@@ -9,7 +9,8 @@
 //!
 //! The WASM extension adapter (`crate::extension_tools`), native command
 //! execution (`crate::exec_tool`) and approved skills (`crate::skill_tool`)
-//! are registered by default; the MCP client (`mcp_offers` /
+//! are registered by default, with `ask_user` (`crate::prompt_tool`) and
+//! `extension_propose` (`crate::propose_tool`); the MCP client (`mcp_offers` /
 //! `call_mcp_tool`) is planned.
 use a206_core::{
     Capability, ErrorKind, ErrorReport, Id, Thread, ToolList, ToolOffer, ToolPermission,

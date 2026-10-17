@@ -386,6 +386,9 @@ impl Gateway {
         let extension_tools: Arc<dyn crate::tools::ToolHost> = Arc::new(
             crate::extension_tools::ExtensionToolHost::new(extensions.clone()),
         );
+        // Proposing grants nothing; installing a proposal is a user operation.
+        let propose_tools: Arc<dyn crate::tools::ToolHost> =
+            Arc::new(crate::propose_tool::ProposeHost::new(extensions.clone()));
         let prompts = Arc::new(crate::prompt_tool::Prompts::new(store.clone()));
         // Approved skills; each conversation still denies the tools until the
         // user permits them.
@@ -410,6 +413,7 @@ impl Gateway {
                 Arc::new(crate::exec_tool::ExecHost::new(root)),
                 Arc::new(crate::prompt_tool::PromptHost::new(prompts.clone())),
                 skill_tools,
+                propose_tools,
             ]),
             approvals: Arc::new(Mutex::new(BTreeMap::new())),
             prompts,
@@ -1469,6 +1473,15 @@ impl Gateway {
                 self.extensions.uninstall(extension).await?;
                 // Running calls and approval waits re-check their tool.
                 self.policy_changed();
+                Ok(Reply::Ok)
+            }
+            Command::InstallProposal { digest } => {
+                let summary = self.extensions.install_proposal(digest).await?;
+                self.policy_changed();
+                Ok(Reply::Extension(Box::new(summary)))
+            }
+            Command::DismissProposal { digest } => {
+                self.extensions.dismiss_proposal(digest).await?;
                 Ok(Reply::Ok)
             }
             Command::Skills => Ok(Reply::Skills(self.skills()?)),

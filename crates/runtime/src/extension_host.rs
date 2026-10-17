@@ -61,6 +61,15 @@ pub enum ExtensionError {
     Bundled(String),
     #[error("\"{0}\" was updated as it started; try again")]
     Updated(String),
+    #[error("no prepared extension package has that digest")]
+    NotProposed,
+    #[error(
+        "{} prepared extension packages are already waiting for review; ask the user to install or dismiss one first",
+        a206_core::MAX_EXTENSION_PROPOSALS
+    )]
+    TooManyProposals,
+    #[error("\"{0}\" is already installed with exactly this package")]
+    AlreadyInstalled(String),
     #[error("could not record the extension")]
     Store(#[from] StoreError),
     #[error("the extension install task failed")]
@@ -119,7 +128,10 @@ impl crate::error::Classified for ExtensionError {
             Self::Package(error) => return classify(error),
             Self::Store(error) => return classify(error),
             Self::Join(_) => ErrorKind::Internal,
-            Self::Updated(_) => ErrorKind::Conflict,
+            Self::Updated(_) | Self::TooManyProposals | Self::AlreadyInstalled(_) => {
+                ErrorKind::Conflict
+            }
+            Self::NotProposed => ErrorKind::NotFound,
             Self::Builtins(_) | Self::Poisoned | Self::CurrentExe(_) => ErrorKind::Internal,
             Self::Confine(error) => return classify(error),
             Self::Spawn(_) | Self::Channel(_) | Self::Exited => ErrorKind::Unavailable,
@@ -184,6 +196,14 @@ pub struct ExtensionHost {
     /// Serializes changes to the package store.
     packages: Arc<Mutex<()>>,
 }
+/// What an update keeps of the grants the user gave the version it replaces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Grants {
+    /// The user supplied the new package: keep what its manifest still requests.
+    Keep,
+    /// An agent prepared it: nothing, so the user reviews every permission again.
+    Clear,
+}
 /// An extension's validated manifest, with its module when it is installed
 /// rather than bundled.
 struct Loaded {
@@ -209,17 +229,26 @@ impl ExtensionHost {
         }
         host
     }
-    /// Remove package files that no installed extension records.
+    /// Remove package files that no installed extension or proposal records.
     fn prune(&self) -> Result<(), ExtensionError> {
         let _serial = self.packages.lock().map_err(|_| ExtensionError::Poisoned)?;
-        let keep = self
-            .plugins()?
-            .into_iter()
-            .filter_map(|plugin| match plugin.source {
-                PluginSource::Installed { digest } => Some(digest),
-                PluginSource::Bundled => None,
-            })
-            .collect();
+        let keep = {
+            let store = self.store.lock().map_err(|_| ExtensionError::Poisoned)?;
+            let installed = store
+                .state
+                .plugins
+                .iter()
+                .filter_map(|plugin| match &plugin.source {
+                    PluginSource::Installed { digest } => Some(digest.clone()),
+                    PluginSource::Bundled => None,
+                });
+            let proposed = store
+                .state
+                .extension_proposals
+                .iter()
+                .map(|proposal| proposal.digest.clone());
+            installed.chain(proposed).collect()
+        };
         Ok(packages::prune(
             &packages::directory(&self.data_dir),
             &keep,
@@ -382,6 +411,15 @@ impl ExtensionHost {
         package: packages::Package,
     ) -> Result<PluginSummary, ExtensionError> {
         let _serial = self.packages.lock().map_err(|_| ExtensionError::Poisoned)?;
+        self.install_locked(package, Grants::Keep)
+    }
+    /// Store and record `package`, withdrawing any proposal of the same
+    /// package. The caller holds the package lock.
+    fn install_locked(
+        &self,
+        package: packages::Package,
+        grants: Grants,
+    ) -> Result<PluginSummary, ExtensionError> {
         let dir = packages::directory(&self.data_dir);
         let created = packages::store(&dir, &package)?;
         // A package directory this install created is removed again if the
@@ -409,8 +447,8 @@ impl ExtensionHost {
             }
             // The same package again: nothing the user reviewed changed.
             Some(plugin) if plugin.source == installed => return Ok(plugin.clone()),
-            Some(plugin) => plugin.granted.clone(),
-            None => BTreeSet::new(),
+            Some(plugin) if grants == Grants::Keep => plugin.granted.clone(),
+            Some(_) | None => BTreeSet::new(),
         };
         let mut summary = package.manifest.summary(false, &granted);
         summary.source = installed;
@@ -421,6 +459,11 @@ impl ExtensionHost {
                 None
             }
         };
+        // The files now belong to the installed extension.
+        store
+            .state
+            .extension_proposals
+            .retain(|proposal| proposal.digest != package.digest);
         // A refused persist restores the earlier state.
         store
             .persist(Some(a206_core::EventKind::ExtensionChanged {
@@ -964,7 +1007,9 @@ impl Drop for Interrupt {
 mod fetch;
 mod git;
 pub mod packages;
+mod proposals;
 mod workspace;
+pub(crate) use workspace::read_limited;
 
 #[cfg(test)]
 mod tests;

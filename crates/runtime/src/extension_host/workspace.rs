@@ -69,6 +69,20 @@ fn read_bounded(file: File) -> Result<Option<Vec<u8>>, HostFailure> {
         .map_err(|e| io_failure(&e))?;
     Ok((bytes.len() as u64 <= MAX_FILE).then_some(bytes))
 }
+/// A regular workspace file of at most `limit` bytes, or `None` when it is
+/// larger. Confined to the workspace like every other read here.
+pub(crate) fn read_limited(
+    root: PathBuf,
+    path: &str,
+    limit: u64,
+) -> Result<Option<Vec<u8>>, HostFailure> {
+    let file = open_regular(&open_workspace(root)?, path)?;
+    let mut bytes = Vec::new();
+    file.take(limit + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| io_failure(&e))?;
+    Ok((bytes.len() as u64 <= limit).then_some(bytes))
+}
 fn too_large() -> HostFailure {
     failure(HostErrorCode::TooLarge, "the file exceeds 512 KiB")
 }
