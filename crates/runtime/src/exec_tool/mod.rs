@@ -13,8 +13,9 @@
 //! fixed `PATH`.
 //!
 //! macOS has no PID namespace, so the shell's process group is killed when it
-//! exits; a process that leaves that group (with `setsid`) can outlive the
-//! call there, though it stays inside the same Seatbelt policy.
+//! exits; a process that leaves that group (with `setsid`), or one being
+//! forked as the group is killed, can outlive the call there, though it
+//! stays inside the same Seatbelt policy.
 //!
 //! With `background`, the command keeps running after the call returns, in
 //! the same sandbox and under the same approval, and the conversation that

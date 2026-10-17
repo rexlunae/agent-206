@@ -567,6 +567,9 @@ async fn background_sessions_end_with_their_host() {
     );
     // The command holds the writing end of a FIFO for as long as it runs,
     // so the reader sees its end as end of file rather than after a delay.
+    // Its child starts before it reports, so the host is not dropped while
+    // the shell is still forking: on macOS a process forked as its group is
+    // killed can escape the kill.
     let fifo = project.path().join("held");
     let made = std::process::Command::new("mkfifo")
         .arg(&fifo)
@@ -576,7 +579,7 @@ async fn background_sessions_end_with_their_host() {
     spawn(
         &host,
         &scope,
-        serde_json::json!({ "command": "exec 3> held; echo started >&3; sleep 600" }),
+        serde_json::json!({ "command": "exec 3> held; sleep 600 & echo started >&3; wait" }),
     )
     .await;
     let (running, started) = tokio::sync::oneshot::channel();

@@ -176,8 +176,9 @@ background sessions.
 - **Cancellation.** Dropping the call kills the sandbox's process group; on
   Linux the sandbox's PID namespace ends with it, taking every descendant
   along. macOS has no PID namespace, so the group is also killed as soon as
-  the shell exits; a process that leaves the group with `setsid` can outlive
-  the call there, still confined by the same policy.
+  the shell exits; a process that leaves the group with `setsid`, or one
+  being forked at the moment the group is killed, can outlive the call
+  there, still confined by the same policy.
 - **Background sessions** (`exec_tool/sessions.rs`). With `background` the
   call returns a session id once the sandbox is up (a sandbox failure still
   reaches the call), and the command keeps running under the same profile
