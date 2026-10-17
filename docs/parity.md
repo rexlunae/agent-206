@@ -58,7 +58,7 @@ invocations and relays gateway-authorized host calls (`a206/docs/plugin-api.md`)
 
 | RustyClaw capability | Agent 206 status | How it should land |
 | --- | --- | --- |
-| read/write/edit/list/search/find files (`tools/file.rs`) | partial: read-only text `ReadDocument` scoped by cap-std; `list_directory`/`read_text_file` ship as WASM tools in the bundled `agent206.workspace` extension (`a206/plugins/workspace`); write/edit/search missing | `workspace` host domain: read/patch/search under ReadWorkspace/WriteWorkspace |
+| read/write/edit/list/search/find files (`tools/file.rs`) | partial: read-only text `ReadDocument` scoped by cap-std; the bundled `agent206.workspace` WASM extension (`a206/plugins/workspace`) has `list_directory`, `read_text_file`, `search_text` (literal, bounded) under ReadWorkspace and `write_text_file`/`edit_text_file` (atomic, single-occurrence edit) under WriteWorkspace; glob/find and regex search missing; agents cannot call them until the run engine's tool loop lands | Remaining: glob/find, regex search, multi-hunk patch as workspace host calls |
 | `apply_patch` multi-hunk (`tools/patch.rs`), `ast_grep_manage` (`ast_grep.rs`) | missing | Workspace patch host call; ast-grep as extension |
 | `execute_command`, `process` bg/poll/send_keys/kill (`tools/runtime.rs`, `process_manager.rs`) | missing natively (Execute grant only for external backends, macOS) | Brokered exec in OS sandbox, bounded output, process-group teardown (reuse `runtime/src/process.rs`) |
 | `web_fetch`, `web_extract` (`tools/web.rs`, `web_extract.rs`) | missing (only download fetch) | Network host call through SSRF guard; readability in WASM |

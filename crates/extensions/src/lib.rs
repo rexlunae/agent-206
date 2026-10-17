@@ -18,7 +18,12 @@ use std::error::Error;
 pub fn required_capability(request: &abi::HostRequest) -> Option<Capability> {
     use abi::HostRequest as R;
     match request {
-        R::ReadFile { .. } | R::ListDirectory { .. } => Some(Capability::ReadWorkspace),
+        R::ReadFile { .. } | R::ListDirectory { .. } | R::Search { .. } => {
+            Some(Capability::ReadWorkspace)
+        }
+        R::WriteFile { .. } | R::EditFile { .. } | R::CreateDirectory { .. } => {
+            Some(Capability::WriteWorkspace)
+        }
         R::StateGet { .. } | R::StatePut { .. } | R::Log { .. } => None,
     }
 }
