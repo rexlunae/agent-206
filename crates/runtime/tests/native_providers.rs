@@ -229,6 +229,7 @@ async fn paginates_native_catalogs_and_dispatches_protocol_specific_text() {
             at: provider::now(),
             backend: CodingBackend::Native,
             tool_calls: vec![],
+            compaction: None,
         });
         if protocol == ProviderApi::Anthropic {
             thread.effort = Some(api.effort.clone());
@@ -660,6 +661,7 @@ fn conversation(info: &ModelInfo) -> Thread {
         at: provider::now(),
         backend: CodingBackend::Native,
         tool_calls: vec![],
+        compaction: None,
     });
     thread
 }

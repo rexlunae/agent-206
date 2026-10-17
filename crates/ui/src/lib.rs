@@ -1,5 +1,6 @@
 //! Shared desktop/web/terminal application tree, composed with fc-dioxus.
 #![forbid(unsafe_code)]
+mod activity;
 mod conversation;
 mod error;
 mod extensions;
@@ -116,7 +117,7 @@ pub(crate) struct State {
     #[cfg(target_arch = "wasm32")]
     pub sign_in: Signal<bool>,
 }
-fn empty_snapshot() -> Snapshot {
+pub(crate) fn empty_snapshot() -> Snapshot {
     Snapshot {
         settings: Settings::default(),
         threads: vec![],
@@ -128,6 +129,7 @@ fn empty_snapshot() -> Snapshot {
         last_event: 0,
         managed_joshua_provider: None,
         mcp_servers: vec![],
+        jobs: vec![],
         extension_proposals: vec![],
     }
 }
@@ -701,7 +703,7 @@ fn Sidebar() -> Element {
     let snapshot = state.data.read();
     rsx! { NavSidebar { class: "a206-sidebar", label: name!("Workspace navigation"), title: rsx! { "Workspace" }, collapsible: false,
         div { class: "a206-nav-group",
-            for item in [Route::Workspace {}, Route::Projects {}, Route::Conversations {}] {
+            for item in [Route::Workspace {}, Route::Projects {}, Route::Conversations {}, Route::Activity {}] {
                 LinkButton { variant: ButtonVariant::Ghost, size: ButtonSize::Sm, class: if route == item { "a206-nav-active" } else { "" }, href: item.to_string(), Icon { name: item.icon(), size: IconSize::Sm } "{item.label()}" }
             }
         }

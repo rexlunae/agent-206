@@ -175,8 +175,10 @@ pub use messengers::{
     ChatBinding, MessengerConfig, MessengerKind, MessengerState, MessengerStatus, RefusedChat,
 };
 pub mod mcp;
+pub mod schedule;
 pub use mcp::{McpServerConfig, McpServerState, McpServerStatus, McpToolInfo, ToolPolicy};
 pub use providers::{ProviderApi, ProviderPreset, ProviderPresetList};
+pub use schedule::{Job, JobAuthor, JobOutcome, JobRun, Schedule};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -333,6 +335,12 @@ pub struct Message {
     /// Tool calls an assistant message requested, with their outcomes.
     #[serde(default)]
     pub tool_calls: Vec<ToolCall>,
+    /// Set on a [`Role::System`] message whose text is a model-written
+    /// summary of every message before it. Native runs send the model the
+    /// latest summary and the messages after it; the earlier messages stay
+    /// in the thread for the user.
+    #[serde(default)]
+    pub compaction: Option<Compaction>,
 }
 impl Message {
     pub fn new(role: Role, text: String, at: u64, backend: CodingBackend) -> Self {
@@ -344,8 +352,65 @@ impl Message {
             at,
             backend,
             tool_calls: vec![],
+            compaction: None,
         }
     }
+}
+/// A policy choice, not a model fact: a native run compacts its earlier
+/// messages before its next request once the previous request's reported
+/// input tokens exceed this percentage of the model's API-reported context
+/// limit. With no reported limit or input count there is no automatic
+/// compaction. RustyClaw uses the same 75%.
+pub const COMPACTION_THRESHOLD_PERCENT: u64 = 75;
+/// Why a conversation's earlier messages were summarized.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactionTrigger {
+    /// The previous model request used more than the gateway's compaction
+    /// threshold of the API-reported context limit.
+    Automatic,
+    /// The user asked for it (`CompactThread`).
+    Manual,
+}
+/// What one compaction summarized and what it cost.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Compaction {
+    pub trigger: CompactionTrigger,
+    /// Messages this summary covers that no earlier summary covered.
+    pub messages: u32,
+    /// The latest summary it folded in, if there was one.
+    pub previous: Option<Id>,
+    /// The last request's input tokens when it started (unknown when the
+    /// provider did not report them).
+    pub input_tokens: Option<u64>,
+    /// The model's API-reported context limit when it started, if known.
+    pub context_limit: Option<u64>,
+    /// The summarization request's own usage.
+    pub usage: Usage,
+}
+/// What happened to one project instruction file a native run looked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InstructionStatus {
+    Included,
+    /// Only the first `bytes` were included.
+    Truncated,
+    /// Not included; `error` says why.
+    Skipped,
+}
+/// Provenance of one project instruction file in a native run's system prompt.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InstructionFile {
+    /// Relative to the project root.
+    pub path: String,
+    pub status: InstructionStatus,
+    /// Bytes included in the prompt.
+    pub bytes: u64,
+    /// The file's size on disk, when it could be read.
+    pub size: Option<u64>,
+    /// SHA-256 of the included text.
+    pub sha256: Option<String>,
+    pub error: Option<ErrorReport>,
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Usage {
@@ -394,6 +459,15 @@ pub struct Thread {
     /// The messenger chat this thread converses with, if any.
     #[serde(default)]
     pub chat: Option<Box<ChatBinding>>,
+    /// Project instruction files the latest native run looked for, and what
+    /// it did with each. Empty when the run could not read the project.
+    #[serde(default)]
+    pub instructions: Vec<InstructionFile>,
+    /// While a user-requested compaction marks the thread `Running`, the
+    /// state it restores afterwards, so a restart restores it too rather
+    /// than reporting an interrupted run.
+    #[serde(default)]
+    pub compacting: Option<RunState>,
 }
 impl Thread {
     pub fn new(title: String, mode: Mode) -> Self {
@@ -419,6 +493,8 @@ impl Thread {
             approvals: vec![],
             prompts: vec![],
             chat: None,
+            instructions: vec![],
+            compacting: None,
         }
     }
 }
@@ -561,6 +637,9 @@ pub struct Snapshot {
     /// Runtime state of configured MCP servers; never a grant.
     #[serde(default)]
     pub mcp_servers: Vec<McpServerStatus>,
+    /// Scheduled messages.
+    #[serde(default)]
+    pub jobs: Vec<Job>,
     /// Extension packages agents prepared, waiting for the user.
     #[serde(default)]
     pub extension_proposals: Vec<ExtensionProposal>,
@@ -596,6 +675,16 @@ pub struct Event {
     pub sequence: u64,
     pub at: u64,
     pub kind: EventKind,
+}
+/// Most events one [`Command::Activity`] page holds.
+pub const MAX_ACTIVITY: u32 = 100;
+/// Journal events newest first, leaving out [progress
+/// notices](EventKind::is_progress).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ActivityPage {
+    pub events: Vec<Event>,
+    /// Older activity is still journaled before the last event here.
+    pub more: bool,
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum EventKind {
@@ -643,6 +732,26 @@ pub enum EventKind {
         prompt: Id,
         outcome: PromptOutcome,
     },
+    /// A scheduled message was added, changed, ran or was removed.
+    JobChanged {
+        id: Id,
+    },
+}
+
+impl EventKind {
+    /// Notices that only tell clients to re-read something that is still
+    /// changing: conversation updates (sent while replies stream) and
+    /// running-download progress. Activity views leave them out.
+    pub fn is_progress(&self) -> bool {
+        matches!(
+            self,
+            Self::ThreadChanged { .. }
+                | Self::DownloadChanged(Download {
+                    state: DownloadState::Running,
+                    ..
+                })
+        )
+    }
 }
 
 /// A capability the vault broker issues to the gateway for one unlock, so the
@@ -724,9 +833,20 @@ pub enum Command {
         query: String,
         limit: u32,
     },
+    /// Summarize a native conversation's earlier messages now, whatever its
+    /// context usage. Replies with the thread; `CancelRun` stops it.
+    CompactThread {
+        thread: Id,
+    },
     /// The tools this conversation could use and how each is permitted.
     ListTools {
         thread: Id,
+    },
+    /// The newest [`ActivityPage`] of the event journal, or the page before
+    /// sequence `before`; `limit` events, between one and [`MAX_ACTIVITY`].
+    Activity {
+        before: Option<u64>,
+        limit: u32,
     },
     /// Set (or with `None`, clear back to deny) one tool's permission.
     SetToolPermission {
@@ -867,6 +987,25 @@ pub enum Command {
         #[serde(default)]
         digest: Option<String>,
     },
+    /// Send `text` to `thread` on `schedule`. The job is enabled.
+    ScheduleJob {
+        name: String,
+        thread: Id,
+        text: String,
+        schedule: Schedule,
+    },
+    /// Pause or resume a job; resuming computes its next time from now.
+    SetJobEnabled {
+        id: Id,
+        enabled: bool,
+    },
+    RemoveJob {
+        id: Id,
+    },
+    /// Run a job now, whatever its schedule.
+    RunJob {
+        id: Id,
+    },
 }
 impl Command {
     /// A stable operation name for logs and diagnostics; never includes arguments.
@@ -887,6 +1026,8 @@ impl Command {
             Self::Send { .. } => "send",
             Self::CancelRun { .. } => "cancel_run",
             Self::SearchMessages { .. } => "search_messages",
+            Self::Activity { .. } => "activity",
+            Self::CompactThread { .. } => "compact_thread",
             Self::ListTools { .. } => "list_tools",
             Self::SetToolPermission { .. } => "set_tool_permission",
             Self::SetToolBudget { .. } => "set_tool_budget",
@@ -917,6 +1058,10 @@ impl Command {
             Self::Skills => "skills",
             Self::ReadSkill { .. } => "read_skill",
             Self::SetSkillEnabled { .. } => "set_skill_enabled",
+            Self::ScheduleJob { .. } => "schedule_job",
+            Self::SetJobEnabled { .. } => "set_job_enabled",
+            Self::RemoveJob { .. } => "remove_job",
+            Self::RunJob { .. } => "run_job",
         }
     }
 }
@@ -938,7 +1083,9 @@ pub enum Reply {
     Skill(SkillText),
     Tools(ToolList),
     Messages(Vec<MessageHit>),
+    Activity(ActivityPage),
     Extension(Box<PluginSummary>),
+    Job(Box<Job>),
 }
 impl Reply {
     /// Separate a gateway-reported failure from a successful reply.

@@ -116,6 +116,7 @@ impl Store {
                 managed_joshua_provider: None,
                 messengers: vec![],
                 mcp_servers: vec![],
+                jobs: vec![],
                 extension_proposals: vec![],
             }
         };
@@ -143,6 +144,8 @@ impl Store {
                 ..Default::default()
             })
             .collect();
+        // Before interrupted runs are marked failed, which it reads.
+        crate::schedule::recover(&mut store.state.jobs, &store.state.threads);
         for thread in &mut store.state.threads {
             // No run survives a restart, so neither do its approvals,
             // questions or calls.
@@ -159,7 +162,11 @@ impl Store {
                     call.error = Some(report);
                 }
             }
-            if thread.state == RunState::Running {
+            // An interrupted compaction is not a run: the previous run's
+            // outcome stays.
+            if let Some(prior) = thread.compacting.take() {
+                thread.state = prior;
+            } else if thread.state == RunState::Running {
                 thread.state = RunState::Failed;
                 thread.error = Some(a206_core::ErrorReport::new(
                     a206_core::ErrorKind::Unavailable,
@@ -238,6 +245,32 @@ impl Store {
             .prepare("SELECT payload FROM events WHERE seq > ?1 ORDER BY seq LIMIT 512")?;
         let rows = stmt.query_map([after], |row| row.get::<_, Vec<u8>>(0))?;
         rows.map(|r| Ok(rmp_serde::from_slice(&r?)?)).collect()
+    }
+    /// See [`Command::Activity`](a206_core::Command::Activity). Only the
+    /// retained journal is read, so the oldest page ends where the journal does.
+    pub fn activity(&self, before: Option<u64>, limit: u32) -> Result<ActivityPage> {
+        // A page always holds at least one event, so a page that says older
+        // activity remains also carries the cursor to reach it.
+        let limit = usize::try_from(limit.clamp(1, MAX_ACTIVITY)).unwrap_or(1);
+        let before = before.unwrap_or(self.state.last_event.saturating_add(1));
+        let mut stmt = self
+            .db
+            .prepare("SELECT payload FROM events WHERE seq < ?1 ORDER BY seq DESC")?;
+        let mut rows = stmt.query([before])?;
+        let mut events = Vec::with_capacity(limit);
+        let mut more = false;
+        while let Some(row) = rows.next()? {
+            let event: Event = rmp_serde::from_slice(&row.get::<_, Vec<u8>>(0)?)?;
+            if event.kind.is_progress() {
+                continue;
+            }
+            if events.len() == limit {
+                more = true;
+                break;
+            }
+            events.push(event);
+        }
+        Ok(ActivityPage { events, more })
     }
     /// A duplicate pending request is indeterminate, never silently executed a second time.
     pub fn begin(&mut self, id: Id, command: &Command) -> Result<Option<Reply>> {
@@ -500,6 +533,45 @@ mod tests {
             vec![ToolCallState::Cancelled, ToolCallState::Succeeded]
         );
         assert!(thread.messages[0].tool_calls[0].error.is_some());
+    }
+    #[test]
+    fn restart_during_a_compaction_restores_the_previous_run_state() {
+        use a206_core::{Mode, Thread};
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = Store::open(directory.path()).unwrap();
+        let report =
+            a206_core::ErrorReport::new(a206_core::ErrorKind::Storage, Id::new_v4().to_string());
+        let mut ids = vec![];
+        // A compaction of a completed and of a failed conversation, and a run.
+        for (prior, compacting) in [
+            (RunState::Complete, true),
+            (RunState::Failed, true),
+            (RunState::Complete, false),
+        ] {
+            let mut thread = Thread::new(Id::new_v4().to_string(), Mode::Chat);
+            thread.state = RunState::Running;
+            if compacting {
+                thread.compacting = Some(prior.clone());
+                thread.error = (prior == RunState::Failed).then(|| report.clone());
+            }
+            ids.push(thread.id);
+            store.state.threads.push(thread);
+        }
+        store.persist(None).unwrap();
+        drop(store);
+        let restored = Store::open(directory.path()).unwrap();
+        let state = |i: usize| restored.thread(ids[i]).unwrap();
+        assert_eq!(state(0).state, RunState::Complete);
+        assert_eq!(state(0).error, None);
+        assert_eq!(state(0).compacting, None);
+        assert_eq!(state(1).state, RunState::Failed);
+        assert_eq!(state(1).error, Some(report));
+        // A run in progress is still reported as interrupted.
+        assert_eq!(state(2).state, RunState::Failed);
+        assert_eq!(
+            state(2).error.as_ref().unwrap().kind,
+            a206_core::ErrorKind::Unavailable
+        );
     }
     #[test]
     fn pending_replays_reference_their_request() {

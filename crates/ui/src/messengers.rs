@@ -62,7 +62,7 @@ fn tone(state: MessengerState) -> BadgeTone {
 
 /// Seconds since the Unix epoch, for judging catalog freshness. A clock set
 /// before the epoch makes every catalog stale rather than every one fresh.
-fn now() -> u64 {
+pub(crate) fn now() -> u64 {
     web_time::SystemTime::now()
         .duration_since(web_time::UNIX_EPOCH)
         .map_or(u64::MAX, |elapsed| elapsed.as_secs())

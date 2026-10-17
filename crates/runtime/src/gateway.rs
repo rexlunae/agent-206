@@ -15,15 +15,18 @@ use std::{
     sync::{Arc, Mutex, MutexGuard},
 };
 use tokio::io::AsyncWriteExt;
+mod compaction;
 mod mcp_servers;
 mod run;
 /// Snapshot bytes a user message needs beyond its text and attachments.
 const MESSAGE_OVERHEAD: usize = 4096;
 mod messengers;
+pub use compaction::{CompactionError, THRESHOLD_PERCENT as COMPACTION_THRESHOLD_PERCENT};
 pub(crate) use mcp_servers::McpClient;
 pub use mcp_servers::{McpOffer, McpOffers};
 pub use run::{RunError, ToolError};
 mod delegation;
+mod schedules;
 mod skills;
 pub use crate::skill_tool::SkillOffer;
 pub use delegation::{Caller, Child, Delegator, DelegatorError, Reservation};
@@ -78,6 +81,7 @@ impl PartialReply {
                 at: now(),
                 backend: thread.backend,
                 tool_calls: vec![],
+                compaction: None,
             });
         }
     }
@@ -102,6 +106,7 @@ impl PartialReply {
                 at: now(),
                 backend: thread.backend,
                 tool_calls: vec![],
+                compaction: None,
             });
         }
         self.apply(thread);
@@ -159,11 +164,15 @@ pub enum GatewayError {
     #[error(transparent)]
     Prompt(#[from] crate::prompt_tool::PromptError),
     #[error(transparent)]
+    Schedule(#[from] crate::schedule::ScheduleError),
+    #[error(transparent)]
     Search(#[from] a206_core::SearchError),
     #[error(transparent)]
     Frame(#[from] transport::FrameError),
     #[error(transparent)]
     Run(#[from] run::RunError),
+    #[error(transparent)]
+    Compaction(#[from] compaction::CompactionError),
     #[error("state could not be encoded")]
     Encode(#[from] rmp_serde::encode::Error),
     #[error("settings could not be encoded")]
@@ -236,8 +245,10 @@ impl crate::error::Classified for GatewayError {
             Self::Mcp(error) => return classify(error),
             Self::Skill(error) => return classify(error),
             Self::Prompt(error) => return classify(error),
+            Self::Schedule(error) => return classify(error),
             Self::Frame(error) => return classify(error),
             Self::Run(error) => return classify(error),
+            Self::Compaction(error) => return classify(error),
             // The cause's own kind (missing, denied, invalid data) is the useful one.
             Self::Receipt(_)
             | Self::Workspace(_)
@@ -339,6 +350,8 @@ pub struct Gateway {
     delegation: delegation::Binding,
     /// Runs the subagent tools reserved before starting them, by subagent.
     reserved: delegation::Reserved,
+    /// Wakes the scheduler when a job is added or changed.
+    jobs_changed: Arc<tokio::sync::Notify>,
 }
 /// The broker pairing this gateway holds, with the connection that anchors it.
 struct Paired {
@@ -439,6 +452,7 @@ impl Gateway {
             mcp,
             delegation: Default::default(),
             reserved: Arc::default(),
+            jobs_changed: Arc::default(),
         };
         // Subagent tools; each conversation still denies them until the user
         // permits them, and they are offered only with subagent models.
@@ -584,6 +598,7 @@ impl Gateway {
                 | Command::ListTools { .. }
                 // Read-only; its reply copies message text.
                 | Command::SearchMessages { .. }
+                | Command::Activity { .. }
                 // Never journal a pairing: request bodies are persisted.
                 | Command::PairBroker { .. }
         );
@@ -1070,33 +1085,7 @@ impl Gateway {
                         current.state != RunState::Running,
                         GatewayError::Conflict("thread is already running"),
                     )?;
-                    let key = current.model.as_ref().ok_or(GatewayError::Invalid(
-                        "connect a provider and select a model first",
-                    ))?;
-                    validate_model(&store.state, key)?;
-                    validate_effort(&store.state, Some(key), current.effort.as_deref())?;
-                    let info = store
-                        .state
-                        .catalogs
-                        .iter()
-                        .flat_map(|c| &c.models)
-                        .find(|m| &m.key == key)
-                        .cloned()
-                        .ok_or(GatewayError::Conflict("model metadata missing"))?;
-                    if let Some(parent) = current.parent {
-                        check(
-                            store.thread(parent)?.subagent_models.contains(key),
-                            GatewayError::Denied("parent revoked this subagent model"),
-                        )?;
-                    }
-                    let config = store
-                        .state
-                        .settings
-                        .providers
-                        .iter()
-                        .find(|p| p.id == key.provider)
-                        .cloned()
-                        .ok_or(GatewayError::NotFound("provider not configured"))?;
+                    let (config, info) = native_model(&store.state, current)?;
                     let prompt = store
                         .state
                         .settings
@@ -1133,6 +1122,7 @@ impl Gateway {
                         at: now(),
                         backend: thread.backend,
                         tool_calls: vec![],
+                        compaction: None,
                     });
                     thread.state = RunState::Running;
                     thread.backend_activity = None;
@@ -1260,6 +1250,10 @@ impl Gateway {
                     limit,
                 )?))
             }
+            Command::Activity { before, limit } => {
+                Ok(Reply::Activity(self.lock()?.activity(before, limit)?))
+            }
+            Command::CompactThread { thread } => self.compact_thread(thread).await,
             Command::ListTools { thread } => self.list_tools(thread).await,
             Command::SetToolPermission {
                 thread,
@@ -1496,6 +1490,15 @@ impl Gateway {
                 self.policy_changed();
                 Ok(Reply::Ok)
             }
+            Command::ScheduleJob {
+                name,
+                thread,
+                text,
+                schedule,
+            } => self.schedule_job(name, thread, text, schedule, JobAuthor::User),
+            Command::SetJobEnabled { id, enabled } => self.set_job_enabled(id, enabled),
+            Command::RemoveJob { id } => self.remove_job(id),
+            Command::RunJob { id } => self.run_job(id),
             Command::InstallProposal { digest } => {
                 let summary = self.extensions.install_proposal(digest).await?;
                 self.policy_changed();
@@ -1822,6 +1825,41 @@ fn fail_run(thread: &mut Thread, id: Id, error: &(dyn std::error::Error + 'stati
     ));
     thread.error = Some(report);
 }
+/// The provider account and API-reported model metadata a thread's next
+/// model request uses, after checking the model is still permitted.
+fn native_model(snapshot: &Snapshot, thread: &Thread) -> Result<(ProviderConfig, ModelInfo)> {
+    let key = thread.model.as_ref().ok_or(GatewayError::Invalid(
+        "connect a provider and select a model first",
+    ))?;
+    validate_model(snapshot, key)?;
+    validate_effort(snapshot, Some(key), thread.effort.as_deref())?;
+    let info = snapshot
+        .catalogs
+        .iter()
+        .flat_map(|c| &c.models)
+        .find(|m| &m.key == key)
+        .cloned()
+        .ok_or(GatewayError::Conflict("model metadata missing"))?;
+    if let Some(parent) = thread.parent {
+        let parent = snapshot
+            .threads
+            .iter()
+            .find(|t| t.id == parent)
+            .ok_or(GatewayError::NotFound("thread not found"))?;
+        check(
+            parent.subagent_models.contains(key),
+            GatewayError::Denied("parent revoked this subagent model"),
+        )?;
+    }
+    let config = snapshot
+        .settings
+        .providers
+        .iter()
+        .find(|p| p.id == key.provider)
+        .cloned()
+        .ok_or(GatewayError::NotFound("provider not configured"))?;
+    Ok((config, info))
+}
 fn validate_model(snapshot: &Snapshot, key: &ModelKey) -> Result<()> {
     check(
         snapshot
@@ -2005,6 +2043,83 @@ mod tests {
                 if report.kind == ErrorKind::InvalidRequest && report.correlation == Some(request)),
             "{reply:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn activity_pages_newest_first_without_progress_notices() {
+        let directory = tempfile::tempdir().unwrap();
+        let gateway = Gateway::open(directory.path()).unwrap();
+        let names: Vec<String> = (0..5).map(|_| Id::new_v4().to_string()).collect();
+        {
+            let mut store = gateway.lock().unwrap();
+            for name in &names {
+                store
+                    .persist(Some(EventKind::ExtensionChanged { id: name.clone() }))
+                    .unwrap();
+                store
+                    .persist(Some(EventKind::ThreadChanged { id: Id::new_v4() }))
+                    .unwrap();
+                store
+                    .persist(Some(EventKind::DownloadChanged(Download {
+                        id: Id::new_v4(),
+                        name: Id::new_v4().to_string(),
+                        source: String::new(),
+                        received: 0,
+                        total: None,
+                        state: DownloadState::Running,
+                        error: None,
+                        sha256: None,
+                        failure: None,
+                    })))
+                    .unwrap();
+            }
+        }
+        let gateway = &gateway;
+        let page = |before| async move {
+            let Reply::Activity(page) = gateway
+                .request(Request {
+                    id: Id::new_v4(),
+                    body: Command::Activity { before, limit: 2 },
+                })
+                .await
+                .body
+            else {
+                panic!("activity failed");
+            };
+            page
+        };
+        let mut seen = Vec::new();
+        let mut before = None;
+        loop {
+            let current = page(before).await;
+            assert!(current.events.len() <= 2);
+            for event in &current.events {
+                let EventKind::ExtensionChanged { id } = &event.kind else {
+                    panic!("progress notice in activity: {event:?}");
+                };
+                seen.push(id.clone());
+            }
+            if !current.more {
+                break;
+            }
+            before = current.events.last().map(|event| event.sequence);
+        }
+        assert_eq!(seen, names.iter().rev().cloned().collect::<Vec<_>>());
+        // A zero limit still returns the cursor its `more` promises.
+        let Reply::Activity(zero) = gateway
+            .request(Request {
+                id: Id::new_v4(),
+                body: Command::Activity {
+                    before: None,
+                    limit: 0,
+                },
+            })
+            .await
+            .body
+        else {
+            panic!("activity failed");
+        };
+        assert!(zero.more && zero.events.len() == 1);
     }
 
     #[tokio::test]
