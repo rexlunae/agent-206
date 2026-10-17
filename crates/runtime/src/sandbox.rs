@@ -87,6 +87,7 @@ mod confined {
                 control: &control,
                 workspace: None,
                 execute: false,
+                programs: &[],
                 hidden: &[],
                 cwd: &root,
                 network: a206_sandbox::NetworkAccess::None,

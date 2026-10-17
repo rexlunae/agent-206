@@ -247,7 +247,7 @@ impl Rig {
         let mut settings = self.gateway.snapshot().unwrap().settings;
         settings.mcp_servers = vec![self.entry.clone()];
         assert_eq!(
-            request(&self.gateway, Command::SaveSettings(settings)).await,
+            request(&self.gateway, Command::SaveSettings(Box::new(settings))).await,
             Reply::Ok
         );
         let (client, server) = tokio::io::duplex(1 << 16);
@@ -266,6 +266,7 @@ impl Rig {
             thread: self.thread,
             workspace: None,
             capabilities: capabilities.iter().copied().collect(),
+            programs: vec![],
         }
     }
     fn name(&self, tool: &str) -> String {
@@ -396,7 +397,7 @@ async fn a_server_that_cannot_start_is_reported_with_its_cause() {
     let mut settings = rig.gateway.snapshot().unwrap().settings;
     settings.mcp_servers = vec![rig.entry.clone()];
     assert_eq!(
-        request(&rig.gateway, Command::SaveSettings(settings)).await,
+        request(&rig.gateway, Command::SaveSettings(Box::new(settings))).await,
         Reply::Ok
     );
     let listing = rig.host.list(&rig.scope(EXECUTE)).await;

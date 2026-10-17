@@ -56,16 +56,16 @@ async fn unsafe_entries_are_refused_and_saved_ones_start_stopped() {
         },
     ];
     for change in cases {
-        let reply = run(&gateway, Command::SaveSettings(invalid(change))).await;
+        let reply = run(&gateway, Command::SaveSettings(Box::new(invalid(change)))).await;
         assert!(kind(&reply).is_some(), "accepted {reply:?}");
     }
     let duplicate = MessengerConfig::new(name(), MessengerKind::Telegram);
     let reply = run(
         &gateway,
-        Command::SaveSettings(Settings {
+        Command::SaveSettings(Box::new(Settings {
             messengers: vec![duplicate.clone(), duplicate],
             ..Settings::default()
-        }),
+        })),
     )
     .await;
     assert!(kind(&reply).is_some(), "accepted duplicate names");
@@ -77,7 +77,7 @@ async fn unsafe_entries_are_refused_and_saved_ones_start_stopped() {
         ..Settings::default()
     };
     assert_eq!(
-        run(&gateway, Command::SaveSettings(settings)).await,
+        run(&gateway, Command::SaveSettings(Box::new(settings))).await,
         Reply::Ok
     );
     let snapshot = gateway.snapshot().unwrap();
@@ -111,7 +111,7 @@ async fn unsafe_entries_are_refused_and_saved_ones_start_stopped() {
     let mut settings = gateway.snapshot().unwrap().settings;
     settings.messengers.clear();
     assert_eq!(
-        run(&gateway, Command::SaveSettings(settings)).await,
+        run(&gateway, Command::SaveSettings(Box::new(settings))).await,
         Reply::Ok
     );
     assert!(gateway.snapshot().unwrap().messengers.is_empty());

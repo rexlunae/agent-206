@@ -27,7 +27,7 @@ fn save_messenger(state: State, name: &str, edit: impl FnOnce(&mut MessengerConf
     let mut settings = state.data.read().settings.clone();
     if let Some(entry) = settings.messengers.iter_mut().find(|m| m.name == name) {
         edit(entry);
-        dispatch(state, Command::SaveSettings(settings));
+        dispatch(state, Command::SaveSettings(Box::new(settings)));
     }
 }
 
@@ -186,7 +186,7 @@ fn MessengerCard(now: u64, config: MessengerConfig, status: MessengerStatus) -> 
             } else {
                 Button { variant: ButtonVariant::Secondary, availability: if config.enabled { Availability::Enabled } else { Availability::Disabled }, onclick: { let name = name.clone(); move |_| dispatch(state, Command::ConnectMessenger { name: name.clone() }) }, "Connect" }
             }
-            Button { variant: ButtonVariant::Ghost, onclick: move |_| { let mut settings = state.data.read().settings.clone(); settings.messengers.retain(|m| m.name != name); dispatch(state, Command::SaveSettings(settings)); }, "Remove messenger" }
+            Button { variant: ButtonVariant::Ghost, onclick: move |_| { let mut settings = state.data.read().settings.clone(); settings.messengers.retain(|m| m.name != name); dispatch(state, Command::SaveSettings(Box::new(settings))); }, "Remove messenger" }
         }
     } }
 }
@@ -374,7 +374,7 @@ fn AddMessenger() -> Element {
             entry.endpoint = Some(endpoint().trim().to_owned()).filter(|e| !e.is_empty());
             let mut settings = state.data.read().settings.clone();
             settings.messengers.push(entry);
-            dispatch(state, Command::SaveSettings(settings));
+            dispatch(state, Command::SaveSettings(Box::new(settings)));
         }, "Add messenger" } }
     } }
 }
