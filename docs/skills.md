@@ -46,7 +46,16 @@ recorded in `settings.toml` (`enabled_skills`); saving settings never changes
 it, so approval stays a separate user operation. Any later edit makes the skill
 "changed": it is withheld from models until the user reviews and enables it
 again. A skill that fails to parse is listed with its error, never silently
-dropped. Installing or editing a skill changes files only, so the page's
+dropped.
+
+Each listed skill carries a **pre-install audit** of its whole `SKILL.md`
+(`a206-audit`, the same rules as for extension packages): matches such as a
+downloaded script piped into a shell, a reverse shell, credential file paths,
+instructions to ignore the system prompt or keep something from the user,
+invisible characters, key-like values or decoded commands are reported by line
+on the skill's card, in `skills list` and after `skills show`. Findings advise
+the review; approval works the same either way, and a clean report proves
+nothing. Supporting files are not yet audited. Installing or editing a skill changes files only, so the page's
 **Refresh** re-reads the folder.
 
 Bounds: 256 skill folders, 256 KiB per `SKILL.md`, 1 MiB per supporting file.

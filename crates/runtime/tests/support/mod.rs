@@ -380,7 +380,7 @@ pub async fn connect_reporting(
         api,
     });
     assert_eq!(
-        request(gateway, Command::SaveSettings(settings)).await,
+        request(gateway, Command::SaveSettings(Box::new(settings))).await,
         Reply::Ok
     );
     let Reply::Catalog(catalog) = request(gateway, Command::RefreshCatalog { provider }).await

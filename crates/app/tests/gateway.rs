@@ -440,7 +440,12 @@ async fn web_controls_require_authority_and_deduplicate_restart() -> Result<()> 
         api: Default::default(),
     });
     ensure!(
-        socket_request(&app, uuid::Uuid::new_v4(), Command::SaveSettings(settings)).await?
+        socket_request(
+            &app,
+            uuid::Uuid::new_v4(),
+            Command::SaveSettings(Box::new(settings))
+        )
+        .await?
             == Reply::Ok
     );
     let refresh = http
@@ -601,8 +606,12 @@ async fn activity_prints_journal_events_as_toml_pages() -> Result<()> {
     let mut app = App::start(tempfile::tempdir()?, BTreeMap::new()).await?;
     for _ in 0..2 {
         let settings = app.snapshot().await?.settings;
-        let reply =
-            socket_request(&app, uuid::Uuid::new_v4(), Command::SaveSettings(settings)).await?;
+        let reply = socket_request(
+            &app,
+            uuid::Uuid::new_v4(),
+            Command::SaveSettings(Box::new(settings)),
+        )
+        .await?;
         ensure!(reply == Reply::Ok, "{reply:?}");
     }
     let first: a206_core::ActivityPage =

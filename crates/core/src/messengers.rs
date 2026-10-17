@@ -50,14 +50,17 @@ pub enum MessengerKind {
     Matrix,
     /// Discord bot: events over the Gateway WebSocket, answers with the REST API.
     Discord,
+    /// Slack app: events over Socket Mode, answers with the Web API.
+    Slack,
 }
 impl MessengerKind {
-    pub const ALL: [Self; 3] = [Self::Telegram, Self::Matrix, Self::Discord];
+    pub const ALL: [Self; 4] = [Self::Telegram, Self::Matrix, Self::Discord, Self::Slack];
     pub fn label(self) -> &'static str {
         match self {
             Self::Telegram => "Telegram",
             Self::Matrix => "Matrix",
             Self::Discord => "Discord",
+            Self::Slack => "Slack",
         }
     }
     /// The service's official API endpoint, used unless an entry names
@@ -67,6 +70,7 @@ impl MessengerKind {
             Self::Telegram => Some("https://api.telegram.org"),
             Self::Matrix => None,
             Self::Discord => Some("https://discord.com"),
+            Self::Slack => Some("https://slack.com"),
         }
     }
     /// How the user obtains the token the vault stores for this kind.
@@ -81,7 +85,15 @@ impl MessengerKind {
             Self::Discord => {
                 "Create a bot in the Discord developer portal, turn on its Message Content intent, and store its token in the vault, bound to the API origin"
             }
+            Self::Slack => {
+                "Create a Slack app with Socket Mode and the message events, then store its bot token (xoxb-) and app-level token (xapp-, connections:write) in the vault, both bound to the API origin"
+            }
         }
+    }
+    /// Whether the kind receives events with a second, app-level token
+    /// ([`MessengerConfig::app_credential`]).
+    pub fn needs_app_credential(self) -> bool {
+        matches!(self, Self::Slack)
     }
 }
 
@@ -98,6 +110,10 @@ pub struct MessengerConfig {
     /// the origin it is bound to; the gateway never sees its value.
     #[serde(default)]
     pub credential: Option<String>,
+    /// Vault credential holding the app-level token a kind such as Slack
+    /// receives events with, bound to the same origin. Unused by other kinds.
+    #[serde(default)]
+    pub app_credential: Option<String>,
     /// API base URL; the kind's official endpoint when absent. Required for
     /// kinds without one, such as Matrix (the homeserver).
     #[serde(default)]
@@ -126,6 +142,7 @@ impl MessengerConfig {
             kind,
             enabled: false,
             credential: None,
+            app_credential: None,
             endpoint: None,
             allowed_chats: BTreeSet::new(),
             allowed_users: BTreeSet::new(),

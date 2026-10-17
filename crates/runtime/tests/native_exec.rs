@@ -18,6 +18,7 @@ fn main() -> std::process::ExitCode {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(commands_hold_only_the_conversations_grants());
         runtime.block_on(network_follows_the_grant());
+        runtime.block_on(program_directories_run_read_only());
         runtime.block_on(output_status_and_time_are_bounded());
         runtime.block_on(background_sessions_follow_their_conversation());
         runtime.block_on(background_sessions_stop_when_their_grant_is_withdrawn());
@@ -35,6 +36,7 @@ fn scope(workspace: Option<&std::path::Path>, capabilities: &[Capability]) -> To
         thread: Id::new_v4(),
         workspace: workspace.map(Into::into),
         capabilities: capabilities.iter().copied().collect(),
+        programs: vec![],
     }
 }
 
@@ -245,6 +247,89 @@ async fn commands_hold_only_the_conversations_grants() {
             .unwrap_err();
         assert_eq!(error.kind, ErrorKind::PermissionDenied);
     }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+async fn program_directories_run_read_only() {
+    use std::os::unix::fs::PermissionsExt;
+    let state = tempfile::tempdir().unwrap();
+    let host = ExecHost::new(state.path());
+    let tools = tempfile::tempdir().unwrap();
+    let bin = tools.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let (program, marker) = (format!("tool-{}", Id::new_v4()), Id::new_v4().to_string());
+    let script = bin.join(&program);
+    std::fs::write(&script, format!("#!/bin/sh\necho {marker}\n")).unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let without = scope(None, &[Capability::Execute]);
+    let output = sh(&host, &without, &program).await;
+    assert!(output.is_error, "{}", output.text);
+    assert!(!output.text.contains(&marker));
+
+    // Found through PATH by the directory's `bin`, and runnable.
+    let given = ToolScope {
+        programs: vec![tools.path().into()],
+        ..without.clone()
+    };
+    let output = sh(&host, &given, &program).await;
+    assert!(!output.is_error, "{}", output.text);
+    assert!(output.text.contains(&marker), "{}", output.text);
+    let output = sh(
+        &host,
+        &given,
+        &format!("echo x > '{}'", bin.join("new").display()),
+    )
+    .await;
+    assert!(output.is_error, "program directories are read-only");
+    assert!(!bin.join("new").exists());
+
+    // A directory that overlaps a writable project could be rewritten.
+    let project = tempfile::tempdir().unwrap();
+    let inside = project.path().join("bin");
+    std::fs::create_dir(&inside).unwrap();
+    let write = ToolScope {
+        programs: vec![inside.clone()],
+        ..scope(
+            Some(project.path()),
+            &[
+                Capability::Execute,
+                Capability::ReadWorkspace,
+                Capability::WriteWorkspace,
+            ],
+        )
+    };
+    let error = sh_error(&host, &write).await;
+    assert_eq!(error.kind, ErrorKind::Conflict, "{error:?}");
+    // Read access cannot rewrite them.
+    let read = ToolScope {
+        capabilities: [Capability::Execute, Capability::ReadWorkspace].into(),
+        ..write
+    };
+    let output = sh(&host, &read, "true").await;
+    assert!(!output.is_error, "{}", output.text);
+
+    // Nor may one lie inside protected state, or go missing.
+    let nested = state.path().join("tools");
+    std::fs::create_dir(&nested).unwrap();
+    for (programs, kind) in [
+        (nested, ErrorKind::PermissionDenied),
+        (tools.path().join("missing"), ErrorKind::NotFound),
+    ] {
+        let refused = ToolScope {
+            programs: vec![programs],
+            ..given.clone()
+        };
+        let error = sh_error(&host, &refused).await;
+        assert_eq!(error.kind, kind, "{error:?}");
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+async fn sh_error(host: &ExecHost, scope: &ToolScope) -> a206_core::ErrorReport {
+    run(host, scope, serde_json::json!({ "command": "true" }))
+        .await
+        .unwrap_err()
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]

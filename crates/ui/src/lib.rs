@@ -1,6 +1,7 @@
 //! Shared desktop/web/terminal application tree, composed with fc-dioxus.
 #![forbid(unsafe_code)]
 mod activity;
+mod audit;
 mod conversation;
 mod error;
 mod extensions;
@@ -16,6 +17,7 @@ mod schedules;
 mod search;
 mod settings;
 mod skills;
+mod slash;
 mod subagents;
 mod tools;
 mod welcome;

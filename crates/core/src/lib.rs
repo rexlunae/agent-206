@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use uuid::Uuid;
 
+pub mod audit;
 pub mod doctor;
 pub mod error;
 pub mod extension;
@@ -11,6 +12,7 @@ pub mod ignore;
 pub mod prompts;
 pub mod search;
 pub mod tools;
+pub use audit::{AuditBuilder, AuditField, AuditFinding, AuditLocation, AuditReport, AuditRule};
 pub use error::{ErrorKind, ErrorReport};
 pub use ignore::Ignore;
 pub use prompts::{AnswerError, PromptAnswer, PromptOutcome, UserPrompt};
@@ -290,6 +292,11 @@ pub struct Settings {
     /// the user approved. Any edit to a skill disables it until re-approved.
     #[serde(default)]
     pub enabled_skills: std::collections::BTreeMap<String, String>,
+    /// Absolute directories, beyond `/usr/bin` and `/bin`, whose programs
+    /// sandboxed commands may run read-only, such as a Homebrew prefix or a
+    /// toolchain. The gateway stores them canonicalized.
+    #[serde(default)]
+    pub program_directories: Vec<std::path::PathBuf>,
     pub prompts: Vec<ModePrompt>,
     pub theme_design: String,
     pub theme_palette: Option<String>,
@@ -306,6 +313,7 @@ impl Default for Settings {
             messengers: vec![],
             mcp_servers: vec![],
             enabled_skills: Default::default(),
+            program_directories: vec![],
             prompts: Mode::ALL
                 .into_iter()
                 .map(|mode| ModePrompt {
@@ -691,6 +699,9 @@ pub struct SkillSummary {
     pub expects_env: Vec<String>,
     /// Why the skill could not be read.
     pub failure: Option<ErrorReport>,
+    /// What the pre-install audit found in `SKILL.md`, for the user's review.
+    #[serde(default)]
+    pub audit: AuditReport,
 }
 /// The exact `SKILL.md` a user reviews, with the digest that approves it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -885,7 +896,7 @@ pub enum Command {
     StopJoshua,
     JoshuaStatus,
     Snapshot,
-    SaveSettings(Settings),
+    SaveSettings(Box<Settings>),
     RefreshCatalog {
         provider: Id,
     },

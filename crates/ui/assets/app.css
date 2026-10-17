@@ -129,3 +129,4 @@ body { max-inline-size: none; inline-size: 100%; padding: 0; background: var(--f
 .a206-shell:focus { outline: none; }
 .a206-palette-results { max-block-size: min(60vh, 28rem); overflow-y: auto; }
 .a206-palette-current { background: var(--fc-color-accent-bg-subtle); color: var(--fc-color-accent-text); border-radius: var(--fc-radius-md); }
+.a206-slash-commands { max-block-size: 14rem; overflow-y: auto; }

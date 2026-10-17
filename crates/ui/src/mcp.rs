@@ -31,7 +31,7 @@ pub fn McpServers() -> Element {
 fn save_servers(state: State, edit: impl FnOnce(&mut Vec<McpServerConfig>)) {
     let mut settings = state.data.read().settings.clone();
     edit(&mut settings.mcp_servers);
-    dispatch(state, Command::SaveSettings(settings));
+    dispatch(state, Command::SaveSettings(Box::new(settings)));
 }
 
 #[component]
