@@ -494,7 +494,7 @@ fn BackendControls(thread: Thread) -> Element {
         }
         LinkButton { variant: ButtonVariant::Ghost, size: ButtonSize::Sm, href: Route::Providers {}.to_string(), "Manage connections" }
         if thread.backend == CodingBackend::Native {
-            p { class: "a206-muted", "Tools are off until you grant them here, and each tool still needs your permission in this conversation. The network grant also lets project commands use the network." }
+            p { class: "a206-muted", "Tools are off until you grant them here, and each tool still needs your permission in this conversation. The mode limits what can be granted here." }
         } else {
             p { class: "a206-muted", "Project tools are off until you grant them. External subagents and direct network access are disabled." }
         }

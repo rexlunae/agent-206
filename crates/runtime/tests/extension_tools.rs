@@ -1125,6 +1125,54 @@ async fn git_tools_run_once_the_conversation_is_granted_git() {
     assert_eq!(failure(reply).kind, ErrorKind::InvalidRequest);
     rig.grant_thread(&[Capability::GitRead, Capability::GitWrite])
         .await;
+
+    // With both grants, the agent commits the file it was asked to.
+    let config = rig.workspace.path().join(".git/config");
+    let mut text = std::fs::read_to_string(&config).unwrap();
+    text.push_str(
+        "[user]\n\tname = Agent Test\n\temail = test@example.invalid\n[commit]\n\tgpgSign = false\n",
+    );
+    std::fs::write(&config, text).unwrap();
+    rig.ok(Command::GrantExtension {
+        extension: GIT.into(),
+        capabilities: [Capability::GitRead, Capability::GitWrite].into(),
+    })
+    .await;
+    rig.tool = tool_name(GIT, "git_commit");
+    rig.permit(ToolPermission::Allow).await;
+    let message = nonce();
+    let commit = Call::new(
+        &rig.tool,
+        json!({ "message": message, "paths": rig.file.0 }),
+    );
+    let (thread, _) = rig.round_trip(&[commit]).await;
+    let record = calls_of(&thread).last().unwrap().clone();
+    assert_eq!(record.state, ToolCallState::Succeeded, "{:?}", record.error);
+    let committed = {
+        let repo = gix::open(rig.workspace.path()).unwrap();
+        let head = repo.head_commit().unwrap();
+        head.message_raw().unwrap().to_string()
+    };
+    assert_eq!(committed.trim(), message);
+
+    // The network alone needs no project, unlike everything else.
+    let Reply::Thread(research) = rig
+        .run(Command::CreateThread {
+            title: nonce(),
+            mode: Mode::Research,
+        })
+        .await
+    else {
+        panic!("research thread created");
+    };
+    let grant = |capabilities: &[Capability]| Command::SetBackend {
+        thread: research.id,
+        backend: CodingBackend::Native,
+        capabilities: capabilities.iter().copied().collect(),
+    };
+    rig.ok(grant(&[Capability::Network])).await;
+    let reply = rig.run(grant(&[Capability::ReadWorkspace])).await;
+    assert_eq!(failure(reply).kind, ErrorKind::InvalidRequest);
 }
 
 async fn the_agent_learns_what_it_can_call_and_what_to_ask_for() {
