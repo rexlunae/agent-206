@@ -286,6 +286,37 @@ fn search_tool_reports_matches_and_truncation() {
 }
 
 #[test]
+fn git_tool_renders_status_from_host_calls() {
+    let builtin = builtin("agent206.git").unwrap().unwrap();
+    let (branch, path) = (unique("branch"), unique("file"));
+    let status = GitStatus {
+        branch: Some(branch.clone()),
+        head: None,
+        entries: vec![GitEntry {
+            path: path.clone(),
+            area: GitArea::Staged,
+            change: GitChange::Added,
+        }],
+        truncated: false,
+    };
+    let (bridge, seen) = mock(move |_| HostReply::GitStatus(status.clone()));
+    let (outcome, _) = engine::run(
+        builtin.wasm,
+        &tool("git_status", &[]),
+        Limits::default(),
+        bridge,
+    );
+    let Ok(Outcome::Tool(output)) = outcome else {
+        panic!("expected tool output, got {outcome:?}");
+    };
+    assert_eq!(
+        output.text,
+        format!("on {branch}, no commits yet\nstaged added {path}")
+    );
+    assert_eq!(*seen.borrow(), vec![HostRequest::GitStatus]);
+}
+
+#[test]
 fn budgets_stop_the_guest() {
     let reply = |_: &HostRequest| HostReply::Directory(vec![]);
     let (fuel, _) = engine::run(

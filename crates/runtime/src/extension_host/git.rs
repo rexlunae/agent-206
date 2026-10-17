@@ -1,0 +1,221 @@
+//! Read-only git host calls through gitoxide. Nothing the repository
+//! configures can run: no hooks, filter, diff or credential programs, and no
+//! system, global or `GIT_*` environment configuration is read.
+use super::{MAX_FILE, failure};
+use a206_extensions::abi::{
+    GitArea, GitChange, GitCommit, GitDiff, GitEntry, GitStatus, HostErrorCode, HostFailure,
+    HostReply,
+};
+use gix::bstr::{BString, ByteSlice};
+use std::{
+    path::PathBuf,
+    sync::{Arc, atomic::AtomicBool},
+};
+
+/// Most changed paths one status lists.
+pub const MAX_STATUS_ENTRIES: usize = 1_000;
+/// Most commits one log returns.
+pub const MAX_COMMITS: u32 = 200;
+/// Longest diff text returned.
+pub const MAX_DIFF: usize = 256 * 1024;
+const CONTEXT_LINES: u32 = 3;
+
+/// Record a gitoxide failure where it is handled; the guest gets a generic
+/// code because the message can name host paths.
+fn git_failure(operation: &'static str, error: &(dyn std::error::Error + 'static)) -> HostFailure {
+    tracing::warn!(error, operation, "extension git call failed");
+    failure(HostErrorCode::Io, "the repository could not be read")
+}
+
+/// Open the repository at exactly the workspace root, never a parent.
+fn open(root: PathBuf) -> Result<gix::Repository, HostFailure> {
+    if std::fs::symlink_metadata(root.join(".git")).is_err() {
+        return Err(failure(
+            HostErrorCode::NotFound,
+            "the workspace is not a git repository",
+        ));
+    }
+    // `isolated` drops system and global configuration and the environment.
+    // Refusing every section to the "trusted values" filter disables the
+    // repository's own filter, diff and credential programs and URL rewrites.
+    let options = gix::open::Options::isolated().filter_config_section(|_| false);
+    gix::open_opts(root, options).map_err(|e| git_failure("open", &e))
+}
+
+pub(super) fn status(root: PathBuf, interrupt: Arc<AtomicBool>) -> Result<HostReply, HostFailure> {
+    let repo = open(root)?;
+    let head = repo.head().map_err(|e| git_failure("head", &e))?;
+    let mut status = GitStatus {
+        branch: head
+            .referent_name()
+            .map(|name| name.shorten().to_str_lossy().into_owned()),
+        head: head.id().map(|id| id.to_string()),
+        ..GitStatus::default()
+    };
+    if repo.workdir().is_none() {
+        return Ok(HostReply::GitStatus(status));
+    }
+    let changes = repo
+        .status(gix::progress::Discard)
+        .map_err(|e| git_failure("status", &e))?
+        .untracked_files(gix::status::UntrackedFiles::Files)
+        .index_worktree_rewrites(None)
+        .tree_index_track_renames(gix::status::tree_index::TrackRenames::Disabled)
+        .index_worktree_submodules(gix::status::Submodule::Given {
+            ignore: gix::submodule::config::Ignore::All,
+            check_dirty: false,
+        })
+        .should_interrupt_owned(Arc::clone(&interrupt))
+        .into_iter(None::<BString>)
+        .map_err(|e| git_failure("status", &e))?;
+    for item in changes {
+        let item = item.map_err(|e| git_failure("status", &e))?;
+        let Some(entry) = entry(&item) else {
+            continue;
+        };
+        if status.entries.len() == MAX_STATUS_ENTRIES {
+            status.truncated = true;
+            interrupt.store(true, std::sync::atomic::Ordering::Relaxed);
+            break;
+        }
+        status.entries.push(entry);
+    }
+    if interrupt.load(std::sync::atomic::Ordering::Relaxed) && !status.truncated {
+        return Err(failure(HostErrorCode::Budget, "git status took too long"));
+    }
+    status
+        .entries
+        .sort_by(|a, b| (&a.path, a.area).cmp(&(&b.path, b.area)));
+    Ok(HostReply::GitStatus(status))
+}
+
+fn entry(item: &gix::status::Item) -> Option<GitEntry> {
+    use gix::status::index_worktree::iter::Summary;
+    match item {
+        gix::status::Item::IndexWorktree(item) => {
+            let (area, change) = match item.summary()? {
+                Summary::Added => (GitArea::Untracked, GitChange::Added),
+                Summary::Removed => (GitArea::Unstaged, GitChange::Removed),
+                Summary::Modified => (GitArea::Unstaged, GitChange::Modified),
+                Summary::TypeChange => (GitArea::Unstaged, GitChange::TypeChange),
+                Summary::Conflict => (GitArea::Unstaged, GitChange::Conflict),
+                Summary::IntentToAdd => (GitArea::Unstaged, GitChange::Added),
+                Summary::Renamed | Summary::Copied => (GitArea::Unstaged, GitChange::Other),
+            };
+            Some(GitEntry {
+                path: item.rela_path().to_str_lossy().into_owned(),
+                area,
+                change,
+            })
+        }
+        gix::status::Item::TreeIndex(change) => {
+            use gix::diff::index::ChangeRef;
+            let change_kind = match change {
+                ChangeRef::Addition { .. } => GitChange::Added,
+                ChangeRef::Deletion { .. } => GitChange::Removed,
+                ChangeRef::Modification { .. } => GitChange::Modified,
+                ChangeRef::Rewrite { .. } => GitChange::Other,
+            };
+            Some(GitEntry {
+                path: change.location().to_str_lossy().into_owned(),
+                area: GitArea::Staged,
+                change: change_kind,
+            })
+        }
+    }
+}
+
+pub(super) fn log(root: PathBuf, max: u32) -> Result<HostReply, HostFailure> {
+    let repo = open(root)?;
+    let head = repo.head().map_err(|e| git_failure("head", &e))?;
+    let Some(id) = head.id() else {
+        return Ok(HostReply::Commits(Vec::new()));
+    };
+    let walk = id.ancestors().all().map_err(|e| git_failure("log", &e))?;
+    let mut commits = Vec::new();
+    for info in walk.take(max.clamp(1, MAX_COMMITS) as usize) {
+        let info = info.map_err(|e| git_failure("log", &e))?;
+        let commit = info.object().map_err(|e| git_failure("log", &e))?;
+        let message = commit.message().map_err(|e| git_failure("log", &e))?;
+        let author = commit.author().map_err(|e| git_failure("log", &e))?;
+        commits.push(GitCommit {
+            id: commit.id.to_string(),
+            summary: message.summary().to_str_lossy().into_owned(),
+            author: author.name.to_str_lossy().into_owned(),
+            time: author.time().map_err(|e| git_failure("log", &e))?.seconds,
+        });
+    }
+    Ok(HostReply::Commits(commits))
+}
+
+pub(super) fn diff(root: PathBuf, path: &str, staged: bool) -> Result<HostReply, HostFailure> {
+    super::workspace::check_relative(path)?;
+    let repo = open(root.clone())?;
+    let index = repo
+        .index_or_empty()
+        .map_err(|e| git_failure("index", &e))?;
+    let indexed = index
+        .entry_by_path(path.as_bytes().as_bstr())
+        .map(|entry| blob(&repo, entry.id))
+        .transpose()?;
+    let (before, after) = if staged {
+        let committed = match repo.head_tree() {
+            Ok(tree) => tree
+                .lookup_entry_by_path(path)
+                .map_err(|e| git_failure("diff", &e))?
+                .map(|entry| blob(&repo, entry.object_id()))
+                .transpose()?,
+            // An unborn `HEAD` has no tree: every staged file is new.
+            Err(_) if repo.head().is_ok_and(|head| head.is_unborn()) => None,
+            Err(error) => return Err(git_failure("diff", &error)),
+        };
+        (committed, indexed)
+    } else {
+        (indexed, super::workspace::read_optional(root, path)?)
+    };
+    let (before, after) = (before.unwrap_or_default(), after.unwrap_or_default());
+    if before == after {
+        return Ok(HostReply::Diff(GitDiff::default()));
+    }
+    if before.contains(&0) || after.contains(&0) {
+        return Ok(HostReply::Diff(GitDiff {
+            binary: true,
+            ..GitDiff::default()
+        }));
+    }
+    let text = unified(&before, &after)?;
+    let truncated = text.len() > MAX_DIFF;
+    Ok(HostReply::Diff(GitDiff {
+        text: super::bounded(&text, MAX_DIFF).to_string(),
+        binary: false,
+        truncated,
+    }))
+}
+
+fn blob(repo: &gix::Repository, id: impl Into<gix::ObjectId>) -> Result<Vec<u8>, HostFailure> {
+    let object = repo
+        .find_object(id.into())
+        .map_err(|e| git_failure("diff", &e))?;
+    if object.data.len() as u64 > MAX_FILE {
+        return Err(failure(HostErrorCode::TooLarge, "the file exceeds 512 KiB"));
+    }
+    Ok(object.detach().data)
+}
+
+fn unified(before: &[u8], after: &[u8]) -> Result<String, HostFailure> {
+    use gix::diff::blob::{
+        Algorithm, Diff, InternedInput, UnifiedDiff,
+        unified_diff::{ConsumeBinaryHunk, ContextSize},
+    };
+    let input = InternedInput::new(before, after);
+    let mut diff = Diff::compute(Algorithm::Histogram, &input);
+    diff.postprocess_lines(&input);
+    UnifiedDiff::new(
+        &diff,
+        &input,
+        ConsumeBinaryHunk::new(String::new(), "\n"),
+        ContextSize::symmetrical(CONTEXT_LINES),
+    )
+    .consume()
+    .map_err(|_| failure(HostErrorCode::Invalid, "the file is not UTF-8 text"))
+}

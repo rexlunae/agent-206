@@ -31,6 +31,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// Wall-clock bound on one invocation, host calls included.
 pub const TIMEOUT: Duration = Duration::from_secs(10);
+/// Wall-clock bound on one git status scan.
+pub const GIT_STATUS_TIMEOUT: Duration = Duration::from_secs(5);
 /// Largest file a guest may read in one call.
 pub const MAX_FILE: u64 = 512 * 1024;
 /// Most entries one directory listing returns.
@@ -496,6 +498,28 @@ impl HostCalls {
                 let root = self.workspace()?;
                 blocking(move || workspace::create_directory(root, &path)).await
             }
+            HostRequest::GitStatus => {
+                let root = self.workspace()?;
+                let interrupt = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let flag = Arc::clone(&interrupt);
+                // Bounds the blocking scan even after the invocation's own
+                // timeout drops this future; aborted below when it is done.
+                let deadline = tokio::spawn(async move {
+                    tokio::time::sleep(GIT_STATUS_TIMEOUT).await;
+                    flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                });
+                let reply = blocking(move || git::status(root, interrupt)).await;
+                deadline.abort();
+                reply
+            }
+            HostRequest::GitLog { max } => {
+                let root = self.workspace()?;
+                blocking(move || git::log(root, max)).await
+            }
+            HostRequest::GitDiff { path, staged } => {
+                let root = self.workspace()?;
+                blocking(move || git::diff(root, &path, staged)).await
+            }
             HostRequest::StateGet { key } => {
                 check_key(&key)?;
                 let value = self
@@ -586,6 +610,7 @@ async fn blocking(
             Err(failure(HostErrorCode::Io, "host call failed"))
         })
 }
+mod git;
 mod workspace;
 
 #[cfg(test)]

@@ -296,6 +296,18 @@ fn writable_path(path: &str) -> Result<&Path, HostFailure> {
     }
     Ok(relative)
 }
+/// A plain relative path outside `.git`, for calls that name a tracked file.
+pub(super) fn check_relative(path: &str) -> Result<(), HostFailure> {
+    writable_path(path).map(drop)
+}
+/// A workspace file's bytes, or `None` when it does not exist.
+pub(super) fn read_optional(root: PathBuf, path: &str) -> Result<Option<Vec<u8>>, HostFailure> {
+    match open_regular(&open_workspace(root)?, path) {
+        Ok(file) => read_bounded(file)?.map(Some).ok_or_else(too_large),
+        Err(failure) if failure.code == HostErrorCode::NotFound => Ok(None),
+        Err(failure) => Err(failure),
+    }
+}
 /// The parent directory and file name of a path the guest may write.
 fn writable(root: PathBuf, path: &str) -> Result<(Dir, String), HostFailure> {
     let relative = writable_path(path)?;

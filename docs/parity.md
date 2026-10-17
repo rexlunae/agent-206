@@ -73,7 +73,7 @@ invocations and relays gateway-authorized host calls (`a206/docs/plugin-api.md`)
 | sysadmin/system tools: firewall, pkg, service, user, net scan, disk, monitor, clipboard, screenshot (`tools/sysadmin/*`, `tools/system_tools/*`, `kernel_tools.rs`) | missing | Opt-in extensions; high-risk ops behind approval |
 | package managers `npm_manage`, `uv_manage` (`tools/npm.rs`, `uv.rs`) | missing | Extensions using Execute grant |
 | `freenet`/`river`/`atlas` (`tools/freenet/*`) | missing | Optional extension |
-| Git ops | partial: read-only `GitStatus` (`gateway.rs`) | Forge-neutral git/forge host domains (diff/stage/commit/PR/CI) |
+| Git ops | partial: read-only `GitStatus` (`gateway.rs`); the bundled `agent206.git` WASM extension has `git_status`, `git_log` and per-file `git_diff` through gitoxide under GitRead, with no repository-configured programs; agents cannot call them until the run engine's tool loop lands | Stage/commit under GitWrite; forge-neutral PR/CI host domain |
 
 ## Memory
 
@@ -124,7 +124,7 @@ invocations and relays gateway-authorized host calls (`a206/docs/plugin-api.md`)
 | Skills: markdown/YAML, dependency gating, enable/disable (`skills/mod.rs`, `tools/skills_tools.rs`) | missing | Instruction packages (TOML manifest) separate from executable extensions |
 | ClawHub registry install/search (`skills/clawhub.rs`, CLI `clawhub`) | missing | Reviewed install with manifest validation + audit |
 | Agent-created skills/curator (`tools/skill_curator.rs`, `skill_create`) | missing | Agent prepares package; user enables |
-| Plugin UI panels + state (`plugins/mod.rs`, `tools/plugin.rs`) | partial: ABI v2 (`a206/crates/extension-abi`, `extension-sdk`, `extensions`, `runtime/src/extension_host.rs`): declared tools and panels, typed fc-dioxus panel nodes with button events, per-extension persisted state, user grants/enable on the Extensions page and CLI, gateway-authorized workspace host calls; only bundled extensions load, agents cannot create or call them until the run engine lands | Agent `plugin_*` tools via the run engine; reviewed package install; more host domains (patch, git, network, exec after the OS sandbox) |
+| Plugin UI panels + state (`plugins/mod.rs`, `tools/plugin.rs`) | partial: ABI v2 (`a206/crates/extension-abi`, `extension-sdk`, `extensions`, `runtime/src/extension_host.rs`): declared tools and panels, typed fc-dioxus panel nodes with button events, per-extension persisted state, user grants/enable on the Extensions page and CLI, gateway-authorized workspace and git host calls; only bundled extensions load, agents cannot create or call them until the run engine lands | Agent `plugin_*` tools via the run engine; reviewed package install; more host domains (patch, git write, network, exec after the OS sandbox) |
 | MCP **client** connect/list/tools (`mcp/*`, `tools/mcp_tools.rs`) | partial (experimental): stdio servers in a macOS sandbox with declared authority, per-tool Allow/Ask/Deny, grant- and project-bound calls, bounded framing/listing/results, status in snapshot, desktop/TUI Extensions page, `mcp-servers` CLI (`a206/crates/mcp`, `runtime/src/gateway/mcp_servers.rs`, `docs/mcp.md`); not reachable by models until the run engine lands; no HTTP transport, credentials or Linux isolation | Run engine offers `mcp_offers` and calls `call_mcp_tool` with approvals; streamable HTTP with vault-brokered auth; Linux sandbox |
 | ACP | present (a206 extra): `agent206 acp`, ACP client for Claude Agent (`runtime/src/acp.rs`, `backends/claude.rs`) | — |
 
@@ -192,8 +192,8 @@ invocations and relays gateway-authorized host calls (`a206/docs/plugin-api.md`)
    (Allow/Ask/Deny), `ask_user`, retries without silent fallback, tool healing and output budgets.
    Without it no tool, memory, cron or channel feature is reachable by a model.
 3. **Extension ABI v2** (MessagePack input, scoped host calls for workspace/exec/network/git, typed
-   UI contributions, reviewed install). Partial: the ABI, SDK, workspace read/list and state host
-   calls, typed panels and user grants are in; exec/network/git host calls and package install remain. Every RustyClaw tool family is meant to ship as a WASM builtin.
+   UI contributions, reviewed install). Partial: the ABI, SDK, workspace read/search/write, git read and state host
+   calls, typed panels and user grants are in; exec/network/git-write host calls and package install remain. Every RustyClaw tool family is meant to ship as a WASM builtin.
 4. **OS sandbox for native exec and the macOS worker.** External backends are isolated on macOS and
    Linux, and the WASM worker on Linux; native Execute/WriteWorkspace grants (when the run engine
    adds native exec) and the macOS worker still need profiles (`crates/sandbox`, `runtime/src/sandbox.rs`).

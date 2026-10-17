@@ -180,6 +180,13 @@ pub enum HostRequest {
     },
     /// Create a directory and any missing parents.
     CreateDirectory { path: String },
+    /// The branch, `HEAD` and changed paths of the workspace's repository.
+    GitStatus,
+    /// The most recent commits reachable from `HEAD`, newest first.
+    GitLog { max: u32 },
+    /// A unified diff of one file: `HEAD` against the index when `staged`,
+    /// otherwise the index against the working tree.
+    GitDiff { path: String, staged: bool },
     /// Read this extension's own persisted state.
     StateGet { key: String },
     /// Replace (`Some`) or delete (`None`) this extension's state entry.
@@ -200,6 +207,9 @@ pub enum HostReply {
     File(ByteBuf),
     Directory(Vec<DirEntry>),
     Matches(SearchResult),
+    GitStatus(GitStatus),
+    Commits(Vec<GitCommit>),
+    Diff(GitDiff),
     State(Option<ByteBuf>),
     Done,
     Failed(HostFailure),
@@ -225,6 +235,64 @@ pub struct SearchMatch {
     pub line: u32,
     /// The matching line, possibly shortened.
     pub text: String,
+}
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitStatus {
+    /// The checked-out branch; `None` when `HEAD` is detached or unborn.
+    pub branch: Option<String>,
+    /// The commit `HEAD` points to; `None` before the first commit.
+    pub head: Option<String>,
+    pub entries: Vec<GitEntry>,
+    /// The listing stopped at a bound; more changes may exist.
+    pub truncated: bool,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitEntry {
+    /// Repository-relative, `/`-separated.
+    pub path: String,
+    pub area: GitArea,
+    pub change: GitChange,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GitArea {
+    /// Between `HEAD` and the index.
+    Staged,
+    /// Between the index and the working tree.
+    Unstaged,
+    Untracked,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GitChange {
+    Added,
+    Removed,
+    Modified,
+    TypeChange,
+    Conflict,
+    /// A change kind from a newer host.
+    #[serde(other)]
+    Other,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitCommit {
+    /// Full hexadecimal object id.
+    pub id: String,
+    /// The first line of the message.
+    pub summary: String,
+    /// The author's name; email addresses are not shared.
+    pub author: String,
+    /// Author time, seconds since the Unix epoch.
+    pub time: i64,
+}
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitDiff {
+    /// Unified diff hunks; empty when the two sides are the same.
+    pub text: String,
+    /// Either side is binary, so no text diff is given.
+    pub binary: bool,
+    /// The diff was cut at a bound.
+    pub truncated: bool,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

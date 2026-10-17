@@ -244,6 +244,30 @@ pub mod host {
     pub fn create_directory(path: &str) -> Result<(), HostFailure> {
         done(call(&HostRequest::CreateDirectory { path: path.into() })?)
     }
+    /// The branch, `HEAD` and changed paths of the workspace's repository.
+    pub fn git_status() -> Result<GitStatus, HostFailure> {
+        match call(&HostRequest::GitStatus)? {
+            HostReply::GitStatus(status) => Ok(status),
+            _ => Err(unexpected()),
+        }
+    }
+    /// Up to `max` commits reachable from `HEAD`, newest first.
+    pub fn git_log(max: u32) -> Result<Vec<GitCommit>, HostFailure> {
+        match call(&HostRequest::GitLog { max })? {
+            HostReply::Commits(commits) => Ok(commits),
+            _ => Err(unexpected()),
+        }
+    }
+    /// A unified diff of one file, staged or unstaged.
+    pub fn git_diff(path: &str, staged: bool) -> Result<GitDiff, HostFailure> {
+        match call(&HostRequest::GitDiff {
+            path: path.into(),
+            staged,
+        })? {
+            HostReply::Diff(diff) => Ok(diff),
+            _ => Err(unexpected()),
+        }
+    }
     fn done(reply: HostReply) -> Result<(), HostFailure> {
         match reply {
             HostReply::Done => Ok(()),
