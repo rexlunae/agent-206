@@ -60,6 +60,10 @@ const BUNDLED: &[(&str, &[u8])] = &[
         include_str!("../../../plugins/web/plugin.toml"),
         include_bytes!(concat!(env!("OUT_DIR"), "/a206_plugin_web.wasm")),
     ),
+    (
+        include_str!("../../../plugins/memory/plugin.toml"),
+        include_bytes!(concat!(env!("OUT_DIR"), "/a206_plugin_memory.wasm")),
+    ),
 ];
 
 pub fn builtins() -> Result<Vec<Builtin>, ManifestError> {
