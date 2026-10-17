@@ -35,6 +35,17 @@ fn running(g: &Gateway, thread: Id) -> CancellationToken {
     token
 }
 
+/// Admit `thread`'s run as `Send` does, for `reservation` if given.
+async fn admitted(g: &Gateway, thread: Id, reservation: Option<Reservation>) -> CancellationToken {
+    let token = match reservation {
+        Some(r) => ADMITTING.scope(r, async { admit(g, thread) }).await,
+        None => admit(g, thread),
+    }
+    .unwrap();
+    g.running.lock().unwrap().remove(&thread);
+    token
+}
+
 #[tokio::test]
 async fn a_subagent_run_reserved_before_it_starts_is_cancelled_with_its_parent() {
     let state = tempfile::tempdir().unwrap();
@@ -47,34 +58,40 @@ async fn a_subagent_run_reserved_before_it_starts_is_cancelled_with_its_parent()
     assert_eq!(refused.kind, ErrorKind::Conflict);
 
     let parent_run = running(&g, parent);
-    delegator.reserve(parent, child).unwrap();
+    let reserved = delegator.reserve(parent, child).unwrap();
     cancel_run(&g, parent).unwrap();
     assert!(parent_run.is_cancelled());
+    // Another message to the subagent neither takes nor drops the reservation.
+    assert!(!admitted(&g, child, None).await.is_cancelled());
     // The run is admitted only after its parent was cancelled, and starts
-    // cancelled.
-    assert!(take_reserved(&g, child).unwrap().is_cancelled());
-    // A thread nobody reserved gets a fresh token.
-    assert!(!take_reserved(&g, child).unwrap().is_cancelled());
+    // cancelled; the reservation is then used up.
+    assert!(admitted(&g, child, Some(reserved)).await.is_cancelled());
+    assert!(!admitted(&g, child, Some(reserved)).await.is_cancelled());
 
     // Reserving after the parent's cancellation is cancelled as well.
-    delegator.reserve(parent, child).unwrap();
-    assert!(take_reserved(&g, child).unwrap().is_cancelled());
+    let reserved = delegator.reserve(parent, child).unwrap();
+    assert!(admitted(&g, child, Some(reserved)).await.is_cancelled());
 
     // A reserved run can be cancelled on its own, and released.
     let parent = thread(&g).await;
     g.lock().unwrap().thread_mut(child).unwrap().parent = Some(parent);
     let parent_run = running(&g, parent);
-    delegator.reserve(parent, child).unwrap();
+    let reserved = delegator.reserve(parent, child).unwrap();
     cancel_run(&g, child).unwrap();
     assert!(!parent_run.is_cancelled());
-    assert!(take_reserved(&g, child).unwrap().is_cancelled());
-    delegator.reserve(parent, child).unwrap();
-    delegator.release(child);
-    assert!(!take_reserved(&g, child).unwrap().is_cancelled());
+    assert!(admitted(&g, child, Some(reserved)).await.is_cancelled());
+    let reserved = delegator.reserve(parent, child).unwrap();
+    delegator.release(reserved);
+    assert!(!admitted(&g, child, Some(reserved)).await.is_cancelled());
     assert!(matches!(
         cancel_run(&g, child),
         Err(GatewayError::NotFound(_))
     ));
+    // A reservation is admitted only for its own subagent.
+    let reserved = delegator.reserve(parent, child).unwrap();
+    cancel_run(&g, parent).unwrap();
+    assert!(!admitted(&g, parent, Some(reserved)).await.is_cancelled());
+    assert!(admitted(&g, child, Some(reserved)).await.is_cancelled());
 }
 
 /// The subagent tools `g` offers and the host list they run subagents with.

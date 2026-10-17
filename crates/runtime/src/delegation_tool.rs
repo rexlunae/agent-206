@@ -15,7 +15,7 @@
 //! cancel and read subagents, and nothing that changes a grant, a permission
 //! or an approval. A model addresses only its own conversation's subagents.
 use crate::{
-    gateway::{Caller, Child, Delegator},
+    gateway::{Caller, Child, Delegator, Reservation},
     tools::{self, ToolHost, ToolListing, ToolOutput, ToolRequest, ToolScope, ToolSpec},
 };
 use a206_core::{
@@ -128,6 +128,7 @@ struct Started {
 struct Finish {
     runs: Arc<Mutex<Runs>>,
     delegator: Arc<Delegator>,
+    reservation: Reservation,
     child: Id,
     run: Id,
     done: CancellationToken,
@@ -141,9 +142,7 @@ impl Finish {
 }
 impl Drop for Finish {
     fn drop(&mut self) {
-        // Released while the run is still recorded as active, so a later
-        // start's reservation cannot be the one removed.
-        self.delegator.release(self.child);
+        self.delegator.release(self.reservation);
         let mut runs = self.runs.lock().unwrap_or_else(PoisonError::into_inner);
         if runs
             .active
@@ -184,7 +183,7 @@ impl DelegationHost {
     /// can cancel it. It is reserved under `caller`'s run before this
     /// returns, so cancelling `caller` cancels it even before it starts.
     fn start(&self, caller: Id, child: Id, text: String) -> Result<(), ErrorReport> {
-        self.delegator.reserve(caller, child)?;
+        let reservation = self.delegator.reserve(caller, child)?;
         let run = Id::new_v4();
         let done = CancellationToken::new();
         {
@@ -202,6 +201,7 @@ impl DelegationHost {
         let mut finish = Finish {
             runs: self.runs.clone(),
             delegator: delegator.clone(),
+            reservation,
             child,
             run,
             done,
@@ -211,7 +211,7 @@ impl DelegationHost {
         // when it finishes, is cancelled or the gateway shuts down, which
         // cancels every run. Its outcome is stored in the subagent's thread.
         drop(tokio::spawn(async move {
-            finish.ended(delegator.send(child, text).await.err());
+            finish.ended(delegator.send(child, text, reservation).await.err());
         }));
         Ok(())
     }

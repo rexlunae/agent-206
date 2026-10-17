@@ -13,8 +13,10 @@
 //! clones keep theirs.
 //!
 //! A subagent run is reserved, as a child of its parent's run token, before
-//! the tool call that starts it returns. Cancelling the parent therefore also
-//! cancels a subagent whose run has not been admitted yet.
+//! the tool call that starts it returns, and only the delegator's own `Send`
+//! for that reservation admits the run with it. Cancelling the parent
+//! therefore also cancels a subagent whose run has not been admitted yet,
+//! while other messages to the subagent neither take nor drop it.
 use super::{Gateway, GatewayError, Result, poisoned};
 use crate::{error::check, store::Store, tools::ToolHost};
 use a206_core::*;
@@ -28,8 +30,18 @@ use tokio_util::sync::CancellationToken;
 pub(super) type HostList = Vec<Arc<dyn ToolHost>>;
 /// The gateway's current tool hosts, for the delegator to run subagents with.
 pub(super) type HostLink = Arc<RwLock<Weak<HostList>>>;
-/// Subagent runs reserved by their parent's run and not yet admitted.
-pub(super) type Reserved = Arc<Mutex<BTreeMap<Id, CancellationToken>>>;
+/// Subagent runs reserved by their parent's run and not yet admitted: the
+/// subagent and its run token, by reservation.
+pub(super) type Reserved = Arc<Mutex<BTreeMap<Reservation, (Id, CancellationToken)>>>;
+
+/// One reserved subagent run, admitted only by the `Send` made for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Reservation(Id);
+
+tokio::task_local! {
+    /// The reservation the `Send` running in this task was made for.
+    static ADMITTING: Reservation;
+}
 
 /// One gateway's subagent tools and the link to the hosts they run with.
 #[derive(Clone, Default)]
@@ -159,14 +171,25 @@ impl Gateway {
     }
 }
 
-/// The token for `thread`'s next run: the one its parent reserved, if any.
-pub(super) fn take_reserved(gateway: &Gateway, thread: Id) -> Result<CancellationToken> {
-    Ok(gateway
-        .reserved
-        .lock()
-        .map_err(poisoned("run"))?
-        .remove(&thread)
-        .unwrap_or_default())
+/// Record `thread`'s run as running and return its token: the one reserved
+/// for the `Send` in progress, if it was made for one, else a fresh one. The
+/// caller holds the store lock, as `cancel_run` does, so a cancellation
+/// always finds the token either reserved or running.
+pub(super) fn admit(gateway: &Gateway, thread: Id) -> Result<CancellationToken> {
+    let mut running = gateway.running.lock().map_err(poisoned("run"))?;
+    let token = match ADMITTING.try_with(|r| *r) {
+        Ok(reservation) => {
+            let mut reserved = gateway.reserved.lock().map_err(poisoned("run"))?;
+            match reserved.get(&reservation) {
+                Some((child, _)) if *child == thread => reserved.remove(&reservation).map(|r| r.1),
+                _ => None,
+            }
+        }
+        Err(_) => None,
+    }
+    .unwrap_or_default();
+    running.insert(thread, token.clone());
+    Ok(token)
 }
 
 impl Delegator {
@@ -282,41 +305,47 @@ impl Delegator {
         Ok(summary)
     }
 
-    /// Send `text` to `child` and wait for its run to end, as `Send` does.
-    pub async fn send(&self, child: Id, text: String) -> Result<(), ErrorReport> {
-        self.request(Command::Send {
+    /// Send `text` to `child` and wait for its run to end, as `Send` does,
+    /// admitting the run with `reservation`'s token.
+    pub async fn send(
+        &self,
+        child: Id,
+        text: String,
+        reservation: Reservation,
+    ) -> Result<(), ErrorReport> {
+        let send = self.request(Command::Send {
             thread: child,
             text,
             attachments: vec![],
-        })
-        .await
-        .map(drop)
+        });
+        ADMITTING.scope(reservation, send).await.map(drop)
     }
 
     /// Reserve `child`'s next run as part of `caller`'s current run, so
     /// cancelling `caller` cancels it even before it is admitted.
-    pub fn reserve(&self, caller: Id, child: Id) -> Result<(), ErrorReport> {
+    pub fn reserve(&self, caller: Id, child: Id) -> Result<Reservation, ErrorReport> {
         self.reserve_run(caller, child)
             .map_err(|e| crate::error::report(&e))
     }
-    fn reserve_run(&self, caller: Id, child: Id) -> Result<(), DelegatorError> {
+    fn reserve_run(&self, caller: Id, child: Id) -> Result<Reservation, DelegatorError> {
         let running = self.base.running.lock().map_err(poisoned("run"))?;
         let parent = running.get(&caller).ok_or(DelegatorError::NotRunning)?;
+        let reservation = Reservation(Id::new_v4());
         self.base
             .reserved
             .lock()
             .map_err(poisoned("run"))?
-            .insert(child, parent.child_token());
-        Ok(())
+            .insert(reservation, (child, parent.child_token()));
+        Ok(reservation)
     }
-    /// Drop `child`'s reservation if its run was never admitted.
-    pub fn release(&self, child: Id) {
+    /// Drop `reservation` if its run was never admitted.
+    pub fn release(&self, reservation: Reservation) {
         // A map of tokens is valid whatever a panicking writer left.
         self.base
             .reserved
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .remove(&child);
+            .remove(&reservation);
     }
 
     /// Cancel `child`'s run and its own subagents' runs.
@@ -333,7 +362,14 @@ pub(super) fn cancel_run(gateway: &Gateway, thread: Id) -> Result<Reply> {
     let store = gateway.lock()?;
     let running = gateway.running.lock().map_err(poisoned("run"))?;
     let reserved = gateway.reserved.lock().map_err(poisoned("run"))?;
-    let tokens = |id: Id| running.get(&id).into_iter().chain(reserved.get(&id));
+    let tokens = |id: Id| {
+        running.get(&id).into_iter().chain(
+            reserved
+                .values()
+                .filter(move |(child, _)| *child == id)
+                .map(|(_, token)| token),
+        )
+    };
     let mut found = false;
     for token in tokens(thread) {
         token.cancel();

@@ -254,8 +254,10 @@ until the user permits them on that conversation.
   250 ms.
 - `CancelRun` cancels the thread's run and the runs of every thread delegated
   from it, whoever started them. A subagent run is reserved under its parent's
-  run token before `subagent_spawn`/`subagent_send` returns, so cancelling the
-  parent also cancels a subagent whose run has not been admitted yet.
+  run token before `subagent_spawn`/`subagent_send` returns, and only that
+  tool's own `Send` admits the run with it (other messages to the subagent
+  neither take nor drop it). Cancelling the parent therefore also cancels a
+  subagent whose run has not been admitted yet.
 
 The host holds a `Delegator`, not the gateway: it can create, message, cancel
 and read subagents and nothing that changes a grant, permission or approval. The
