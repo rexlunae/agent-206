@@ -18,6 +18,7 @@ pub mod mcp;
 pub mod mcp_tools;
 pub mod messengers;
 pub mod network;
+pub mod plan_tool;
 pub mod process;
 pub mod prompt_tool;
 pub mod propose_tool;

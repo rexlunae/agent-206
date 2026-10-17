@@ -25,6 +25,8 @@ body { max-inline-size: none; inline-size: 100%; padding: 0; background: var(--f
 .a206-row { display: flex; gap: var(--fc-space-3); align-items: center; flex-wrap: wrap; }
 .a206-between { justify-content: space-between; }
 .a206-stack { display: flex; flex-direction: column; gap: var(--fc-space-4); }
+.a206-plan { display: flex; flex-direction: column; gap: var(--fc-space-2); }
+.a206-plan-steps { display: flex; flex-direction: column; gap: var(--fc-space-2); margin: 0; padding-inline-start: 0; list-style: none; }
 .a206-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 230px), 1fr)); gap: var(--fc-space-4); }
 .a206-hero { padding-block: var(--fc-space-6); display: grid; gap: var(--fc-space-6); align-items: center; padding: var(--fc-space-5); grid-template-columns: 1fr auto; }
 .a206-orbit { inline-size: 152px; aspect-ratio: 1; color: var(--fc-color-accent-text); opacity: .75; }

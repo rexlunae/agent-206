@@ -27,7 +27,9 @@ pub(crate) use mcp_servers::McpClient;
 pub use mcp_servers::{McpOffer, McpOffers};
 pub use run::{RunError, ToolError};
 mod delegation;
+mod plans;
 mod schedules;
+pub use plans::Plans;
 mod skills;
 pub use crate::skill_tool::SkillOffer;
 pub use delegation::{Caller, Child, Delegator, DelegatorError, Reservation};
@@ -468,6 +470,9 @@ impl Gateway {
         // permits them, and each new job waits for the user's approval.
         let schedule_tools = Arc::new(crate::schedule_tool::ScheduleHost::new(gateway.jobs()));
         Arc::make_mut(&mut gateway.tool_hosts).push(schedule_tools);
+        // The plan tool, denied in each conversation until the user permits it.
+        let plan_tools = Arc::new(crate::plan_tool::PlanHost::new(gateway.plans()));
+        Arc::make_mut(&mut gateway.tool_hosts).push(plan_tools);
         // Subagent tools; each conversation still denies them until the user
         // permits them, and they are offered only with subagent models.
         gateway.bind_delegation();
