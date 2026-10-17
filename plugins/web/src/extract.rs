@@ -581,12 +581,26 @@ fn origin(url: &str) -> Option<&str> {
     url.starts_with("http").then(|| &url[..end])
 }
 
-/// A URL as a Markdown link destination: bytes that would end or break it
-/// (whitespace, controls, brackets, quotes) are percent-encoded, as a
-/// browser encodes them in a request.
+/// A URL as a Markdown link destination. Bytes a browser percent-encodes
+/// in a request anyway (whitespace, controls, `<>"` and backticks) are
+/// encoded. Parentheses are kept as written, since a server may tell them
+/// from `%28`/`%29` (a signed link, say); Markdown accepts them when they
+/// balance, so they are encoded only when they do not.
 fn escape(url: String) -> String {
-    let unsafe_byte =
-        |byte: u8| byte <= b' ' || matches!(byte, b'<' | b'>' | b'(' | b')' | b'"' | b'`' | 0x7f);
+    let mut depth = 0i32;
+    let balanced = url.bytes().all(|byte| {
+        depth += match byte {
+            b'(' => 1,
+            b')' => -1,
+            _ => 0,
+        };
+        depth >= 0
+    }) && depth == 0;
+    let unsafe_byte = |byte: u8| {
+        byte <= b' '
+            || matches!(byte, b'<' | b'>' | b'"' | b'`' | 0x7f)
+            || (!balanced && matches!(byte, b'(' | b')'))
+    };
     if !url.bytes().any(unsafe_byte) {
         return url;
     }
@@ -903,8 +917,10 @@ See the other, x, no and rel.\n\nUse cargo:\n\nfn  main() {\n    x();\n}\n\nafte
             ("/x/./y/..", "https://site.example/x/"),
             (
                 "next page (2)",
-                "https://site.example/docs/next%20page%20%282%29",
+                "https://site.example/docs/next%20page%20(2)",
             ),
+            ("a(1)?s=x", "https://site.example/docs/a(1)?s=x"),
+            ("a)(", "https://site.example/docs/a%29%28"),
             (
                 "https://x.example/a&quot;b<c>",
                 "https://x.example/a%22b%3Cc%3E",
