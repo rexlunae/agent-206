@@ -8,7 +8,7 @@ implemented structure for finished agent execution or security parity.
 
 | Area | Available now | Remaining work |
 | --- | --- | --- |
-| Rust architecture | Ten small crates, typed shared commands, forbidden application unsafe, pinned dependencies | Further extraction as capabilities grow; measured build/runtime budgets |
+| Rust architecture | Twelve small crates, typed shared commands, forbidden application unsafe, pinned dependencies | Further extraction as capabilities grow; measured build/runtime budgets |
 | Desktop | Native macOS app bundle, shared fc-dioxus interface, automatic local gateway startup, shared lifecycle controls | Windows named pipes; Linux desktop packaging and hardware validation |
 | Gateway lifecycle | Shared Gateway page and controller, status from the actual process, start/stop/restart/reconnect, durable deliberate-stop marker, cleanup before acknowledgement, bounded control receipts; web uses an authenticated user-only binary endpoint | Remote SSH acceptance, stronger cross-process lifecycle coordination, encrypted enrollment and authentication; running is not security readiness |
 | Initial setup/import | `agent206 setup` resumes first-run setup on the existing flows (gateway target, vault create/unlock, optional TOTP enrollment, pairing) and ends with the health report; `agent206 import rustyclaw` previews by default and with `--apply` adds missing provider accounts through the revision-checked settings API, copies a password vault in through the broker (`ImportVault`: encrypted copy, password and enrolled TOTP verified on the copy, never merged or replacing a vault, source untouched) and writes an owner-only receipt; messengers, MCP servers, tool permissions, skills and plaintext tokens are counted and left inactive; tested in the import crate, the broker and through the real binary against a real gateway | Desktop/TUI setup wizard and import screen, key-file vaults, conversations/workspace instructions/memory, rollback command, adapters for Cline, Claude Code, Codex, DeepSeek Harness and others, isolated reader process; interactive vault import is exercised only in broker tests (it needs a terminal) |
@@ -30,8 +30,8 @@ implemented structure for finished agent execution or security parity.
 | Vault | SecureStore-compatible encryption, locked state, redacted nonserializable secret type, private atomic writes, interactive standalone CLI; library-level typed credentials in RustyClaw's layout, all five access policies plus disabled/agent switch, verified TOTP enrollment with replay protection, auth throttle and reveal step-up window; the CLI challenges enrolled vaults ; a separate broker process owns the vault, serves the CLI and performs destination-bound provider requests for a gateway paired per unlock; the desktop/TUI Security page creates, unlocks (with the authenticator challenge), locks and pairs a local profile's vault and enrolls TOTP through the same broker requests (`a206_runtime::vault`, shared with the CLI; runtime tests against a real broker and gateway, UI tests of offered actions and the remote notice only) | Vault controls for a remote (SSH) gateway, desktop/TUI credential and policy management and TOTP removal (CLI only), QR display of the enrollment key, agent approval UI, recovery codes, key-file migration, remote broker over SSH, credentialed external backends and browser injection |
 | Security model | Deny-by-default grants, no secret-bearing agent tool, restricted MCP, bounded worker, SSRF-resistant public downloads, capability-scoped text reads | Full RustyClaw defense parity, OS sandbox profiles, leak/injection boundary scanning, adversarial review |
 | MCP client | Experimental: user-configured stdio servers, disabled by default, run under macOS sandbox-exec with only declared authority (project read/write, commands, network) and a cleared environment; per-tool Allow/Ask/Deny; calls authorized against the thread's current grant and project; bounded lines, listings, results and time; status, tools and typed failures in the snapshot; Extensions page and `mcp-servers` CLI; gateway API for the run engine (`docs/mcp.md`). Tested against a Rust fixture server as a child process, the macOS sandbox on CI, and gateway policy denials | Model access through the run engine with approvals, streamable HTTP, vault-brokered server credentials, Linux/Windows isolation, resources/prompts, network sandbox acceptance |
-| WASM | Genuine compiled bundled inspector, separate child, no imports/WASI, fuel/memory/output/time bounds | General SDK inputs/host calls, user/agent package creation and reviewed installation, most tools as extensions |
-| Plugin UI/API | Versioned manifest and executable v1 documented; trusted text-only extension panel | Rich validated component descriptions, panel/viewer/command contributions and subscriptions |
+| WASM | ABI v2: Rust guest SDK; bundled `agent206.workspace` compiled to WASM by `build.rs`; separate worker child per call relaying MessagePack host calls; only the two ABI imports, no WASI; fuel/memory/input/output/host-call/time bounds; workspace read/list (cap-std scoped) and per-extension state host calls checked against user grant ∩ caller ceiling ∩ declaration (tested against real WASM and adversarial modules; end-to-end smoke test through the worker) | Write/search/git/network/exec host calls, OS sandbox profile for the worker, user/agent package creation and reviewed installation, calls from the native run engine |
+| Plugin UI/API | ABI v2 documented (`docs/plugin-api.md`); manifests declare typed tools and panels; validated panel node trees rendered with fc-dioxus on the Extensions page (desktop/TUI) and as text in the CLI; button events; per-capability grant and enable switches in app chrome | Viewer/command contributions, subscriptions, richer components, web client parity |
 | Downloads | HTTPS monitor, progress events, cancellation and partial-file cleanup, SHA-256 verification, atomic no-clobber publication, transfer library or ~/models | Range resume, persisted ETags, retries, remote model transfer, agent-scoped subscriptions |
 | Joshua | Owned local/SSH child start/stop, loopback forwarding, user-selected file/port, API model discovery, owned provider retirement on stop/observed exit/restart | Installation/updating, verified remote supervision/readiness, one-step model switching, real model/remote-host acceptance tests |
 | Documents | UTF-8 text/Markdown source preview scoped by cap-std to a project | WASM format plugins, editing/rendering, PDF/office viewers, ArtCraft evaluation |
@@ -57,8 +57,10 @@ unlocked, the gateway paired for that unlock, and the credential bound to the
 provider's exact origin, or the request fails with an explanation. The gateway never reads a credential value, and agents
 still have no credential use. External coding backends still refuse credentialed
 providers. Browser
-preview has no credential injection. Third-party extension installation and
-capability-bearing imports are unavailable. New coding conversations have no
+preview has no credential injection. Third-party extension installation is unavailable.
+Bundled extensions reach the workspace and their own state only through
+gateway-authorized host calls; no extension links WASI or any other
+capability-bearing WASM import. New coding conversations have no
 execution or filesystem grants. A coding mode label alone does not claim a working
 autonomous native coding agent. External coding backends require separately configured
 runtimes and providers; authenticated dispatch and external delegation remain
@@ -146,8 +148,8 @@ vault migration or production security certification.
    dispatch only after those boundary tests pass.
 2. Implement the agent execution engine, streamed tool calls, permissioned tools, project
    scheduler and delegated task lifecycle, including cancellation and budgets.
-3. Ship a useful extension SDK, compiled tool plugins and reviewed agent-generated
-   extension packages with validated UI contributions.
+3. Grow the extension SDK's host domains and builtins, and add reviewed
+   agent-generated extension packages.
 4. Add verified local/SSH installers, remote supervision, browser/vault integration,
    document format plugins and forge-neutral PR/CI workflows.
 5. Complete context/accounting controls and API integrations without introducing a

@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/core", "crates/protocol", "crates/vault", "crates/broker", "crates/import", "crates/extensions", "crates/mcp", "crates/runtime", "crates/ui", "crates/app"]
+members = ["crates/core", "crates/protocol", "crates/vault", "crates/broker", "crates/import", "crates/extension-abi", "crates/extension-sdk", "crates/extensions", "plugins/workspace", "crates/mcp", "crates/runtime", "crates/ui", "crates/app"]
 default-members = ["crates/app"]
 resolver = "3"
 
@@ -14,6 +14,7 @@ a206-core = { path = "crates/core" }
 a206-protocol = { path = "crates/protocol" }
 a206-vault = { path = "crates/vault" }
 a206-broker = { path = "crates/broker" }
+a206-extension-abi = { path = "crates/extension-abi" }
 a206-import = { path = "crates/import" }
 a206-extensions = { path = "crates/extensions" }
 a206-mcp = { path = "crates/mcp" }

@@ -1,0 +1,15 @@
+[package]
+name = "a206-extension-abi"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Versioned MessagePack contract shared by Agent 206 extension guests and the host."
+[dependencies]
+serde.workspace = true
+serde_bytes = "0.11"
+thiserror.workspace = true
+[dev-dependencies]
+rmp-serde.workspace = true
+[lints]
+workspace = true
