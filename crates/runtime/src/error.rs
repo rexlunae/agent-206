@@ -92,6 +92,7 @@ pub(crate) fn classify(error: &(dyn Error + 'static)) -> Option<ErrorKind> {
         crate::provider::EndpointError,
         crate::provider::PresetError,
         crate::provider::ProviderError,
+        crate::sandbox::StartError,
         crate::service::ServiceError,
         crate::store::StoreError,
         crate::transport::FrameError,

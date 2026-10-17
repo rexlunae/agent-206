@@ -7,6 +7,9 @@ manifest. They contribute **tools** (for agents and the CLI) and **panels**
 (typed UI descriptions rendered by trusted fc-dioxus code). Every invocation
 runs in a fresh instance inside a separate `agent206 extension-worker` process
 with a cleared environment, and every host call is authorized by the gateway.
+On Linux that process is also confined by bubblewrap and Landlock with no
+network, no project files and nothing to execute but itself; host calls are its
+only reach. Without bubblewrap or Landlock, calls fail rather than run unconfined.
 
 Agent 206 bundles `agent206.workspace` (`plugins/workspace`), written in Rust
 against the guest SDK and compiled to WASM by `crates/extensions/build.rs`. It
@@ -190,8 +193,8 @@ exists yet. Tool text is extension output, never instructions.
 | secrets | Request brokered use | user approval + destination + expiry |
 
 No host call will accept raw secret values; a secret handle is not authority to
-export its contents. Execution host calls wait for the OS sandbox profile for
-the worker.
+export its contents. Execution host calls will run their commands in a separate
+sandboxed process, never in the worker, and wait for the run engine's native exec.
 
 Installed packages will be digest-pinned and validated before installation.
 Agent-created extensions remain disabled until the user reviews their source or

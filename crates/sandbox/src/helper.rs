@@ -1,6 +1,7 @@
 //! The helper that runs inside bubblewrap's namespaces: it binds the proxy
-//! port on the private loopback, applies Landlock to itself, starts the
-//! runtime (which inherits that Landlock domain) and relays proxy traffic.
+//! port on the private loopback when there is one, applies Landlock to itself,
+//! starts the runtime (which inherits that Landlock domain) and relays proxy
+//! traffic.
 use crate::{Access, SPEC_VERSION, SandboxError, Spec, Status};
 use a206_core::Ignore;
 use landlock::{
@@ -51,27 +52,34 @@ fn start(
     args: impl Iterator<Item = OsString>,
 ) -> Result<std::process::Child, SandboxError> {
     // Bound before Landlock, which then forbids the runtime from binding.
-    let listener = TcpListener::bind(("127.0.0.1", spec.port)).map_err(SandboxError::Listen)?;
+    let listener = match &spec.proxy {
+        Some(proxy) => Some((
+            TcpListener::bind(("127.0.0.1", proxy.port)).map_err(SandboxError::Listen)?,
+            proxy.socket.clone(),
+        )),
+        None => None,
+    };
     restrict(spec)?;
-    let proxy = spec.proxy.clone();
-    // Detached: the relay lives exactly as long as this process, which exits
-    // with the runtime. Each connection's threads end when either side closes.
-    std::thread::spawn(move || {
-        for stream in listener.incoming() {
-            match stream {
-                Ok(stream) => {
-                    let proxy = proxy.clone();
-                    std::thread::spawn(move || relay(stream, &proxy));
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        error = &error as &dyn std::error::Error,
-                        "proxy accept failed"
-                    );
+    if let Some((listener, socket)) = listener {
+        // Detached: the relay lives exactly as long as this process, which exits
+        // with the runtime. Each connection's threads end when either side closes.
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                match stream {
+                    Ok(stream) => {
+                        let socket = socket.clone();
+                        std::thread::spawn(move || relay(stream, &socket));
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            error = &error as &dyn std::error::Error,
+                            "proxy accept failed"
+                        );
+                    }
                 }
             }
-        }
-    });
+        });
+    }
     std::process::Command::new(&spec.executable)
         .args(args)
         // The gateway reads this process's stderr for diagnostics until it is
@@ -123,9 +131,12 @@ fn restrict(spec: &Spec) -> Result<(), SandboxError> {
             .add_rule(PathBeneath::new(fd, access))
             .map_err(SandboxError::Landlock)?;
     }
-    ruleset = ruleset
-        .add_rule(NetPort::new(spec.port, AccessNet::ConnectTcp))
-        .map_err(SandboxError::Landlock)?;
+    // Without a proxy no TCP connection is allowed at all.
+    if let Some(proxy) = &spec.proxy {
+        ruleset = ruleset
+            .add_rule(NetPort::new(proxy.port, AccessNet::ConnectTcp))
+            .map_err(SandboxError::Landlock)?;
+    }
     let status = ruleset.restrict_self().map_err(SandboxError::Landlock)?;
     if status.ruleset == RulesetStatus::NotEnforced || !status.no_new_privs {
         return Err(SandboxError::NotEnforced);

@@ -65,9 +65,13 @@ commands use the same controller.
 Windows named pipes remain follow-up work.
 
 WASM builtins execute in a separate `extension-worker` child with a cleared
-environment, no WASI/host imports, bounded fuel/memory/output, and a five-second
-parent timeout. This is an interpreter sandbox plus process separation, not yet
-an OS sandbox for third-party installation. Only the bundled capability-free
+environment, no WASI, only the ABI host imports, bounded fuel/memory/output, and a
+parent timeout. On Linux the worker is also confined by `a206-sandbox`
+(`runtime::sandbox::Confined`): bubblewrap namespaces with no network, a mount view
+of the system libraries, this executable and an empty private directory, and a
+Landlock allowlist that leaves nothing executable but this executable. A missing
+layer fails the call. On macOS the worker is still only interpreter-sandboxed and
+process-separated. Only the bundled capability-free
 extension can be launched in this build.
 
 Joshua is started as an owned child process or an SSH session with a loopback
