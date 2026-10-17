@@ -28,3 +28,28 @@ jobs:
       - run: cargo check -p agent206 --features tui --locked
       - run: cargo check -p agent206 --no-default-features --features web --target wasm32-unknown-unknown --locked
       - run: cargo test -p agent206 --no-default-features --test smoke --locked
+  linux-sandbox:
+    # The desktop crate needs GTK; the Linux sandbox lives below it.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+          # The runtime embeds the bundled WASM extensions.
+          targets: wasm32-unknown-unknown
+      - run: sudo apt-get update && sudo apt-get install -y bubblewrap
+      # Ubuntu's AppArmor default blocks the unprivileged user namespaces
+      # bubblewrap creates; the sandbox itself still requires both layers.
+      - run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      - uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ runner.arch }}-sandbox-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', '**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-sandbox-
+      - run: cargo clippy -p a206-sandbox -p a206-runtime --all-targets --locked -- -D warnings
+      - run: cargo test -p a206-sandbox -p a206-runtime --locked
