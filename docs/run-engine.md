@@ -73,11 +73,13 @@ capabilities (an extension the user disabled or ungranted, or an MCP server the
 user disconnected or disabled, no longer does). A running call that is no
 longer permitted (Deny, or Ask for a call the user did not approve, or a tool
 its host withdrew) is dropped, which stops it, and is settled `Denied` with a
-`PermissionDenied` report. A call that fails is checked the same way before its
-failure is recorded, since withdrawing a host can end its call first (a
-disconnected server's session closes): if the tool is no longer permitted, the
-withdrawal is reported, not the host failure; a pending approval whose tool is now denied ends with
-`ApprovalResolved { outcome: Revoked }`. The run continues with the refusal as
+`PermissionDenied` report. Withdrawing a host can end its call before the run
+sees the change (a disconnected server's session closes), so these commands
+signal before they stop any work, and a call that fails while a change is still
+unseen is checked the same way before its failure is recorded: if the tool is
+no longer permitted, the withdrawal is reported. A call that fails with no
+change pending (a server that crashed) keeps its own failure. A pending approval
+whose tool is now denied ends with `ApprovalResolved { outcome: Revoked }`. The run continues with the refusal as
 that call's result.
 
 `Thread::tool_budget` limits model rounds per run (at least one) and tool calls

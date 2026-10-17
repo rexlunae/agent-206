@@ -773,8 +773,11 @@ impl Gateway {
         };
         // Withdrawing a host's authority can end its call before the policy
         // change is seen here, as when a disconnected MCP server's session
-        // closes: such a failure is the withdrawal, not the tool's.
+        // closes: such a failure is the withdrawal, not the tool's. Hosts
+        // signal a withdrawal before ending the work, so a failure with no
+        // unseen change (a server that crashed) keeps its own report.
         if result.is_err()
+            && policy.has_changed().unwrap_or(false)
             && !self
                 .still_permits(id, &record.tool, &routed.spec, approved)
                 .await?

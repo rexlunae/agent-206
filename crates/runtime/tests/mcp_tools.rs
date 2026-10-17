@@ -114,11 +114,16 @@ impl Rig {
         settings.mcp_servers = servers;
         self.ok(Command::SaveSettings(settings)).await;
     }
-    /// Serve the fixture in process and connect the entry to it.
-    async fn attach(&self) {
+    /// Serve the fixture in process and connect the entry to it. Aborting
+    /// the returned task ends the server as a crash would.
+    async fn attach(&self) -> tokio::task::JoinHandle<()> {
         let (client, server) = tokio::io::duplex(1 << 16);
-        // Detached: the fixture ends when the session closes its end.
-        tokio::spawn(fixture::serve(tokio::io::split(server)));
+        // Not awaited: the fixture ends when the session closes its end, or
+        // when a test aborts it.
+        let served = tokio::spawn(async move {
+            // The fixture's own result is not under test here.
+            let _ = fixture::serve(tokio::io::split(server)).await;
+        });
         let session =
             a206_mcp::Session::start(tokio::io::split(client), None, a206_mcp::Limits::default())
                 .await
@@ -126,6 +131,7 @@ impl Rig {
         self.gateway
             .attach_mcp_session(&self.entry.name, session)
             .unwrap();
+        served
     }
     fn tool(&self, tool: &str) -> String {
         tool_name(&self.entry.name, tool)
@@ -467,6 +473,40 @@ async fn withdrawing_the_server_stops_its_running_call() {
         assert_eq!(status.state, McpServerState::Disconnected, "{how:?}");
         assert_eq!(status.failure, None, "{how:?}");
     }
+}
+
+#[tokio::test]
+async fn a_server_that_fails_during_a_call_is_reported_as_a_failure_not_a_withdrawal() {
+    let mut rig = rig().await;
+    rig.entry.default_policy = ToolPolicy::Allow;
+    rig.save(vec![rig.entry.clone()]).await;
+    let served = rig.attach().await;
+    rig.permit("wait", ToolPermission::Allow).await;
+    let call = Call::new(&rig.tool("wait"), json!({}));
+    let task = send(&rig.gateway, rig.thread);
+    let first = next_request(&mut rig.requests).await;
+    first
+        .respond(calls_response(API, std::slice::from_ref(&call), ""))
+        .await;
+    rig.until("the call to run", |t| {
+        calls_of(t)
+            .first()
+            .is_some_and(|c| c.state == ToolCallState::Running)
+            .then_some(())
+    })
+    .await;
+    // The server goes away on its own; the user withdrew nothing, and its
+    // (empty) executable cannot start again.
+    served.abort();
+    let second = next_request(&mut rig.requests).await;
+    let result = result_for(API, &second.body, &call.id).unwrap();
+    assert!(!result.contains("withdrawn"), "{result}");
+    second.respond(text_response(API, &nonce())).await;
+    let thread = finished(task).await;
+    assert_eq!(thread.state, RunState::Complete, "{:?}", thread.error);
+    let record = &calls_of(&thread)[0];
+    assert_eq!(record.state, ToolCallState::Failed);
+    assert_ne!(error_kind(record), ErrorKind::PermissionDenied);
 }
 
 #[tokio::test]

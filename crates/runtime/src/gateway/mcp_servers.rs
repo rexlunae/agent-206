@@ -176,23 +176,25 @@ impl Gateway {
         previous: &[McpServerConfig],
         servers: &[McpServerConfig],
     ) -> Result<()> {
-        let mut withdrawn = false;
-        for old in previous {
-            if !servers.iter().any(|s| s == old && s.enabled) {
-                self.mcp.servers.remove(&old.name)?;
-                self.mcp
-                    .servers
-                    .stopped
-                    .lock()
-                    .map_err(poisoned("MCP sessions"))?
-                    .remove(&old.name);
-                withdrawn = true;
-            }
-        }
-        if withdrawn {
+        let withdrawn: Vec<&McpServerConfig> = previous
+            .iter()
+            .filter(|old| !servers.iter().any(|s| s == *old && s.enabled))
+            .collect();
+        if !withdrawn.is_empty() {
             // Running calls and approval waits re-check that their tool is
-            // still offered under the new entry.
+            // still offered under the new entry. Signalled before the
+            // sessions close, so a call that fails because its session closed
+            // is already known to be withdrawn.
             self.policy_changed();
+        }
+        for old in withdrawn {
+            self.mcp.servers.remove(&old.name)?;
+            self.mcp
+                .servers
+                .stopped
+                .lock()
+                .map_err(poisoned("MCP sessions"))?
+                .remove(&old.name);
         }
         Ok(())
     }
@@ -228,10 +230,11 @@ impl Gateway {
                 .map_err(poisoned("MCP sessions"))?
                 .insert(name.to_owned());
         }
-        self.mcp.servers.remove(name)?;
         // Running calls and approval waits re-check that their tool is still
-        // offered, which it no longer is.
+        // offered, which it no longer is. Signalled before the session closes,
+        // so a call that fails because it closed is known to be withdrawn.
         self.policy_changed();
+        self.mcp.servers.remove(name)?;
         self.mcp.set_status(name, |status| {
             status.state = McpServerState::Disconnected;
             status.failure = None;
