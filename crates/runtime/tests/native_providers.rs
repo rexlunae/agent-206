@@ -1272,10 +1272,8 @@ async fn an_older_broker_is_used_without_streaming() {
 /// once the attempts run out.
 #[tokio::test]
 async fn brokered_connection_failures_are_retried() {
-    // A port that nothing listens on.
-    let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let origin = format!("http://{}", closed.local_addr().unwrap());
-    drop(closed);
+    // Port 0 can never be listened on, so every connection is refused.
+    let origin = "http://127.0.0.1:0".to_owned();
     let (dir, credential, pairing) = start_broker(&origin, &Id::new_v4().to_string()).await;
     let _anchor = provider::verify_pairing(dir.path(), &pairing)
         .await
