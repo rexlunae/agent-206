@@ -157,17 +157,45 @@ fn models(snapshot: &Snapshot) -> impl Iterator<Item = &ModelInfo> {
     snapshot.catalogs.iter().flat_map(|c| &c.models)
 }
 
-/// The one model `query` names: an exact name or identifier, else the only
-/// one containing it, ignoring case.
+/// How a model is shown when a name is ambiguous: its connection, a `/`,
+/// and its name. Typing it names that one model.
+fn qualified(snapshot: &Snapshot, model: &ModelInfo) -> String {
+    format!("{}/{}", connection(snapshot, model), model.name)
+}
+
+fn connection<'a>(snapshot: &'a Snapshot, model: &ModelInfo) -> &'a str {
+    snapshot
+        .settings
+        .providers
+        .iter()
+        .find(|p| p.id == model.key.provider)
+        .map_or("Unavailable connection", |p| p.label.as_str())
+}
+
+/// The one model `query` names: an exact name or identifier, optionally
+/// after its connection and a `/`, else the only one containing it, ignoring
+/// case. Several connections can list the same model, so a name they share
+/// is refused with the qualified names that tell them apart.
 fn find_model<'a>(snapshot: &'a Snapshot, query: &str) -> Result<&'a ModelInfo, ErrorReport> {
     let query = query.to_lowercase();
-    let names = |m: &ModelInfo| [m.name.to_lowercase(), m.key.model.to_lowercase()];
-    if let Some(exact) = models(snapshot).find(|m| names(m).contains(&query)) {
-        return Ok(exact);
-    }
-    let found: Vec<_> = models(snapshot)
-        .filter(|m| names(m).iter().any(|name| name.contains(&query)))
+    let names = |m: &ModelInfo| {
+        let connection = connection(snapshot, m);
+        [
+            m.name.clone(),
+            m.key.model.clone(),
+            format!("{connection}/{}", m.name),
+            format!("{connection}/{}", m.key.model),
+        ]
+        .map(|name| name.to_lowercase())
+    };
+    let mut found: Vec<_> = models(snapshot)
+        .filter(|m| names(m).contains(&query))
         .collect();
+    if found.is_empty() {
+        found = models(snapshot)
+            .filter(|m| names(m).iter().any(|name| name.contains(&query)))
+            .collect();
+    }
     match found.as_slice() {
         [one] => Ok(one),
         [] => Err(refused("No connected model matches that name")),
@@ -175,7 +203,7 @@ fn find_model<'a>(snapshot: &'a Snapshot, query: &str) -> Result<&'a ModelInfo, 
             "{} models match; name one of {}",
             many.len(),
             many.iter()
-                .map(|m| m.name.as_str())
+                .map(|m| qualified(snapshot, m))
                 .collect::<Vec<_>>()
                 .join(", ")
         ))),
@@ -259,18 +287,21 @@ pub(crate) fn resolve(
                     "The selected model's API reports no reasoning effort choices",
                 ));
             }
-            let effort = if level.eq_ignore_ascii_case("auto") {
-                None
-            } else {
-                Some(
-                    efforts
-                        .iter()
-                        .find(|e| e.eq_ignore_ascii_case(&level))
-                        .cloned()
-                        .ok_or_else(|| {
-                            refused(&format!("Choose auto or one of {}", efforts.join(", ")))
-                        })?,
-                )
+            // An advertised choice wins, even one spelled `auto`; `default`
+            // always means the selector's unadvertised Auto effort.
+            let effort = match efforts.iter().find(|e| e.eq_ignore_ascii_case(&level)) {
+                Some(listed) => Some(listed.clone()),
+                None if level.eq_ignore_ascii_case("auto")
+                    || level.eq_ignore_ascii_case("default") =>
+                {
+                    None
+                }
+                None => {
+                    return Err(refused(&format!(
+                        "Choose default or one of {}",
+                        efforts.join(", ")
+                    )));
+                }
             };
             Ok(Command::SetEffort {
                 thread: thread.id,
@@ -291,7 +322,7 @@ pub(crate) fn run(state: State, command: Command) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use a206_core::{Catalog, CodingBackend, Mode, ModelKey};
+    use a206_core::{Catalog, CodingBackend, Mode, ModelKey, ProviderApi, ProviderConfig};
     use uuid::Uuid;
 
     fn text() -> String {
@@ -517,5 +548,63 @@ mod tests {
         assert!(effort(&thread, &text()).is_err());
         thread.state = RunState::Running;
         assert!(effort(&thread, &level).is_err());
+    }
+
+    #[test]
+    fn a_model_two_connections_list_is_named_by_its_connection() {
+        let first = model(vec![]);
+        let mut second = model(vec![]);
+        second.name = first.name.clone();
+        second.key.model = first.key.model.clone();
+        let mut snapshot = listing(vec![first.clone(), second.clone()]);
+        let labels = [text(), text()];
+        for (model, label) in [&first, &second].into_iter().zip(&labels) {
+            snapshot.settings.providers.push(ProviderConfig {
+                id: model.key.provider,
+                label: label.clone(),
+                base_url: text(),
+                credential: None,
+                api: ProviderApi::default(),
+            });
+        }
+        let thread = Thread::new(text(), Mode::Chat);
+        let chosen = |query: String| resolve(Slash::Model(query), &thread, &snapshot, true);
+        let shared = chosen(first.name.clone()).expect_err("two connections list it");
+        assert!(
+            shared
+                .message
+                .contains(&format!("{}/{}", labels[1], first.name))
+        );
+        assert_eq!(
+            configured(chosen(format!("{}/{}", labels[1], first.name))).1,
+            Some(second.key.clone())
+        );
+        assert_eq!(
+            configured(chosen(format!("{}/{}", labels[0], first.key.model))).1,
+            Some(first.key.clone())
+        );
+    }
+
+    #[test]
+    fn an_advertised_auto_effort_is_chosen_and_default_clears_it() {
+        let listed = model(vec!["auto".into(), text()]);
+        let snapshot = listing(vec![listed.clone()]);
+        let mut thread = Thread::new(text(), Mode::Chat);
+        thread.model = Some(listed.key);
+        let effort = |typed: &str| resolve(Slash::Effort(typed.into()), &thread, &snapshot, true);
+        assert_eq!(
+            effort("AUTO"),
+            Ok(Command::SetEffort {
+                thread: thread.id,
+                effort: Some("auto".into())
+            })
+        );
+        assert_eq!(
+            effort("default"),
+            Ok(Command::SetEffort {
+                thread: thread.id,
+                effort: None
+            })
+        );
     }
 }
