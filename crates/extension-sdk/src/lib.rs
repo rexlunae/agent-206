@@ -221,6 +221,24 @@ pub mod host {
         }
     }
 
+    /// Read the complete approved skill index. The host restricts this import
+    /// to the skills builtin; other extensions receive Denied.
+    pub fn skill_list() -> Result<String, HostFailure> {
+        skill_text(HostRequest::SkillList)
+    }
+    /// Read an approved skill or one supporting file without workspace authority.
+    pub fn skill_read(name: &str, path: Option<&str>) -> Result<String, HostFailure> {
+        skill_text(HostRequest::SkillRead {
+            name: name.into(),
+            path: path.map(str::to_owned),
+        })
+    }
+    fn skill_text(request: HostRequest) -> Result<String, HostFailure> {
+        match call(&request)? {
+            HostReply::File(bytes) => String::from_utf8(bytes.into_vec()).map_err(|_| unexpected()),
+            _ => Err(unexpected()),
+        }
+    }
     /// Read a file relative to the invocation's workspace.
     pub fn read_file(path: &str) -> Result<Vec<u8>, HostFailure> {
         match call(&HostRequest::ReadFile { path: path.into() })? {

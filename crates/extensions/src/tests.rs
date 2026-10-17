@@ -627,3 +627,32 @@ fn worker_reports_failures_as_structured_values() {
     };
     assert_eq!(report.kind, ErrorKind::Unavailable);
 }
+
+#[test]
+fn bundled_skill_guest_only_uses_the_scoped_skill_imports() {
+    let builtin = builtin("agent206.skills").unwrap().unwrap();
+    let (bridge, seen) =
+        mock(|_: &HostRequest| HostReply::File(b"complete approved instructions".to_vec().into()));
+    let (result, _) = engine::run(
+        builtin.wasm,
+        &Invocation {
+            abi: ABI,
+            call: Call::Tool {
+                name: "skill_info".into(),
+                args: [("name".into(), Value::Str("notes".into()))].into(),
+            },
+        },
+        Limits::default(),
+        bridge,
+    );
+    assert!(
+        matches!(result.unwrap(), Outcome::Tool(output) if output.text == "complete approved instructions")
+    );
+    assert_eq!(
+        *seen.borrow(),
+        vec![HostRequest::SkillRead {
+            name: "notes".into(),
+            path: None
+        }]
+    );
+}

@@ -160,6 +160,8 @@ unsafe operation.
 
 | Request | Needs | Reply | Bounds |
 | --- | --- | --- | --- |
+| `skill_list` | bundled `agent206.skills` only + enabled builtin/current approval pins | complete index as UTF-8 file bytes | 64 KiB, no partial success |
+| `skill_read { name, path }` | same builtin/pin checks; no workspace authority | approved instructions or supporting UTF-8 file bytes | 64 KiB result, relative paths only, no traversal or symlinks |
 | `read_file { path }` | `read_workspace` + a project | file bytes | 512 KiB, regular files only (opened without blocking) |
 | `list_directory { path }` | `read_workspace` + a project | entries (name, kind, size if known) | 1,024 entries |
 | `search { path, query, max_matches }` | `read_workspace` + a project | matches (path, line, text) and whether it stopped early | literal, case-sensitive query of 1 KiB; 500 matches, 5,000 files, 32 MiB read; 10,000 directories, 64 levels; skips `.git`, symlinks, files over 512 KiB and non-UTF-8 files; results in path order |
@@ -173,6 +175,13 @@ unsafe operation.
 | `state_get { key }` | nothing | the extension's own value | — |
 | `state_put { key, value }` | nothing | done (`value = None` deletes) | 64 keys, 256 KiB per extension |
 | `log { level, message }` | nothing | done; recorded through tracing | 32 per call, 1 KiB each |
+
+The skill imports are additive ABI v2 requests used by the bundled skills guest.
+Other extensions receive `denied`, even when they hold workspace permissions.
+The gateway rechecks approval after a read and rejects results from changed pins.
+Skill filesystem operations run in a bounded blocking pool; cancelling the call
+kills the WASM worker and discards the read result. A stalled OS read retains a
+pool permit until it exits, so it cannot exhaust async executor workers.
 
 Git calls use gitoxide on the repository at exactly the project root (never a
 parent directory): a `.git` directory there, or a bare repository that is the
@@ -198,7 +207,7 @@ path through `.git` (in any letter case) or through a symlink, and the
 gateway serializes extension writes so an edit cannot interleave with another. A refusal is a typed
 `failed { code, message }` reply (`denied`, `no_workspace`, `not_found`,
 `invalid`, `too_large`, `exists`, `conflict`, `budget`, `unsupported`, `io`,
-`network`;
+`timeout`, `network`;
 a host that predates a code sends it as `other`); messages never contain
 host paths. Extension state is stored in the gateway's SQLite database,
 private to each extension id. Extension output is never written to the request
