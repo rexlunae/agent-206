@@ -350,8 +350,87 @@ the call (cancel, permission withdrawn) withdraws the question with
 An answer approves nothing. Clients: the conversation's question card
 (`ui/src/prompts.rs`, desktop/web/TUI) and `agent206 prompts`.
 
+## Context
+
+### Project instruction files
+
+At the start of each native run the gateway reads instruction files from the
+project root when the conversation may read its project: `ReadWorkspace` is in its
+grant within its mode's ceiling and in every ancestor's (the same intersection
+tools get, `ToolScope::capabilities`). Otherwise nothing is read. The reviewed
+list, in prompt order, is `AGENTS.md`, `CLAUDE.md`, `SOUL.md`, `IDENTITY.md`,
+`TOOLS.md` (`crates/runtime/src/instructions.rs`). RustyClaw's `USER.md`,
+`MEMORY.md`, `HEARTBEAT.md` and daily memory files are personal or scheduling state
+and are not read.
+
+- Files are opened through cap-std from the project root: absolute paths, `..` and
+  symlinks that leave the project are refused; a symlink within the project is
+  followed. Only regular files are read (FIFOs are opened non-blocking and
+  refused), and only up to the per-file limit: the text included must be UTF-8
+  without NUL, while bytes past the limit are never read or checked.
+- Each file contributes at most 32 KiB and all of them 64 KiB, cut on a character
+  boundary with a note in the prompt; a file whose content repeats an included one
+  (for example `CLAUDE.md` linked to `AGENTS.md`) is skipped.
+- They follow the mode prompt under a "Project instructions" heading that says they
+  cannot grant permissions. They are read once per run.
+- `Thread::instructions` records every file found: `Included`, `Truncated` (with
+  the reason as a report) or `Skipped` (with a structured `ErrorReport`: outside the
+  project, not regular, not text, duplicate, total limit used), its included bytes,
+  size and the SHA-256 of the included text. Missing files are not listed. The
+  desktop/TUI context popover shows it.
+
+### Compaction
+
+`crates/runtime/src/gateway/compaction.rs`. A compaction summarizes a conversation's
+older turns (a turn starts at a user message) with the conversation's own model and
+effort, through `provider::complete` like any request: same broker, credential
+binding and stream checks, no tools offered. The summarizing model gets a text
+transcript (each message at most 8 KiB, tool arguments and results 2 KiB, the whole
+transcript 256 KiB with the earliest messages left out first and said so), with the
+previous summary first.
+
+- **Automatic.** Before each model request of a native run, if the previous
+  request's provider-reported input tokens exceed `COMPACTION_THRESHOLD_PERCENT`
+  (75, a policy choice shared with RustyClaw, not a model fact) of the model's
+  API-reported `ModelInfo::context_limit`, the run compacts everything before the
+  current and the previous turn. Before the first round "previous" is the last
+  request of the previous run. An unknown limit or input count never triggers it.
+  When only those two turns are in context there is nothing to compact and the
+  request is sent as it is (a single turn larger than the window is not reduced).
+- **Manual.** `Command::CompactThread { thread }` compacts a native conversation
+  that is not running, keeping its latest turn, whatever its context usage or
+  limit. It marks the thread `Running` (so `Send` waits and `CancelRun` stops it)
+  with the previous state saved in `Thread::compacting`, restores that state
+  afterwards, or on the next start if the gateway stopped meanwhile, and replies
+  with the thread. Nothing to
+  compact is a `Conflict` before any request. CLI: `agent206 compact THREAD`.
+- **Result.** The summary is inserted as a `Role::System` message with
+  `Message::compaction` (trigger, messages covered, previous summary, input tokens
+  and context limit at the time, the summary request's usage) just before the first
+  kept turn. The covered messages stay in the thread for the user. A model request
+  carries only the latest summary and the messages after it: the summary, after a
+  fixed preamble, is prefixed to the first following user message (so every
+  protocol keeps a user-first, alternating history and the summary never gets
+  system-prompt authority). Since a call and its result live on one assistant
+  message and cuts fall only before user messages, every tool call keeps its
+  result in OpenAI, Anthropic and Gemini form. `Thread::usage` becomes unknown
+  until the next request reports it.
+- **Accounting.** An automatic compaction's usage is added to `Thread::run_usage`;
+  it does not count against the round budget.
+- **Failure and cancellation.** Nothing changes until the summary is complete. A
+  failed summary (`CompactionError::Summary`, with the provider failure as its
+  cause), an empty one, or a conversation that changed meanwhile leaves the history
+  intact: an automatic compaction fails the run with that report, a manual one
+  replies with it. Cancellation (`CancelRun`, shutdown) abandons the summary
+  request and leaves the run `Cancelled` or the manual compaction failed with
+  `Cancelled`.
+- Compaction does not reduce the conversation's stored size.
+
+Tests: `crates/runtime/tests/context.rs` (scripted OpenAI, Anthropic and Gemini
+streams) and unit tests in `compaction.rs` and `instructions.rs`.
+
 ## Not implemented
 
 Leaked tool-markup filtering, schema type coercion and repeat-call warnings from
-RustyClaw's healing; Anthropic thinking-block replay alongside tool results;
+RustyClaw's healing; pre-compaction memory flush; Anthropic thinking-block replay alongside tool results;
 retries; parallel tool execution.

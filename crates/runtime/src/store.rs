@@ -159,7 +159,11 @@ impl Store {
                     call.error = Some(report);
                 }
             }
-            if thread.state == RunState::Running {
+            // An interrupted compaction is not a run: the previous run's
+            // outcome stays.
+            if let Some(prior) = thread.compacting.take() {
+                thread.state = prior;
+            } else if thread.state == RunState::Running {
                 thread.state = RunState::Failed;
                 thread.error = Some(a206_core::ErrorReport::new(
                     a206_core::ErrorKind::Unavailable,
@@ -526,6 +530,45 @@ mod tests {
             vec![ToolCallState::Cancelled, ToolCallState::Succeeded]
         );
         assert!(thread.messages[0].tool_calls[0].error.is_some());
+    }
+    #[test]
+    fn restart_during_a_compaction_restores_the_previous_run_state() {
+        use a206_core::{Mode, Thread};
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = Store::open(directory.path()).unwrap();
+        let report =
+            a206_core::ErrorReport::new(a206_core::ErrorKind::Storage, Id::new_v4().to_string());
+        let mut ids = vec![];
+        // A compaction of a completed and of a failed conversation, and a run.
+        for (prior, compacting) in [
+            (RunState::Complete, true),
+            (RunState::Failed, true),
+            (RunState::Complete, false),
+        ] {
+            let mut thread = Thread::new(Id::new_v4().to_string(), Mode::Chat);
+            thread.state = RunState::Running;
+            if compacting {
+                thread.compacting = Some(prior.clone());
+                thread.error = (prior == RunState::Failed).then(|| report.clone());
+            }
+            ids.push(thread.id);
+            store.state.threads.push(thread);
+        }
+        store.persist(None).unwrap();
+        drop(store);
+        let restored = Store::open(directory.path()).unwrap();
+        let state = |i: usize| restored.thread(ids[i]).unwrap();
+        assert_eq!(state(0).state, RunState::Complete);
+        assert_eq!(state(0).error, None);
+        assert_eq!(state(0).compacting, None);
+        assert_eq!(state(1).state, RunState::Failed);
+        assert_eq!(state(1).error, Some(report));
+        // A run in progress is still reported as interrupted.
+        assert_eq!(state(2).state, RunState::Failed);
+        assert_eq!(
+            state(2).error.as_ref().unwrap().kind,
+            a206_core::ErrorKind::Unavailable
+        );
     }
     #[test]
     fn pending_replays_reference_their_request() {

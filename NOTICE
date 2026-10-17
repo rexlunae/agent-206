@@ -8,8 +8,11 @@ and tool-result model, the provider identifiers and credential names the
 RustyClaw import adapter maps, the extension model of declared actions,
 persisted per-extension state and recorded panel interactions, the skill
 format, frontmatter and gating rules, the Linux bubblewrap/Landlock sandbox
-design (crates/sandbox), and tool-call argument repair and in-response
-de-duplication (`tool_healing.rs`) are adapted from RustyClaw,
+design (crates/sandbox), tool-call argument repair and in-response
+de-duplication (`tool_healing.rs`), the project instruction file list
+(`workspace_context.rs`) and the 75% compaction threshold with
+summarize-older-turns compaction (`gateway/providers/mod.rs`) are adapted from
+RustyClaw,
 https://github.com/rexlunae/RustyClaw,
 Copyright (c) 2026 Erica Stith, MIT License (included in LICENSE).
 

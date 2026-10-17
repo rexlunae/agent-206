@@ -1,7 +1,7 @@
 use crate::{State, dispatch, route::Route};
 use a206_core::{
-    Capability, CodingBackend, Command, ErrorKind, ErrorReport, Mode, ModelKey, Reply, Role,
-    RunState, TextAttachment, Thread,
+    Capability, CodingBackend, Command, CompactionTrigger, ErrorKind, ErrorReport,
+    InstructionStatus, Mode, ModelKey, Reply, Role, RunState, TextAttachment, Thread,
 };
 use fc_dioxus::prelude::*;
 use uuid::Uuid;
@@ -239,7 +239,12 @@ fn Conversation(thread: Thread) -> Element {
                 for message in &thread.messages {
                     Message { key: "{message.id}", role: match message.role { Role::User => MessageRole::User, Role::Assistant => MessageRole::Assistant, Role::System => MessageRole::System, Role::Tool => MessageRole::Tool },
                         state: Lifecycle::Complete,
-                        author: rsx! { match message.role { Role::User => "You", Role::Assistant => message.backend.label(), Role::System => "System", Role::Tool => "Tool" } },
+                        author: rsx! { match (&message.role, &message.compaction) { (_, Some(_)) => "Summary of earlier messages", (Role::User, _) => "You", (Role::Assistant, _) => message.backend.label(), (Role::System, _) => "System", (Role::Tool, _) => "Tool" } },
+                        if let Some(compaction) = &message.compaction {
+                            Badge { tone: BadgeTone::Accent,
+                                {format!("{} {} earlier messages", match compaction.trigger { CompactionTrigger::Automatic => "Automatically summarized", CompactionTrigger::Manual => "Summarized" }, compaction.messages)}
+                            }
+                        }
                         p { class: "a206-message-text", "{message.text}" }
                         for file in &message.attachments { Badge { Icon { name: IconName::File, size: IconSize::Sm } "{file.name} · {file.text.len()} B" } }
                         for call in &message.tool_calls { crate::tools::ToolTrace { key: "{call.id}", call: call.clone() } }
@@ -354,6 +359,7 @@ fn Conversation(thread: Thread) -> Element {
                 }
                 Popover { id: details, class: "a206-chat-popover", title: rsx! { "Conversation details" },
                     ThreadFacts { thread: thread.clone() }
+                    ContextControls { thread: thread.clone() }
                     BackendControls { thread: thread.clone() }
                 }
             }
@@ -569,6 +575,52 @@ fn ThreadFacts(thread: Thread) -> Element {
             strong { "Tool permissions" }
             if thread.grant.capabilities.is_empty() { span { class: "a206-muted", "None granted" } }
             for grant in &thread.grant.capabilities { Badge { "{grant:?}" } }
+        }
+    } }
+}
+
+/// Compaction and the project instruction files of the latest run.
+#[component]
+fn ContextControls(thread: Thread) -> Element {
+    let state = use_context::<State>();
+    let id = thread.id;
+    let native = thread.backend == CodingBackend::Native;
+    let summaries = thread
+        .messages
+        .iter()
+        .filter(|m| m.compaction.is_some())
+        .count();
+    let availability = if native && thread.state != RunState::Running && thread.model.is_some() {
+        Availability::Enabled
+    } else {
+        Availability::Disabled
+    };
+    rsx! { div { class: "a206-stack",
+        strong { "Context" }
+        if native {
+            p { class: "a206-muted",
+                {format!("Earlier messages are summarized automatically when a request uses more than {}% of the context limit the model's API reports. With no reported limit, only you can compact.", a206_core::COMPACTION_THRESHOLD_PERCENT)}
+            }
+            p { class: "a206-fact-note", {format!("{summaries} summaries in this conversation")} }
+            Button { size: ButtonSize::Sm, variant: ButtonVariant::Secondary, availability,
+                title: "Summarize all but the latest turn with this conversation's model",
+                onclick: move |_| dispatch(state, Command::CompactThread { thread: id }),
+                "Compact earlier messages"
+            }
+        }
+        strong { "Project instructions" }
+        if thread.instructions.is_empty() {
+            span { class: "a206-muted", "None loaded by the latest run" }
+        }
+        for file in &thread.instructions {
+            div { key: "{file.path}", class: "a206-row",
+                Badge { tone: match file.status { InstructionStatus::Included => BadgeTone::Success, InstructionStatus::Truncated => BadgeTone::Warning, InstructionStatus::Skipped => BadgeTone::Neutral },
+                    {match file.status { InstructionStatus::Included => "Included", InstructionStatus::Truncated => "Truncated", InstructionStatus::Skipped => "Skipped" }}
+                }
+                span { "{file.path}" }
+                span { class: "a206-muted", {format!("{} bytes", file.bytes)} }
+                if let Some(report) = &file.error { span { class: "a206-muted", "{report.message}" } }
+            }
         }
     } }
 }
