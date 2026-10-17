@@ -145,8 +145,10 @@ and offers one tool, `execute_command`.
   optional `working_dir` relative to the project root (no `..`, absolute paths
   or symlinks leading out) and `timeout_secs` (1–600, default 30). Anything
   else, including unknown keys, is `InvalidRequest` before anything starts.
-- **Sandbox.** On Linux the command runs under `a206-sandbox` (bubblewrap
-  namespaces plus Landlock inside), with `/usr/bin` and `/bin` executable. The
+- **Sandbox.** The command runs under `a206-sandbox`: bubblewrap namespaces
+  plus Landlock inside on Linux, a generated Seatbelt policy applied by
+  `sandbox-exec` on macOS. Both come from one profile, with `/usr/bin` and
+  `/bin` executable (programs elsewhere, such as Homebrew's, are not). The
   project is mounted only with `ReadWorkspace` and is writable only with
   `WriteWorkspace`; the host network is shared only with `Network`; gateway
   state and the credential stores under `$HOME` stay hidden even inside the
@@ -158,14 +160,19 @@ and offers one tool, `execute_command`.
   chatty command cannot stall. A non-zero exit is `is_error`. A command still
   running at its timeout is killed and reported as a `Timeout` error.
   The deadline includes sandbox startup and readiness, as well as execution.
-- **Cancellation.** Dropping the call kills the sandbox's process group; the
-  sandbox's PID namespace ends with it, taking every descendant along.
-- **Other platforms.** The tool is not offered; the listing reports
+- **Cancellation.** Dropping the call kills the sandbox's process group; on
+  Linux the sandbox's PID namespace ends with it, taking every descendant
+  along. macOS has no PID namespace, so the group is also killed as soon as
+  the shell exits; a process that leaves the group with `setsid` can outlive
+  the call there, still confined by the same policy.
+- **Other platforms.** Windows does not offer the tool; the listing reports
   `native exec` unavailable rather than run commands unconfined.
 
 Tests: `crates/runtime/tests/native_exec.rs` drives the host through the real
-sandbox (grants, hidden state, symlinked working directories, network, exit
-status, output and time bounds); the test binary doubles as the helper.
+sandbox on Linux and macOS CI (grants, hidden state, symlinked working
+directories, network, exit status, output and time bounds, leftover
+background processes; on Linux the test binary doubles as the helper), and
+`crates/sandbox/src/seatbelt.rs` tests the macOS policy text on every platform.
 
 ### WASM extensions
 

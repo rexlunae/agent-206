@@ -1,6 +1,6 @@
-//! OS isolation for external agent runtimes on Linux.
+//! OS isolation for external agent runtimes and commands on Linux and macOS.
 //!
-//! Two independent layers confine a runtime, and both are required:
+//! On Linux two independent layers confine a runtime, and both are required:
 //!
 //! 1. **Bubblewrap** gives it new user, PID, IPC, UTS, cgroup and network
 //!    namespaces and a mount namespace that holds only the system libraries,
@@ -14,6 +14,11 @@
 //! relays each connection over a Unix socket to the gateway, so the runtime
 //! reaches that proxy and nothing else. Without a proxy it has no network at
 //! all. Only a runtime the user granted network access shares the host's.
+//!
+//! On macOS a [`Profile`] becomes one Seatbelt policy that `sandbox-exec`
+//! applies before the runtime starts (see `seatbelt.rs`), with the same
+//! filesystem grants and hidden paths. A runtime with a credential proxy may
+//! reach that loopback port and nothing else.
 //!
 //! Nothing here downgrades: a missing bubblewrap, a kernel without Landlock or a
 //! policy the layers cannot express is an error, never a weaker sandbox.
@@ -33,10 +38,12 @@ mod gateway;
 mod helper;
 #[cfg(unix)]
 mod profile;
+#[cfg(unix)]
+mod seatbelt;
 
 #[cfg(unix)]
 pub use elf::interpreter;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub use gateway::Control;
 pub use gateway::StartError;
 #[cfg(unix)]
@@ -49,6 +56,8 @@ pub const HELPER_COMMAND: &str = "__a206-sandbox-helper";
 pub const SPEC_VERSION: u32 = 4;
 /// Bubblewrap is resolved from this fixed system path, never from `PATH`.
 pub const BUBBLEWRAP: &str = "/usr/bin/bwrap";
+/// macOS's Seatbelt launcher, likewise from its fixed system path.
+pub const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 /// Largest status message the gateway accepts from a helper.
 pub const MAX_STATUS: u64 = 64 * 1024;
 
@@ -140,6 +149,10 @@ pub enum Status {
 pub enum SandboxError {
     #[error("Linux isolation requires bubblewrap at {BUBBLEWRAP}; install the bubblewrap package")]
     Bubblewrap(#[source] std::io::Error),
+    #[error("macOS isolation requires {SANDBOX_EXEC}")]
+    SandboxExec(#[source] std::io::Error),
+    #[error("{} cannot be named in a sandbox policy; use a UTF-8 path without control characters", path.display())]
+    Path { path: PathBuf },
     #[error("could not inspect {} for the sandbox", path.display())]
     Inspect {
         path: PathBuf,
@@ -185,7 +198,7 @@ pub enum SandboxError {
     Spawn(#[source] std::io::Error),
     #[error("could not wait for the runtime inside the sandbox")]
     Wait(#[source] std::io::Error),
-    #[error("OS isolation for external runtimes is only implemented for Linux here")]
+    #[error("OS isolation for external runtimes is only implemented for Linux and macOS")]
     Unsupported,
 }
 
@@ -193,8 +206,11 @@ impl SandboxError {
     /// The client-facing kind; `None` defers to the I/O cause.
     pub fn kind(&self) -> Option<ErrorKind> {
         Some(match self {
-            Self::Bubblewrap(_) | Self::NotEnforced | Self::Unsupported => ErrorKind::Unavailable,
+            Self::Bubblewrap(_) | Self::SandboxExec(_) | Self::NotEnforced | Self::Unsupported => {
+                ErrorKind::Unavailable
+            }
             Self::Exposed { .. } => ErrorKind::PermissionDenied,
+            Self::Path { .. } => ErrorKind::InvalidRequest,
             Self::Inspect { .. } => return None,
             Self::Encode(_)
             | Self::Base64(_)

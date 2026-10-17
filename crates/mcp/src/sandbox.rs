@@ -223,105 +223,10 @@ async fn launch(
     Ok((launch, stdout, stdin))
 }
 
-#[cfg(target_os = "macos")]
-fn sandbox_command(
-    server: &McpServerConfig,
-    placement: &Placement,
-    scratch: &Path,
-    _cwd: &Path,
-) -> Result<Command, McpError> {
-    // A JSON string literal is also a valid SBPL string literal.
-    let quote = |path: &Path| -> Result<String, McpError> {
-        path.to_str()
-            .map(|path| serde_json::Value::from(path).to_string())
-            .ok_or(McpError::NonUtf8Path)
-    };
-    let root = quote(&placement.root)?;
-    let scratch_quoted = quote(scratch)?;
-    let mut policy = format!(
-        r#"(version 1)
-(deny default)
-(allow process-fork)
-(allow process-exec (subpath {root}))
-(allow signal (target self))
-(allow sysctl-read)
-(allow system-mac-syscall (mac-policy-name "vnguard"))
-(allow system-mac-syscall (require-all (mac-policy-name "Sandbox") (mac-syscall-number 67)))
-(allow file-read* (literal "/"))
-(allow file-read-metadata (literal "/var") (literal "/tmp") (literal "/etc"))
-(allow mach-lookup (global-name "com.apple.system.logger") (global-name "com.apple.system.opendirectoryd"))
-(allow file-map-executable file-read* (subpath "/System/Library") (subpath "/System/iOSSupport/System/Library") (subpath "/usr/lib") (subpath "/usr/share") (subpath "/Library/Apple") (subpath "/private/var/db/dyld") (literal "/dev/null") (literal "/dev/urandom") (literal "/dev/random") (subpath {root}) (subpath {scratch_quoted}))
-(allow file-write* (subpath {scratch_quoted}) (literal "/dev/null"))
-"#
-    );
-    let mut ancestors = std::collections::BTreeSet::new();
-    let mut traversed = vec![
-        placement.root.as_path(),
-        scratch,
-        Path::new("/System/Library"),
-        Path::new("/System/iOSSupport/System/Library"),
-        Path::new("/usr/lib"),
-        Path::new("/usr/share"),
-        Path::new("/Library/Apple"),
-        Path::new("/private/var/db/dyld"),
-    ];
-    if let Some(workspace) = &placement.workspace {
-        traversed.push(workspace);
-    }
-    for path in traversed {
-        ancestors.extend(path.ancestors().skip(1));
-    }
-    for ancestor in ancestors {
-        policy.push_str(&format!(
-            "(allow file-read-metadata (literal {}))\n",
-            quote(ancestor)?
-        ));
-    }
-    let holds = |c| server.capabilities.contains(&c);
-    if let Some(workspace) = &placement.workspace {
-        let workspace = quote(workspace)?;
-        policy.push_str(&format!("(allow file-read* (subpath {workspace}))\n"));
-        if holds(Capability::WriteWorkspace) {
-            policy.push_str(&format!("(allow file-write* (subpath {workspace}))\n"));
-        }
-    }
-    if holds(Capability::Execute) {
-        policy.push_str(
-            "(allow process-exec file-read* file-map-executable (subpath \"/bin\") (subpath \"/usr/bin\"))\n",
-        );
-    }
-    if holds(Capability::Network) {
-        policy.push_str(
-            r#"(allow network-outbound)
-(allow system-socket)
-(allow mach-lookup (global-name "com.apple.dnssd.service") (global-name "com.apple.SystemConfiguration.configd") (global-name "com.apple.trustd.agent"))
-(allow file-read* (subpath "/private/etc/ssl") (literal "/private/etc/resolv.conf") (literal "/private/etc/hosts") (literal "/private/etc/services"))
-"#,
-        );
-    }
-    // Seatbelt rules are ordered: exclusions must follow broad workspace grants.
-    policy.push_str(&format!(
-        "(deny file-read* file-write* (subpath {}))\n",
-        quote(&placement.state)?
-    ));
-    // Ambient agent configuration and common credential stores stay hidden even
-    // inside a broad workspace.
-    if let Some(home) = std::env::var_os("HOME") {
-        for suffix in a206_sandbox::HIDDEN_HOME_PATHS {
-            policy.push_str(&format!(
-                "(deny file-read* file-write* (subpath {}))\n",
-                quote(&PathBuf::from(&home).join(suffix))?
-            ));
-        }
-    }
-    let mut command = Command::new("/usr/bin/sandbox-exec");
-    command.args(["-p", &policy]).arg(&placement.executable);
-    Ok(command)
-}
-/// Bubblewrap and Landlock (`a206_sandbox`), with the same grants as the
-/// macOS profile. The helper is this executable, which must call
-/// `a206_sandbox::dispatch` first.
-#[cfg(target_os = "linux")]
+/// `a206_sandbox`: bubblewrap and Landlock on Linux, where the helper is this
+/// executable, which must call `a206_sandbox::dispatch` first; Seatbelt on
+/// macOS.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn sandbox_command(
     server: &McpServerConfig,
     placement: &Placement,
