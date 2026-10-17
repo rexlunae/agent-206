@@ -12,6 +12,7 @@ tui = ["dep:dioxus-tui"]
 [dependencies]
 a206-ui.workspace = true
 a206-core.workspace = true
+a206-audit.workspace = true
 dioxus = { workspace = true, features = ["launch"] }
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 a206-runtime.workspace = true

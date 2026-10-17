@@ -7,6 +7,7 @@
 //! `rustyclaw-core::skills` (MIT); approval by content digest, bounded reads
 //! and typed errors are Agent 206's.
 #![forbid(unsafe_code)]
+use a206_core::AuditReport;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::{
@@ -70,6 +71,9 @@ pub struct Skill {
     pub instructions: String,
     /// SHA-256 of the whole `SKILL.md`, in lowercase hex; approval pins it.
     pub digest: String,
+    /// What the pre-install audit found in the whole `SKILL.md`. Advice for
+    /// the user's review; it neither approves nor blocks the skill.
+    pub audit: AuditReport,
 }
 
 /// What the skill says it needs. Unmet requirements are reported, not enforced:
@@ -223,6 +227,7 @@ pub fn parse(text: &str, directory: &str) -> Result<Skill, SkillError> {
         requires,
         instructions: without_leading_blank_lines(instructions).to_owned(),
         digest,
+        audit: a206_audit::text(text),
     })
 }
 
