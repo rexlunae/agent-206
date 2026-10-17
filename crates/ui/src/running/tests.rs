@@ -178,6 +178,7 @@ fn what_waits_on_the_user_and_scheduled_runs_are_listed() {
     assert_eq!(asks(&asking), "1 approval and 2 questions");
     let idle = thread(RunState::Complete, None);
     let job = Job {
+        kind: a206_core::JobKind::Message,
         id: Uuid::new_v4(),
         name: text(),
         thread: idle.id,

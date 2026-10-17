@@ -118,6 +118,7 @@ fn a_restart_sends_an_interrupted_message_once() {
     use a206_core::{CodingBackend, Id, Job, JobRun, Message, Mode, Thread};
     let started = time();
     let job = |thread: Id, text: &str, schedule: Schedule, next: Option<u64>| Job {
+        kind: a206_core::JobKind::Message,
         id: Id::new_v4(),
         name: Id::new_v4().to_string(),
         thread,
@@ -216,4 +217,62 @@ fn a_restart_sends_an_interrupted_message_once() {
             .iter()
             .all(|job| !job.enabled && job.next.is_none())
     );
+}
+
+#[test]
+fn a_restart_settles_a_heartbeat_by_its_reply() {
+    use a206_core::{
+        CodingBackend, Id, Job, JobKind, JobRun, Message, Mode, Thread,
+        schedule::{HEARTBEAT_OK, heartbeat_message},
+    };
+    let started = time();
+    let heartbeat = |thread: Id| Job {
+        kind: JobKind::Heartbeat,
+        id: Id::new_v4(),
+        name: Id::new_v4().to_string(),
+        thread,
+        text: String::new(),
+        schedule: Schedule::At { at: started },
+        enabled: false,
+        created: started - 1,
+        next: None,
+        last: Some(JobRun::start(started)),
+        author: Default::default(),
+    };
+    let conversation = |reply: &str| {
+        let mut thread = Thread::new(Id::new_v4().to_string(), Mode::Chat);
+        let checklist = heartbeat_message(&Id::new_v4().to_string());
+        for (role, text) in [(Role::User, checklist.as_str()), (Role::Assistant, reply)] {
+            thread.messages.push(Message::new(
+                role,
+                text.into(),
+                started,
+                CodingBackend::default(),
+            ));
+        }
+        thread.state = RunState::Complete;
+        thread
+    };
+    let quiet = conversation(&format!("{HEARTBEAT_OK}\n"));
+    let alert = conversation(&format!("{HEARTBEAT_OK} {}", Id::new_v4()));
+    // Its message is built when it runs, so an older plain message in the
+    // conversation does not count as sent.
+    let mut unsent = Thread::new(Id::new_v4().to_string(), Mode::Chat);
+    unsent.messages.push(Message::new(
+        Role::User,
+        Id::new_v4().to_string(),
+        started,
+        CodingBackend::default(),
+    ));
+    let mut jobs = vec![
+        heartbeat(quiet.id),
+        heartbeat(alert.id),
+        heartbeat(unsent.id),
+    ];
+    recover(&mut jobs, &[quiet, alert, unsent]);
+    let outcome = |job: &Job| job.last.as_ref().unwrap().outcome.clone();
+    assert_eq!(outcome(&jobs[0]), JobOutcome::Quiet);
+    assert_eq!(outcome(&jobs[1]), JobOutcome::Complete);
+    assert!(matches!(outcome(&jobs[2]), JobOutcome::Refused(_)));
+    assert_eq!(jobs[2].next, Some(started));
 }

@@ -1,6 +1,9 @@
 //! When scheduled messages are due: pure functions of a schedule and a time,
 //! so the scheduler's decisions are tested without a clock.
-use a206_core::{ErrorKind, ErrorReport, Job, JobOutcome, Role, RunState, Schedule, Thread};
+use a206_core::{
+    ErrorKind, ErrorReport, Job, JobKind, JobOutcome, Role, RunState, Schedule, Thread,
+    schedule::{is_heartbeat_message, is_heartbeat_ok},
+};
 use jiff::{Timestamp, tz::TimeZone};
 use std::str::FromStr;
 
@@ -134,9 +137,15 @@ pub fn recover(jobs: &mut [Job], threads: &[Thread]) {
         };
         let thread = threads.iter().find(|thread| thread.id == job.thread);
         let messages = thread.map_or(&[][..], |thread| &thread.messages[..]);
-        let sent = messages
-            .iter()
-            .position(|m| m.role == Role::User && m.at >= run.at && m.text == job.text);
+        let sent = messages.iter().position(|m| {
+            m.role == Role::User
+                && m.at >= run.at
+                && match job.kind {
+                    JobKind::Message => m.text == job.text,
+                    // Its text is built from HEARTBEAT.md when it runs.
+                    JobKind::Heartbeat => is_heartbeat_message(&m.text),
+                }
+        });
         // The run's own outcome is the conversation's only while its message
         // is the latest; a later message started another run, so this one
         // ended earlier, with a reply or without one.
@@ -146,19 +155,33 @@ pub fn recover(jobs: &mut [Job], threads: &[Thread]) {
                 .position(|m| m.role == Role::User)
         };
         run.outcome = match (sent, thread.map(|thread| &thread.state)) {
-            (Some(sent), state) => match (later(sent), state) {
-                (None, Some(RunState::Complete)) => JobOutcome::Complete,
-                (None, Some(RunState::Cancelled)) => JobOutcome::Cancelled,
-                (None, _) => JobOutcome::Failed,
-                (Some(next), _) => {
-                    let replies = &messages[sent + 1..sent + 1 + next];
-                    if replies.iter().any(|m| m.role == Role::Assistant) {
-                        JobOutcome::Complete
-                    } else {
-                        JobOutcome::Failed
+            (Some(sent), state) => {
+                let end = later(sent).map_or(messages.len(), |next| sent + 1 + next);
+                let reply = messages[sent + 1..end]
+                    .iter()
+                    .rev()
+                    .find(|m| m.role == Role::Assistant);
+                let answered = match (end < messages.len(), state) {
+                    (false, Some(RunState::Complete)) => true,
+                    (true, _) => reply.is_some(),
+                    (false, Some(RunState::Cancelled)) => {
+                        run.outcome = JobOutcome::Cancelled;
+                        continue;
                     }
+                    (false, _) => false,
+                };
+                match reply {
+                    Some(reply)
+                        if answered
+                            && job.kind == JobKind::Heartbeat
+                            && is_heartbeat_ok(&reply.text) =>
+                    {
+                        JobOutcome::Quiet
+                    }
+                    _ if answered => JobOutcome::Complete,
+                    _ => JobOutcome::Failed,
                 }
-            },
+            }
             _ => {
                 // Due again at the interrupted time; the scheduler runs it
                 // once and then continues on its schedule.

@@ -109,3 +109,50 @@ fn days_and_weeks_are_fixed_lengths_and_months_are_refused() {
         ));
     }
 }
+
+#[test]
+fn jobs_stored_before_heartbeats_are_messages_and_only_an_exact_ok_is_quiet() {
+    /// A job as gateways stored it before jobs had a kind.
+    #[derive(serde::Serialize)]
+    struct Stored {
+        id: Id,
+        name: String,
+        thread: Id,
+        text: String,
+        schedule: Schedule,
+        enabled: bool,
+        created: u64,
+        next: Option<u64>,
+        last: Option<JobRun>,
+    }
+    let at = Id::new_v4().as_u128() as u64 % 4_000_000_000;
+    let stored = Stored {
+        id: Id::new_v4(),
+        name: Id::new_v4().to_string(),
+        thread: Id::new_v4(),
+        text: Id::new_v4().to_string(),
+        schedule: Schedule::At { at },
+        enabled: true,
+        created: at,
+        next: Some(at),
+        last: None,
+    };
+    let bytes = rmp_serde::to_vec_named(&stored).unwrap();
+    let job: Job = rmp_serde::from_slice(&bytes).unwrap();
+    assert_eq!(job.kind, JobKind::Message);
+    assert_eq!(job.text, stored.text);
+
+    let checklist = Id::new_v4().to_string();
+    let message = heartbeat_message(&format!("\n{checklist}\n"));
+    assert!(is_heartbeat_message(&message) && message.contains(&checklist));
+    assert!(!is_heartbeat_message(&checklist));
+    assert!(is_heartbeat_ok(&format!(" {HEARTBEAT_OK}\n")));
+    for reply in [
+        format!("{HEARTBEAT_OK} {checklist}"),
+        format!("{checklist}\n{HEARTBEAT_OK}"),
+        HEARTBEAT_OK.to_lowercase(),
+        String::new(),
+    ] {
+        assert!(!is_heartbeat_ok(&reply), "{reply}");
+    }
+}

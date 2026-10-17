@@ -29,6 +29,7 @@ async fn schedule(g: &Gateway, thread: Id, schedule: Schedule) -> Reply {
     send(
         g,
         Command::ScheduleJob {
+            kind: a206_core::JobKind::Message,
             name: nonce(),
             thread,
             text: nonce(),
@@ -100,6 +101,7 @@ async fn unusable_jobs_are_refused() {
     let unnamed = send(
         &g,
         Command::ScheduleJob {
+            kind: a206_core::JobKind::Message,
             name: " ".into(),
             thread,
             text: nonce(),

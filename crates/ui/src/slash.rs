@@ -307,6 +307,7 @@ fn schedule(
         line.to_owned()
     };
     Ok(Command::ScheduleJob {
+        kind: a206_core::JobKind::Message,
         name,
         thread: thread.id,
         text: timed.text,
@@ -773,6 +774,7 @@ mod tests {
         assert_eq!(
             resolve(once, &thread, &snapshot, true),
             Ok(Command::ScheduleJob {
+                kind: a206_core::JobKind::Message,
                 name: message.clone(),
                 thread: thread.id,
                 text: message.clone(),
@@ -786,6 +788,7 @@ mod tests {
         assert!(matches!(
             resolve(repeating, &thread, &snapshot, true),
             Ok(Command::ScheduleJob {
+                kind: a206_core::JobKind::Message,
                 schedule: Schedule::Every {
                     seconds: 86_400,
                     anchor: None
@@ -796,7 +799,10 @@ mod tests {
         // A long message is named by the start of its first line.
         let long = "x".repeat(200);
         let Ok(Command::ScheduleJob {
-            name, text: sent, ..
+            kind: a206_core::JobKind::Message,
+            name,
+            text: sent,
+            ..
         }) = resolve(
             Slash::In(Timed {
                 interval: "1h".into(),

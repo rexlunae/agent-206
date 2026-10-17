@@ -21,7 +21,8 @@ use std::{collections::BTreeSet, io::Read, path::PathBuf};
 /// `IDENTITY.md` and `TOOLS.md` are the RustyClaw workspace files that
 /// describe the agent and its tools. RustyClaw's `USER.md`, `MEMORY.md`,
 /// `HEARTBEAT.md` and daily memory files are personal or scheduling state it
-/// keeps out of shared and delegated sessions; they are not read here.
+/// keeps out of shared and delegated sessions; they are not read here, and
+/// `HEARTBEAT.md` is read only by a scheduled heartbeat check ([`heartbeat`]).
 pub const FILES: [&str; 5] = [
     "AGENTS.md",
     "CLAUDE.md",
@@ -29,6 +30,8 @@ pub const FILES: [&str; 5] = [
     "IDENTITY.md",
     "TOOLS.md",
 ];
+/// The heartbeat checklist a scheduled heartbeat check sends, read only then.
+pub const HEARTBEAT: &str = "HEARTBEAT.md";
 /// Most bytes of one file included in the prompt.
 pub const MAX_FILE: usize = 32 * 1024;
 /// Most bytes of all files together.
@@ -161,6 +164,26 @@ pub fn load(root: PathBuf) -> Loaded {
         );
     }
     loaded
+}
+
+/// The text of [`HEARTBEAT`] at the project `root`, cut to [`MAX_FILE`]
+/// bytes with a note, or `None` when it does not exist. Blocking: run it on
+/// the blocking pool.
+pub fn heartbeat(root: PathBuf) -> Result<Option<String>, InstructionError> {
+    let directory = cap_std::fs::Dir::open_ambient_dir(&root, cap_std::ambient_authority())
+        .map_err(InstructionError::Workspace)?;
+    let Some((bytes, size)) = read(&directory, HEARTBEAT)? else {
+        return Ok(None);
+    };
+    let text = text_within(&bytes, MAX_FILE).ok_or(InstructionError::NotText)?;
+    let mut checklist = text.to_owned();
+    if text.len() < bytes.len() {
+        checklist.push_str(&format!(
+            "\n\n[{HEARTBEAT} was truncated: {} of {size} bytes included]",
+            text.len()
+        ));
+    }
+    Ok(Some(checklist))
 }
 
 /// The file's bytes (at most one more than [`MAX_FILE`]) and its size, or

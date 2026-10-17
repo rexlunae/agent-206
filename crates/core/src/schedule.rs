@@ -40,6 +40,43 @@ pub enum JobAuthor {
     Agent { thread: Id },
 }
 
+/// What a job sends when it runs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JobKind {
+    /// The job's own text.
+    #[default]
+    Message,
+    /// A heartbeat check, as RustyClaw's: the checklist in `HEARTBEAT.md` at
+    /// the conversation's project root, read when the job runs, with the
+    /// request to reply exactly [`HEARTBEAT_OK`] when nothing needs attention.
+    /// A missing file refuses the run; an empty one sends nothing.
+    Heartbeat,
+}
+
+/// The whole reply to a heartbeat check when nothing needs attention.
+pub const HEARTBEAT_OK: &str = "HEARTBEAT_OK";
+/// The first line of every heartbeat check message.
+pub const HEARTBEAT_HEADER: &str = "Scheduled heartbeat check.";
+
+/// The message a heartbeat check sends, around the `HEARTBEAT.md` checklist.
+pub fn heartbeat_message(checklist: &str) -> String {
+    format!(
+        "{HEARTBEAT_HEADER} Work through this checklist from HEARTBEAT.md now. Do not repeat tasks from earlier conversations that it does not list. If nothing needs attention, reply with exactly {HEARTBEAT_OK} and nothing else; otherwise reply with what needs attention and leave {HEARTBEAT_OK} out.\n\n{}",
+        checklist.trim()
+    )
+}
+
+/// Whether `text` is a heartbeat check message.
+pub fn is_heartbeat_message(text: &str) -> bool {
+    text.starts_with(HEARTBEAT_HEADER)
+}
+
+/// Whether a reply to a heartbeat check says nothing needs attention.
+pub fn is_heartbeat_ok(reply: &str) -> bool {
+    reply.trim() == HEARTBEAT_OK
+}
+
 /// How a job's latest run went.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -49,6 +86,9 @@ pub enum JobOutcome {
     /// The run failed; the conversation shows why.
     Failed,
     Cancelled,
+    /// A heartbeat check found nothing that needs attention: the reply was
+    /// exactly [`HEARTBEAT_OK`], or `HEARTBEAT.md` was empty and nothing was sent.
+    Quiet,
     /// The gateway did not run the message, for example because the
     /// conversation was busy or had no model.
     Refused(ErrorReport),
@@ -82,7 +122,11 @@ pub struct Job {
     pub id: Id,
     pub name: String,
     pub thread: Id,
+    /// The message; empty for a heartbeat check, whose message is built
+    /// from `HEARTBEAT.md` when it runs.
     pub text: String,
+    #[serde(default)]
+    pub kind: JobKind,
     pub schedule: Schedule,
     pub enabled: bool,
     /// Unix seconds.
