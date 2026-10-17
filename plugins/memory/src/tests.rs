@@ -380,11 +380,35 @@ fn search_stops_at_the_byte_bound() {
     }
     let found = run_search(&mut fake, &term, 10).unwrap();
     assert!(
-        found.contains("[stopped at a bound after 2 files"),
+        found.contains("[skipped 2 files that did not fit in the "),
         "{found}"
     );
-    // The third file's listed size is over the budget, so it is not read.
-    assert!(!fake.requests.contains(&Request::Read("memory/2.md".into())));
+    assert!(!found.contains("[stopped at a bound"), "{found}");
+    // Listed sizes over the budget are not read.
+    for skipped in ["memory/2.md", "memory/3.md"] {
+        assert!(!fake.requests.contains(&Request::Read(skipped.into())));
+    }
+}
+
+#[test]
+fn a_large_root_file_does_not_hide_later_notes() {
+    let mut words = Words::new(17);
+    let term = planted();
+    let mut big = String::new();
+    while big.len() <= MAX_BYTES {
+        big.push_str(&words.word().repeat(16));
+        big.push('\n');
+    }
+    let note = format!("memory/{}.md", unique("n"));
+    let mut fake = Fake::default()
+        .file("MEMORY.md", big)
+        .file(&note, format!("{} {term}", words.word()));
+    let found = run_search(&mut fake, &term, 5).unwrap();
+    assert!(found.starts_with(&format!("{note}:1-1 (score ")), "{found}");
+    assert!(
+        found.contains("[skipped 1 files that did not fit in the "),
+        "{found}"
+    );
 }
 
 #[test]
@@ -455,6 +479,12 @@ fn search_stops_at_the_folder_bound_and_depth() {
     assert!(found.contains("[stopped at a bound"), "{found}");
     let found = run_search(&mut deep_fake, &term, 20).unwrap();
     assert!(found.starts_with("no memory files"), "{found}");
+    assert!(
+        found.contains(&format!(
+            "[skipped 1 folders nested more than {MAX_DEPTH} levels"
+        )),
+        "{found}"
+    );
     assert!(
         !deep_fake
             .requests
@@ -718,6 +748,20 @@ fn appending_after_a_concurrent_change_is_a_conflict() {
     let mut host = Racing(Fake::default().file("memory/n.md", unique("old ")));
     let refused = append(&mut host, "memory/n.md", &unique("new ")).unwrap_err();
     assert_eq!(GuestError::from(refused).code, "conflict");
+}
+
+#[test]
+fn appending_to_an_empty_note_is_refused_without_writing() {
+    let path = format!("memory/{}.md", unique("e"));
+    let mut fake = Fake::default().file(&path, "");
+    let refused = save(
+        &mut fake,
+        &args(&[("path", s(&path)), ("text", s(&unique("t ")))]),
+    )
+    .unwrap_err();
+    assert_eq!(GuestError::from(refused).code, "empty_note_file");
+    assert_eq!(fake.writes(), 0);
+    assert_eq!(fake.text(&path), Some(String::new()));
 }
 
 #[test]

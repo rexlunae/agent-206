@@ -38,6 +38,11 @@ pub struct Corpus {
     pub too_large: usize,
     /// Files that are not UTF-8 text.
     pub not_text: usize,
+    /// Files that did not fit in what was left of [`MAX_BYTES`]; the walk
+    /// goes on, so smaller files after them are still searched.
+    pub no_room: usize,
+    /// Folders nested deeper than [`paths::MAX_DEPTH`], outside the scope.
+    pub too_deep: usize,
 }
 
 impl Corpus {
@@ -98,6 +103,7 @@ impl<H: Host> Walk<'_, H> {
                 EntryKind::Directory if depth < paths::MAX_DEPTH => {
                     self.directory(child, depth + 1)?
                 }
+                EntryKind::Directory => self.corpus.too_deep += 1,
                 EntryKind::File if paths::check(&child, Scope::Memory).is_ok() => {
                     self.file(child, entry.size)?
                 }
@@ -111,13 +117,14 @@ impl<H: Host> Walk<'_, H> {
     }
 
     fn file(&mut self, path: String, size: Option<u64>) -> Result<(), MemoryError> {
+        if self.corpus.documents.len() == MAX_FILES || self.work.left() < WORK_PER_FILE {
+            self.corpus.truncated = true;
+            return Ok(());
+        }
         // A listed size over what is left is not read at all.
         let over = |size: u64| self.corpus.bytes() as u64 + size > MAX_BYTES as u64;
-        if self.corpus.documents.len() == MAX_FILES
-            || size.is_some_and(over)
-            || self.work.left() < WORK_PER_FILE
-        {
-            self.corpus.truncated = true;
+        if size.is_some_and(over) {
+            self.corpus.no_room += 1;
             return Ok(());
         }
         let bytes = match self.host.read_file(&path) {
@@ -130,7 +137,15 @@ impl<H: Host> Walk<'_, H> {
             Err(failure) => return Err(failure.into()),
         };
         if self.corpus.bytes() + bytes.len() > MAX_BYTES {
-            self.corpus.truncated = true;
+            // The read itself was work, even though the file is dropped.
+            if !self
+                .work
+                .spend(WORK_PER_FILE + bytes.len() as u64 * WORK_PER_BYTE)
+            {
+                self.corpus.truncated = true;
+            } else {
+                self.corpus.no_room += 1;
+            }
             return Ok(());
         }
         // Charged before the UTF-8 check and everything after it; the read

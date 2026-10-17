@@ -39,6 +39,10 @@ pub enum MemoryError {
     NoteTooLong,
     #[error("`{0}` would grow past {MAX_NOTE_FILE} bytes; save to a new note")]
     NoteFull(String),
+    #[error(
+        "`{0}` is empty, so an append could not detect a change made meanwhile; save to a new note"
+    )]
+    EmptyFile(String),
     /// The host refused or failed a call; its own code is kept.
     #[error(transparent)]
     Host(#[from] HostFailure),
@@ -60,6 +64,7 @@ impl MemoryError {
             Self::NotText(_) => "not_text",
             Self::PastEnd { .. } => "out_of_range",
             Self::NoteFull(_) => "note_full",
+            Self::EmptyFile(_) => "empty_note_file",
             Self::Host(failure) => failure.code.as_str(),
         }
     }

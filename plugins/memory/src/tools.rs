@@ -93,6 +93,20 @@ fn notice(corpus: &Corpus, ranked: usize) -> Vec<String> {
             corpus.too_large
         ));
     }
+    if corpus.no_room > 0 {
+        notes.push(format!(
+            "[skipped {} files that did not fit in the {}-byte search budget]",
+            corpus.no_room,
+            crate::corpus::MAX_BYTES
+        ));
+    }
+    if corpus.too_deep > 0 {
+        notes.push(format!(
+            "[skipped {} folders nested more than {} levels inside memory/]",
+            corpus.too_deep,
+            crate::paths::MAX_DEPTH
+        ));
+    }
     if corpus.not_text > 0 {
         notes.push(format!(
             "[skipped {} files that are not UTF-8 text]",
@@ -220,9 +234,9 @@ pub fn append(host: &mut impl Host, path: &str, text: &str) -> Result<String, Me
     }
 }
 
-/// Append to `existing`. A non-empty note is replaced through `edit_file`
-/// with its whole text as the expected old text, so the host refuses the
-/// append with `conflict` if the note changed since it was read.
+/// Append to `existing` through `edit_file` with its whole text as the
+/// expected old text, so the host refuses the append with `conflict` if the
+/// note changed since it was read.
 fn extend(
     host: &mut impl Host,
     path: &str,
@@ -238,11 +252,12 @@ fn extend(
     if updated.len() > MAX_NOTE_FILE {
         return Err(MemoryError::NoteFull(path.into()));
     }
+    // `edit_file` needs old text to compare, and a plain overwrite could
+    // replace text written since the read, so an empty note is refused.
     if existing.is_empty() {
-        host.write_file(path, updated.as_bytes(), true)?;
-    } else {
-        host.edit_file(path, existing, &updated)?;
+        return Err(MemoryError::EmptyFile(path.into()));
     }
+    host.edit_file(path, existing, &updated)?;
     Ok(format!(
         "appended to {path}, lines {}-{}",
         existing.lines().count() + 1,
