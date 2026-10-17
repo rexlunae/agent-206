@@ -1,0 +1,295 @@
+use super::*;
+use crate::gateway::Gateway;
+use a206_core::{Command, Mode, Reply};
+use a206_protocol::Request;
+
+fn nonce() -> String {
+    Id::new_v4().simple().to_string()
+}
+async fn send(g: &Gateway, body: Command) -> Reply {
+    g.request(Request {
+        id: Id::new_v4(),
+        body,
+    })
+    .await
+    .body
+}
+async fn thread(g: &Gateway) -> Id {
+    let reply = send(
+        g,
+        Command::CreateThread {
+            title: nonce(),
+            mode: Mode::Chat,
+        },
+    )
+    .await;
+    let Reply::Thread(thread) = reply else {
+        panic!("thread created: {reply:?}");
+    };
+    thread.id
+}
+fn call(host: &ScheduleHost, thread: Id, name: &str, args: Value) -> Result<Value, ErrorReport> {
+    let Value::Object(arguments) = args else {
+        panic!("arguments are an object");
+    };
+    host.run(
+        thread,
+        &ToolRequest {
+            call: nonce(),
+            name: name.into(),
+            arguments,
+            approved: true,
+        },
+    )
+}
+fn every() -> Value {
+    json!({"name": nonce(), "message": nonce(), "every_seconds": 60 + Id::new_v4().as_u128() as u64 % 100_000})
+}
+fn ids(listed: &Value) -> Vec<(String, String)> {
+    listed["scheduled"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|job| {
+            (
+                job["id"].as_str().unwrap().to_owned(),
+                job["added_by"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn a_model_reaches_only_its_own_conversations_jobs_and_removes_only_its_own() {
+    let state = tempfile::tempdir().unwrap();
+    let g = Gateway::open(state.path()).unwrap();
+    let host = ScheduleHost::new(g.jobs());
+    let (mine, other) = (thread(&g).await, thread(&g).await);
+
+    let added = call(&host, mine, ADD, every()).unwrap();
+    let id = added["id"].as_str().unwrap().to_owned();
+    assert_eq!(added["added_by"], "you");
+    let theirs = call(&host, other, ADD, every()).unwrap();
+    let Reply::Job(users) = send(
+        &g,
+        Command::ScheduleJob {
+            name: nonce(),
+            thread: mine,
+            text: nonce(),
+            schedule: Schedule::Every {
+                seconds: 3600,
+                anchor: now(),
+            },
+        },
+    )
+    .await
+    else {
+        panic!("user job scheduled");
+    };
+
+    let listed = call(&host, mine, LIST, json!({})).unwrap();
+    let mut seen = ids(&listed);
+    seen.sort();
+    let mut expected = vec![
+        (id.clone(), "you".to_owned()),
+        (users.id.to_string(), "user".to_owned()),
+    ];
+    expected.sort();
+    assert_eq!(seen, expected);
+    assert_eq!(listed["you_may_add"], MAX_AGENT_JOBS - 1);
+
+    // The user's job and another conversation's job stay.
+    for foreign in [
+        users.id.to_string(),
+        theirs["id"].as_str().unwrap().to_owned(),
+    ] {
+        let refused = call(&host, mine, REMOVE, json!({"id": foreign})).unwrap_err();
+        assert_eq!(refused.kind, ErrorKind::NotFound);
+    }
+    assert_eq!(g.snapshot().unwrap().jobs.len(), 3);
+    assert_eq!(
+        call(&host, mine, REMOVE, json!({"id": id})).unwrap()["removed"],
+        id
+    );
+    let left = ids(&call(&host, mine, LIST, json!({})).unwrap());
+    assert_eq!(left, vec![(users.id.to_string(), "user".to_owned())]);
+}
+
+#[tokio::test]
+async fn a_conversation_keeps_a_bounded_number_of_jobs_its_models_added() {
+    let state = tempfile::tempdir().unwrap();
+    let g = Gateway::open(state.path()).unwrap();
+    let host = ScheduleHost::new(g.jobs());
+    let (mine, other) = (thread(&g).await, thread(&g).await);
+    for _ in 0..MAX_AGENT_JOBS {
+        call(&host, mine, ADD, every()).unwrap();
+    }
+    let refused = call(&host, mine, ADD, every()).unwrap_err();
+    assert_eq!(refused.kind, ErrorKind::InvalidRequest);
+    assert_eq!(
+        call(&host, mine, LIST, json!({})).unwrap()["you_may_add"],
+        0
+    );
+    // Other conversations and the user are not limited by it.
+    call(&host, other, ADD, every()).unwrap();
+    let user = send(
+        &g,
+        Command::ScheduleJob {
+            name: nonce(),
+            thread: mine,
+            text: nonce(),
+            schedule: Schedule::Every {
+                seconds: 3600,
+                anchor: now(),
+            },
+        },
+    )
+    .await;
+    assert!(matches!(user, Reply::Job(_)), "{user:?}");
+}
+
+#[tokio::test]
+async fn schedules_are_parsed_from_exactly_one_form() {
+    let state = tempfile::tempdir().unwrap();
+    let g = Gateway::open(state.path()).unwrap();
+    let host = ScheduleHost::new(g.jobs());
+    let mine = thread(&g).await;
+    let base = || json!({"name": nonce(), "message": nonce()});
+    let with = |extra: Value| {
+        let mut args = base();
+        for (key, value) in extra.as_object().unwrap() {
+            args[key] = value.clone();
+        }
+        args
+    };
+    let future = now() + 1 + Id::new_v4().as_u128() as u64 % 1_000_000;
+    let at = jiff::Timestamp::from_second(future as i64).unwrap();
+    let added = call(&host, mine, ADD, with(json!({"at": at.to_string()}))).unwrap();
+    assert_eq!(added["schedule"]["at"], at.to_string());
+    assert_eq!(added["next"], at.to_string());
+    let zone = "UTC";
+    let added = call(
+        &host,
+        mine,
+        ADD,
+        with(json!({"cron": "0 0 * * *", "zone": zone})),
+    )
+    .unwrap();
+    assert_eq!(added["schedule"]["zone"], zone);
+
+    for (bad, kind) in [
+        (base(), ErrorKind::InvalidRequest),
+        (
+            with(json!({"at": at.to_string(), "every_seconds": 3600})),
+            ErrorKind::InvalidRequest,
+        ),
+        (
+            with(json!({"every_seconds": 3600, "zone": zone})),
+            ErrorKind::InvalidRequest,
+        ),
+        (with(json!({"at": nonce()})), ErrorKind::InvalidRequest),
+        // A fraction of a second would otherwise be cut, running early.
+        (
+            with(
+                json!({"at": jiff::Timestamp::new(future as i64, 1 + (future % 999_999_998) as i32).unwrap().to_string()}),
+            ),
+            ErrorKind::InvalidRequest,
+        ),
+        (
+            with(json!({"every_seconds": "often"})),
+            ErrorKind::InvalidRequest,
+        ),
+        (
+            with(json!({"every_seconds": 3600, "extra": 1})),
+            ErrorKind::InvalidRequest,
+        ),
+        (
+            json!({"name": nonce(), "every_seconds": 3600}),
+            ErrorKind::InvalidRequest,
+        ),
+        // The gateway's own checks: a past time and a bad expression.
+        (
+            with(json!({"at": "1970-01-01T00:00:01Z"})),
+            ErrorKind::InvalidRequest,
+        ),
+        (with(json!({"cron": nonce()})), ErrorKind::InvalidRequest),
+    ] {
+        let error = call(&host, mine, ADD, bad.clone()).unwrap_err();
+        assert_eq!(error.kind, kind, "{bad}: {error:?}");
+    }
+    assert_eq!(g.snapshot().unwrap().jobs.len(), 2);
+    let unknown = call(&host, mine, &nonce(), json!({})).unwrap_err();
+    assert_eq!(unknown.kind, ErrorKind::NotFound);
+}
+
+#[tokio::test]
+async fn listings_stay_whole_json_below_the_output_cap() {
+    let state = tempfile::tempdir().unwrap();
+    let g = Gateway::open(state.path()).unwrap();
+    let host = ScheduleHost::new(g.jobs());
+    let mine = thread(&g).await;
+    // Two-byte characters, so a cut inside one would be visible.
+    let message = "é".repeat(MESSAGE_BYTES + Id::new_v4().as_u128() as usize % 1000);
+    let count = 2 * LIST_BYTES / MESSAGE_BYTES;
+    for _ in 0..count {
+        let reply = send(
+            &g,
+            Command::ScheduleJob {
+                name: nonce(),
+                thread: mine,
+                text: message.clone(),
+                schedule: Schedule::Every {
+                    seconds: 3600,
+                    anchor: now(),
+                },
+            },
+        )
+        .await;
+        assert!(matches!(reply, Reply::Job(_)), "{reply:?}");
+    }
+    // Pages follow `next_after` to every job exactly once, even when a job
+    // already listed is removed between pages.
+    let mut seen = std::collections::BTreeSet::new();
+    let mut pages = 0;
+    let mut after = json!(null);
+    loop {
+        let listed = call(&host, mine, LIST, json!({ "after": after })).unwrap();
+        pages += 1;
+        assert!(listed.to_string().len() < crate::tools::MAX_OUTPUT);
+        assert_eq!(listed["total"], count - usize::from(pages > 1));
+        let shown = listed["scheduled"].as_array().unwrap();
+        assert!(!shown.is_empty());
+        for job in shown {
+            assert!(seen.insert(job["id"].as_str().unwrap().to_owned()));
+            let text = job["message"].as_str().unwrap();
+            assert!(text.len() <= MESSAGE_BYTES && message.starts_with(text));
+            assert!(
+                text.len() + 1 >= MESSAGE_BYTES,
+                "cut at the last whole character"
+            );
+            assert_eq!(job["message_bytes"], message.len());
+        }
+        if listed["next_after"].is_null() {
+            break;
+        }
+        after = listed["next_after"].clone();
+        if pages == 1 {
+            // Remove the first job listed; the next page must not skip one.
+            let first: Id = shown[0]["id"].as_str().unwrap().parse().unwrap();
+            assert_eq!(send(&g, Command::RemoveJob { id: first }).await, Reply::Ok);
+        }
+    }
+    assert!(pages > 1, "the listing needed more than one page");
+    assert_eq!(seen.len(), count);
+    for (bad, caused) in [
+        (json!(7), false),
+        (json!("later"), false),
+        (json!(format!("soon:{}", Id::new_v4())), true),
+        (json!("1:not-an-id"), true),
+    ] {
+        let error = call(&host, mine, LIST, json!({ "after": bad })).unwrap_err();
+        assert_eq!(error.kind, ErrorKind::InvalidRequest, "{bad}");
+        // A cursor that fails to parse keeps the parser's reason.
+        assert_eq!(error.source.is_some(), caused, "{bad}");
+    }
+}
