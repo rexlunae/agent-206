@@ -250,6 +250,12 @@ impl Gateway {
         self.bind_delegation();
         self
     }
+    /// Retry model requests under `retry` instead of
+    /// [`crate::retry::RetryPolicy::DEFAULT`].
+    pub fn with_retry_policy(mut self, retry: crate::retry::RetryPolicy) -> Self {
+        self.retry = retry;
+        self
+    }
     fn view(&self, id: Id) -> Result<View> {
         view(&*self.lock()?, id)
     }
@@ -596,14 +602,18 @@ impl Gateway {
         let operation = provider::complete(
             &run.config,
             broker,
-            thread,
-            prompt,
-            &run.info,
-            offered,
+            provider::Ask {
+                thread,
+                prompt,
+                info: &run.info,
+                tools: offered,
+            },
             &sender,
+            &self.retry,
         );
         let mut operation = std::pin::pin!(operation);
         let mut partial = PartialReply::default();
+        let mut noticed = false;
         let result = loop {
             let due = partial.due();
             tokio::select! {
@@ -614,7 +624,13 @@ impl Gateway {
                     partial.publish(&mut store, run.thread)?;
                 }
                 Some(update) = progress.recv() => {
-                    if partial.update(update) {
+                    // A retry notice, shown until the round ends.
+                    if let crate::backends::Progress::Activity(title) = update {
+                        noticed = true;
+                        let mut store = self.lock()?;
+                        store.thread_mut(run.thread)?.backend_activity = Some(title.clone());
+                        store.persist(Some(EventKind::BackendActivity { thread: run.thread, title }))?;
+                    } else if partial.update(update) {
                         let mut store = self.lock()?;
                         partial.publish(&mut store, run.thread)?;
                     }
@@ -627,6 +643,9 @@ impl Gateway {
         }
         let mut store = self.lock()?;
         let thread = store.thread_mut(run.thread)?;
+        if noticed {
+            thread.backend_activity = None;
+        }
         let result = match result {
             Some(Ok(turn)) => {
                 let message = partial.finish(thread, turn.text.clone());

@@ -488,8 +488,34 @@ previous summary first.
 Tests: `crates/runtime/tests/context.rs` (scripted OpenAI, Anthropic and Gemini
 streams) and unit tests in `compaction.rs`, `memory_flush.rs` and `instructions.rs`.
 
+## Retrying model requests
+
+`crates/runtime/src/retry.rs`. A model request (a round or a compaction summary) is
+repeated only while nothing of its response has arrived. That covers a connection
+failure or timeout (made directly, or reported by the vault broker for a
+credentialed request), and an HTTP 408, 429, 500, 502, 503, 504 or 529 refusal. Once any
+response bytes are received, the failure is final, so no text or tool call is
+streamed twice. Any other status is also final. A retry repeats the identical
+request to the same provider, model and credential binding: there is no fallback
+to another model or account.
+
+`RetryPolicy::DEFAULT` makes 4 attempts. Its backoff starts at 250 ms, doubles up
+to 8 s and is spread by ±20%, never past the 8 s cap. A `Retry-After` in seconds from a direct
+(uncredentialed) provider is honoured up to 30 s; brokered requests don't carry
+the header, so they use the backoff. These are policy choices, not provider facts.
+While a native round waits to retry, the conversation's activity line says why and
+which attempt comes next, for example "The provider answered HTTP 503; retrying
+(attempt 2 of 4)". The line is cleared when the round ends. `CancelRun` ends the
+wait at once. When the attempts run out, the run fails with the last attempt's
+structured error. Follows RustyClaw's `retry/policy.rs`; auth-profile failover is
+not carried over.
+
+Tests: `crates/runtime/tests/retries.rs` (scripted OpenAI, Anthropic and Gemini
+providers: refusals, attempts, final statuses, broken connections, cancellation)
+and unit tests in `retry.rs`.
+
 ## Not implemented
 
 Leaked tool-markup filtering, schema type coercion and repeat-call warnings from
 RustyClaw's healing; Anthropic thinking-block replay alongside tool results;
-retries; parallel tool execution.
+parallel tool execution.
