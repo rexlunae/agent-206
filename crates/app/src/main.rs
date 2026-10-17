@@ -7,6 +7,8 @@ fn main() {
 mod doctor_cli;
 #[cfg(not(target_arch = "wasm32"))]
 mod extension_cli;
+#[cfg(not(target_arch = "wasm32"))]
+mod messenger_cli;
 #[cfg(all(unix, not(target_arch = "wasm32")))]
 mod setup_cli;
 #[cfg(all(unix, not(target_arch = "wasm32")))]
@@ -108,6 +110,11 @@ mod native {
         Import {
             #[command(subcommand)]
             source: crate::setup_cli::ImportSource,
+        },
+        /// Configure chat service accounts that converse with threads.
+        Messenger {
+            #[command(subcommand)]
+            command: crate::messenger_cli::MessengerAction,
         },
         /// Show gateway and workspace status without starting a service.
         Status,
@@ -613,6 +620,9 @@ mod native {
                 } = action
                 {
                     return Ok(a206_runtime::mcp::serve(client, thread, allow_title_edit).await?);
+                }
+                if let Action::Messenger { command } = action {
+                    return crate::messenger_cli::run(&client, command).await;
                 }
                 let command = match action {
                     Action::Providers {

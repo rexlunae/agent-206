@@ -114,6 +114,7 @@ impl Store {
                 plugins: vec![],
                 last_event: 0,
                 managed_joshua_provider: None,
+                messengers: vec![],
                 mcp_servers: vec![],
             }
         };

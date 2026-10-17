@@ -5,8 +5,8 @@ use crate::vault_cli;
 use a206_broker::{BrokerError, ClientError, Reply as BrokerReply, Request, WireSecret};
 use a206_core::{Command, GatewayAction, GatewayPhase, GatewayTarget, Reply};
 use a206_import::{
-    InactiveCategory, Preview, ProviderAction, Receipt, Unsupported, UnsupportedProvider,
-    VaultPlan, VaultProtection,
+    InactiveCategory, MessengerAction, Preview, ProviderAction, Receipt, Unsupported,
+    UnsupportedMessenger, UnsupportedProvider, VaultPlan, VaultProtection,
 };
 use anyhow::{Context, Result, bail};
 use clap::Subcommand;
@@ -29,6 +29,9 @@ pub enum ImportSource {
         /// Leave provider accounts behind.
         #[arg(long)]
         skip_providers: bool,
+        /// Leave messenger accounts behind.
+        #[arg(long)]
+        skip_messengers: bool,
         /// Print the preview as TOML.
         #[arg(long)]
         toml: bool,
@@ -171,6 +174,57 @@ fn print_preview(preview: &Preview) {
             println!("    previous default model {model} is kept as a note, not selected");
         }
     }
+    for messenger in &preview.messengers {
+        let action = match &messenger.action {
+            MessengerAction::Add => "will be added, disabled",
+            MessengerAction::AlreadyConfigured => "already configured",
+            MessengerAction::Unsupported { reason } => match reason {
+                UnsupportedMessenger::UnknownKind => "skipped: this service is not supported yet",
+                UnsupportedMessenger::ExternalConfig => {
+                    "skipped: its settings are in a separate file, which is not read"
+                }
+                UnsupportedMessenger::InvalidChats => {
+                    "skipped: its allowed chats are not ones Agent 206 accepts"
+                }
+            },
+        };
+        println!(
+            "  messenger {} ({} {:?}) {action}",
+            messenger.name, messenger.source_kind, messenger.source_name
+        );
+        if messenger.action != MessengerAction::Add {
+            continue;
+        }
+        if messenger.allowed_chats.is_empty() {
+            println!("    no chat is allowed until you allow one");
+        } else {
+            println!(
+                "    allows chats {}",
+                messenger
+                    .allowed_chats
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        if !messenger.allowed_users.is_empty() {
+            println!(
+                "    accepts only senders {}",
+                messenger
+                    .allowed_users
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        if messenger.token_left_behind {
+            println!(
+                "    its token was stored in plain text and stays behind; add it to the vault yourself"
+            );
+        }
+    }
     for item in &preview.inactive {
         println!(
             "  left inactive: {} × {}",
@@ -223,6 +277,7 @@ pub async fn import(root: &Path, remote: Option<String>, source: ImportSource) -
         apply,
         skip_vault,
         skip_providers,
+        skip_messengers,
         toml,
     } = source;
     let path = match path {
@@ -281,6 +336,7 @@ pub async fn import(root: &Path, remote: Option<String>, source: ImportSource) -
             .duration_since(std::time::UNIX_EPOCH)?
             .as_secs(),
         providers_added: vec![],
+        messengers_added: vec![],
         vault_imported: false,
     };
     if let Some(vault) = preview
@@ -293,21 +349,32 @@ pub async fn import(root: &Path, remote: Option<String>, source: ImportSource) -
         receipt.vault_imported = true;
     }
     let mut saved = Ok(());
-    if !skip_providers {
-        let mut settings = snapshot.settings.clone();
-        let added = preview.apply_providers(&mut settings);
-        if !added.is_empty() {
-            saved = client
-                .call(Command::SaveSettings(settings))
-                .await
-                .map_err(anyhow::Error::from)
-                .and_then(|reply| Ok(reply.into_result().map(drop)?));
-            if saved.is_ok() {
-                receipt.providers_added = added;
-            }
+    let mut settings = snapshot.settings.clone();
+    let providers = if skip_providers {
+        vec![]
+    } else {
+        preview.apply_providers(&mut settings)
+    };
+    let messengers = if skip_messengers {
+        vec![]
+    } else {
+        preview.apply_messengers(&mut settings)
+    };
+    if !providers.is_empty() || !messengers.is_empty() {
+        saved = client
+            .call(Command::SaveSettings(settings))
+            .await
+            .map_err(anyhow::Error::from)
+            .and_then(|reply| Ok(reply.into_result().map(drop)?));
+        if saved.is_ok() {
+            receipt.providers_added = providers;
+            receipt.messengers_added = messengers;
         }
     }
-    if receipt.vault_imported || !receipt.providers_added.is_empty() {
+    if receipt.vault_imported
+        || !receipt.providers_added.is_empty()
+        || !receipt.messengers_added.is_empty()
+    {
         let written = a206_import::write_receipt(root, &receipt)?;
         println!("Receipt: {}", written.display());
     } else {
@@ -315,9 +382,9 @@ pub async fn import(root: &Path, remote: Option<String>, source: ImportSource) -
     }
     // A vault import already happened; report it alongside the failure.
     saved.context(if receipt.vault_imported {
-        "the vault was imported, but provider accounts were not saved"
+        "the vault was imported, but provider and messenger accounts were not saved"
     } else {
-        "provider accounts were not saved"
+        "provider and messenger accounts were not saved"
     })?;
     let command = if receipt.vault_imported {
         "adopt"
@@ -334,6 +401,19 @@ pub async fn import(root: &Path, remote: Option<String>, source: ImportSource) -
                 provider.label
             );
         }
+    }
+    for messenger in preview
+        .messengers
+        .iter()
+        .filter(|m| receipt.messengers_added.contains(&m.name))
+    {
+        let (name, origin) = (
+            &messenger.name,
+            messenger.kind.map_or("", |kind| kind.default_endpoint()),
+        );
+        println!(
+            "To use messenger {name}: agent206 vault add {name}-token --kind token --destination {origin}, then agent206 messenger set {name} --credential {name}-token, agent206 messenger allow {name} <chat> and agent206 messenger enable {name}"
+        );
     }
     Ok(())
 }

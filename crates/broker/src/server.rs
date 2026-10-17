@@ -26,7 +26,12 @@ struct Shared {
     vault: Mutex<Vault>,
     throttle: AuthThrottle<()>,
     stop: CancellationToken,
+    /// For HTTPS, through the system proxy if one is configured: a proxy
+    /// sees only the tunnelled, encrypted request.
     http: reqwest::Client,
+    /// For plain HTTP, which is only ever loopback: never through a proxy,
+    /// which would see the credential in the clear.
+    direct: reqwest::Client,
     /// Cancels provider requests started under an earlier vault generation.
     in_flight: Mutex<(u64, CancellationToken)>,
     pairing: Mutex<Option<Pairing>>,
@@ -104,8 +109,8 @@ struct Session {
 struct Outbound {
     method: HttpMethod,
     url: url::Url,
-    header: &'static str,
-    value: Zeroizing<String>,
+    /// The credential header, or `None` when the credential is in `url`.
+    header: Option<(&'static str, Zeroizing<String>)>,
     anthropic_version: Option<String>,
     body: Option<Vec<u8>>,
     cancel: CancellationToken,
@@ -719,21 +724,56 @@ fn provider(shared: &Shared, session: &Session, call: ProviderCall, stream: bool
         })
         .map_err(vault_error)?;
     drop(vault);
-    let header = match call.auth {
-        AuthScheme::Bearer => "authorization",
-        AuthScheme::ApiKeyHeader => "x-api-key",
-        AuthScheme::GoogleApiKey => "x-goog-api-key",
+    let (url, header) = match call.auth {
+        AuthScheme::Bearer => (url, Some(("authorization", value))),
+        AuthScheme::ApiKeyHeader => (url, Some(("x-api-key", value))),
+        AuthScheme::GoogleApiKey => (url, Some(("x-goog-api-key", value))),
+        AuthScheme::TelegramBot => (telegram_url(url, &value)?, None),
     };
     Ok(Outcome::Send(Box::new(Outbound {
         method: call.method,
         url,
         header,
-        value,
         anthropic_version: call.anthropic_version,
         body: call.body,
         cancel,
         stream,
     })))
+}
+
+/// Telegram takes the bot token as the first path segment. A token that could
+/// change the path's shape is refused rather than escaped. The URL is not
+/// zeroized, but it lives only until the request is sent, and transport
+/// errors drop it (see `upstream`).
+fn telegram_url(mut url: url::Url, token: &str) -> Result<url::Url, BrokerError> {
+    let valid = !token.is_empty()
+        && token
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b':' | b'_' | b'-'));
+    if !valid {
+        return Err(BrokerError::Upstream(UpstreamFailure::InvalidBotToken));
+    }
+    let path = format!("/bot{token}{}", url.path());
+    url.set_path(&path);
+    Ok(url)
+}
+
+fn http_client() -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(180))
+        .connect_timeout(Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::none())
+}
+
+impl Shared {
+    /// The client for `url`: plain HTTP never goes through a proxy.
+    fn client(&self, url: &url::Url) -> &reqwest::Client {
+        if url.scheme() == "https" {
+            &self.http
+        } else {
+            &self.direct
+        }
+    }
 }
 
 /// Why a send was abandoned: the vault locked, or the pairing it was sent
@@ -752,7 +792,7 @@ async fn send(shared: &Shared, out: Outbound) -> Result<Reply, BrokerError> {
     let cancel = out.cancel.clone();
     if !cancel.is_cancelled() {
         tokio::select! {
-            reply = transmit(&shared.http, out) => return reply,
+            reply = transmit(shared.client(&out.url), out) => return reply,
             _ = cancel.cancelled() => {}
         }
     }
@@ -761,14 +801,17 @@ async fn send(shared: &Shared, out: Outbound) -> Result<Reply, BrokerError> {
 
 /// Attach the credential and send; resolves once the upstream status arrives.
 async fn request(http: &reqwest::Client, out: Outbound) -> Result<reqwest::Response, BrokerError> {
-    let mut header = reqwest::header::HeaderValue::from_str(&out.value)
-        .map_err(|_| BrokerError::Upstream(UpstreamFailure::InvalidHeader))?;
-    header.set_sensitive(true);
     let method = match out.method {
         HttpMethod::Get => reqwest::Method::GET,
         HttpMethod::Post => reqwest::Method::POST,
     };
-    let mut request = http.request(method, out.url).header(out.header, header);
+    let mut request = http.request(method, out.url);
+    if let Some((name, value)) = &out.header {
+        let mut header = reqwest::header::HeaderValue::from_str(value)
+            .map_err(|_| BrokerError::Upstream(UpstreamFailure::InvalidHeader))?;
+        header.set_sensitive(true);
+        request = request.header(*name, header);
+    }
     if let Some(version) = out.anthropic_version {
         request = request.header("anthropic-version", version);
     }
@@ -819,7 +862,7 @@ async fn relay(
         _ = cancel.cancelled() => Err(revoked(shared)),
         _ = shared.stop.cancelled() => return Ok(false),
         closed = inbox.closed() => return closed.map(|()| false),
-        response = request(&shared.http, out) => response,
+        response = request(shared.client(&out.url), out) => response,
     };
     let response = match response {
         Ok(response) => response,
@@ -1055,10 +1098,9 @@ pub async fn serve(root: &Path) -> std::io::Result<()> {
         vault: Mutex::new(Vault::locked(crate::vault_path(root))),
         throttle: AuthThrottle::default(),
         stop: CancellationToken::new(),
-        http: reqwest::Client::builder()
-            .timeout(Duration::from_secs(180))
-            .connect_timeout(Duration::from_secs(10))
-            .redirect(reqwest::redirect::Policy::none())
+        http: http_client().build().map_err(std::io::Error::other)?,
+        direct: http_client()
+            .no_proxy()
             .build()
             .map_err(std::io::Error::other)?,
         in_flight: Mutex::new((0, CancellationToken::new())),

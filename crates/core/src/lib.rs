@@ -164,8 +164,12 @@ pub struct ModelKey {
     pub model: String,
 }
 
-pub mod mcp;
+pub mod messengers;
 pub mod providers;
+pub use messengers::{
+    ChatBinding, MessengerConfig, MessengerKind, MessengerState, MessengerStatus, RefusedChat,
+};
+pub mod mcp;
 pub use mcp::{McpServerConfig, McpServerState, McpServerStatus, McpToolInfo, ToolPolicy};
 pub use providers::{ProviderApi, ProviderPreset, ProviderPresetList};
 
@@ -254,6 +258,8 @@ pub struct Settings {
     #[serde(default)]
     pub backends: Vec<BackendConfig>,
     #[serde(default)]
+    pub messengers: Vec<MessengerConfig>,
+    #[serde(default)]
     pub mcp_servers: Vec<McpServerConfig>,
     pub prompts: Vec<ModePrompt>,
     pub theme_design: String,
@@ -268,6 +274,7 @@ impl Default for Settings {
             providers: vec![],
             provider_presets: ProviderPresetList::default(),
             backends: vec![],
+            messengers: vec![],
             mcp_servers: vec![],
             prompts: Mode::ALL
                 .into_iter()
@@ -371,6 +378,9 @@ pub struct Thread {
     /// Tool calls of the current run waiting for the user.
     #[serde(default)]
     pub approvals: Vec<ApprovalRequest>,
+    /// The messenger chat this thread converses with, if any.
+    #[serde(default)]
+    pub chat: Option<Box<ChatBinding>>,
 }
 impl Thread {
     pub fn new(title: String, mode: Mode) -> Self {
@@ -394,6 +404,7 @@ impl Thread {
             tool_permissions: BTreeMap::new(),
             tool_budget: ToolBudget::default(),
             approvals: vec![],
+            chat: None,
         }
     }
 }
@@ -466,6 +477,9 @@ pub struct Snapshot {
     pub last_event: u64,
     #[serde(default)]
     pub managed_joshua_provider: Option<Id>,
+    /// Runtime state of configured messengers; never a grant.
+    #[serde(default)]
+    pub messengers: Vec<MessengerStatus>,
     /// Runtime state of configured MCP servers; never a grant.
     #[serde(default)]
     pub mcp_servers: Vec<McpServerStatus>,
@@ -518,6 +532,9 @@ pub enum EventKind {
     },
     ProjectChanged {
         id: Id,
+    },
+    MessengerChanged {
+        name: String,
     },
     McpServerChanged {
         name: String,
@@ -694,6 +711,14 @@ pub enum Command {
     PairBroker {
         pairing: BrokerPairing,
     },
+    /// Connect an enabled messenger the user disconnected (user operation).
+    ConnectMessenger {
+        name: String,
+    },
+    /// Disconnect a messenger; it stays stopped until the user connects it.
+    DisconnectMessenger {
+        name: String,
+    },
     /// Start an enabled MCP server and list its tools (user operation).
     ConnectMcpServer {
         name: String,
@@ -739,6 +764,8 @@ impl Command {
             Self::Shutdown => "shutdown",
             Self::GatewayStatus => "gateway_status",
             Self::PairBroker { .. } => "pair_broker",
+            Self::ConnectMessenger { .. } => "connect_messenger",
+            Self::DisconnectMessenger { .. } => "disconnect_messenger",
             Self::ConnectMcpServer { .. } => "connect_mcp_server",
             Self::DisconnectMcpServer { .. } => "disconnect_mcp_server",
         }
@@ -892,6 +919,25 @@ pub struct HostKey {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn settings_saved_before_later_sections_still_load() {
+        let mut table: toml::Table = toml::from_str(
+            &toml::to_string(&Settings {
+                messengers: vec![MessengerConfig::new(
+                    format!("m-{}", Id::new_v4().simple()),
+                    MessengerKind::Telegram,
+                )],
+                ..Settings::default()
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        for section in ["backends", "messengers", "mcp_servers"] {
+            table.remove(section);
+        }
+        let settings: Settings = toml::from_str(&toml::to_string(&table).unwrap()).unwrap();
+        assert!(settings.messengers.is_empty() && settings.mcp_servers.is_empty());
+    }
     #[test]
     fn delegation_never_increases_authority() {
         use Capability::*;
