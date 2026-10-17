@@ -128,7 +128,10 @@ pub trait ToolHost: Send + Sync + 'static {
 Hosts are added with `Gateway::with_tool_host`. Names are model-facing and
 namespaced by the host (1–64 of `[A-Za-z0-9_-]`); a name two hosts offer is
 offered by neither. Schemas must be object schemas (32 KiB at most). Results are
-capped at 64 KiB with a declared truncation. Dropping a `call` future cancels the
+capped at 64 KiB, or at the conversation's remaining storage, with a declared
+truncation. A tool whose `ToolSpec::whole_output` is set (output only useful
+complete, such as instruction text) is instead settled `Failed` with a
+`Storage` report when its output does not fit, and none of it is kept. Dropping a `call` future cancels the
 call, so a host must stop the work it started. A host failure is an `ErrorReport`
 so its kind and causes survive the process boundary.
 

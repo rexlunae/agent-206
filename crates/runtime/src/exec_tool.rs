@@ -201,6 +201,7 @@ impl ExecHost {
             }),
             capabilities: [Capability::Execute].into(),
             permission: ToolPermission::Ask,
+            whole_output: false,
         }
     }
 }

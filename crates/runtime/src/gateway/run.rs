@@ -76,6 +76,14 @@ pub enum ToolError {
         "this call's {bytes} bytes of arguments do not fit in the conversation's remaining storage; it did not run"
     )]
     Capacity { bytes: usize },
+    #[error(
+        "{tool} returned {bytes} bytes, more than the {room} that fit; its output is only useful whole, so none of it was kept"
+    )]
+    OutputTooLarge {
+        tool: String,
+        bytes: usize,
+        room: usize,
+    },
 }
 impl crate::error::Classified for ToolError {
     fn kind(&self) -> Option<ErrorKind> {
@@ -84,7 +92,7 @@ impl crate::error::Classified for ToolError {
             Self::Denied(_) | Self::Capability { .. } | Self::Rejected | Self::Revoked(_) => {
                 ErrorKind::PermissionDenied
             }
-            Self::Capacity { .. } => ErrorKind::Storage,
+            Self::Capacity { .. } | Self::OutputTooLarge { .. } => ErrorKind::Storage,
             Self::Cancelled => ErrorKind::Cancelled,
             Self::Duplicate => ErrorKind::Conflict,
             Self::Reported(_) => ErrorKind::Other,
@@ -780,6 +788,20 @@ impl Gateway {
             &call,
             changed,
             |_, record, room| match result {
+                Ok(output)
+                    if routed.spec.whole_output
+                        && output.text.len() > room.min(tools::MAX_OUTPUT) =>
+                {
+                    settle(
+                        record,
+                        ToolCallState::Failed,
+                        &ToolError::OutputTooLarge {
+                            tool: record.tool.clone(),
+                            bytes: output.text.len(),
+                            room: room.min(tools::MAX_OUTPUT),
+                        },
+                    )
+                }
                 Ok(output) if !output.is_error => {
                     record.state = ToolCallState::Succeeded;
                     record.output = Some(bounded_output(output.text, room));

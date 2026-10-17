@@ -212,6 +212,7 @@ fn spec(name: String, offer: McpOffer) -> Result<ToolSpec, McpToolError> {
         parameters,
         capabilities: offer.capabilities,
         permission: permission(offer.policy),
+        whole_output: false,
     })
 }
 

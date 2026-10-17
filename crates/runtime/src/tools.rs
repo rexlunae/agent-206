@@ -46,6 +46,10 @@ pub struct ToolSpec {
     /// The host's own policy, for example a user-configured MCP server entry.
     /// The gateway never enforces anything less restrictive than this.
     pub permission: ToolPermission,
+    /// The output is only useful whole (an instruction text, a listing the
+    /// model acts on): a result that does not fit is settled as a failed call
+    /// rather than cut short.
+    pub whole_output: bool,
 }
 
 /// The authority a call runs under.
@@ -282,6 +286,7 @@ mod tests {
             parameters: serde_json::json!({"type": "object"}),
             capabilities: caps.iter().copied().collect(),
             permission,
+            whole_output: false,
         }
     }
     #[test]
