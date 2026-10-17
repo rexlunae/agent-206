@@ -218,18 +218,13 @@ pub fn valid_irc_channel(name: &str) -> bool {
         && !name.chars().any(|c| c == ' ' || c == ',' || c.is_control())
 }
 
-/// `name` folded as IRC networks compare names (RFC 1459 case mapping), so
-/// `#Rust` and `#rust`, or `[Bot]` and `{bot}`, are the same channel or account.
+/// `name` folded for comparison: ASCII letters only (the `ascii` case
+/// mapping). Networks using RFC 1459 mapping also treat `[]\\~` as `{}|^`,
+/// but folding those would merge names that `ascii` networks keep apart,
+/// letting an account listed as `[bot]` admit a different `{bot}`. Folding
+/// less only ever refuses a name written another way, never admits one.
 pub fn irc_lowercase(name: &str) -> String {
-    name.chars()
-        .map(|c| match c {
-            '[' => '{',
-            ']' => '}',
-            '\\' => '|',
-            '~' => '^',
-            c => c.to_ascii_lowercase(),
-        })
-        .collect()
+    name.to_ascii_lowercase()
 }
 
 /// A user-configured messenger account.
@@ -512,7 +507,10 @@ mod tests {
         ] {
             assert!(!valid_irc_nick(&bad), "{bad:?}");
         }
-        assert_eq!(irc_lowercase("#Rust[]\\~"), "#rust{}|^");
+        assert_eq!(irc_lowercase("#Rust"), "#rust");
+        // Distinct accounts on networks with ASCII case mapping stay apart.
+        assert_ne!(irc_lowercase("[Bot]"), irc_lowercase("{bot}"));
+        assert_eq!(irc_lowercase("[Bot]\\~"), "[bot]\\~");
         assert!(valid_irc_channel("#rust") && valid_irc_channel("&local"));
         for bad in ["#", "rust", "#a b", "#a,#b", "#a\u{7}", "#a\r\nQUIT"] {
             assert!(!valid_irc_channel(bad), "{bad:?}");

@@ -583,5 +583,7 @@ pub(crate) mod tests {
         dom.rebuild_in_place();
         let html = dioxus_ssr::render(&dom);
         assert!(html.contains(&format!("Signs in as {login}")), "{html}");
+        // The login can be changed on the card, as credentials can.
+        assert!(html.contains("Change login"), "{html}");
     }
 }

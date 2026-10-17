@@ -298,21 +298,29 @@ agent206 messenger enable libera
   account names; a message without an account (its sender is not signed in)
   is never answered. Chats are channel names (`#team`, which need listed
   senders like any group) or, for direct messages, the sender's account
-  name. Names are compared with the network's RFC 1459 case folding, and the
-  CLI, the Messengers page and import fold them as they are saved.
-- **Direct replies.** A reply to a direct message goes to the nickname that
-  sent it only after a `WHOIS` shows that nickname is still signed in to the
-  same account; otherwise the reply is not sent and the status says the
-  recipient is gone. The messenger keeps running.
+  name. Names are compared with ASCII letters folded to lowercase, and the
+  CLI, the Messengers page and import fold them as they are saved. Networks
+  that also treat `[]\~` as `{}|^` (RFC 1459 case mapping) are not folded
+  that far, since networks with ASCII case mapping keep `[bot]` and `{bot}`
+  as different accounts; a name written the other way is refused rather
+  than taken for someone else.
+- **Direct replies.** Each line of a reply to a direct message goes to the
+  nickname that sent it only after a `WHOIS` shows that nickname is still
+  signed in to the same account; otherwise nothing more is sent and the
+  status says the recipient is gone. The messenger keeps running.
 - **What is read and sent.** Only `PRIVMSG` text is read; CTCP requests,
-  notices, the bot's own lines and lines tagged as from a bot are ignored. The bot joins its allowed
-  channels on connecting and when invited to one. Replies are `PRIVMSG`
-  lines with control characters removed (so no formatting or CTCP), at most
-  380 bytes each and 24 lines per reply (longer replies end with a note that
-  they were cut), sent 700 ms apart so the server does not disconnect the
-  bot for flooding.
+  notices, the bot's own lines and lines tagged as from a bot are ignored.
+  The bot joins its allowed channels on connecting and when invited to one.
+  Replies are `PRIVMSG` lines with control characters removed (so no
+  formatting or CTCP), short enough that the relayed line fits in 512 bytes
+  whatever the channel's length, and at most 24 lines per reply (longer
+  replies end with a note that they were cut). They are sent 700 ms apart,
+  or 1.4 s for direct replies, whose lines each follow a `WHOIS`, so the
+  server does not disconnect the bot for flooding.
 - **Delivery.** Messages sent while the bot was disconnected are not
-  answered; a dropped connection signs in again.
+  answered; a dropped connection signs in again. A nickname in use (often
+  the bot's own earlier connection, until the server notices it is gone) is
+  retried with the usual backoff, with the failure shown meanwhile.
 
 ## Interface for the run engine
 

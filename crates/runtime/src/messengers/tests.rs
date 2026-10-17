@@ -1857,14 +1857,15 @@ async fn slack_reconnects_on_request_and_needs_both_tokens() {
 
 /// A stand-in IRC server on loopback: it signs the bot in with SASL PLAIN
 /// when the password matches, then sends `script` once the bot has joined
-/// its channels, answers `WHOIS` from `accounts` (nickname to account) and
+/// its channels, answers `WHOIS` from `accounts` (nickname to the accounts
+/// it belongs to at each `WHOIS` in turn, the last one from then on) and
 /// records every line it receives.
 #[derive(Clone, Default)]
 struct IrcServer {
     password: String,
     channels: usize,
     script: Arc<Mutex<Vec<String>>>,
-    accounts: Arc<Mutex<HashMap<String, String>>>,
+    accounts: Arc<Mutex<HashMap<String, VecDeque<String>>>>,
     received: Arc<Mutex<Vec<String>>>,
 }
 
@@ -1906,7 +1907,16 @@ async fn serve_irc(server: IrcServer) -> String {
                     } else if line.starts_with("JOIN ") {
                         joined += 1;
                     } else if let Some(whois) = line.strip_prefix("WHOIS ") {
-                        if let Some(account) = server.accounts.lock().unwrap().get(whois) {
+                        let mut accounts = server.accounts.lock().unwrap();
+                        let account = accounts.get_mut(whois).and_then(|owners| {
+                            if owners.len() > 1 {
+                                owners.pop_front()
+                            } else {
+                                owners.front().cloned()
+                            }
+                        });
+                        drop(accounts);
+                        if let Some(account) = account {
                             send.push(format!(
                                 ":irc.test 330 {nick} {whois} {account} :is logged in as"
                             ));
@@ -1938,6 +1948,7 @@ async fn irc_answers_signed_in_people_and_checks_nicknames_before_direct_replies
     let nickname = || format!("n{}", &random().replace('-', "")[..10]);
     let (login, member, friend, moved) = (nickname(), nickname(), nickname(), nickname());
     let (friend_nick, moved_nick, impostor) = (nickname(), nickname(), nickname());
+    let (handover, handover_nick) = (nickname(), nickname());
     let channel = format!("#{}", nickname());
     let server = IrcServer {
         password: random(),
@@ -1945,6 +1956,8 @@ async fn irc_answers_signed_in_people_and_checks_nicknames_before_direct_replies
         ..IrcServer::default()
     };
     let (q1, q2, q3) = (random(), random(), random());
+    // Long enough for a reply of two lines.
+    let q4 = (0..16).map(|_| random()).collect::<Vec<_>>().join(" ");
     let token = nickname();
     server.script.lock().unwrap().extend([
         // Not signed in to services: no sender, so a group refuses it.
@@ -1966,12 +1979,18 @@ async fn irc_answers_signed_in_people_and_checks_nicknames_before_direct_replies
         format!("PING :{token}"),
         format!("@account={friend} :{friend_nick}!u@h PRIVMSG {{nick}} :{q2}"),
         format!("@account={moved} :{moved_nick}!u@h PRIVMSG {{nick}} :{q3}"),
+        format!("@account={handover} :{handover_nick}!u@h PRIVMSG {{nick}} :{q4}"),
     ]);
     {
         let mut accounts = server.accounts.lock().unwrap();
-        accounts.insert(friend_nick.clone(), friend.clone());
+        accounts.insert(friend_nick.clone(), VecDeque::from([friend.clone()]));
         // Someone else has the nickname by the time the reply is ready.
-        accounts.insert(moved_nick.clone(), impostor);
+        accounts.insert(moved_nick.clone(), VecDeque::from([impostor.clone()]));
+        // Or takes it between the reply's first and second line.
+        accounts.insert(
+            handover_nick.clone(),
+            VecDeque::from([handover.clone(), impostor]),
+        );
     }
     let origin = serve_irc(server.clone()).await;
     let (dir, credential, pairing, _anchor) = broker(&origin, &server.password).await;
@@ -1988,8 +2007,18 @@ async fn irc_answers_signed_in_people_and_checks_nicknames_before_direct_replies
     let entry = MessengerConfig {
         kind: MessengerKind::Irc,
         login: Some(login.clone()),
-        allowed_chats: BTreeSet::from([channel.clone(), friend.clone(), moved.clone()]),
-        allowed_users: BTreeSet::from([member.clone(), friend.clone(), moved.clone()]),
+        allowed_chats: BTreeSet::from([
+            channel.clone(),
+            friend.clone(),
+            moved.clone(),
+            handover.clone(),
+        ]),
+        allowed_users: BTreeSet::from([
+            member.clone(),
+            friend.clone(),
+            moved.clone(),
+            handover.clone(),
+        ]),
         ..config("irc", &origin, &credential, 0)
     };
     let name = entry.name.clone();
@@ -2000,10 +2029,21 @@ async fn irc_answers_signed_in_people_and_checks_nicknames_before_direct_replies
     let stop = CancellationToken::new();
     let supervisor = tokio::spawn(supervise(host.clone(), receiver, FAST, stop.clone()));
     let has = |line: &str| server.received.lock().unwrap().iter().any(|l| l == line);
+    let sent_to = |nick: &str| {
+        server
+            .received
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|l| l.starts_with(&format!("PRIVMSG {nick} ")))
+            .count()
+    };
     host.until(|h| {
         has(&format!("PRIVMSG {friend_nick} :reply to {q2}"))
-            && h.turns.lock().unwrap().len() == 3
-            && h.status(&name).failure.is_some()
+            && h.turns.lock().unwrap().len() == 4
+            && h.status(&name)
+                .failure
+                .is_some_and(|f| f.message.contains(&handover))
     })
     .await;
     let status = host.status(&name);
@@ -2016,22 +2056,23 @@ async fn irc_answers_signed_in_people_and_checks_nicknames_before_direct_replies
         .iter()
         .map(|(_, t)| t.clone())
         .collect();
-    assert_eq!(turns, [q1.clone(), q2.clone(), q3.clone()]);
+    assert_eq!(turns, [q1.clone(), q2.clone(), q3.clone(), q4.clone()]);
     assert!(has(&format!("JOIN {channel}")));
     assert!(has(&format!("PONG :{token}")));
     assert!(has(&format!("PRIVMSG {channel} :reply to {q1}")));
     assert!(has(&format!("WHOIS {moved_nick}")));
     // The nickname now belongs to someone else: nothing is sent to it.
-    assert!(
-        !server
-            .received
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|l| l.starts_with(&format!("PRIVMSG {moved_nick}")))
-    );
-    let failure = status.failure.unwrap();
-    assert!(failure.message.contains(&moved), "{failure:?}");
+    assert_eq!(sent_to(&moved_nick), 0);
+    // A nickname taken over mid-reply gets only the line checked before.
+    let whois = format!("WHOIS {handover_nick}");
+    let asked = server
+        .received
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|l| **l == whois)
+        .count();
+    assert_eq!((asked, sent_to(&handover_nick)), (2, 1));
     let refused: Vec<_> = status
         .refused
         .iter()

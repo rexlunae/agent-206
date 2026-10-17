@@ -146,8 +146,8 @@ fn MessengerCard(now: u64, config: MessengerConfig, status: MessengerStatus) -> 
                 Badge { tone: tone(status.state), "{status.state.label()}" }
                 if let Some(account) = &status.account { span { class: "a206-muted", "Bot account {account}" } }
             }
-            if let Some(login) = config.login.as_deref().filter(|_| config.kind.needs_login()) {
-                p { class: "a206-muted", "Signs in as {login}" }
+            if config.kind.needs_login() {
+                LoginRow { messenger: config.name.clone(), current: config.login.clone() }
             }
             CredentialRow { messenger: config.name.clone(), app: false, current: config.credential.clone() }
             if config.kind.needs_app_credential() {
@@ -221,6 +221,29 @@ fn CredentialRow(messenger: String, app: bool, current: Option<String>) -> Eleme
                 save_messenger(state, &messenger, |m| if app { m.app_credential = value } else { m.credential = value });
                 draft.set(String::new());
             }, if current.is_some() { "Change credential" } else { "Use credential" } }
+        }
+    }
+}
+
+/// The services account an IRC entry signs in as, with a field to change it.
+#[component]
+fn LoginRow(messenger: String, current: Option<String>) -> Element {
+    let state = use_context::<State>();
+    let mut draft = use_signal(String::new);
+    let ready = !draft().trim().is_empty();
+    let shown = match &current {
+        Some(login) => format!("Signs in as {login}"),
+        None => "No login chosen; it cannot connect.".to_owned(),
+    };
+    rsx! {
+        p { class: "a206-muted", "{shown}" }
+        div { class: "a206-row",
+            Input { aria_label: "Login", value: ReadSignal::from(draft), oninput: move |v| draft.set(v), placeholder: "Nickname" }
+            Button { size: ButtonSize::Sm, variant: ButtonVariant::Secondary, availability: if ready { Availability::Enabled } else { Availability::Disabled }, onclick: move |_| {
+                let value = Some(draft().trim().to_owned());
+                save_messenger(state, &messenger, |m| m.login = value);
+                draft.set(String::new());
+            }, if current.is_some() { "Change login" } else { "Use login" } }
         }
     }
 }

@@ -48,6 +48,9 @@ impl Lines {
     async fn next(&mut self) -> Result<Option<String>, BrokerError> {
         loop {
             if let Some(end) = self.pending.iter().position(|&b| b == b'\n') {
+                if end > MAX_READ_LINE {
+                    return Err(BrokerError::Upstream(UpstreamFailure::TooLarge));
+                }
                 let mut line: Vec<u8> = self.pending.drain(..=end).collect();
                 line.pop();
                 if line.last() == Some(&b'\r') {
@@ -335,6 +338,8 @@ async fn sign_in(io: Box<dyn Io>, login: &str, password: &str) -> Result<SignIn,
     writer.line(&format!("NICK {login}")).await?;
     writer.line(&format!("USER {login} 0 * :Agent 206")).await?;
     let mut offered: Vec<String> = vec![];
+    let mut acknowledged: Vec<String> = vec![];
+    let mut authenticating = false;
     let mut signed_in = false;
     for _ in 0..MAX_SIGN_IN_LINES {
         let Some(line) = lines.next().await? else {
@@ -362,7 +367,25 @@ async fn sign_in(io: Box<dyn Io>, login: &str, password: &str) -> Result<SignIn,
                     }
                 }
             }
-            ("CAP", [_, "ACK", ..]) => writer.line("AUTHENTICATE PLAIN").await?,
+            // An acknowledgement may span several lines (`*` before the
+            // list); sign-in starts once both required capabilities are on.
+            ("CAP", [_, "ACK", rest @ ..]) => {
+                let caps = match rest {
+                    ["*", caps] | [caps] => *caps,
+                    _ => return Err(BrokerError::Upstream(UpstreamFailure::SocketProtocol)),
+                };
+                for cap in caps.split(' ').filter(|c| !c.is_empty()) {
+                    match cap.strip_prefix('-') {
+                        Some(removed) => acknowledged.retain(|c| c != removed),
+                        None => acknowledged.push(cap.to_owned()),
+                    }
+                }
+                let on = |name: &str| acknowledged.iter().any(|c| c == name);
+                if !authenticating && on("sasl") && on("account-tag") {
+                    authenticating = true;
+                    writer.line("AUTHENTICATE PLAIN").await?;
+                }
+            }
             ("CAP", [_, "NAK", ..]) => return Ok(SignIn::Refused("sasl_unavailable")),
             ("AUTHENTICATE", ["+"]) => send_password(&mut writer, login, password).await?,
             ("903", _) => {
@@ -447,6 +470,7 @@ async fn send_password(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
     #[test]
     fn lines_parse_past_tags_and_source() {
@@ -485,6 +509,82 @@ mod tests {
         );
         assert_eq!(request(&caps(&["account-tag"])), Err("sasl_unavailable"));
         assert_eq!(request(&caps(&["sasl"])), Err("account_tag_unavailable"));
+    }
+
+    fn lines(io: tokio::io::DuplexStream) -> Lines {
+        let (reader, _) = tokio::io::split(Box::new(io) as Box<dyn Io>);
+        Lines {
+            reader,
+            pending: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn oversized_server_lines_are_refused_with_or_without_an_ending() {
+        for ending in ["\r\n", ""] {
+            let (mut server, client) = tokio::io::duplex(MAX_READ_LINE * 2);
+            let mut read = lines(client);
+            let long = format!("{}{ending}", "a".repeat(MAX_READ_LINE + 1));
+            server.write_all(long.as_bytes()).await.unwrap();
+            drop(server);
+            assert_eq!(
+                read.next().await,
+                Err(BrokerError::Upstream(UpstreamFailure::TooLarge)),
+                "{ending:?}"
+            );
+        }
+        let (mut server, client) = tokio::io::duplex(1024);
+        let mut read = lines(client);
+        server.write_all(b"one\r\ntwo\n").await.unwrap();
+        drop(server);
+        assert_eq!(read.next().await, Ok(Some("one".to_owned())));
+        assert_eq!(read.next().await, Ok(Some("two".to_owned())));
+        assert_eq!(read.next().await, Ok(None));
+    }
+
+    /// Sign-in waits for every required capability, even when the server
+    /// acknowledges them on separate lines.
+    #[tokio::test]
+    async fn sasl_starts_only_once_both_capabilities_are_acknowledged() {
+        let (server, client) = tokio::io::duplex(64 * 1024);
+        let login = format!("bot{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
+        let password = uuid::Uuid::new_v4().to_string();
+        let signing = tokio::spawn({
+            let login = login.clone();
+            async move { sign_in(Box::new(client), &login, &password).await }
+        });
+        let (read, mut write) = tokio::io::split(server);
+        let mut read = tokio::io::BufReader::new(read).lines();
+        let mut next = async || read.next_line().await.unwrap().unwrap();
+        assert_eq!(next().await, "CAP LS 302");
+        next().await;
+        next().await;
+        write
+            .write_all(b":s CAP * LS :sasl account-tag\r\n")
+            .await
+            .unwrap();
+        assert_eq!(next().await, "CAP REQ :sasl account-tag");
+        write.write_all(b":s CAP * ACK * :sasl\r\n").await.unwrap();
+        write
+            .write_all(b":s CAP * ACK :account-tag\r\n")
+            .await
+            .unwrap();
+        // Nothing was sent between the two acknowledgements.
+        assert_eq!(next().await, "AUTHENTICATE PLAIN");
+        write.write_all(b"AUTHENTICATE +\r\n").await.unwrap();
+        let payload = next().await;
+        assert!(payload.starts_with("AUTHENTICATE "), "{payload}");
+        assert_ne!(payload, "AUTHENTICATE PLAIN");
+        write
+            .write_all(format!(":s 903 {login} :ok\r\n").as_bytes())
+            .await
+            .unwrap();
+        assert_eq!(next().await, "CAP END");
+        write
+            .write_all(format!(":s 001 {login} :Welcome\r\n").as_bytes())
+            .await
+            .unwrap();
+        assert!(matches!(signing.await.unwrap(), Ok(SignIn::Ready { .. })));
     }
 
     #[test]

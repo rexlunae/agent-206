@@ -7,8 +7,8 @@
 //! account, which the server attaches to each message (`account-tag`):
 //! sender lists name accounts, a direct message's chat is the sender's
 //! account, and a message from someone not signed in to services is never
-//! taken as from anyone listed. Before a direct reply is sent, the nickname
-//! is checked (`WHOIS`) to still belong to that account.
+//! taken as from anyone listed. Before each line of a direct reply is sent,
+//! the nickname is checked (`WHOIS`) to still belong to that account.
 //!
 //! The session runs in its own task, which answers the server's pings while
 //! turns run and paces replies so the server does not disconnect the bot
@@ -16,19 +16,20 @@
 //! delivered: IRC has no history to catch up from.
 use super::listener::{Listener, Queue};
 use super::{Account, Api, Batch, Event, Inbound, MessengerError, Result};
-use a206_broker::{Socket, SocketEvent, SocketScheme};
+use a206_broker::{MAX_IRC_LINE, Socket, SocketEvent, SocketScheme};
 use a206_core::messengers::{irc_lowercase, valid_irc_channel, valid_irc_nick};
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 
 const SERVICE: &str = "IRC";
-/// Bytes of message text per line, leaving room in the server's 512-byte
-/// line for the command, the target and the source it adds when relaying.
-const MAX_TEXT_BYTES: usize = 380;
+/// Room left in each line for the source (`:nick!user@host `) the server
+/// adds when it relays a message, so the relayed line still fits in 512 bytes.
+const RELAY_ROOM: usize = 120;
 /// Most lines one reply is sent as; the rest is cut with a notice.
 const MAX_REPLY_LINES: usize = 24;
-/// Time between lines, so a long reply is not taken for a flood.
+/// Time between lines, so a long reply is not taken for a flood. A direct
+/// reply's lines each follow their own `WHOIS`, so they are spaced twice this.
 const LINE_SPACING: Duration = Duration::from_millis(700);
 /// How long the server may take to answer a `WHOIS`.
 const WHOIS_TIMEOUT: Duration = Duration::from_secs(30);
@@ -280,15 +281,20 @@ async fn serve(
     }
 }
 
-/// A direct reply waiting for its `WHOIS` answer.
+/// A direct reply being sent a line at a time, each after a `WHOIS` shows
+/// `nick` still belongs to `account`, so a nickname that changes hands
+/// mid-reply receives none of the rest.
 struct Check {
     nick: String,
     account: String,
     /// The account the server reported for `nick`, once it has.
     found: Option<String>,
-    lines: Vec<String>,
+    lines: VecDeque<String>,
     done: oneshot::Sender<Result<()>>,
-    until: tokio::time::Instant,
+    /// When to ask about the next line; `None` while a question is open.
+    ask_at: Option<tokio::time::Instant>,
+    /// When the open question times out.
+    until: Option<tokio::time::Instant>,
 }
 
 /// Lines being sent, spaced out, and who waits for them.
@@ -340,7 +346,8 @@ async fn session(
     let mut check: Option<Check> = None;
     let mut sending = Sending::default();
     loop {
-        let until = check.as_ref().map(|check| check.until);
+        let until = check.as_ref().and_then(|check| check.until);
+        let ask_at = check.as_ref().and_then(|check| check.ask_at);
         let next_line = sending.next.filter(|_| !sending.lines.is_empty());
         tokio::select! {
             event = socket.next() => {
@@ -398,6 +405,7 @@ async fn session(
                     // RPL_WHOISACCOUNT: <me> <nick> <account> :is logged in as
                     ("330", [_, whois, account, ..]) => {
                         if let Some(check) = check.as_mut()
+                            && check.until.is_some()
                             && irc_lowercase(whois) == irc_lowercase(&check.nick)
                         {
                             check.found = Some(irc_lowercase(account));
@@ -405,19 +413,28 @@ async fn session(
                     }
                     // End of WHOIS, or no such nickname.
                     ("318" | "401", [_, whois, ..]) => {
-                        if check
-                            .as_ref()
-                            .is_some_and(|check| irc_lowercase(whois) == irc_lowercase(&check.nick))
-                            && let Some(done) = check.take()
+                        if check.as_ref().is_some_and(|check| {
+                            check.until.is_some()
+                                && irc_lowercase(whois) == irc_lowercase(&check.nick)
+                        }) && let Some(mut current) = check.take()
                         {
-                            if done.found.as_deref() == Some(done.account.as_str()) {
-                                sending.next.get_or_insert_with(tokio::time::Instant::now);
-                                sending.push(done.lines, done.done);
-                            } else {
-                                nicks.remove(&done.account);
-                                answer(done.done, Err(MessengerError::RecipientGone {
-                                    chat: done.account,
+                            if current.found.take().as_deref() != Some(current.account.as_str()) {
+                                nicks.remove(&current.account);
+                                answer(current.done, Err(MessengerError::RecipientGone {
+                                    chat: current.account,
                                 }));
+                            } else if let Some(line) = current.lines.pop_front() {
+                                socket.send(line).await.map_err(broker)?;
+                                if current.lines.is_empty() {
+                                    answer(current.done, Ok(()));
+                                } else {
+                                    current.until = None;
+                                    current.ask_at =
+                                        Some(tokio::time::Instant::now() + LINE_SPACING * 2);
+                                    check = Some(current);
+                                }
+                            } else {
+                                answer(current.done, Ok(()));
                             }
                         }
                     }
@@ -450,14 +467,14 @@ async fn session(
                             sending.next.get_or_insert_with(tokio::time::Instant::now);
                             sending.push(lines, done);
                         } else {
-                            socket.send(format!("WHOIS {target}")).await.map_err(broker)?;
                             check = Some(Check {
                                 nick: target,
                                 account: chat,
                                 found: None,
-                                lines,
+                                lines: lines.into(),
                                 done,
-                                until: tokio::time::Instant::now() + WHOIS_TIMEOUT,
+                                ask_at: Some(tokio::time::Instant::now()),
+                                until: None,
                             });
                         }
                     }
@@ -470,6 +487,13 @@ async fn session(
                     sending.settle();
                 }
                 sending.next = Some(tokio::time::Instant::now() + LINE_SPACING);
+            }
+            () = sleep_until(ask_at) => {
+                if let Some(check) = check.as_mut() {
+                    socket.send(format!("WHOIS {}", check.nick)).await.map_err(broker)?;
+                    check.ask_at = None;
+                    check.until = Some(tokio::time::Instant::now() + WHOIS_TIMEOUT);
+                }
             }
             () = sleep_until(until) => {
                 if let Some(check) = check.take() {
@@ -540,8 +564,14 @@ fn message_event(line: &Line<'_>, target: &str, text: &str, own: &str) -> Event 
 }
 
 /// `PRIVMSG` lines for `text`: one per line of text, split to fit, without
-/// control characters, cut at [`MAX_REPLY_LINES`].
+/// control characters, cut at [`MAX_REPLY_LINES`]. Each line fits the
+/// broker's [`MAX_IRC_LINE`] with [`RELAY_ROOM`] to spare, whatever the
+/// target's length.
 fn reply_lines(target: &str, text: &str) -> Vec<String> {
+    let header = format!("PRIVMSG {target} :");
+    let budget = MAX_IRC_LINE
+        .saturating_sub(RELAY_ROOM + header.len())
+        .max(TRUNCATED.len());
     let mut parts = vec![];
     for line in text.lines() {
         let clean: String = line
@@ -551,7 +581,7 @@ fn reply_lines(target: &str, text: &str) -> Vec<String> {
             .collect();
         let mut rest = clean.trim_end();
         while !rest.is_empty() {
-            let (part, tail) = split_at_bytes(rest, MAX_TEXT_BYTES);
+            let (part, tail) = split_at_bytes(rest, budget);
             parts.push(part.to_owned());
             rest = tail.trim_start();
         }
@@ -562,7 +592,7 @@ fn reply_lines(target: &str, text: &str) -> Vec<String> {
     }
     parts
         .into_iter()
-        .map(|part| format!("PRIVMSG {target} :{part}"))
+        .map(|part| format!("{header}{part}"))
         .collect()
 }
 
@@ -681,20 +711,23 @@ mod tests {
                 format!("PRIVMSG {target} :QUIT :x"),
             ]
         );
-        let long = "é".repeat(MAX_TEXT_BYTES);
-        let lines = reply_lines(&target, &long);
-        assert!(
-            lines
-                .iter()
-                .all(|l| l.len() <= MAX_TEXT_BYTES + target.len() + 10)
-        );
-        assert_eq!(
-            lines
-                .iter()
-                .map(|l| l.split_once(" :").unwrap().1)
-                .collect::<String>(),
-            long
-        );
+        // The longest channel a messenger may join still gets lines the
+        // broker accepts, with room for the source the server adds.
+        let longest = format!("#{}", "c".repeat(199));
+        assert!(valid_irc_channel(&longest));
+        for target in [target.as_str(), &longest] {
+            let long = "é".repeat(MAX_IRC_LINE);
+            let lines = reply_lines(target, &long);
+            assert!(lines.len() > 1);
+            assert!(lines.iter().all(|l| l.len() <= MAX_IRC_LINE - RELAY_ROOM));
+            assert_eq!(
+                lines
+                    .iter()
+                    .map(|l| l.split_once(" :").unwrap().1)
+                    .collect::<String>(),
+                long
+            );
+        }
         let many = (0..MAX_REPLY_LINES * 2)
             .map(|i| i.to_string())
             .collect::<Vec<_>>()
