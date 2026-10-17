@@ -27,7 +27,7 @@ pub const LIST: &str = "schedule_list";
 pub const REMOVE: &str = "schedule_remove";
 /// Longest message text a result shows; `message_bytes` gives the full size.
 pub const MESSAGE_BYTES: usize = 512;
-/// Most bytes of jobs one `schedule_list` returns; `next_skip` continues it.
+/// Most bytes of jobs one `schedule_list` returns; `next_after` continues it.
 pub const LIST_BYTES: usize = 48 * 1024;
 
 /// Why a schedule tool call failed.
@@ -37,6 +37,8 @@ pub enum ScheduleToolError {
     Missing(&'static str),
     #[error("`{0}` has the wrong type")]
     Type(&'static str),
+    #[error("`after` is not a `next_after` from schedule_list")]
+    Cursor,
     #[error("unknown argument `{0}`")]
     Unknown(String),
     #[error("unknown schedule tool `{0}`")]
@@ -108,11 +110,11 @@ impl ScheduleHost {
             ),
             spec(
                 LIST,
-                "List the messages scheduled to this conversation, by the user or by you. A long listing stops early with `next_skip`; call again with `skip` set to it for the rest.",
+                "List the messages scheduled to this conversation, by the user or by you, oldest first. A long listing stops early with `next_after`; call again with `after` set to it for the rest.",
                 json!({
                     "type": "object",
                     "properties": {
-                        "skip": {"type": "integer", "minimum": 0, "description": "How many jobs to skip; `next_skip` from the previous listing."}
+                        "after": {"type": "string", "description": "`next_after` from the previous listing."}
                     },
                     "additionalProperties": false
                 }),
@@ -148,29 +150,42 @@ impl ScheduleHost {
                 Ok(describe(&job, thread))
             }
             LIST => {
-                allow(args, &["skip"])?;
-                let skip = match optional(args, "skip") {
-                    None => 0,
-                    Some(skip) => skip
-                        .as_u64()
-                        .and_then(|skip| usize::try_from(skip).ok())
-                        .ok_or_else(|| fail(ScheduleToolError::Type("skip")))?,
+                allow(args, &["after"])?;
+                let after = match optional(args, "after") {
+                    None => None,
+                    Some(after) => Some(cursor(
+                        after
+                            .as_str()
+                            .ok_or_else(|| fail(ScheduleToolError::Type("after")))?,
+                    )?),
                 };
-                let jobs = self.jobs.list(thread)?;
+                let mut jobs = self.jobs.list(thread)?;
+                // A cursor is a position in this fixed order, so jobs added or
+                // removed between pages never shift the rest.
+                jobs.sort_by_key(|job| (job.created, job.id));
                 let mut scheduled = Vec::new();
+                let mut last = None;
                 let mut bytes = 0;
-                for job in jobs.iter().skip(skip) {
+                let mut remaining = jobs
+                    .iter()
+                    .filter(|job| after.is_none_or(|after| (job.created, job.id) > after))
+                    .peekable();
+                while let Some(job) = remaining.peek() {
                     let entry = describe(job, thread);
                     bytes += entry.to_string().len() + 1;
                     if bytes > LIST_BYTES {
                         break;
                     }
                     scheduled.push(entry);
+                    last = Some((job.created, job.id));
+                    remaining.next();
                 }
-                let next = skip.saturating_add(scheduled.len());
+                let more = remaining.peek().is_some();
                 Ok(json!({
                     "total": jobs.len(),
-                    "next_skip": (next < jobs.len()).then_some(next),
+                    "next_after": last
+                        .filter(|_| more)
+                        .map(|(created, id)| format!("{created}:{id}")),
                     "scheduled": scheduled,
                     "you_may_add": MAX_AGENT_JOBS.saturating_sub(
                         jobs.iter().filter(|job| job.author == JobAuthor::Agent { thread }).count()
@@ -190,6 +205,12 @@ impl ScheduleHost {
     }
 }
 
+/// The position a `next_after` names.
+fn cursor(text: &str) -> Result<(u64, Id), ErrorReport> {
+    text.split_once(':')
+        .and_then(|(created, id)| Some((created.parse().ok()?, id.parse().ok()?)))
+        .ok_or_else(|| fail(ScheduleToolError::Cursor))
+}
 fn allow(args: &Map<String, Value>, known: &[&str]) -> Result<(), ErrorReport> {
     match args.keys().find(|key| !known.contains(&key.as_str())) {
         Some(key) => Err(fail(ScheduleToolError::Unknown(key.clone()))),

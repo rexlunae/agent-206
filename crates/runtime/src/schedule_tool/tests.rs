@@ -247,15 +247,16 @@ async fn listings_stay_whole_json_below_the_output_cap() {
         .await;
         assert!(matches!(reply, Reply::Job(_)), "{reply:?}");
     }
-    // Pages follow `next_skip` to every job exactly once.
+    // Pages follow `next_after` to every job exactly once, even when a job
+    // already listed is removed between pages.
     let mut seen = std::collections::BTreeSet::new();
     let mut pages = 0;
-    let mut skip = json!(null);
+    let mut after = json!(null);
     loop {
-        let listed = call(&host, mine, LIST, json!({ "skip": skip })).unwrap();
+        let listed = call(&host, mine, LIST, json!({ "after": after })).unwrap();
         pages += 1;
         assert!(listed.to_string().len() < crate::tools::MAX_OUTPUT);
-        assert_eq!(listed["total"], count);
+        assert_eq!(listed["total"], count - usize::from(pages > 1));
         let shown = listed["scheduled"].as_array().unwrap();
         assert!(!shown.is_empty());
         for job in shown {
@@ -268,13 +269,20 @@ async fn listings_stay_whole_json_below_the_output_cap() {
             );
             assert_eq!(job["message_bytes"], message.len());
         }
-        if listed["next_skip"].is_null() {
+        if listed["next_after"].is_null() {
             break;
         }
-        skip = listed["next_skip"].clone();
+        after = listed["next_after"].clone();
+        if pages == 1 {
+            // Remove the first job listed; the next page must not skip one.
+            let first: Id = shown[0]["id"].as_str().unwrap().parse().unwrap();
+            assert_eq!(send(&g, Command::RemoveJob { id: first }).await, Reply::Ok);
+        }
     }
     assert!(pages > 1, "the listing needed more than one page");
     assert_eq!(seen.len(), count);
-    let error = call(&host, mine, LIST, json!({"skip": "later"})).unwrap_err();
-    assert_eq!(error.kind, ErrorKind::InvalidRequest);
+    for bad in [json!(7), json!("later"), json!("1:not-an-id")] {
+        let error = call(&host, mine, LIST, json!({ "after": bad })).unwrap_err();
+        assert_eq!(error.kind, ErrorKind::InvalidRequest, "{bad}");
+    }
 }

@@ -57,8 +57,9 @@ conversation until the user permits them:
   must be a whole second, so a message never arrives before the time approved.
 - `schedule_list` lists the conversation's jobs, the user's included, marked
   `added_by: user` or `you`. Results show the first 512 bytes of each message
-  with its full `message_bytes`. A listing stops at 48 KiB with `next_skip`,
-  which `schedule_list { skip }` continues from, so every listing is complete
+  with its full `message_bytes`. Jobs are listed oldest first; a listing stops at 48
+  KiB with `next_after`, a cursor over that order which `schedule_list { after }`
+  continues from even when jobs are added or removed between pages, so every listing is complete
   JSON below the output cap and every job is reachable. Only the listing is
   marked whole output: adding and removing commit before they return, so their
   small results are never turned into a failure for lack of room.
