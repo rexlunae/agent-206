@@ -5,14 +5,14 @@ use a206_core::{
     schedule::{parse_instant, parse_interval},
 };
 use a206_runtime::client::Client;
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use clap::Subcommand;
 
 #[derive(Subcommand)]
 pub enum ScheduleAction {
     /// List scheduled messages with their next and latest runs.
     List,
-    /// Schedule a message. Give exactly one of --at, --every or --cron.
+    /// Schedule a message. Give exactly one of --at, --in, --every or --cron.
     Add {
         /// The conversation the message is sent to.
         thread: uuid::Uuid,
@@ -25,10 +25,14 @@ pub enum ScheduleAction {
         /// Once, at an RFC 3339 time such as 2026-10-18T09:00:00Z.
         #[arg(long, group = "when")]
         at: Option<String>,
+        /// Once, after this long (for example "90m" or "1d"), by the gateway's clock.
+        #[arg(long = "in", group = "when")]
+        after: Option<String>,
         /// Repeatedly, at this interval (for example "90m" or "1d").
         #[arg(long, group = "when")]
         every: Option<String>,
-        /// Start the --every grid at this RFC 3339 time instead of now.
+        /// Start the --every grid at this RFC 3339 time instead of when the
+        /// gateway accepts the job.
         #[arg(long, requires = "every")]
         anchor: Option<String>,
         /// On a cron expression: five fields, or six with seconds first.
@@ -50,26 +54,25 @@ pub enum ScheduleAction {
 
 fn schedule(
     at: Option<String>,
+    after: Option<String>,
     every: Option<String>,
     anchor: Option<String>,
     cron: Option<String>,
     zone: Option<String>,
 ) -> Result<Schedule> {
-    Ok(match (at, every, cron) {
-        (Some(at), None, None) => Schedule::At {
+    Ok(match (at, after, every, cron) {
+        (Some(at), None, None, None) => Schedule::At {
             at: parse_instant(&at)?,
         },
-        (None, Some(every), None) => {
-            let seconds = parse_interval(&every)?;
-            let anchor = match anchor {
-                Some(anchor) => parse_instant(&anchor)?,
-                None => u64::try_from(jiff::Timestamp::now().as_second())
-                    .context("the system clock is before 1970")?,
-            };
-            Schedule::Every { seconds, anchor }
-        }
-        (None, None, Some(expression)) => Schedule::Cron { expression, zone },
-        _ => bail!("give exactly one of --at, --every or --cron"),
+        (None, Some(after), None, None) => Schedule::In {
+            seconds: parse_interval(&after)?,
+        },
+        (None, None, Some(every), None) => Schedule::Every {
+            seconds: parse_interval(&every)?,
+            anchor: anchor.as_deref().map(parse_instant).transpose()?,
+        },
+        (None, None, None, Some(expression)) => Schedule::Cron { expression, zone },
+        _ => bail!("give exactly one of --at, --in, --every or --cron"),
     })
 }
 
@@ -98,6 +101,7 @@ pub async fn run(client: &Client, action: ScheduleAction) -> Result<()> {
             name,
             text,
             at,
+            after,
             every,
             anchor,
             cron,
@@ -106,7 +110,7 @@ pub async fn run(client: &Client, action: ScheduleAction) -> Result<()> {
             name,
             thread,
             text,
-            schedule: schedule(at, every, anchor, cron, zone)?,
+            schedule: schedule(at, after, every, anchor, cron, zone)?,
         },
         ScheduleAction::Pause { id } => Command::SetJobEnabled { id, enabled: false },
         ScheduleAction::Resume { id } => Command::SetJobEnabled { id, enabled: true },
@@ -135,6 +139,7 @@ mod tests {
         assert_eq!(
             schedule(
                 None,
+                None,
                 Some(format!("{seconds}s")),
                 Some(anchor.to_string()),
                 None,
@@ -143,17 +148,30 @@ mod tests {
             .unwrap(),
             Schedule::Every {
                 seconds,
-                anchor: seconds
+                anchor: Some(seconds)
+            }
+        );
+        // Without --anchor, and for --in, the gateway's clock decides.
+        assert_eq!(
+            schedule(None, None, Some(format!("{seconds}s")), None, None, None).unwrap(),
+            Schedule::Every {
+                seconds,
+                anchor: None
             }
         );
         assert_eq!(
-            schedule(Some(anchor.to_string()), None, None, None, None).unwrap(),
+            schedule(None, Some(format!("{seconds}s")), None, None, None, None).unwrap(),
+            Schedule::In { seconds }
+        );
+        assert_eq!(
+            schedule(Some(anchor.to_string()), None, None, None, None, None).unwrap(),
             Schedule::At { at: seconds }
         );
-        assert!(schedule(None, None, None, None, None).is_err());
+        assert!(schedule(None, None, None, None, None, None).is_err());
         assert!(
             schedule(
                 Some(anchor.to_string()),
+                None,
                 None,
                 None,
                 Some("* * * * *".into()),
@@ -161,10 +179,10 @@ mod tests {
             )
             .is_err()
         );
-        assert!(schedule(None, Some("-5m".into()), None, None, None).is_err());
+        assert!(schedule(None, None, Some("-5m".into()), None, None, None).is_err());
         // Fractions of a second are refused, not truncated.
         let fraction = format!("{seconds}.{}s", 1 + seconds % 9);
-        assert!(schedule(None, Some(fraction), None, None, None).is_err());
-        assert!(schedule(Some("tomorrow".into()), None, None, None, None).is_err());
+        assert!(schedule(None, None, Some(fraction), None, None, None).is_err());
+        assert!(schedule(Some("tomorrow".into()), None, None, None, None, None).is_err());
     }
 }

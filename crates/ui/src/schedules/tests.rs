@@ -105,22 +105,21 @@ fn an_empty_page_says_so_and_offers_the_form() {
 
 #[test]
 fn the_form_builds_exactly_the_schedule_it_shows() {
-    let now = arbitrary(4_000_000_000);
     let seconds = 60 + arbitrary(1_000_000);
-    let blank = |kind| form_schedule(kind, "", "", "", "", "", now);
+    let blank = |kind| form_schedule(kind, "", "", "", "", "");
     for kind in Kind::ALL {
         assert!(blank(kind).is_none(), "nothing typed is not an error");
     }
-    let every = form_schedule(Kind::Every, "", "", "", &format_interval(seconds), "", now);
+    let every = form_schedule(Kind::Every, "", "", "", &format_interval(seconds), "");
     assert_eq!(
         every.unwrap().unwrap(),
         Schedule::Every {
             seconds,
-            anchor: now
+            anchor: None
         }
     );
     assert!(matches!(
-        form_schedule(Kind::Every, "", "", "", "soon", "", now),
+        form_schedule(Kind::Every, "", "", "", "soon", ""),
         Some(Err(ScheduleInputError::Duration { .. }))
     ));
     let at = 86_400 + arbitrary(4_000_000_000);
@@ -135,13 +134,12 @@ fn the_form_builds_exactly_the_schedule_it_shows() {
         "UTC",
         "",
         "",
-        now,
     );
     assert_eq!(once.unwrap().unwrap(), Schedule::At { at: at - at % 60 });
     let expression = format!("{} 9 * * *", arbitrary(60));
     for (zone, expected) in [("", None), (" UTC ", Some("UTC".to_owned()))] {
         assert_eq!(
-            form_schedule(Kind::Cron, "", "", zone, "", &expression, now)
+            form_schedule(Kind::Cron, "", "", zone, "", &expression)
                 .unwrap()
                 .unwrap(),
             Schedule::Cron {
