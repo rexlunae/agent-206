@@ -13,6 +13,9 @@ thiserror.workspace = true
 tracing.workspace = true
 tokio.workspace = true
 base64 = "0.22"
+[target.'cfg(unix)'.dependencies]
+# Safe wrappers for the session and terminal calls the launcher and helper make.
+rustix = { version = "1", features = ["process", "termios"] }
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = "0.4.4"
 [dev-dependencies]

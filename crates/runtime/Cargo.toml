@@ -53,6 +53,7 @@ serde_bytes = "0.11"
 [target.'cfg(unix)'.dependencies]
 async-io = "2"
 nix = { version = "0.31", features = ["signal", "process", "fs", "user"] }
+rustix = { version = "1", features = ["pty", "termios", "fs"] }
 [features]
 # Test-only gateway hooks (attaching an in-process MCP session). Enabled for
 # this crate's own tests below; the application never enables it.

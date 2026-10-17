@@ -15,7 +15,8 @@ summarize-older-turns compaction (`gateway/providers/mod.rs`), and the memory
 extension's BM25 search with heading/20-line section chunking, its word
 tokenization and the `MEMORY.md` + `memory/` file scope of `memory_search`,
 `memory_get` and note saving (`memory.rs`, `tools/memory_tools.rs`;
-plugins/memory) are adapted from
+plugins/memory), and the key names and escape sequences of background
+process keystrokes (`process_manager.rs` `translate_keys`) are adapted from
 RustyClaw,
 https://github.com/rexlunae/RustyClaw,
 Copyright (c) 2026 Erica Stith, MIT License (included in LICENSE).

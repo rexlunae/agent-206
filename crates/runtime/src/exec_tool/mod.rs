@@ -22,13 +22,18 @@
 //! started it follows it with `process` (list, poll, kill, remove) and gives
 //! it input with `process_write`, which the user approves like a command
 //! (`sessions`). A session stops as soon as its conversation no longer grants
-//! what its sandbox was given.
+//! what its sandbox was given. With `terminal` a background command runs on
+//! its own pseudo-terminal (`terminal`), and `process_write` can also send
+//! it named keys such as Ctrl-C (`keys`).
 //!
 //! Platforms without that isolation do not offer these tools: they report
 //! them unavailable rather than run commands unconfined.
 // Nothing starts a session where commands are unsupported.
+pub mod keys;
 #[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
 mod sessions;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod terminal;
 
 use crate::tools::{ToolHost, ToolListing, ToolOutput, ToolRequest, ToolScope, ToolSpec};
 use a206_core::{Capability, ErrorKind, ErrorReport, ToolPermission, UnavailableTools};
@@ -60,6 +65,9 @@ pub const MAX_TIMEOUT: u64 = 600;
 pub const DEFAULT_BACKGROUND_TIMEOUT: u64 = 600;
 /// Longest a background command may run.
 pub const MAX_BACKGROUND_TIMEOUT: u64 = 3600;
+/// Columns and rows a session's terminal reports.
+pub const TERMINAL_COLUMNS: u16 = 80;
+pub const TERMINAL_ROWS: u16 = 24;
 /// Longest command accepted.
 pub const MAX_COMMAND: usize = 16 * 1024;
 /// Output kept from each of stdout and stderr; the rest is read and dropped
@@ -115,8 +123,21 @@ pub enum ExecError {
     Action,
     #[error("`session` must name a background session")]
     Session,
-    #[error("`data` is required, at most {MAX_INPUT} bytes, unless `close` is set")]
+    #[error("`data` is required, at most {MAX_INPUT} bytes, unless `keys` or `close` is set")]
     Data,
+    #[error("`keys` must be a list of at most {} key names", keys::MAX_KEYS)]
+    NotKeys,
+    #[error(transparent)]
+    Key(#[from] keys::UnknownKey),
+    #[error("`terminal` needs `background`")]
+    TerminalNeedsBackground,
+    #[error("keys need a session started with `terminal`; send text with `data`")]
+    KeysNeedTerminal,
+    #[error("a terminal's input cannot be closed; send the key Ctrl-D to end it")]
+    TerminalClose,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[error("could not give the command a terminal")]
+    Terminal(#[source] terminal::TerminalError),
     #[error("no such background session in this conversation")]
     UnknownSession,
     #[error("this conversation already holds {limit} background sessions; remove a finished one")]
@@ -147,6 +168,9 @@ impl crate::error::Classified for ExecError {
             | Self::Action
             | Self::Session
             | Self::Data
+            | Self::NotKeys
+            | Self::Key(_)
+            | Self::TerminalNeedsBackground
             | Self::MissingCommand
             | Self::Command
             | Self::Timeout
@@ -164,7 +188,11 @@ impl crate::error::Classified for ExecError {
             Self::TooManySessions { .. }
             | Self::SessionFinished
             | Self::InputClosed
+            | Self::KeysNeedTerminal
+            | Self::TerminalClose
             | Self::Input(_) => ErrorKind::Conflict,
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            Self::Terminal(_) => ErrorKind::Internal,
         })
     }
 }
@@ -176,6 +204,8 @@ struct Call {
     working_dir: Option<PathBuf>,
     timeout: u64,
     background: bool,
+    /// Run on a pseudo-terminal; only in the background.
+    terminal: bool,
 }
 
 fn text(arguments: &Map<String, Value>, key: &'static str) -> Result<Option<String>, ExecError> {
@@ -202,10 +232,20 @@ fn only(arguments: &Map<String, Value>, known: &[&str]) -> Result<(), ExecError>
 fn parse(arguments: &Map<String, Value>) -> Result<Call, ExecError> {
     only(
         arguments,
-        &["command", "working_dir", "timeout_secs", "background"],
+        &[
+            "command",
+            "working_dir",
+            "timeout_secs",
+            "background",
+            "terminal",
+        ],
     )?;
     let text = |key| text(arguments, key);
     let background = flag(arguments, "background")?;
+    let terminal = flag(arguments, "terminal")?;
+    if terminal && !background {
+        return Err(ExecError::TerminalNeedsBackground);
+    }
     let command = text("command")?.ok_or(ExecError::MissingCommand)?;
     if command.trim().is_empty() || command.len() > MAX_COMMAND || command.contains('\0') {
         return Err(ExecError::Command);
@@ -243,6 +283,7 @@ fn parse(arguments: &Map<String, Value>) -> Result<Call, ExecError> {
         working_dir,
         timeout,
         background,
+        terminal,
     })
 }
 
@@ -274,20 +315,36 @@ fn parse_action(arguments: &Map<String, Value>) -> Result<Action, ExecError> {
 #[derive(Debug, PartialEq, Eq)]
 struct Write {
     session: a206_core::Id,
+    /// The text, then the keys' sequences.
     data: Vec<u8>,
+    /// Whether any keys were named, which needs a terminal.
+    keys: bool,
     close: bool,
 }
 fn parse_write(arguments: &Map<String, Value>) -> Result<Write, ExecError> {
-    only(arguments, &["session", "data", "close"])?;
+    only(arguments, &["session", "data", "keys", "close"])?;
     let session = session(arguments)?;
     let close = flag(arguments, "close")?;
-    let data = text(arguments, "data")?.unwrap_or_default().into_bytes();
-    if data.len() > MAX_INPUT || (data.is_empty() && !close) {
+    let mut data = text(arguments, "data")?.unwrap_or_default().into_bytes();
+    if data.len() > MAX_INPUT {
+        return Err(ExecError::Data);
+    }
+    let names = match arguments.get("keys") {
+        None | Some(Value::Null) => vec![],
+        Some(Value::Array(names)) if names.len() <= keys::MAX_KEYS => names
+            .iter()
+            .map(|name| name.as_str().ok_or(ExecError::NotKeys))
+            .collect::<Result<_, _>>()?,
+        Some(_) => return Err(ExecError::NotKeys),
+    };
+    data.extend(keys::translate(names.iter().copied())?);
+    if data.is_empty() && !close {
         return Err(ExecError::Data);
     }
     Ok(Write {
         session,
         data,
+        keys: !names.is_empty(),
         close,
     })
 }
@@ -317,7 +374,10 @@ impl ExecHost {
                  network only with network access. Nothing else on the computer is visible, \
                  and the environment is empty. Every call needs the user's approval. With \
                  `background` it returns a session id at once and the command keeps running: \
-                 follow it with `{PROCESS}` and give it input with `{PROCESS_WRITE}`."
+                 follow it with `{PROCESS}` and give it input with `{PROCESS_WRITE}`. Add \
+                 `terminal` for a program that needs a terminal: it then runs on a {TERMINAL_COLUMNS}x{TERMINAL_ROWS} \
+                 pseudo-terminal with TERM=dumb, its stdout and stderr arrive as one stream, and \
+                 `{PROCESS_WRITE}` can send it keys such as Ctrl-C."
             ),
             parameters: json!({
                 "type": "object",
@@ -343,6 +403,10 @@ impl ExecHost {
                     "background": {
                         "type": "boolean",
                         "description": "Return a session id at once and keep the command running."
+                    },
+                    "terminal": {
+                        "type": "boolean",
+                        "description": "With background: run the command on a pseudo-terminal."
                     }
                 },
                 "required": ["command"],
@@ -381,17 +445,27 @@ impl ExecHost {
     fn write_spec() -> ToolSpec {
         ToolSpec {
             name: PROCESS_WRITE.into(),
-            description: "Write text to the standard input of one of this conversation's \
-                          background commands, then close its input if `close` is set. Every \
-                          call needs the user's approval, like a command. If the command does \
-                          not take the input within a few seconds the call fails and the rest of \
-                          the input is withdrawn."
-                .into(),
+            description:
+                "Write text to the standard input of one of this conversation's background \
+                 commands, then close its input if `close` is set. A command started with \
+                 `terminal` takes `keys` too, sent after the text: Enter, Tab, Escape, Space, \
+                 Backspace, Delete, Insert, Up, Down, Left, Right, Home, End, PageUp, PageDown, \
+                 F1 to F12 and Ctrl-A to Ctrl-Z (Ctrl-C interrupts, Ctrl-D ends input); its \
+                 input cannot be closed. Every call needs the user's approval, like a command. \
+                 If the command does not take the input within a few seconds the call fails \
+                 and the rest of the input is withdrawn."
+                    .into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "session": { "type": "string" },
                     "data": { "type": "string", "maxLength": MAX_INPUT },
+                    "keys": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "maxItems": keys::MAX_KEYS,
+                        "description": "Key names to press after the text, such as [\"Enter\"] or [\"Ctrl-C\"]."
+                    },
                     "close": { "type": "boolean", "description": "Close the command's input afterwards." }
                 },
                 "required": ["session"],
@@ -445,7 +519,13 @@ impl ExecHost {
                 let write = parse_write(&request.arguments)?;
                 let bytes = write.data.len();
                 self.sessions
-                    .write(scope.thread, write.session, write.data, write.close)
+                    .write(
+                        scope.thread,
+                        write.session,
+                        write.data,
+                        write.keys,
+                        write.close,
+                    )
                     .await?;
                 Ok(done(format!(
                     "Wrote {bytes} bytes to session {}{}.",
@@ -510,6 +590,8 @@ impl ExecHost {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 struct Started {
     child: tokio::process::Child,
+    /// The gateway's side of the command's terminal, if it has one.
+    terminal: Option<terminal::Controller>,
     group: Group,
     control: a206_sandbox::Control,
     /// The command's private home and temporary directory, removed with it.
@@ -527,6 +609,7 @@ impl ExecHost {
             group,
             control,
             scratch,
+            terminal: _,
         } = self.start(scope, &call, deadline).await?;
         let finished = tokio::time::timeout_at(deadline, async {
             let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
@@ -579,8 +662,9 @@ impl ExecHost {
             .adopt(ticket, started, call.timeout, deadline)?;
         Ok(ToolOutput {
             text: format!(
-                "Started background session {id}; it is stopped after {} s. Follow it with \
+                "Started background session {id}{}; it is stopped after {} s. Follow it with \
                  `{PROCESS}` and give it input with `{PROCESS_WRITE}`.",
+                if call.terminal { " on a terminal" } else { "" },
                 call.timeout
             ),
             is_error: false,
@@ -649,6 +733,11 @@ impl ExecHost {
             reject_protected_workspace(workspace, &hidden)?;
         }
         let control = root.join("control");
+        let pair = if call.terminal {
+            Some(terminal::Pair::open().map_err(ExecError::Terminal)?)
+        } else {
+            None
+        };
         let profile = a206_sandbox::Profile {
             helper: &helper,
             executable: &shell,
@@ -669,6 +758,7 @@ impl ExecHost {
                 a206_sandbox::NetworkAccess::None
             },
             stderr: true,
+            terminal: pair.as_ref().map(|pair| pair.path.as_path()),
         };
         let mut command =
             tokio::process::Command::from(profile.command().map_err(ExecError::Sandbox)?);
@@ -681,18 +771,43 @@ impl ExecHost {
             .env("TMPDIR", &tmp)
             .env("PATH", "/usr/bin:/bin")
             .env("LANG", LOCALE)
-            // Only a background command can be given input.
-            .stdin(if call.background {
-                Stdio::piped()
-            } else {
-                Stdio::null()
-            })
-            .stdout(Stdio::piped())
             // Bubblewrap reports setup failures here before the command starts.
             .stderr(Stdio::piped())
-            .process_group(0)
             .kill_on_drop(true);
+        let controller = match pair {
+            Some(pair) => {
+                let device = || pair.device.try_clone().map_err(ExecError::Setup);
+                command
+                    .env("TERM", "dumb")
+                    .stdin(device()?)
+                    .stdout(device()?);
+                // On Linux the helper gives the command the terminal as its
+                // stderr, after bubblewrap's diagnostics; on macOS nothing
+                // runs in between, and the launcher starts its own session
+                // (and so its own group).
+                #[cfg(target_os = "macos")]
+                command.stderr(device()?);
+                #[cfg(not(target_os = "macos"))]
+                command.process_group(0);
+                Some(pair.controller)
+            }
+            None => {
+                command
+                    // Only a background command can be given input.
+                    .stdin(if call.background {
+                        Stdio::piped()
+                    } else {
+                        Stdio::null()
+                    })
+                    .stdout(Stdio::piped())
+                    .process_group(0);
+                None
+            }
+        };
         let mut child = command.spawn().map_err(ExecError::Spawn)?;
+        // The command holds the terminal now; the gateway's copies would keep
+        // its output from ever ending.
+        drop(command);
         let group = Group(std::sync::Mutex::new(
             child
                 .id()
@@ -702,6 +817,7 @@ impl ExecHost {
         match tokio::time::timeout_at(deadline, control.ready(&mut child)).await {
             Ok(Ok(())) => Ok(Started {
                 child,
+                terminal: controller,
                 group,
                 control,
                 scratch,
@@ -873,6 +989,7 @@ mod tests {
                 working_dir: Some("src/./x".into()),
                 timeout: 5,
                 background: false,
+                terminal: false,
             }
         );
         assert_eq!(
@@ -914,7 +1031,9 @@ mod tests {
         let command = uuid::Uuid::new_v4().to_string();
         let call = |value: Value| parse(&arguments(value));
         let background = call(json!({ "command": command, "background": true })).unwrap();
-        assert!(background.background);
+        assert!(background.background && !background.terminal);
+        let terminal = json!({ "command": command, "background": true, "terminal": true });
+        assert!(call(terminal).unwrap().terminal);
         assert_eq!(background.timeout, DEFAULT_BACKGROUND_TIMEOUT);
         let long = json!({ "command": command, "timeout_secs": MAX_BACKGROUND_TIMEOUT });
         assert!(
@@ -930,6 +1049,8 @@ mod tests {
         for value in [
             json!({ "command": command, "background": true, "timeout_secs": MAX_BACKGROUND_TIMEOUT + 1 }),
             json!({ "command": command, "background": "yes" }),
+            json!({ "command": command, "terminal": true }),
+            json!({ "command": command, "background": true, "terminal": 1 }),
         ] {
             assert_eq!(
                 crate::error::report(&call(value).unwrap_err()).kind,
@@ -963,12 +1084,38 @@ mod tests {
         }
         let write = |value: Value| parse_write(&arguments(value));
         assert!(write(json!({ "session": id.to_string(), "close": true })).is_ok());
+        let text = uuid::Uuid::new_v4().to_string();
+        assert_eq!(
+            write(json!({ "session": id.to_string(), "data": text, "keys": ["Enter", "Ctrl-C"] }))
+                .unwrap(),
+            Write {
+                session: id,
+                data: [text.as_bytes(), b"\r\x03"].concat(),
+                keys: true,
+                close: false,
+            }
+        );
+        assert!(
+            !write(json!({ "session": id.to_string(), "data": text, "keys": [] }))
+                .unwrap()
+                .keys
+        );
         for value in [
             json!({ "session": id.to_string() }),
+            json!({ "session": id.to_string(), "keys": [] }),
             json!({ "session": id.to_string(), "data": "x".repeat(MAX_INPUT + 1) }),
             json!({ "session": id.to_string(), "data": "x", "close": "no" }),
+            json!({ "session": id.to_string(), "keys": "Enter" }),
+            json!({ "session": id.to_string(), "keys": [1] }),
+            json!({ "session": id.to_string(), "keys": ["Hello"] }),
+            json!({ "session": id.to_string(), "keys": vec!["Enter"; keys::MAX_KEYS + 1] }),
         ] {
-            assert!(write(value.clone()).is_err(), "{value}");
+            let error = write(value.clone()).unwrap_err();
+            assert_eq!(
+                crate::error::report(&error).kind,
+                ErrorKind::InvalidRequest,
+                "{value}"
+            );
         }
     }
 
