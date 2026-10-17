@@ -523,6 +523,7 @@ fn worker_relays_host_calls_over_frames() {
     let name = unique("entry");
     let start = worker::Start {
         extension: "agent206.workspace".into(),
+        module: None,
         invocation: tool("list_directory", &[]),
         limits: Limits::default(),
     };
@@ -548,9 +549,53 @@ fn worker_relays_host_calls_over_frames() {
 }
 
 #[test]
+fn worker_runs_a_supplied_module_for_an_unbundled_id() {
+    let workspace = crate::builtin("agent206.workspace").unwrap().unwrap();
+    let name = unique("entry");
+    let start = worker::Start {
+        extension: unique("installed."),
+        module: Some(serde_bytes::ByteBuf::from(workspace.wasm.to_vec())),
+        invocation: tool("list_directory", &[]),
+        limits: Limits::default(),
+    };
+    let mut input = a206_protocol::encode(&start).unwrap();
+    input.extend(
+        a206_protocol::encode(&HostReply::Directory(vec![entry(
+            &name,
+            EntryKind::Directory,
+        )]))
+        .unwrap(),
+    );
+    let output = worker::serve(std::io::Cursor::new(input), Vec::new()).unwrap();
+    let frames: Vec<worker::Frame> = a206_protocol::Decoder::default().feed(&output).unwrap();
+    assert_eq!(
+        frames.last(),
+        Some(&worker::Frame::Done(Ok(Outcome::Tool(ToolOutput {
+            text: format!("{name}/")
+        }))))
+    );
+    // Bytes that are not a module fail as the extension's invalid request.
+    let start = worker::Start {
+        module: Some(serde_bytes::ByteBuf::from(unique("not wasm").into_bytes())),
+        ..start
+    };
+    let output = worker::serve(
+        std::io::Cursor::new(a206_protocol::encode(&start).unwrap()),
+        Vec::new(),
+    )
+    .unwrap();
+    let frames: Vec<worker::Frame> = a206_protocol::Decoder::default().feed(&output).unwrap();
+    let [worker::Frame::Done(Err(report))] = frames.as_slice() else {
+        panic!("expected one failed result, got {frames:?}");
+    };
+    assert_eq!(report.kind, ErrorKind::InvalidRequest);
+}
+
+#[test]
 fn worker_reports_failures_as_structured_values() {
     let start = worker::Start {
         extension: unique("missing."),
+        module: None,
         invocation: panel(None),
         limits: Limits::default(),
     };
@@ -567,6 +612,7 @@ fn worker_reports_failures_as_structured_values() {
     // A channel that closes mid-invocation is a worker error, not a result.
     let truncated = worker::Start {
         extension: "agent206.workspace".into(),
+        module: None,
         invocation: tool("list_directory", &[]),
         limits: Limits::default(),
     };

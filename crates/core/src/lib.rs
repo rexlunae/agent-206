@@ -474,6 +474,23 @@ pub struct PluginSummary {
     /// Where the `network` permission may connect; `*` is any public host.
     #[serde(default)]
     pub hosts: Vec<String>,
+    #[serde(default)]
+    pub source: PluginSource,
+}
+/// Largest `plugin.toml` sent with [`Command::InstallExtension`].
+pub const MAX_EXTENSION_MANIFEST: usize = 64 * 1024;
+/// Largest module sent with [`Command::InstallExtension`]; with its manifest
+/// it fits one protocol frame.
+pub const MAX_EXTENSION_MODULE: usize = 3 * 1024 * 1024;
+/// Where an extension's package came from.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PluginSource {
+    /// Compiled into this application.
+    #[default]
+    Bundled,
+    /// Installed by the user. `digest` is the SHA-256 of the stored package,
+    /// which the gateway verifies before every run.
+    Installed { digest: String },
 }
 /// A skill installed in the gateway's profile, as the user reviews it.
 /// Text fields are written by the skill's author.
@@ -743,6 +760,19 @@ pub enum Command {
         extension: String,
         enabled: bool,
     },
+    /// Install or update a third-party extension from its `plugin.toml` and
+    /// compiled module (user operation). It arrives disabled with nothing
+    /// granted; an update is disabled again and keeps only the grants its new
+    /// manifest still requests.
+    InstallExtension {
+        manifest: String,
+        #[serde(with = "serde_bytes")]
+        module: Vec<u8>,
+    },
+    /// Remove an installed extension and its stored state (user operation).
+    UninstallExtension {
+        extension: String,
+    },
     Shutdown,
     GatewayStatus,
     /// Hand the gateway a vault broker pairing minted by a trusted client.
@@ -814,6 +844,8 @@ impl Command {
             Self::CallTool { .. } => "call_tool",
             Self::GrantExtension { .. } => "grant_extension",
             Self::EnableExtension { .. } => "enable_extension",
+            Self::InstallExtension { .. } => "install_extension",
+            Self::UninstallExtension { .. } => "uninstall_extension",
             Self::Shutdown => "shutdown",
             Self::GatewayStatus => "gateway_status",
             Self::PairBroker { .. } => "pair_broker",
@@ -844,6 +876,7 @@ pub enum Reply {
     Skills(Vec<SkillSummary>),
     Skill(SkillText),
     Tools(ToolList),
+    Extension(Box<PluginSummary>),
 }
 impl Reply {
     /// Separate a gateway-reported failure from a successful reply.

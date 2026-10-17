@@ -46,6 +46,7 @@ rmcp = { version = "3.5", features = ["transport-io"] }
 rusqlite = { version = "0.37", features = ["bundled"] }
 agent-client-protocol = { version = "3.3", features = ["stdio"] }
 tempfile.workspace = true
+serde_bytes = "0.11"
 [target.'cfg(unix)'.dependencies]
 async-io = "2"
 nix = { version = "0.31", features = ["signal", "process", "fs", "user"] }

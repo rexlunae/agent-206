@@ -531,6 +531,9 @@ impl Gateway {
                 | Command::ListTools { .. }
                 // Never journal a pairing: request bodies are persisted.
                 | Command::PairBroker { .. }
+                // Installing the same package again changes nothing, and a
+                // journal entry would keep a copy of the whole module.
+                | Command::InstallExtension { .. }
         );
         let begin = if mutation {
             self.lock()
@@ -1421,6 +1424,17 @@ impl Gateway {
                 drop(store);
                 // Running extension calls and approval waits re-check that
                 // their tool is still offered.
+                self.policy_changed();
+                Ok(Reply::Ok)
+            }
+            Command::InstallExtension { manifest, module } => {
+                let summary = self.extensions.install(manifest, module).await?;
+                self.policy_changed();
+                Ok(Reply::Extension(Box::new(summary)))
+            }
+            Command::UninstallExtension { extension } => {
+                self.extensions.uninstall(&extension)?;
+                // Running calls and approval waits re-check their tool.
                 self.policy_changed();
                 Ok(Reply::Ok)
             }

@@ -2,7 +2,8 @@
 //! panels are typed descriptions rendered here, never extension markup.
 use crate::{PageFrame, State, call, dispatch, error::ErrorNotice};
 use a206_core::{
-    Capability, Command, ErrorReport, PluginSummary, Reply,
+    Capability, Command, ErrorKind, ErrorReport, MAX_EXTENSION_MANIFEST, MAX_EXTENSION_MODULE,
+    PluginSource, PluginSummary, Reply,
     extension::{Node, Tone, UiEvent, View},
 };
 use fc_dioxus::prelude::*;
@@ -61,6 +62,7 @@ pub fn Extensions() -> Element {
                 for p in &state.data.read().projects { option { value: "{p.id}", "{p.name}" } }
             }
         }
+        InstallExtension {}
         div { class: "a206-grid",
             for plugin in plugins {
                 ExtensionCard { key: "{plugin.id}", plugin: plugin.clone(), onopen: move |target| show(target, None) }
@@ -80,6 +82,87 @@ pub fn Extensions() -> Element {
         crate::skills::Skills {}
         crate::mcp::McpServers {}
     } }
+}
+
+/// Install a package the user picks: its `plugin.toml` and compiled module.
+/// The gateway validates it again; it arrives disabled with nothing granted.
+#[component]
+fn InstallExtension() -> Element {
+    let mut reading = use_signal(|| false);
+    let mut failure = use_signal(|| None::<ErrorReport>);
+    let mut installed = use_signal(|| None::<String>);
+    // A keyed fragment replaces the native input after each choice, so
+    // choosing the same files again emits a fresh change event.
+    let mut version = use_signal(|| 0_u64);
+    rsx! { Card {
+        CardHeader {
+            CardTitle { "Install an extension" }
+            CardSubtitle { "Choose its plugin.toml and compiled .wasm module together. It arrives disabled, with no permissions, until you review it below." }
+        }
+        CardBody {
+            if let Some(report) = failure() { ErrorNotice { report, title: "Could not install the extension".to_string() } }
+            if let Some(name) = installed() { p { class: "a206-muted", "Installed {name}. Review its permissions below before enabling it." } }
+            for key in [version()] {
+                input { key: "{key}", r#type: "file", multiple: true, accept: ".toml,.wasm", aria_label: "Choose an extension's plugin.toml and .wasm module", disabled: reading(),
+                    onchange: move |event: FormEvent| {
+                        let files = event.files();
+                        if files.is_empty() { return; }
+                        reading.set(true);
+                        failure.set(None);
+                        installed.set(None);
+                        spawn(async move {
+                            let result = async {
+                                let command = package_command(&files).await?;
+                                match call(command).await? {
+                                    Reply::Extension(summary) => Ok(summary.name),
+                                    _ => Err(ErrorReport::new(ErrorKind::Protocol, "The gateway answered with the wrong kind of result")),
+                                }
+                            }.await;
+                            match result {
+                                Ok(name) => installed.set(Some(name)),
+                                Err(report) => failure.set(Some(report)),
+                            }
+                            reading.set(false);
+                            version.set(version().wrapping_add(1));
+                        });
+                    }
+                }
+            }
+        }
+    } }
+}
+
+/// The install command for exactly one `.toml` manifest and one `.wasm` module.
+async fn package_command(files: &[dioxus::html::FileData]) -> Result<Command, ErrorReport> {
+    let rejected = |message: &str| ErrorReport::new(ErrorKind::InvalidRequest, message);
+    let pick = |extension: &str| {
+        let mut matching = files
+            .iter()
+            .filter(|f| f.name().to_ascii_lowercase().ends_with(extension));
+        match (matching.next(), matching.next()) {
+            (Some(file), None) => Some(file),
+            _ => None,
+        }
+    };
+    let (Some(manifest), Some(module), 2) = (pick(".toml"), pick(".wasm"), files.len()) else {
+        return Err(rejected("Choose one plugin.toml and one .wasm module"));
+    };
+    let unreadable = |error: dioxus::CapturedError| {
+        ErrorReport::new(ErrorKind::Other, "Could not read the chosen file")
+            .caused_by(ErrorReport::capture(&**error, |_| None))
+    };
+    let manifest = crate::files::read_bounded(manifest, MAX_EXTENSION_MANIFEST)
+        .await
+        .map_err(unreadable)?
+        .ok_or_else(|| rejected("The manifest is larger than 64 KiB"))?;
+    let manifest = String::from_utf8(manifest).map_err(|error| {
+        rejected("The manifest is not UTF-8 text").caused_by(ErrorReport::capture(&error, |_| None))
+    })?;
+    let module = crate::files::read_bounded(module, MAX_EXTENSION_MODULE)
+        .await
+        .map_err(unreadable)?
+        .ok_or_else(|| rejected("The module is larger than 3 MiB"))?;
+    Ok(Command::InstallExtension { manifest, module })
 }
 
 /// The enable switch (`None`) or one capability's grant switch. Both are
@@ -141,6 +224,8 @@ fn ExtensionSwitch(extension: String, capability: Option<Capability>) -> Element
 
 #[component]
 fn ExtensionCard(plugin: PluginSummary, onopen: EventHandler<Open>) -> Element {
+    let state = use_context::<State>();
+    let mut confirm = use_signal(|| false);
     let id = plugin.id.clone();
     let enabled = plugin.enabled;
     rsx! { Card {
@@ -150,9 +235,10 @@ fn ExtensionCard(plugin: PluginSummary, onopen: EventHandler<Open>) -> Element {
         }
         CardBody {
             div { class: "a206-row",
-                Badge { "Bundled WASM" }
+                PackageSource { source: plugin.source.clone() }
                 if !plugin.version.is_empty() { Badge { tone: BadgeTone::Neutral, outline: true, "Version {plugin.version}" } }
             }
+            p { class: "a206-muted", code { "{plugin.id}" } }
             ExtensionSwitch { extension: id.clone(), capability: None }
             if plugin.capabilities.is_empty() {
                 p { class: "a206-muted", "This extension requests no permissions." }
@@ -174,7 +260,16 @@ fn ExtensionCard(plugin: PluginSummary, onopen: EventHandler<Open>) -> Element {
                 }
             }
         }
+        if confirm() {
+            CardBody { Alert { title: rsx! { "Uninstall {plugin.name}?" }, "Its package and everything it stored are removed. Installing it again starts disabled, with nothing granted.",
+                Button { variant: ButtonVariant::Danger, onclick: { let id = id.clone(); move |_| { confirm.set(false); dispatch(state, Command::UninstallExtension { extension: id.clone() }); } }, "Confirm uninstall" }
+                Button { variant: ButtonVariant::Ghost, onclick: move |_| confirm.set(false), "Keep it" }
+            } }
+        }
         CardFooter {
+            if matches!(plugin.source, PluginSource::Installed { .. }) {
+                Button { variant: ButtonVariant::Ghost, onclick: move |_| confirm.set(true), "Uninstall" }
+            }
             for panel in plugin.panels.clone() {
                 {
                     let label = format!("Open {}", panel.title);
@@ -185,6 +280,19 @@ fn ExtensionCard(plugin: PluginSummary, onopen: EventHandler<Open>) -> Element {
             }
         }
     } }
+}
+
+/// Where the package came from. An installed one is marked as the user's and
+/// shows its digest, so it cannot pass for a bundled extension by its name.
+#[component]
+fn PackageSource(source: PluginSource) -> Element {
+    match source {
+        PluginSource::Bundled => rsx! { Badge { "Bundled WASM" } },
+        PluginSource::Installed { digest } => rsx! {
+            Badge { tone: BadgeTone::Warning, "Installed by you" }
+            Badge { tone: BadgeTone::Neutral, outline: true, title: "SHA-256 of the installed package: {digest}", "Package {digest.get(..12).unwrap_or(&digest)}" }
+        },
+    }
 }
 
 /// Where an extension's network permission may connect, as the user reads it.
@@ -231,5 +339,33 @@ fn badge_tone(tone: Tone) -> BadgeTone {
         Tone::Success => BadgeTone::Success,
         Tone::Warning => BadgeTone::Warning,
         Tone::Danger => BadgeTone::Danger,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn render(source: PluginSource) -> String {
+        fn root(source: PluginSource) -> Element {
+            rsx! { PackageSource { source } }
+        }
+        let mut dom = VirtualDom::new_with_props(root, source);
+        dom.rebuild_in_place();
+        dioxus_ssr::render(&dom)
+    }
+
+    #[test]
+    fn installed_packages_are_marked_with_their_digest() {
+        let digest = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+        let html = render(PluginSource::Installed {
+            digest: digest.clone(),
+        });
+        assert!(html.contains("Installed by you"), "{html}");
+        assert!(html.contains(&digest[..12]), "{html}");
+        assert!(html.contains(&digest), "{html}");
+        assert!(!html.contains("Bundled"), "{html}");
+        let html = render(PluginSource::Bundled);
+        assert!(!html.contains("Installed"), "{html}");
     }
 }

@@ -3,6 +3,7 @@
 mod conversation;
 mod error;
 mod extensions;
+mod files;
 mod health;
 mod mcp;
 mod messengers;

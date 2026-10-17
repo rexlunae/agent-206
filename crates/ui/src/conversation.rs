@@ -4,8 +4,6 @@ use a206_core::{
     RunState, TextAttachment, Thread,
 };
 use fc_dioxus::prelude::*;
-#[cfg(not(target_arch = "wasm32"))]
-use futures_util::StreamExt;
 use uuid::Uuid;
 #[component]
 pub fn Workspace(id: Uuid, split: Option<Uuid>) -> Element {
@@ -589,34 +587,14 @@ fn RenameTitle(id: Uuid, initial: String) -> Element {
     }
 }
 
-/// Browser File objects are immutable and report their exact size. The Dioxus
-/// 0.7 web byte_stream implementation casts an ArrayBuffer to Uint8Array and
-/// panics; read_bytes uses FileReader and constructs the typed array correctly.
 async fn read_attachment(
     file: &dioxus::html::FileData,
     remaining: usize,
 ) -> Result<String, ErrorReport> {
-    if file.size() > remaining as u64 {
-        return Err(rejected("Attachments exceed 128 KiB"));
-    }
-    #[cfg(target_arch = "wasm32")]
-    let bytes = file.read_bytes().await.map_err(unreadable)?.to_vec();
-    #[cfg(not(target_arch = "wasm32"))]
-    let bytes = {
-        let mut stream = file.byte_stream();
-        let mut bytes = Vec::new();
-        while let Some(part) = stream.next().await {
-            let part = part.map_err(unreadable)?;
-            if bytes.len() + part.len() > remaining {
-                return Err(rejected("Attachments exceed 128 KiB"));
-            }
-            bytes.extend_from_slice(&part);
-        }
-        bytes
-    };
-    if bytes.len() > remaining {
-        return Err(rejected("Attachments exceed 128 KiB"));
-    }
+    let bytes = crate::files::read_bounded(file, remaining)
+        .await
+        .map_err(unreadable)?
+        .ok_or_else(|| rejected("Attachments exceed 128 KiB"))?;
     let text = String::from_utf8(bytes).map_err(|error| {
         rejected("Use UTF-8 text documents; image, PDF and audio attachments are not supported yet")
             .caused_by(ErrorReport::capture(&error, |_| None))

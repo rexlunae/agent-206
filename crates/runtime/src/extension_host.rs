@@ -10,7 +10,7 @@
 //! what the tool or panel declares.
 use crate::store::{StatePut, StateQuota, Store, StoreError};
 use a206_core::{
-    Capability, ErrorKind, ErrorReport, PluginSummary,
+    Capability, ErrorKind, ErrorReport, PluginSource, PluginSummary,
     extension::{Args, ToolOutput, ToolSpec, UiEvent, View},
 };
 use a206_extensions::{
@@ -55,6 +55,14 @@ pub enum ExtensionError {
     Disabled(String),
     #[error("the bundled extensions are invalid")]
     Builtins(#[source] ManifestError),
+    #[error(transparent)]
+    Package(#[from] packages::PackageError),
+    #[error("\"{0}\" is bundled with Agent 206; disable it instead")]
+    Bundled(String),
+    #[error("could not record the extension")]
+    Store(#[from] StoreError),
+    #[error("the extension install task failed")]
+    Join(#[source] tokio::task::JoinError),
     #[error(transparent)]
     Call(#[from] ArgError),
     #[error("\"{extension}\" needs the \"{}\" permission", capability.label())]
@@ -105,7 +113,10 @@ impl crate::error::Classified for ExtensionError {
             Self::Disabled(_) | Self::NotGranted { .. } | Self::OutOfScope { .. } => {
                 ErrorKind::PermissionDenied
             }
-            Self::NoProject => ErrorKind::InvalidRequest,
+            Self::NoProject | Self::Bundled(_) => ErrorKind::InvalidRequest,
+            Self::Package(error) => return classify(error),
+            Self::Store(error) => return classify(error),
+            Self::Join(_) => ErrorKind::Internal,
             Self::Builtins(_) | Self::Poisoned | Self::CurrentExe(_) => ErrorKind::Internal,
             Self::Confine(error) => return classify(error),
             Self::Spawn(_) | Self::Channel(_) | Self::Exited => ErrorKind::Unavailable,
@@ -163,9 +174,15 @@ pub struct ExtensionTools {
 pub struct ExtensionHost {
     store: Arc<Mutex<Store>>,
     net: Arc<dyn crate::network::Net>,
-    /// Passed to unconfined workers; a Linux worker gets an empty one instead.
-    #[cfg_attr(target_os = "linux", allow(dead_code))]
+    /// Holds installed packages. Passed to unconfined workers; a Linux worker
+    /// gets an empty one instead.
     data_dir: PathBuf,
+}
+/// An extension's validated manifest, with its module when it is installed
+/// rather than bundled.
+struct Loaded {
+    manifest: Manifest,
+    module: Option<Vec<u8>>,
 }
 impl ExtensionHost {
     pub fn new(store: Arc<Mutex<Store>>, data_dir: PathBuf) -> Self {
@@ -208,8 +225,9 @@ impl ExtensionHost {
             .into_iter()
             .filter(|plugin| plugin.enabled)
             .map(|plugin| {
-                let tools = self.manifest(&plugin.id).map(|manifest| {
-                    manifest
+                let tools = self.load(&plugin.id).map(|loaded| {
+                    loaded
+                        .manifest
                         .tools
                         .into_iter()
                         .filter(|tool| tool.capabilities.is_subset(&plugin.granted))
@@ -236,7 +254,7 @@ impl ExtensionHost {
         args: Args,
         scope: Scope,
     ) -> Result<ToolOutput, ExtensionError> {
-        let manifest = self.manifest(extension)?;
+        let Loaded { manifest, module } = self.load(extension)?;
         let spec = manifest.tool(tool)?;
         a206_extensions::check_args(spec, &args)?;
         let call = Call::Tool {
@@ -244,7 +262,7 @@ impl ExtensionHost {
             args,
         };
         match self
-            .invoke(&manifest, &spec.capabilities, call, scope)
+            .invoke(&manifest, module, &spec.capabilities, call, scope)
             .await?
         {
             Outcome::Tool(output) => Ok(output),
@@ -260,14 +278,14 @@ impl ExtensionHost {
         event: Option<UiEvent>,
         scope: Scope,
     ) -> Result<View, ExtensionError> {
-        let manifest = self.manifest(extension)?;
+        let Loaded { manifest, module } = self.load(extension)?;
         let spec = manifest.panel(panel)?;
         let call = Call::Panel {
             id: panel.into(),
             event,
         };
         match self
-            .invoke(&manifest, &spec.capabilities, call, scope)
+            .invoke(&manifest, module, &spec.capabilities, call, scope)
             .await?
         {
             Outcome::Panel(view) => Ok(view),
@@ -284,16 +302,128 @@ impl ExtensionHost {
             .plugins
             .clone())
     }
-    fn manifest(&self, extension: &str) -> Result<Manifest, ExtensionError> {
-        a206_extensions::builtin(extension)
-            .map_err(ExtensionError::Builtins)?
-            .map(|builtin| builtin.manifest)
-            .ok_or_else(|| ExtensionError::NotInstalled(extension.into()))
+    /// The manifest and module recorded for `extension`. An installed
+    /// package is verified against its digest on every load.
+    fn load(&self, extension: &str) -> Result<Loaded, ExtensionError> {
+        let not_installed = || ExtensionError::NotInstalled(extension.into());
+        let plugin = self
+            .plugins()?
+            .into_iter()
+            .find(|p| p.id == extension)
+            .ok_or_else(not_installed)?;
+        match plugin.source {
+            PluginSource::Bundled => a206_extensions::builtin(extension)
+                .map_err(ExtensionError::Builtins)?
+                .map(|builtin| Loaded {
+                    manifest: builtin.manifest,
+                    module: None,
+                })
+                .ok_or_else(not_installed),
+            PluginSource::Installed { digest } => {
+                let package =
+                    packages::load(&packages::directory(&self.data_dir), extension, &digest)?;
+                Ok(Loaded {
+                    manifest: package.manifest,
+                    module: Some(package.module),
+                })
+            }
+        }
+    }
+
+    /// Install or update a third-party package (user operation). It arrives
+    /// disabled; an update keeps only the grants its new manifest requests.
+    /// Installing the package already installed changes nothing, apart from
+    /// restoring its stored copy if that was altered.
+    pub async fn install(
+        &self,
+        manifest: String,
+        module: Vec<u8>,
+    ) -> Result<PluginSummary, ExtensionError> {
+        let dir = packages::directory(&self.data_dir);
+        let package = packages::prepare(manifest, module)?;
+        let stored = package.clone();
+        let store_dir = dir.clone();
+        tokio::task::spawn_blocking(move || packages::store(&store_dir, &stored))
+            .await
+            .map_err(ExtensionError::Join)??;
+        let id = package.manifest.id.clone();
+        let mut store = self.store.lock().map_err(|_| ExtensionError::Poisoned)?;
+        let plugins = &mut store.state.plugins;
+        let previous = plugins.iter().position(|p| p.id == id);
+        let granted = match previous.map(|index| &plugins[index]) {
+            // Unreachable while bundled ids keep the reserved prefix.
+            Some(PluginSummary {
+                source: PluginSource::Bundled,
+                ..
+            }) => {
+                drop(store);
+                packages::remove(&dir, &package.digest)?;
+                return Err(ExtensionError::Bundled(id));
+            }
+            // The same package again: nothing the user reviewed changed.
+            Some(plugin)
+                if plugin.source
+                    == (PluginSource::Installed {
+                        digest: package.digest.clone(),
+                    }) =>
+            {
+                return Ok(plugin.clone());
+            }
+            Some(plugin) => plugin.granted.clone(),
+            None => BTreeSet::new(),
+        };
+        let mut summary = package.manifest.summary(false, &granted);
+        summary.source = PluginSource::Installed {
+            digest: package.digest.clone(),
+        };
+        let replaced = match previous {
+            Some(index) => Some(std::mem::replace(&mut plugins[index], summary.clone())),
+            None => {
+                plugins.push(summary.clone());
+                None
+            }
+        };
+        store.persist(Some(a206_core::EventKind::ExtensionChanged {
+            id: id.clone(),
+        }))?;
+        drop(store);
+        if let Some(PluginSource::Installed { digest }) = replaced.map(|p| p.source)
+            && digest != package.digest
+        {
+            // The new package is recorded; a leftover copy only takes space.
+            if let Err(error) = packages::remove(&dir, &digest) {
+                tracing::warn!(error = &error as &dyn std::error::Error, extension = %id, "could not remove the replaced extension package");
+            }
+        }
+        Ok(summary)
+    }
+
+    /// Remove an installed extension, its package and its stored state.
+    pub fn uninstall(&self, extension: &str) -> Result<(), ExtensionError> {
+        let mut store = self.store.lock().map_err(|_| ExtensionError::Poisoned)?;
+        let index = store
+            .state
+            .plugins
+            .iter()
+            .position(|p| p.id == extension)
+            .ok_or_else(|| ExtensionError::NotInstalled(extension.into()))?;
+        let PluginSource::Installed { digest } = store.state.plugins[index].source.clone() else {
+            return Err(ExtensionError::Bundled(extension.into()));
+        };
+        store.state.plugins.remove(index);
+        store.persist(Some(a206_core::EventKind::ExtensionChanged {
+            id: extension.into(),
+        }))?;
+        store.clear_extension_state(extension)?;
+        drop(store);
+        packages::remove(&packages::directory(&self.data_dir), &digest)?;
+        Ok(())
     }
 
     async fn invoke(
         &self,
         manifest: &Manifest,
+        module: Option<Vec<u8>>,
         declared: &BTreeSet<Capability>,
         call: Call,
         scope: Scope,
@@ -344,6 +474,7 @@ impl ExtensionHost {
         };
         let start = Start {
             extension: manifest.id.clone(),
+            module: module.map(serde_bytes::ByteBuf::from),
             invocation: Invocation { abi: ABI, call },
             limits: Limits::default(),
         };
@@ -701,6 +832,7 @@ impl Drop for Interrupt {
 }
 mod fetch;
 mod git;
+pub mod packages;
 mod workspace;
 
 #[cfg(test)]

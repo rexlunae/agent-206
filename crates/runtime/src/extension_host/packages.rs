@@ -1,0 +1,231 @@
+//! Installed extension packages: a validated manifest and module stored in
+//! the gateway's data directory under their digest, and verified again
+//! before every use, so a changed file never runs as the reviewed package.
+use a206_extensions::{Manifest, ManifestError};
+use sha2::{Digest, Sha256};
+use std::{
+    io::Read,
+    path::{Path, PathBuf},
+};
+
+pub use a206_core::{MAX_EXTENSION_MANIFEST as MAX_MANIFEST, MAX_EXTENSION_MODULE as MAX_MODULE};
+/// Ids under this prefix belong to bundled extensions.
+pub const RESERVED_PREFIX: &str = "agent206.";
+/// The WebAssembly binary magic and version 1.
+const WASM_HEADER: &[u8] = b"\0asm\x01\0\0\0";
+const MANIFEST_FILE: &str = "plugin.toml";
+const MODULE_FILE: &str = "module.wasm";
+
+#[derive(Debug, thiserror::Error)]
+pub enum PackageError {
+    #[error(transparent)]
+    Manifest(#[from] ManifestError),
+    #[error("extension ids starting with `{RESERVED_PREFIX}` are reserved for bundled extensions")]
+    Reserved,
+    #[error("the manifest is larger than {} KiB", MAX_MANIFEST / 1024)]
+    ManifestTooLarge,
+    #[error("the module is larger than {} MiB", MAX_MODULE / (1024 * 1024))]
+    ModuleTooLarge,
+    #[error("the module is not a WebAssembly 1.0 binary")]
+    NotWasm,
+    #[error("could not store the extension package")]
+    Write(#[source] std::io::Error),
+    #[error("could not read the installed extension package")]
+    Read(#[source] std::io::Error),
+    #[error("the installed package for `{0}` changed since it was installed; install it again")]
+    Changed(String),
+}
+impl crate::error::Classified for PackageError {
+    fn kind(&self) -> Option<a206_core::ErrorKind> {
+        use a206_core::ErrorKind as K;
+        Some(match self {
+            Self::Manifest(_)
+            | Self::Reserved
+            | Self::ManifestTooLarge
+            | Self::ModuleTooLarge
+            | Self::NotWasm => K::InvalidRequest,
+            Self::Write(_) | Self::Read(_) => K::Storage,
+            Self::Changed(_) => K::Conflict,
+        })
+    }
+}
+
+/// A validated package.
+#[derive(Debug, Clone)]
+pub struct Package {
+    pub manifest: Manifest,
+    pub text: String,
+    pub module: Vec<u8>,
+    /// Lowercase hex SHA-256 over the manifest text and the module.
+    pub digest: String,
+}
+
+/// Validate a package a user is installing. Only the WASM header is checked
+/// here; the module itself is compiled only in the confined worker.
+pub fn prepare(text: String, module: Vec<u8>) -> Result<Package, PackageError> {
+    if text.len() > MAX_MANIFEST {
+        return Err(PackageError::ManifestTooLarge);
+    }
+    if module.len() > MAX_MODULE {
+        return Err(PackageError::ModuleTooLarge);
+    }
+    if !module.starts_with(WASM_HEADER) {
+        return Err(PackageError::NotWasm);
+    }
+    let manifest = Manifest::parse(&text)?;
+    if manifest.id.starts_with(RESERVED_PREFIX) {
+        return Err(PackageError::Reserved);
+    }
+    let digest = digest(&text, &module);
+    Ok(Package {
+        manifest,
+        text,
+        module,
+        digest,
+    })
+}
+
+fn digest(text: &str, module: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"agent206-extension-package-v1\0");
+    hasher.update((text.len() as u64).to_be_bytes());
+    hasher.update(text.as_bytes());
+    hasher.update(module);
+    hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// Where installed packages live inside the gateway's data directory.
+pub fn directory(data_dir: &Path) -> PathBuf {
+    data_dir.join("extensions")
+}
+
+/// Store `package` under its digest. Storing the same package again keeps
+/// the verified copy already there.
+pub fn store(dir: &Path, package: &Package) -> Result<(), PackageError> {
+    let target = dir.join(&package.digest);
+    if load(dir, &package.manifest.id, &package.digest).is_ok() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(dir).map_err(PackageError::Write)?;
+    let staging = tempfile::Builder::new()
+        .prefix(".staging-")
+        .tempdir_in(dir)
+        .map_err(PackageError::Write)?;
+    for (name, bytes) in [
+        (MANIFEST_FILE, package.text.as_bytes()),
+        (MODULE_FILE, package.module.as_slice()),
+    ] {
+        let mut file =
+            std::fs::File::create(staging.path().join(name)).map_err(PackageError::Write)?;
+        std::io::Write::write_all(&mut file, bytes).map_err(PackageError::Write)?;
+        file.sync_all().map_err(PackageError::Write)?;
+    }
+    // A directory left by an interrupted or altered install is replaced.
+    match std::fs::remove_dir_all(&target) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(PackageError::Write(error)),
+    }
+    std::fs::rename(staging.keep(), &target).map_err(PackageError::Write)
+}
+
+/// Read the package installed for `id` and check it is still the one with
+/// digest `expected`.
+pub fn load(dir: &Path, id: &str, expected: &str) -> Result<Package, PackageError> {
+    let changed = || PackageError::Changed(id.into());
+    if expected.len() != 64 || !expected.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(changed());
+    }
+    let package = dir.join(expected);
+    let text = read(&package.join(MANIFEST_FILE), MAX_MANIFEST)?.ok_or_else(changed)?;
+    let module = read(&package.join(MODULE_FILE), MAX_MODULE)?.ok_or_else(changed)?;
+    let text = String::from_utf8(text).map_err(|_| changed())?;
+    if digest(&text, &module) != expected {
+        return Err(changed());
+    }
+    let manifest = Manifest::parse(&text)?;
+    if manifest.id != id {
+        return Err(changed());
+    }
+    Ok(Package {
+        manifest,
+        text,
+        module,
+        digest: expected.into(),
+    })
+}
+/// The file's bytes, or `None` when it is missing or larger than `limit`.
+fn read(path: &Path, limit: usize) -> Result<Option<Vec<u8>>, PackageError> {
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(PackageError::Read(error)),
+    };
+    let mut bytes = Vec::new();
+    file.take(limit as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(PackageError::Read)?;
+    Ok((bytes.len() <= limit).then_some(bytes))
+}
+
+/// Remove the package stored under `digest`, if any.
+pub fn remove(dir: &Path, digest: &str) -> Result<(), PackageError> {
+    match std::fs::remove_dir_all(dir.join(digest)) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(PackageError::Write(error)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn package() -> Package {
+        let builtin = a206_extensions::builtin("agent206.web").unwrap().unwrap();
+        let id = format!("test.{}", uuid::Uuid::new_v4().simple());
+        let text = include_str!("../../../../plugins/web/plugin.toml").replacen(
+            "id = \"agent206.web\"",
+            &format!("id = \"{id}\""),
+            1,
+        );
+        prepare(text, builtin.wasm.to_vec()).unwrap()
+    }
+
+    #[test]
+    fn stored_packages_load_only_under_their_digest_and_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let package = package();
+        let id = &package.manifest.id;
+        store(dir.path(), &package).unwrap();
+        let loaded = load(dir.path(), id, &package.digest).unwrap();
+        assert_eq!(loaded.module, package.module);
+        assert_eq!(loaded.text, package.text);
+        let other = format!("test.{}", uuid::Uuid::new_v4().simple());
+        assert!(matches!(
+            load(dir.path(), &other, &package.digest),
+            Err(PackageError::Changed(_))
+        ));
+        // A digest is only ever a directory name, never a path.
+        let outside = dir.path().join(&package.digest);
+        let escape = format!("../{}", outside.file_name().unwrap().to_string_lossy());
+        for digest in [escape.as_str(), "", &package.digest[1..]] {
+            assert!(matches!(
+                load(dir.path(), id, digest),
+                Err(PackageError::Changed(_))
+            ));
+        }
+        std::fs::remove_file(dir.path().join(&package.digest).join(MANIFEST_FILE)).unwrap();
+        assert!(matches!(
+            load(dir.path(), id, &package.digest),
+            Err(PackageError::Changed(_))
+        ));
+        remove(dir.path(), &package.digest).unwrap();
+        assert!(!dir.path().join(&package.digest).exists());
+        remove(dir.path(), &package.digest).unwrap();
+    }
+}

@@ -287,6 +287,14 @@ impl Store {
             )
             .optional()?)
     }
+    /// Forget everything an extension stored.
+    pub fn clear_extension_state(&mut self, extension: &str) -> Result<()> {
+        self.db.execute(
+            "DELETE FROM extension_state WHERE extension=?1",
+            params![extension],
+        )?;
+        Ok(())
+    }
     /// Replace or delete one entry, refusing writes past `quota`.
     pub fn put_extension_state(
         &mut self,
@@ -347,24 +355,62 @@ pub enum StatePut {
 
 /// Summaries of the bundled extensions, keeping the user's enable choice and
 /// only those grants the current manifest still requests: an update never
-/// inherits a newly requested capability.
+/// inherits a newly requested capability. Installed extensions follow
+/// unchanged, unless a bundled one now has their id.
 fn bundled_plugins(previous: &[PluginSummary]) -> Result<Vec<PluginSummary>> {
-    Ok(a206_extensions::builtins()
-        .map_err(StoreError::Builtin)?
+    let builtins = a206_extensions::builtins().map_err(StoreError::Builtin)?;
+    let mut plugins: Vec<PluginSummary> = builtins
         .iter()
         .map(|builtin| {
-            let earlier = previous.iter().find(|p| p.id == builtin.manifest.id);
+            let earlier = previous.iter().find(|p| {
+                p.id == builtin.manifest.id && p.source == a206_core::PluginSource::Bundled
+            });
             builtin.manifest.summary(
                 earlier.is_none_or(|p| p.enabled),
                 &earlier.map(|p| p.granted.clone()).unwrap_or_default(),
             )
         })
-        .collect())
+        .collect();
+    let installed: Vec<PluginSummary> = previous
+        .iter()
+        .filter(|p| {
+            matches!(p.source, a206_core::PluginSource::Installed { .. })
+                && !plugins.iter().any(|b| b.id == p.id)
+        })
+        .cloned()
+        .collect();
+    plugins.extend(installed);
+    Ok(plugins)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn reopening_keeps_installed_extensions_but_not_over_bundled_ids() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = Store::open(directory.path()).unwrap();
+        let bundled = store.state.plugins[0].clone();
+        let installed = |id: &str| PluginSummary {
+            id: id.into(),
+            enabled: true,
+            source: a206_core::PluginSource::Installed {
+                digest: Id::new_v4().simple().to_string(),
+            },
+            ..bundled.clone()
+        };
+        let kept = installed(&format!("test.{}", Id::new_v4().simple()));
+        // A bundled extension that now has an installed extension's id wins.
+        store.state.plugins.push(kept.clone());
+        store.state.plugins.push(installed(&bundled.id));
+        store.persist(None).unwrap();
+        drop(store);
+        let restored = Store::open(directory.path()).unwrap();
+        let plugins = &restored.state.plugins;
+        assert!(plugins.contains(&kept));
+        assert_eq!(plugins.iter().filter(|p| p.id == bundled.id).count(), 1);
+        assert!(plugins.contains(&bundled));
+    }
     #[test]
     fn restart_retires_only_the_owned_joshua_connection() {
         let directory = tempfile::tempdir().unwrap();
