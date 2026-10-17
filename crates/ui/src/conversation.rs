@@ -489,15 +489,18 @@ fn BackendControls(thread: Thread) -> Element {
     rsx! { div { class: "a206-stack",
         h3 { "Agent engine" }
         Select { label: name!("Coding-agent backend"), value: ReadSignal::from(selected), options, availability,
-            onchange: move |value: String| { if let Some(backend) = CodingBackend::ALL.into_iter().find(|kind| kind.label() == value) { dispatch(state, Command::SetBackend { thread: id, backend, capabilities: grants.clone() }); } }
+            // A grant the new backend cannot be held to is dropped, not refused.
+            onchange: move |value: String| { if let Some(backend) = CodingBackend::ALL.into_iter().find(|kind| kind.label() == value) { dispatch(state, Command::SetBackend { thread: id, backend, capabilities: grants.iter().copied().filter(|c| backend.grantable().contains(c)).collect() }); } }
         }
         LinkButton { variant: ButtonVariant::Ghost, size: ButtonSize::Sm, href: Route::Providers {}.to_string(), "Manage connections" }
-        if thread.backend != CodingBackend::Native {
+        if thread.backend == CodingBackend::Native {
+            p { class: "a206-muted", "Tools are off until you grant them here, and each tool still needs your permission in this conversation. The network grant also lets project commands use the network." }
+        } else {
             p { class: "a206-muted", "Project tools are off until you grant them. External subagents and direct network access are disabled." }
-            if thread.project.is_none() { p { class: "a206-muted", "Open a project coordinator to grant workspace tools." } }
-            for capability in [Capability::ReadWorkspace, Capability::WriteWorkspace, Capability::Execute] {
-                BackendGrant { key: "{capability:?}", thread: id, capability }
-            }
+        }
+        if thread.project.is_none() { p { class: "a206-muted", "Open a project coordinator to grant workspace and git tools." } }
+        for capability in thread.backend.grantable().iter().copied() {
+            BackendGrant { key: "{capability:?}", thread: id, capability }
         }
     } }
 }
@@ -521,22 +524,32 @@ fn BackendGrant(thread: Uuid, capability: Capability) -> Element {
     let snapshot = state.data.read();
     let current = snapshot.threads.iter().find(|t| t.id == thread);
     let enabled = current.is_some_and(|t| {
-        t.project.is_some()
+        (t.project.is_some() || capability == Capability::Network)
             && t.parent.is_none()
             && t.state != RunState::Running
             && t.mode.ceiling().contains(&capability)
     });
-    let label = match capability {
-        Capability::ReadWorkspace => "Read project files",
-        Capability::WriteWorkspace => "Edit project files",
-        Capability::Execute => "Run project commands",
-        _ => "Unavailable",
-    };
+    let label = capability.label();
     rsx! { Checkbox { label: rsx! { "{label}" }, checked: ReadSignal::from(checked), availability: if enabled { Availability::Enabled } else { Availability::Disabled }, onchange: move |allowed| {
         if let Some(current) = state.data.read().threads.iter().find(|t| t.id == thread).cloned() {
             let mut capabilities = current.grant.capabilities;
-            if allowed { capabilities.insert(capability); if capability == Capability::WriteWorkspace { capabilities.insert(Capability::ReadWorkspace); } }
-            else { capabilities.remove(&capability); if capability == Capability::ReadWorkspace { capabilities.clear(); } }
+            // Writing needs reading: granting a write grant adds its read grant,
+            // and withdrawing a read grant withdraws what depends on it.
+            if allowed {
+                capabilities.insert(capability);
+                match capability {
+                    Capability::WriteWorkspace => { capabilities.insert(Capability::ReadWorkspace); }
+                    Capability::GitWrite => { capabilities.insert(Capability::GitRead); }
+                    _ => {}
+                }
+            } else {
+                capabilities.remove(&capability);
+                match capability {
+                    Capability::ReadWorkspace => { capabilities.remove(&Capability::WriteWorkspace); capabilities.remove(&Capability::Execute); }
+                    Capability::GitRead => { capabilities.remove(&Capability::GitWrite); }
+                    _ => {}
+                }
+            }
             dispatch(state, Command::SetBackend { thread, backend: current.backend, capabilities });
         }
     } } }
