@@ -1,13 +1,22 @@
-//! Loopback web bridge. Origin-scoped bearer sessions avoid leaking cookies to preview servers.
+//! Web bridge. By default it listens on loopback, and a one-time link hands the
+//! browser an origin-scoped bearer (cookies would leak to preview servers).
+//! Opened to other devices it serves HTTPS only and browsers sign in with the
+//! vault's authenticator; see [`access`].
+mod access;
+pub mod tls;
+pub use access::SignInError;
+pub use tls::{Certificate, TlsError};
+
 use crate::{
     connection::{self, ConnectionError},
     control::GatewayController,
 };
 use a206_core::{
     Command, ErrorReport, GatewayAction, GatewayConnection, GatewayTarget, Reply, SetupReply,
-    SetupRequest, SetupStatus,
+    SetupRequest, SetupStatus, SignInReply, SignInRequest,
 };
 use a206_protocol::{Decoder, Request};
+use access::{Access, Loopback, Network};
 use axum::{
     Router,
     body::Bytes,
@@ -17,11 +26,10 @@ use axum::{
     routing::{get, post},
 };
 use std::{
+    net::{IpAddr, SocketAddr},
     path::PathBuf,
-    sync::{
-        Arc, PoisonError, RwLock,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Arc, Mutex, PoisonError, RwLock, atomic::AtomicBool},
+    time::Instant,
 };
 use tower::ServiceExt;
 use tower_http::services::{ServeDir, ServeFile};
@@ -29,18 +37,30 @@ use tower_http::services::{ServeDir, ServeFile};
 struct Web {
     gateway: Arc<RwLock<Gateway>>,
     root: Arc<PathBuf>,
-    token: Arc<String>,
-    bootstrap: Arc<String>,
-    claimed: Arc<AtomicBool>,
-    origin: Arc<String>,
-    host: Arc<String>,
+    access: Arc<Access>,
 }
-/// Why the loopback web bridge could not run.
+/// Where the bridge listens and who may use it.
+#[derive(Clone, Debug)]
+pub enum Exposure {
+    /// This computer only, authorized by a one-time link.
+    Loopback { port: u16 },
+    /// Other devices too, over HTTPS with authenticator sign-in.
+    Network(NetworkOptions),
+}
+#[derive(Clone, Debug)]
+pub struct NetworkOptions {
+    pub listen: SocketAddr,
+    /// Host names or IP addresses browsers use to reach this server. Requests
+    /// for any other host are refused, which defeats DNS rebinding.
+    pub names: Vec<String>,
+    pub certificate: Certificate,
+}
+/// Why the web bridge could not run.
 #[derive(Debug, thiserror::Error)]
 pub enum WebError {
-    #[error("could not listen on 127.0.0.1:{port}")]
+    #[error("could not listen on {addr}")]
     Bind {
-        port: u16,
+        addr: SocketAddr,
         #[source]
         source: std::io::Error,
     },
@@ -48,6 +68,26 @@ pub enum WebError {
     Serve(#[source] std::io::Error),
     #[error("cannot use the gateway given with --remote")]
     Remote(#[source] ConnectionError),
+    #[error(
+        "name at least one host name or IP address that other devices use to reach this server"
+    )]
+    NoNames,
+    #[error("{name:?} is not a host name or IP address")]
+    Name { name: String },
+    #[error("cannot serve HTTPS")]
+    Tls(#[source] TlsError),
+    #[error("browsers on other devices could not sign in")]
+    SignIn(#[source] SignInError),
+}
+impl crate::error::Classified for WebError {
+    fn kind(&self) -> Option<a206_core::ErrorKind> {
+        use a206_core::ErrorKind;
+        Some(match self {
+            Self::Bind { .. } | Self::Serve(_) => ErrorKind::Unavailable,
+            Self::NoNames | Self::Name { .. } => ErrorKind::InvalidRequest,
+            Self::Remote(_) | Self::Tls(_) | Self::SignIn(_) => return None,
+        })
+    }
 }
 /// The gateway the bridge fronts. Until one is saved (or a saved one is
 /// repaired) the browser is offered setup and nothing connects or launches.
@@ -126,25 +166,40 @@ pub async fn serve(
     root: PathBuf,
     remote: Option<String>,
     static_dir: PathBuf,
+    exposure: Exposure,
+) -> Result<(), WebError> {
+    match exposure {
+        Exposure::Loopback { port } => serve_loopback(root, remote, static_dir, port).await,
+        Exposure::Network(options) => serve_network(root, remote, static_dir, options).await,
+    }
+}
+
+async fn serve_loopback(
+    root: PathBuf,
+    remote: Option<String>,
+    static_dir: PathBuf,
     port: u16,
 ) -> Result<(), WebError> {
-    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
+    let addr = SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port));
+    let listener = tokio::net::TcpListener::bind(addr)
         .await
-        .map_err(|source| WebError::Bind { port, source })?;
+        .map_err(|source| WebError::Bind { addr, source })?;
     let port = listener
         .local_addr()
-        .map_err(|source| WebError::Bind { port, source })?
+        .map_err(|source| WebError::Bind { addr, source })?
         .port();
     let gateway = Gateway::resolve(&root, remote)?;
     let token = uuid::Uuid::new_v4().simple().to_string();
     let state = Web {
         gateway: Arc::new(RwLock::new(gateway)),
         root: Arc::new(root),
-        token: Arc::new(uuid::Uuid::new_v4().simple().to_string()),
-        bootstrap: Arc::new(token.clone()),
-        claimed: Arc::new(AtomicBool::new(false)),
-        origin: Arc::new(format!("http://127.0.0.1:{port}")),
-        host: Arc::new(format!("127.0.0.1:{port}")),
+        access: Arc::new(Access::Loopback(Loopback {
+            token: uuid::Uuid::new_v4().simple().to_string(),
+            bootstrap: token.clone(),
+            claimed: AtomicBool::new(false),
+            origin: format!("http://127.0.0.1:{port}"),
+            host: format!("127.0.0.1:{port}"),
+        })),
     };
     println!("Open http://127.0.0.1:{port}/connect/{token} to authorize this browser.");
     axum::serve(listener, app(state, static_dir))
@@ -152,12 +207,100 @@ pub async fn serve(
         .map_err(WebError::Serve)?;
     Ok(())
 }
+
+/// HTTPS for other devices. Nothing is served over plain HTTP, and the vault
+/// must be able to check authenticator codes before the server starts.
+async fn serve_network(
+    root: PathBuf,
+    remote: Option<String>,
+    static_dir: PathBuf,
+    options: NetworkOptions,
+) -> Result<(), WebError> {
+    let (names, hosts) = host_names(&options.names, options.listen.port())?;
+    access::ready(&root).await.map_err(WebError::SignIn)?;
+    let tls = tls::load(&root, &names, &options.certificate).map_err(WebError::Tls)?;
+    let addr = options.listen;
+    let listener =
+        std::net::TcpListener::bind(addr).map_err(|source| WebError::Bind { addr, source })?;
+    listener
+        .set_nonblocking(true)
+        .map_err(|source| WebError::Bind { addr, source })?;
+    let gateway = Gateway::resolve(&root, remote)?;
+    let urls: Vec<_> = hosts
+        .iter()
+        .map(|host| format!("https://{host}/"))
+        .collect();
+    let state = Web {
+        gateway: Arc::new(RwLock::new(gateway)),
+        root: Arc::new(root.clone()),
+        access: Arc::new(Access::Network(Network {
+            hosts,
+            root,
+            sessions: Mutex::default(),
+        })),
+    };
+    println!(
+        "Serving Agent 206 to other devices at {}. Sign in with a code from the vault's authenticator app.",
+        urls.join(" and ")
+    );
+    println!("Certificate SHA-256 fingerprint: {}", tls.fingerprint);
+    if matches!(options.certificate, Certificate::Generated) {
+        println!(
+            "The certificate is self-signed: continue past the browser's warning only if it shows this fingerprint."
+        );
+    }
+    axum_server::from_tcp_rustls(
+        listener,
+        axum_server::tls_rustls::RustlsConfig::from_config(tls.config),
+    )
+    .map_err(|source| WebError::Bind { addr, source })?
+    .serve(app(state, static_dir).into_make_service())
+    .await
+    .map_err(WebError::Serve)
+}
+
+/// Certificate names and the `Host` values browsers send for them. Port 443
+/// is left out of `Host` by browsers, so it is left out here too.
+fn host_names(names: &[String], port: u16) -> Result<(Vec<String>, Vec<String>), WebError> {
+    if names.is_empty() {
+        return Err(WebError::NoNames);
+    }
+    let mut certified = Vec::new();
+    let mut hosts = Vec::new();
+    for name in names {
+        let trimmed = name.trim_start_matches('[').trim_end_matches(']');
+        let host = match trimmed.parse::<IpAddr>() {
+            Ok(IpAddr::V6(ip)) => (ip.to_string(), format!("[{ip}]")),
+            Ok(IpAddr::V4(ip)) => (ip.to_string(), ip.to_string()),
+            Err(_) => match url::Host::parse(name) {
+                Ok(url::Host::Domain(domain))
+                    if !domain.is_empty()
+                        && domain
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.') =>
+                {
+                    (domain.clone(), domain)
+                }
+                _ => return Err(WebError::Name { name: name.clone() }),
+            },
+        };
+        hosts.push(if port == 443 {
+            host.1
+        } else {
+            format!("{}:{port}", host.1)
+        });
+        certified.push(host.0);
+    }
+    Ok((certified, hosts))
+}
+
 fn app(state: Web, static_dir: PathBuf) -> Router {
     Router::new()
         .route("/connect/{token}", get(connect))
         .route("/api/command", post(command))
         .route("/api/gateway", post(control))
         .route("/api/setup", post(setup))
+        .route("/api/sign-in", post(sign_in))
         .layer(DefaultBodyLimit::max(a206_protocol::MAX_FRAME + 10))
         .fallback_service(static_files(static_dir))
         .layer(axum::middleware::from_fn_with_state(
@@ -189,12 +332,15 @@ async fn canonical_host(
     request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
+    let Some(loopback) = state.access.loopback() else {
+        return next.run(request).await;
+    };
     let host = request
         .headers()
         .get(header::HOST)
         .and_then(|h| h.to_str().ok());
     let alias = host.and_then(|h| h.strip_prefix("localhost:"));
-    if alias.is_some() && alias == state.host.split_once(':').map(|(_, port)| port) {
+    if alias.is_some() && alias == loopback.host.split_once(':').map(|(_, port)| port) {
         let path = request
             .uri()
             .path_and_query()
@@ -202,7 +348,7 @@ async fn canonical_host(
         return (
             StatusCode::TEMPORARY_REDIRECT,
             [
-                (header::LOCATION, format!("{}{path}", state.origin)),
+                (header::LOCATION, format!("{}{path}", loopback.origin)),
                 (header::CACHE_CONTROL, "no-store".into()),
             ],
         )
@@ -251,8 +397,12 @@ async fn connect(
     Path(token): Path<String>,
     headers: HeaderMap,
 ) -> Response {
-    if token != *state.bootstrap
-        || headers.get(header::HOST).and_then(|h| h.to_str().ok()) != Some(state.host.as_str())
+    // Opened to other devices, browsers sign in instead.
+    let Some(loopback) = state.access.loopback() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if token != loopback.bootstrap
+        || headers.get(header::HOST).and_then(|h| h.to_str().ok()) != Some(loopback.host.as_str())
     {
         return (
             StatusCode::FORBIDDEN,
@@ -260,16 +410,12 @@ async fn connect(
         )
             .into_response();
     }
-    if state
-        .claimed
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .is_err()
-    {
+    if !loopback.claim() {
         return (
             StatusCode::FORBIDDEN,
             format!(
                 "This authorization link was already used. Open {}/ in the browser that used it, or restart `agent206 web` for a new link.",
-                state.origin
+                loopback.origin
             ),
         )
             .into_response();
@@ -281,7 +427,7 @@ async fn connect(
                 header::SET_COOKIE,
                 "a206_session=; Max-Age=0; HttpOnly; SameSite=Strict; Path=/".into(),
             ),
-            (header::LOCATION, format!("/#a206={}", state.token)),
+            (header::LOCATION, format!("/#a206={}", loopback.token)),
             (header::CACHE_CONTROL, "no-store".into()),
             (header::REFERRER_POLICY, "no-referrer".into()),
         ],
@@ -290,17 +436,7 @@ async fn connect(
         .into_response()
 }
 fn authorized(state: &Web, headers: &HeaderMap) -> bool {
-    let bearer = format!("Bearer {}", state.token);
-    headers
-        .get(header::AUTHORIZATION)
-        .and_then(|h| h.to_str().ok())
-        == Some(bearer.as_str())
-        && headers.get(header::HOST).and_then(|h| h.to_str().ok()) == Some(state.host.as_str())
-        && headers.get(header::ORIGIN).and_then(|h| h.to_str().ok()) == Some(state.origin.as_str())
-        && headers
-            .get(header::CONTENT_TYPE)
-            .and_then(|h| h.to_str().ok())
-            == Some("application/msgpack")
+    state.access.authorized(headers, Instant::now())
 }
 async fn command(State(state): State<Web>, headers: HeaderMap, bytes: Bytes) -> Response {
     if !authorized(&state, &headers) {
@@ -423,9 +559,53 @@ async fn setup(State(state): State<Web>, headers: HeaderMap, bytes: Bytes) -> Re
     respond(StatusCode::OK, request.id, &reply)
 }
 
+/// Sign-in for a server opened to other devices. Only a same-origin request
+/// is answered; signing out also needs the session it ends.
+async fn sign_in(State(state): State<Web>, headers: HeaderMap, bytes: Bytes) -> Response {
+    if !state.access.same_origin(&headers) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let mut decoder = Decoder::default();
+    let Ok(mut requests) = decoder.feed::<Request<SignInRequest>>(&bytes) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    if requests.len() != 1 || decoder.finish().is_err() {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let request = requests.remove(0);
+    let network = match state.access.as_ref() {
+        Access::Network(network) => Some(network),
+        Access::Loopback(_) => None,
+    };
+    let outcome = match (request.body, network) {
+        (SignInRequest::Methods, network) => Ok(SignInReply::Methods {
+            totp: network.is_some(),
+        }),
+        (SignInRequest::Totp { code }, Some(network)) => network
+            .sign_in(&code)
+            .await
+            .map(|session| SignInReply::SignedIn { session }),
+        (SignInRequest::SignOut, Some(network)) => {
+            if !authorized(&state, &headers) {
+                return StatusCode::FORBIDDEN.into_response();
+            }
+            if let Some(token) = access::bearer(&headers) {
+                network.sign_out(token);
+            }
+            Ok(SignInReply::SignedOut)
+        }
+        (SignInRequest::Totp { .. } | SignInRequest::SignOut, None) => Err(SignInError::NotOffered),
+    };
+    let reply = outcome.unwrap_or_else(|error| {
+        SignInReply::Error(crate::error::correlated("sign in", request.id, &error))
+    });
+    respond(StatusCode::OK, request.id, &reply)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::Ordering;
     #[tokio::test]
     async fn browser_deep_links_reload_without_masking_api_or_asset_errors() {
         let directory = tempfile::tempdir().unwrap();
@@ -529,6 +709,11 @@ mod tests {
             }
         }
     }
+    impl Web {
+        fn lo(&self) -> &Loopback {
+            self.access.loopback().unwrap()
+        }
+    }
     fn bridge(port: u16) -> Web {
         let root = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
         Web {
@@ -539,11 +724,13 @@ mod tests {
                 problem: None,
             })),
             root: Arc::new(root),
-            token: Arc::new(uuid::Uuid::new_v4().simple().to_string()),
-            bootstrap: Arc::new(uuid::Uuid::new_v4().simple().to_string()),
-            claimed: Arc::new(AtomicBool::new(false)),
-            host: Arc::new(format!("127.0.0.1:{port}")),
-            origin: Arc::new(format!("http://127.0.0.1:{port}")),
+            access: Arc::new(Access::Loopback(Loopback {
+                token: uuid::Uuid::new_v4().simple().to_string(),
+                bootstrap: uuid::Uuid::new_v4().simple().to_string(),
+                claimed: AtomicBool::new(false),
+                host: format!("127.0.0.1:{port}"),
+                origin: format!("http://127.0.0.1:{port}"),
+            })),
         }
     }
     async fn get_with_host(app: &Router, path: &str, host: &str) -> Response {
@@ -567,41 +754,41 @@ mod tests {
             .unwrap();
         let port = 20_000 + (uuid::Uuid::new_v4().as_u128() % 10_000) as u16;
         let state = bridge(port);
-        let link = format!("/connect/{}", state.bootstrap);
+        let link = format!("/connect/{}", state.lo().bootstrap);
         let app = app(state.clone(), directory.path().into());
         let response =
             get_with_host(&app, &format!("{link}?x=1"), &format!("localhost:{port}")).await;
         assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
         assert_eq!(
             response.headers()[header::LOCATION],
-            format!("{}{link}?x=1", state.origin).as_str()
+            format!("{}{link}?x=1", state.lo().origin).as_str()
         );
-        assert!(!state.claimed.load(Ordering::Acquire));
+        assert!(!state.lo().claimed.load(Ordering::Acquire));
         // Another port's localhost is not this bridge's alias.
         let other = get_with_host(&app, "/", &format!("localhost:{}", port + 1)).await;
         assert_ne!(other.status(), StatusCode::TEMPORARY_REDIRECT);
-        let claimed = get_with_host(&app, &link, &state.host).await;
+        let claimed = get_with_host(&app, &link, &state.lo().host).await;
         assert_eq!(claimed.status(), StatusCode::SEE_OTHER);
         assert_eq!(
             claimed.headers()[header::LOCATION],
-            format!("/#a206={}", state.token).as_str()
+            format!("/#a206={}", state.lo().token).as_str()
         );
-        let reused = get_with_host(&app, &link, &state.host).await;
+        let reused = get_with_host(&app, &link, &state.lo().host).await;
         assert_eq!(reused.status(), StatusCode::FORBIDDEN);
         let body = axum::body::to_bytes(reused.into_body(), 4096)
             .await
             .unwrap();
         let body = String::from_utf8(body.to_vec()).unwrap();
         assert!(body.contains("already used"), "{body}");
-        assert!(!body.contains(state.token.as_str()));
+        assert!(!body.contains(state.lo().token.as_str()));
     }
     #[test]
     fn auth_requires_an_explicit_origin_bound_bearer() {
         let state = bridge(8206);
-        let token = state.token.to_string();
+        let token = state.lo().token.to_string();
         let mut headers = HeaderMap::new();
-        headers.insert(header::HOST, state.host.parse().unwrap());
-        headers.insert(header::ORIGIN, state.origin.parse().unwrap());
+        headers.insert(header::HOST, state.lo().host.parse().unwrap());
+        headers.insert(header::ORIGIN, state.lo().origin.parse().unwrap());
         headers.insert(header::CONTENT_TYPE, "application/msgpack".parse().unwrap());
         headers.insert(
             header::COOKIE,
@@ -631,17 +818,33 @@ mod tests {
         path: &str,
         body: T,
     ) -> (StatusCode, R) {
+        let lo = state.lo();
+        let (status, reply) =
+            post_as(app, (&lo.host, &lo.origin), Some(&lo.token), path, body).await;
+        (status, reply.expect("a reply frame"))
+    }
+    /// Post as a page at `origin` reaching `host`; `None` when no frame came back.
+    async fn post_as<T: serde::Serialize, R: serde::de::DeserializeOwned>(
+        app: &Router,
+        (host, origin): (&str, &str),
+        bearer: Option<&str>,
+        path: &str,
+        body: T,
+    ) -> (StatusCode, Option<R>) {
         let id = uuid::Uuid::new_v4();
+        let mut request = axum::http::Request::builder()
+            .method("POST")
+            .uri(path)
+            .header(header::HOST, host)
+            .header(header::ORIGIN, origin)
+            .header(header::CONTENT_TYPE, "application/msgpack");
+        if let Some(bearer) = bearer {
+            request = request.header(header::AUTHORIZATION, format!("Bearer {bearer}"));
+        }
         let response = app
             .clone()
             .oneshot(
-                axum::http::Request::builder()
-                    .method("POST")
-                    .uri(path)
-                    .header(header::HOST, state.host.as_str())
-                    .header(header::ORIGIN, state.origin.as_str())
-                    .header(header::CONTENT_TYPE, "application/msgpack")
-                    .header(header::AUTHORIZATION, format!("Bearer {}", state.token))
+                request
                     .body(axum::body::Body::from(
                         a206_protocol::encode(&Request { id, body }).unwrap(),
                     ))
@@ -653,12 +856,15 @@ mod tests {
         let bytes = axum::body::to_bytes(response.into_body(), a206_protocol::MAX_FRAME)
             .await
             .unwrap();
+        if bytes.is_empty() {
+            return (status, None);
+        }
         let mut decoder = Decoder::default();
         let mut frames = decoder.feed::<a206_protocol::Response<R>>(&bytes).unwrap();
         assert_eq!(frames.len(), 1);
         let frame = frames.remove(0);
         assert_eq!(frame.id, id);
-        (status, frame.body)
+        (status, Some(frame.body))
     }
     #[tokio::test]
     async fn an_unconfigured_bridge_offers_setup_and_reports_why_it_cannot_serve() {
@@ -751,8 +957,8 @@ mod tests {
                 axum::http::Request::builder()
                     .method("POST")
                     .uri("/api/setup")
-                    .header(header::HOST, state.host.as_str())
-                    .header(header::ORIGIN, state.origin.as_str())
+                    .header(header::HOST, state.lo().host.as_str())
+                    .header(header::ORIGIN, state.lo().origin.as_str())
                     .header(header::CONTENT_TYPE, "application/msgpack")
                     .body(axum::body::Body::from(
                         a206_protocol::encode(&Request {
@@ -808,5 +1014,215 @@ mod tests {
             panic!("unexpected {reply:?}");
         };
         assert_eq!(status.active, Some(pinned));
+    }
+
+    #[test]
+    fn network_names_become_certificate_names_and_host_values() {
+        let domain = format!("h{}.test", uuid::Uuid::new_v4().simple());
+        let (names, hosts) = host_names(
+            &[domain.clone(), "192.0.2.7".into(), "[2001:db8::7]".into()],
+            8443,
+        )
+        .unwrap();
+        assert_eq!(names, [domain.as_str(), "192.0.2.7", "2001:db8::7"]);
+        assert_eq!(
+            hosts,
+            [
+                format!("{domain}:8443"),
+                "192.0.2.7:8443".into(),
+                "[2001:db8::7]:8443".into()
+            ]
+        );
+        // Browsers leave the default HTTPS port out of `Host`.
+        let (_, hosts) = host_names(std::slice::from_ref(&domain), 443).unwrap();
+        assert_eq!(hosts, [domain]);
+        assert!(matches!(host_names(&[], 8443), Err(WebError::NoNames)));
+        for bad in ["", "two words", "host:8443", "a/b", "user@host"] {
+            assert!(
+                matches!(host_names(&[bad.into()], 8443), Err(WebError::Name { .. })),
+                "{bad:?}"
+            );
+        }
+    }
+
+    const HOST: &str = "gateway.test:8443";
+    const ORIGIN: &str = "https://gateway.test:8443";
+    /// A bridge opened to other devices over `root`'s vault.
+    fn network_bridge(root: &std::path::Path) -> Router {
+        let state = Web {
+            gateway: Arc::new(RwLock::new(Gateway::resolve(root, None).unwrap())),
+            root: Arc::new(root.into()),
+            access: Arc::new(Access::Network(Network {
+                hosts: vec![HOST.into()],
+                root: root.into(),
+                sessions: Mutex::default(),
+            })),
+        };
+        app(state, root.join("static"))
+    }
+    async fn sign_in_with(app: &Router, code: &str) -> SignInReply {
+        let (status, reply) = post_as(
+            app,
+            (HOST, ORIGIN),
+            None,
+            "/api/sign-in",
+            SignInRequest::Totp { code: code.into() },
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        reply.unwrap()
+    }
+    fn refused(reply: SignInReply) -> ErrorReport {
+        match reply {
+            SignInReply::Error(report) => report,
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_loopback_bridge_offers_no_code_sign_in() {
+        let root = tempfile::tempdir().unwrap();
+        let (state, app) = unconfigured(root.path());
+        let (_, methods) =
+            post::<_, SignInReply>(&app, &state, "/api/sign-in", SignInRequest::Methods).await;
+        assert_eq!(methods, SignInReply::Methods { totp: false });
+        let (_, reply) = post::<_, SignInReply>(
+            &app,
+            &state,
+            "/api/sign-in",
+            SignInRequest::Totp {
+                code: "123456".into(),
+            },
+        )
+        .await;
+        assert_eq!(refused(reply).kind, a206_core::ErrorKind::InvalidRequest);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn other_devices_sign_in_with_the_vaults_authenticator() {
+        use a206_broker::{
+            Client, Reply as BrokerReply, Request as BrokerRequest, Role, WireSecret,
+        };
+        let root = tempfile::tempdir().unwrap();
+        let app = network_bridge(root.path());
+        // Without a broker nothing signs in, and nothing is started for the request.
+        let report = refused(sign_in_with(&app, "123456").await);
+        assert_eq!(report.kind, a206_core::ErrorKind::Unavailable);
+        assert!(report.correlation.is_some());
+        assert!(!a206_broker::socket_path(root.path()).exists());
+
+        let broker_root = root.path().to_owned();
+        // Deliberately detached: the broker serves until the test runtime ends.
+        tokio::spawn(async move { a206_broker::serve(&broker_root).await });
+        let socket = a206_broker::socket_path(root.path());
+        for _ in 0..500 {
+            if socket.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let mut user = Client::connect(root.path(), Role::User).await.unwrap();
+        let password = uuid::Uuid::new_v4().to_string();
+        user.call(BrokerRequest::Unlock {
+            password: WireSecret::new(password.clone()),
+            totp: None,
+            create: true,
+        })
+        .await
+        .unwrap();
+        // An unlocked vault without an authenticator cannot sign anyone in.
+        let report = refused(sign_in_with(&app, "123456").await);
+        assert_eq!(report.kind, a206_core::ErrorKind::PermissionDenied);
+        let BrokerReply::TotpEnrollment { manual_key, .. } = user
+            .call(BrokerRequest::BeginTotp {
+                account: uuid::Uuid::new_v4().simple().to_string(),
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("no enrollment");
+        };
+        let generator = totp_rs::TOTP::new_unchecked(
+            totp_rs::Algorithm::SHA1,
+            6,
+            1,
+            30,
+            totp_rs::Secret::Encoded(manual_key.expose().to_owned())
+                .to_bytes()
+                .unwrap(),
+            None,
+            String::new(),
+        );
+        let now = a206_vault::unix_now();
+        user.call(BrokerRequest::ConfirmTotp {
+            code: generator.generate(now),
+        })
+        .await
+        .unwrap();
+        // The next step's code is unused and inside the accepted window.
+        let code = generator.generate(now + 30);
+        let SignInReply::SignedIn { session } = sign_in_with(&app, &code).await else {
+            panic!("not signed in");
+        };
+        assert_eq!(
+            format!(
+                "{:?}",
+                SignInReply::SignedIn {
+                    session: session.clone()
+                }
+            ),
+            "SignedIn { session: [REDACTED] }"
+        );
+        let (status, reply) = post_as::<_, SetupReply>(
+            &app,
+            (HOST, ORIGIN),
+            Some(&session),
+            "/api/setup",
+            SetupRequest::Status,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(matches!(reply, Some(SetupReply::Status(_))));
+        // The same session from a page on another origin is refused.
+        let (status, _) = post_as::<_, SetupReply>(
+            &app,
+            (HOST, "https://elsewhere.test"),
+            Some(&session),
+            "/api/setup",
+            SetupRequest::Status,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        // A used code cannot sign in again, and the refusal stays typed.
+        let report = refused(sign_in_with(&app, &code).await);
+        assert_eq!(report.kind, a206_core::ErrorKind::PermissionDenied);
+        assert!(report.source.is_some(), "{report:?}");
+        // Signing out ends the session.
+        let (_, reply) = post_as::<_, SignInReply>(
+            &app,
+            (HOST, ORIGIN),
+            Some(&session),
+            "/api/sign-in",
+            SignInRequest::SignOut,
+        )
+        .await;
+        assert_eq!(reply, Some(SignInReply::SignedOut));
+        let (status, _) = post_as::<_, SetupReply>(
+            &app,
+            (HOST, ORIGIN),
+            Some(&session),
+            "/api/setup",
+            SetupRequest::Status,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        // A locked vault signs nobody in.
+        user.call(BrokerRequest::Lock).await.unwrap();
+        let report = refused(sign_in_with(&app, &generator.generate(now + 30)).await);
+        assert_eq!(report.kind, a206_core::ErrorKind::Unavailable);
+        // There is no one-time link to claim.
+        let link = get_with_host(&app, "/connect/anything", HOST).await;
+        assert_eq!(link.status(), StatusCode::NOT_FOUND);
     }
 }
