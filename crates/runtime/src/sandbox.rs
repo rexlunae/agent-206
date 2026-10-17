@@ -38,6 +38,8 @@ pub use confined::Confined;
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod confined {
+    #[cfg(target_os = "macos")]
+    use super::macos;
     use super::{ConfineError, Control, StartError};
     use std::path::Path;
     use tokio::process::Child;
@@ -162,19 +164,19 @@ mod macos {
 
     pub async fn drain(mut pipe: impl tokio::io::AsyncRead + Unpin) -> Vec<u8> {
         let mut kept = Vec::new();
-        // A read failure ends the diagnostic early; what was kept still counts.
-        if (&mut pipe)
-            .take(MAX_DIAGNOSTIC)
-            .read_to_end(&mut kept)
-            .await
-            .is_ok()
-        {
-            if let Err(error) = tokio::io::copy(&mut pipe, &mut tokio::io::sink()).await {
-                tracing::debug!(
-                    error = &error as &dyn std::error::Error,
-                    "confined stderr closed early"
-                );
-            }
+        let drained = async {
+            (&mut pipe)
+                .take(MAX_DIAGNOSTIC)
+                .read_to_end(&mut kept)
+                .await?;
+            tokio::io::copy(&mut pipe, &mut tokio::io::sink()).await
+        };
+        // A read failure only ends the diagnostic early; what was kept counts.
+        if let Err(error) = drained.await {
+            tracing::debug!(
+                error = &error as &dyn std::error::Error,
+                "confined stderr closed early"
+            );
         }
         kept
     }
