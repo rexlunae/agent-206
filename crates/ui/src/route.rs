@@ -409,7 +409,34 @@ pub(crate) mod tests {
         let fixture = use_context::<ThreadFixture>();
         let state = loaded_state(fixture.snapshot.clone());
         use_context_provider(|| state);
+        use_context_provider(|| crate::conversation::Drafts(Signal::new(Default::default())));
         rsx! { Chat { id: fixture.id, split: fixture.split, message: fixture.message } }
+    }
+
+    /// A workspace whose columns follow `step` through `steps`.
+    #[derive(Clone)]
+    struct Relayout {
+        snapshot: a206_core::Snapshot,
+        id: Uuid,
+        steps: Vec<Option<Columns>>,
+        step: Signal<usize>,
+        drafts: crate::conversation::Drafts,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Routable)]
+    enum RelayoutRoute {
+        #[route("/")]
+        RelayoutView {},
+    }
+
+    #[component]
+    fn RelayoutView() -> Element {
+        let fixture = use_context::<Relayout>();
+        let state = loaded_state(fixture.snapshot.clone());
+        use_context_provider(|| state);
+        use_context_provider(|| fixture.drafts);
+        let split = fixture.steps[(fixture.step)()].clone();
+        rsx! { Chat { id: fixture.id, split, message: None } }
     }
 
     fn render_thread(fixture: ThreadFixture) -> String {
@@ -511,6 +538,71 @@ pub(crate) mod tests {
         );
         assert!(!html.contains("Add a column"));
         assert!(!html.contains(&format!("Close {}", threads[5].title)));
+    }
+
+    #[test]
+    fn adding_and_closing_columns_keeps_unsent_drafts() {
+        let threads: Vec<_> = (0..3)
+            .map(|_| a206_core::Thread::new(Uuid::new_v4().to_string(), a206_core::Mode::Chat))
+            .collect();
+        let [first, b, c] = [threads[0].id, threads[1].id, threads[2].id];
+        let typed: std::collections::HashMap<Uuid, String> = threads
+            .iter()
+            .map(|t| (t.id, format!("unsent {}", Uuid::new_v4())))
+            .collect();
+        let mut snapshot = crate::empty_snapshot();
+        snapshot.threads = threads;
+        fn app() -> Element {
+            rsx! { Router::<RelayoutRoute> {} }
+        }
+        let mut dom = VirtualDom::new(app);
+        let (mut step, drafts) = dom.in_scope(ScopeId::ROOT, || {
+            let drafts = typed
+                .iter()
+                .map(|(id, text)| {
+                    let unsent = crate::conversation::Unsent {
+                        text: text.clone(),
+                        attachments: vec![],
+                    };
+                    (*id, unsent)
+                })
+                .collect();
+            (Signal::new(0), Signal::new(drafts))
+        });
+        // Add a column, close the one before the last, then close split view.
+        let steps = vec![
+            Columns::of([b]),
+            Columns::of([b, c]),
+            Columns::of([c]),
+            None,
+        ];
+        let visible = [
+            vec![first, b],
+            vec![first, b, c],
+            vec![first, c],
+            vec![first],
+        ];
+        dom.provide_root_context(Relayout {
+            snapshot,
+            id: first,
+            steps: steps.clone(),
+            step,
+            drafts: crate::conversation::Drafts(drafts),
+        });
+        dom.provide_root_context(Rc::new(MemoryHistory::default()) as Rc<dyn History>);
+        dom.rebuild_in_place();
+        for (index, shown) in visible.iter().enumerate() {
+            if index > 0 {
+                dom.in_scope(ScopeId::ROOT, || step.set(index));
+                dom.render_immediate(&mut dioxus::core::NoOpMutations);
+            }
+            let html = dioxus_ssr::render(&dom);
+            for id in shown {
+                assert!(html.contains(&typed[id]), "step {index}: {html}");
+            }
+        }
+        let kept = dom.in_scope(ScopeId::ROOT, || drafts.peek().len());
+        assert_eq!(kept, typed.len());
     }
 
     #[test]

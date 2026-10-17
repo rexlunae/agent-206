@@ -7,6 +7,7 @@ use a206_core::{
     InstructionStatus, Mode, ModelKey, PlanStatus, Reply, Role, RunState, TextAttachment, Thread,
 };
 use fc_dioxus::prelude::*;
+use std::collections::HashMap;
 use uuid::Uuid;
 /// Scrolls a linked message into view where the renderer can scroll.
 async fn reveal(mounted: MountedEvent) {
@@ -23,6 +24,17 @@ async fn reveal(mounted: MountedEvent) {
         }
     }
 }
+/// What a composer holds but has not sent.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct Unsent {
+    pub(crate) text: String,
+    pub(crate) attachments: Vec<TextAttachment>,
+}
+/// Unsent drafts by conversation for the life of the client, so adding or
+/// closing a column, which remounts the conversations, or leaving the page
+/// keeps them.
+#[derive(Clone, Copy)]
+pub(crate) struct Drafts(pub(crate) Signal<HashMap<Uuid, Unsent>>);
 #[component]
 pub fn Workspace(id: Uuid, split: Option<Columns>, message: Option<Uuid>) -> Element {
     let state = use_context::<State>();
@@ -160,8 +172,34 @@ fn run_status(thread: &Thread) -> (Lifecycle, String) {
 #[component]
 fn Conversation(thread: Thread, target: Option<Uuid>) -> Element {
     let mut state = use_context::<State>();
-    let mut draft = use_signal(String::new);
-    let mut attachments = use_signal(Vec::<TextAttachment>::new);
+    let Drafts(mut drafts) = use_context::<Drafts>();
+    let id = thread.id;
+    let mut draft = use_signal(|| {
+        drafts
+            .peek()
+            .get(&id)
+            .map(|u| u.text.clone())
+            .unwrap_or_default()
+    });
+    let mut attachments = use_signal(|| {
+        drafts
+            .peek()
+            .get(&id)
+            .map(|u| u.attachments.clone())
+            .unwrap_or_default()
+    });
+    use_effect(move || {
+        let unsent = Unsent {
+            text: draft(),
+            attachments: attachments(),
+        };
+        let mut all = drafts.write();
+        if unsent == Unsent::default() {
+            all.remove(&id);
+        } else {
+            all.insert(id, unsent);
+        }
+    });
     let mut attachment_error = use_signal(|| None::<ErrorReport>);
     let mut command_error = use_signal(|| None::<ErrorReport>);
     let mut reading_files = use_signal(|| false);
@@ -172,7 +210,6 @@ fn Conversation(thread: Thread, target: Option<Uuid>) -> Element {
     let steered: Vec<String> = thread.steering.iter().map(|m| m.text.clone()).collect();
     let has_model = thread.model.is_some();
     let selected_model = thread.model.clone();
-    let id = thread.id;
     let allowed_for_mode = thread.subagent_models.clone();
     let allowed_for_model = thread.subagent_models.clone();
     let mode = thread.mode;
