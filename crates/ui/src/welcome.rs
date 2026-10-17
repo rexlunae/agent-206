@@ -6,8 +6,8 @@
 //! conversation; projects, messengers and skills follow as extras.
 use crate::{PageFrame, State, call, dispatch, error::ErrorNotice, route::Route};
 use a206_core::{
-    Command, ErrorKind, ErrorReport, GatewayPhase, GatewayReport, MessengerKind, Mode, Reply,
-    SkillSummary, Snapshot,
+    Command, ErrorKind, ErrorReport, GatewayPhase, GatewayReport, MessengerKind, MessengerState,
+    Mode, Reply, SkillSummary, Snapshot,
 };
 use fc_dioxus::prelude::*;
 
@@ -284,7 +284,20 @@ fn extras(
     };
     let projects = snapshot.projects.len();
     let messengers = &snapshot.settings.messengers;
-    let enabled = messengers.iter().filter(|m| m.enabled).count();
+    let enabled: Vec<_> = messengers.iter().filter(|m| m.enabled).collect();
+    // What the gateway reports for a turned-on messenger; one it has not
+    // reported yet has not started.
+    let state = |name: &str| {
+        snapshot
+            .messengers
+            .iter()
+            .find(|status| status.name == name)
+            .map_or(MessengerState::Stopped, |status| status.state)
+    };
+    let connected = enabled
+        .iter()
+        .filter(|m| state(&m.name) == MessengerState::Connected)
+        .count();
     [
         done_or(
             projects > 0,
@@ -295,9 +308,9 @@ fn extras(
         )
         .on(Route::Projects {}),
         done_or(
-            enabled > 0,
+            connected > 0,
             "Connect a messenger",
-            format!("Turned on: {enabled} of {}.", messengers.len()),
+            format!("Connected: {connected} of {}.", messengers.len()),
             if messengers.is_empty() {
                 let kinds: Vec<_> = MessengerKind::ALL.iter().map(|kind| kind.label()).collect();
                 let kinds = match kinds.split_last() {
@@ -307,8 +320,17 @@ fn extras(
                     _ => kinds.concat(),
                 };
                 format!("Reach your agent from {kinds}. Its token stays in the vault.")
-            } else {
+            } else if enabled.is_empty() {
                 "Configured but turned off; a messenger connects only once you turn it on.".into()
+            } else {
+                let states: Vec<_> = enabled
+                    .iter()
+                    .map(|m| format!("{}: {}", m.name, state(&m.name).label()))
+                    .collect();
+                format!(
+                    "Turned on but not connected ({}). The Messengers page shows why.",
+                    states.join(", ")
+                )
             },
         )
         .on(Route::Messengers {}),
@@ -664,7 +686,33 @@ mod tests {
         assert_eq!(off.progress, Progress::Optional);
         assert!(off.detail.contains("turned off"), "{}", off.detail);
         messenger.enabled = true;
-        snapshot.settings.messengers = vec![messenger];
+        snapshot.settings.messengers = vec![messenger.clone()];
+        // Turned on is not connected: not started, failed or still connecting.
+        for state in [
+            None,
+            Some(MessengerState::Failed),
+            Some(MessengerState::Connecting),
+            Some(MessengerState::WaitingForVault),
+        ] {
+            snapshot.messengers = state
+                .map(|state| a206_core::MessengerStatus {
+                    name: messenger.name.clone(),
+                    state,
+                    account: None,
+                    failure: None,
+                    refused: vec![],
+                })
+                .into_iter()
+                .collect();
+            let [_, on, _] = extras(&snapshot, none);
+            assert_eq!(on.progress, Progress::Optional, "{state:?}");
+            assert!(on.detail.contains(&messenger.name), "{}", on.detail);
+        }
+        // Another messenger's connection does not count for this one.
+        snapshot.messengers[0].name = text();
+        snapshot.messengers[0].state = MessengerState::Connected;
+        assert_eq!(extras(&snapshot, none)[1].progress, Progress::Optional);
+        snapshot.messengers[0].name = messenger.name.clone();
         let enabled = Ok(vec![SkillSummary {
             name: text(),
             enabled: true,
