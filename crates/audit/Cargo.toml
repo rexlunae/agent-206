@@ -1,0 +1,13 @@
+[package]
+name = "a206-audit"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+[dependencies]
+a206-core.workspace = true
+regex = { version = "1", default-features = false, features = ["std", "unicode-case", "unicode-perl"] }
+[dev-dependencies]
+uuid.workspace = true
+[lints]
+workspace = true

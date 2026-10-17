@@ -348,6 +348,15 @@ impl Delegator {
             .remove(&reservation);
     }
 
+    /// Add `text` to `child`'s running native run.
+    pub async fn steer(&self, child: Id, text: String) -> Result<(), ErrorReport> {
+        self.request(Command::Steer {
+            thread: child,
+            text,
+        })
+        .await
+        .map(drop)
+    }
     /// Cancel `child`'s run and its own subagents' runs.
     pub async fn cancel(&self, child: Id) -> Result<(), ErrorReport> {
         self.request(Command::CancelRun { thread: child })

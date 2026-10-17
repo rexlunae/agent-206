@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use uuid::Uuid;
 
+pub mod audit;
 pub mod doctor;
 pub mod error;
 pub mod extension;
@@ -11,6 +12,7 @@ pub mod ignore;
 pub mod prompts;
 pub mod search;
 pub mod tools;
+pub use audit::{AuditBuilder, AuditField, AuditFinding, AuditLocation, AuditReport, AuditRule};
 pub use error::{ErrorKind, ErrorReport};
 pub use ignore::Ignore;
 pub use prompts::{AnswerError, PromptAnswer, PromptOutcome, UserPrompt};
@@ -491,6 +493,10 @@ pub struct Thread {
     /// offered once for each summary, before the next one is made.
     #[serde(default)]
     pub memory_flush: Option<MemoryFlush>,
+    /// Messages sent to the running native run with `Steer`, waiting for the
+    /// run to reach its next round, where they join `messages` in order.
+    #[serde(default)]
+    pub steering: Vec<Message>,
     /// The checklist the conversation's models keep with `plan_update`,
     /// shown to the user beside the conversation. Empty when there is none.
     #[serde(default)]
@@ -569,6 +575,7 @@ impl Thread {
             instructions: vec![],
             compacting: None,
             memory_flush: None,
+            steering: vec![],
             plan: vec![],
         }
     }
@@ -686,6 +693,9 @@ pub struct SkillSummary {
     pub expects_env: Vec<String>,
     /// Why the skill could not be read.
     pub failure: Option<ErrorReport>,
+    /// What the pre-install audit found in `SKILL.md`, for the user's review.
+    #[serde(default)]
+    pub audit: AuditReport,
 }
 /// The exact `SKILL.md` a user reviews, with the digest that approves it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1095,6 +1105,14 @@ pub enum Command {
     RunJob {
         id: Id,
     },
+    /// Add a message to `thread`'s running native run. The run reads it
+    /// before its next model request, after any tool calls in progress, and
+    /// continues instead of ending while one waits. Refused when no native
+    /// run is taking messages; send it with `Send` then.
+    Steer {
+        thread: Id,
+        text: String,
+    },
 }
 impl Command {
     /// A stable operation name for logs and diagnostics; never includes arguments.
@@ -1151,6 +1169,7 @@ impl Command {
             Self::SetJobEnabled { .. } => "set_job_enabled",
             Self::RemoveJob { .. } => "remove_job",
             Self::RunJob { .. } => "run_job",
+            Self::Steer { .. } => "steer",
         }
     }
 }

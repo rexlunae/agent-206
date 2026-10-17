@@ -1874,3 +1874,242 @@ async fn subagent_tools_stay_within_permitted_models_and_the_callers_own_subagen
     first.respond(text_response(api, &nonce())).await;
     finished(task).await;
 }
+
+// ── Steering ────────────────────────────────────────────────────────────────
+
+impl Rig {
+    async fn steer(&self, thread: Id, text: &str) -> Reply {
+        self.run(Command::Steer {
+            thread,
+            text: text.into(),
+        })
+        .await
+    }
+}
+fn refused(reply: Reply, kind: ErrorKind) {
+    match reply {
+        Reply::Error(report) => assert_eq!(report.kind, kind, "{report:?}"),
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_steered_message_is_answered_before_the_run_ends() {
+    for api in PROTOCOLS {
+        let mut rig = rig(api, vec![], None).await;
+        let task = rig.send();
+        let first = rig.next_request().await;
+        // Steered while the model is still replying: it waits for the round.
+        let steered = nonce();
+        assert_eq!(rig.steer(rig.thread, &steered).await, Reply::Ok);
+        assert_eq!(rig.thread().steering.len(), 1);
+        assert!(!first.body.to_string().contains(&steered));
+        let reply = nonce();
+        first.respond(text_response(api, &reply)).await;
+
+        // The run continues instead of ending, with the message after the reply.
+        let second = rig.next_request().await;
+        let body = second.body.to_string();
+        let (at_reply, at_steered) = (body.find(&reply), body.find(&steered));
+        assert!(
+            at_reply.is_some() && at_steered > at_reply,
+            "{api:?}: {body}"
+        );
+        let answer = nonce();
+        second.respond(text_response(api, &answer)).await;
+        let thread = finished(task).await;
+        assert_eq!(thread.state, RunState::Complete, "{:?}", thread.error);
+        assert!(thread.steering.is_empty());
+        let texts: Vec<_> = thread
+            .messages
+            .iter()
+            .map(|m| (m.role.clone(), m.text.as_str()))
+            .collect();
+        assert_eq!(
+            texts[texts.len() - 3..],
+            [
+                (Role::Assistant, reply.as_str()),
+                (Role::User, steered.as_str()),
+                (Role::Assistant, answer.as_str())
+            ],
+            "{api:?}"
+        );
+        // An ended run takes no more messages.
+        refused(rig.steer(rig.thread, &nonce()).await, ErrorKind::Conflict);
+    }
+}
+
+#[tokio::test]
+async fn a_steered_message_follows_the_tool_results_of_its_round() {
+    let api = ProviderApi::Anthropic;
+    let name = nonce();
+    let mut rig = rig(api, vec![tool(&name, ToolPermission::Allow, &[])], None).await;
+    rig.permit(&name, ToolPermission::Allow).await;
+    let task = rig.send();
+    let first = rig.next_request().await;
+    let steered = nonce();
+    assert_eq!(rig.steer(rig.thread, &steered).await, Reply::Ok);
+    let call = Call::new(&name, json!({"value": nonce()}));
+    first
+        .respond(calls_response(api, std::slice::from_ref(&call), &nonce()))
+        .await;
+    let second = rig.next_request().await;
+    let history = history_of(api, &second.body);
+    let result = history
+        .iter()
+        .position(|m| m.to_string().contains(&call.id) && m["role"] == "user")
+        .expect("tool result");
+    let message = history
+        .iter()
+        .position(|m| m.to_string().contains(&steered))
+        .expect("steered message");
+    assert!(message > result, "{history:?}");
+    second.respond(text_response(api, &nonce())).await;
+    let thread = finished(task).await;
+    assert_eq!(thread.state, RunState::Complete, "{:?}", thread.error);
+    assert_eq!(calls_of(&thread)[0].state, ToolCallState::Succeeded);
+}
+
+#[tokio::test]
+async fn steering_is_refused_without_a_run_and_kept_when_a_run_is_cancelled() {
+    let api = ProviderApi::OpenAi;
+    let mut rig = rig(api, vec![], None).await;
+    refused(rig.steer(rig.thread, &nonce()).await, ErrorKind::Conflict);
+    refused(rig.steer(Id::new_v4(), &nonce()).await, ErrorKind::NotFound);
+    let task = rig.send();
+    let _first = rig.next_request().await;
+    refused(rig.steer(rig.thread, " ").await, ErrorKind::InvalidRequest);
+    let steered = nonce();
+    assert_eq!(rig.steer(rig.thread, &steered).await, Reply::Ok);
+    assert_eq!(
+        rig.run(Command::CancelRun { thread: rig.thread }).await,
+        Reply::Ok
+    );
+    let thread = finished(task).await;
+    assert_eq!(thread.state, RunState::Cancelled);
+    // The user's words are never dropped: they stay after the cancelled run.
+    assert!(thread.steering.is_empty());
+    let last = thread.messages.last().unwrap();
+    assert_eq!(
+        (last.role.clone(), last.text.as_str()),
+        (Role::User, steered.as_str())
+    );
+    refused(rig.steer(rig.thread, &nonce()).await, ErrorKind::Conflict);
+}
+
+#[tokio::test]
+async fn a_steered_message_left_by_a_failed_run_follows_its_failure() {
+    let api = ProviderApi::OpenAi;
+    let mut rig = rig(api, vec![], None).await;
+    // One round: the reply uses it, so the steered message cannot be answered.
+    let budget = ToolBudget {
+        rounds: 1,
+        tool_calls: 1,
+    };
+    let reply = rig
+        .run(Command::SetToolBudget {
+            thread: rig.thread,
+            budget,
+        })
+        .await;
+    assert_eq!(reply, Reply::Ok);
+    let task = rig.send();
+    let first = rig.next_request().await;
+    let steered = nonce();
+    assert_eq!(rig.steer(rig.thread, &steered).await, Reply::Ok);
+    let answer = nonce();
+    first.respond(text_response(api, &answer)).await;
+    let thread = finished(task).await;
+    assert_eq!(thread.state, RunState::Failed);
+    assert!(thread.steering.is_empty());
+    let texts: Vec<_> = thread
+        .messages
+        .iter()
+        .map(|m| (m.role.clone(), m.text.as_str()))
+        .collect();
+    let [
+        ..,
+        (Role::Assistant, said),
+        (Role::System, _),
+        (Role::User, left),
+    ] = texts.as_slice()
+    else {
+        panic!("expected reply, failure, then the steered message: {texts:?}");
+    };
+    assert_eq!((*said, *left), (answer.as_str(), steered.as_str()));
+}
+
+#[tokio::test]
+async fn a_run_whose_start_was_not_saved_takes_no_messages_and_cannot_be_cancelled() {
+    let api = ProviderApi::OpenAi;
+    let mut rig = rig(api, vec![], None).await;
+    // Another connection makes every snapshot write fail, as a full or
+    // failing disk would; the committed snapshot stays readable.
+    let db = rusqlite::Connection::open(rig._state.path().join("state.sqlite3")).unwrap();
+    db.execute_batch(
+        "CREATE TRIGGER refuse BEFORE UPDATE ON snapshot BEGIN SELECT RAISE(ABORT, 'refused'); END;",
+    )
+    .unwrap();
+    let Reply::Error(_) = rig.send().await.unwrap() else {
+        panic!("a run whose start could not be saved must be refused");
+    };
+    assert_eq!(rig.thread().state, RunState::Idle);
+    refused(rig.steer(rig.thread, &nonce()).await, ErrorKind::Conflict);
+    refused(
+        rig.run(Command::CancelRun { thread: rig.thread }).await,
+        ErrorKind::NotFound,
+    );
+    // Once writes work again the conversation runs as usual.
+    db.execute_batch("DROP TRIGGER refuse;").unwrap();
+    let task = rig.send();
+    rig.next_request()
+        .await
+        .respond(text_response(api, &nonce()))
+        .await;
+    assert_eq!(finished(task).await.state, RunState::Complete);
+}
+
+#[tokio::test]
+async fn subagent_send_steers_a_running_subagent() {
+    let api = ProviderApi::OpenAi;
+    let mut rig = rig(api, vec![], None).await;
+    for tool in [subagents::SPAWN, subagents::SEND] {
+        rig.permit(tool, ToolPermission::Allow).await;
+    }
+    let task = rig.send();
+    let first = rig.next_request().await;
+    let spawn = Call::new(subagents::SPAWN, json!({"task": nonce()}));
+    first
+        .respond(calls_response(api, std::slice::from_ref(&spawn), &nonce()))
+        .await;
+    let (parent, child) = parent_and_child(&mut rig, api, &spawn.id).await;
+    let id: Id = result_json(api, &parent.body, &spawn.id)["thread"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    // The subagent's model has not answered yet, so its run is going.
+    let steered = nonce();
+    let send = Call::new(subagents::SEND, json!({"thread": id, "message": steered}));
+    parent
+        .respond(calls_response(api, std::slice::from_ref(&send), &nonce()))
+        .await;
+    let third = rig.next_request().await;
+    let sent = result_json(api, &third.body, &send.id);
+    assert_eq!(sent["steered"], true, "{sent}");
+    assert_eq!(thread_of(&rig, id).steering.len(), 1);
+    child.respond(text_response(api, &nonce())).await;
+    let again = rig.next_request().await;
+    assert!(again.body.to_string().contains(&steered));
+    again.respond(text_response(api, &nonce())).await;
+    third.respond(text_response(api, &nonce())).await;
+    assert_eq!(finished(task).await.state, RunState::Complete);
+    tokio::time::timeout(PATIENCE, async {
+        while thread_of(&rig, id).state != RunState::Complete {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(wait("the subagent to finish"));
+    assert!(thread_of(&rig, id).steering.is_empty());
+}
