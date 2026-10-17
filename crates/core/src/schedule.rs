@@ -48,9 +48,23 @@ pub enum JobOutcome {
 /// One run of a job.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct JobRun {
+    /// Identifies the run, so the result of an earlier run that ends late
+    /// never replaces a newer one started in the same second.
+    #[serde(default)]
+    pub id: Id,
     /// Unix seconds.
     pub at: u64,
     pub outcome: JobOutcome,
+}
+impl JobRun {
+    /// A run starting at `at`.
+    pub fn start(at: u64) -> Self {
+        Self {
+            id: Id::new_v4(),
+            at,
+            outcome: JobOutcome::Running,
+        }
+    }
 }
 
 /// A message the gateway sends to `thread` on `schedule`.

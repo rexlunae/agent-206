@@ -14,6 +14,11 @@ of those applies to the next run; a job never carries authority of its own.
 | `Every { seconds, anchor }` | At `anchor + n × seconds`, 60 seconds to ten years apart. A late run does not shift later ones. |
 | `Cron { expression, zone }` | A cron expression (five fields, or six with seconds first; [croner](https://docs.rs/croner) syntax) in an IANA time zone, or the gateway's own zone when unset. |
 
+If the gateway stops while a job's run is starting, the next start settles it:
+when the conversation received the message, the run ends as that conversation's
+run did; when it did not, the job is due again at once, so the message is sent
+exactly once.
+
 When the gateway was stopped through one or more due times, the job runs once
 when it starts and then continues from the next time after now. Pausing clears
 the next time; resuming computes it from now, so times passed while paused are
@@ -29,7 +34,8 @@ the system) pauses the job and records why.
 - `RemoveJob { id }` deletes it; its conversation keeps what it sent.
 
 Jobs are in `Snapshot::jobs`, and each change publishes `JobChanged { id }`.
-`Job::last` records the latest run: `Running`, `Complete`, `Failed` (the
+`Job::last` records the latest run, with its own ID so a late result of an
+earlier run never replaces a newer one: `Running`, `Complete`, `Failed` (the
 conversation shows the failure), `Cancelled` or `Refused` with the gateway's
 report when the message was not run, for example because the conversation was
 busy or had no model.

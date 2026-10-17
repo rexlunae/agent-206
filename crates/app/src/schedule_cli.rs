@@ -65,6 +65,9 @@ fn schedule(
             let interval: jiff::SignedDuration = every
                 .parse()
                 .with_context(|| format!("{every} is not a duration"))?;
+            if interval.subsec_nanos() != 0 {
+                bail!("intervals are whole seconds; {every} is not");
+            }
             let seconds =
                 u64::try_from(interval.as_secs()).context("the interval must be positive")?;
             let anchor = match anchor {
@@ -168,6 +171,9 @@ mod tests {
             .is_err()
         );
         assert!(schedule(None, Some("-5m".into()), None, None, None).is_err());
+        // Fractions of a second are refused, not truncated.
+        let fraction = format!("{seconds}.{}s", 1 + seconds % 9);
+        assert!(schedule(None, Some(fraction), None, None, None).is_err());
         assert!(schedule(Some("tomorrow".into()), None, None, None, None).is_err());
     }
 }

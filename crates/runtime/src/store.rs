@@ -143,6 +143,8 @@ impl Store {
                 ..Default::default()
             })
             .collect();
+        // Before interrupted runs are marked failed, which it reads.
+        crate::schedule::recover(&mut store.state.jobs, &store.state.threads);
         for thread in &mut store.state.threads {
             // No run survives a restart, so neither do its approvals,
             // questions or calls.

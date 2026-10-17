@@ -95,14 +95,11 @@ impl Gateway {
         let at = now();
         let mut store = self.lock()?;
         let job = job_mut(&mut store.state, id)?;
-        job.last = Some(JobRun {
-            at,
-            outcome: JobOutcome::Running,
-        });
+        job.last = Some(JobRun::start(at));
         let job = job.clone();
         store.persist(Some(EventKind::JobChanged { id }))?;
         drop(store);
-        self.fire(&job, at);
+        self.fire(&job);
         Ok(Reply::Job(Box::new(job)))
     }
 
@@ -122,10 +119,7 @@ impl Gateway {
                 Ok(next) => {
                     job.next = next;
                     job.enabled = next.is_some();
-                    job.last = Some(JobRun {
-                        at: now,
-                        outcome: JobOutcome::Running,
-                    });
+                    job.last = Some(JobRun::start(now));
                     due.push(job.clone());
                 }
                 // A schedule that stopped resolving (a time zone removed from
@@ -134,6 +128,7 @@ impl Gateway {
                     job.next = None;
                     job.enabled = false;
                     job.last = Some(JobRun {
+                        id: Id::new_v4(),
                         at: now,
                         outcome: JobOutcome::Refused(crate::error::handle(
                             "schedule_job",
@@ -155,22 +150,23 @@ impl Gateway {
             .filter_map(|job| job.next)
             .min();
         drop(store);
-        for job in due.iter().filter(|job| {
-            matches!(
-                job.last,
-                Some(JobRun {
-                    outcome: JobOutcome::Running,
-                    ..
-                })
-            )
-        }) {
-            self.fire(job, now);
+        for job in &due {
+            self.fire(job);
         }
         Ok(next)
     }
 
-    /// Send `job`'s text in the background and record how the run ended.
-    fn fire(&self, job: &Job, at: u64) {
+    /// Send `job`'s text in the background, if its latest run has started,
+    /// and record how that run ended.
+    fn fire(&self, job: &Job) {
+        let Some(JobRun {
+            id: run,
+            outcome: JobOutcome::Running,
+            ..
+        }) = job.last
+        else {
+            return;
+        };
         let gateway = self.clone();
         let (id, thread, text) = (job.id, job.thread, job.text.clone());
         // Detached: the run belongs to the conversation, where the user sees
@@ -197,19 +193,19 @@ impl Gateway {
             };
             // Nobody waits on this task, so a failure to record the outcome
             // is logged; the conversation still shows the run itself.
-            if let Err(error) = gateway.finish_job(id, at, outcome) {
+            if let Err(error) = gateway.finish_job(id, run, outcome) {
                 crate::error::handle("schedule_job", &error);
             }
         }));
     }
-    fn finish_job(&self, id: Id, at: u64, outcome: JobOutcome) -> Result<()> {
+    fn finish_job(&self, id: Id, run: Id, outcome: JobOutcome) -> Result<()> {
         let mut store = self.lock()?;
         // The job may have been removed, or run again, meanwhile.
         let Some(job) = store.state.jobs.iter_mut().find(|job| job.id == id) else {
             return Ok(());
         };
         match &mut job.last {
-            Some(run) if run.at == at => run.outcome = outcome,
+            Some(last) if last.id == run => last.outcome = outcome,
             _ => return Ok(()),
         }
         store.persist(Some(EventKind::JobChanged { id }))?;

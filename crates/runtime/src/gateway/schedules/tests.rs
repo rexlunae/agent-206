@@ -58,10 +58,17 @@ async fn ended(g: &Gateway, id: Id) -> JobRun {
     .await
     .expect("the job's run ended")
 }
+/// A Unix time in this century, generated at runtime.
+fn arbitrary() -> u64 {
+    1_000_000_000 + (Id::new_v4().as_u128() % 3_000_000_000) as u64
+}
+/// Times the gateway reads the live clock for are chosen so that only a
+/// clock step of many years could change a test's outcome.
+const YEAR: u64 = 366 * 86_400;
 fn every(seconds: u64) -> Schedule {
     Schedule::Every {
         seconds,
-        anchor: now(),
+        anchor: arbitrary() % 1_000_000_000,
     }
 }
 fn kind(reply: Reply) -> ErrorKind {
@@ -77,7 +84,7 @@ async fn unusable_jobs_are_refused() {
     let g = Gateway::open(state.path()).unwrap();
     let thread = thread(&g).await;
     let past = Schedule::At {
-        at: now() - 1 - now() % 1000,
+        at: 1 + arbitrary() % 1000,
     };
     assert_eq!(
         kind(schedule(&g, thread, past).await),
@@ -109,7 +116,7 @@ async fn due_jobs_run_once_per_wake_and_keep_their_grid() {
     let state = tempfile::tempdir().unwrap();
     let g = Gateway::open(state.path()).unwrap();
     let thread = thread(&g).await;
-    let seconds = schedule::MIN_INTERVAL + now() % 1000;
+    let seconds = schedule::MIN_INTERVAL + arbitrary() % 1000;
     let Reply::Job(created) = schedule(&g, thread, every(seconds)).await else {
         panic!("job scheduled");
     };
@@ -122,7 +129,7 @@ async fn due_jobs_run_once_per_wake_and_keep_their_grid() {
 
     // Several times passed (the gateway was stopped): one run, then the
     // next time on the grid after now.
-    let missed = 2 + now() % 5;
+    let missed = 2 + arbitrary() % 5;
     let late = first + missed * seconds + 1;
     assert_eq!(
         g.run_due_jobs(late).unwrap(),
@@ -143,7 +150,7 @@ async fn one_time_and_paused_jobs_do_not_run_again() {
     let state = tempfile::tempdir().unwrap();
     let g = Gateway::open(state.path()).unwrap();
     let thread = thread(&g).await;
-    let at = now() + 1 + now() % 1000;
+    let at = now() + YEAR + arbitrary() % YEAR;
     let Reply::Job(once) = schedule(&g, thread, Schedule::At { at }).await else {
         panic!("job scheduled");
     };
@@ -206,4 +213,30 @@ async fn run_now_leaves_the_schedule_alone() {
         ended(&g, created.id).await.outcome,
         JobOutcome::Refused(_)
     ));
+}
+
+#[tokio::test]
+async fn an_earlier_run_ending_late_leaves_the_latest_result() {
+    let state = tempfile::tempdir().unwrap();
+    let g = Gateway::open(state.path()).unwrap();
+    let thread = thread(&g).await;
+    let Reply::Job(created) = schedule(&g, thread, every(schedule::MIN_INTERVAL)).await else {
+        panic!("job scheduled");
+    };
+    // Two runs in the same second: the first one's result arrives last.
+    let at = arbitrary();
+    let first = JobRun::start(at);
+    let second = JobRun::start(at);
+    job_mut(&mut g.lock().unwrap().state, created.id)
+        .unwrap()
+        .last = Some(second.clone());
+    g.finish_job(created.id, first.id, JobOutcome::Failed)
+        .unwrap();
+    assert_eq!(job(&g, created.id).last, Some(second.clone()));
+    g.finish_job(created.id, second.id, JobOutcome::Complete)
+        .unwrap();
+    assert_eq!(
+        job(&g, created.id).last.map(|run| run.outcome),
+        Some(JobOutcome::Complete)
+    );
 }

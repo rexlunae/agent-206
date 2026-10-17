@@ -1,6 +1,6 @@
 //! When scheduled messages are due: pure functions of a schedule and a time,
 //! so the scheduler's decisions are tested without a clock.
-use a206_core::{ErrorKind, Schedule};
+use a206_core::{ErrorKind, ErrorReport, Job, JobOutcome, Role, RunState, Schedule, Thread};
 use jiff::{Timestamp, tz::TimeZone};
 use std::str::FromStr;
 
@@ -81,6 +81,44 @@ pub fn first(schedule: &Schedule, now: u64) -> Result<u64, ScheduleError> {
         Schedule::At { .. } => ScheduleError::Past,
         _ => ScheduleError::Never,
     })
+}
+
+/// Settle the job runs a restart interrupted. Call it on the stored state before
+/// interrupted conversation runs are marked failed. A run whose message the
+/// conversation received ends as that conversation's run did; a run that
+/// never sent it is due again at once, so the message is sent exactly once.
+pub fn recover(jobs: &mut [Job], threads: &[Thread]) {
+    for job in jobs {
+        let Some(run) = job
+            .last
+            .as_mut()
+            .filter(|run| run.outcome == JobOutcome::Running)
+        else {
+            continue;
+        };
+        let thread = threads.iter().find(|thread| thread.id == job.thread);
+        let sent = thread.is_some_and(|thread| {
+            thread
+                .messages
+                .iter()
+                .any(|m| m.role == Role::User && m.at >= run.at && m.text == job.text)
+        });
+        run.outcome = match thread.map(|thread| &thread.state) {
+            Some(RunState::Complete) if sent => JobOutcome::Complete,
+            Some(RunState::Cancelled) if sent => JobOutcome::Cancelled,
+            _ if sent => JobOutcome::Failed,
+            _ => {
+                // Due again at the interrupted time; the scheduler runs it
+                // once and then continues on its schedule.
+                job.enabled = true;
+                job.next = Some(job.next.map_or(run.at, |next| next.min(run.at)));
+                JobOutcome::Refused(ErrorReport::new(
+                    ErrorKind::Unavailable,
+                    "The gateway restarted before sending this message; it is sent again.",
+                ))
+            }
+        };
+    }
 }
 
 #[cfg(test)]
