@@ -6,6 +6,10 @@
 //!
 //! Adapted from RustyClaw's `StreamSanitizer` (`tool_healing.rs`, MIT).
 
+/// The most undecided text held before it is decided as if the stream had
+/// ended, so a long line is not copied again for every chunk.
+const MAX_HOLD: usize = 4096;
+
 /// Open and close tags of leaked tool-call blocks.
 const TAGS: [(&str, &str); 6] = [
     ("<tool_call>", "</tool_call>"),
@@ -20,10 +24,11 @@ const TAGS: [(&str, &str); 6] = [
 ///
 /// Chunks split tags anywhere, so text that could still become a tag, a code
 /// fence or a backtick run is held until a later chunk decides it. Held text
-/// is short except in two cases, both bounded by the line: a tag after an
-/// unclosed backtick run waits for the run's close or the line's end, and a
-/// possible closing fence waits for its line to end. [`Filter::finish`]
-/// releases held text and drops an unterminated block.
+/// is short except in two cases: a tag after an unclosed backtick run waits
+/// for the run's close or the line's end, and a possible closing fence waits
+/// for its line to end. Either is decided as if the stream had ended once
+/// [`MAX_HOLD`] bytes are waiting. [`Filter::finish`] releases held text and
+/// drops an unterminated block.
 #[derive(Debug, Default)]
 pub struct Filter {
     /// Text not decided yet, or inside a block the tail that could begin its
@@ -115,7 +120,7 @@ impl Filter {
         }
         if !self.mid_line {
             match fence_mark(rest) {
-                Mark::Undecided if self.ended => return self.pass_line(text, at, out),
+                Mark::Undecided if self.decide(text, at) => return self.pass_line(text, at, out),
                 Mark::Undecided => return Step::Hold(at),
                 Mark::Fence(mark, bare) => {
                     match self.fence {
@@ -124,7 +129,7 @@ impl Filter {
                             match bare {
                                 Some(true) => self.fence = None,
                                 Some(false) => {}
-                                None if self.ended => {}
+                                None if self.decide(text, at) => self.fence = None,
                                 None => return Step::Hold(at),
                             }
                         }
@@ -153,7 +158,7 @@ impl Filter {
                 }
                 b'`' => {
                     let run = bytes[i..].iter().take_while(|&&b| b == b'`').count();
-                    if i + run == bytes.len() && !self.ended {
+                    if i + run == bytes.len() && !self.decide(text, i) {
                         out.push_str(&text[at..i]);
                         return self.hold(line_start && i == at, i);
                     }
@@ -172,7 +177,7 @@ impl Filter {
                         // An opening backtick run is code only once a run of
                         // the same length closes it on this line.
                         if let Some(run) = self.code {
-                            match closes(tail, run).or(self.ended.then_some(false)) {
+                            match closes(tail, run, self.decide(text, i)) {
                                 Some(true) => {
                                     i += 1;
                                     continue;
@@ -192,7 +197,7 @@ impl Filter {
                         self.mid_line = !(line_start && i == at);
                         return Step::At(i + open.len());
                     }
-                    if !self.ended
+                    if !self.decide(text, i)
                         && TAGS
                             .iter()
                             .any(|(open, _)| open.len() > tail.len() && open.starts_with(tail))
@@ -207,6 +212,11 @@ impl Filter {
         }
         out.push_str(rest);
         Step::At(text.len())
+    }
+
+    /// Whether text from `from` must be decided now rather than held.
+    fn decide(&self, text: &str, from: usize) -> bool {
+        self.ended || text.len() - from > MAX_HOLD
     }
 
     /// Hold the text from `from`, which starts a line when `line_start`.
@@ -258,7 +268,7 @@ fn fence_mark(line: &str) -> Mark {
     let end = after.iter().position(|&b| b == b'\n');
     let bare = after[..end.unwrap_or(after.len())]
         .iter()
-        .all(|&b| b == b' ' || b == b'\t');
+        .all(|&b| matches!(b, b' ' | b'\t' | b'\r'));
     Mark::Fence(
         Fence { mark, len },
         (end.is_some() || !bare).then_some(bare),
@@ -266,8 +276,8 @@ fn fence_mark(line: &str) -> Mark {
 }
 
 /// Whether a backtick run of `run` closes inline code later on this line
-/// (`None` when the text ends first).
-fn closes(text: &str, run: usize) -> Option<bool> {
+/// (`None` when the text ends first, unless `complete`).
+fn closes(text: &str, run: usize, complete: bool) -> Option<bool> {
     let bytes = text.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
@@ -275,7 +285,7 @@ fn closes(text: &str, run: usize) -> Option<bool> {
             b'\n' => return Some(false),
             b'`' => {
                 let len = bytes[i..].iter().take_while(|&&b| b == b'`').count();
-                if i + len == bytes.len() {
+                if i + len == bytes.len() && !complete {
                     return None;
                 }
                 if len == run {
@@ -286,7 +296,7 @@ fn closes(text: &str, run: usize) -> Option<bool> {
             _ => i += 1,
         }
     }
-    None
+    complete.then_some(false)
 }
 
 #[cfg(test)]
@@ -388,6 +398,14 @@ mod tests {
             every_split("a <tool_call>x</tool_call>```\n<tool_call>y</tool_call>"),
             ("a ```\n".to_owned(), 2)
         );
+        // A closing fence may end in CRLF.
+        assert_eq!(
+            every_split("```\r\n<tool_call>e</tool_call>\r\n```\r\n<tool_call>x</tool_call>"),
+            ("```\r\n<tool_call>e</tool_call>\r\n```\r\n".to_owned(), 1)
+        );
+        // Inline code may close on the reply's last byte.
+        let text = "Use `<tool_call>x</tool_call>`";
+        assert_eq!(every_split(text), (text.to_owned(), 0));
         // An unmatched backtick is literal text.
         assert_eq!(
             every_split("Use `oops <tool_call>{}</tool_call> here\nnext"),
@@ -402,6 +420,21 @@ mod tests {
             every_split("    ```\n<tool_call>x</tool_call>"),
             ("    ```\n".to_owned(), 1)
         );
+    }
+
+    #[test]
+    fn a_long_undecided_line_is_decided_without_waiting_for_its_end() {
+        let mut filter = Filter::default();
+        assert_eq!(filter.feed("`a <tool_call>"), "`a ");
+        let mut out = String::new();
+        for _ in 0..1000 {
+            out.push_str(&filter.feed(&uuid::Uuid::new_v4().to_string()));
+            assert!(filter.held.len() <= MAX_HOLD + 64, "{}", filter.held.len());
+        }
+        // Decided as an unmatched backtick: the block is removed.
+        assert_eq!(out, "");
+        assert_eq!(filter.feed("</tool_call>b\n"), "b\n");
+        assert_eq!(filter.removed(), 1);
     }
 
     #[test]
