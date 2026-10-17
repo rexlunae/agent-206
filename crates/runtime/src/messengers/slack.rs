@@ -13,19 +13,24 @@ use super::{Account, Api, Batch, Event, Inbound, MessengerError, Result, split};
 use a206_broker::{AuthScheme, HttpMethod, SocketEvent, SocketScheme};
 use serde::Deserialize;
 use std::collections::{HashSet, VecDeque};
+use std::sync::{Arc, Mutex};
 
 const SERVICE: &str = "Slack";
 /// Slack truncates messages past 40,000 characters and advises at most
 /// 4,000; split at that, counting UTF-16 code units.
 const MAX_MESSAGE_UNITS: usize = 4000;
 /// How many recent messages are remembered, so one Slack delivers again
-/// (an envelope retried before its acknowledgement arrived) is not answered
-/// twice.
+/// (an envelope retried before its acknowledgement arrived, possibly on the
+/// next socket) is not answered twice.
 const RECENT: usize = 1024;
 
 pub(crate) struct Slack {
     api: Api,
     socket: Option<Listener>,
+    /// Messages already queued for the bot account named first. Kept across
+    /// sockets, because Slack redelivers an envelope whose acknowledgement
+    /// was lost with the old one.
+    recent: Option<(String, Arc<Mutex<Recent>>)>,
 }
 
 /// A Web API answer: Slack reports failures with `ok: false` and a code.
@@ -86,7 +91,11 @@ fn malformed(source: serde_json::Error) -> MessengerError {
 
 impl Slack {
     pub(crate) fn new(api: Api) -> Self {
-        Self { api, socket: None }
+        Self {
+            api,
+            socket: None,
+            recent: None,
+        }
     }
 
     /// A Web API method, which Slack answers with HTTP 200 and `ok`.
@@ -142,10 +151,18 @@ impl Slack {
             .as_ref()
             .is_none_or(|socket| socket.account() != account.id)
         {
+            let recent = match &self.recent {
+                Some((owner, recent)) if *owner == account.id => Arc::clone(recent),
+                _ => {
+                    let recent = Arc::default();
+                    self.recent = Some((account.id.clone(), Arc::clone(&recent)));
+                    recent
+                }
+            };
             let api = self.api.clone();
             let own = account.id.clone();
             self.socket = Some(Listener::start(SERVICE, account.id.clone(), |queue| {
-                serve(api, own, queue)
+                serve(api, own, recent, queue)
             }));
         }
         Ok(account)
@@ -174,17 +191,21 @@ impl Slack {
 }
 
 /// Acknowledge envelopes and queue messages until something fails.
-async fn serve(api: Api, own: String, queue: Queue) -> MessengerError {
-    match session(&api, &own, &queue).await {
+async fn serve(api: Api, own: String, recent: Arc<Mutex<Recent>>, queue: Queue) -> MessengerError {
+    match session(&api, &own, &recent, &queue).await {
         Ok(never) => match never {},
         Err(error) => error,
     }
 }
 
-async fn session(api: &Api, own: &str, queue: &Queue) -> Result<std::convert::Infallible> {
+async fn session(
+    api: &Api,
+    own: &str,
+    recent: &Mutex<Recent>,
+    queue: &Queue,
+) -> Result<std::convert::Infallible> {
     let url = api.url_segments(&["api", "apps.connections.open"])?;
     let mut socket = api.socket(SocketScheme::SlackSocketMode, url, true).await?;
-    let mut recent = Recent::default();
     loop {
         let text = match socket.next().await.map_err(MessengerError::Broker)? {
             SocketEvent::Text(text) => text,
@@ -214,7 +235,13 @@ async fn session(api: &Api, own: &str, queue: &Queue) -> Result<std::convert::In
         let Some((key, event)) = message_event(message, own) else {
             continue;
         };
-        if recent.insert(&key) {
+        // A poisoned lock only means another session panicked mid-insert;
+        // the keys it holds are still sound.
+        let new = recent
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(&key);
+        if new {
             queue.push(key, event)?;
         }
     }

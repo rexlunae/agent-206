@@ -243,7 +243,9 @@ agent206 messenger enable workspace
   socket sessions apply (see [Discord](#discord)).
 - **Acknowledgements.** Every envelope is acknowledged as it arrives, before
   any turn runs, so Slack does not deliver it again. A message delivered
-  again anyway (the same channel and timestamp) is answered once.
+  again anyway (the same channel and timestamp), including on the next
+  socket after a reconnect, is answered once: the last 1024 message keys are
+  kept for as long as the bot user and vault pairing stay the same.
 - **What is read and sent.** Only people's plain messages are read: the
   app's own, other bots', edits, joins and every other subtype are ignored,
   as are slash commands and interactions. Slack's `&amp;`, `&lt;` and

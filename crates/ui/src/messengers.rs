@@ -146,9 +146,9 @@ fn MessengerCard(now: u64, config: MessengerConfig, status: MessengerStatus) -> 
                 Badge { tone: tone(status.state), "{status.state.label()}" }
                 if let Some(account) = &status.account { span { class: "a206-muted", "Bot account {account}" } }
             }
-            p { class: "a206-muted", match &config.credential { Some(credential) => format!("Token: vault credential {credential}"), None => "No vault credential chosen; it cannot connect.".to_owned() } }
+            CredentialRow { messenger: config.name.clone(), app: false, current: config.credential.clone() }
             if config.kind.needs_app_credential() {
-                p { class: "a206-muted", match &config.app_credential { Some(credential) => format!("App-level token: vault credential {credential}"), None => "No app-level token chosen; it cannot receive messages.".to_owned() } }
+                CredentialRow { messenger: config.name.clone(), app: true, current: config.app_credential.clone() }
             }
             Checkbox { label: rsx! { "Enabled" }, checked: ReadSignal::from(enabled), onchange: { let name = name.clone(); move |on: bool| save_messenger(state, &name, |m| m.enabled = on) } }
             if let Some(report) = status.failure.clone() { ErrorNotice { report, title: "Messenger failed".to_string() } }
@@ -189,6 +189,37 @@ fn MessengerCard(now: u64, config: MessengerConfig, status: MessengerStatus) -> 
             Button { variant: ButtonVariant::Ghost, onclick: move |_| { let mut settings = state.data.read().settings.clone(); settings.messengers.retain(|m| m.name != name); dispatch(state, Command::SaveSettings(settings)); }, "Remove messenger" }
         }
     } }
+}
+
+/// The vault credential an entry uses, or its app-level one when `app`, with
+/// a field to choose another (an imported entry arrives with none).
+#[component]
+fn CredentialRow(messenger: String, app: bool, current: Option<String>) -> Element {
+    let state = use_context::<State>();
+    let mut draft = use_signal(String::new);
+    let ready = !draft().trim().is_empty();
+    let shown = match (&current, app) {
+        (Some(credential), false) => format!("Token: vault credential {credential}"),
+        (Some(credential), true) => format!("App-level token: vault credential {credential}"),
+        (None, false) => "No vault credential chosen; it cannot connect.".to_owned(),
+        (None, true) => "No app-level token chosen; it cannot receive messages.".to_owned(),
+    };
+    let label = if app {
+        "App-level token credential"
+    } else {
+        "Vault credential"
+    };
+    rsx! {
+        p { class: "a206-muted", "{shown}" }
+        div { class: "a206-row",
+            Input { aria_label: label, value: ReadSignal::from(draft), oninput: move |v| draft.set(v), placeholder: "Credential name" }
+            Button { size: ButtonSize::Sm, variant: ButtonVariant::Secondary, availability: if ready { Availability::Enabled } else { Availability::Disabled }, onclick: move |_| {
+                let value = Some(draft().trim().to_owned());
+                save_messenger(state, &messenger, |m| if app { m.app_credential = value } else { m.credential = value });
+                draft.set(String::new());
+            }, if current.is_some() { "Change credential" } else { "Use credential" } }
+        }
+    }
 }
 
 /// Edit one of an entry's allow-lists: chats, or senders when `senders`.

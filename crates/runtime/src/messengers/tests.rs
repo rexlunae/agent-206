@@ -1791,18 +1791,34 @@ async fn slack_reconnects_on_request_and_needs_both_tokens() {
     let stop = CancellationToken::new();
     let supervisor = tokio::spawn(supervise(host.clone(), receiver, FAST, stop.clone()));
     host.until(|_| *api.opens.lock().unwrap() == 1).await;
+    let author = random();
+    let (first, second) = (random(), random());
+    let answered = slack_event(&channel, "im", &author, &first);
+    api.envelopes.lock().unwrap().push_back(answered.clone());
+    host.until(|_| api.sent.lock().unwrap().len() == 1).await;
     // Slack asks for a refresh: a new socket, and messages still arrive.
     api.envelopes
         .lock()
         .unwrap()
         .push_back(json!({"type": "disconnect", "reason": "refresh_requested"}));
     host.until(|_| *api.opens.lock().unwrap() == 2).await;
-    let author = random();
+    // The new socket redelivers the answered message, as Slack does when the
+    // acknowledgement was lost with the old one: it is not answered again.
+    let mut redelivered = answered;
+    redelivered["envelope_id"] = json!(random());
     api.envelopes
         .lock()
         .unwrap()
-        .push_back(slack_event(&channel, "im", &author, &random()));
-    host.until(|_| api.sent.lock().unwrap().len() == 1).await;
+        .extend([redelivered, slack_event(&channel, "im", &author, &second)]);
+    host.until(|_| api.sent.lock().unwrap().len() == 2).await;
+    let turns: Vec<String> = host
+        .turns
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|t| t.1.clone())
+        .collect();
+    assert_eq!(turns, [first, second]);
 
     // Without an app-level token it waits for the user instead of retrying.
     desired.send_replace(vec![Desired {
