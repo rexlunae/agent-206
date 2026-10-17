@@ -208,6 +208,7 @@ fn describe(kind: &EventKind, snapshot: &Snapshot) -> Entry {
             Some(Route::Chat {
                 id: *id,
                 split: None,
+                message: None,
             }),
         ),
         None => (text("a conversation that no longer exists"), None),
@@ -472,7 +473,8 @@ mod tests {
             html.contains(
                 &Route::Chat {
                     id: thread.id,
-                    split: None
+                    split: None,
+                    message: None,
                 }
                 .to_string()
             )
@@ -508,7 +510,14 @@ mod tests {
             );
         }
         let entry = describe(&EventKind::ThreadCreated { id }, &snapshot);
-        assert_eq!(entry.link, Some(Route::Chat { id, split: None }));
+        assert_eq!(
+            entry.link,
+            Some(Route::Chat {
+                id,
+                split: None,
+                message: None
+            })
+        );
     }
 
     #[test]
@@ -541,7 +550,8 @@ mod tests {
             entry.link,
             Some(Route::Chat {
                 id: thread.id,
-                split: None
+                split: None,
+                message: None,
             })
         );
         let removed = describe(&EventKind::JobChanged { id: Id::new_v4() }, &snapshot);

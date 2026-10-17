@@ -84,7 +84,7 @@ fn ConversationList(
             { let id = thread.id;
               let model = thread.model.as_ref().and_then(|key| snapshot.catalogs.iter().flat_map(|c| &c.models).find(|m| &m.key == key)).map(|m| m.name.as_str()).unwrap_or("Choose a model");
               rsx! { LinkButton { key: "{id}", class: "a206-recent-thread", size: ButtonSize::Sm, variant: ButtonVariant::Ghost,
-                  href: Route::Chat { id, split: None }.to_string(),
+                  href: Route::Chat { id, split: None, message: None }.to_string(),
                   Icon { name: IconName::Sparkles, size: IconSize::Sm }
                   span { class: "a206-nav-title", strong { "{thread.title}" } span { class: "a206-muted", "{model} · {thread.messages.len()} messages" } }
                   Badge { tone: BadgeTone::Accent, "{thread.mode.label()}" }
@@ -107,7 +107,7 @@ pub fn Projects() -> Element {
         div { class: "a206-grid", for project in &state.data.read().projects {
             { let manager = project.manager; rsx! { Card {
                 CardHeader { CardTitle { "{project.name}" } CardSubtitle { "{project.root}" } }
-                CardFooter { LinkButton { variant: ButtonVariant::Secondary, href: Route::Chat { id: manager, split: None }.to_string(), "Open coordinator" } }
+                CardFooter { LinkButton { variant: ButtonVariant::Secondary, href: Route::Chat { id: manager, split: None, message: None }.to_string(), "Open coordinator" } }
             } } }
         } }
     } }
