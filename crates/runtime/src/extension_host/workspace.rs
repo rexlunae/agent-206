@@ -248,26 +248,38 @@ fn write_lock() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Refuse a path whose existing components include a symlink: cap-std keeps
-/// links inside the root, but a link could still lead a write into `.git`
-/// or anywhere else the plain-name check would refuse.
-fn no_links(directory: &Dir, relative: &Path) -> Result<(), HostFailure> {
-    let mut prefix = PathBuf::new();
-    for component in relative.components() {
-        prefix.push(component);
-        match directory.symlink_metadata(&prefix) {
-            Ok(metadata) if metadata.is_symlink() => {
-                return Err(failure(
-                    HostErrorCode::Invalid,
-                    "the path goes through a symbolic link",
-                ));
+/// Open `relative` one component at a time without following symlinks, so
+/// a link (even one swapped in during the walk) can never lead a write into
+/// `.git` or anywhere else the plain-name check refuses. With `create`,
+/// missing directories are made on the way.
+fn descend(mut directory: Dir, relative: &Path, create: bool) -> Result<Dir, HostFailure> {
+    use cap_fs_ext::DirExt;
+    for name in relative.components().map(Component::as_os_str) {
+        let opened = match directory.open_dir_nofollow(name) {
+            Err(error) if create && error.kind() == std::io::ErrorKind::NotFound => {
+                match directory.create_dir(name) {
+                    Err(error) if error.kind() != std::io::ErrorKind::AlreadyExists => {
+                        return Err(io_failure(&error));
+                    }
+                    _ => directory.open_dir_nofollow(name),
+                }
             }
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => return Err(io_failure(&error)),
-        }
+            opened => opened,
+        };
+        directory = opened.map_err(|error| match directory.symlink_metadata(name) {
+            Ok(metadata) if metadata.is_symlink() => failure(
+                HostErrorCode::Invalid,
+                "the path goes through a symbolic link",
+            ),
+            Ok(_) if create => failure(HostErrorCode::Exists, "a file has that name"),
+            Ok(_) => failure(
+                HostErrorCode::Invalid,
+                "a path component is not a directory",
+            ),
+            Err(_) => io_failure(&error),
+        })?;
     }
-    Ok(())
+    Ok(directory)
 }
 
 /// A relative path the guest may write: plain components only, and `.git`
@@ -291,14 +303,7 @@ fn writable(root: PathBuf, path: &str) -> Result<(Dir, String), HostFailure> {
         .ok_or_else(|| failure(HostErrorCode::Invalid, "invalid path"))?
         .to_string();
     let parent = relative.parent().unwrap_or(Path::new(""));
-    let workspace = open_workspace(root)?;
-    no_links(&workspace, parent)?;
-    let directory = if parent.as_os_str().is_empty() {
-        workspace
-    } else {
-        workspace.open_dir(parent).map_err(|e| io_failure(&e))?
-    };
-    Ok((directory, name))
+    Ok((descend(open_workspace(root)?, parent, false)?, name))
 }
 
 pub(super) fn write_file(
@@ -337,7 +342,14 @@ fn replace(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => return Err(io_failure(&error)),
     };
-    let temporary = format!(".{name}.{}.a206-tmp", uuid::Uuid::new_v4().simple());
+    if expected.is_some() && existing.is_none() {
+        return Err(failure(
+            HostErrorCode::Conflict,
+            "the file was removed while it was being edited",
+        ));
+    }
+    // Fixed length, so a valid name near the file system's limit still works.
+    let temporary = format!(".a206-{}.tmp", uuid::Uuid::new_v4().simple());
     let file = directory
         .open_with(&temporary, OpenOptions::new().write(true).create_new(true))
         .map_err(|e| io_failure(&e))?;
@@ -441,15 +453,8 @@ pub(super) fn edit_file(
 pub(super) fn create_directory(root: PathBuf, path: &str) -> Result<HostReply, HostFailure> {
     let relative = writable_path(path)?;
     let _writing = write_lock();
-    let workspace = open_workspace(root)?;
-    no_links(&workspace, relative)?;
-    match workspace.create_dir_all(relative) {
-        Ok(()) => Ok(HostReply::Done),
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            Err(failure(HostErrorCode::Exists, "a file has that name"))
-        }
-        Err(error) => Err(io_failure(&error)),
-    }
+    descend(open_workspace(root)?, relative, true)?;
+    Ok(HostReply::Done)
 }
 
 #[cfg(test)]
@@ -492,5 +497,38 @@ mod tests {
         );
         // Neither attempt leaves its temporary file behind.
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn an_edit_never_recreates_a_file_removed_since_it_was_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let directory = open_workspace(dir.path().to_path_buf()).unwrap();
+        let (read, edited) = (
+            uuid::Uuid::new_v4().to_string(),
+            uuid::Uuid::new_v4().to_string(),
+        );
+        let refused = replace(
+            &directory,
+            "f.txt",
+            edited.as_bytes(),
+            true,
+            Some(read.as_bytes()),
+        );
+        assert_eq!(refused.unwrap_err().code, HostErrorCode::Conflict);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn a_name_at_the_usual_length_limit_can_be_created() {
+        let dir = tempfile::tempdir().unwrap();
+        let directory = open_workspace(dir.path().to_path_buf()).unwrap();
+        // 255 bytes is the component limit of common Unix file systems.
+        let name = "n".repeat(255);
+        let contents = uuid::Uuid::new_v4().to_string();
+        replace(&directory, &name, contents.as_bytes(), false, None).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(&name)).unwrap(),
+            contents
+        );
     }
 }
