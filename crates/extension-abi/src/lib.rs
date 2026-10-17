@@ -208,7 +208,9 @@ pub enum HostRequest {
     /// Apply line-based changes to UTF-8 files: every file is checked
     /// before any is written, and with `check_only` none is. The reply is
     /// [`HostReply::Patched`]; a file that cannot be patched or written is
-    /// named in [`PatchResult::failed`].
+    /// named in [`PatchResult::failed`]. A request refused as a whole (no
+    /// files, too many, or an invalid or repeated path) is
+    /// [`HostReply::Failed`].
     PatchFiles {
         files: Vec<FilePatch>,
         check_only: bool,
