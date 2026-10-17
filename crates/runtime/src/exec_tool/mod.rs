@@ -855,7 +855,7 @@ fn reject_protected_workspace(workspace: &Path, hidden: &[PathBuf]) -> Result<()
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", test))]
-fn stream_text(name: &str, bytes: &[u8], cut: bool) -> String {
+pub(crate) fn stream_text(name: &str, bytes: &[u8], cut: bool) -> String {
     let decoded = String::from_utf8_lossy(bytes);
     let mut end = decoded.len().min(MAX_STREAM);
     while !decoded.is_char_boundary(end) {

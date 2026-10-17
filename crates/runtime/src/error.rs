@@ -128,6 +128,8 @@ pub(crate) fn classify(error: &(dyn Error + 'static)) -> Option<ErrorKind> {
         a206_extensions::abi::HostFailure,
         a206_mcp::McpError,
         a206_skills::SkillError,
+        a206_output_rules::RulesError,
+        a206_output_rules::PatternError,
         a206_protocol::Error,
         a206_sandbox::SandboxError,
         a206_sandbox::StartError,
@@ -203,6 +205,28 @@ impl Classified for a206_skills::SkillError {
             | Unreviewed => ErrorKind::InvalidRequest,
             Disabled | Changed => ErrorKind::PermissionDenied,
         })
+    }
+}
+
+impl Classified for a206_output_rules::RulesError {
+    fn kind(&self) -> Option<ErrorKind> {
+        use a206_output_rules::RulesError::*;
+        Some(match self {
+            // Absent and unreadable files need different recovery; the I/O cause decides.
+            Directory { .. } | Read { .. } => return None,
+            TooLarge { .. }
+            | Parse { .. }
+            | MissingId { .. }
+            | TooLong { .. }
+            | Pattern { .. }
+            | Duplicate { .. }
+            | TooMany => ErrorKind::InvalidRequest,
+        })
+    }
+}
+impl Classified for a206_output_rules::PatternError {
+    fn kind(&self) -> Option<ErrorKind> {
+        Some(ErrorKind::InvalidRequest)
     }
 }
 

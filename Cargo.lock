@@ -113,6 +113,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "a206-output-rules"
+version = "0.1.0"
+dependencies = [
+ "regex",
+ "serde",
+ "tempfile",
+ "thiserror 2.0.21",
+ "toml 0.9.12+spec-1.1.0",
+ "uuid",
+]
+
+[[package]]
 name = "a206-plugin-git"
 version = "0.1.0"
 dependencies = [
@@ -167,6 +179,7 @@ dependencies = [
  "a206-core",
  "a206-extensions",
  "a206-mcp",
+ "a206-output-rules",
  "a206-protocol",
  "a206-runtime",
  "a206-sandbox",

@@ -1,8 +1,8 @@
 //! Tool traces, pending approvals and per-tool permissions in a conversation.
 use crate::{State, dispatch, error::ErrorNotice};
 use a206_core::{
-    ApprovalDecision, ApprovalRequest, Command, ErrorKind, ErrorReport, Reply, ToolCall,
-    ToolCallState, ToolPermission,
+    ApprovalDecision, ApprovalRequest, Command, ErrorKind, ErrorReport, OutputReduction, Reply,
+    ToolCall, ToolCallState, ToolPermission,
 };
 use fc_dioxus::prelude::*;
 use uuid::Uuid;
@@ -43,7 +43,28 @@ pub(crate) fn ToolTrace(call: ToolCall) -> Element {
                 pre { class: "a206-tool-output", "{output}" }
             }
         }
+        if let Some(reduction) = call.reduction.as_ref() {
+            p { class: "a206-muted", {reduction_note(reduction)} }
+        }
     }
+}
+
+/// What an output rule did to a result, which is all the model saw of it.
+fn reduction_note(reduction: &OutputReduction) -> String {
+    let layer = if reduction.user_rule {
+        "your"
+    } else {
+        "the built-in"
+    };
+    let counts: String = reduction
+        .counts
+        .iter()
+        .map(|count| format!("; {}: {}", count.name, count.count))
+        .collect();
+    format!(
+        "Shortened for the model by {layer} output rule `{}` from {} bytes{counts}",
+        reduction.rule, reduction.original_bytes
+    )
 }
 
 /// A call waiting for the user. Only this trusted surface can answer it; the
@@ -200,6 +221,7 @@ mod tests {
             output: None,
             error: None,
             signature: None,
+            reduction: None,
         }
     }
     #[test]
@@ -261,6 +283,32 @@ mod tests {
         );
         assert!(html.contains(&output), "{html}");
         assert!(html.contains(Lifecycle::Complete.as_str()), "{html}");
+    }
+    #[test]
+    fn a_reduced_result_says_which_rule_shortened_it() {
+        use a206_core::OutputCount;
+        let mut done = call(ToolCallState::Succeeded);
+        done.output = Some(Uuid::new_v4().to_string());
+        let plain = render(done.clone());
+        assert!(!plain.contains("Shortened"), "{plain}");
+        let (rule, name) = (Uuid::new_v4().to_string(), Uuid::new_v4().to_string());
+        let bytes = Uuid::new_v4().as_u128() as u64;
+        done.reduction = Some(OutputReduction {
+            rule: rule.clone(),
+            user_rule: true,
+            original_bytes: bytes,
+            counts: vec![OutputCount {
+                name: name.clone(),
+                count: 3,
+            }],
+        });
+        let html = render(done);
+        assert!(
+            html.contains(&format!(
+                "Shortened for the model by your output rule `{rule}` from {bytes} bytes; {name}: 3"
+            )),
+            "{html}"
+        );
     }
     #[test]
     fn a_refused_call_shows_its_structured_reason_not_its_output() {
