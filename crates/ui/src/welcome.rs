@@ -358,10 +358,15 @@ pub(crate) fn Welcome() -> Element {
     let progress = use_context_provider(|| VaultProgress(Signal::new(None)));
     let now = crate::messengers::use_catalog_clock(state)();
     let mut skills = use_signal(|| None::<Result<Vec<SkillSummary>, ErrorReport>>);
-    // Approvals made elsewhere arrive as settings revisions.
-    let revision = state.data.read().settings.revision;
-    use_effect(use_reactive!(|revision| {
-        let _ = revision;
+    // Each read is numbered; only the latest may report, so a slow reply
+    // from before an approval or a gateway switch never overwrites a newer one.
+    let mut latest = use_signal(|| 0_u64);
+    let mut reload = move || {
+        let request = latest.peek().wrapping_add(1);
+        latest.set(request);
+        skills.set(None);
+        // Detached: the reply lands in this page's signals, and one that
+        // outlives the page or a newer read is dropped by the check below.
         spawn(async move {
             let read = match call(Command::Skills).await {
                 Ok(Reply::Skills(list)) => Ok(list),
@@ -374,8 +379,19 @@ pub(crate) fn Welcome() -> Element {
                     Err(report)
                 }
             };
-            skills.set(Some(read));
+            if *latest.peek() == request {
+                skills.set(Some(read));
+            }
         });
+    };
+    // Approvals made elsewhere arrive as settings revisions, and a switch to
+    // another gateway changes its generation; edits to a skill's files change
+    // neither, so the card also offers a refresh.
+    let revision = state.data.read().settings.revision;
+    let gateway_generation = (state.gateway_generation)();
+    use_effect(use_reactive!(|revision, gateway_generation| {
+        let _ = (revision, gateway_generation);
+        reload();
     }));
     let vault = initial_vault(progress);
     let snapshot = state.data.read();
@@ -403,7 +419,9 @@ pub(crate) fn Welcome() -> Element {
             }
         }
         Card { variant: CardVariant::Elevated,
-            CardHeader { CardTitle { "When you're ready" } }
+            CardHeader { CardTitle { "When you're ready" }
+                Button { size: ButtonSize::Sm, variant: ButtonVariant::Ghost, onclick: move |_| reload(), "Check skills again" }
+            }
             CardBody {
                 List { divided: true,
                     for step in extras { StepItem { key: "{step.title}", step } }
