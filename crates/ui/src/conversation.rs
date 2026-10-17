@@ -142,16 +142,17 @@ fn Conversation(thread: Thread, target: Option<Uuid>) -> Element {
             Ok(crate::slash::Typed::Send(text)) => text,
             Ok(crate::slash::Typed::Run(slash)) => {
                 // The conversation as the gateway last reported it.
-                let current = state
-                    .data
-                    .peek()
-                    .threads
-                    .iter()
-                    .find(|t| t.id == id)
-                    .cloned();
-                let resolved = current
-                    .ok_or_else(|| rejected("This conversation is no longer available"))
-                    .and_then(|thread| crate::slash::resolve(slash, &thread, can_create));
+                let resolved = {
+                    let snapshot = state.data.peek();
+                    snapshot
+                        .threads
+                        .iter()
+                        .find(|t| t.id == id)
+                        .ok_or_else(|| rejected("This conversation is no longer available"))
+                        .and_then(|thread| {
+                            crate::slash::resolve(slash, thread, &snapshot, can_create)
+                        })
+                };
                 match resolved {
                     Ok(command) => {
                         draft.set(String::new());
