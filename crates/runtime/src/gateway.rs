@@ -17,6 +17,7 @@ use std::{
 use tokio::io::AsyncWriteExt;
 mod compaction;
 mod mcp_servers;
+mod memory_flush;
 mod run;
 /// Snapshot bytes a user message needs beyond its text and attachments.
 const MESSAGE_OVERHEAD: usize = 4096;

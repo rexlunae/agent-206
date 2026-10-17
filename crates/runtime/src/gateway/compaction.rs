@@ -110,17 +110,31 @@ struct Plan {
     transcript: String,
 }
 
-/// Plan a compaction that keeps the last `keep_turns` turns (a turn starts
-/// at a user message) verbatim.
-fn plan(thread: &Thread, keep_turns: usize) -> Result<Plan, CompactionError> {
+/// The latest summary's position, and where each turn after it starts (a
+/// turn starts at a user message).
+fn turns(thread: &Thread) -> (Option<usize>, Vec<usize>) {
     let messages = &thread.messages;
     let previous = messages.iter().rposition(|m| m.compaction.is_some());
     let start = previous.map_or(0, |at| at + 1);
-    let turns: Vec<usize> = (start..messages.len())
+    let turns = (start..messages.len())
         .filter(|&at| messages[at].role == Role::User)
         .collect();
+    (previous, turns)
+}
+
+/// Whether a compaction keeping the last `keep_turns` turns would summarize
+/// anything.
+pub(super) fn compactable(thread: &Thread, keep_turns: usize) -> bool {
+    keep_turns > 0 && turns(thread).1.len() > keep_turns
+}
+
+/// Plan a compaction that keeps the last `keep_turns` turns verbatim.
+fn plan(thread: &Thread, keep_turns: usize) -> Result<Plan, CompactionError> {
+    let messages = &thread.messages;
+    let (previous, turns) = turns(thread);
+    let start = previous.map_or(0, |at| at + 1);
     check(
-        keep_turns > 0 && turns.len() > keep_turns,
+        compactable(thread, keep_turns),
         CompactionError::NothingToCompact,
     )?;
     let keep_from = turns[turns.len() - keep_turns];
