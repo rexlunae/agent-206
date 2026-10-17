@@ -67,6 +67,15 @@ fn cargo_run_output_reaches_the_model_as_printed() {
 }
 
 #[test]
+fn split_string_commands_are_not_matched_by_their_trailing_words() {
+    let output = format!("test {} ... ok\n   Compiling x\n", word());
+    assert_eq!(
+        Rules::builtin().reduce(&run("env -S 'printf x' cargo test", &output)),
+        None
+    );
+}
+
+#[test]
 fn cargo_output_keeps_failures_and_drops_progress() {
     let (pass, fail) = (word(), word());
     let output = format!(
@@ -125,6 +134,15 @@ fn programs_are_found_in_lists_pipelines_and_wrappers() {
     assert_eq!(program("nice -n 5 time -p git status"), ["git", "status"]);
     assert_eq!(program("env -- ls"), ["ls"]);
     assert!(program("env -u").is_empty());
+    // `env -S` runs its operand, so no later word is taken for the program.
+    for line in [
+        "env -S 'printf ok' cargo test",
+        "env -iS'printf ok' cargo test",
+        "env --split-string='printf ok' cargo test",
+        "env --split-string 'printf ok' cargo test",
+    ] {
+        assert!(program(line).is_empty(), "{line}");
+    }
     let git = |line: &str| command::git_subcommand(&super::program(line)).map(str::to_owned);
     assert_eq!(
         git("git -C dir -c a=b --no-pager diff --stat").as_deref(),

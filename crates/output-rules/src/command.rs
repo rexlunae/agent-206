@@ -4,10 +4,7 @@
 /// Wrappers that run a later word as the program, with their options that
 /// take the next word as a value.
 const WRAPPERS: [(&str, &[&str]); 6] = [
-    (
-        "env",
-        &["-u", "--unset", "-C", "--chdir", "-S", "--split-string"],
-    ),
+    ("env", &["-u", "--unset", "-C", "--chdir"]),
     ("time", &["-o", "--output", "-f", "--format"]),
     ("command", &[]),
     ("exec", &["-a"]),
@@ -90,6 +87,12 @@ pub fn program(line: &str) -> Vec<String> {
             skip += 1;
             // The wrapper's options, up to `--` or the first other word.
             while let Some(option) = argv.get(skip).filter(|word| word.starts_with('-')) {
+                // `env -S` splits its operand into the program and its
+                // arguments, so later words are not the program; no rule
+                // can be chosen safely.
+                if word.as_str() == "env" && split_string(option) {
+                    return Vec::new();
+                }
                 skip += if option == "--" {
                     1
                 } else if valued.contains(&option.as_str()) {
@@ -113,6 +116,15 @@ pub fn program(line: &str) -> Vec<String> {
         *first = name.to_owned();
     }
     argv
+}
+
+/// Whether an `env` option is `-S`/`--split-string`, alone, with an
+/// attached value, or in a cluster of short options.
+fn split_string(option: &str) -> bool {
+    match option.strip_prefix("--") {
+        Some(long) => long == "split-string" || long.starts_with("split-string="),
+        None => option[1..].contains('S'),
+    }
 }
 
 fn assignment(word: &str) -> bool {

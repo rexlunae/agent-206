@@ -80,6 +80,8 @@ The program a rule matches is found in the call's `command` argument: the last
 command of a `;`, `&&` or `||` list, the first command of a pipeline, without
 leading `NAME=value` assignments or `env`, `time`, `command`, `exec`, `nice` or
 `nohup` (with their options), and without its directory. Quotes are honoured; nothing is expanded.
+A command run through `env -S`/`--split-string` matches no rule, since the
+program is inside that option's value.
 So `cd crate && RUST_LOG=debug cargo test 2>&1 | tail` matches as
 `cargo test 2>&1`.
 
