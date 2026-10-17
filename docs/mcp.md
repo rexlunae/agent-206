@@ -10,8 +10,8 @@ Linux inside bubblewrap namespaces with Landlock applied inside them
 (`a206-sandbox`, the same layers as the coding backends). Other platforms refuse
 to start them until an equivalent OS sandbox exists. On Linux a missing
 bubblewrap or a kernel without Landlock is a startup error, never a weaker
-sandbox. The run engine that offers MCP
-tools to models is not merged yet, so no model can call them today.
+sandbox. The native run engine offers MCP tools to models (see below), so models
+reach them wherever servers can be launched: macOS and Linux.
 
 ## Configuration
 
@@ -100,9 +100,37 @@ an `ErrorReport`) is part of the snapshot and announced with
 CLI: `agent206 mcp-servers list | enable NAME | disable NAME | connect NAME |
 disconnect NAME`.
 
-## Run engine interface
+## Model access through the run engine
 
-The run engine calls two gateway methods (`crates/runtime/src/gateway/mcp_servers.rs`):
+`McpToolHost` (`crates/runtime/src/mcp_tools.rs`) is registered by `Gateway::open`
+beside the WASM extension host; `docs/run-engine.md` describes its contract. In short:
+
+- A conversation is offered the tools of each enabled, not disconnected server it
+  may use: its grant covers the server's capabilities, the scope's capabilities
+  (that grant within the mode ceiling, intersected with every ancestor's) do too,
+  and a workspace server is bound to its project. Other servers are neither listed
+  nor started. Listed tools are still denied until the user permits them in the
+  conversation.
+- Names are `mcp__<server>__<tool>`, every tool-name character outside
+  `[A-Za-z0-9_-]` written as `_`. A name over 64 characters, an empty tool name, or
+  a name two tools of the server would share is not offered and is reported in the
+  listing's `unavailable` (source `mcp__<server>`); names are never truncated.
+- The server's per-tool policy is the host policy, so the enforced permission is
+  the most restrictive of it (Ask by default) and the conversation's settings. Deny
+  tools are listed, with an effective Deny, and never offered to a model.
+- A server that cannot start is listed in `unavailable` with its start failure as
+  the cause; the other servers' tools are still offered.
+- Each call goes through `call_mcp_tool`, which authorizes it against current state
+  and revokes it on a later change, after the host checks the scope's
+  capabilities. `Approval::Approved` is passed only when the user approved that
+  call. Content blocks become text (binary content is described, not inlined;
+  structured JSON is used when there is no content); `isError` results are tool
+  failures, not host failures. Cancelling the run drops the call, which sends the
+  server an MCP cancellation.
+
+## Gateway interface
+
+The run engine's MCP host calls two gateway operations (`crates/runtime/src/gateway/mcp_servers.rs`):
 
 - `Gateway::mcp_offers(thread)` returns the tools the thread may be offered, each
   with its server and policy (`ask` tools need approval per call), plus servers
@@ -114,8 +142,8 @@ The run engine calls two gateway methods (`crates/runtime/src/gateway/mcp_server
   structured JSON). Pass `Approval::Approved` only after the user approved this
   call in the trusted approval surface. Failures are `GatewayError::Mcp(McpError)`
   with stable kinds (permission denied, unavailable, protocol, timeout).
-  To cancel a call when its run is cancelled, drop the future; the server is
-  not told, and its eventual reply is discarded.
+  To cancel a call when its run is cancelled, drop the future; the server
+  receives an MCP cancellation notice, and its eventual reply is discarded.
 
 ## Not yet implemented
 
@@ -123,4 +151,6 @@ The run engine calls two gateway methods (`crates/runtime/src/gateway/mcp_server
 - Windows isolation.
 - Network grants that exclude the host's loopback services (see Isolation).
 - Resources, prompts, sampling, elicitation and list-change notifications.
-- Approval UI and model access (run engine).
+- Native-run tests launch no real server: they serve the Rust fixture in process
+  (`Gateway::attach_mcp_session`, behind the runtime's `test-support` feature).
+  Launching through the macOS and Linux sandboxes is tested in `a206-mcp` only.

@@ -230,6 +230,7 @@ impl DelegationHost {
             parameters,
             capabilities: Default::default(),
             permission: ToolPermission::Allow,
+            whole_output: false,
         };
         vec![
             spec(

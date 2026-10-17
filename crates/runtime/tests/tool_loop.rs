@@ -107,6 +107,7 @@ fn tool(name: &str, permission: ToolPermission, capabilities: &[Capability]) -> 
         parameters: json!({"type": "object", "properties": {}}),
         capabilities: capabilities.iter().copied().collect(),
         permission,
+        whole_output: false,
     }
 }
 
@@ -1337,6 +1338,55 @@ async fn a_message_is_admitted_only_with_room_for_its_reply() {
     }
     assert!(accepted > 0);
 }
+
+#[tokio::test]
+async fn output_that_must_be_whole_fails_rather_than_being_cut() {
+    let api = ProviderApi::OpenAi;
+    let whole = nonce();
+    let cut = nonce();
+    let mut tools = vec![
+        tool(&whole, ToolPermission::Allow, &[]),
+        tool(&cut, ToolPermission::Allow, &[]),
+    ];
+    tools[0].whole_output = true;
+    let mut rig = rig(api, tools, None).await;
+    for name in [&whole, &cut] {
+        rig.permit(name, ToolPermission::Allow).await;
+    }
+    // The echo host returns its arguments with a prefix, so arguments near
+    // their limit make an output past the output limit.
+    let arguments = |id: &str| {
+        let filler = "o".repeat(a206_runtime::tool_calls::MAX_ARGUMENTS - 64);
+        json!({"value": format!("{id}{filler}")})
+    };
+    let calls = [
+        Call::new(&whole, arguments(&nonce())),
+        Call::new(&cut, arguments(&nonce())),
+    ];
+    let task = rig.send();
+    let first = rig.next_request().await;
+    first.respond(calls_response(api, &calls, "")).await;
+    let second = rig.next_request().await;
+    let truncated = result_for(api, &second.body, &calls[1].id).unwrap();
+    assert!(
+        truncated.contains("[output truncated by the gateway"),
+        "the output was not over the limit"
+    );
+    let refused = result_for(api, &second.body, &calls[0].id).unwrap();
+    assert!(refused.contains("only useful whole"), "{refused}");
+    second.respond(text_response(api, &nonce())).await;
+    let thread = finished(task).await;
+    assert_eq!(thread.state, RunState::Complete, "{:?}", thread.error);
+    let recorded = calls_of(&thread);
+    let record = |id: &str| recorded.iter().find(|c| c.id == id).unwrap();
+    assert_eq!(record(&calls[0].id).state, ToolCallState::Failed);
+    assert_eq!(error_kind(record(&calls[0].id)), ErrorKind::Storage);
+    // The model is told why; none of the tool's own output is kept.
+    let kept = record(&calls[0].id).output.as_deref().unwrap_or_default();
+    assert!(!kept.contains("oooo"), "{kept}");
+    assert_eq!(record(&calls[1].id).state, ToolCallState::Succeeded);
+}
+
 // ── Subagents ───────────────────────────────────────────────────────────────
 
 use a206_runtime::delegation_tool as subagents;

@@ -151,8 +151,9 @@ impl Session {
     }
     /// [`Self::call`], cancelled with [`McpError::Revoked`] if `revoked`
     /// resolves first. A cancelled or timed-out call is also cancelled at the
-    /// server. Dropping the returned future abandons the call without telling
-    /// the server; the result, if any, is discarded.
+    /// server, and so is a call whose future is dropped before it finishes
+    /// ([`McpError::Abandoned`] is the reason the server is given); its
+    /// result, if any, is discarded.
     pub async fn call_until(
         &self,
         tool: &str,
@@ -167,7 +168,12 @@ impl Session {
         // One deadline covers sending, which blocks if the server stops
         // reading, and waiting for the reply.
         let deadline = tokio::time::Instant::now() + timeout.unwrap_or(self.limits.call_timeout);
-        let mut sent = None;
+        // Cancels the request at the server if this future is dropped while
+        // it is outstanding.
+        let mut sent = Outstanding {
+            session: self,
+            id: None,
+        };
         let outcome = {
             let call = async {
                 let request = self
@@ -178,7 +184,7 @@ impl Session {
                     )
                     .await
                     .map_err(McpError::Service)?;
-                sent = Some(request.id.clone());
+                sent.id = Some(request.id.clone());
                 request.await_response().await.map_err(McpError::Service)
             };
             tokio::select! {
@@ -188,9 +194,10 @@ impl Session {
                 () = revoked => Err(McpError::Revoked),
             }
         };
+        let id = sent.id.take();
         let response = match outcome {
             Err(error @ (McpError::Timeout(_) | McpError::Revoked)) => {
-                if let Some(id) = sent {
+                if let Some(id) = id {
                     self.cancel_request(id, &error);
                 }
                 return Err(error);
@@ -231,9 +238,15 @@ impl Session {
             Some(reason.to_string()),
         ));
         let peer = self.peer.clone();
+        // Dropped outside any runtime, as when the caller's runtime shuts
+        // down: nothing could deliver the notice, and the session loop
+        // ends with its runtime.
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
         // Detached on purpose: the send ends when delivered or when the
         // session loop ends, which `stop` (also run on drop) forces.
-        tokio::spawn(async move {
+        runtime.spawn(async move {
             if let Err(error) = peer.send_notification(notification.into()).await {
                 // The call already failed for its caller; a server that cannot
                 // hear the cancellation has exited or broken its pipe.
@@ -257,6 +270,21 @@ impl Session {
 impl Drop for Session {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+/// A request the server has been sent and not yet answered. Dropping it with
+/// the ID still set, which happens only when the caller drops the call,
+/// cancels the request at the server.
+struct Outstanding<'a> {
+    session: &'a Session,
+    id: Option<RequestId>,
+}
+impl Drop for Outstanding<'_> {
+    fn drop(&mut self) {
+        if let Some(id) = self.id.take() {
+            self.session.cancel_request(id, &McpError::Abandoned);
+        }
     }
 }
 
