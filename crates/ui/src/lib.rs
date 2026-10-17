@@ -13,6 +13,7 @@ mod pages;
 mod palette;
 mod prompts;
 mod route;
+mod running;
 mod schedules;
 mod search;
 mod settings;
