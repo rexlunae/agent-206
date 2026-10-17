@@ -978,7 +978,9 @@ impl Gateway {
                     .collect();
                 let thread = thread.clone();
                 store.persist(Some(EventKind::ThreadChanged { id }))?;
+                drop(store);
                 self.policy_changed();
+                self.grants_changed()?;
                 Ok(Reply::Thread(Box::new(thread)))
             }
             Command::SetEffort { thread: id, effort } => {
@@ -1044,7 +1046,9 @@ impl Gateway {
                 thread.backend_activity = None;
                 thread.grant.capabilities = capabilities;
                 store.persist(Some(EventKind::ThreadChanged { id }))?;
+                drop(store);
                 self.policy_changed();
+                self.grants_changed()?;
                 Ok(Reply::Ok)
             }
             Command::Send {

@@ -305,6 +305,17 @@ impl Gateway {
         self.policy_changed();
         Ok(Reply::Ok)
     }
+    /// Let every tool host stop work, such as a background command, that a
+    /// conversation's grants no longer cover. Call without the state lock.
+    pub(super) fn grants_changed(&self) -> Result<()> {
+        let store = self.lock()?;
+        // A conversation that cannot be viewed no longer exists.
+        let scope = |id| view(&store, id).ok().map(|view| view.scope);
+        for host in self.tool_hosts.iter() {
+            host.rescope(&scope);
+        }
+        Ok(())
+    }
     /// Make running calls and approval waits re-check their authority.
     pub(super) fn policy_changed(&self) {
         self.policy
@@ -882,6 +893,7 @@ impl Gateway {
         ));
         // Dropping the host's future stops the call, on cancellation and on
         // revocation alike.
+        let mut changed_meanwhile = false;
         let result = loop {
             tokio::select! {
                 result = &mut running => break result,
@@ -889,6 +901,7 @@ impl Gateway {
                 // The sender lives as long as the gateway, so this branch
                 // only runs for a change.
                 Ok(()) = policy.changed() => {
+                    changed_meanwhile = true;
                     if !self
                         .still_permits(id, &record.tool, &routed.spec, approved)
                         .await?
@@ -899,6 +912,12 @@ impl Gateway {
                 }
             }
         };
+        // The call ran with `scope`; work it left running (a background
+        // command) may hold a grant withdrawn since, after the rescope that
+        // withdrawal triggered had already looked. Look again.
+        if changed_meanwhile || policy.has_changed().unwrap_or(false) {
+            self.grants_changed()?;
+        }
         // Withdrawing a host's authority can end its call before the policy
         // change is seen here, as when a disconnected MCP server's session
         // closes: such a failure is the withdrawal, not the tool's. Hosts

@@ -109,6 +109,12 @@ pub trait ToolHost: Send + Sync + 'static {
         scope: &'a ToolScope,
         request: ToolRequest,
     ) -> BoxFuture<'a, Result<ToolOutput, ErrorReport>>;
+    /// Grants changed. A host that keeps work running between calls stops
+    /// whatever a conversation's current scope, from `scope`, no longer
+    /// covers; `None` means the conversation is gone. Called under the
+    /// gateway's state lock, so it returns promptly and never calls back
+    /// into the gateway.
+    fn rescope(&self, _scope: &dyn Fn(Id) -> Option<ToolScope>) {}
 }
 
 /// Why a listed tool is not offered.
