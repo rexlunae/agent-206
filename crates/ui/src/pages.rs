@@ -7,6 +7,7 @@ use uuid::Uuid;
 #[component]
 pub fn Overview() -> Element {
     let state = use_context::<State>();
+    let now = crate::messengers::use_catalog_clock(state)();
     let snapshot = state.data.read();
     rsx! { section { class: "a206-page", div { class: "a206-page-inner",
         Card { variant: CardVariant::Feature, as_: CardTag::Div, class: "a206-hero",
@@ -22,7 +23,7 @@ pub fn Overview() -> Element {
             }
             Badge { tone: BadgeTone::Accent, "{snapshot.threads.iter().filter(|t| t.state == a206_core::RunState::Running).count()} active responses" }
         }
-        if crate::welcome::unfinished(&snapshot, crate::messengers::now()) {
+        if crate::welcome::unfinished(&snapshot, now) {
             Card { variant: CardVariant::Subtle, CardBody { div { class: "a206-row a206-between",
                 div { strong { "Finish setting up." } p { class: "a206-muted", "Connect a model provider, secure the vault and start a conversation, with each step's current state in one checklist." } }
                 LinkButton { variant: ButtonVariant::Primary, href: Route::Welcome {}.to_string(), "Get started" }

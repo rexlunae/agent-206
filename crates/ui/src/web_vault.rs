@@ -15,14 +15,13 @@ fn known(value: Option<bool>) -> &'static str {
     }
 }
 
-/// The checklist's view of the vault. The bridge's state does not say
-/// whether the gateway is paired; the gateway's own report fills that in.
+/// The checklist's view of the vault.
 fn facts(state: &VaultState) -> VaultFacts {
     VaultFacts {
         exists: state.exists,
         unlocked: state.unlocked,
         totp_enrolled: state.totp_enrolled,
-        paired: None,
+        paired: state.gateway_paired,
     }
 }
 
@@ -110,6 +109,35 @@ pub(crate) fn WebVault() -> Element {
     };
     // Reads only through `peek`, so this runs once, after the first render.
     use_effect(move || run(VaultRequest::Status));
+    // On the Get started page, keep the checklist current with changes other
+    // clients make, without clearing what the card is showing. A failed
+    // re-read is recorded and shown as unknown; Check again displays it.
+    use_future(move || async move {
+        if progress.is_none() {
+            return;
+        }
+        loop {
+            futures_timer::Delay::new(crate::welcome::VAULT_POLL).await;
+            if *busy.peek() {
+                continue;
+            }
+            match ask(VaultRequest::Status).await {
+                Ok(VaultReply::State(state)) => {
+                    report(VaultSeen::Facts(facts(&state)));
+                    shown.set(Shown::State(state));
+                }
+                Ok(VaultReply::Remote { endpoint }) => {
+                    report(VaultSeen::Remote);
+                    shown.set(Shown::Remote(endpoint));
+                }
+                Ok(VaultReply::Locked { .. }) => {}
+                Ok(VaultReply::Error(error)) | Err(error) => {
+                    record("vault", &error);
+                    report(VaultSeen::Unreadable);
+                }
+            }
+        }
+    });
     let busy_now = busy();
     let availability = if busy_now {
         Availability::Disabled

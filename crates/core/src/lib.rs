@@ -1370,6 +1370,10 @@ pub struct VaultState {
     pub unlocked: bool,
     pub totp_enrolled: Option<bool>,
     pub agent_access: Option<bool>,
+    /// Whether the broker holds a gateway pairing for this unlock; unknown
+    /// while locked or from an older bridge.
+    #[serde(default)]
+    pub gateway_paired: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

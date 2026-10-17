@@ -433,6 +433,19 @@ fn VaultPanel(root: PathBuf) -> Element {
     };
     // Reads only through `peek`, so this runs once, after the first render.
     use_effect(move || panel.check());
+    // On the Get started page, keep the checklist current with changes other
+    // clients make. Skipped while an action or a multi-step flow is running.
+    use_future(move || async move {
+        if panel.progress.is_none() {
+            return;
+        }
+        loop {
+            futures_timer::Delay::new(crate::welcome::VAULT_POLL).await;
+            if !*panel.busy.peek() && *panel.flow.peek() == Flow::Idle {
+                panel.refresh().await;
+            }
+        }
+    });
     let mut password = use_signal(String::new);
     let mut confirm = use_signal(String::new);
     let mut code = use_signal(String::new);

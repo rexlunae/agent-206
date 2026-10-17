@@ -44,6 +44,10 @@ impl VaultProgress {
     }
 }
 
+/// How often a vault card on the Get started page re-reads its broker, so
+/// a lock or unlock from another client or the CLI reaches the checklist.
+pub(crate) const VAULT_POLL: std::time::Duration = std::time::Duration::from_secs(5);
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Progress {
     Done,
@@ -172,38 +176,35 @@ fn vault_steps(vault: Option<VaultSeen>, gateway: Option<&GatewayReport>) -> [St
                 None if !facts.exists => Step::new(TOTP, Progress::ToDo, "Create the vault first."),
                 None => unknown(TOTP, "Unknown while the vault is locked."),
             };
-            // A pairing lasts for one unlock; the gateway's own report fills in
-            // for brokers that do not say.
-            let paired = facts.paired.or_else(|| {
-                gateway
-                    .and_then(|report| report.info.as_ref())
-                    .and_then(|info| info.vault_paired)
-            });
+            // As in the doctor: the broker voids pairings on lock, so a token
+            // the gateway still holds counts only while the broker also
+            // reports a pairing for this unlock.
+            let held = gateway
+                .and_then(|report| report.info.as_ref())
+                .and_then(|info| info.vault_paired);
             let running = gateway.is_some_and(|report| report.phase == GatewayPhase::Running);
-            let pair = match paired {
+            let pair = match (held, facts.paired) {
                 _ if !facts.unlocked => Step::new(
                     PAIR,
                     Progress::ToDo,
                     "Unlock the vault first; locking it ends every pairing.",
                 ),
-                Some(true) => Step::new(
+                _ if !running => {
+                    Step::new(PAIR, Progress::ToDo, "Start the gateway, then pair it.")
+                }
+                (Some(false), _) | (_, Some(false)) => Step::new(
+                    PAIR,
+                    Progress::ToDo,
+                    "Not paired. Pair it from the vault card in the desktop or terminal app, or run `agent206 setup`.",
+                ),
+                (Some(true), Some(true)) => Step::new(
                     PAIR,
                     Progress::Done,
                     "The gateway can make requests that use your credentials.",
                 ),
-                _ if !running => Step::new(
+                _ => unknown(
                     PAIR,
-                    Progress::ToDo,
-                    "Start the gateway, then pair it below.",
-                ),
-                Some(false) => Step::new(
-                    PAIR,
-                    Progress::ToDo,
-                    "Pair it below so the gateway can use your credentials.",
-                ),
-                None => unknown(
-                    PAIR,
-                    "Neither the vault nor the gateway reported a pairing.",
+                    "The vault and the gateway have not both reported this pairing.",
                 ),
             };
             [vault, totp, pair]
@@ -274,10 +275,11 @@ pub(crate) fn unfinished(snapshot: &Snapshot, now: u64) -> bool {
 pub(crate) fn Welcome() -> Element {
     let state = use_context::<State>();
     let progress = use_context_provider(|| VaultProgress(Signal::new(None)));
+    let now = crate::messengers::use_catalog_clock(state)();
     let vault = initial_vault(progress);
     let snapshot = state.data.read();
     let gateway = state.gateway.read();
-    let steps = steps(gateway.as_ref(), vault, &snapshot, crate::messengers::now());
+    let steps = steps(gateway.as_ref(), vault, &snapshot, now);
     let done = steps
         .iter()
         .filter(|step| step.progress == Progress::Done)
@@ -441,18 +443,25 @@ mod tests {
     }
 
     #[test]
-    fn pairing_uses_the_broker_then_the_gateway_report() {
+    fn pairing_is_done_only_when_broker_and_gateway_both_confirm_it() {
         let unlocked = |paired| facts(true, true, Some(false), paired);
-        let [vault, totp, pair] = vault_steps(Some(unlocked(Some(true))), Some(&running(None)));
+        let [vault, totp, pair] =
+            vault_steps(Some(unlocked(Some(true))), Some(&running(Some(true))));
         assert_eq!(
             progress(&[vault, totp, pair]),
             [Progress::Done, Progress::Optional, Progress::Done]
         );
+        // A token the gateway kept after another client locked and unlocked
+        // the vault is not a pairing the broker accepts.
         let [_, _, pair] = vault_steps(Some(unlocked(None)), Some(&running(Some(true))));
-        assert_eq!(pair.progress, Progress::Done);
-        let [_, _, pair] = vault_steps(Some(unlocked(None)), Some(&running(None)));
         assert_eq!(pair.progress, Progress::Unknown);
-        let [_, _, pair] = vault_steps(Some(unlocked(Some(false))), Some(&stopped()));
+        let [_, _, pair] = vault_steps(Some(unlocked(Some(true))), Some(&running(None)));
+        assert_eq!(pair.progress, Progress::Unknown);
+        for (broker, gateway) in [(Some(false), Some(true)), (Some(true), Some(false))] {
+            let [_, _, pair] = vault_steps(Some(unlocked(broker)), Some(&running(gateway)));
+            assert_eq!(pair.progress, Progress::ToDo, "{broker:?} {gateway:?}");
+        }
+        let [_, _, pair] = vault_steps(Some(unlocked(Some(true))), Some(&stopped()));
         assert_eq!(pair.progress, Progress::ToDo);
         assert!(pair.detail.contains("Start the gateway"), "{}", pair.detail);
     }
@@ -492,7 +501,7 @@ mod tests {
             .threads
             .push(a206_core::Thread::new(text(), a206_core::Mode::Chat));
         let steps = steps(
-            Some(&running(None)),
+            Some(&running(Some(true))),
             Some(facts(true, true, Some(true), Some(true))),
             &snapshot,
             0,
