@@ -32,7 +32,8 @@ flowchart LR
 is bounded MessagePack framing. `a206-runtime` owns the state machine, journal,
 provider adapter, SSH, ACP/MCP and host services. `a206-extensions` validates
 manifests and runs WASM. `a206-mcp` validates, sandboxes and talks to
-user-configured MCP servers (`docs/mcp.md`). `a206-vault` preserves the SecureStore format with a
+user-configured MCP servers (`docs/mcp.md`). `a206-skills` reads and bounds
+instruction-only skill folders (`docs/skills.md`). `a206-vault` preserves the SecureStore format with a
 narrow API. `a206-ui` contains one fc-dioxus component tree. `agent206` selects
 the renderer or service entry point.
 
