@@ -40,6 +40,9 @@ axum-server = { version = "0.8", features = ["tls-rustls-no-provider"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
 time = "0.3"
+# Cron expressions, evaluated in IANA time zones through jiff.
+croner = { version = "4.0.1", default-features = false, features = ["jiff"] }
+jiff = "0.2"
 tower-http = { version = "0.6", features = ["fs", "set-header"] }
 tower = { version = "0.5", features = ["util"] }
 rmcp = { version = "3.5", features = ["transport-io"] }

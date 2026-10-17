@@ -23,6 +23,7 @@ mod messengers;
 pub use mcp_servers::{McpOffer, McpOffers};
 pub use run::{RunError, ToolError};
 mod delegation;
+mod schedules;
 mod skills;
 pub use crate::skill_tool::SkillOffer;
 pub use delegation::{Caller, Child, Delegator, DelegatorError, Reservation};
@@ -158,6 +159,8 @@ pub enum GatewayError {
     #[error(transparent)]
     Prompt(#[from] crate::prompt_tool::PromptError),
     #[error(transparent)]
+    Schedule(#[from] crate::schedule::ScheduleError),
+    #[error(transparent)]
     Frame(#[from] transport::FrameError),
     #[error(transparent)]
     Run(#[from] run::RunError),
@@ -233,6 +236,7 @@ impl crate::error::Classified for GatewayError {
             Self::Mcp(error) => return classify(error),
             Self::Skill(error) => return classify(error),
             Self::Prompt(error) => return classify(error),
+            Self::Schedule(error) => return classify(error),
             Self::Frame(error) => return classify(error),
             Self::Run(error) => return classify(error),
             // The cause's own kind (missing, denied, invalid data) is the useful one.
@@ -336,6 +340,8 @@ pub struct Gateway {
     delegation: delegation::Binding,
     /// Runs the subagent tools reserved before starting them, by subagent.
     reserved: delegation::Reserved,
+    /// Wakes the scheduler when a job is added or changed.
+    jobs_changed: Arc<tokio::sync::Notify>,
 }
 /// The broker pairing this gateway holds, with the connection that anchors it.
 struct Paired {
@@ -426,6 +432,7 @@ impl Gateway {
             mcp: Arc::default(),
             delegation: Default::default(),
             reserved: Arc::default(),
+            jobs_changed: Arc::default(),
         };
         // Subagent tools; each conversation still denies them until the user
         // permits them, and they are offered only with subagent models.
@@ -1473,6 +1480,15 @@ impl Gateway {
                 self.policy_changed();
                 Ok(Reply::Ok)
             }
+            Command::ScheduleJob {
+                name,
+                thread,
+                text,
+                schedule,
+            } => self.schedule_job(name, thread, text, schedule, JobAuthor::User),
+            Command::SetJobEnabled { id, enabled } => self.set_job_enabled(id, enabled),
+            Command::RemoveJob { id } => self.remove_job(id),
+            Command::RunJob { id } => self.run_job(id),
             Command::Skills => Ok(Reply::Skills(self.skills()?)),
             Command::ReadSkill { name } => Ok(Reply::Skill(self.read_skill(&name)?)),
             Command::SetSkillEnabled {

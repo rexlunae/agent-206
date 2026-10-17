@@ -19,6 +19,7 @@ pub mod process;
 pub mod prompt_tool;
 pub mod provider;
 pub mod sandbox;
+pub mod schedule;
 pub mod service;
 pub mod skill_tool;
 pub mod sse;
