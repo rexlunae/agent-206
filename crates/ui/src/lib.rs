@@ -580,6 +580,7 @@ fn Shell() -> Element {
         navigator: navigator(),
     };
     use_context_provider(|| state);
+    use_context_provider(|| conversation::Drafts(Signal::new(Default::default())));
     use_future(move || async move {
         // The web bridge may not have a gateway yet; it is asked once this
         // browser may use it, before any gateway is polled.

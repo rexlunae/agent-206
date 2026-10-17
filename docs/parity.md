@@ -108,7 +108,7 @@ invocations and relays gateway-authorized host calls (`a206/docs/plugin-api.md`)
 | Swarm orchestration + templates (`swarm/*`, `tools/swarm_tools.rs`, CLI `swarm`) | missing | Project coordinator thread + delegated task lifecycle |
 | Task fg/bg/pause/resume/input (`tasks/*`, `tools/task_tools.rs`; RustyClaw's task tools are gateway stubs) | partial: `PauseRun`/`ResumeRun` hold a native run, and its subagents' runs, before their next model round (composer, command palette, `agent206 pause/resume`), with a journaled `held` state; input is `Steer`; subagents already run in the background (`subagent_spawn`/`wait`) and shell sessions with `process` | A cross-conversation view of running work; pausing external coding engines |
 | `session_status` usage/cost (`tools/sessions_tools.rs`) | partial: per-request usage/cost/balance widgets from API (`docs/status.md` Usage) | Cumulative accounting, API-sourced only |
-| Concurrent model execution (`gateway/concurrent.rs`) | partial: two visible conversations; runs per thread | >2 views, saved layouts |
+| Concurrent model execution (`gateway/concurrent.rs`) | partial (owner: web client thread): up to four conversations side by side in resizable columns, kept in the address (`?split=` lists them, so older one-conversation links still open; `ui/src/route.rs` Columns, `ui/src/conversation.rs` SideBySide), each column closable and its actions in the command palette; runs per thread | Saved layouts |
 
 ## Scheduling and automation
 

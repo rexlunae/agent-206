@@ -28,7 +28,7 @@ pub(crate) enum Route {
     #[route("/conversations/:id?:split&:message")]
     Chat {
         id: Uuid,
-        split: Option<Uuid>,
+        split: Option<Columns>,
         message: Option<Uuid>,
     },
     #[route("/projects")]
@@ -138,6 +138,57 @@ impl Route {
     }
 }
 
+/// Conversations open beside the first, in order. In an address they are
+/// comma-separated ids, so a link naming one `split` conversation still opens.
+/// The router requires a default; an empty list shows nothing beside.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Columns(Vec<Uuid>);
+
+impl Columns {
+    /// Most conversations a view shows side by side, the first included.
+    pub(crate) const MAX_VISIBLE: usize = 4;
+
+    /// The columns `ids` name, or none for an empty list.
+    pub(crate) fn of(ids: impl IntoIterator<Item = Uuid>) -> Option<Self> {
+        let ids: Vec<_> = ids.into_iter().collect();
+        (!ids.is_empty()).then_some(Self(ids))
+    }
+    /// The conversations to show beside `first`: each once, never `first`
+    /// itself, and no more than fit.
+    pub(crate) fn beside(&self, first: Uuid) -> Vec<Uuid> {
+        let mut ids: Vec<Uuid> = vec![];
+        for id in &self.0 {
+            if *id != first && !ids.contains(id) {
+                ids.push(*id);
+            }
+        }
+        ids.truncate(Self::MAX_VISIBLE - 1);
+        ids
+    }
+}
+
+impl std::fmt::Display for Columns {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for (n, id) in self.0.iter().enumerate() {
+            if n > 0 {
+                f.write_str(",")?;
+            }
+            write!(f, "{id}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::str::FromStr for Columns {
+    type Err = uuid::Error;
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        text.split(',')
+            .map(Uuid::parse_str)
+            .collect::<Result<_, _>>()
+            .map(Self)
+    }
+}
+
 #[component]
 fn NotFound(segments: Vec<String>) -> Element {
     rsx! {
@@ -165,7 +216,7 @@ pub(crate) mod tests {
             },
             Route::Chat {
                 id,
-                split: Some(split),
+                split: Columns::of([split]),
                 message: None,
             },
             Route::Chat {
@@ -175,8 +226,13 @@ pub(crate) mod tests {
             },
             Route::Chat {
                 id,
-                split: Some(split),
+                split: Columns::of([split]),
                 message: Some(id),
+            },
+            Route::Chat {
+                id,
+                split: Columns::of([split, Uuid::new_v4(), Uuid::new_v4()]),
+                message: None,
             },
         ] {
             assert_eq!(route.to_string().parse::<Route>().unwrap(), route);
@@ -270,7 +326,7 @@ pub(crate) mod tests {
     struct ThreadFixture {
         snapshot: a206_core::Snapshot,
         id: Uuid,
-        split: Option<Uuid>,
+        split: Option<Columns>,
         message: Option<Uuid>,
     }
 
@@ -353,7 +409,34 @@ pub(crate) mod tests {
         let fixture = use_context::<ThreadFixture>();
         let state = loaded_state(fixture.snapshot.clone());
         use_context_provider(|| state);
+        use_context_provider(|| crate::conversation::Drafts(Signal::new(Default::default())));
         rsx! { Chat { id: fixture.id, split: fixture.split, message: fixture.message } }
+    }
+
+    /// A workspace whose columns follow `step` through `steps`.
+    #[derive(Clone)]
+    struct Relayout {
+        snapshot: a206_core::Snapshot,
+        id: Uuid,
+        steps: Vec<Option<Columns>>,
+        step: Signal<usize>,
+        drafts: crate::conversation::Drafts,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Routable)]
+    enum RelayoutRoute {
+        #[route("/")]
+        RelayoutView {},
+    }
+
+    #[component]
+    fn RelayoutView() -> Element {
+        let fixture = use_context::<Relayout>();
+        let state = loaded_state(fixture.snapshot.clone());
+        use_context_provider(|| state);
+        use_context_provider(|| fixture.drafts);
+        let split = fixture.steps[(fixture.step)()].clone();
+        rsx! { Chat { id: fixture.id, split, message: None } }
     }
 
     fn render_thread(fixture: ThreadFixture) -> String {
@@ -377,7 +460,7 @@ pub(crate) mod tests {
         let html = render_thread(ThreadFixture {
             snapshot,
             id: parent.id,
-            split: Some(child.id),
+            split: Columns::of([child.id]),
             message: None,
         });
         assert_eq!(html.matches(">Subagents<").count(), 2, "{html}");
@@ -394,12 +477,12 @@ pub(crate) mod tests {
         let fixture = ThreadFixture {
             snapshot,
             id: first.id,
-            split: Some(second.id),
+            split: Columns::of([second.id]),
             message: None,
         };
         let html = render_thread(fixture.clone());
         assert_eq!(html.matches("aria-label=\"Message your agent\"").count(), 2);
-        assert!(html.contains(&format!("value=\"{}\" selected", second.id)));
+        assert!(html.contains(&format!("Close {}", second.title)), "{html}");
 
         // A URL may never open the latest or first available thread as a fallback.
         let html = render_thread(ThreadFixture {
@@ -410,16 +493,136 @@ pub(crate) mod tests {
         assert!(!html.contains(&first.title));
         assert!(!html.contains(&second.title));
         let html = render_thread(ThreadFixture {
-            split: Some(Uuid::new_v4()),
+            split: Columns::of([Uuid::new_v4()]),
             ..fixture.clone()
         });
-        assert!(html.contains("Second conversation unavailable"));
+        assert!(html.contains("A conversation beside this one is unavailable"));
         assert_eq!(html.matches("aria-label=\"Message your agent\"").count(), 1);
         let html = render_thread(ThreadFixture {
-            split: Some(first.id),
+            split: Columns::of([first.id]),
             ..fixture
         });
         assert_eq!(html.matches("aria-label=\"Message your agent\"").count(), 1);
+    }
+
+    #[test]
+    fn up_to_four_conversations_open_side_by_side() {
+        let threads: Vec<_> = (0..6)
+            .map(|_| a206_core::Thread::new(Uuid::new_v4().to_string(), a206_core::Mode::Chat))
+            .collect();
+        let mut snapshot = crate::empty_snapshot();
+        snapshot.threads = threads.clone();
+        let first = threads[0].id;
+        let html = render_thread(ThreadFixture {
+            snapshot: snapshot.clone(),
+            id: first,
+            split: Columns::of(threads[1..3].iter().map(|t| t.id)),
+            message: None,
+        });
+        assert_eq!(html.matches("aria-label=\"Message your agent\"").count(), 3);
+        // Each column beside the first can be closed, and one more added.
+        assert!(html.contains(&format!("Close {}", threads[1].title)));
+        assert!(html.contains(&format!("Close {}", threads[2].title)));
+        assert!(html.contains("Add a column"));
+
+        // A fourth fills the view: no more are offered, and extra ids are not shown.
+        let html = render_thread(ThreadFixture {
+            snapshot,
+            id: first,
+            split: Columns::of(threads[1..].iter().map(|t| t.id)),
+            message: None,
+        });
+        assert_eq!(
+            html.matches("aria-label=\"Message your agent\"").count(),
+            Columns::MAX_VISIBLE
+        );
+        assert!(!html.contains("Add a column"));
+        assert!(!html.contains(&format!("Close {}", threads[5].title)));
+    }
+
+    #[test]
+    fn adding_and_closing_columns_keeps_unsent_drafts() {
+        let threads: Vec<_> = (0..3)
+            .map(|_| a206_core::Thread::new(Uuid::new_v4().to_string(), a206_core::Mode::Chat))
+            .collect();
+        let [first, b, c] = [threads[0].id, threads[1].id, threads[2].id];
+        let typed: std::collections::HashMap<Uuid, String> = threads
+            .iter()
+            .map(|t| (t.id, format!("unsent {}", Uuid::new_v4())))
+            .collect();
+        let mut snapshot = crate::empty_snapshot();
+        snapshot.threads = threads;
+        fn app() -> Element {
+            rsx! { Router::<RelayoutRoute> {} }
+        }
+        let mut dom = VirtualDom::new(app);
+        let (mut step, drafts) = dom.in_scope(ScopeId::ROOT, || {
+            let drafts = typed
+                .iter()
+                .map(|(id, text)| {
+                    let unsent = crate::conversation::Unsent {
+                        text: text.clone(),
+                        attachments: vec![],
+                    };
+                    (*id, unsent)
+                })
+                .collect();
+            (Signal::new(0), Signal::new(drafts))
+        });
+        // Add a column, close the one before the last, then close split view.
+        let steps = vec![
+            Columns::of([b]),
+            Columns::of([b, c]),
+            Columns::of([c]),
+            None,
+        ];
+        let visible = [
+            vec![first, b],
+            vec![first, b, c],
+            vec![first, c],
+            vec![first],
+        ];
+        dom.provide_root_context(Relayout {
+            snapshot,
+            id: first,
+            steps: steps.clone(),
+            step,
+            drafts: crate::conversation::Drafts(drafts),
+        });
+        dom.provide_root_context(Rc::new(MemoryHistory::default()) as Rc<dyn History>);
+        dom.rebuild_in_place();
+        for (index, shown) in visible.iter().enumerate() {
+            if index > 0 {
+                dom.in_scope(ScopeId::ROOT, || step.set(index));
+                dom.render_immediate(&mut dioxus::core::NoOpMutations);
+            }
+            let html = dioxus_ssr::render(&dom);
+            for id in shown {
+                assert!(html.contains(&typed[id]), "step {index}: {html}");
+            }
+        }
+        let kept = dom.in_scope(ScopeId::ROOT, || drafts.peek().len());
+        assert_eq!(kept, typed.len());
+    }
+
+    #[test]
+    fn columns_keep_order_without_repeats_and_read_old_split_links() {
+        let [first, a, b] = [Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()];
+        let columns = Columns::of([a, first, a, b]).expect("not empty");
+        assert_eq!(columns.beside(first), [a, b]);
+        assert_eq!(Columns::of([]), None);
+        // An address written for one split conversation still opens it.
+        assert_eq!(
+            format!("/conversations/{first}?split={a}")
+                .parse::<Route>()
+                .unwrap(),
+            Route::Chat {
+                id: first,
+                split: Columns::of([a]),
+                message: None
+            }
+        );
+        assert!(format!("{a},").parse::<Columns>().is_err());
     }
 
     #[test]

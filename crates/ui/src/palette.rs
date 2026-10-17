@@ -54,11 +54,11 @@ pub(crate) fn can_compact(thread: &Thread) -> bool {
 /// `can_create` is whether the gateway can take a new conversation now.
 pub(crate) fn entries(snapshot: &Snapshot, route: &Route, can_create: bool) -> Vec<Entry> {
     let mut entries = vec![];
-    // Both conversations of a split view are on screen, so both offer their
-    // actions, named by title when there are two.
+    // Every conversation of a split view is on screen, so each offers its
+    // actions, named by title when there are several.
     let visible: Vec<Id> = match route {
         Route::Chat { id, split, .. } => std::iter::once(*id)
-            .chain(split.filter(|second| second != id))
+            .chain(split.iter().flat_map(|columns| columns.beside(*id)))
             .collect(),
         _ => vec![],
     };
@@ -534,7 +534,7 @@ mod tests {
         let snap = snapshot(vec![first.clone(), second.clone(), other.clone()]);
         let route = Route::Chat {
             id: first.id,
-            split: Some(second.id),
+            split: crate::route::Columns::of([second.id]),
             message: None,
         };
         let offered = entries_for(&snap, route);
