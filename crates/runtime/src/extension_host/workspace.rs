@@ -347,10 +347,20 @@ type Visit<'a> = dyn FnMut(&Dir, &Entry<'_>) -> Result<std::ops::ControlFlow<()>
 /// `a/child.rs`), it holds only one open directory per level, and it never
 /// follows symlinks or enters `.git`. A directory is visited before its
 /// contents.
-#[derive(Default)]
 struct Walk {
     directories: usize,
+    /// Directory entries read so far, and how many the walk may read.
     entries: usize,
+    limit: usize,
+}
+impl Default for Walk {
+    fn default() -> Self {
+        Self {
+            directories: 0,
+            entries: 0,
+            limit: MAX_WALK_ENTRIES,
+        }
+    }
 }
 /// One step of a directory's walk.
 enum Step {
@@ -380,16 +390,23 @@ impl Walk {
         // The whole directory is read before anything in it is visited: the
         // file system lists entries in no particular order, so stopping part
         // way through would leave an arbitrary prefix, not a sorted one.
+        // A directory that cannot be read whole within the walk's budget ends
+        // the walk before any of its entries, so what was found stays a
+        // sorted prefix; if it is where the walk started, nothing can be.
+        let first = self.entries == 0;
         let mut steps = Vec::new();
-        let mut read = 0;
         for entry in directory.entries().map_err(|e| io_failure(&e))? {
-            if read == MAX_WALK_ENTRIES {
-                return Err(failure(
-                    HostErrorCode::TooLarge,
-                    "a directory has more than 100,000 entries",
-                ));
+            if self.entries == self.limit {
+                return if first {
+                    Err(failure(
+                        HostErrorCode::TooLarge,
+                        "the directory has more than 100,000 entries",
+                    ))
+                } else {
+                    Ok(Break(()))
+                };
             }
-            read += 1;
+            self.entries += 1;
             let entry = entry.map_err(|e| io_failure(&e))?;
             let kind = kind(entry.file_type().map_err(|e| io_failure(&e))?);
             let name = entry.file_name().to_string_lossy().into_owned();
@@ -401,12 +418,6 @@ impl Walk {
             }
             steps.push(Step::Visit(name, kind));
         }
-        // A directory that would pass the walk's total ends the walk before
-        // any of its entries, so what was found stays a sorted prefix.
-        if self.entries + read > MAX_WALK_ENTRIES {
-            return Ok(Break(()));
-        }
-        self.entries += read;
         steps.sort_by(|a, b| a.key().cmp(&b.key()));
         for step in steps {
             match step {
@@ -836,6 +847,48 @@ mod tests {
             std::fs::read_to_string(dir.path().join(&name)).unwrap(),
             contents
         );
+    }
+
+    #[test]
+    fn a_walk_stops_before_a_directory_it_cannot_read_within_its_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        // `a` and its contents sort before the two root files.
+        std::fs::create_dir(dir.path().join("a")).unwrap();
+        for name in ["a/1", "a/2", "a/3", "a/4", "b", "c"] {
+            std::fs::write(dir.path().join(name), "").unwrap();
+        }
+        let mut walk = Walk {
+            limit: 5,
+            ..Walk::default()
+        };
+        let mut seen = Vec::new();
+        let flow = walk
+            .walk(
+                &open_workspace(dir.path().into()).unwrap(),
+                "",
+                0,
+                &mut |_, entry| {
+                    seen.push(entry.below.to_owned());
+                    Ok(std::ops::ControlFlow::Continue(()))
+                },
+            )
+            .unwrap();
+        assert!(flow.is_break());
+        // Reading stopped at the budget, inside `a`, before visiting any of it.
+        assert_eq!(walk.entries, 5);
+        assert_eq!(seen, ["a"]);
+        // A starting directory larger than the budget is refused outright.
+        let mut small = Walk {
+            limit: 2,
+            ..Walk::default()
+        };
+        let refused = small.walk(
+            &open_workspace(dir.path().into()).unwrap(),
+            "",
+            0,
+            &mut |_, _| Ok(std::ops::ControlFlow::Continue(())),
+        );
+        assert_eq!(refused.unwrap_err().code, HostErrorCode::TooLarge);
     }
 
     #[cfg(unix)]

@@ -684,12 +684,22 @@ async fn a_directory_past_the_entry_bound_is_refused_not_cut() {
         std::fs::File::create(root.join("big").join(index.to_string())).unwrap();
     }
     let mut host = workspace_calls(&store, Some(root.clone()), &[Capability::ReadWorkspace]);
-    let find = HostRequest::Find {
-        path: ".".into(),
+    let find = |path: &str| HostRequest::Find {
+        path: path.into(),
         glob: "0".into(),
         max_results: 1,
     };
-    assert_eq!(code(host.handle(find).await), Some(HostErrorCode::TooLarge));
+    // Reached from the root, the walk stops before it, with nothing cut.
+    let HostReply::Found(found) = host.handle(find(".")).await else {
+        panic!("find failed");
+    };
+    assert!(found.entries.is_empty());
+    assert!(found.truncated);
+    // Where the walk starts, nothing can be found within the bound.
+    assert_eq!(
+        code(host.handle(find("big")).await),
+        Some(HostErrorCode::TooLarge)
+    );
 }
 
 #[tokio::test]
