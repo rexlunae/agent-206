@@ -43,7 +43,7 @@ async fn a_due_job_sends_its_text_to_the_conversation_and_records_the_run() {
             text: text.clone(),
             schedule: Schedule::Every {
                 seconds: 3600,
-                anchor: Id::new_v4().as_u128() as u64 % 1_000_000_000,
+                anchor: Some(Id::new_v4().as_u128() as u64 % 1_000_000_000),
             },
         },
     )
