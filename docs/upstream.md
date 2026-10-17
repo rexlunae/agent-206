@@ -54,11 +54,15 @@ no upstream engine implementation was copied):
 - [Claude runtime license](https://github.com/anthropics/claude-code/blob/main/LICENSE.md):
   separate Anthropic terms; the ACP adapter's license does not license the runtime.
 
-The fc-dioxus dependency pins `ffa3b2b88cc5dcff82955c093db4227fbc755884`
-from the select-popup fix branch. Its future-css pin is
+The fc-dioxus dependency pins `1b5eee0a54a13b19ac02f3c93d43c65d8f662a2e`
+from the select-blur-focus fix branch. Its future-css pin is
 `a6d2846c6e0d6858d101550acb06a657dd18d857`. These revisions fix
 bottom-edge popup placement in the source toolkit and host bridge, with parity
-and viewport regression tests. The source fixes are in [future-css #63](https://github.com/rexlunae/future-css/pull/63) and [fc-dioxus #8](https://github.com/rexlunae/fc-dioxus/pull/8). Generated toolkit CSS was not edited.
+and viewport regression tests. The source fixes are in [future-css #63](https://github.com/rexlunae/future-css/pull/63) and [fc-dioxus #8](https://github.com/rexlunae/fc-dioxus/pull/8).
+The toolkit revision also includes [fc-dioxus #10](https://github.com/rexlunae/fc-dioxus/pull/10):
+blur and Tab dismiss a Select without reclaiming focus, so switching selectors
+does not leave an unfocused popup open. Native browser regression tests cover
+selector switching, blur, and Tab traversal. Generated toolkit CSS was not edited.
 
 Provider adapters follow the primary [Anthropic model](https://platform.claude.com/docs/en/api/models/list)
 and [Messages](https://platform.claude.com/docs/en/api/messages/create) contracts,
