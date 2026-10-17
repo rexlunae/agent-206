@@ -1,6 +1,6 @@
 //! Native protocol contracts against a live API with generated model facts.
 use a206_core::*;
-use a206_runtime::{backends::Progress, provider};
+use a206_runtime::{backends::Progress, provider, retry::RetryPolicy};
 use axum::{
     Json, Router,
     extract::{Query, State},
@@ -237,10 +237,20 @@ async fn paginates_native_catalogs_and_dispatches_protocol_specific_text() {
         }
         let prompt = Id::new_v4().to_string();
         let (progress, mut deltas) = tokio::sync::mpsc::channel(64);
-        let provider::Turn { text, usage, .. } =
-            provider::complete(&config, broker, &thread, &prompt, model, &[], &progress)
-                .await
-                .unwrap();
+        let provider::Turn { text, usage, .. } = provider::complete(
+            &config,
+            broker,
+            provider::Ask {
+                thread: &thread,
+                prompt: &prompt,
+                info: model,
+                tools: &[],
+            },
+            &progress,
+            &RetryPolicy::NONE,
+        )
+        .await
+        .unwrap();
         assert_eq!(text, api.text);
         let mut streamed = String::new();
         while let Ok(update) = deltas.try_recv() {
@@ -741,9 +751,20 @@ fn spawn_complete(
             pairing: pairing.as_ref(),
         };
         let prompt = Id::new_v4().to_string();
-        provider::complete(&config, broker, &thread, &prompt, &info, &[], &progress)
-            .await
-            .map(|turn| (turn.text, turn.usage))
+        provider::complete(
+            &config,
+            broker,
+            provider::Ask {
+                thread: &thread,
+                prompt: &prompt,
+                info: &info,
+                tools: &[],
+            },
+            &progress,
+            &RetryPolicy::NONE,
+        )
+        .await
+        .map(|turn| (turn.text, turn.usage))
     });
     (task, deltas)
 }
@@ -1218,9 +1239,20 @@ async fn an_older_broker_is_used_without_streaming() {
     let thread = conversation(&info);
     let provider::Turn {
         text: got, usage, ..
-    } = provider::complete(&config, broker, &thread, "", &info, &[], &progress)
-        .await
-        .unwrap();
+    } = provider::complete(
+        &config,
+        broker,
+        provider::Ask {
+            thread: &thread,
+            prompt: "",
+            info: &info,
+            tools: &[],
+        },
+        &progress,
+        &RetryPolicy::NONE,
+    )
+    .await
+    .unwrap();
     assert_eq!(got, text);
     assert_eq!(next_delta(&mut deltas).await, text);
     assert_eq!(usage.input_tokens, Some(input));

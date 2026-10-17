@@ -21,6 +21,7 @@ pub mod process;
 pub mod prompt_tool;
 pub mod propose_tool;
 pub mod provider;
+pub mod retry;
 pub mod sandbox;
 pub mod schedule;
 pub mod service;

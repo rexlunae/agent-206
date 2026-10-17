@@ -333,6 +333,8 @@ pub struct Gateway {
     refreshed: Arc<Mutex<BTreeMap<Id, u64>>>,
     paired: Arc<tokio::sync::Notify>,
     tool_hosts: Arc<Vec<Arc<dyn crate::tools::ToolHost>>>,
+    /// How model requests are retried.
+    retry: crate::retry::RetryPolicy,
     /// Runs waiting for the user, by approval ID. Only `ResolveApproval` answers them.
     approvals: Arc<Mutex<BTreeMap<Id, run::Waiter>>>,
     /// Questions `ask_user` calls are waiting on. Only `AnswerPrompt` answers them.
@@ -436,6 +438,7 @@ impl Gateway {
             pair_requests: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             refreshed: Arc::new(Mutex::new(BTreeMap::new())),
             paired: Arc::new(tokio::sync::Notify::new()),
+            retry: crate::retry::RetryPolicy::DEFAULT,
             tool_hosts: Arc::new(vec![
                 extension_tools,
                 mcp_tools,

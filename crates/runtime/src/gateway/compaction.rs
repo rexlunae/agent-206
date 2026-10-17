@@ -261,11 +261,14 @@ impl Gateway {
         let operation = provider::complete(
             request.config,
             broker,
-            &thread,
-            SUMMARY_PROMPT,
-            request.info,
-            &[],
+            provider::Ask {
+                thread: &thread,
+                prompt: SUMMARY_PROMPT,
+                info: request.info,
+                tools: &[],
+            },
             &sender,
+            &self.retry,
         );
         let turn = tokio::select! {
             turn = operation => turn.map_err(CompactionError::Summary)?,
