@@ -30,6 +30,7 @@ thiserror.workspace = true
 zeroize.workspace = true
 fs2 = "0.4"
 cap-std = "4"
+cap-fs-ext = "4"
 axum = "0.8"
 tower-http = { version = "0.6", features = ["fs", "set-header"] }
 tower = { version = "0.5", features = ["util"] }

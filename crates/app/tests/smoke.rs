@@ -93,6 +93,10 @@ fn result(reply: Value) -> Result<Value> {
 
 /// The bundled WASM extension through the gateway and its worker process:
 /// denied until granted, then file tools, a panel and persisted panel state.
+fn refs(args: &[String]) -> Vec<&str> {
+    args.iter().map(String::as_str).collect()
+}
+
 async fn extension_smoke(app: &App) -> Result<()> {
     let workspace = tempfile::Builder::new().prefix("a206-ws-").tempdir()?;
     let body = uuid::Uuid::new_v4().to_string();
@@ -163,6 +167,59 @@ async fn extension_smoke(app: &App) -> Result<()> {
     ensure!(
         app.cli(&panel).await?.contains(".hidden"),
         "panel state was not kept"
+    );
+    let tool = |name: &str, args: String| -> Vec<String> {
+        [
+            "extension",
+            "tool",
+            id,
+            name,
+            "--project",
+            &project,
+            "--args",
+            &args,
+        ]
+        .map(String::from)
+        .to_vec()
+    };
+    let changed = uuid::Uuid::new_v4().to_string();
+    let write = tool(
+        "write_text_file",
+        format!("path = \"made/new.txt\"\ntext = \"{body}\""),
+    );
+    ensure!(
+        !capture(app.command(&refs(&write))).await?.status.success(),
+        "a read-only grant wrote a file"
+    );
+    app.cli(&[
+        "extension",
+        "grant",
+        id,
+        "--capability",
+        "read_workspace",
+        "--capability",
+        "write_workspace",
+    ])
+    .await?;
+    app.cli(&refs(&write)).await?;
+    let edit = tool(
+        "edit_text_file",
+        format!("path = \"made/new.txt\"\nold_text = \"{body}\"\nnew_text = \"{changed}\""),
+    );
+    app.cli(&refs(&edit)).await?;
+    ensure!(
+        std::fs::read_to_string(workspace.path().join("made/new.txt"))? == changed,
+        "the write and edit did not reach the workspace"
+    );
+    let found = app
+        .cli(&refs(&tool(
+            "search_text",
+            format!("query = \"{changed}\""),
+        )))
+        .await?;
+    ensure!(
+        found.contains("made/new.txt:1:"),
+        "search missed the edit: {found}"
     );
     app.cli(&["extension", "grant", id]).await?;
     ensure!(

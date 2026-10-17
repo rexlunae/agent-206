@@ -1,6 +1,7 @@
 //! Policy and host calls, exercised without a worker process. The end-to-end
 //! path through the real worker is covered by the app's smoke test.
 use super::*;
+use a206_extensions::abi::{EntryKind, SearchMatch};
 
 fn store() -> (tempfile::TempDir, Arc<Mutex<Store>>) {
     let dir = tempfile::tempdir().unwrap();
@@ -139,6 +140,253 @@ async fn workspace_calls_stay_inside_the_root() {
         ),
         Some(HostErrorCode::Invalid)
     );
+}
+
+fn write(path: &str, contents: &str, overwrite: bool) -> HostRequest {
+    HostRequest::WriteFile {
+        path: path.into(),
+        contents: contents.as_bytes().to_vec().into(),
+        overwrite,
+    }
+}
+
+#[tokio::test]
+async fn writes_need_the_write_grant_and_stay_inside_the_root() {
+    let (dir, store) = store();
+    let root = dir.path().join("project");
+    std::fs::create_dir_all(root.join(".git")).unwrap();
+    let body = uuid::Uuid::new_v4().to_string();
+    let mut read_only = workspace_calls(&store, Some(root.clone()), &[Capability::ReadWorkspace]);
+    assert_eq!(
+        code(read_only.handle(write("new.txt", &body, false)).await),
+        Some(HostErrorCode::Denied)
+    );
+    assert!(!root.join("new.txt").exists());
+
+    let mut host = workspace_calls(
+        &store,
+        Some(root.clone()),
+        &[Capability::ReadWorkspace, Capability::WriteWorkspace],
+    );
+    let outside = dir.path().join("outside.txt");
+    for path in [
+        "../outside.txt",
+        outside.to_str().unwrap(),
+        ".git/config",
+        "sub/../../outside.txt",
+        "",
+    ] {
+        assert_eq!(
+            code(host.handle(write(path, &body, true)).await),
+            Some(HostErrorCode::Invalid),
+            "{path:?}"
+        );
+    }
+    assert!(!outside.exists());
+    assert!(!root.join(".git/config").exists());
+    #[cfg(unix)]
+    {
+        std::fs::write(&outside, "kept").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
+        assert_eq!(
+            code(host.handle(write("link", &body, true)).await),
+            Some(HostErrorCode::Invalid)
+        );
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "kept");
+
+        // A relative link stays inside the root, so cap-std allows it; it
+        // still must not lead a write into `.git`.
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::os::unix::fs::symlink(".git", root.join("repo")).unwrap();
+        assert_eq!(
+            code(host.handle(write("repo/config", &body, false)).await),
+            Some(HostErrorCode::Invalid)
+        );
+        assert_eq!(
+            code(
+                host.handle(HostRequest::CreateDirectory {
+                    path: "repo/hooks".into()
+                })
+                .await
+            ),
+            Some(HostErrorCode::Invalid)
+        );
+        assert!(!root.join(".git/config").exists());
+        assert!(!root.join(".git/hooks").exists());
+    }
+    let huge = "x".repeat(MAX_FILE as usize + 1);
+    assert_eq!(
+        code(host.handle(write("huge.txt", &huge, false)).await),
+        Some(HostErrorCode::TooLarge)
+    );
+}
+
+#[tokio::test]
+async fn writes_create_replace_and_edit_files() {
+    let (dir, store) = store();
+    let root = dir.path().to_path_buf();
+    let mut host = workspace_calls(
+        &store,
+        Some(root.clone()),
+        &[Capability::ReadWorkspace, Capability::WriteWorkspace],
+    );
+    let (first, second) = (
+        uuid::Uuid::new_v4().to_string(),
+        uuid::Uuid::new_v4().to_string(),
+    );
+    assert_eq!(
+        host.handle(HostRequest::CreateDirectory { path: "a/b".into() })
+            .await,
+        HostReply::Done
+    );
+    assert_eq!(
+        host.handle(write("a/b/f.txt", &first, false)).await,
+        HostReply::Done
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("a/b/f.txt")).unwrap(),
+        first
+    );
+    assert_eq!(
+        code(host.handle(write("a/b/f.txt", &second, false)).await),
+        Some(HostErrorCode::Exists)
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::Permissions::from_mode(0o600);
+        std::fs::set_permissions(root.join("a/b/f.txt"), mode).unwrap();
+    }
+    assert_eq!(
+        host.handle(write("a/b/f.txt", &second, true)).await,
+        HostReply::Done
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("a/b/f.txt")).unwrap(),
+        second
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(root.join("a/b/f.txt"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "replacing keeps permissions");
+    }
+    // No temporary file is left behind.
+    assert_eq!(std::fs::read_dir(root.join("a/b")).unwrap().count(), 1);
+    assert_eq!(
+        code(
+            host.handle(HostRequest::CreateDirectory {
+                path: "a/b/f.txt".into()
+            })
+            .await
+        ),
+        Some(HostErrorCode::Exists)
+    );
+
+    let edit = |old: &str, new: &str| HostRequest::EditFile {
+        path: "a/b/f.txt".into(),
+        old: old.into(),
+        new: new.into(),
+    };
+    std::fs::write(
+        root.join("a/b/f.txt"),
+        format!("{first}\n{second}\n{second}\n"),
+    )
+    .unwrap();
+    assert_eq!(host.handle(edit(&first, "one")).await, HostReply::Done);
+    assert_eq!(
+        code(host.handle(edit(&first, "again")).await),
+        Some(HostErrorCode::Conflict),
+        "the text is gone"
+    );
+    assert_eq!(
+        code(host.handle(edit(&second, "two")).await),
+        Some(HostErrorCode::Conflict),
+        "the text is ambiguous"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("a/b/f.txt")).unwrap(),
+        format!("one\n{second}\n{second}\n")
+    );
+}
+
+#[tokio::test]
+async fn search_is_bounded_and_does_not_follow_links() {
+    let (dir, store) = store();
+    let root = dir.path().join("project");
+    let needle = uuid::Uuid::new_v4().to_string();
+    std::fs::create_dir_all(root.join("src/deep")).unwrap();
+    std::fs::create_dir_all(root.join(".git")).unwrap();
+    std::fs::write(root.join("src/a.txt"), format!("x\n{needle} here\n")).unwrap();
+    std::fs::write(root.join("src/deep/b.txt"), format!("{needle}\n")).unwrap();
+    std::fs::write(root.join(".git/c.txt"), &needle).unwrap();
+    std::fs::write(root.join("binary.bin"), [0xff, 0xfe, 0x00]).unwrap();
+    // After `src/` in name order, though it is nearer the search root.
+    std::fs::write(root.join("top.txt"), &needle).unwrap();
+    std::fs::write(dir.path().join("outside.txt"), &needle).unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(dir.path(), root.join("escape")).unwrap();
+    let search = |path: &str, max_matches| HostRequest::Search {
+        path: path.into(),
+        query: needle.clone(),
+        max_matches,
+    };
+    let mut denied = workspace_calls(&store, Some(root.clone()), &[]);
+    assert_eq!(
+        code(denied.handle(search(".", 10)).await),
+        Some(HostErrorCode::Denied)
+    );
+
+    let mut host = workspace_calls(&store, Some(root.clone()), &[Capability::ReadWorkspace]);
+    let HostReply::Matches(found) = host.handle(search(".", 10)).await else {
+        panic!("search failed");
+    };
+    assert!(!found.truncated);
+    assert_eq!(
+        found.matches,
+        vec![
+            SearchMatch {
+                path: "src/a.txt".into(),
+                line: 2,
+                text: format!("{needle} here")
+            },
+            SearchMatch {
+                path: "src/deep/b.txt".into(),
+                line: 1,
+                text: needle.clone()
+            },
+            SearchMatch {
+                path: "top.txt".into(),
+                line: 1,
+                text: needle.clone()
+            },
+        ]
+    );
+    let HostReply::Matches(first) = host.handle(search(".", 1)).await else {
+        panic!("search failed");
+    };
+    assert!(first.truncated);
+    assert_eq!(
+        first
+            .matches
+            .iter()
+            .map(|m| &m.path[..])
+            .collect::<Vec<_>>(),
+        ["src/a.txt"]
+    );
+    assert_eq!(
+        code(host.handle(search("..", 10)).await),
+        Some(HostErrorCode::Invalid)
+    );
+    let empty = HostRequest::Search {
+        path: ".".into(),
+        query: String::new(),
+        max_matches: 1,
+    };
+    assert_eq!(code(host.handle(empty).await), Some(HostErrorCode::Invalid));
 }
 
 #[tokio::test]
@@ -299,19 +547,26 @@ async fn policy_is_checked_before_the_guest_runs() {
     ));
     assert_eq!(kind(error), ErrorKind::PermissionDenied);
 
-    grant(&store, &id, &[Capability::ReadWorkspace]);
-    assert_eq!(
-        host.tools()
+    // Only tools whose every declared capability is granted are offered.
+    let listed = |granted: &[Capability]| {
+        grant(&store, &id, granted);
+        let offered: Vec<_> = host
+            .tools()
             .unwrap()
-            .iter()
-            .map(|t| &t.spec.name)
-            .collect::<Vec<_>>(),
-        workspace_extension()
+            .into_iter()
+            .map(|t| t.spec.name)
+            .collect();
+        let expected: Vec<_> = workspace_extension()
             .tools
-            .iter()
-            .map(|t| &t.name)
-            .collect::<Vec<_>>()
-    );
+            .into_iter()
+            .filter(|t| t.capabilities.iter().all(|c| granted.contains(c)))
+            .map(|t| t.name)
+            .collect();
+        assert_eq!(offered, expected);
+        offered.len()
+    };
+    let all = [Capability::ReadWorkspace, Capability::WriteWorkspace];
+    assert!(listed(&all) > listed(&[Capability::ReadWorkspace]));
     let error = host
         .call_tool(&id, &tool.name, path("."), Scope::default())
         .await
