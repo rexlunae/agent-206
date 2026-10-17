@@ -17,8 +17,8 @@ Key a206 facts that drive most rows: the native engine is text-only, no tool-cal
 (`a206/crates/runtime/src/provider.rs` streams text but sends no `tools`); credentialed providers
 now go through the vault broker (survey time: refused); the agent-facing surface is the MCP harness with
 one tool, `rename_thread` (`a206/crates/runtime/src/mcp.rs`); the `Command` enum
-(`a206/crates/core/src/lib.rs:418`) is the entire gateway API; WASM ABI v1 has no inputs or host calls
-(`a206/docs/plugin-api.md`).
+(`a206/crates/core/src/lib.rs:418`) is the entire gateway API; WASM ABI v2 (survey time: v1, no inputs or host calls) takes MessagePack
+invocations and relays gateway-authorized host calls (`a206/docs/plugin-api.md`).
 
 ## Security, vault and authentication
 
@@ -58,7 +58,7 @@ one tool, `rename_thread` (`a206/crates/runtime/src/mcp.rs`); the `Command` enum
 
 | RustyClaw capability | Agent 206 status | How it should land |
 | --- | --- | --- |
-| read/write/edit/list/search/find files (`tools/file.rs`) | partial: read-only text `ReadDocument` scoped by cap-std (`gateway.rs` `scoped_path`) | `workspace` host domain: read/patch/search under ReadWorkspace/WriteWorkspace |
+| read/write/edit/list/search/find files (`tools/file.rs`) | partial: read-only text `ReadDocument` scoped by cap-std; `list_directory`/`read_text_file` ship as WASM tools in the bundled `agent206.workspace` extension (`a206/plugins/workspace`); write/edit/search missing | `workspace` host domain: read/patch/search under ReadWorkspace/WriteWorkspace |
 | `apply_patch` multi-hunk (`tools/patch.rs`), `ast_grep_manage` (`ast_grep.rs`) | missing | Workspace patch host call; ast-grep as extension |
 | `execute_command`, `process` bg/poll/send_keys/kill (`tools/runtime.rs`, `process_manager.rs`) | missing natively (Execute grant only for external backends, macOS) | Brokered exec in OS sandbox, bounded output, process-group teardown (reuse `runtime/src/process.rs`) |
 | `web_fetch`, `web_extract` (`tools/web.rs`, `web_extract.rs`) | missing (only download fetch) | Network host call through SSRF guard; readability in WASM |
@@ -123,7 +123,7 @@ one tool, `rename_thread` (`a206/crates/runtime/src/mcp.rs`); the `Command` enum
 | Skills: markdown/YAML, dependency gating, enable/disable (`skills/mod.rs`, `tools/skills_tools.rs`) | missing | Instruction packages (TOML manifest) separate from executable extensions |
 | ClawHub registry install/search (`skills/clawhub.rs`, CLI `clawhub`) | missing | Reviewed install with manifest validation + audit |
 | Agent-created skills/curator (`tools/skill_curator.rs`, `skill_create`) | missing | Agent prepares package; user enables |
-| Plugin UI panels + state (`plugins/mod.rs`, `tools/plugin.rs`) | partial: one bundled text-only WASM panel (`a206/crates/extensions`, `plugins/inspector`) | ABI v2: MessagePack inputs, host calls, typed UI |
+| Plugin UI panels + state (`plugins/mod.rs`, `tools/plugin.rs`) | partial: ABI v2 (`a206/crates/extension-abi`, `extension-sdk`, `extensions`, `runtime/src/extension_host.rs`): declared tools and panels, typed fc-dioxus panel nodes with button events, per-extension persisted state, user grants/enable on the Extensions page and CLI, gateway-authorized workspace host calls; only bundled extensions load, agents cannot create or call them until the run engine lands | Agent `plugin_*` tools via the run engine; reviewed package install; more host domains (patch, git, network, exec after the OS sandbox) |
 | MCP **client** connect/list/tools (`mcp/*`, `tools/mcp_tools.rs`) | missing (a206 has MCP **server** harness only, `runtime/src/mcp.rs`) | MCP client in isolated process; tools gated by grants; imported servers inactive |
 | ACP | present (a206 extra): `agent206 acp`, ACP client for Claude Agent (`runtime/src/acp.rs`, `backends/claude.rs`) | — |
 
@@ -170,7 +170,7 @@ one tool, `rename_thread` (`a206/crates/runtime/src/mcp.rs`); the `Command` enum
 | --- | --- | --- |
 | Landlock, Bubblewrap, Landlock+Bwrap, Docker, macOS sandbox-exec, path validation (`sandbox/*`, `runtime/docker.rs`) | partial: external backends run under macOS sandbox-exec, or on Linux under bubblewrap namespaces plus Landlock applied inside, with a loopback-only proxy relay (`crates/sandbox`, `runtime/src/backends/isolation.rs`); missing bwrap or Landlock is an error, never a fallback. Docker and path-validation modes are deliberately not ported (they are downgrades); native exec and the WASM worker are not sandboxed yet | Reuse `a206-sandbox` profiles for native exec and the extension worker |
 | SSH runtime adapter for remote exec (`runtime/ssh.rs`) | missing (remote gateway via SSH exists) | Execute on remote gateway rather than per-command SSH |
-| WASM tool sandbox | present (a206 extra): fuel/memory/time-bounded worker, no WASI (`a206/crates/extensions`) | Add OS profile to worker |
+| WASM tool sandbox | present (a206 extra): fuel/memory/time-bounded worker process, no WASI, only the two ABI host imports, each call re-authorized by the gateway (`a206/crates/extensions`) | Add OS profile to worker |
 
 ## Observability, deployment
 
@@ -191,7 +191,8 @@ one tool, `rename_thread` (`a206/crates/runtime/src/mcp.rs`); the `Command` enum
    (Allow/Ask/Deny), `ask_user`, retries without silent fallback, tool healing and output budgets.
    Without it no tool, memory, cron or channel feature is reachable by a model.
 3. **Extension ABI v2** (MessagePack input, scoped host calls for workspace/exec/network/git, typed
-   UI contributions, reviewed install). Every RustyClaw tool family is meant to ship as a WASM builtin.
+   UI contributions, reviewed install). Partial: the ABI, SDK, workspace read/list and state host
+   calls, typed panels and user grants are in; exec/network/git host calls and package install remain. Every RustyClaw tool family is meant to ship as a WASM builtin.
 4. **OS sandbox for native exec and the WASM worker.** External backends are isolated on macOS and
    Linux; native Execute/WriteWorkspace grants still need the same profiles (`crates/sandbox`).
 5. **Context management**: compaction keyed to API-reported limits, workspace instruction files,

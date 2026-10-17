@@ -100,11 +100,15 @@ pub(crate) fn classify(error: &(dyn Error + 'static)) -> Option<ErrorKind> {
         crate::vault::VaultError,
         a206_broker::BrokerError,
         a206_broker::ClientError,
-        a206_extensions::ExtensionError,
+        crate::extension_host::ExtensionError,
+        a206_extensions::abi::HostFailure,
         a206_protocol::Error,
         a206_sandbox::SandboxError,
         reqwest::Error,
     );
+    if let Some(kind) = a206_extensions::classify(error) {
+        return Some(kind);
+    }
     if error.is::<tokio::time::error::Elapsed>() {
         return Some(ErrorKind::Timeout);
     }
@@ -158,24 +162,6 @@ impl Classified for a206_broker::ClientError {
             // `transparent` hides the reply from the chain, so classify it here.
             C::Broker(reply) => reply.kind(),
         }
-    }
-}
-impl Classified for a206_extensions::ExtensionError {
-    fn kind(&self) -> Option<ErrorKind> {
-        use a206_extensions::ExtensionError as X;
-        Some(match self {
-            X::Manifest(_) | X::Abi(_) | X::Id | X::Entry | X::TooLarge | X::Module(_) => {
-                ErrorKind::InvalidRequest
-            }
-            // The extension broke its ABI contract.
-            X::MissingRun(_)
-            | X::MissingMemory
-            | X::OutputBounds(_)
-            | X::OutputTooLarge
-            | X::Output(_)
-            | X::TooManyFields => ErrorKind::Protocol,
-            X::Runtime(_) => return None,
-        })
     }
 }
 impl Classified for a206_protocol::Error {
