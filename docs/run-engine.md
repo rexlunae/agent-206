@@ -550,7 +550,9 @@ reports, every link of a host failure's report, and whole-output results too,
 so the removed text reaches neither the model nor the stored conversation.
 `ToolCall::redactions` records each kind and how often it was removed, never
 the text, and the tool trace says "Credentials removed before the model saw
-this result". Output rules then see only the cleaned text.
+this result". Output rules then see only the cleaned text, and a result a
+rule changed is scanned again, since a rule can join a credential's parts (by
+stripping terminal escapes from inside it).
 
 Matching is by shape, so this is defense in depth: a secret that looks like
 ordinary text is not found, and nothing here replaces keeping credentials in

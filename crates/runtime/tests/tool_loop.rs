@@ -1779,6 +1779,43 @@ async fn credentials_in_tool_results_never_reach_the_model_or_the_record() {
 }
 
 #[tokio::test]
+async fn a_credential_an_output_rule_joins_is_removed_too() {
+    let api = ProviderApi::Anthropic;
+    let name = format!("lines_{}", nonce());
+    let mut rig = rig(api, vec![tool(&name, ToolPermission::Allow, &[])], None).await;
+    rig.permit(&name, ToolPermission::Allow).await;
+    rig.write_rules(&format!(
+        "[[rule]]\nid = \"{}\"\n[rule.match]\ntools = [\"{name}\"]\n[rule.transforms]\nstrip_ansi = true\n",
+        nonce()
+    ));
+    // A colour change inside the token hides its shape until the rule
+    // strips the escape.
+    let (head, tail) = (nonce(), nonce());
+    let value = format!("ghp_{head}\u{1b}[0m{tail}\n");
+    let call = Call::new(&name, json!({"value": value}));
+    let task = rig.send();
+    let first = rig.next_request().await;
+    first
+        .respond(calls_response(api, std::slice::from_ref(&call), ""))
+        .await;
+    let second = rig.next_request().await;
+    let seen = result_for(api, &second.body, &call.id).unwrap();
+    assert!(!seen.contains(&tail), "{seen}");
+    assert!(seen.contains("[redacted github_token]"), "{seen}");
+    second.respond(text_response(api, &nonce())).await;
+    let thread = finished(task).await;
+    let call = &calls_of(&thread)[0];
+    assert!(call.reduction.is_some());
+    assert_eq!(
+        call.redactions,
+        [OutputCount {
+            name: "github_token".into(),
+            count: 1
+        }]
+    );
+}
+
+#[tokio::test]
 async fn an_invalid_output_rule_file_fails_the_run_before_the_model_is_asked() {
     let api = ProviderApi::Gemini;
     let mut rig = rig(api, vec![], None).await;

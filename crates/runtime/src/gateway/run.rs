@@ -1051,12 +1051,21 @@ impl Gateway {
             return Ok(true);
         }
         let whole = routed.spec.whole_output;
-        // Credentials are removed first, so no rule counts or keeps them.
+        // Credentials are removed first, so no rule counts or keeps them,
+        // and again afterwards, since a rule can join a credential's parts
+        // (stripping terminal escapes from inside it).
         let reduce = |record: &mut ToolCall, text: String| {
-            let (text, redactions) = redact_output(&record.tool, text);
-            record.redactions = redactions;
+            let (text, mut redactions) = redact_output(&record.tool, text);
             let (text, reduction) =
                 reduce_output(rules, &record.tool, command.as_deref(), text, whole);
+            let text = if reduction.is_some() {
+                let (text, more) = redact_output(&record.tool, text);
+                merge_counts(&mut redactions, more);
+                text
+            } else {
+                text
+            };
+            record.redactions = redactions;
             record.reduction = reduction;
             text
         };
@@ -1264,6 +1273,17 @@ fn redact_output(tool: &str, text: String) -> (String, Vec<OutputCount>) {
         "removed credentials from a tool result"
     );
     (redacted.text, found)
+}
+
+/// Add `more` to `counts`, keeping one entry per name in name order.
+fn merge_counts(counts: &mut Vec<OutputCount>, more: Vec<OutputCount>) {
+    for count in more {
+        match counts.iter_mut().find(|known| known.name == count.name) {
+            Some(known) => known.count += count.count,
+            None => counts.push(count),
+        }
+    }
+    counts.sort_by(|a, b| a.name.cmp(&b.name));
 }
 
 /// Remove credentials from a failed call's model text and from every link
