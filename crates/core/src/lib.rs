@@ -468,8 +468,27 @@ pub struct Thread {
     /// than reporting an interrupted run.
     #[serde(default)]
     pub compacting: Option<RunState>,
+    /// When the latest pre-compaction memory flush was offered: the summary
+    /// that was then the latest (`None` before the first). A flush is
+    /// offered once for each summary, before the next one is made.
+    #[serde(default)]
+    pub memory_flush: Option<MemoryFlush>,
+}
+/// A pre-compaction memory flush offered to a native run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryFlush {
+    /// The latest compaction summary when the flush was offered.
+    pub after: Option<Id>,
 }
 impl Thread {
+    /// The latest compaction summary in the conversation, if any.
+    pub fn latest_compaction(&self) -> Option<Id> {
+        self.messages
+            .iter()
+            .rev()
+            .find(|m| m.compaction.is_some())
+            .map(|m| m.id)
+    }
     pub fn new(title: String, mode: Mode) -> Self {
         Self {
             id: Id::new_v4(),
@@ -495,6 +514,7 @@ impl Thread {
             chat: None,
             instructions: vec![],
             compacting: None,
+            memory_flush: None,
         }
     }
 }
