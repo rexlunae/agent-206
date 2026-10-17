@@ -33,7 +33,7 @@ const MAX_HEARTBEAT: Duration = Duration::from_secs(600);
 const CLOSE_AUTHENTICATION: u16 = 4004;
 /// Discord's channel type for a direct message.
 const DIRECT_MESSAGE: u8 = 1;
-/// How long a channel lookup may hold up the session's heartbeats.
+/// How long a channel lookup may hold up a batch.
 const LOOKUP_TIMEOUT: Duration = Duration::from_secs(10);
 /// Most channel types remembered at once.
 const MAX_KNOWN_CHANNELS: usize = 4096;
@@ -45,6 +45,7 @@ type Queued = Result<(String, Event)>;
 pub(crate) struct Discord {
     api: Api,
     gateway: Option<Gateway>,
+    private: Private,
 }
 
 /// The running socket task and what it has queued.
@@ -115,7 +116,11 @@ fn malformed(source: serde_json::Error) -> MessengerError {
 
 impl Discord {
     pub(crate) fn new(api: Api) -> Self {
-        Self { api, gateway: None }
+        Self {
+            api,
+            gateway: None,
+            private: Private::default(),
+        }
     }
 
     /// Check the token, name the bot account, and start the socket for it.
@@ -158,7 +163,24 @@ impl Discord {
 
     /// The messages the socket queued, waiting for at least one. A session
     /// failure ends the adapter's session; the next connect starts another.
+    ///
+    /// Channels are classified here rather than in the socket task, so a
+    /// slow lookup never holds up heartbeats.
     pub(crate) async fn receive(&mut self, _cursor: Option<&str>) -> Result<Batch> {
+        let mut batch = self.queued().await?;
+        for (_, event) in &mut batch.events {
+            // Without a guild id, only a channel Discord itself calls a
+            // direct message is private.
+            if let Event::Message(inbound) = event
+                && !inbound.group
+            {
+                inbound.group = !self.private.check(&self.api, &inbound.chat).await;
+            }
+        }
+        Ok(batch)
+    }
+
+    async fn queued(&mut self) -> Result<Batch> {
         let gateway = self
             .gateway
             .as_mut()
@@ -280,7 +302,6 @@ async fn session(api: &Api, sender: &mpsc::Sender<Queued>) -> Result<std::conver
     let mut seq: Option<u64> = None;
     let mut acknowledged = true;
     let mut own: Option<String> = None;
-    let mut private = Private::default();
     loop {
         let event = tokio::select! {
             _ = heartbeat.tick() => {
@@ -316,14 +337,7 @@ async fn session(api: &Api, sender: &mpsc::Sender<Queued>) -> Result<std::conver
                 Some("MESSAGE_CREATE") => {
                     let message: Message = serde_json::from_value(payload.d).map_err(malformed)?;
                     let key = message.id.clone();
-                    let mut event = message_event(message, own.as_deref());
-                    // Without a guild id, only a channel Discord itself calls a
-                    // direct message is private.
-                    if let Event::Message(inbound) = &mut event
-                        && !inbound.group
-                    {
-                        inbound.group = !private.check(api, &inbound.chat).await;
-                    }
+                    let event = message_event(message, own.as_deref());
                     match sender.try_send(Ok((key, event))) {
                         Ok(()) => {}
                         Err(mpsc::error::TrySendError::Full(_)) => {
