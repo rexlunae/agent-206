@@ -367,16 +367,30 @@ impl ExtensionHost {
         let (Some(mut input), Some(mut output)) = (child.stdin.take(), child.stdout.take()) else {
             return Err(ExtensionError::Exited);
         };
-        write_frame(&mut input, &start).await?;
-        let result = loop {
-            match read_frame::<Frame>(&mut output).await? {
-                Frame::Host(request) => {
-                    let reply = host.handle(request).await;
-                    write_frame(&mut input, &reply).await?;
+        let exchange = async {
+            write_frame(&mut input, &start).await?;
+            loop {
+                match read_frame::<Frame>(&mut output).await? {
+                    Frame::Host(request) => {
+                        let reply = host.handle(request).await;
+                        write_frame(&mut input, &reply).await?;
+                    }
+                    Frame::Done(result) => break Ok(result),
                 }
-                Frame::Done(result) => break result,
             }
         };
+        let result = match exchange.await {
+            Ok(result) => result,
+            // A worker that never answered may never have started.
+            Err(error @ (ExtensionError::Exited | ExtensionError::Channel(_))) => {
+                return Err(match worker.startup_failure().await {
+                    Some(start) => crate::sandbox::ConfineError::Start(start).into(),
+                    None => error,
+                });
+            }
+            Err(error) => return Err(error),
+        };
+        let child = worker.child();
         // The worker exits after its result; reap it rather than leave a zombie.
         drop(input);
         if let Err(error) = child.wait().await {
@@ -409,6 +423,13 @@ impl Worker {
     async fn stop(self) {
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         self.0.stop().await;
+    }
+    /// Why the sandbox kept the worker from starting, if it did.
+    async fn startup_failure(&mut self) -> Option<crate::sandbox::StartError> {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        return self.0.startup_failure().await;
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        return None;
     }
 }
 
