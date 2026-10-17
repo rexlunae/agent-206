@@ -601,6 +601,98 @@ async fn find_matches_names_or_paths_without_following_links() {
 }
 
 #[tokio::test]
+async fn walks_return_whole_paths_in_byte_order() {
+    let (dir, store) = store();
+    let root = dir.path().join("project");
+    let n = uuid::Uuid::new_v4().simple().to_string();
+    // `.` sorts before `/`, which sorts before `0`, so the directory `n`
+    // must give way to `n.rs` before its own contents.
+    std::fs::create_dir_all(root.join(&n)).unwrap();
+    for path in [format!("{n}.rs"), format!("{n}/child.rs"), format!("{n}0")] {
+        std::fs::write(root.join(path), &n).unwrap();
+    }
+    let mut host = workspace_calls(&store, Some(root.clone()), &[Capability::ReadWorkspace]);
+    let HostReply::Found(found) = host
+        .handle(HostRequest::Find {
+            path: ".".into(),
+            glob: "*".into(),
+            max_results: 10,
+        })
+        .await
+    else {
+        panic!("find failed");
+    };
+    let paths: Vec<_> = found.entries.into_iter().map(|e| e.path).collect();
+    let expected = [
+        n.clone(),
+        format!("{n}.rs"),
+        format!("{n}/child.rs"),
+        format!("{n}0"),
+    ];
+    assert_eq!(paths, expected);
+    let HostReply::Matches(found) = host
+        .handle(HostRequest::Search {
+            path: ".".into(),
+            query: n.clone(),
+            max_matches: 1,
+        })
+        .await
+    else {
+        panic!("search failed");
+    };
+    assert_eq!(found.matches[0].path, format!("{n}.rs"));
+    assert!(found.truncated);
+}
+
+#[tokio::test]
+async fn long_paths_end_a_find_before_its_reply_outgrows_the_worker_bound() {
+    let (dir, store) = store();
+    let root = dir.path().join("project");
+    // About 1.2 KiB of directories above each file.
+    let mut deep = std::path::PathBuf::new();
+    for _ in 0..6 {
+        deep.push("d".repeat(200));
+    }
+    std::fs::create_dir_all(root.join(&deep)).unwrap();
+    for index in 0..workspace::MAX_FOUND {
+        std::fs::write(root.join(&deep).join(format!("{index:04}.rs")), "").unwrap();
+    }
+    let mut host = workspace_calls(&store, Some(root.clone()), &[Capability::ReadWorkspace]);
+    let reply = host
+        .handle(HostRequest::Find {
+            path: ".".into(),
+            glob: "*.rs".into(),
+            max_results: workspace::MAX_FOUND,
+        })
+        .await;
+    let encoded = rmp_serde::to_vec_named(&reply).unwrap().len();
+    let HostReply::Found(found) = reply else {
+        panic!("find failed: {reply:?}");
+    };
+    assert!(found.truncated);
+    assert!(!found.entries.is_empty());
+    assert!(found.entries.len() < workspace::MAX_FOUND as usize);
+    assert!(encoded <= a206_extensions::Limits::default().host_reply_bytes);
+}
+
+#[tokio::test]
+async fn a_directory_past_the_entry_bound_is_refused_not_cut() {
+    let (dir, store) = store();
+    let root = dir.path().join("project");
+    std::fs::create_dir_all(root.join("big")).unwrap();
+    for index in 0..=workspace::MAX_WALK_ENTRIES {
+        std::fs::File::create(root.join("big").join(index.to_string())).unwrap();
+    }
+    let mut host = workspace_calls(&store, Some(root.clone()), &[Capability::ReadWorkspace]);
+    let find = HostRequest::Find {
+        path: ".".into(),
+        glob: "0".into(),
+        max_results: 1,
+    };
+    assert_eq!(code(host.handle(find).await), Some(HostErrorCode::TooLarge));
+}
+
+#[tokio::test]
 async fn revoking_stops_calls_already_running() {
     let (dir, store) = store();
     std::fs::write(dir.path().join("note.txt"), "text").unwrap();

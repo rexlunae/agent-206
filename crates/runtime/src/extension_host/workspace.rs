@@ -28,6 +28,10 @@ pub const MAX_REGEX_SIZE: usize = 1024 * 1024;
 /// Most entries one find returns, and directory entries any walk may read.
 pub const MAX_FOUND: u32 = 1_000;
 pub const MAX_WALK_ENTRIES: usize = 100_000;
+/// Encoded size a search or find reply may reach, below the worker's 1 MiB
+/// reply bound; [`ENTRY_OVERHEAD`] is the most framing one result adds.
+pub const MAX_RESULT_BYTES: usize = 768 * 1024;
+const ENTRY_OVERHEAD: usize = 64;
 
 fn io_failure(error: &std::io::Error) -> HostFailure {
     use std::io::ErrorKind as Io;
@@ -200,7 +204,7 @@ pub(super) fn search_pattern(
     let include = options.include.map(glob).transpose()?;
     let prefix = prefix(path);
     let limit = max_matches.clamp(1, MAX_MATCHES) as usize;
-    let (mut files, mut bytes) = (0, 0u64);
+    let (mut files, mut bytes, mut reply) = (0, 0u64, 0);
     let mut result = SearchResult::default();
     let mut walk = Walk::default();
     let flow = walk.walk(
@@ -231,14 +235,17 @@ pub(super) fn search_pattern(
                 if !lines.is_match(line) {
                     continue;
                 }
-                if result.matches.len() == limit {
-                    return Ok(Break(()));
-                }
-                result.matches.push(SearchMatch {
+                let found = SearchMatch {
                     path: format!("{prefix}{}", entry.below),
                     line: u32::try_from(index + 1).unwrap_or(u32::MAX),
                     text: super::bounded(line, MAX_MATCH_TEXT).to_string(),
-                });
+                };
+                let size = found.path.len() + found.text.len() + ENTRY_OVERHEAD;
+                if result.matches.len() == limit || reply + size > MAX_RESULT_BYTES {
+                    return Ok(Break(()));
+                }
+                reply += size;
+                result.matches.push(found);
             }
             Ok(Continue(()))
         },
@@ -258,6 +265,7 @@ pub(super) fn find(
     let matcher = glob(pattern)?;
     let prefix = prefix(path);
     let limit = max_results.clamp(1, MAX_FOUND) as usize;
+    let mut reply = 0;
     let mut result = FindResult::default();
     let mut walk = Walk::default();
     let flow = walk.walk(&open_directory(root, path)?, "", 0, &mut |_, entry| {
@@ -265,11 +273,14 @@ pub(super) fn find(
         if !matcher.is_match(entry.below) {
             return Ok(Continue(()));
         }
-        if result.entries.len() == limit {
+        let path = format!("{prefix}{}", entry.below);
+        let size = path.len() + ENTRY_OVERHEAD;
+        if result.entries.len() == limit || reply + size > MAX_RESULT_BYTES {
             return Ok(Break(()));
         }
+        reply += size;
         result.entries.push(FoundEntry {
-            path: format!("{prefix}{}", entry.below),
+            path,
             kind: entry.kind,
         });
         Ok(Continue(()))
@@ -331,14 +342,31 @@ struct Entry<'a> {
 }
 type Visit<'a> = dyn FnMut(&Dir, &Entry<'_>) -> Result<std::ops::ControlFlow<()>, HostFailure> + 'a;
 
-/// A bounded walk shared by searches. It is depth-first in name order, so
-/// entries arrive in global path order, it holds only one open directory per
-/// level, and it never follows symlinks or enters `.git`. Each directory is
-/// visited before its contents.
+/// A bounded walk shared by searches. Entries arrive in global path order
+/// (byte order of the whole `/`-separated path, so `a.rs` comes before
+/// `a/child.rs`), it holds only one open directory per level, and it never
+/// follows symlinks or enters `.git`. A directory is visited before its
+/// contents.
 #[derive(Default)]
 struct Walk {
     directories: usize,
     entries: usize,
+}
+/// One step of a directory's walk.
+enum Step {
+    Visit(String, EntryKind),
+    /// Walk the named directory's contents.
+    Descend(String),
+}
+impl Step {
+    /// Where the step falls in path order: a directory's contents sort as
+    /// `name/`, after `name.rs` and before `name0`.
+    fn key(&self) -> std::borrow::Cow<'_, str> {
+        match self {
+            Self::Visit(name, _) => name.into(),
+            Self::Descend(name) => format!("{name}/").into(),
+        }
+    }
 }
 impl Walk {
     fn walk(
@@ -349,42 +377,62 @@ impl Walk {
         visit: &mut Visit<'_>,
     ) -> Result<std::ops::ControlFlow<()>, HostFailure> {
         use std::ops::ControlFlow::{Break, Continue};
-        let mut entries = Vec::new();
+        // The whole directory is read before anything in it is visited: the
+        // file system lists entries in no particular order, so stopping part
+        // way through would leave an arbitrary prefix, not a sorted one.
+        let mut steps = Vec::new();
+        let mut read = 0;
         for entry in directory.entries().map_err(|e| io_failure(&e))? {
-            if self.entries == MAX_WALK_ENTRIES {
-                return Ok(Break(()));
+            if read == MAX_WALK_ENTRIES {
+                return Err(failure(
+                    HostErrorCode::TooLarge,
+                    "a directory has more than 100,000 entries",
+                ));
             }
-            self.entries += 1;
+            read += 1;
             let entry = entry.map_err(|e| io_failure(&e))?;
-            let file_type = entry.file_type().map_err(|e| io_failure(&e))?;
-            entries.push((entry.file_name().to_string_lossy().into_owned(), file_type));
-        }
-        entries.sort_by(|a, b| a.0.cmp(&b.0));
-        for (name, file_type) in entries {
-            let below = format!("{prefix}{name}");
-            let kind = kind(file_type);
-            if kind == EntryKind::Directory && is_git(&name) {
-                continue;
-            }
-            let entry = Entry {
-                name: &name,
-                below: &below,
-                kind,
-            };
-            if visit(directory, &entry)?.is_break() {
-                return Ok(Break(()));
-            }
+            let kind = kind(entry.file_type().map_err(|e| io_failure(&e))?);
+            let name = entry.file_name().to_string_lossy().into_owned();
             if kind == EntryKind::Directory {
-                if depth == MAX_SEARCH_DEPTH || self.directories == MAX_SEARCH_DIRECTORIES {
-                    return Ok(Break(()));
+                if is_git(&name) {
+                    continue;
                 }
-                self.directories += 1;
-                let child = directory.open_dir(&name).map_err(|e| io_failure(&e))?;
-                if self
-                    .walk(&child, &format!("{below}/"), depth + 1, visit)?
-                    .is_break()
-                {
-                    return Ok(Break(()));
+                steps.push(Step::Descend(name.clone()));
+            }
+            steps.push(Step::Visit(name, kind));
+        }
+        // A directory that would pass the walk's total ends the walk before
+        // any of its entries, so what was found stays a sorted prefix.
+        if self.entries + read > MAX_WALK_ENTRIES {
+            return Ok(Break(()));
+        }
+        self.entries += read;
+        steps.sort_by(|a, b| a.key().cmp(&b.key()));
+        for step in steps {
+            match step {
+                Step::Visit(name, kind) => {
+                    let below = format!("{prefix}{name}");
+                    let entry = Entry {
+                        name: &name,
+                        below: &below,
+                        kind,
+                    };
+                    if visit(directory, &entry)?.is_break() {
+                        return Ok(Break(()));
+                    }
+                }
+                Step::Descend(name) => {
+                    if depth == MAX_SEARCH_DEPTH || self.directories == MAX_SEARCH_DIRECTORIES {
+                        return Ok(Break(()));
+                    }
+                    self.directories += 1;
+                    let child = directory.open_dir(&name).map_err(|e| io_failure(&e))?;
+                    if self
+                        .walk(&child, &format!("{prefix}{name}/"), depth + 1, visit)?
+                        .is_break()
+                    {
+                        return Ok(Break(()));
+                    }
                 }
             }
         }
