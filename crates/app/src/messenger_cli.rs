@@ -52,6 +52,10 @@ pub struct Options {
     /// Vault credential holding the bot or access token, never the token itself.
     #[arg(long)]
     credential: Option<String>,
+    /// Vault credential holding the app-level token a service receives
+    /// events with (Slack's xapp- token).
+    #[arg(long)]
+    app_credential: Option<String>,
     /// API base URL, when not the service's official endpoint. Required for
     /// Matrix: the homeserver's client API origin.
     #[arg(long)]
@@ -70,6 +74,9 @@ impl Options {
     fn apply(self, config: &mut MessengerConfig) -> Result<()> {
         if let Some(credential) = self.credential {
             config.credential = Some(credential);
+        }
+        if let Some(credential) = self.app_credential {
+            config.app_credential = Some(credential);
         }
         if let Some(endpoint) = self.endpoint {
             config.endpoint = Some(endpoint);
@@ -204,6 +211,7 @@ mod tests {
     fn options() -> Options {
         Options {
             credential: Some(random()),
+            app_credential: None,
             endpoint: None,
             provider: None,
             model: None,
