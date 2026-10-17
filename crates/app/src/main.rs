@@ -272,13 +272,16 @@ mod native {
             tool: String,
             permission: String,
         },
-        /// Limit model rounds and tool calls per run.
+        /// Limit model rounds, tool calls and, optionally, tokens per run.
         Budget {
             thread: uuid::Uuid,
             #[arg(long)]
             rounds: u32,
             #[arg(long)]
             tool_calls: u32,
+            /// Input plus output tokens per run, as the provider reports them.
+            #[arg(long)]
+            tokens: Option<u64>,
         },
     }
     #[derive(Subcommand)]
@@ -975,9 +978,14 @@ mod native {
                             thread,
                             rounds,
                             tool_calls,
+                            tokens,
                         } => Command::SetToolBudget {
                             thread,
-                            budget: ToolBudget { rounds, tool_calls },
+                            budget: ToolBudget {
+                                rounds,
+                                tool_calls,
+                                tokens,
+                            },
                         },
                     },
                     Action::Plan { thread } => {

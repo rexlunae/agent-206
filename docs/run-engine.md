@@ -109,6 +109,19 @@ set above its parent. The budget enforced at each check is, for rounds and for
 calls independently, the smallest of the conversation's and every ancestor's
 current budget.
 
+`ToolBudget::tokens` optionally limits a run's model tokens: input plus output
+as the provider reports them, summed over every request of the run, automatic
+summaries included (what the run is billed for, not what the context holds).
+The smallest limit along the delegation chain applies, and a delegated
+conversation needs a limit no higher than its parent's whenever the parent has
+one, so a parent's token budget bounds each subagent. A run is checked after
+each request: when no further request fits (`used ≥ limit`), its pending calls
+are stopped and it fails with `PermissionDenied` (`RunError::Tokens`); a final
+reply that crosses the limit still completes. With a limit set, usage a
+provider leaves unknown stops the run (`RunError::UsageUnknown`) instead of
+letting it run unmeasured. CLI: `tools budget THREAD --rounds R --tool-calls C
+[--tokens T]`.
+
 Commands: `ListTools`, `SetToolPermission`, `SetToolBudget`, `ResolveApproval`.
 CLI: `agent206 tools list|permit|budget` and `agent206 approvals list|approve|deny`.
 
