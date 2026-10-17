@@ -12,7 +12,7 @@ pub mod ignore;
 pub mod prompts;
 pub mod search;
 pub mod tools;
-pub use audit::{AuditField, AuditFinding, AuditLocation, AuditReport, AuditRule};
+pub use audit::{AuditBuilder, AuditField, AuditFinding, AuditLocation, AuditReport, AuditRule};
 pub use error::{ErrorKind, ErrorReport};
 pub use ignore::Ignore;
 pub use prompts::{AnswerError, PromptAnswer, PromptOutcome, UserPrompt};

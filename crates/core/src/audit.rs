@@ -2,6 +2,7 @@
 //! Findings are advice for the user's review: they neither approve nor block,
 //! and a clean report does not make content safe.
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 
 /// Most findings kept for one skill or extension; the rest are counted.
 pub const MAX_AUDIT_FINDINGS: usize = 32;
@@ -105,15 +106,28 @@ impl AuditReport {
     pub fn is_clean(&self) -> bool {
         self.findings.is_empty() && self.more == 0
     }
-    /// Add a distinct finding: keep it while under the cap, else count it.
-    /// Callers deduplicate, since a counted finding is no longer here to
-    /// compare against.
+}
+
+/// Builds an [`AuditReport`], keeping each distinct finding once: the first
+/// [`MAX_AUDIT_FINDINGS`] in the order pushed, and a count of the rest.
+#[derive(Debug, Default)]
+pub struct AuditBuilder {
+    report: AuditReport,
+    seen: BTreeSet<AuditFinding>,
+}
+impl AuditBuilder {
     pub fn push(&mut self, finding: AuditFinding) {
-        if self.findings.len() < MAX_AUDIT_FINDINGS {
-            self.findings.push(finding);
-        } else {
-            self.more = self.more.saturating_add(1);
+        if !self.seen.insert(finding.clone()) {
+            return;
         }
+        if self.report.findings.len() < MAX_AUDIT_FINDINGS {
+            self.report.findings.push(finding);
+        } else {
+            self.report.more = self.report.more.saturating_add(1);
+        }
+    }
+    pub fn finish(self) -> AuditReport {
+        self.report
     }
 }
 
@@ -129,7 +143,7 @@ mod tests {
             audit: AuditReport,
         }
         let item = format!("tool{}", MAX_AUDIT_FINDINGS + 1);
-        let mut audit = AuditReport::default();
+        let mut audit = AuditBuilder::default();
         audit.push(AuditFinding {
             rule: AuditRule::RemoteScript,
             location: AuditLocation::Line(7),
@@ -141,9 +155,29 @@ mod tests {
                 field: AuditField::ToolDescription,
             },
         });
+        let audit = audit.finish();
         let text = toml::to_string_pretty(&Listing { audit }).unwrap();
         assert!(text.contains("line = 7"), "{text}");
         assert!(text.contains(&item), "{text}");
         assert!(text.contains("tool_description"), "{text}");
+    }
+
+    #[test]
+    fn repeats_are_kept_once_before_and_after_the_cap() {
+        let finding = |line| AuditFinding {
+            rule: AuditRule::InstructionOverride,
+            location: AuditLocation::Line(line),
+        };
+        let mut audit = AuditBuilder::default();
+        let cap = u32::try_from(MAX_AUDIT_FINDINGS).unwrap();
+        for line in 1..=cap + 1 {
+            audit.push(finding(line));
+            audit.push(finding(line));
+        }
+        audit.push(finding(1));
+        let report = audit.finish();
+        assert_eq!(report.findings.len(), MAX_AUDIT_FINDINGS);
+        assert_eq!(report.findings[1], finding(2));
+        assert_eq!(report.more, 1);
     }
 }

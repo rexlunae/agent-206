@@ -4,9 +4,11 @@
 //! review; they never approve or block, and a clean report proves nothing.
 //! Scanning reads text only: it runs nothing and opens no files.
 #![forbid(unsafe_code)]
-use a206_core::{AuditField, AuditFinding, AuditLocation, AuditReport, AuditRule, PluginSummary};
+use a206_core::{
+    AuditBuilder, AuditField, AuditFinding, AuditLocation, AuditReport, AuditRule, PluginSummary,
+};
 use regex::RegexSet;
-use std::{collections::BTreeSet, sync::LazyLock};
+use std::sync::LazyLock;
 
 /// Patterns per rule. Each matches within one line.
 const PATTERNS: &[(AuditRule, &str)] = &[
@@ -124,23 +126,9 @@ fn rules_in(text: &str) -> Vec<AuditRule> {
     found
 }
 
-/// Builds a report, dropping repeats even once findings are only counted.
-#[derive(Default)]
-struct Collector {
-    report: AuditReport,
-    seen: BTreeSet<AuditFinding>,
-}
-impl Collector {
-    fn push(&mut self, finding: AuditFinding) {
-        if self.seen.insert(finding.clone()) {
-            self.report.push(finding);
-        }
-    }
-}
-
 /// Audit a text file line by line, such as a `SKILL.md`.
 pub fn text(text: &str) -> AuditReport {
-    let mut report = Collector::default();
+    let mut report = AuditBuilder::default();
     // A byte-order mark opening the file is an encoding marker, not content.
     let text = text.strip_prefix('\u{FEFF}').unwrap_or(text);
     for (index, line) in text.lines().enumerate() {
@@ -152,13 +140,13 @@ pub fn text(text: &str) -> AuditReport {
             });
         }
     }
-    report.report
+    report.finish()
 }
 
 /// Audit the text an extension's manifest gives the user and the model:
 /// its name and description, and its tools', parameters' and panels' text.
 pub fn plugin(summary: &PluginSummary) -> AuditReport {
-    let mut report = Collector::default();
+    let mut report = AuditBuilder::default();
     let mut check = |item: Option<&str>, field: AuditField, text: &str| {
         for rule in rules_in(text) {
             report.push(AuditFinding {
@@ -191,7 +179,7 @@ pub fn plugin(summary: &PluginSummary) -> AuditReport {
     for panel in &summary.panels {
         check(Some(&panel.id), AuditField::PanelTitle, &panel.title);
     }
-    report.report
+    report.finish()
 }
 
 #[cfg(test)]
