@@ -206,6 +206,7 @@ dependencies = [
  "uuid",
  "wasm-bindgen",
  "web-sys",
+ "web-time",
 ]
 
 [[package]]
