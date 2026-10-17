@@ -763,6 +763,17 @@ impl Gateway {
                 }
             }
         };
+        // Withdrawing a host's authority can end its call before the policy
+        // change is seen here, as when a disconnected MCP server's session
+        // closes: such a failure is the withdrawal, not the tool's.
+        if result.is_err()
+            && !self
+                .still_permits(id, &record.tool, &routed.spec, approved)
+                .await?
+        {
+            refuse(ToolError::Revoked(record.tool.clone()))?;
+            return Ok(true);
+        }
         self.update_call(
             id,
             message,

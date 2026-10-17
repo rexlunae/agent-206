@@ -48,7 +48,12 @@ tempfile.workspace = true
 [target.'cfg(unix)'.dependencies]
 async-io = "2"
 nix = { version = "0.31", features = ["signal", "process", "fs", "user"] }
+[features]
+# Test-only gateway hooks (attaching an in-process MCP session). Enabled for
+# this crate's own tests below; the application never enables it.
+test-support = []
 [dev-dependencies]
+a206-runtime = { path = ".", features = ["test-support"] }
 totp-rs = { version = "5.7", default-features = false }
 tracing-subscriber.workspace = true
 tempfile.workspace = true

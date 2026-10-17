@@ -64,14 +64,19 @@ ceiling. A delegated conversation cannot be set above its parent, and a parent
 narrowed later narrows its descendants at their next decision.
 
 Withdrawn authority also stops work in flight. `SetToolPermission`,
-`ConfigureThread`, `SetBackend`, `GrantExtension` and `EnableExtension` wake
-every run, which re-decides its running call and its pending approval against
-the conversation and its ancestors, and lists the tools again to confirm the
-call's host still offers that tool with the same capabilities (an extension
-the user disabled or ungranted no longer does). A running call that is no
+`ConfigureThread`, `SetBackend`, `GrantExtension`, `EnableExtension`,
+`DisconnectMcpServer` and a `SaveSettings` that changes, disables or removes an
+MCP server entry wake every run, which re-decides its running call and its
+pending approval against the conversation and its ancestors, and lists the tools
+again to confirm the call's host still offers that tool with the same
+capabilities (an extension the user disabled or ungranted, or an MCP server the
+user disconnected or disabled, no longer does). A running call that is no
 longer permitted (Deny, or Ask for a call the user did not approve, or a tool
 its host withdrew) is dropped, which stops it, and is settled `Denied` with a
-`PermissionDenied` report; a pending approval whose tool is now denied ends with
+`PermissionDenied` report. A call that fails is checked the same way before its
+failure is recorded, since withdrawing a host can end its call first (a
+disconnected server's session closes): if the tool is no longer permitted, the
+withdrawal is reported, not the host failure; a pending approval whose tool is now denied ends with
 `ApprovalResolved { outcome: Revoked }`. The run continues with the refusal as
 that call's result.
 
@@ -220,16 +225,58 @@ Tests: `crates/runtime/src/extension_tools/tests.rs` (listing, naming,
 conversion, checks before the worker) and `crates/runtime/tests/extension_tools.rs`
 (native runs through the real worker; the test binary doubles as the worker).
 
-### Adapters still to write
+### MCP servers
 
-- MCP client (PR #16): `list` maps `Gateway::mcp_offers(thread)` to specs named
-  `mcp__<server>__<tool>` with the server's per-tool policy as
-  `ToolSpec::permission` and the server's declared capabilities as
-  `ToolSpec::capabilities`, and `unavailable` servers to `UnavailableTools`.
-  `call` passes `Approval::Approved` when `request.approved` and flattens
-  `a206_mcp::ToolOutput` content blocks to text, keeping `is_error`.
+`McpToolHost` (`crates/runtime/src/mcp_tools.rs`) is registered by `Gateway::open`
+after the extension host. It holds only the gateway's MCP client (server sessions
+and the state they report to), not the gateway: no approvals, runs or vault.
 
-It needs only the gateway handle it wraps; the run engine is unchanged.
+- **Listing.** The tools of every enabled server the user has not disconnected
+  that the conversation may use: `a206_mcp::server_callable` (enabled, the
+  thread's grant covers every capability the server holds, a workspace server is
+  bound to the thread's project) and the server's capabilities within
+  `scope.capabilities`. Other servers are neither listed nor started; one that is
+  starts on first use. A server that fails to start, or whose session ends, is
+  reported in `unavailable` (source `mcp__<server>`) with its start failure as
+  the cause, and the other servers' tools are still listed. If the servers
+  cannot be read at all, the source is `mcp`.
+- **Names.** `mcp__<server>__<tool>`, every character of the tool name outside
+  `[A-Za-z0-9_-]` written as `_`. Server names never contain `_`, so the server is
+  unambiguous; a name that two tools of one server would share is offered for
+  neither (`Conflict` per claimant), and an empty tool name or a name over 64
+  characters is refused (`InvalidRequest`); names are never truncated.
+- **Spec.** The server's JSON Schema (an unparsable one is reported as
+  `Protocol`); the description, else the title; the server's capabilities as
+  `ToolSpec::capabilities`; the entry's per-tool policy (Ask unless configured) as
+  `ToolSpec::permission`. Deny tools are listed so the user sees them, with an
+  effective Deny, and are never offered to a model. Description and schema are
+  untrusted server text, bounded by the catalog checks.
+- **Calls.** Routed by the server's live session under its current entry (a call
+  never starts a server); the host refuses a server capability outside
+  `scope.capabilities` (`PermissionDenied`), then calls `Gateway::call_mcp_tool`,
+  which authorizes the call against the thread's current grant, project and the
+  entry's policy (`Approval::Approved` only when `request.approved`) and is the
+  single enforcement point for MCP authority. Failures stay structured
+  (`GatewayError::Mcp` reports, for example `NotConnected` → `Unavailable`).
+- **Results.** Text blocks are joined with newlines; image, audio, binary resource
+  and link blocks are described, not inlined; structured JSON is used only when a
+  result has no content. An `isError` result is `ToolOutput { is_error: true }`,
+  which the run engine records as a failed call with the tool's text as the
+  report's cause.
+- **Cancellation.** Dropping the call future (run cancelled, authority
+  withdrawn) drops the session request, which sends the server an MCP
+  `notifications/cancelled`; the server's eventual reply is discarded. Losing the
+  thread's authority mid-call also cancels it at the server (`McpError::Revoked`),
+  and changing the server's entry stops its session.
+
+Native-run tests launch no server: the fixture binary belongs to `a206-mcp`, and
+on Linux the launching binary must also serve as the sandbox helper. They serve the
+Rust fixture (`crates/mcp/src/bin/a206-mcp-fixture/server.rs`) in process and attach
+its session with `Gateway::attach_mcp_session`, which exists only with the
+runtime's `test-support` feature (enabled for the runtime's own tests). Tests:
+`crates/runtime/src/mcp_tools/tests.rs` (naming, specs, results, calls through the
+gateway, the scope ceiling, cancellation) and `crates/runtime/tests/mcp_tools.rs`
+(native runs).
 
 ## Not implemented
 
