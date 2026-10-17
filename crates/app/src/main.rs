@@ -10,6 +10,8 @@ mod extension_cli;
 #[cfg(not(target_arch = "wasm32"))]
 mod messenger_cli;
 #[cfg(not(target_arch = "wasm32"))]
+mod running_cli;
+#[cfg(not(target_arch = "wasm32"))]
 mod schedule_cli;
 #[cfg(all(unix, not(target_arch = "wasm32")))]
 mod setup_cli;
@@ -128,6 +130,8 @@ mod native {
             #[command(subcommand)]
             command: crate::schedule_cli::ScheduleAction,
         },
+        /// Show every conversation with a response in progress.
+        Running,
         /// Show gateway and workspace status without starting a service.
         Status,
         /// Export the current workspace snapshot as TOML.
@@ -766,6 +770,9 @@ mod native {
                 }
                 if let Action::Schedule { command } = action {
                     return crate::schedule_cli::run(&client, command).await;
+                }
+                if let Action::Running = action {
+                    return crate::running_cli::run(&client).await;
                 }
                 let command = match action {
                     Action::Providers {

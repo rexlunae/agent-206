@@ -9,6 +9,7 @@ use crate::{
         Browser, Conversations, Documents, Downloads, Extensions, Joshua, Overview as Workspace,
         Projects, Security,
     },
+    running::Running,
     schedules::Schedules,
     settings::{Appearance, Prompts, Providers},
     welcome::Welcome,
@@ -35,6 +36,8 @@ pub(crate) enum Route {
     Projects {},
     #[route("/activity")]
     Activity {},
+    #[route("/running")]
+    Running {},
     #[route("/connections")]
     Providers {},
     #[route("/messengers")]
@@ -72,6 +75,7 @@ impl Route {
             Self::Chat { .. } | Self::Conversations {} => IconName::Sparkles,
             Self::Projects {} => IconName::Folder,
             Self::Activity {} => IconName::Clock,
+            Self::Running {} => IconName::Play,
             Self::Providers {} => IconName::Link,
             Self::Messengers {} => IconName::Send,
             Self::Downloads {} => IconName::Download,
@@ -93,6 +97,7 @@ impl Route {
                 Self::Workspace {},
                 Self::Projects {},
                 Self::Conversations {},
+                Self::Running {},
                 Self::Activity {},
             ],
             vec![
@@ -120,6 +125,7 @@ impl Route {
             Self::Conversations {} => "Conversations",
             Self::Projects {} => "Projects",
             Self::Activity {} => "Activity",
+            Self::Running {} => "Running work",
             Self::Providers {} => "Connections",
             Self::Messengers {} => "Messengers",
             Self::Downloads {} => "Downloads",
