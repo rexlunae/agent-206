@@ -174,6 +174,15 @@ mod native {
         RefreshModels {
             provider: uuid::Uuid,
         },
+        /// Gateway activity newest first, without conversation and download
+        /// progress notices; pass the last `sequence` printed as --before for
+        /// the next page.
+        Activity {
+            #[arg(long)]
+            before: Option<u64>,
+            #[arg(long, default_value_t = 20)]
+            limit: u32,
+        },
         /// Find messages containing every word of QUERY, newest first.
         Search {
             query: String,
@@ -1051,6 +1060,7 @@ mod native {
                     }
                     Action::RefreshModels { provider } => Command::RefreshCatalog { provider },
                     Action::Search { query, limit } => Command::SearchMessages { query, limit },
+                    Action::Activity { before, limit } => Command::Activity { before, limit },
                     Action::Project { name, root } => Command::CreateProject {
                         name,
                         root: root.to_string_lossy().into_owned(),
@@ -1109,6 +1119,7 @@ mod native {
                         }
                         print!("{}", toml::to_string_pretty(&Hits { hits })?);
                     }
+                    Reply::Activity(page) => print!("{}", toml::to_string_pretty(&page)?),
                     reply => println!("{}", toml::to_string_pretty(&reply)?),
                 }
                 Ok(())

@@ -35,7 +35,9 @@ without launching a gateway. With no subcommand, the app launches the desktop; `
 | doctor | doctor [--toml]: non-mutating checks of the profile, gateway, vault broker, pairing and provider credentials/catalogs; exits non-zero when something must be fixed; never starts the gateway or broker | Explicit reviewed fixes (--repair) |
 
 Other current commands include Joshua start/stop/status, backend configure/select,
-downloads, Git status, document reads, durable events, ACP/MCP, web and render.
+downloads, Git status, document reads, durable events, `activity [--before SEQ]
+[--limit N]` (the gateway's notable events newest first as a TOML page, without
+conversation or download progress notices), ACP/MCP, web and render.
 Use `agent206 --help` and subcommand help for the actual supported tree.
 
 Status/reconnect must not launch a missing or deliberately stopped gateway.
