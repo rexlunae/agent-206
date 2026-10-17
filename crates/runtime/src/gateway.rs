@@ -327,8 +327,10 @@ pub struct Gateway {
     /// Messengers the user disconnected; they connect again only on request.
     messengers_stopped: Arc<Mutex<BTreeSet<String>>>,
     mcp: Arc<mcp_servers::McpServers>,
-    /// The tool hosts subagent runs use, weakly held by the delegation tools.
-    delegation: delegation::HostLink,
+    /// This gateway's subagent tools and the hosts their subagents run with.
+    delegation: delegation::Binding,
+    /// Runs the subagent tools reserved before starting them, by subagent.
+    reserved: delegation::Reserved,
 }
 /// The broker pairing this gateway holds, with the connection that anchors it.
 struct Paired {
@@ -399,13 +401,12 @@ impl Gateway {
             messengers: tokio::sync::watch::Sender::new(desired),
             messengers_stopped: Arc::new(Mutex::new(BTreeSet::new())),
             mcp: Arc::default(),
-            delegation: Arc::default(),
+            delegation: Default::default(),
+            reserved: Arc::default(),
         };
         // Subagent tools; each conversation still denies them until the user
         // permits them, and they are offered only with subagent models.
-        let delegation = crate::delegation_tool::DelegationHost::new(gateway.delegator());
-        Arc::make_mut(&mut gateway.tool_hosts).push(Arc::new(delegation));
-        gateway.link_delegation();
+        gateway.bind_delegation();
         Ok(gateway)
     }
     fn pairing(&self) -> Result<Option<BrokerPairing>> {
@@ -1015,7 +1016,8 @@ impl Gateway {
                         && text.len() <= 128 * 1024,
                     GatewayError::Invalid("message must be 1–131072 bytes"),
                 )?;
-                let token = tokio_util::sync::CancellationToken::new();
+                // A subagent run its parent reserved is cancelled with it.
+                let token = delegation::take_reserved(self, id)?;
                 let (config, thread, prompt, info, backend, workspace, root) = {
                     let mut store = self.lock()?;
                     // Admit the message only with room for it and for the

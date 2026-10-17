@@ -56,6 +56,7 @@ tempfile.workspace = true
 a206-broker.workspace = true
 a206-vault.workspace = true
 http = "1"
+tokio = { workspace = true, features = ["test-util"] }
 [[test]]
 name = "native_exec"
 harness = false

@@ -54,6 +54,8 @@ pub const MAX_RUNNING: usize = 8;
 /// Longest `subagent_wait`, in seconds.
 pub const MAX_WAIT: u64 = 600;
 const DEFAULT_WAIT: u64 = 60;
+/// How often `subagent_wait` re-reads a run this host did not start.
+const POLL: Duration = Duration::from_millis(250);
 /// Longest title derived from a task.
 const TITLE: usize = 80;
 
@@ -125,6 +127,7 @@ struct Started {
 /// Ends a started run's record however its task ends, so waiters always wake.
 struct Finish {
     runs: Arc<Mutex<Runs>>,
+    delegator: Arc<Delegator>,
     child: Id,
     run: Id,
     done: CancellationToken,
@@ -138,6 +141,9 @@ impl Finish {
 }
 impl Drop for Finish {
     fn drop(&mut self) {
+        // Released while the run is still recorded as active, so a later
+        // start's reservation cannot be the one removed.
+        self.delegator.release(self.child);
         let mut runs = self.runs.lock().unwrap_or_else(PoisonError::into_inner);
         if runs
             .active
@@ -175,8 +181,10 @@ impl DelegationHost {
 
     /// Run `child` on `text` in the background. The run belongs to the
     /// gateway like any other: the user sees it in the subagent's thread and
-    /// can cancel it, and cancelling this conversation's run cancels it too.
-    fn start(&self, child: Id, text: String) {
+    /// can cancel it. It is reserved under `caller`'s run before this
+    /// returns, so cancelling `caller` cancels it even before it starts.
+    fn start(&self, caller: Id, child: Id, text: String) -> Result<(), ErrorReport> {
+        self.delegator.reserve(caller, child)?;
         let run = Id::new_v4();
         let done = CancellationToken::new();
         {
@@ -193,6 +201,7 @@ impl DelegationHost {
         let delegator = self.delegator.clone();
         let mut finish = Finish {
             runs: self.runs.clone(),
+            delegator: delegator.clone(),
             child,
             run,
             done,
@@ -204,6 +213,7 @@ impl DelegationHost {
         drop(tokio::spawn(async move {
             finish.ended(delegator.send(child, text).await.err());
         }));
+        Ok(())
     }
 
     fn specs(caller: &Caller) -> Vec<ToolSpec> {
@@ -336,7 +346,7 @@ impl DelegationHost {
                     .delegator
                     .create(scope.thread, title, mode, model, requested, &ALL)
                     .await?;
-                self.start(child.id, task);
+                self.start(scope.thread, child.id, task)?;
                 Ok(json!({
                     "thread": child.id,
                     "title": child.title,
@@ -358,7 +368,7 @@ impl DelegationHost {
                 if self.running(&children) >= MAX_RUNNING {
                     return Err(fail(DelegationToolError::TooMany { limit: MAX_RUNNING }));
                 }
-                self.start(child.id, message);
+                self.start(scope.thread, child.id, message)?;
                 Ok(json!({"thread": child.id, "state": "running"}))
             }
             LIST => {
@@ -396,23 +406,24 @@ impl DelegationHost {
                 .map_err(fail)?;
                 let id = child.id;
                 // Waiting is cancel-safe: dropping this call stops only the wait.
-                if let Some(done) = self.started(id) {
-                    let ended =
-                        tokio::time::timeout(Duration::from_secs(seconds), done.cancelled())
-                            .await
-                            .is_ok();
-                    if !ended {
-                        let mut status = self.status(child);
-                        status["waited_seconds"] = json!(seconds);
-                        return Ok(status);
+                let limit = Duration::from_secs(seconds);
+                let ended = match tokio::time::timeout(limit, self.ended(scope.thread, id)).await {
+                    Ok(result) => {
+                        result?;
+                        true
                     }
-                }
+                    Err(_) => false,
+                };
                 let (_, children) = self.delegator.family(scope.thread)?;
                 let child = children
                     .iter()
                     .find(|c| c.id == id)
                     .ok_or_else(|| fail(DelegationToolError::NotAChild))?;
-                Ok(self.status(child))
+                let mut status = self.status(child);
+                if !ended {
+                    status["waited_seconds"] = json!(seconds);
+                }
+                Ok(status)
             }
             CANCEL => {
                 check_keys(arguments, &["thread"]).map_err(fail)?;
@@ -430,6 +441,23 @@ impl DelegationHost {
             .iter()
             .filter(|c| self.state(c) == "running")
             .count()
+    }
+    /// Returns once `child` has no run: one this host started ends when its
+    /// task does; any other (one the user started) is re-read every [`POLL`].
+    async fn ended(&self, caller: Id, child: Id) -> Result<(), ErrorReport> {
+        loop {
+            if let Some(done) = self.started(child) {
+                done.cancelled().await;
+            }
+            let (_, children) = self.delegator.family(caller)?;
+            let running = children
+                .iter()
+                .any(|c| c.id == child && c.state == RunState::Running);
+            if !running && self.started(child).is_none() {
+                return Ok(());
+            }
+            tokio::time::sleep(POLL).await;
+        }
     }
     fn started(&self, child: Id) -> Option<CancellationToken> {
         let runs = self.runs.lock().unwrap_or_else(PoisonError::into_inner);

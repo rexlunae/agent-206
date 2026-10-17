@@ -8,25 +8,43 @@
 //!
 //! The tool hosts hold the delegator and the gateway holds the tool hosts, so
 //! the delegator keeps only a weak reference to them: dropping every gateway
-//! still drops the hosts and everything they own.
+//! still drops the hosts and everything they own. A gateway that gains a tool
+//! host gets subagent tools of its own, bound to its own host list, so other
+//! clones keep theirs.
+//!
+//! A subagent run is reserved, as a child of its parent's run token, before
+//! the tool call that starts it returns. Cancelling the parent therefore also
+//! cancels a subagent whose run has not been admitted yet.
 use super::{Gateway, GatewayError, Result, poisoned};
 use crate::{error::check, store::Store, tools::ToolHost};
 use a206_core::*;
 use a206_protocol::Request;
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::{Arc, PoisonError, RwLock, Weak},
+    sync::{Arc, Mutex, PoisonError, RwLock, Weak},
 };
+use tokio_util::sync::CancellationToken;
 
 pub(super) type HostList = Vec<Arc<dyn ToolHost>>;
 /// The gateway's current tool hosts, for the delegator to run subagents with.
 pub(super) type HostLink = Arc<RwLock<Weak<HostList>>>;
+/// Subagent runs reserved by their parent's run and not yet admitted.
+pub(super) type Reserved = Arc<Mutex<BTreeMap<Id, CancellationToken>>>;
+
+/// One gateway's subagent tools and the link to the hosts they run with.
+#[derive(Clone, Default)]
+pub(super) struct Binding {
+    link: HostLink,
+    host: Option<Arc<dyn ToolHost>>,
+}
 
 /// Why the delegator could not act.
 #[derive(Debug, thiserror::Error)]
 pub enum DelegatorError {
     #[error("the gateway is shutting down")]
     Closed,
+    #[error("the conversation's run has ended")]
+    NotRunning,
     #[error(transparent)]
     Gateway(#[from] GatewayError),
 }
@@ -34,6 +52,7 @@ impl crate::error::Classified for DelegatorError {
     fn kind(&self) -> Option<ErrorKind> {
         match self {
             Self::Closed => Some(ErrorKind::Unavailable),
+            Self::NotRunning => Some(ErrorKind::Conflict),
             Self::Gateway(error) => crate::error::classify(error),
         }
     }
@@ -112,20 +131,42 @@ impl Gateway {
     pub(super) fn delegator(&self) -> Delegator {
         let mut base = self.clone();
         base.tool_hosts = Arc::default();
+        base.delegation.host = None;
         Delegator {
             base,
-            hosts: self.delegation.clone(),
+            hosts: self.delegation.link.clone(),
         }
     }
-    /// Point the delegator at the current tool hosts.
-    pub(super) fn link_delegation(&self) {
-        // The link is a single weak pointer, valid whatever a panicking
-        // writer left, so a poisoned lock is still safe to overwrite.
+    /// Give this gateway subagent tools bound to its current tool hosts,
+    /// replacing any it shares with the gateway it was cloned from.
+    pub(super) fn bind_delegation(&mut self) {
+        self.delegation.link = HostLink::default();
+        let host: Arc<dyn ToolHost> = Arc::new(crate::delegation_tool::DelegationHost::new(
+            self.delegator(),
+        ));
+        let hosts = Arc::make_mut(&mut self.tool_hosts);
+        if let Some(old) = self.delegation.host.take() {
+            hosts.retain(|h| !std::ptr::addr_eq(Arc::as_ptr(h), Arc::as_ptr(&old)));
+        }
+        hosts.push(host.clone());
+        self.delegation.host = Some(host);
+        // The link is new and unshared, so no writer can have poisoned it.
         *self
             .delegation
+            .link
             .write()
             .unwrap_or_else(PoisonError::into_inner) = Arc::downgrade(&self.tool_hosts);
     }
+}
+
+/// The token for `thread`'s next run: the one its parent reserved, if any.
+pub(super) fn take_reserved(gateway: &Gateway, thread: Id) -> Result<CancellationToken> {
+    Ok(gateway
+        .reserved
+        .lock()
+        .map_err(poisoned("run"))?
+        .remove(&thread)
+        .unwrap_or_default())
 }
 
 impl Delegator {
@@ -252,6 +293,32 @@ impl Delegator {
         .map(drop)
     }
 
+    /// Reserve `child`'s next run as part of `caller`'s current run, so
+    /// cancelling `caller` cancels it even before it is admitted.
+    pub fn reserve(&self, caller: Id, child: Id) -> Result<(), ErrorReport> {
+        self.reserve_run(caller, child)
+            .map_err(|e| crate::error::report(&e))
+    }
+    fn reserve_run(&self, caller: Id, child: Id) -> Result<(), DelegatorError> {
+        let running = self.base.running.lock().map_err(poisoned("run"))?;
+        let parent = running.get(&caller).ok_or(DelegatorError::NotRunning)?;
+        self.base
+            .reserved
+            .lock()
+            .map_err(poisoned("run"))?
+            .insert(child, parent.child_token());
+        Ok(())
+    }
+    /// Drop `child`'s reservation if its run was never admitted.
+    pub fn release(&self, child: Id) {
+        // A map of tokens is valid whatever a panicking writer left.
+        self.base
+            .reserved
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&child);
+    }
+
     /// Cancel `child`'s run and its own subagents' runs.
     pub async fn cancel(&self, child: Id) -> Result<(), ErrorReport> {
         self.request(Command::CancelRun { thread: child })
@@ -260,18 +327,24 @@ impl Delegator {
     }
 }
 
-/// Cancel `thread`'s run and those of every thread delegated from it.
+/// Cancel `thread`'s run and those of every thread delegated from it,
+/// including runs reserved and not yet admitted.
 pub(super) fn cancel_run(gateway: &Gateway, thread: Id) -> Result<Reply> {
     let store = gateway.lock()?;
     let running = gateway.running.lock().map_err(poisoned("run"))?;
-    running
-        .get(&thread)
-        .ok_or(GatewayError::NotFound("thread is not running"))?
-        .cancel();
+    let reserved = gateway.reserved.lock().map_err(poisoned("run"))?;
+    let tokens = |id: Id| running.get(&id).into_iter().chain(reserved.get(&id));
+    let mut found = false;
+    for token in tokens(thread) {
+        token.cancel();
+        found = true;
+    }
+    check(found, GatewayError::NotFound("thread is not running"))?;
     for id in descendants(&store, thread) {
-        if let Some(token) = running.get(&id) {
-            token.cancel();
-        }
+        tokens(id).for_each(CancellationToken::cancel);
     }
     Ok(Reply::Ok)
 }
+
+#[cfg(test)]
+mod tests;

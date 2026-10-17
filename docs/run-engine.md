@@ -242,17 +242,23 @@ until the user permits them on that conversation.
 - `subagent_spawn` and `subagent_send` start the run in the background through
   `Send`, so it is admitted, journaled and shown like any other run, approvals
   included; a message the gateway refuses is reported by `subagent_status`.
-  `subagent_wait` waits at most 600 seconds and is cancel-safe.
+  `subagent_wait` waits at most 600 seconds and is cancel-safe; it follows a
+  run the user started in the subagent's thread too, re-reading it every
+  250 ms.
 - `CancelRun` cancels the thread's run and the runs of every thread delegated
-  from it, whoever started them.
+  from it, whoever started them. A subagent run is reserved under its parent's
+  run token before `subagent_spawn`/`subagent_send` returns, so cancelling the
+  parent also cancels a subagent whose run has not been admitted yet.
 
 The host holds a `Delegator`, not the gateway: it can create, message, cancel
 and read subagents and nothing that changes a grant, permission or approval. The
 delegator reaches the gateway's tool hosts through a weak link, so the hosts
-holding it never keep a closed gateway alive. Waiting tracks runs this host
-started; a run the user started is reported as it stands. Tests:
-`crates/runtime/tests/tool_loop.rs` (spawn, inherited permissions, wait,
-cascading cancel, refusals) and `delegation_tool/tests.rs`.
+holding it never keep a closed gateway alive. A gateway that gains a tool host
+(`with_tool_host`) gets subagent tools bound to its own host list, so its other
+clones keep theirs. Tests: `crates/runtime/tests/tool_loop.rs` (spawn,
+inherited permissions, wait, cascading cancel, refusals),
+`delegation_tool/tests.rs` and `gateway/delegation/tests.rs` (reservations,
+clones, waiting on user-started runs).
 
 ### Adapters still to write
 
