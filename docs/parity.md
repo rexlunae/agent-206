@@ -4,10 +4,17 @@ This is the working gap list for reaching RustyClaw parity. Update a row when it
 status changes; `docs/status.md` remains the authoritative implementation ledger.
 
 Scope decisions (2026-10-16): gateway communication keeps RustyClaw's SSH-based
-protocol, and parity work targets desktop and TUI first. Web-client parity is
-deferred; existing web support is kept but new gateway features need not reach it.
-The web client reaches gateways, local or SSH, through its server-side bridge
-(2026-10-17), not through SSH in the browser.
+protocol, and parity work targets desktop and TUI first. The web client reaches
+gateways, local or SSH, through its server-side bridge (2026-10-17), not through
+SSH in the browser. Its pages are the desktop app's shared fc-dioxus components
+calling the gateway's command API through the bridge; two cards that the desktop
+runs against local processes use their own bridge routes instead: the Gateway
+page's health checks (`/api/health`) and the Security page's vault card
+(`/api/vault`). Chat streaming and tool approvals use the same snapshot polling
+as the desktop but have not been exercised in a browser against a live model
+provider. By design the browser only reads and locks
+the vault: creating, unlocking, pairing and enrolling it need the desktop or
+terminal app, so the vault password never passes through a browser.
 
 Reference: [RustyClaw `481a428c`](https://github.com/rexlunae/RustyClaw/tree/481a428cb7a3b82d1a5e556ffef40e3dd9f52ce3) (`rc/` below).
 Agent 206 paths are prefixed `a206/`; the survey was taken at `1666303`. Parity = equivalent user-facing
