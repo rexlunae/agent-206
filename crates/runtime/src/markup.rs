@@ -6,11 +6,10 @@
 //!
 //! Adapted from RustyClaw's `StreamSanitizer` (`tool_healing.rs`, MIT).
 
-/// How far ahead the filter looks to decide a line, so a long line is not
-/// copied again for every chunk: inline code must close within this many
-/// bytes after a tag, and a fence line whose marker run or trailing
-/// whitespace is longer is not a fence. The limit is on the text, not on the
-/// chunks, so every chunking of a reply is filtered the same way.
+/// How far past a tag the filter looks for the backtick run that would make
+/// it inline code, so a long line is not copied again for every chunk. The
+/// limit is on the text, not on the chunks, so every chunking of a reply is
+/// filtered the same way.
 const MAX_HOLD: usize = 4096;
 
 /// Open and close tags of leaked tool-call blocks.
@@ -25,11 +24,11 @@ const TAGS: [(&str, &str); 6] = [
 
 /// Removes leaked tool-call blocks from streamed text.
 ///
-/// Chunks split tags anywhere, so text that could still become a tag, a code
-/// fence or a backtick run is held until a later chunk decides it. Held text
-/// is short except in two cases: a tag after an unclosed backtick run waits
-/// for the run's close or the line's end, and a possible closing fence waits
-/// for its line to end. Both look at most [`MAX_HOLD`] bytes ahead.
+/// Chunks split tags anywhere, so text that could still become a tag or a
+/// backtick run is held until a later chunk decides it; a tag after an
+/// unclosed backtick run waits for the run's close, the line's end or
+/// [`MAX_HOLD`] bytes. Fence lines are passed on as they arrive, with only
+/// their marker run and whether a closing line stays blank kept as state.
 /// [`Filter::finish`] releases held text and drops an unterminated block.
 #[derive(Debug, Default)]
 pub struct Filter {
@@ -40,8 +39,13 @@ pub struct Filter {
     closing: Option<&'static str>,
     /// The next byte does not start a line.
     mid_line: bool,
+    /// The start of the current line, while it may still be a fence.
+    lead: Option<Lead>,
     /// The fenced code block being passed through.
     fence: Option<Fence>,
+    /// The current line began with a marker that closes the fence if nothing
+    /// but whitespace follows it.
+    closer: bool,
     /// Length of the backtick run that opened the inline code on this line.
     code: Option<usize>,
     removed: usize,
@@ -55,20 +59,20 @@ struct Fence {
     len: usize,
 }
 
+/// Indentation and marker run seen at the start of a line so far.
+#[derive(Clone, Copy, Debug, Default)]
+struct Lead {
+    indent: usize,
+    /// The marker byte, or 0 before one.
+    mark: u8,
+    len: usize,
+}
+
 enum Step {
     /// Continue from this byte offset.
     At(usize),
     /// Hold the text from this byte offset for the next chunk.
     Hold(usize),
-}
-
-enum Mark {
-    /// A fence, and whether only spaces or tabs follow it on its line
-    /// (`None` until the line ends); only such a line can close a block.
-    Fence(Fence, Option<bool>),
-    None,
-    /// The chunk ended before the line showed whether it is a fence.
-    Undecided,
 }
 
 impl Filter {
@@ -120,33 +124,71 @@ impl Filter {
             }
             return Step::Hold(from);
         }
-        if !self.mid_line {
-            match fence_mark(rest) {
-                Mark::Undecided if self.ended => return self.pass_line(text, at, out),
-                Mark::Undecided => return Step::Hold(at),
-                Mark::Fence(mark, bare) => {
-                    match self.fence {
-                        None => self.fence = Some(mark),
-                        Some(open) if mark.mark == open.mark && mark.len >= open.len => {
-                            match bare {
-                                Some(true) => self.fence = None,
-                                Some(false) => {}
-                                None if self.ended => self.fence = None,
-                                None => return Step::Hold(at),
-                            }
-                        }
-                        Some(_) => {}
-                    }
-                    return self.pass_line(text, at, out);
+        if self.mid_line && self.lead.is_none() {
+            return match self.fence {
+                Some(_) => self.pass_line(text, at, out),
+                None => self.prose(text, at, out, false),
+            };
+        }
+        // The line's indentation and marker run hold no tags, so they are
+        // passed on while counted.
+        let mut lead = self.lead.take().unwrap_or_default();
+        let bytes = text.as_bytes();
+        let mut i = at;
+        while let Some(&b) = bytes.get(i) {
+            let counted = if lead.mark == 0 {
+                if b == b' ' && lead.indent < 4 {
+                    lead.indent += 1;
+                    true
+                } else if lead.indent < 4 && (b == b'`' || b == b'~') {
+                    lead.mark = b;
+                    lead.len = 1;
+                    true
+                } else {
+                    false
                 }
-                Mark::None => {}
+            } else if b == lead.mark {
+                lead.len += 1;
+                true
+            } else {
+                false
+            };
+            if !counted {
+                break;
+            }
+            i += 1;
+        }
+        out.push_str(&text[at..i]);
+        self.mid_line = true;
+        if i == bytes.len() && !self.ended {
+            self.lead = Some(lead);
+            return Step::At(i);
+        }
+        let fence = (lead.mark != 0 && lead.len >= 3).then_some(Fence {
+            mark: lead.mark,
+            len: lead.len,
+        });
+        match (self.fence, fence) {
+            (None, Some(fence)) => {
+                self.fence = Some(fence);
+                self.pass_line(text, i, out)
+            }
+            (Some(open), fence) => {
+                self.closer = fence.is_some_and(|f| f.mark == open.mark && f.len >= open.len);
+                self.pass_line(text, i, out)
+            }
+            (None, None) => {
+                if lead.mark == b'`' {
+                    self.code = Some(lead.len);
+                }
+                let line_start = lead.indent == 0 && lead.mark == 0;
+                self.prose(text, i, out, line_start)
             }
         }
-        if self.fence.is_some() {
-            return self.pass_line(text, at, out);
-        }
-        let line_start = !self.mid_line;
-        self.mid_line = true;
+    }
+
+    /// Ordinary text: remove leaked blocks outside inline code.
+    fn prose(&mut self, text: &str, at: usize, out: &mut String, line_start: bool) -> Step {
         let bytes = text.as_bytes();
         let mut i = at;
         // Every byte compared is ASCII, so each offset is a char boundary.
@@ -212,7 +254,7 @@ impl Filter {
                 _ => i += 1,
             }
         }
-        out.push_str(rest);
+        out.push_str(&text[at..]);
         Step::At(text.len())
     }
 
@@ -227,12 +269,19 @@ impl Filter {
         Step::Hold(from)
     }
 
-    /// Pass the rest of a line through unchanged.
+    /// Pass the rest of a fence line through unchanged; a closing marker
+    /// followed only by whitespace ends the fence with its line.
     fn pass_line(&mut self, text: &str, at: usize, out: &mut String) -> Step {
         let rest = &text[at..];
-        match rest.find('\n') {
+        let end = rest.find('\n');
+        let line = &rest[..end.unwrap_or(rest.len())];
+        self.closer &= line.bytes().all(|b| matches!(b, b' ' | b'\t' | b'\r'));
+        match end {
             Some(pos) => {
                 out.push_str(&rest[..=pos]);
+                if std::mem::take(&mut self.closer) {
+                    self.fence = None;
+                }
                 self.mid_line = false;
                 Step::At(at + pos + 1)
             }
@@ -243,43 +292,6 @@ impl Filter {
             }
         }
     }
-}
-
-/// Whether a line opens or closes a fenced code block: up to three spaces,
-/// then three or more backticks or tildes.
-fn fence_mark(line: &str) -> Mark {
-    let bytes = line.as_bytes();
-    let indent = bytes.iter().take(4).take_while(|&&b| b == b' ').count();
-    if indent > 3 {
-        return Mark::None;
-    }
-    let Some(&mark) = bytes.get(indent) else {
-        return Mark::Undecided;
-    };
-    if mark != b'`' && mark != b'~' {
-        return Mark::None;
-    }
-    let len = bytes[indent..].iter().take_while(|&&b| b == mark).count();
-    if len > MAX_HOLD {
-        return Mark::None;
-    }
-    if indent + len == bytes.len() {
-        return Mark::Undecided;
-    }
-    if len < 3 {
-        return Mark::None;
-    }
-    let after = &bytes[indent + len..];
-    let end = after.iter().position(|&b| b == b'\n');
-    let trailing = &after[..end.unwrap_or(after.len())];
-    let bare = if !trailing.iter().all(|&b| matches!(b, b' ' | b'\t' | b'\r'))
-        || trailing.len() > MAX_HOLD
-    {
-        Some(false)
-    } else {
-        end.map(|_| true)
-    };
-    Mark::Fence(Fence { mark, len }, bare)
 }
 
 /// Whether a backtick run of `run` closes inline code later on this line
@@ -455,15 +467,17 @@ mod tests {
         assert_eq!(every_split(&text), (format!("`  {long}`"), 1));
         let text = format!("`<tool_call>x</tool_call>{}`", &long[..MAX_HOLD - 40]);
         assert_eq!(every_split(&text), (text.clone(), 0));
-        // A closing fence candidate with too much trailing space is code.
+        // Fence lines of any length are decided by their whole line.
         let spaces = " ".repeat(MAX_HOLD + 1);
-        let text =
-            format!("```\n```{spaces}\n<tool_call>q</tool_call>\n```\n<tool_call>l</tool_call>");
-        let kept = format!("```\n```{spaces}\n<tool_call>q</tool_call>\n```\n");
+        let text = format!(
+            "```\n```{spaces}x\n<tool_call>q</tool_call>\n```{spaces}\n<tool_call>l</tool_call>"
+        );
+        let kept = format!("```\n```{spaces}x\n<tool_call>q</tool_call>\n```{spaces}\n");
         assert_eq!(every_split(&text), (kept, 1));
-        // A marker run that long is not a fence.
-        let text = format!("{}\n<tool_call>e</tool_call>\n", "`".repeat(MAX_HOLD + 1));
-        assert_eq!(every_split(&text).1, 1);
+        let fence = "`".repeat(MAX_HOLD + 1);
+        let text = format!("{fence}\n<tool_call>e</tool_call>\n{fence}\n<tool_call>x</tool_call>");
+        let kept = format!("{fence}\n<tool_call>e</tool_call>\n{fence}\n");
+        assert_eq!(every_split(&text), (kept, 1));
     }
 
     #[test]
