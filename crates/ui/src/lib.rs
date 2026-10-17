@@ -16,6 +16,7 @@ mod schedules;
 mod search;
 mod settings;
 mod skills;
+mod slash;
 mod subagents;
 mod tools;
 mod welcome;

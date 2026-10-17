@@ -82,6 +82,7 @@ fn Conversation(thread: Thread, target: Option<Uuid>) -> Element {
     let mut draft = use_signal(String::new);
     let mut attachments = use_signal(Vec::<TextAttachment>::new);
     let mut attachment_error = use_signal(|| None::<ErrorReport>);
+    let mut command_error = use_signal(|| None::<ErrorReport>);
     let mut reading_files = use_signal(|| false);
     let mut file_input_version = use_signal(|| 0_u64);
     let mut submitting = use_signal(|| false);
@@ -111,8 +112,38 @@ fn Conversation(thread: Thread, target: Option<Uuid>) -> Element {
             .and_then(|t| t.model.as_ref())
             .map(|k| format!("{}:{}", k.provider, k.model))
     });
+    let can_create = (state.connected)() && state.gateway_busy.read().is_none();
     let mut submit = move || {
-        let text = draft().trim().to_owned();
+        // A slash command runs instead of sending; anything else is a message.
+        let text = match crate::slash::parse(draft().trim()) {
+            Ok(crate::slash::Typed::Send(text)) => text,
+            Ok(crate::slash::Typed::Run(slash)) => {
+                // The conversation as the gateway last reported it.
+                let current = state
+                    .data
+                    .peek()
+                    .threads
+                    .iter()
+                    .find(|t| t.id == id)
+                    .cloned();
+                let resolved = current
+                    .ok_or_else(|| rejected("This conversation is no longer available"))
+                    .and_then(|thread| crate::slash::resolve(slash, &thread, can_create));
+                match resolved {
+                    Ok(command) => {
+                        draft.set(String::new());
+                        command_error.set(None);
+                        crate::slash::run(state, command);
+                    }
+                    Err(report) => command_error.set(Some(report)),
+                }
+                return;
+            }
+            Err(report) => {
+                command_error.set(Some(report));
+                return;
+            }
+        };
         if !running
             && has_model
             && !reading_files()
@@ -238,6 +269,7 @@ fn Conversation(thread: Thread, target: Option<Uuid>) -> Element {
             .collect()
     };
     let effort_unavailable = effort_options.is_empty() || running;
+    let commands = crate::slash::suggestions(&draft());
     let tool_count = thread.grant.capabilities.len();
     let availability = if running {
         Availability::Disabled
@@ -288,12 +320,28 @@ fn Conversation(thread: Thread, target: Option<Uuid>) -> Element {
         }
         div { class: "a206-composer",
             Card { as_: CardTag::Div, variant: CardVariant::Elevated, class: "a206-compose-surface", role: "group", aria_label: "Message composer",
+                if !commands.is_empty() {
+                    List { class: "a206-slash-commands", aria_label: "Commands · Tab completes the first",
+                        for spec in commands.iter().copied() {
+                            ListItem { key: "{spec.name}", headline: rsx! { "{spec.usage()}" }, supporting: rsx! { "{spec.about}" },
+                                action: ListAction::Button(EventHandler::new(move |_| draft.set(spec.completion()))) }
+                        }
+                    }
+                }
+                if let Some(report) = command_error() { crate::error::ErrorNotice { report, title: "Command not run".to_string(), dismiss: move |_| command_error.set(None) } }
                 div { class: "a206-compose-entry", onkeydown: move |event: KeyboardEvent| {
                     if event.key() == Key::Enter && !event.is_composing() && !event.modifiers().shift() { event.prevent_default(); submit(); }
+                    // Tab completes a command once; with nothing left to add it moves focus as usual.
+                    else if event.key() == Key::Tab && !event.modifiers().shift()
+                        && let Some(completion) = crate::slash::suggestions(&draft()).first().map(|spec| spec.completion()).filter(|c| *c != draft()) {
+                        event.prevent_default();
+                        draft.set(completion);
+                    }
                 },
                 Textarea { class: "a206-compose-input", aria_label: "Message your agent", rows: "1", autosize: true,
-                    placeholder: if has_model { "Describe what you'd like to do…" } else { "Choose a model to start…" },
-                    value: ReadSignal::from(draft), oninput: move |value| draft.set(value), readonly: running,
+                    placeholder: if has_model { "Describe what you'd like to do… (/ for commands)" } else { "Choose a model to start… (/ for commands)" },
+                    value: ReadSignal::from(draft), readonly: running,
+                    oninput: move |value| { draft.set(value); if command_error.peek().is_some() { command_error.set(None); } },
                 }
                 }
                 if !attachments.read().is_empty() {
