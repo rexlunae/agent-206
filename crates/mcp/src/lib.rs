@@ -131,6 +131,8 @@ pub enum McpError {
         "the thread lost permission to use this MCP tool while the call ran; the call was cancelled"
     )]
     Revoked,
+    #[error("the MCP call was cancelled by its caller")]
+    Abandoned,
 }
 
 /// The authority an MCP server process may hold. Anything else (secrets, git,
