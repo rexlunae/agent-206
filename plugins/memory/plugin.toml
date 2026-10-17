@@ -1,0 +1,62 @@
+id = "agent206.memory"
+name = "Project memory"
+description = "Searches and reads the project's MEMORY.md and memory/ notes, and saves new notes under memory/."
+version = "0.1.0"
+abi = 2
+capabilities = ["read_workspace", "write_workspace"]
+
+[[tools]]
+name = "memory_search"
+description = "Rank sections of the project's MEMORY.md and memory/**/*.md notes against a query with BM25 keyword scoring (case-insensitive words). Returns each match's path, line range and a short snippet; read more with memory_get."
+capabilities = ["read_workspace"]
+
+[[tools.params]]
+name = "query"
+type = "string"
+description = "Words to look for."
+required = true
+
+[[tools.params]]
+name = "max_results"
+type = "integer"
+description = "Most results to return, from 1 to 20. Defaults to 5."
+
+[[tools]]
+name = "memory_get"
+description = "Read a range of lines from MEMORY.md or a .md note under memory/. Other paths are refused."
+capabilities = ["read_workspace"]
+
+[[tools.params]]
+name = "path"
+type = "string"
+description = "MEMORY.md, or a .md path under memory/, relative to the project root."
+required = true
+
+[[tools.params]]
+name = "from"
+type = "integer"
+description = "First line to return, counting from 1. Defaults to 1."
+
+[[tools.params]]
+name = "lines"
+type = "integer"
+description = "How many lines to return, from 1 to 500. Defaults to 200."
+
+# Appending reads the note first, so saving needs both grants; the write
+# grant is what separates it from searching and reading.
+[[tools]]
+name = "memory_save"
+description = "Append text to a .md note under memory/, creating the note and its folders if needed. MEMORY.md and paths outside memory/ are refused."
+capabilities = ["read_workspace", "write_workspace"]
+
+[[tools.params]]
+name = "path"
+type = "string"
+description = "A .md path under memory/, such as memory/decisions.md."
+required = true
+
+[[tools.params]]
+name = "text"
+type = "string"
+description = "The text to append, up to 16 KiB."
+required = true

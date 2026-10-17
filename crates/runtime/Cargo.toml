@@ -78,5 +78,9 @@ harness = false
 [[test]]
 name = "extension_tools"
 harness = false
+# Likewise the worker for the bundled memory extension.
+[[test]]
+name = "memory_tools"
+harness = false
 [lints]
 workspace = true
