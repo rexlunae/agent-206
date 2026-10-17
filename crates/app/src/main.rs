@@ -967,12 +967,14 @@ mod native {
                             .into_iter()
                             .find(|t| t.id == thread)
                             .ok_or_else(|| anyhow::anyhow!("conversation not found"))?;
-                        if thread.plan.is_empty() {
-                            println!("No plan");
+                        #[derive(serde::Serialize)]
+                        struct Plan {
+                            steps: Vec<a206_core::PlanStep>,
                         }
-                        for step in &thread.plan {
-                            println!("[{}] {}", step.status.name(), step.text);
-                        }
+                        print!(
+                            "{}",
+                            toml::to_string_pretty(&Plan { steps: thread.plan })?
+                        );
                         return Ok(());
                     }
                     Action::Approvals { command } => match command {

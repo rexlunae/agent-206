@@ -399,7 +399,7 @@ whole checklist in order: up to 50 steps, each `{text, status}` with 1–500 byt
 of text (trimmed) and a status of `pending`, `in_progress` or `done`. A call
 replaces `Thread::plan` and journals `ThreadChanged`; an empty list clears it.
 A malformed call fails as `InvalidRequest` and leaves the plan as it was, and a
-plan that would take the room the next reply needs is refused as history full.
+plan is changed only when the call's result still fits above the run's storage reserve; otherwise the call fails as history full and the plan stays as it was.
 The result is the plan with `done` and `total` counts. Replacing the whole
 plan means a model never edits a step it has not seen. The plan uses no
 capability, grants nothing, and like every tool is denied until the user permits

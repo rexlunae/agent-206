@@ -159,7 +159,7 @@ pub(super) const NEXT_ROUND: usize = provider::MAX_REPLY_TEXT + SETTLEMENT;
 /// Snapshot bytes a response's call arguments and outputs never use: the
 /// settlement of those calls, then the next round. Recording calls therefore
 /// never stops the run from storing the model's next reply.
-const RESERVE: usize = SETTLEMENT + NEXT_ROUND;
+pub(super) const RESERVE: usize = SETTLEMENT + NEXT_ROUND;
 /// Cut a tool's output to `limit` bytes (at most [`tools::MAX_OUTPUT`]),
 /// saying so in the text the model and the user see.
 fn bounded_output(mut text: String, limit: usize) -> String {

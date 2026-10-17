@@ -107,7 +107,7 @@ impl PlanHost {
         }
         let plan = parse(&request.arguments)?;
         let result = describe(&plan);
-        self.plans.set(thread, plan)?;
+        self.plans.set(thread, plan, result.to_string().len())?;
         Ok(result)
     }
 }
