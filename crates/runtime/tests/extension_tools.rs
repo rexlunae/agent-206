@@ -56,6 +56,15 @@ const TESTS: &[(&str, Test)] = &[
         "cancelling_during_an_extension_call_kills_the_worker",
         || Box::pin(cancelling_during_an_extension_call_kills_the_worker()),
     ),
+    ("an_installed_extension_runs_only_as_reviewed", || {
+        Box::pin(an_installed_extension_runs_only_as_reviewed())
+    }),
+    ("invalid_packages_are_refused_before_storing", || {
+        Box::pin(invalid_packages_are_refused_before_storing())
+    }),
+    ("a_retried_install_replays_its_receipt", || {
+        Box::pin(a_retried_install_replays_its_receipt())
+    }),
 ];
 
 fn main() {
@@ -591,6 +600,214 @@ fn alive(pid: u32) -> bool {
 fn alive(_pid: u32) -> bool {
     // No portable liveness check: the run's cancellation is still verified.
     false
+}
+
+// ── Installed packages ──────────────────────────────────────────────────────
+
+/// The bundled workspace extension's manifest under a new id and version,
+/// with its compiled module: a stand-in for a third-party package.
+fn package(id: &str, version: &str) -> (String, Vec<u8>) {
+    let builtin = a206_extensions::builtin(EXTENSION).unwrap().unwrap();
+    let text = include_str!("../../../plugins/workspace/plugin.toml")
+        .replacen(
+            &format!("id = \"{EXTENSION}\""),
+            &format!("id = \"{id}\""),
+            1,
+        )
+        .replacen(
+            &format!("version = \"{}\"", builtin.manifest.version),
+            &format!("version = \"{version}\""),
+            1,
+        );
+    (text, builtin.wasm.to_vec())
+}
+async fn install(gateway: &Gateway, (manifest, module): (String, Vec<u8>)) -> Reply {
+    request(gateway, Command::InstallExtension { manifest, module }).await
+}
+fn failure(reply: Reply) -> ErrorReport {
+    match reply {
+        Reply::Error(report) => report,
+        other => panic!("expected a failure, got {other:?}"),
+    }
+}
+fn installed_digest(summary: &PluginSummary) -> String {
+    match &summary.source {
+        PluginSource::Installed { digest } => digest.clone(),
+        PluginSource::Bundled => panic!("expected an installed extension"),
+    }
+}
+
+async fn an_installed_extension_runs_only_as_reviewed() {
+    let state = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let file = format!("{}.txt", nonce());
+    std::fs::write(workspace.path().join(&file), nonce()).unwrap();
+    let gateway = Gateway::open(state.path()).unwrap();
+    let Reply::Project(project) = request(
+        &gateway,
+        Command::CreateProject {
+            name: nonce(),
+            root: workspace.path().display().to_string(),
+        },
+    )
+    .await
+    else {
+        panic!("project creation failed");
+    };
+    let id = format!("test.{}", nonce());
+    let list = || Command::CallTool {
+        extension: id.clone(),
+        tool: "list_directory".into(),
+        args: Default::default(),
+        project: Some(project.id),
+    };
+    let ok = |command| {
+        let gateway = gateway.clone();
+        async move { assert_eq!(request(&gateway, command).await, Reply::Ok) }
+    };
+    let enable = || Command::EnableExtension {
+        extension: id.clone(),
+        enabled: true,
+    };
+
+    // It arrives disabled, with nothing granted.
+    let Reply::Extension(summary) = install(&gateway, package(&id, "1.0.0")).await else {
+        panic!("install failed");
+    };
+    assert!(!summary.enabled && summary.granted.is_empty());
+    let digest = installed_digest(&summary);
+    assert!(gateway.snapshot().unwrap().plugins.contains(&summary));
+    let denied = failure(request(&gateway, list()).await);
+    assert_eq!(denied.kind, ErrorKind::PermissionDenied);
+    ok(enable()).await;
+    let denied = failure(request(&gateway, list()).await);
+    assert_eq!(denied.kind, ErrorKind::PermissionDenied);
+    ok(Command::GrantExtension {
+        extension: id.clone(),
+        capabilities: [Capability::ReadWorkspace].into(),
+    })
+    .await;
+    let Reply::Text(listing) = request(&gateway, list()).await else {
+        panic!("the installed tool failed");
+    };
+    assert!(listing.contains(&file), "{listing}");
+
+    // A stored package that no longer matches its digest never runs.
+    let stored = state.path().join("extensions").join(&digest);
+    std::fs::write(stored.join("module.wasm"), nonce()).unwrap();
+    let changed = failure(request(&gateway, list()).await);
+    assert_eq!(changed.kind, ErrorKind::Conflict, "{changed:?}");
+    // Installing the same package restores it without asking again.
+    let Reply::Extension(same) = install(&gateway, package(&id, "1.0.0")).await else {
+        panic!("reinstall failed");
+    };
+    assert!(same.enabled && installed_digest(&same) == digest);
+    assert!(matches!(request(&gateway, list()).await, Reply::Text(_)));
+
+    // An update is disabled until the user enables it again, keeps the
+    // grants it still requests and replaces the earlier package.
+    let Reply::Extension(update) = install(&gateway, package(&id, "2.0.0")).await else {
+        panic!("update failed");
+    };
+    assert!(!update.enabled);
+    assert_eq!(update.granted, [Capability::ReadWorkspace].into());
+    assert_ne!(installed_digest(&update), digest);
+    assert!(!stored.exists());
+    let denied = failure(request(&gateway, list()).await);
+    assert_eq!(denied.kind, ErrorKind::PermissionDenied);
+    ok(enable()).await;
+    assert!(matches!(request(&gateway, list()).await, Reply::Text(_)));
+
+    // Uninstalling removes the package; bundled extensions stay.
+    ok(Command::UninstallExtension {
+        extension: id.clone(),
+    })
+    .await;
+    assert!(
+        !gateway
+            .snapshot()
+            .unwrap()
+            .plugins
+            .iter()
+            .any(|p| p.id == id)
+    );
+    assert!(
+        !state
+            .path()
+            .join("extensions")
+            .join(installed_digest(&update))
+            .exists()
+    );
+    let gone = failure(request(&gateway, list()).await);
+    assert_eq!(gone.kind, ErrorKind::NotFound);
+    let bundled = failure(
+        request(
+            &gateway,
+            Command::UninstallExtension {
+                extension: EXTENSION.into(),
+            },
+        )
+        .await,
+    );
+    assert_eq!(bundled.kind, ErrorKind::InvalidRequest);
+}
+
+async fn invalid_packages_are_refused_before_storing() {
+    let state = tempfile::tempdir().unwrap();
+    let gateway = Gateway::open(state.path()).unwrap();
+    let id = format!("test.{}", nonce());
+    let (manifest, module) = package(&id, "1.0.0");
+    let refused = [
+        // The bundled namespace, including a bundled extension's own id.
+        package(&format!("agent206.{}", nonce()), "1.0.0"),
+        package(EXTENSION, "1.0.0"),
+        (manifest.clone(), nonce().into_bytes()),
+        (format!("{manifest}\n{} = 1", nonce()), module.clone()),
+        (manifest.clone(), {
+            let mut large = module.clone();
+            large.resize(4 * 1024 * 1024, 0);
+            large
+        }),
+    ];
+    for package in refused {
+        let report = failure(install(&gateway, package).await);
+        assert_eq!(report.kind, ErrorKind::InvalidRequest, "{report:?}");
+    }
+    assert!(!state.path().join("extensions").exists());
+    let plugins = gateway.snapshot().unwrap().plugins;
+    assert!(plugins.iter().all(|p| p.source == PluginSource::Bundled));
+}
+
+async fn a_retried_install_replays_its_receipt() {
+    let state = tempfile::tempdir().unwrap();
+    let gateway = Gateway::open(state.path()).unwrap();
+    let id = format!("test.{}", nonce());
+    let send = |request: Id, (manifest, module): (String, Vec<u8>)| {
+        let gateway = gateway.clone();
+        async move {
+            gateway
+                .request(a206_protocol::Request {
+                    id: request,
+                    body: Command::InstallExtension { manifest, module },
+                })
+                .await
+                .body
+        }
+    };
+    let first = Id::new_v4();
+    let receipt = send(first, package(&id, "1.0.0")).await;
+    assert!(matches!(receipt, Reply::Extension(_)), "{receipt:?}");
+    let Reply::Extension(newer) = send(Id::new_v4(), package(&id, "2.0.0")).await else {
+        panic!("update failed");
+    };
+    // A late retry returns its receipt instead of reinstalling the old package.
+    assert_eq!(send(first, package(&id, "1.0.0")).await, receipt);
+    let plugins = gateway.snapshot().unwrap().plugins;
+    assert!(plugins.contains(&newer), "{plugins:?}");
+    // The same id with a different package is refused, not installed.
+    let reused = failure(send(first, package(&id, "3.0.0")).await);
+    assert_eq!(reused.kind, ErrorKind::Conflict, "{reused:?}");
+    assert!(gateway.snapshot().unwrap().plugins.contains(&newer));
 }
 
 async fn approved_skills_reach_the_model_through_the_skill_tools() {

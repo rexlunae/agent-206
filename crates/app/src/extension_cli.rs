@@ -3,6 +3,8 @@ use a206_core::{
     Capability, Command,
     extension::{Args, Node, UiEvent, Value, View},
 };
+use a206_runtime::extension_host::packages;
+use anyhow::Context;
 use clap::Subcommand;
 use serde::{Deserialize, de::IntoDeserializer};
 
@@ -20,6 +22,16 @@ pub enum ExtensionAction {
         id: String,
     },
     Disable {
+        id: String,
+    },
+    /// Install or update an extension from its `plugin.toml` and compiled
+    /// WASM module. It arrives disabled with nothing granted.
+    Install {
+        manifest: std::path::PathBuf,
+        module: std::path::PathBuf,
+    },
+    /// Remove an installed extension and everything it stored.
+    Uninstall {
         id: String,
     },
     /// Render a panel as text, optionally after pressing one of its buttons.
@@ -62,6 +74,16 @@ pub fn command(action: ExtensionAction) -> anyhow::Result<Option<Command>> {
             extension: id,
             enabled: false,
         },
+        ExtensionAction::Install { manifest, module } => {
+            let manifest = std::fs::read_to_string(&manifest)
+                .with_context(|| format!("could not read {}", manifest.display()))?;
+            let module = std::fs::read(&module)
+                .with_context(|| format!("could not read {}", module.display()))?;
+            // Refuse here what the gateway would, before sending megabytes.
+            packages::prepare(manifest.clone(), module.clone())?;
+            Command::InstallExtension { manifest, module }
+        }
+        ExtensionAction::Uninstall { id } => Command::UninstallExtension { extension: id },
         ExtensionAction::Panel {
             id,
             panel,
