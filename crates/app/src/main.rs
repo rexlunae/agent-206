@@ -139,6 +139,11 @@ mod native {
         Cancel {
             thread: uuid::Uuid,
         },
+        /// Summarize a conversation's earlier messages now, keeping its
+        /// latest turn; `cancel THREAD` stops it.
+        Compact {
+            thread: uuid::Uuid,
+        },
         /// Inspect and set a conversation's tool permissions and budget.
         Tools {
             #[command(subcommand)]
@@ -909,6 +914,7 @@ mod native {
                         attachments: vec![],
                     },
                     Action::Cancel { thread } => Command::CancelRun { thread },
+                    Action::Compact { thread } => Command::CompactThread { thread },
                     Action::Tools { command } => match command {
                         ToolAction::List { thread } => Command::ListTools { thread },
                         ToolAction::Permit {

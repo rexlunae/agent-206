@@ -360,6 +360,15 @@ async fn protocol_smoke() -> Result<()> {
         anyhow::bail!("expected thread");
     };
     let thread_id = thread.id.to_string();
+    // The CLI reaches the gateway's compaction and reports its refusal.
+    let compact = capture(app.command(&["compact", &thread_id])).await?;
+    ensure!(
+        !compact.status.success(),
+        "compacted a conversation with no model"
+    );
+    let stderr = String::from_utf8_lossy(&compact.stderr);
+    ensure!(stderr.contains("select a model"), "{stderr}");
+    ensure!(app.snapshot().await?.threads[0].messages.is_empty());
     extension_smoke(&app).await?;
     let mut acp = Peer::start(&app, &["acp", &thread_id])?;
     let init = result(
