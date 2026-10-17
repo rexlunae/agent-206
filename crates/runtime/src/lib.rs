@@ -4,6 +4,7 @@ pub mod backends;
 pub mod client;
 pub mod connection;
 pub mod control;
+pub mod delegation_tool;
 pub mod doctor;
 pub mod error;
 pub mod exec_tool;

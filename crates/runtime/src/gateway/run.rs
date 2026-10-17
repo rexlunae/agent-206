@@ -243,6 +243,7 @@ impl Gateway {
     /// Add a source of tools. Hosts are consulted in the order they were added.
     pub fn with_tool_host(mut self, host: Arc<dyn ToolHost>) -> Self {
         Arc::make_mut(&mut self.tool_hosts).push(host);
+        self.bind_delegation();
         self
     }
     fn view(&self, id: Id) -> Result<View> {

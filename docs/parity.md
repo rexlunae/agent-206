@@ -102,8 +102,8 @@ invocations and relays gateway-authorized host calls (`a206/docs/plugin-api.md`)
 | RustyClaw capability | Agent 206 status | How it should land |
 | --- | --- | --- |
 | Threads, projects (`threads/*`, `projects/*`) | present: threads, projects, parent-linked subagents (`core/src/lib.rs` Thread/Project) | — |
-| `sessions_spawn/send/history/kill`, steer (`tools/sessions_tools.rs`) | partial: user `CreateSubagent` with model allowlist + narrowed grants; no agent-initiated spawn, steering or hierarchical cancel | Agent *requests* spawn via SpawnAgent; gateway enforces intersection |
-| `subagent_create/run/list/delete` (`tools/subagent_tools.rs`, `gateway/subagent_runner.rs`) | partial (as above) | Same run engine as root threads |
+| `sessions_spawn/send/history/kill`, steer (`tools/sessions_tools.rs`) | partial: native runs can `subagent_spawn/send/list/status/wait/cancel` (`runtime/src/delegation_tool.rs`) through `CreateSubagent`, so the model allowlist and grant intersection apply; children inherit the caller's tool permissions minus delegation, depth and concurrency are bounded, and `CancelRun` cascades to descendants | Steering a running subagent, an agent-requested `SpawnAgent` grant flow, per-subagent budgets, desktop tree view |
+| `subagent_create/run/list/delete` (`tools/subagent_tools.rs`, `gateway/subagent_runner.rs`) | partial: subagents run on the same native run engine as root threads (see above); no named, reusable subagent profiles | Profiles as TOML presets of mode, model and capabilities |
 | Named agent registry, `agents_create` (`agents.rs`) | missing | Profiles as TOML agent definitions |
 | Swarm orchestration + templates (`swarm/*`, `tools/swarm_tools.rs`, CLI `swarm`) | missing | Project coordinator thread + delegated task lifecycle |
 | Task fg/bg/pause/resume/input (`tasks/*`, `tools/task_tools.rs`) | missing | Task state machine with durable events |
