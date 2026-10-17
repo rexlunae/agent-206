@@ -7,6 +7,7 @@ mod health;
 mod mcp;
 mod messengers;
 mod pages;
+mod prompts;
 mod route;
 mod settings;
 mod skills;
