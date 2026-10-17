@@ -205,7 +205,10 @@ mod tests {
         settings
             .enabled_skills
             .insert("notes".into(), reviewed.digest.clone());
-        assert_eq!(send(&g, Command::SaveSettings(settings)).await, Reply::Ok);
+        assert_eq!(
+            send(&g, Command::SaveSettings(Box::new(settings))).await,
+            Reply::Ok
+        );
         assert!(g.skill_offers(thread.id).unwrap().is_empty());
         // Approval needs the reviewed text's digest, and refuses a file that
         // changed since that review.

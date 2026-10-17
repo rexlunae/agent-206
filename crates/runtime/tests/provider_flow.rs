@@ -75,7 +75,7 @@ async fn shutdown_cancels_active_inference_and_rejects_new_work() {
         api: Default::default(),
     });
     assert_eq!(
-        run(&gateway, Command::SaveSettings(settings)).await,
+        run(&gateway, Command::SaveSettings(Box::new(settings))).await,
         Reply::Ok
     );
     let Reply::Catalog(catalog) = run(&gateway, Command::RefreshCatalog { provider }).await else {
@@ -185,7 +185,7 @@ async fn discovers_models_from_api_then_sends_and_persists_a_conversation() {
         api: Default::default(),
     });
     assert_eq!(
-        run(&gateway, Command::SaveSettings(settings)).await,
+        run(&gateway, Command::SaveSettings(Box::new(settings))).await,
         Reply::Ok
     );
     let Reply::Catalog(catalog) = run(&gateway, Command::RefreshCatalog { provider }).await else {
@@ -441,11 +441,11 @@ async fn stale_settings_cannot_overwrite_newer_user_changes() {
     let mut first = old.clone();
     first.prompts[0].prompt = Id::new_v4().to_string();
     assert_eq!(
-        run(&gateway, Command::SaveSettings(first.clone())).await,
+        run(&gateway, Command::SaveSettings(Box::new(first.clone()))).await,
         Reply::Ok
     );
     assert!(matches!(
-        run(&gateway, Command::SaveSettings(old)).await,
+        run(&gateway, Command::SaveSettings(Box::new(old))).await,
         Reply::Error { .. }
     ));
     assert_eq!(gateway.snapshot().unwrap().settings.prompts, first.prompts);

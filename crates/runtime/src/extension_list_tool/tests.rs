@@ -80,6 +80,7 @@ impl Rig {
             thread: self.thread,
             workspace: self.project.then(|| self.dir.path().into()),
             capabilities: capabilities.iter().copied().collect(),
+            programs: vec![],
         };
         let request = ToolRequest {
             call: Id::new_v4().to_string(),
@@ -374,6 +375,7 @@ async fn a_large_catalog_fits_one_result_and_names_what_it_left_out() {
         thread: rig.thread,
         workspace: Some(rig.dir.path().into()),
         capabilities: BTreeSet::new(),
+        programs: vec![],
     };
     let request = ToolRequest {
         call: Id::new_v4().to_string(),

@@ -406,7 +406,10 @@ async fn gateway_needs_a_verified_pairing_and_never_persists_it() {
         credential: Some(credential),
         api: ProviderApi::Anthropic,
     });
-    assert_eq!(run(Command::SaveSettings(settings)).await, Reply::Ok);
+    assert_eq!(
+        run(Command::SaveSettings(Box::new(settings))).await,
+        Reply::Ok
+    );
     let refresh = || Command::RefreshCatalog { provider };
     assert!(matches!(
         run(refresh()).await,
@@ -993,7 +996,10 @@ async fn the_gateway_journals_streamed_text_and_reports_partial_failures() {
         credential: None,
         api: ProviderApi::OpenAi,
     });
-    assert_eq!(run(Command::SaveSettings(settings)).await, Reply::Ok);
+    assert_eq!(
+        run(Command::SaveSettings(Box::new(settings))).await,
+        Reply::Ok
+    );
     let Reply::Catalog(catalog) = run(Command::RefreshCatalog { provider }).await else {
         panic!("catalog refresh failed");
     };

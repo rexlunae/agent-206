@@ -766,7 +766,7 @@ mod tests {
     async fn save(g: &Gateway, servers: Vec<McpServerConfig>) -> Reply {
         let mut settings = g.snapshot().unwrap().settings;
         settings.mcp_servers = servers;
-        send(g, Command::SaveSettings(settings)).await
+        send(g, Command::SaveSettings(Box::new(settings))).await
     }
 
     #[tokio::test]
