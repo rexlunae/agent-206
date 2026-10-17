@@ -1080,7 +1080,7 @@ async fn the_agent_learns_what_it_can_call_and_what_to_ask_for() {
     assert_eq!(thread.state, RunState::Complete, "{:?}", thread.error);
     let listing: serde_json::Value = serde_json::from_str(results[0].as_deref().unwrap()).unwrap();
     let entry = read(&listing);
-    assert_eq!(entry["call_as"], tool_name(EXTENSION, READ));
+    assert_eq!(entry["name"], tool_name(EXTENSION, READ));
     assert_eq!(entry["blocked_by"], json!([]));
 
     // Once the user withdraws the grant, the agent is told what to ask for.
@@ -1088,7 +1088,7 @@ async fn the_agent_learns_what_it_can_call_and_what_to_ask_for() {
     let (_, results) = rig.round_trip(&[list()]).await;
     let listing: serde_json::Value = serde_json::from_str(results[0].as_deref().unwrap()).unwrap();
     let entry = read(&listing);
-    assert!(entry["call_as"].is_null(), "{entry}");
+    assert!(entry["name"].is_null(), "{entry}");
     assert_eq!(
         entry["blocked_by"],
         json!([format!(

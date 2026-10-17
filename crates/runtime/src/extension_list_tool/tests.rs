@@ -2,26 +2,29 @@
 //! native run is in `tests/extension_tools.rs`.
 use super::*;
 use crate::store::Store;
-use a206_core::Id;
+use a206_core::{ExtensionProposal, Id};
 use std::sync::{Arc, Mutex};
 
 const WORKSPACE: &str = "agent206.workspace";
 
 struct Rig {
-    _dir: tempfile::TempDir,
+    dir: tempfile::TempDir,
     store: Arc<Mutex<Store>>,
     host: ListHost,
     thread: Id,
+    /// The conversation has a project.
+    project: bool,
 }
 fn rig() -> Rig {
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(Mutex::new(Store::open(&dir.path().join("data")).unwrap()));
     let host = ListHost::new(ExtensionHost::new(store.clone(), dir.path().into()));
     Rig {
-        _dir: dir,
+        dir,
         store,
         host,
         thread: Id::new_v4(),
+        project: true,
     }
 }
 impl Rig {
@@ -49,7 +52,7 @@ impl Rig {
         };
         let scope = ToolScope {
             thread: self.thread,
-            workspace: None,
+            workspace: self.project.then(|| self.dir.path().into()),
             capabilities: capabilities.iter().copied().collect(),
         };
         let request = ToolRequest {
@@ -101,19 +104,24 @@ fn needing(rig: &Rig, need: Capability) -> String {
 }
 
 #[tokio::test]
-async fn the_listing_uses_no_capability_and_takes_no_arguments() {
+async fn the_listing_uses_no_capability_and_checks_its_arguments() {
     let rig = rig();
     // Readable from any conversation the user permits it in.
     assert!(rig.call(json!({}), &[]).await.is_ok());
     let extra = rig.call(json!({"include_state": true}), &[]).await;
     assert_eq!(extra.unwrap_err().kind, ErrorKind::InvalidRequest);
+    let number = rig.call(json!({"extension": 1}), &[]).await;
+    assert_eq!(number.unwrap_err().kind, ErrorKind::InvalidRequest);
+    let missing = format!("test.{}", Id::new_v4().simple());
+    let unknown = rig.call(json!({"extension": missing}), &[]).await;
+    assert_eq!(unknown.unwrap_err().kind, ErrorKind::NotFound);
     let spec = ListHost::spec();
     assert!(spec.capabilities.is_empty());
     assert!(spec.whole_output);
 }
 
 #[tokio::test]
-async fn each_tool_says_how_to_call_it_or_what_blocks_it() {
+async fn each_tool_gives_its_offered_name_and_what_blocks_it() {
     let rig = rig();
     let (read, write) = (
         needing(&rig, Capability::ReadWorkspace),
@@ -130,7 +138,7 @@ async fn each_tool_says_how_to_call_it_or_what_blocks_it() {
     let listing = rig.listed(&[]).await;
     let entry = tool(&listing, WORKSPACE, &read);
     assert_eq!(
-        entry["call_as"],
+        entry["name"],
         crate::extension_tools::tool_name(WORKSPACE, &read)
     );
     assert_eq!(
@@ -138,7 +146,7 @@ async fn each_tool_says_how_to_call_it_or_what_blocks_it() {
         [format!("This conversation does not allow: {read_label}.")]
     );
     let entry = tool(&listing, WORKSPACE, &write);
-    assert!(entry["call_as"].is_null());
+    assert!(entry["name"].is_null());
     assert_eq!(
         blocked(entry),
         [
@@ -159,7 +167,7 @@ async fn each_tool_says_how_to_call_it_or_what_blocks_it() {
     rig.edit(WORKSPACE, |p| p.enabled = false);
     let listing = rig.listed(&[Capability::ReadWorkspace]).await;
     let entry = tool(&listing, WORKSPACE, &read);
-    assert!(entry["call_as"].is_null());
+    assert!(entry["name"].is_null());
     assert_eq!(blocked(entry), ["The user has not enabled this extension."]);
     assert_eq!(extension(&listing, WORKSPACE)["enabled"], false);
 }
@@ -182,7 +190,7 @@ async fn an_extension_that_cannot_load_reports_its_failure() {
     assert_eq!(entry["source"], "installed by the user");
     assert!(!entry["errors"].as_array().unwrap().is_empty(), "{entry}");
     for tool in entry["tools"].as_array().unwrap() {
-        assert!(tool["call_as"].is_null(), "{tool}");
+        assert!(tool["name"].is_null(), "{tool}");
     }
     // The other extensions are still listed as usual.
     assert!(extension(&listing, WORKSPACE).get("errors").is_none());
@@ -228,5 +236,121 @@ async fn proposals_say_which_conversation_prepared_them() {
             .unwrap()
             .iter()
             .all(|e| e["id"] != here.summary.id)
+    );
+}
+
+#[tokio::test]
+async fn project_and_skill_requirements_are_reported() {
+    let mut rig = rig();
+    let read = needing(&rig, Capability::ReadWorkspace);
+    rig.edit(WORKSPACE, |p| {
+        p.enabled = true;
+        p.granted = [Capability::ReadWorkspace].into();
+    });
+    rig.project = false;
+    let listing = rig.listed(&[Capability::ReadWorkspace]).await;
+    assert_eq!(
+        blocked(tool(&listing, WORKSPACE, &read)),
+        ["This conversation has no project."]
+    );
+    rig.project = true;
+
+    // The skill tools are offered only while the user has approved a skill.
+    let skills = rig.plugin(crate::skill_tool::EXTENSION);
+    rig.edit(crate::skill_tool::EXTENSION, |p| {
+        p.enabled = true;
+        p.granted = p.capabilities.clone();
+    });
+    let all: Vec<Capability> = skills.capabilities.iter().copied().collect();
+    let listing = rig.listed(&all).await;
+    for spec in &skills.tools {
+        let entry = tool(&listing, crate::skill_tool::EXTENSION, &spec.name);
+        assert_eq!(entry["name"], spec.name.as_str());
+        assert_eq!(blocked(entry), ["The user has not approved any skill."]);
+    }
+    let name = Id::new_v4().simple().to_string();
+    rig.store
+        .lock()
+        .unwrap()
+        .state
+        .settings
+        .enabled_skills
+        .insert(name, Id::new_v4().simple().to_string());
+    let listing = rig.listed(&all).await;
+    for spec in &skills.tools {
+        let entry = tool(&listing, crate::skill_tool::EXTENSION, &spec.name);
+        assert!(blocked(entry).is_empty(), "{entry}");
+    }
+}
+
+#[tokio::test]
+async fn a_large_catalog_fits_one_result_and_names_what_it_left_out() {
+    let rig = rig();
+    let base = rig.plugin(WORKSPACE);
+    // Each entry is large enough that several cannot fit together.
+    let text = "x".repeat(tools::MAX_OUTPUT / 4);
+    let ids: Vec<String> = (0..8)
+        .map(|_| format!("test.{}", Id::new_v4().simple()))
+        .collect();
+    {
+        let mut store = rig.store.lock().unwrap();
+        for id in &ids {
+            let mut plugin = base.clone();
+            plugin.id = id.clone();
+            plugin.description = text.clone();
+            store.state.plugins.push(plugin);
+        }
+    }
+    let scope = ToolScope {
+        thread: rig.thread,
+        workspace: Some(rig.dir.path().into()),
+        capabilities: BTreeSet::new(),
+    };
+    let request = ToolRequest {
+        call: Id::new_v4().to_string(),
+        name: NAME.into(),
+        arguments: Map::new(),
+        approved: false,
+    };
+    let output = rig.host.call(&scope, request).await.unwrap();
+    assert!(
+        output.text.len() <= tools::MAX_OUTPUT,
+        "{}",
+        output.text.len()
+    );
+    let listing: Value = serde_json::from_str(&output.text).unwrap();
+    let listed: Vec<&str> = listing["extensions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["id"].as_str().unwrap())
+        .collect();
+    let omitted: Vec<&str> = listing["omitted"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|id| id.as_str().unwrap())
+        .collect();
+    assert!(!omitted.is_empty());
+    for id in &ids {
+        assert!(
+            listed.contains(&id.as_str()) != omitted.contains(&id.as_str()),
+            "{id} is listed or omitted, exactly once"
+        );
+    }
+    // The full listing leaves tool descriptions out; one extension has them.
+    assert!(
+        tool(&listing, WORKSPACE, &base.tools[0].name)
+            .get("description")
+            .is_none()
+    );
+    let one = rig
+        .call(json!({"extension": omitted[0]}), &[])
+        .await
+        .unwrap();
+    assert_eq!(one["extensions"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        tool(&one, omitted[0], &base.tools[0].name)["description"],
+        base.tools[0].description.as_str()
     );
 }

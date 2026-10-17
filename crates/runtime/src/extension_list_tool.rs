@@ -1,6 +1,8 @@
 //! The native `extension_list` tool: what extensions the user has, which of
 //! their tools this conversation can call, and what stands in the way of the
-//! rest (RustyClaw's `plugin_list`).
+//! rest (RustyClaw's `plugin_list`). The tools it may call are in the model's
+//! own tool list; this names each tool as it is offered there and gives the
+//! reasons one is missing, without claiming more than the gateway offers.
 //!
 //! It reads the same records as the Extensions page and changes nothing, so
 //! it uses no capability; like every tool it is denied until the user
@@ -11,12 +13,12 @@
 //! extension's private storage, and agents change it only through the
 //! extension's own tools, which validate what they store.
 use crate::{
-    extension_host::{ExtensionError, ExtensionHost},
-    tools::{ToolHost, ToolListing, ToolOutput, ToolRequest, ToolScope, ToolSpec},
+    extension_host::{Catalog, ExtensionError, ExtensionHost, PROJECT_CAPABILITIES},
+    tools::{self, ToolHost, ToolListing, ToolOutput, ToolRequest, ToolScope, ToolSpec},
 };
 use a206_core::{
-    Capability, ErrorKind, ErrorReport, ExtensionProposal, PluginSource, PluginSummary,
-    ToolPermission, UnavailableTools,
+    Capability, ErrorKind, ErrorReport, PluginSource, PluginSummary, ToolPermission,
+    UnavailableTools,
 };
 use futures_util::future::BoxFuture;
 use serde_json::{Map, Value, json};
@@ -29,6 +31,10 @@ pub const NAME: &str = "extension_list";
 pub enum ListError {
     #[error("unexpected argument `{0}`")]
     Unexpected(String),
+    #[error("`{0}` must be a string")]
+    NotAString(&'static str),
+    #[error("no extension `{0}` is installed")]
+    NotInstalled(String),
     #[error("unknown tool `{0}`")]
     UnknownTool(String),
     #[error(transparent)]
@@ -37,8 +43,8 @@ pub enum ListError {
 impl crate::error::Classified for ListError {
     fn kind(&self) -> Option<ErrorKind> {
         Some(match self {
-            Self::Unexpected(_) => ErrorKind::InvalidRequest,
-            Self::UnknownTool(_) => ErrorKind::NotFound,
+            Self::Unexpected(_) | Self::NotAString(_) => ErrorKind::InvalidRequest,
+            Self::UnknownTool(_) | Self::NotInstalled(_) => ErrorKind::NotFound,
             Self::Extension(error) => return crate::error::classify(error),
         })
     }
@@ -55,16 +61,22 @@ impl ListHost {
     fn spec() -> ToolSpec {
         ToolSpec {
             name: NAME.into(),
-            description: "List the user's extensions with their tools and panels. For each \
-                tool it gives the name to call it by in this conversation, or why it cannot \
-                be called: the extension is disabled, the user has not granted it a \
-                permission, or this conversation does not allow one. Only the user can \
-                enable extensions and grant permissions; ask them to on the Extensions page. \
-                Also lists packages waiting for the user's review."
+            description: "List the user's extensions with their tools and panels, and for each \
+                tool what keeps you from calling it: the extension is disabled, the user has \
+                not granted it a permission, this conversation does not allow one or has no \
+                project. Tools you can call are in your tool list under the name given here. \
+                Only the user can enable extensions and grant permissions; ask them to on the \
+                Extensions page. Also lists packages waiting for the user's review. Pass \
+                `extension` for one extension with its tool descriptions."
                 .into(),
             parameters: json!({
                 "type": "object",
-                "properties": {},
+                "properties": {
+                    "extension": {
+                        "type": "string",
+                        "description": "An extension id, to list only that extension in full."
+                    }
+                },
                 "additionalProperties": false
             }),
             capabilities: BTreeSet::new(),
@@ -77,107 +89,164 @@ impl ListHost {
         scope: &ToolScope,
         arguments: &Map<String, Value>,
     ) -> Result<ToolOutput, ListError> {
-        if let Some(name) = arguments.keys().next() {
+        if let Some(name) = arguments.keys().find(|name| name.as_str() != "extension") {
             return Err(ListError::Unexpected(name.clone()));
         }
-        let (plugins, proposals) = self.extensions.catalog()?;
+        let only = match arguments.get("extension") {
+            None => None,
+            Some(Value::String(id)) => Some(id.as_str()),
+            Some(_) => return Err(ListError::NotAString("extension")),
+        };
+        let mut catalog = self.extensions.catalog()?;
+        if let Some(id) = only {
+            catalog.plugins.retain(|plugin| plugin.id == id);
+            if catalog.plugins.is_empty() {
+                return Err(ListError::NotInstalled(id.into()));
+            }
+        }
         let (names, unavailable) = crate::extension_tools::offered_names(&self.extensions);
+        let context = Context {
+            scope,
+            names: &names,
+            unavailable: &unavailable,
+            approved_skills: catalog.approved_skills,
+        };
         Ok(ToolOutput {
-            text: listing(scope, &plugins, &proposals, &names, &unavailable).to_string(),
+            text: listing(&context, &catalog, only.is_some()).to_string(),
             is_error: false,
         })
     }
 }
 
+/// Room for the extension entries in one result; the rest is the proposals
+/// (at most [`a206_core::MAX_EXTENSION_PROPOSALS`]) and the note.
+const BUDGET: usize = tools::MAX_OUTPUT - 8 * 1024;
+
+/// What a tool's availability depends on besides its extension's record.
+struct Context<'a> {
+    scope: &'a ToolScope,
+    names: &'a BTreeMap<(String, String), String>,
+    unavailable: &'a [UnavailableTools],
+    approved_skills: bool,
+}
+
 /// The listing the model receives. Names and descriptions are written by each
-/// extension's author.
-fn listing(
-    scope: &ToolScope,
-    plugins: &[PluginSummary],
-    proposals: &[ExtensionProposal],
-    names: &BTreeMap<(String, String), String>,
-    unavailable: &[UnavailableTools],
-) -> Value {
-    let extensions: Vec<Value> = plugins
-        .iter()
-        .map(|plugin| {
-            let failures: Vec<String> = unavailable
-                .iter()
-                .filter(|u| u.source == plugin.id)
-                .map(|u| display(&u.error))
-                .collect();
-            let tools: Vec<Value> = plugin
-                .tools
-                .iter()
-                .map(|tool| {
-                    let call_as = if plugin.id == crate::skill_tool::EXTENSION {
-                        // Offered under its stable names while a skill is approved.
-                        (plugin.enabled && tool.capabilities.is_subset(&plugin.granted))
-                            .then(|| tool.name.clone())
-                    } else {
-                        names.get(&(plugin.id.clone(), tool.name.clone())).cloned()
-                    };
-                    let mut blocked = blocked(plugin, &tool.capabilities, scope);
-                    if call_as.is_none() && blocked.is_empty() && failures.is_empty() {
-                        blocked.push(
-                            "Not offered: its name is too long or shared with another \
-                             extension's tool."
-                                .into(),
-                        );
-                    }
-                    json!({
-                        "tool": tool.name,
-                        "description": tool.description,
-                        "permissions": labels(&tool.capabilities),
-                        "call_as": call_as,
-                        "blocked_by": blocked,
-                    })
-                })
-                .collect();
-            let panels: Vec<Value> = plugin
-                .panels
-                .iter()
-                .map(|panel| json!({"id": panel.id, "title": panel.title}))
-                .collect();
-            let mut entry = json!({
-                "id": plugin.id,
-                "name": plugin.name,
-                "description": plugin.description,
-                "version": plugin.version,
-                "source": match plugin.source {
-                    PluginSource::Bundled => "bundled",
-                    PluginSource::Installed { .. } => "installed by the user",
-                },
-                "enabled": plugin.enabled,
-                "permissions_requested": labels(&plugin.capabilities),
-                "permissions_granted": labels(&plugin.granted),
-                "tools": tools,
-                "panels": panels,
-            });
-            if !failures.is_empty() {
-                entry["errors"] = json!(failures);
-            }
-            entry
-        })
-        .collect();
-    let proposals: Vec<Value> = proposals
+/// extension's author. The full listing leaves out tool descriptions and stops
+/// before [`BUDGET`], naming the extensions it left out; a listing of one
+/// extension includes them when they fit.
+fn listing(context: &Context<'_>, catalog: &Catalog, detailed: bool) -> Value {
+    let mut extensions = vec![];
+    let mut omitted = vec![];
+    let mut used = 0;
+    for plugin in &catalog.plugins {
+        let mut entry = extension(context, plugin, detailed);
+        let mut size = entry.to_string().len();
+        if detailed && size > BUDGET {
+            entry = extension(context, plugin, false);
+            entry["tool_descriptions_omitted"] = json!(true);
+            size = entry.to_string().len();
+        }
+        if used + size > BUDGET {
+            omitted.push(plugin.id.clone());
+            continue;
+        }
+        used += size;
+        extensions.push(entry);
+    }
+    let proposals: Vec<Value> = catalog
+        .proposals
         .iter()
         .map(|proposal| {
             json!({
                 "id": proposal.summary.id,
                 "version": proposal.summary.version,
                 "digest": proposal.digest,
-                "prepared_in_this_conversation": proposal.thread == scope.thread,
+                "prepared_in_this_conversation": proposal.thread == context.scope.thread,
             })
         })
         .collect();
-    json!({
+    let mut listing = json!({
         "extensions": extensions,
         "waiting_for_review": proposals,
-        "note": "Only the user can install, enable or grant permissions to extensions. \
-            A tool whose call_as is set may still need the user's permission in this \
-            conversation.",
-    })
+        "note": "Only the user can install, enable or grant permissions to extensions. A tool \
+            with nothing in blocked_by can be called if it is in your tool list; if it is not, \
+            the user may still need to permit it in this conversation.",
+    });
+    if !omitted.is_empty() {
+        listing["omitted"] = json!(omitted);
+        listing["omitted_note"] =
+            json!("These extensions did not fit; pass one as `extension` to list it on its own.");
+    }
+    listing
+}
+
+fn extension(context: &Context<'_>, plugin: &PluginSummary, detailed: bool) -> Value {
+    let failures: Vec<String> = context
+        .unavailable
+        .iter()
+        .filter(|u| u.source == plugin.id)
+        .map(|u| display(&u.error))
+        .collect();
+    let skills = plugin.id == crate::skill_tool::EXTENSION;
+    let tools: Vec<Value> = plugin
+        .tools
+        .iter()
+        .map(|tool| {
+            let mut blocked = blocked(plugin, &tool.capabilities, context.scope);
+            let name = if skills {
+                // Offered under its stable names, and only while a skill is approved.
+                if !context.approved_skills {
+                    blocked.push("The user has not approved any skill.".into());
+                }
+                Some(tool.name.clone())
+            } else {
+                context
+                    .names
+                    .get(&(plugin.id.clone(), tool.name.clone()))
+                    .cloned()
+            };
+            if name.is_none() && blocked.is_empty() && failures.is_empty() {
+                blocked.push(
+                    "Not offered: its name is too long or shared with another extension's tool."
+                        .into(),
+                );
+            }
+            let mut entry = json!({
+                "tool": tool.name,
+                "name": name,
+                "permissions": labels(&tool.capabilities),
+                "blocked_by": blocked,
+            });
+            if detailed {
+                entry["description"] = json!(tool.description);
+            }
+            entry
+        })
+        .collect();
+    let panels: Vec<Value> = plugin
+        .panels
+        .iter()
+        .map(|panel| json!({"id": panel.id, "title": panel.title}))
+        .collect();
+    let mut entry = json!({
+        "id": plugin.id,
+        "name": plugin.name,
+        "description": plugin.description,
+        "version": plugin.version,
+        "source": match plugin.source {
+            PluginSource::Bundled => "bundled",
+            PluginSource::Installed { .. } => "installed by the user",
+        },
+        "enabled": plugin.enabled,
+        "permissions_requested": labels(&plugin.capabilities),
+        "permissions_granted": labels(&plugin.granted),
+        "tools": tools,
+        "panels": panels,
+    });
+    if !failures.is_empty() {
+        entry["errors"] = json!(failures);
+    }
+    entry
 }
 
 /// What keeps a tool needing `needs` from being called in `scope`.
@@ -199,6 +268,9 @@ fn blocked(plugin: &PluginSummary, needs: &BTreeSet<Capability>, scope: &ToolSco
             "This conversation does not allow: {}.",
             labels(&disallowed).join(", ")
         ));
+    }
+    if scope.workspace.is_none() && PROJECT_CAPABILITIES.iter().any(|c| needs.contains(c)) {
+        reasons.push("This conversation has no project.".into());
     }
     reasons
 }
