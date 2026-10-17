@@ -169,9 +169,9 @@ invocations and relays gateway-authorized host calls (`a206/docs/plugin-api.md`)
 
 | RustyClaw capability | Agent 206 status | How it should land |
 | --- | --- | --- |
-| Landlock, Bubblewrap, Landlock+Bwrap, Docker, macOS sandbox-exec, path validation (`sandbox/*`, `runtime/docker.rs`) | partial: external backends and MCP servers (`a206/crates/mcp/src/sandbox.rs`) run under macOS sandbox-exec; external backends also or on Linux under bubblewrap namespaces plus Landlock applied inside, with a loopback-only proxy relay (`crates/sandbox`, `runtime/src/backends/isolation.rs`); missing bwrap or Landlock is an error, never a fallback. Docker and path-validation modes are deliberately not ported (they are downgrades); native exec and the WASM worker are not sandboxed yet | Reuse `a206-sandbox` profiles for MCP servers, native exec and the extension worker |
+| Landlock, Bubblewrap, Landlock+Bwrap, Docker, macOS sandbox-exec, path validation (`sandbox/*`, `runtime/docker.rs`) | partial: external backends and MCP servers (`a206/crates/mcp/src/sandbox.rs`) run under macOS sandbox-exec; external backends also run on Linux under bubblewrap namespaces plus Landlock applied inside, with a loopback-only proxy relay (`crates/sandbox`, `runtime/src/backends/isolation.rs`); missing bwrap or Landlock is an error, never a fallback. On Linux the WASM extension worker also runs confined (no network, no project files, nothing executable but itself; `runtime/src/sandbox.rs`). Docker and path-validation modes are deliberately not ported (they are downgrades). Native exec does not exist yet; the worker is unconfined on macOS | Reuse `a206-sandbox` for Linux MCP servers and for native exec when the run engine adds it; Seatbelt profile for the macOS worker |
 | SSH runtime adapter for remote exec (`runtime/ssh.rs`) | missing (remote gateway via SSH exists) | Execute on remote gateway rather than per-command SSH |
-| WASM tool sandbox | present (a206 extra): fuel/memory/time-bounded worker process, no WASI, only the two ABI host imports, each call re-authorized by the gateway (`a206/crates/extensions`) | Add OS profile to worker |
+| WASM tool sandbox | present (a206 extra): fuel/memory/time-bounded worker process, no WASI, only the two ABI host imports, each call re-authorized by the gateway (`a206/crates/extensions`); on Linux the worker runs under bubblewrap + Landlock with no network | Add the macOS OS profile to the worker |
 
 ## Observability, deployment
 
@@ -194,8 +194,9 @@ invocations and relays gateway-authorized host calls (`a206/docs/plugin-api.md`)
 3. **Extension ABI v2** (MessagePack input, scoped host calls for workspace/exec/network/git, typed
    UI contributions, reviewed install). Partial: the ABI, SDK, workspace read/list and state host
    calls, typed panels and user grants are in; exec/network/git host calls and package install remain. Every RustyClaw tool family is meant to ship as a WASM builtin.
-4. **OS sandbox for native exec and the WASM worker.** External backends are isolated on macOS and
-   Linux; native Execute/WriteWorkspace grants still need the same profiles (`crates/sandbox`).
+4. **OS sandbox for native exec and the macOS worker.** External backends are isolated on macOS and
+   Linux, and the WASM worker on Linux; native Execute/WriteWorkspace grants (when the run engine
+   adds native exec) and the macOS worker still need profiles (`crates/sandbox`, `runtime/src/sandbox.rs`).
 5. **Context management**: compaction keyed to API-reported limits, workspace instruction files,
    memory extension. Needed for long-running and scheduled agents.
 6. **Delegation/task lifecycle** (agent-requested spawn, steering, hierarchical cancel, budgets) →

@@ -2,7 +2,9 @@
 //! the host calls it relays.
 //!
 //! Every invocation runs in a fresh `agent206 extension-worker` child with a
-//! cleared environment. The worker holds no authority; each host call it
+//! cleared environment; on Linux that child is also confined by
+//! `a206_sandbox`, with no network, no project files and nothing to execute
+//! but itself. The worker holds no authority; each host call it
 //! relays is checked here against the call's effective grant, which is the
 //! intersection of the user's grant to the extension, the caller's scope and
 //! what the tool or panel declares.
@@ -68,6 +70,8 @@ pub enum ExtensionError {
     CurrentExe(#[source] std::io::Error),
     #[error("could not start the extension worker")]
     Spawn(#[source] std::io::Error),
+    #[error("could not confine the extension worker")]
+    Confine(#[from] crate::sandbox::ConfineError),
     #[error("the extension worker channel failed")]
     Channel(#[source] std::io::Error),
     #[error("the extension worker sent an invalid frame")]
@@ -101,6 +105,7 @@ impl crate::error::Classified for ExtensionError {
             }
             Self::NoProject => ErrorKind::InvalidRequest,
             Self::Builtins(_) | Self::Poisoned | Self::CurrentExe(_) => ErrorKind::Internal,
+            Self::Confine(error) => return classify(error),
             Self::Spawn(_) | Self::Channel(_) | Self::Exited => ErrorKind::Unavailable,
             Self::Frame(_) | Self::Unexpected => ErrorKind::Protocol,
             Self::Timeout(_) => ErrorKind::Timeout,
@@ -145,6 +150,8 @@ pub struct ExtensionTool {
 #[derive(Clone)]
 pub struct ExtensionHost {
     store: Arc<Mutex<Store>>,
+    /// Passed to unconfined workers; a Linux worker gets an empty one instead.
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
     data_dir: PathBuf,
 }
 impl ExtensionHost {
@@ -299,19 +306,8 @@ impl ExtensionHost {
         start: Start,
         mut host: HostCalls,
     ) -> Result<Outcome, ExtensionError> {
-        let mut child = tokio::process::Command::new(
-            std::env::current_exe().map_err(ExtensionError::CurrentExe)?,
-        )
-        .arg("--data-dir")
-        .arg(&self.data_dir)
-        .arg("extension-worker")
-        .env_clear()
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(ExtensionError::Spawn)?;
+        let mut worker = self.spawn_worker().await?;
+        let child = worker.child();
         let (Some(mut input), Some(mut output)) = (child.stdin.take(), child.stdout.take()) else {
             return Err(ExtensionError::Exited);
         };
@@ -330,6 +326,7 @@ impl ExtensionHost {
         if let Err(error) = child.wait().await {
             tracing::warn!(error = &error as &dyn std::error::Error, extension = %start.extension, "could not reap the extension worker");
         }
+        worker.stop().await;
         match result.map_err(ExtensionError::Failed)? {
             Outcome::Failed(guest) => Err(ExtensionError::Guest {
                 code: guest.code,
@@ -338,6 +335,59 @@ impl ExtensionHost {
             }),
             outcome => Ok(outcome),
         }
+    }
+}
+
+/// A running worker, confined on Linux.
+#[cfg(target_os = "linux")]
+struct Worker(crate::sandbox::Confined);
+#[cfg(not(target_os = "linux"))]
+struct Worker(tokio::process::Child);
+impl Worker {
+    fn child(&mut self) -> &mut tokio::process::Child {
+        #[cfg(target_os = "linux")]
+        return &mut self.0.child;
+        #[cfg(not(target_os = "linux"))]
+        return &mut self.0;
+    }
+    async fn stop(self) {
+        #[cfg(target_os = "linux")]
+        self.0.stop().await;
+    }
+}
+
+impl ExtensionHost {
+    #[cfg(not(target_os = "linux"))]
+    async fn spawn_worker(&self) -> Result<Worker, ExtensionError> {
+        let child = tokio::process::Command::new(
+            std::env::current_exe().map_err(ExtensionError::CurrentExe)?,
+        )
+        .arg("--data-dir")
+        .arg(&self.data_dir)
+        .arg("extension-worker")
+        .env_clear()
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(ExtensionError::Spawn)?;
+        Ok(Worker(child))
+    }
+
+    /// A missing sandbox layer is an error, never an unconfined worker.
+    #[cfg(target_os = "linux")]
+    async fn spawn_worker(&self) -> Result<Worker, ExtensionError> {
+        // The worker keeps nothing; its data directory is the empty scratch.
+        let confined = crate::sandbox::Confined::spawn_self(|scratch| {
+            vec![
+                "--data-dir".into(),
+                scratch.into(),
+                "extension-worker".into(),
+            ]
+        })
+        .await?;
+        Ok(Worker(confined))
     }
 }
 

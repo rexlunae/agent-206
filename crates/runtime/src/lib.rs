@@ -13,6 +13,7 @@ pub mod mcp;
 pub mod network;
 pub mod process;
 pub mod provider;
+pub mod sandbox;
 pub mod service;
 pub mod sse;
 pub mod store;
