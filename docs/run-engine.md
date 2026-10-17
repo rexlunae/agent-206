@@ -208,8 +208,33 @@ background sessions.
   grants is stopped and reported as such, and a command still starting is
   stopped with `PermissionDenied`. Because a call runs with the scope taken
   when it started, the gateway rescopes again when a call returns after
-  policy changed during it. There is no terminal, so `send_keys`
-  (key chords for interactive programs) is not offered.
+  policy changed during it.
+- **Terminal sessions.** `background` with `terminal: true` runs the command
+  on a pseudo-terminal the gateway opens (`exec_tool/terminal.rs`, 80x24,
+  `TERM=dumb`): its stdin, stdout and stderr are the terminal, which is also
+  its controlling terminal, so programs that need a terminal run and the
+  line discipline turns Ctrl-C and Ctrl-Z into signals for the command's
+  process group. On Linux the sandbox helper starts its own session inside
+  bubblewrap's, takes the terminal as controlling terminal and hands the
+  foreground to the command's group (`a206-sandbox` `helper.rs`); bubblewrap
+  and the helper still report setup failures on a separate pipe, shown in a
+  poll as `sandbox` output only when there is any. On macOS a launcher in
+  this executable starts the session and takes the terminal before it
+  becomes `sandbox-exec` (`terminal.rs`); the Seatbelt policy adds only that
+  terminal device and `/dev/tty`, and Landlock on Linux adds only `/dev/tty`,
+  with the device-control right so a program can configure the terminal it
+  opens there.
+  `poll` returns the terminal's output, echoed input included, as one
+  `terminal` stream with the same bounds. `process_write` then also takes
+  `keys`, a list of at most 256 key names sent after `data` (Enter as a
+  carriage return, Tab, Escape, Space, Backspace, Delete, Insert, arrows,
+  Home, End, PageUp, PageDown, F1–F12, Ctrl-A–Z and Ctrl-@ [ \ ] ^ _, names
+  as in RustyClaw's `send_keys`); an unknown name is refused rather than
+  typed as text. Keys sent to a session without a terminal, and `close` on
+  one with a terminal (send Ctrl-D instead), are `Conflict`. On macOS the
+  terminal's controlling side is opened without close-on-exec and marked
+  so immediately after, so a program the gateway starts in that instant can
+  inherit it; Linux opens it close-on-exec.
 - **Other platforms.** Windows does not offer these tools; the listing reports
   `native exec` unavailable rather than run commands unconfined.
 
@@ -218,7 +243,11 @@ sandbox on Linux and macOS CI (grants, hidden state, symlinked working
 directories, network, exit status, output and time bounds, leftover
 background processes; background sessions' input, output, ownership, kill,
 timeout, limits, input deadlines, stopping on a withdrawn grant and end
-with their host; on Linux the test binary doubles as
+with their host; terminal sessions' terminal streams, size read through a `/dev/tty`
+opened in the sandbox,
+text and keys, refused close and Ctrl-C interrupting the command, checked
+to fail when the command's group is not given the foreground; on Linux the
+test binary doubles as
 the helper), and
 `crates/sandbox/src/seatbelt.rs` tests the macOS policy text on every platform.
 

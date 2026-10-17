@@ -11,6 +11,7 @@ use crate::{
     },
     schedules::Schedules,
     settings::{Appearance, Prompts, Providers},
+    welcome::Welcome,
 };
 use fc_dioxus::prelude::*;
 use uuid::Uuid;
@@ -58,6 +59,8 @@ pub(crate) enum Route {
     Joshua {},
     #[route("/gateway")]
     Gateway {},
+    #[route("/welcome")]
+    Welcome {},
     #[route("/:..segments")]
     NotFound { segments: Vec<String> },
 }
@@ -80,6 +83,7 @@ impl Route {
             Self::Prompts {} => IconName::Edit,
             Self::Security {} => IconName::Lock,
             Self::Joshua {} | Self::Gateway {} => IconName::Terminal,
+            Self::Welcome {} => IconName::Check,
         }
     }
     pub(crate) fn label(&self) -> &'static str {
@@ -101,6 +105,7 @@ impl Route {
             Self::Security {} => "Security",
             Self::Joshua {} => "Joshua",
             Self::Gateway {} => "Gateway",
+            Self::Welcome {} => "Get started",
             Self::NotFound { .. } => "Page not found",
         }
     }
@@ -333,6 +338,24 @@ pub(crate) mod tests {
         dom.provide_root_context(Rc::new(MemoryHistory::default()) as Rc<dyn History>);
         dom.rebuild_in_place();
         dioxus_ssr::render(&dom)
+    }
+
+    #[test]
+    fn split_view_keeps_each_conversations_subagents_in_its_details() {
+        let parent = a206_core::Thread::new(Uuid::new_v4().to_string(), a206_core::Mode::Chat);
+        let mut child = a206_core::Thread::new(Uuid::new_v4().to_string(), a206_core::Mode::Chat);
+        child.parent = Some(parent.id);
+        let mut snapshot = crate::empty_snapshot();
+        snapshot.threads = vec![parent.clone(), child.clone()];
+        let html = render_thread(ThreadFixture {
+            snapshot,
+            id: parent.id,
+            split: Some(child.id),
+            message: None,
+        });
+        assert_eq!(html.matches(">Subagents<").count(), 2, "{html}");
+        assert!(html.contains("Delegated from"), "{html}");
+        assert!(html.contains("No subagents yet"), "{html}");
     }
 
     #[test]

@@ -197,6 +197,24 @@ impl CodingBackend {
             Self::ClaudeAgent => "Claude Agent",
         }
     }
+    /// What the user can grant a conversation on this backend, in display
+    /// order. Agent 206 enforces git and network grants in its own tools; an
+    /// external runtime is confined only by project access and commands, so
+    /// it is never offered a grant it could not be held to.
+    pub fn grantable(self) -> &'static [Capability] {
+        use Capability::*;
+        match self {
+            Self::Native => &[
+                ReadWorkspace,
+                WriteWorkspace,
+                Execute,
+                GitRead,
+                GitWrite,
+                Network,
+            ],
+            Self::Codex | Self::ClaudeAgent => &[ReadWorkspace, WriteWorkspace, Execute],
+        }
+    }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BackendConfig {
@@ -1370,6 +1388,10 @@ pub struct VaultState {
     pub unlocked: bool,
     pub totp_enrolled: Option<bool>,
     pub agent_access: Option<bool>,
+    /// Whether the broker holds a gateway pairing for this unlock; unknown
+    /// while locked or from an older bridge.
+    #[serde(default)]
+    pub gateway_paired: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

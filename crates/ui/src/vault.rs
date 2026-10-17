@@ -8,11 +8,12 @@
 //! held as a zeroizing [`WireSecret`], never rendered. The enrollment key is
 //! shown as text content so it can be copied into an authenticator app.
 use crate::error::{ErrorNotice, record};
+use crate::welcome::{VaultFacts, VaultProgress, VaultSeen};
 use a206_broker::{BrokerError, BrokerStatus, ClientError, Reply, Request, WireSecret};
 use a206_core::{ErrorReport, GatewayTarget};
 use a206_runtime::vault::{Session, VaultError};
 use fc_dioxus::prelude::*;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// The account name shown in the authenticator app, as the CLI uses by default.
 const TOTP_ACCOUNT: &str = "agent206";
@@ -103,11 +104,26 @@ struct Panel {
     failure: Signal<Option<Failure>>,
     /// A secondary failure that did not undo the main action (pairing after unlock).
     warning: Signal<Option<Failure>>,
+    /// The latest background re-read's failure, until a read succeeds.
+    poll_failure: Signal<Option<Failure>>,
     notice: Signal<Option<&'static str>>,
     busy: Signal<bool>,
     flow: Signal<Flow>,
     held: Signal<Option<WireSecret>>,
     enrollment: Signal<Option<Enrollment>>,
+    /// The Get started checklist, when this panel is on that page.
+    progress: Option<VaultProgress>,
+}
+/// A stopped broker holds no unlocked vault, so its vault reads as locked.
+fn stopped(root: &Path) -> BrokerStatus {
+    BrokerStatus {
+        exists: a206_broker::vault_path(root).exists(),
+        unlocked: false,
+        totp_enrolled: None,
+        agent_access: None,
+        step_up_active: false,
+        gateway_paired: None,
+    }
 }
 fn broker_refused(error: &VaultError, expected: BrokerError) -> bool {
     matches!(error, VaultError::Broker(ClientError::Broker(refusal)) if *refusal == expected)
@@ -151,10 +167,44 @@ impl Panel {
         self.refresh().await;
         self.busy.set(false);
     }
+    fn report(self, seen: VaultSeen) {
+        if let Some(progress) = self.progress {
+            progress.report(seen);
+        }
+    }
+    fn show(mut self, status: BrokerStatus) {
+        self.report(VaultSeen::Facts(VaultFacts {
+            exists: status.exists,
+            unlocked: status.unlocked,
+            totp_enrolled: status.totp_enrolled,
+            paired: status.gateway_paired,
+        }));
+        self.poll_failure.set(None);
+        self.status.set(Some(status));
+    }
+    /// The Get started page's background re-read. It never starts a broker,
+    /// so a deliberate `vault stop` stays stopped, and its failure is shown
+    /// apart from action failures and cleared by the next good read.
+    async fn poll(mut self, root: &Path) {
+        match self.session().status_if_running().await {
+            Ok(found) => self.show(found.unwrap_or_else(|| stopped(root))),
+            Err(error) => {
+                // Offer no action on a state that could not be confirmed.
+                self.report(VaultSeen::Unreadable);
+                self.status.set(None);
+                self.poll_failure.set(Some(failure(
+                    "vault_status",
+                    "Could not re-read the vault state",
+                    &error,
+                )));
+            }
+        }
+    }
     async fn refresh(mut self) {
         match self.session().status().await {
-            Ok(status) => self.status.set(Some(status)),
+            Ok(status) => self.show(status),
             Err(error) => {
+                self.report(VaultSeen::Unreadable);
                 self.status.set(None);
                 let status = failure("vault_status", "Could not read the vault state", &error);
                 let (mut primary, mut secondary) = (self.failure.write(), self.warning.write());
@@ -407,14 +457,33 @@ fn VaultPanel(root: PathBuf) -> Element {
         status: use_signal(|| None),
         failure: use_signal(|| None),
         warning: use_signal(|| None),
+        poll_failure: use_signal(|| None),
         notice: use_signal(|| None),
         busy: use_signal(|| false),
         flow: use_signal(|| Flow::Idle),
         held: use_signal(|| None),
         enrollment: use_signal(|| None),
+        progress: VaultProgress::listener(),
     };
     // Reads only through `peek`, so this runs once, after the first render.
     use_effect(move || panel.check());
+    // On the Get started page, keep the checklist current with changes other
+    // clients make. Skipped while an action or a multi-step flow is running.
+    let polled = root.clone();
+    use_future(move || {
+        let root = polled.clone();
+        async move {
+            if panel.progress.is_none() {
+                return;
+            }
+            loop {
+                futures_timer::Delay::new(crate::welcome::VAULT_POLL).await;
+                if !*panel.busy.peek() && *panel.flow.peek() == Flow::Idle {
+                    panel.poll(&root).await;
+                }
+            }
+        }
+    });
     let mut password = use_signal(String::new);
     let mut confirm = use_signal(String::new);
     let mut code = use_signal(String::new);
@@ -446,7 +515,7 @@ fn VaultPanel(root: PathBuf) -> Element {
                     DescriptionItem { term: rsx! { "Two-factor authentication" }, "{known(status.totp_enrolled)}" }
                     DescriptionItem { term: rsx! { "Agent credential access" }, "{known(status.agent_access)}" }
                 }
-            } else if (panel.failure)().is_none() {
+            } else if (panel.failure)().is_none() && (panel.poll_failure)().is_none() {
                 p { class: "a206-muted", role: "status", "Checking the vault…" }
             }
             if let Some(message) = (panel.notice)() {
@@ -456,6 +525,9 @@ fn VaultPanel(root: PathBuf) -> Element {
                 ErrorNotice { report, title }
             }
             if let Some(Failure { title, report }) = (panel.warning)() {
+                ErrorNotice { report, title }
+            }
+            if let Some(Failure { title, report }) = (panel.poll_failure)() {
                 ErrorNotice { report, title }
             }
             match flow {

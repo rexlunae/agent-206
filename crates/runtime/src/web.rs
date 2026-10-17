@@ -649,6 +649,7 @@ async fn broker_vault(root: &std::path::Path, id: uuid::Uuid, request: VaultRequ
         unlocked: false,
         totp_enrolled: None,
         agent_access: None,
+        gateway_paired: None,
     };
     let operation = match request {
         VaultRequest::Status => "read vault state",
@@ -678,6 +679,7 @@ async fn broker_vault(root: &std::path::Path, id: uuid::Uuid, request: VaultRequ
             unlocked: status.unlocked,
             totp_enrolled: status.totp_enrolled,
             agent_access: status.agent_access,
+            gateway_paired: status.gateway_paired,
         });
     match (request, state) {
         (VaultRequest::Status, Ok(state)) => VaultReply::State(state),
@@ -1209,6 +1211,7 @@ mod tests {
                 unlocked: false,
                 totp_enrolled: None,
                 agent_access: None,
+                gateway_paired: None,
             };
             let expected = match request {
                 VaultRequest::Status => VaultReply::State(stopped),
