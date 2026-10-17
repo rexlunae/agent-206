@@ -11,7 +11,10 @@ gateway never relays passwords, codes or values. The gateway connects with the
 `Gateway` role, which can only ask the broker to send a provider request to an
 origin the user bound to that credential; it never receives the value. The CLI
 and the desktop/TUI Security page are the trusted surfaces; both use the shared
-`a206_runtime::vault` operations. Agent approvals are the next gate.
+`a206_runtime::vault` operations. The web client's Security page only reads the
+vault state of the bridge's local gateway and can lock it (`/api/vault`); the
+vault password and enrollment key never pass through a browser, and a remote
+gateway's vault is never touched. Agent approvals are the next gate.
 
 Gateway pairing: the `Gateway` role must present a pairing before any provider
 request. Only a stepped-up user connection can mint one (`agent206 vault unlock`
@@ -106,7 +109,7 @@ protection on a renderer or platform that cannot enforce it.
 | Vault encryption | Password or owner-only key file, atomic encrypted writes | Legacy password-based library tested; an existing password vault (RustyClaw's) can be adopted through the broker's `ImportVault`, which verifies password and enrolled TOTP on a private copy and never replaces a vault (tested); key-file import and modern envelope pending |
 | Process/channel separation | Secrets outside agent context | Separate broker process with role-limited bounded MessagePack IPC, tested; gateway role is value-free. Same-user socket access and remote SSH channel are open items (see above) |
 | TOTP | Vault-held seed is authoritative; 6 digits, 30-second steps, ±1 step | Library: seed generated in memory and committed only after a valid code, enrollment expiry, ±1 step, persisted replay protection, drift diagnosis, code-gated removal; seed stored under RustyClaw's key so imported vaults stay enrolled; tested. Standalone CLI challenges enrolled vaults. Broker enrollment from the CLI and the desktop/TUI Security page shows the manual key and otpauth link as text (no QR yet) and reports enrollment only after the broker confirms a code. Broker connect challenge and recovery codes pending |
-| Unlock and step-up surfaces | Password unlock, TOTP challenge when enrolled, step-up before sensitive operations | CLI and desktop/TUI Security page (local profiles) send the same broker `Unlock`/`StepUp` requests; the TOTP challenge follows the broker's `TotpRequired`, never a client flag; secrets are cleared from fields on submit and kept out of status text and logs. Remote-gateway controls in the GUI pending (CLI on that host) |
+| Unlock and step-up surfaces | Password unlock, TOTP challenge when enrolled, step-up before sensitive operations | CLI and desktop/TUI Security page (local profiles) send the same broker `Unlock`/`StepUp` requests; the TOTP challenge follows the broker's `TotpRequired`, never a client flag; secrets are cleared from fields on submit and kept out of status text and logs. The web client shows state and locks only. Remote-gateway controls in the GUI pending (CLI on that host) |
 | Authentication throttling | Shared 3-failure / 30-second lockout over a 60-second failure window | Library throttle keyed by principal, not connection, tested; failures during lockout neither shorten nor extend it. Broker-wide wiring pending (the standalone CLI is one attempt per process) |
 | Per-credential policy | Always, WithApproval, WithAuth, SkillOnly, TriggerOnly | All variants, RustyClaw JSON shape, unknown variants rejected; evaluated deny-by-default and tested. Approval/step-up facts must come from the broker's trusted surface, pending |
 | Disabled credentials | Disabled entry cannot be used | Enforced for agent use and tested; missing flag reads as RustyClaw's default; owner reveal still allowed |
