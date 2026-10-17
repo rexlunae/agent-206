@@ -1119,6 +1119,22 @@ async fn the_gateway_journals_streamed_text_and_reports_partial_failures() {
     assert_eq!(cancelled.state, RunState::Cancelled);
     assert_eq!(cancelled.messages.last().unwrap().text, partial);
     upstream_closed(&opened.feed, "cancellation").await;
+
+    // Each run's end is journaled once, with how it ended.
+    let Reply::Events(events) = run(Command::Events { after: cursor }).await else {
+        panic!("events unavailable");
+    };
+    let ended: Vec<_> = events
+        .into_iter()
+        .filter_map(|e| match e.kind {
+            EventKind::RunEnded { thread, state } if thread == id => Some(state),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        ended,
+        [RunState::Complete, RunState::Failed, RunState::Cancelled]
+    );
 }
 /// A broker from before streaming answers in one buffered reply; the gateway
 /// greets it with its own version, never sends it a stream request, and
