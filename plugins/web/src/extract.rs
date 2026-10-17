@@ -598,7 +598,8 @@ fn escape(url: String) -> String {
     }) && depth == 0;
     let unsafe_byte = |byte: u8| {
         byte <= b' '
-            || matches!(byte, b'<' | b'>' | b'"' | b'`' | 0x7f)
+            // A backslash would escape the Markdown after it.
+            || matches!(byte, b'<' | b'>' | b'"' | b'`' | b'\\' | 0x7f)
             || (!balanced && matches!(byte, b'(' | b')'))
     };
     if !url.bytes().any(unsafe_byte) {
@@ -921,6 +922,7 @@ See the other, x, no and rel.\n\nUse cargo:\n\nfn  main() {\n    x();\n}\n\nafte
             ),
             ("a(1)?s=x", "https://site.example/docs/a(1)?s=x"),
             ("a)(", "https://site.example/docs/a%29%28"),
+            ("a(\\)", "https://site.example/docs/a(%5C)"),
             (
                 "https://x.example/a&quot;b<c>",
                 "https://x.example/a%22b%3Cc%3E",
