@@ -58,10 +58,15 @@ restart cancels unfinished calls and drops pending approvals.
 every conversation it delegated to, before their next model round, the same
 boundary steered messages join at (composer Pause, the command palette or
 `agent206 pause THREAD`). A round already under way finishes first: its reply,
-tool calls and approvals are not interrupted. While a run waits, its
+tool calls and approvals are not interrupted. A round looks for a pause when it
+starts, before an automatic compaction, and last just before its model request,
+so a pause made while the round lists its tools or compacts still holds that
+request; one made after the request is sent holds the round after it. While a
+run waits, its
 conversation is marked `held`, so clients show it as paused, or as waiting on a
 paused parent. `ResumeRun` lets it continue; `CancelRun` still ends it. A pause
-is refused with a conflict when no native run is going, and is lifted when the
+is refused with a conflict when no native run is going (a manual compaction is
+not one), and is lifted when the
 run ends or the gateway restarts. Agents cannot pause or resume runs.
 
 ### Steering a run

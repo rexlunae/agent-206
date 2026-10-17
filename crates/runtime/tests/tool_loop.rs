@@ -64,6 +64,13 @@ struct TestHost {
     rescoped: Rescoped,
     /// Tools named `held_…` finish only when this is notified.
     release: Arc<tokio::sync::Notify>,
+    /// When set, the next listing waits until it is released.
+    listing: Arc<Mutex<Option<ListHold>>>,
+}
+/// Says when a listing has started, then holds it until told to finish.
+struct ListHold {
+    entered: tokio::sync::oneshot::Sender<()>,
+    release: tokio::sync::oneshot::Receiver<()>,
 }
 /// Conversations whose scope `rescope` records, with the capabilities it
 /// last saw for each (`None` before any rescope, or once one is gone).
@@ -78,6 +85,11 @@ impl Drop for DropFlag {
 impl ToolHost for TestHost {
     fn list<'a>(&'a self, _: &'a ToolScope) -> BoxFuture<'a, ToolListing> {
         Box::pin(async move {
+            let hold = self.listing.lock().unwrap().take();
+            if let Some(hold) = hold {
+                hold.entered.send(()).unwrap();
+                hold.release.await.unwrap();
+            }
             ToolListing {
                 tools: self.tools.clone(),
                 unavailable: vec![],
@@ -140,6 +152,7 @@ struct Rig {
     dropped: Arc<AtomicBool>,
     rescoped: Rescoped,
     release: Arc<tokio::sync::Notify>,
+    listing: Arc<Mutex<Option<ListHold>>>,
 }
 async fn rig(api: ProviderApi, tools: Vec<ToolSpec>, blocking: Option<String>) -> Rig {
     let (sender, calls) = mpsc::unbounded_channel();
@@ -147,6 +160,7 @@ async fn rig(api: ProviderApi, tools: Vec<ToolSpec>, blocking: Option<String>) -
     let dropped = Arc::new(AtomicBool::new(false));
     let rescoped = Rescoped::default();
     let release = Arc::new(tokio::sync::Notify::new());
+    let listing = Arc::new(Mutex::new(None));
     let state = tempfile::tempdir().unwrap();
     let gateway = Gateway::open(state.path())
         .unwrap()
@@ -158,6 +172,7 @@ async fn rig(api: ProviderApi, tools: Vec<ToolSpec>, blocking: Option<String>) -
             dropped: dropped.clone(),
             rescoped: rescoped.clone(),
             release: release.clone(),
+            listing: listing.clone(),
         }));
     let (model, requests) = connect(&gateway, api).await;
     let mut rig = Rig {
@@ -171,6 +186,7 @@ async fn rig(api: ProviderApi, tools: Vec<ToolSpec>, blocking: Option<String>) -
         dropped,
         rescoped,
         release,
+        listing,
     };
     let Reply::Thread(thread) = rig
         .run(Command::CreateThread {
@@ -2199,6 +2215,42 @@ async fn a_paused_run_finishes_its_round_and_waits_until_resumed() {
     assert_eq!(thread.state, RunState::Complete, "{:?}", thread.error);
     assert!(!thread.paused && !thread.held);
     refused(rig.pause(rig.thread, false).await, ErrorKind::Conflict);
+}
+
+#[tokio::test]
+async fn a_pause_made_while_a_round_is_prepared_holds_its_request() {
+    let api = ProviderApi::Anthropic;
+    let name = nonce();
+    let mut rig = rig(api, vec![tool(&name, ToolPermission::Allow, &[])], None).await;
+    rig.permit(&name, ToolPermission::Allow).await;
+    let task = rig.send();
+    let first = rig.next_request().await;
+    // The next round's tool listing waits until released.
+    let (entered, listing) = tokio::sync::oneshot::channel();
+    let (release, waiting) = tokio::sync::oneshot::channel();
+    *rig.listing.lock().unwrap() = Some(ListHold {
+        entered,
+        release: waiting,
+    });
+    first
+        .respond(calls_response(api, &[Call::new(&name, json!({}))], ""))
+        .await;
+    tokio::time::timeout(PATIENCE, listing)
+        .await
+        .unwrap_or_else(wait("the next round's tool listing"))
+        .unwrap();
+    // The round has passed its first look; the pause still holds it.
+    assert_eq!(rig.pause(rig.thread, true).await, Reply::Ok);
+    release.send(()).unwrap();
+    rig.held(rig.thread).await;
+    assert!(rig.requests.try_recv().is_err());
+
+    assert_eq!(rig.pause(rig.thread, false).await, Reply::Ok);
+    rig.next_request()
+        .await
+        .respond(text_response(api, &nonce()))
+        .await;
+    assert_eq!(finished(task).await.state, RunState::Complete);
 }
 
 #[tokio::test]

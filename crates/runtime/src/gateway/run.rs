@@ -506,6 +506,12 @@ impl Gateway {
                 && offered
                     .iter()
                     .any(|spec| spec.name == memory_flush::save_tool());
+            // A pause that arrived while the round was prepared holds it
+            // before its first request; the round is prepared again after.
+            if self.pause_pending(run.thread)? {
+                round -= 1;
+                continue;
+            }
             if over && !flush {
                 let compacted = self
                     .compact(compaction::Request {
@@ -566,6 +572,12 @@ impl Gateway {
                 root: &run.root,
                 pairing: pairing.as_ref(),
             };
+            // The same, after compaction and the tools offered with it: the
+            // last look before the request, with nothing awaited in between.
+            if self.pause_pending(run.thread)? {
+                round -= 1;
+                continue;
+            }
             let (turn, message) = match self
                 .stream_round(run, &round_prompt, &view.thread, broker, &offered)
                 .await?

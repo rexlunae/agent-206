@@ -12,8 +12,14 @@ impl Gateway {
         let mut store = self.lock()?;
         let current = store.thread(thread)?;
         if paused {
+            // Only an admitted native run waits for a pause; a conversation
+            // that is Running while it is compacted has none, and a pause
+            // left on it would hold its next run.
             check(
-                current.state == RunState::Running && current.backend == CodingBackend::Native,
+                current.state == RunState::Running
+                    && current.backend == CodingBackend::Native
+                    && current.compacting.is_none()
+                    && self.accepting()?.contains(&thread),
                 GatewayError::Conflict("the conversation has no native run to pause"),
             )?;
             check(
@@ -33,6 +39,12 @@ impl Gateway {
         self.pauses.send_modify(|generation| *generation += 1);
         Ok(Reply::Ok)
     }
+    /// Whether `thread` or any ancestor is paused now.
+    pub(super) fn pause_pending(&self, thread: Id) -> Result<bool> {
+        Ok(run::lineage(&*self.lock()?, thread)?
+            .iter()
+            .any(|t| t.paused))
+    }
     /// Wait while `thread` or any ancestor is paused, marking the
     /// conversation held meanwhile. Returns `false` when the run was
     /// cancelled.
@@ -45,10 +57,7 @@ impl Gateway {
         let proceed = loop {
             // Subscribed before looking, so a resume in between is seen.
             let mut changed = self.pauses.subscribe();
-            let paused = run::lineage(&*self.lock()?, thread)?
-                .iter()
-                .any(|t| t.paused);
-            if !paused {
+            if !self.pause_pending(thread)? {
                 break true;
             }
             if !held {

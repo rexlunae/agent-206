@@ -84,7 +84,10 @@ pub(crate) fn entries(snapshot: &Snapshot, route: &Route, can_create: bool) -> V
             ));
         }
         // The same conditions as the conversation's own Pause and Resume.
-        if running && thread.backend == CodingBackend::Native {
+        if running
+            && thread.backend == CodingBackend::Native
+            && (thread.paused || thread.compacting.is_none())
+        {
             entries.push(if thread.paused {
                 Entry::new(
                     title("Resume response"),
@@ -430,6 +433,15 @@ mod tests {
             !offered
                 .iter()
                 .any(|e| e.action == Action::Resume(running.id))
+        );
+        // Summarizing is not a run that can be paused.
+        let mut compacting = running.clone();
+        compacting.compacting = Some(RunState::Complete);
+        let offered = entries_for(&snapshot(vec![compacting.clone()]), chat(compacting.id));
+        assert!(
+            !offered
+                .iter()
+                .any(|e| e.action == Action::Pause(compacting.id))
         );
         let mut paused = running.clone();
         paused.paused = true;

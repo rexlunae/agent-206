@@ -511,7 +511,9 @@ fn Conversation(thread: Thread, target: Option<Uuid>) -> Element {
                                 onclick: move |_| submit(),
                             }
                         }
-                        if thread.state == RunState::Running && thread.backend == CodingBackend::Native {
+                        // A conversation being compacted has no run to pause.
+                        if thread.state == RunState::Running && thread.backend == CodingBackend::Native
+                            && (thread.paused || thread.compacting.is_none()) {
                             if thread.paused {
                                 IconButton { icon: IconName::Play, label: name!("Resume response"), title: "Resume response",
                                     size: ButtonSize::Sm, variant: ButtonVariant::Ghost,
