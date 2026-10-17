@@ -438,6 +438,9 @@ impl Gateway {
             if self.lock()?.remaining()? < NEXT_ROUND {
                 return Ok(Ended::Failed(GatewayError::HistoryFull));
             }
+            // Messages steered to the run join it here, between rounds and
+            // before the compaction check counts them.
+            self.drain_steering(run.thread)?;
             let mut view = self.view(run.thread)?;
             let Some((mut catalog, mut offered)) = self.offer(run, &view).await else {
                 return Ok(Ended::Cancelled);
@@ -531,10 +534,24 @@ impl Gateway {
             total = Some(sum.clone());
             last_input = turn.usage.input_tokens;
             if turn.calls.is_empty() {
-                return Ok(Ended::Complete {
-                    last: turn.usage,
-                    total: sum,
-                });
+                if !self.steering_pending(run.thread)? {
+                    return Ok(Ended::Complete {
+                        last: turn.usage,
+                        total: sum,
+                    });
+                }
+                // A message steered during this reply is answered in a
+                // further round, within the same budget.
+                let budget = effective_budget(&*self.lock()?, run.thread)?;
+                if round >= budget.rounds {
+                    return Ok(Ended::Failed(
+                        RunError::Rounds {
+                            rounds: budget.rounds,
+                        }
+                        .into(),
+                    ));
+                }
+                continue;
             }
             let parsed = self.record_calls(run.thread, message, turn.calls)?;
             // Re-read at each check: a parent may lower its budget mid-run.

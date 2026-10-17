@@ -143,6 +143,12 @@ mod native {
             thread: uuid::Uuid,
             text: String,
         },
+        /// Add a message to a conversation's running native run; it is read
+        /// before the run's next model request.
+        Steer {
+            thread: uuid::Uuid,
+            text: String,
+        },
         Cancel {
             thread: uuid::Uuid,
         },
@@ -951,6 +957,7 @@ mod native {
                         text,
                         attachments: vec![],
                     },
+                    Action::Steer { thread, text } => Command::Steer { thread, text },
                     Action::Cancel { thread } => Command::CancelRun { thread },
                     Action::Compact { thread } => Command::CompactThread { thread },
                     Action::Tools { command } => match command {

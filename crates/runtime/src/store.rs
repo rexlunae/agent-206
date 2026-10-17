@@ -151,6 +151,10 @@ impl Store {
             // questions or calls.
             thread.approvals.clear();
             thread.prompts.clear();
+            // Messages steered to the interrupted run stay in the
+            // conversation, after it.
+            let mut steered = std::mem::take(&mut thread.steering);
+            thread.messages.append(&mut steered);
             for call in thread.messages.iter_mut().flat_map(|m| &mut m.tool_calls) {
                 if !call.state.is_final() {
                     let report = a206_core::ErrorReport::new(
@@ -468,6 +472,28 @@ mod tests {
         assert_eq!(restored.state.settings.providers, vec![user]);
         assert!(restored.state.managed_joshua_provider.is_none());
         assert_eq!(restored.state.settings.revision, 1);
+    }
+    #[test]
+    fn restart_keeps_messages_steered_to_an_interrupted_run_after_it() {
+        use a206_core::{CodingBackend, Message, Mode, Role, Thread};
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = Store::open(directory.path()).unwrap();
+        let mut thread = Thread::new(Id::new_v4().to_string(), Mode::Chat);
+        thread.state = RunState::Running;
+        let message = |text: String| Message::new(Role::User, text, 0, CodingBackend::Native);
+        let earlier = message(Id::new_v4().to_string());
+        let steered = message(Id::new_v4().to_string());
+        thread.messages.push(earlier.clone());
+        thread.steering.push(steered.clone());
+        let id = thread.id;
+        store.state.threads.push(thread);
+        store.persist(None).unwrap();
+        drop(store);
+        let restored = Store::open(directory.path()).unwrap();
+        let thread = restored.thread(id).unwrap();
+        assert_eq!(thread.state, RunState::Failed);
+        assert!(thread.steering.is_empty());
+        assert_eq!(thread.messages, vec![earlier, steered]);
     }
     #[test]
     fn restart_expires_approvals_and_questions_and_cancels_unfinished_tool_calls() {
