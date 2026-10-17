@@ -94,6 +94,24 @@ fn composer(thread: &Thread, sending: bool, steering: bool) -> Composer {
         steerable: active && thread.backend == CodingBackend::Native && !steering,
     }
 }
+/// The activity line under a running conversation.
+fn run_status(thread: &Thread) -> (Lifecycle, String) {
+    match (thread.held, thread.paused) {
+        (true, true) => (Lifecycle::Queued, "Paused before its next step".into()),
+        (true, false) => (
+            Lifecycle::Queued,
+            "Waiting: a conversation that delegated this one is paused".into(),
+        ),
+        (false, true) => (Lifecycle::Running, "Pausing after this step…".into()),
+        (false, false) => (
+            Lifecycle::Running,
+            thread
+                .backend_activity
+                .clone()
+                .unwrap_or_else(|| format!("{} is working…", thread.backend.label())),
+        ),
+    }
+}
 /// One conversation; `target` is a message to scroll to and mark.
 #[component]
 fn Conversation(thread: Thread, target: Option<Uuid>) -> Element {
@@ -150,7 +168,13 @@ fn Conversation(thread: Thread, target: Option<Uuid>) -> Element {
                         .find(|t| t.id == id)
                         .ok_or_else(|| rejected("This conversation is no longer available"))
                         .and_then(|thread| {
-                            crate::slash::resolve(slash, thread, &snapshot, can_create)
+                            crate::slash::resolve(
+                                slash,
+                                thread,
+                                &snapshot,
+                                can_create,
+                                crate::messengers::now(),
+                            )
                         })
                 };
                 match resolved {
@@ -368,7 +392,7 @@ fn Conversation(thread: Thread, target: Option<Uuid>) -> Element {
             for request in &thread.approvals { crate::tools::PendingApproval { key: "{request.id}", thread: id, request: request.clone() } }
             for question in &thread.prompts { crate::prompts::PendingPrompt { key: "{question.id}", thread: id, question: question.clone() } }
             if !thread.plan.is_empty() { ThreadPlan { thread: thread.clone() } }
-            if running { AgentStatus { state: Lifecycle::Running, label: rsx! { {thread.backend_activity.clone().unwrap_or_else(|| format!("{} is working…", thread.backend.label()))} } } }
+            if running { {let (state, label) = run_status(&thread); rsx! { AgentStatus { state, label: rsx! { "{label}" } } }} }
             if let Some(report) = thread.error.clone().filter(|_| !running && thread.state == RunState::Failed) {
                 crate::error::ErrorNotice { report, title: "Run failed".to_string() }
             }
@@ -492,6 +516,21 @@ fn Conversation(thread: Thread, target: Option<Uuid>) -> Element {
                                 size: ButtonSize::Sm, variant: ButtonVariant::Ghost,
                                 availability: if draft().trim().is_empty() { Availability::Disabled } else { Availability::Enabled },
                                 onclick: move |_| submit(),
+                            }
+                        }
+                        // A conversation being compacted has no run to pause.
+                        if thread.state == RunState::Running && thread.backend == CodingBackend::Native
+                            && (thread.paused || thread.compacting.is_none()) {
+                            if thread.paused {
+                                IconButton { icon: IconName::Play, label: name!("Resume response"), title: "Resume response",
+                                    size: ButtonSize::Sm, variant: ButtonVariant::Ghost,
+                                    onclick: move |_| dispatch(state, Command::ResumeRun { thread: id }),
+                                }
+                            } else {
+                                IconButton { icon: IconName::Pause, label: name!("Pause response"), title: "Pause before its next step",
+                                    size: ButtonSize::Sm, variant: ButtonVariant::Ghost,
+                                    onclick: move |_| dispatch(state, Command::PauseRun { thread: id }),
+                                }
                             }
                         }
                         IconButton { icon: if running { IconName::Stop } else { IconName::ArrowUp }, label: if running { name!("Stop response") } else { name!("Send message") },
@@ -862,6 +901,24 @@ fn unreadable(error: dioxus::CapturedError) -> ErrorReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn a_running_conversation_says_whether_a_pause_holds_it() {
+        let mut thread = Thread::new(Uuid::new_v4().to_string(), Mode::Chat);
+        thread.state = RunState::Running;
+        let working = run_status(&thread);
+        assert_eq!(working.0, Lifecycle::Running);
+        let mut statuses = vec![working.1];
+        for (held, paused) in [(false, true), (true, true), (true, false)] {
+            (thread.held, thread.paused) = (held, paused);
+            let (lifecycle, label) = run_status(&thread);
+            assert_eq!(lifecycle == Lifecycle::Queued, held, "{label}");
+            statuses.push(label);
+        }
+        statuses.sort();
+        statuses.dedup();
+        assert_eq!(statuses.len(), 4, "{statuses:?}");
+    }
+
     #[test]
     fn the_composer_steers_the_run_it_started_one_message_at_a_time() {
         let mut thread = Thread::new(Uuid::new_v4().to_string(), Mode::Chat);

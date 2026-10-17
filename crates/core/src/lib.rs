@@ -503,6 +503,15 @@ pub struct Thread {
     /// run to reach its next round, where they join `messages` in order.
     #[serde(default)]
     pub steering: Vec<Message>,
+    /// The user paused this conversation's work with `PauseRun`: its native
+    /// run, and those of its subagents, wait before their next model round
+    /// until `ResumeRun`. Cleared when the conversation's run ends.
+    #[serde(default)]
+    pub paused: bool,
+    /// The native run is waiting before its next model round because this
+    /// conversation or an ancestor is paused.
+    #[serde(default)]
+    pub held: bool,
     /// The checklist the conversation's models keep with `plan_update`,
     /// shown to the user beside the conversation. Empty when there is none.
     #[serde(default)]
@@ -582,6 +591,8 @@ impl Thread {
             compacting: None,
             memory_flush: None,
             steering: vec![],
+            paused: false,
+            held: false,
             plan: vec![],
         }
     }
@@ -1119,6 +1130,17 @@ pub enum Command {
         thread: Id,
         text: String,
     },
+    /// Hold `thread`'s running native run, and its subagents' runs, before
+    /// their next model round. A round in progress, with its tool calls and
+    /// approvals, finishes first. Refused when no native run is going.
+    PauseRun {
+        thread: Id,
+    },
+    /// Let a paused conversation's runs continue. Refused when it is not
+    /// paused.
+    ResumeRun {
+        thread: Id,
+    },
 }
 impl Command {
     /// A stable operation name for logs and diagnostics; never includes arguments.
@@ -1176,6 +1198,8 @@ impl Command {
             Self::RemoveJob { .. } => "remove_job",
             Self::RunJob { .. } => "run_job",
             Self::Steer { .. } => "steer",
+            Self::PauseRun { .. } => "pause_run",
+            Self::ResumeRun { .. } => "resume_run",
         }
     }
 }
