@@ -188,6 +188,13 @@ async fn schedules_are_parsed_from_exactly_one_form() {
             ErrorKind::InvalidRequest,
         ),
         (with(json!({"at": nonce()})), ErrorKind::InvalidRequest),
+        // A fraction of a second would otherwise be cut, running early.
+        (
+            with(
+                json!({"at": jiff::Timestamp::new(future as i64, 1 + (future % 999_999_998) as i32).unwrap().to_string()}),
+            ),
+            ErrorKind::InvalidRequest,
+        ),
         (
             with(json!({"every_seconds": "often"})),
             ErrorKind::InvalidRequest,
@@ -213,4 +220,46 @@ async fn schedules_are_parsed_from_exactly_one_form() {
     assert_eq!(g.snapshot().unwrap().jobs.len(), 2);
     let unknown = call(&host, mine, &nonce(), json!({})).unwrap_err();
     assert_eq!(unknown.kind, ErrorKind::NotFound);
+}
+
+#[tokio::test]
+async fn listings_stay_whole_json_below_the_output_cap() {
+    let state = tempfile::tempdir().unwrap();
+    let g = Gateway::open(state.path()).unwrap();
+    let host = ScheduleHost::new(g.jobs());
+    let mine = thread(&g).await;
+    // Two-byte characters, so a cut inside one would be visible.
+    let message = "é".repeat(MESSAGE_BYTES + Id::new_v4().as_u128() as usize % 1000);
+    let count = 2 * LIST_BYTES / MESSAGE_BYTES;
+    for _ in 0..count {
+        let reply = send(
+            &g,
+            Command::ScheduleJob {
+                name: nonce(),
+                thread: mine,
+                text: message.clone(),
+                schedule: Schedule::Every {
+                    seconds: 3600,
+                    anchor: now(),
+                },
+            },
+        )
+        .await;
+        assert!(matches!(reply, Reply::Job(_)), "{reply:?}");
+    }
+    let listed = call(&host, mine, LIST, json!({})).unwrap();
+    assert!(listed.to_string().len() < crate::tools::MAX_OUTPUT);
+    let shown = listed["scheduled"].as_array().unwrap();
+    let omitted = listed["omitted"].as_u64().unwrap() as usize;
+    assert!(omitted > 0 && !shown.is_empty());
+    assert_eq!(shown.len() + omitted, count);
+    for job in shown {
+        let text = job["message"].as_str().unwrap();
+        assert!(text.len() <= MESSAGE_BYTES && message.starts_with(text));
+        assert!(
+            text.len() + 1 >= MESSAGE_BYTES,
+            "cut at the last whole character"
+        );
+        assert_eq!(job["message_bytes"], message.len());
+    }
 }

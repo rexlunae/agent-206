@@ -53,9 +53,12 @@ conversation until the user permits them:
 - `schedule_add { name, message, at | every_seconds | cron [, zone] }` schedules
   a message to the model's own conversation (`JobAuthor::Agent`). Every call
   waits for the user's approval of that exact call, even where the conversation
-  allows the tool. A conversation keeps at most 16 jobs its models added.
+  allows the tool. A conversation keeps at most 16 jobs its models added. `at`
+  must be a whole second, so a message never arrives before the time approved.
 - `schedule_list` lists the conversation's jobs, the user's included, marked
-  `added_by: user` or `you`.
+  `added_by: user` or `you`. Results show the first 512 bytes of each message
+  with its full `message_bytes`, and a listing stops at 48 KiB with `omitted`
+  counting the rest, so every result is complete JSON below the output cap.
 - `schedule_remove { id }` removes a job a model of this conversation added; the
   user's jobs and other conversations' jobs are not found.
 

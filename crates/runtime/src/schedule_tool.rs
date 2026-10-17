@@ -25,6 +25,10 @@ pub const ADD: &str = "schedule_add";
 pub const LIST: &str = "schedule_list";
 /// Removes a scheduled message a model added.
 pub const REMOVE: &str = "schedule_remove";
+/// Longest message text a result shows; `message_bytes` gives the full size.
+pub const MESSAGE_BYTES: usize = 512;
+/// Most bytes of jobs one `schedule_list` returns; `omitted` counts the rest.
+pub const LIST_BYTES: usize = 48 * 1024;
 
 /// Why a schedule tool call failed.
 #[derive(Debug, thiserror::Error)]
@@ -45,6 +49,8 @@ pub enum ScheduleToolError {
     At(#[source] jiff::Error),
     #[error("`at` is before 1970")]
     Epoch,
+    #[error("`at` must be a whole second, so the message never arrives early")]
+    Fraction,
     #[error("`id` is not a scheduled message ID")]
     Id(#[source] uuid::Error),
 }
@@ -76,7 +82,8 @@ impl ScheduleHost {
             parameters,
             capabilities: Default::default(),
             permission,
-            whole_output: false,
+            // Each result is one JSON value, bounded below the output cap.
+            whole_output: true,
         };
         vec![
             spec(
@@ -135,8 +142,19 @@ impl ScheduleHost {
             LIST => {
                 allow(args, &[])?;
                 let jobs = self.jobs.list(thread)?;
+                let mut scheduled = Vec::new();
+                let mut bytes = 0;
+                for job in &jobs {
+                    let entry = describe(job, thread);
+                    bytes += entry.to_string().len() + 1;
+                    if bytes > LIST_BYTES {
+                        break;
+                    }
+                    scheduled.push(entry);
+                }
                 Ok(json!({
-                    "scheduled": jobs.iter().map(|job| describe(job, thread)).collect::<Vec<_>>(),
+                    "omitted": jobs.len() - scheduled.len(),
+                    "scheduled": scheduled,
                     "you_may_add": MAX_AGENT_JOBS.saturating_sub(
                         jobs.iter().filter(|job| job.author == JobAuthor::Agent { thread }).count()
                     ),
@@ -195,6 +213,9 @@ fn schedule(args: &Map<String, Value>) -> Result<Schedule, ErrorReport> {
                 .ok_or_else(|| fail(ScheduleToolError::Type("at")))?
                 .parse()
                 .map_err(|e| fail(ScheduleToolError::At(e)))?;
+            if at.subsec_nanosecond() != 0 {
+                return Err(fail(ScheduleToolError::Fraction));
+            }
             let at = u64::try_from(at.as_second()).map_err(|_| fail(ScheduleToolError::Epoch))?;
             Ok(Schedule::At { at })
         }
@@ -216,6 +237,17 @@ fn schedule(args: &Map<String, Value>) -> Result<Schedule, ErrorReport> {
 }
 
 /// A job as the model sees it, with times in RFC 3339.
+/// The start of `text`, at most `bytes` long and cut at a character boundary.
+fn preview(text: &str, bytes: usize) -> &str {
+    let end = (0..=bytes.min(text.len()))
+        .rev()
+        .find(|end| text.is_char_boundary(*end))
+        .unwrap_or(0);
+    &text[..end]
+}
+
+/// A job for the model. Messages are cut to [`MESSAGE_BYTES`], so a result
+/// always fits the tool output cap.
 fn describe(job: &Job, thread: Id) -> Value {
     let time = |seconds: u64| {
         i64::try_from(seconds)
@@ -241,7 +273,8 @@ fn describe(job: &Job, thread: Id) -> Value {
     json!({
         "id": job.id,
         "name": job.name,
-        "message": job.text,
+        "message": preview(&job.text, MESSAGE_BYTES),
+        "message_bytes": job.text.len(),
         "schedule": schedule,
         "enabled": job.enabled,
         "next": job.next.and_then(time),
