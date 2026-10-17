@@ -114,6 +114,7 @@ impl Store {
                 plugins: vec![],
                 last_event: 0,
                 managed_joshua_provider: None,
+                mcp_servers: vec![],
             }
         };
         let mut store = Self {
@@ -128,6 +129,18 @@ impl Store {
         // A fresh gateway has no owned child. Retire its persisted connection, not
         // arbitrary user-configured endpoints that happen to have the same URL.
         store.state.clear_managed_joshua();
+        // A fresh gateway has no MCP sessions: every configured server starts
+        // disconnected, and nothing from an earlier session counts as connected.
+        store.state.mcp_servers = store
+            .state
+            .settings
+            .mcp_servers
+            .iter()
+            .map(|server| McpServerStatus {
+                name: server.name.clone(),
+                ..Default::default()
+            })
+            .collect();
         for thread in &mut store.state.threads {
             // No run survives a restart, so neither do its approvals or calls.
             thread.approvals.clear();

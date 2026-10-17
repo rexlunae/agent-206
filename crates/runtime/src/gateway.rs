@@ -15,8 +15,11 @@ use std::{
     sync::{Arc, Mutex, MutexGuard},
 };
 use tokio::io::AsyncWriteExt;
+mod mcp_servers;
 mod run;
+pub use mcp_servers::{McpOffer, McpOffers};
 pub use run::{RunError, ToolError};
+
 /// Streamed reply text that is not final yet. It is published as the
 /// thread's assistant message at most every [`PartialReply::INTERVAL`], so a
 /// fast stream does not rewrite the journal for every delta, and the newest
@@ -142,6 +145,8 @@ pub enum GatewayError {
     #[error(transparent)]
     Extension(#[from] crate::extension_host::ExtensionError),
     #[error(transparent)]
+    Mcp(#[from] a206_mcp::McpError),
+    #[error(transparent)]
     Frame(#[from] transport::FrameError),
     #[error(transparent)]
     Run(#[from] run::RunError),
@@ -214,6 +219,7 @@ impl crate::error::Classified for GatewayError {
             Self::Process(error) => return classify(error),
             Self::Download(error) => return classify(error),
             Self::Extension(error) => return classify(error),
+            Self::Mcp(error) => return classify(error),
             Self::Frame(error) => return classify(error),
             Self::Run(error) => return classify(error),
             // The cause's own kind (missing, denied, invalid data) is the useful one.
@@ -304,6 +310,7 @@ pub struct Gateway {
     /// Bumped whenever a tool permission, grant or mode changes, so running
     /// tool calls and approval waits re-check their authority at once.
     policy: Arc<tokio::sync::watch::Sender<u64>>,
+    mcp: Arc<mcp_servers::McpServers>,
 }
 /// The broker pairing this gateway holds, with the connection that anchors it.
 struct Paired {
@@ -333,6 +340,7 @@ impl Gateway {
             tool_hosts: Arc::new(vec![]),
             approvals: Arc::new(Mutex::new(BTreeMap::new())),
             policy: Arc::new(tokio::sync::watch::Sender::new(0)),
+            mcp: Arc::default(),
         })
     }
     fn pairing(&self) -> Result<Option<BrokerPairing>> {
@@ -488,6 +496,10 @@ impl Gateway {
                     Ok(reply) => reply,
                     Err(error) => Reply::Error(crate::error::correlated(operation, id, &error)),
                 };
+                if mutation {
+                    // In-flight MCP calls re-check their authorization.
+                    self.mcp.state_changed();
+                }
                 let stop = is_shutdown && matches!(reply, Reply::Ok);
                 if mutation
                     && let Err(error) = self
@@ -650,6 +662,7 @@ impl Gateway {
                         "settings changed in another operation; refresh and retry your change",
                     ),
                 )?;
+                let mcp_servers = Self::mcp_statuses(&store.state, &settings.mcp_servers)?;
                 if let Some(id) = store.state.managed_joshua_provider {
                     let owned = store.state.settings.providers.iter().find(|provider| provider.id == id)
                         .ok_or(GatewayError::Conflict("managed Joshua connection is missing; stop Joshua before applying settings"))?;
@@ -711,8 +724,10 @@ impl Gateway {
                         .iter()
                         .any(|p| p.id == c.provider && old.contains(p))
                 });
-                store.state.settings = settings;
+                let previous = std::mem::replace(&mut store.state.settings, settings);
+                store.state.mcp_servers = mcp_servers;
                 store.persist(Some(EventKind::SettingsChanged))?;
+                self.stop_changed_mcp(&previous.mcp_servers, &store.state.settings.mcp_servers)?;
                 Ok(Reply::Ok)
             }
             Command::RefreshCatalog { provider } => {
@@ -1342,6 +1357,14 @@ impl Gateway {
                 store.persist(Some(EventKind::ExtensionChanged { id: extension }))?;
                 Ok(Reply::Ok)
             }
+            Command::ConnectMcpServer { name } => {
+                self.connect_mcp(&name).await?;
+                Ok(Reply::Ok)
+            }
+            Command::DisconnectMcpServer { name } => {
+                self.disconnect_mcp(&name)?;
+                Ok(Reply::Ok)
+            }
             Command::Shutdown => {
                 // Serialize independent shutdown attempts so a failed one's
                 // rollback cannot reopen admission during another one's cleanup.
@@ -1379,6 +1402,7 @@ impl Gateway {
                     }
                     self.joshua.lock().await.stop().await?;
                     self.clear_managed_joshua()?;
+                    self.mcp.stop_all()?;
                     Ok::<_, GatewayError>(())
                 })
                 .await

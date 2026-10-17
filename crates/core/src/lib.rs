@@ -164,7 +164,9 @@ pub struct ModelKey {
     pub model: String,
 }
 
+pub mod mcp;
 pub mod providers;
+pub use mcp::{McpServerConfig, McpServerState, McpServerStatus, McpToolInfo, ToolPolicy};
 pub use providers::{ProviderApi, ProviderPreset, ProviderPresetList};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -251,6 +253,8 @@ pub struct Settings {
     pub provider_presets: ProviderPresetList,
     #[serde(default)]
     pub backends: Vec<BackendConfig>,
+    #[serde(default)]
+    pub mcp_servers: Vec<McpServerConfig>,
     pub prompts: Vec<ModePrompt>,
     pub theme_design: String,
     pub theme_palette: Option<String>,
@@ -264,6 +268,7 @@ impl Default for Settings {
             providers: vec![],
             provider_presets: ProviderPresetList::default(),
             backends: vec![],
+            mcp_servers: vec![],
             prompts: Mode::ALL
                 .into_iter()
                 .map(|mode| ModePrompt {
@@ -461,6 +466,9 @@ pub struct Snapshot {
     pub last_event: u64,
     #[serde(default)]
     pub managed_joshua_provider: Option<Id>,
+    /// Runtime state of configured MCP servers; never a grant.
+    #[serde(default)]
+    pub mcp_servers: Vec<McpServerStatus>,
 }
 impl Snapshot {
     /// Retire only the connection owned by the managed process, including its model grants.
@@ -510,6 +518,9 @@ pub enum EventKind {
     },
     ProjectChanged {
         id: Id,
+    },
+    McpServerChanged {
+        name: String,
     },
     ExtensionChanged {
         id: String,
@@ -683,6 +694,14 @@ pub enum Command {
     PairBroker {
         pairing: BrokerPairing,
     },
+    /// Start an enabled MCP server and list its tools (user operation).
+    ConnectMcpServer {
+        name: String,
+    },
+    /// Stop an MCP server; it stays stopped until the user connects it again.
+    DisconnectMcpServer {
+        name: String,
+    },
 }
 impl Command {
     /// A stable operation name for logs and diagnostics; never includes arguments.
@@ -720,6 +739,8 @@ impl Command {
             Self::Shutdown => "shutdown",
             Self::GatewayStatus => "gateway_status",
             Self::PairBroker { .. } => "pair_broker",
+            Self::ConnectMcpServer { .. } => "connect_mcp_server",
+            Self::DisconnectMcpServer { .. } => "disconnect_mcp_server",
         }
     }
 }
