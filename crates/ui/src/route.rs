@@ -9,6 +9,7 @@ use crate::{
         Browser, Conversations, Documents, Downloads, Extensions, Joshua, Overview as Workspace,
         Projects, Security,
     },
+    schedules::Schedules,
     settings::{Appearance, Prompts, Providers},
     welcome::Welcome,
 };
@@ -46,6 +47,8 @@ pub(crate) enum Route {
     Browser {},
     #[route("/documents")]
     Documents {},
+    #[route("/schedules")]
+    Schedules {},
     #[route("/settings/appearance")]
     Appearance {},
     #[route("/settings/modes")]
@@ -75,6 +78,7 @@ impl Route {
             Self::Extensions {} => IconName::Plus,
             Self::Browser {} => IconName::Globe,
             Self::Documents {} => IconName::File,
+            Self::Schedules {} => IconName::Clock,
             Self::Appearance {} => IconName::Settings,
             Self::Prompts {} => IconName::Edit,
             Self::Security {} => IconName::Lock,
@@ -95,6 +99,7 @@ impl Route {
             Self::Extensions {} => "Extensions",
             Self::Browser {} => "Browser",
             Self::Documents {} => "Documents & git",
+            Self::Schedules {} => "Schedules",
             Self::Appearance {} => "Appearance",
             Self::Prompts {} => "Agent modes",
             Self::Security {} => "Security",
