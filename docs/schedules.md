@@ -11,7 +11,14 @@ of those applies to the next run; a job never carries authority of its own.
 | Schedule | Meaning |
 | --- | --- |
 | `At { at }` | Once, at a Unix time in seconds. A time already passed is refused. After it runs the job is disabled and kept with its result. |
-| `Every { seconds, anchor }` | At `anchor + n × seconds`, 60 seconds to ten years apart. A late run does not shift later ones. |
+| `In { seconds }` | Once, 1 second to ten years after the gateway accepts the job. Stored as `At`. |
+| `Every { seconds, anchor }` | At `anchor + n × seconds`, 60 seconds to ten years apart. A late run does not shift later ones. With no `anchor`, the gateway anchors it when it accepts the job, so it first runs one interval later. |
+
+`In` and an unanchored `Every` are measured by the gateway's clock, so a client
+whose clock differs never moves them; the Schedules page sends intervals
+unanchored. Intervals are written like `90m`, `1h 30m` or `1d`: days and weeks
+are 24 and 168 hours, and months and years, which have no fixed length, are
+refused.
 | `Cron { expression, zone }` | A cron expression (five fields, or six with seconds first; [croner](https://docs.rs/croner) syntax) in an IANA time zone, or the gateway's own zone when unset. |
 
 If the gateway stops while a job's run is starting, the next start settles it:
@@ -42,7 +49,7 @@ report when the message was not run, for example because the conversation was
 busy or had no model.
 
 CLI: `agent206 schedule list`, `schedule add THREAD --name N --text T` with one
-of `--at RFC3339`, `--every 90m [--anchor RFC3339]` or `--cron EXPR [--zone Z]`,
+of `--at RFC3339`, `--in 90m`, `--every 90m [--anchor RFC3339]` or `--cron EXPR [--zone Z]`,
 and `schedule pause|resume|run|remove ID`. Times and intervals are parsed by
 `a206_core::schedule::{parse_instant, parse_interval}`, shared with the page below.
 

@@ -35,6 +35,8 @@ impl Gateway {
             GatewayError::Invalid("job messages are 1–131072 bytes"),
         )?;
         let created = now();
+        // Relative schedules count from now by this clock, not the client's.
+        let schedule = schedule::resolve(schedule, created)?;
         let next = schedule::first(&schedule, created)?;
         let mut store = self.lock()?;
         store.thread(thread)?;

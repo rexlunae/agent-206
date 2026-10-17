@@ -1,5 +1,5 @@
 use super::*;
-use crate::gateway::Gateway;
+use crate::{gateway::Gateway, provider::now};
 use a206_core::{Command, Mode, Reply};
 use a206_protocol::Request;
 
@@ -78,7 +78,7 @@ async fn a_model_reaches_only_its_own_conversations_jobs_and_removes_only_its_ow
             text: nonce(),
             schedule: Schedule::Every {
                 seconds: 3600,
-                anchor: now(),
+                anchor: None,
             },
         },
     )
@@ -140,7 +140,7 @@ async fn a_conversation_keeps_a_bounded_number_of_jobs_its_models_added() {
             text: nonce(),
             schedule: Schedule::Every {
                 seconds: 3600,
-                anchor: now(),
+                anchor: None,
             },
         },
     )
@@ -240,7 +240,7 @@ async fn listings_stay_whole_json_below_the_output_cap() {
                 text: message.clone(),
                 schedule: Schedule::Every {
                     seconds: 3600,
-                    anchor: now(),
+                    anchor: None,
                 },
             },
         )

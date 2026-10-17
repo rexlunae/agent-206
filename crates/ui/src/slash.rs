@@ -315,14 +315,13 @@ fn schedule(
 }
 
 /// What running `slash` in `thread` does, or why it cannot run now.
-/// `can_create` is whether the gateway can take a new conversation, and
-/// `now` this client's clock in Unix seconds, which scheduled messages count from.
+/// `can_create` is whether the gateway can take a new conversation.
+/// Scheduled messages count from when the gateway accepts them, by its clock.
 pub(crate) fn resolve(
     slash: Slash,
     thread: &Thread,
     snapshot: &Snapshot,
     can_create: bool,
-    now: u64,
 ) -> Result<Command, ErrorReport> {
     let running = thread.state == RunState::Running;
     // The mode, model and effort selectors are disabled while a response runs.
@@ -415,14 +414,12 @@ pub(crate) fn resolve(
                 effort,
             })
         }
-        Slash::In(timed) => schedule(thread, timed, |seconds| Schedule::At {
-            at: now.saturating_add(seconds),
-        }),
-        // The first run is one interval away even when the gateway's clock
-        // is behind this one: a future anchor is itself the first run.
+        Slash::In(timed) => schedule(thread, timed, |seconds| Schedule::In { seconds }),
+        // Anchored by the gateway on acceptance, so the first run is one
+        // interval later.
         Slash::Every(timed) => schedule(thread, timed, |seconds| Schedule::Every {
             seconds,
-            anchor: now.saturating_add(seconds),
+            anchor: None,
         }),
     }
 }
@@ -440,9 +437,6 @@ mod tests {
     use super::*;
     use a206_core::{Catalog, CodingBackend, Mode, ModelKey, ProviderApi, ProviderConfig};
     use uuid::Uuid;
-
-    /// The client's clock in these tests; nothing reads the real one.
-    const NOW: u64 = 1_800_000_000;
 
     fn text() -> String {
         format!("t-{}", Uuid::new_v4().simple())
@@ -511,16 +505,16 @@ mod tests {
     fn a_command_runs_only_when_the_conversation_allows_it() {
         let snapshot = crate::empty_snapshot();
         let mut thread = Thread::new(text(), Mode::Chat);
-        assert!(resolve(Slash::Stop, &thread, &snapshot, true, NOW).is_err());
-        assert!(resolve(Slash::Compact, &thread, &snapshot, true, NOW).is_err());
-        assert!(resolve(Slash::New, &thread, &snapshot, false, NOW).is_err());
+        assert!(resolve(Slash::Stop, &thread, &snapshot, true).is_err());
+        assert!(resolve(Slash::Compact, &thread, &snapshot, true).is_err());
+        assert!(resolve(Slash::New, &thread, &snapshot, false).is_err());
         assert!(matches!(
-            resolve(Slash::New, &thread, &snapshot, true, NOW),
+            resolve(Slash::New, &thread, &snapshot, true),
             Ok(Command::CreateThread { .. })
         ));
         let title = text();
         assert_eq!(
-            resolve(Slash::Rename(title.clone()), &thread, &snapshot, true, NOW),
+            resolve(Slash::Rename(title.clone()), &thread, &snapshot, true),
             Ok(Command::RenameThread {
                 id: thread.id,
                 title
@@ -531,18 +525,18 @@ mod tests {
             model: text(),
         });
         assert_eq!(
-            resolve(Slash::Compact, &thread, &snapshot, true, NOW),
+            resolve(Slash::Compact, &thread, &snapshot, true),
             Ok(Command::CompactThread { thread: thread.id })
         );
         thread.state = RunState::Running;
         assert_eq!(
-            resolve(Slash::Stop, &thread, &snapshot, true, NOW),
+            resolve(Slash::Stop, &thread, &snapshot, true),
             Ok(Command::CancelRun { thread: thread.id })
         );
-        assert!(resolve(Slash::Compact, &thread, &snapshot, true, NOW).is_err());
+        assert!(resolve(Slash::Compact, &thread, &snapshot, true).is_err());
         thread.state = RunState::Idle;
         thread.backend = CodingBackend::Codex;
-        assert!(resolve(Slash::Compact, &thread, &snapshot, true, NOW).is_err());
+        assert!(resolve(Slash::Compact, &thread, &snapshot, true).is_err());
     }
 
     fn model(efforts: Vec<String>) -> ModelInfo {
@@ -591,14 +585,14 @@ mod tests {
         for mode in Mode::ALL {
             let typed = mode.label().to_uppercase();
             assert_eq!(
-                configured(resolve(Slash::Mode(typed), &thread, &snapshot, true, NOW)),
+                configured(resolve(Slash::Mode(typed), &thread, &snapshot, true)),
                 (mode, thread.model.clone())
             );
         }
-        assert!(resolve(Slash::Mode(text()), &thread, &snapshot, true, NOW).is_err());
+        assert!(resolve(Slash::Mode(text()), &thread, &snapshot, true).is_err());
         thread.state = RunState::Running;
         let label = Mode::ALL[0].label().to_owned();
-        assert!(resolve(Slash::Mode(label), &thread, &snapshot, true, NOW).is_err());
+        assert!(resolve(Slash::Mode(label), &thread, &snapshot, true).is_err());
     }
 
     #[test]
@@ -613,7 +607,6 @@ mod tests {
                 &thread,
                 &snapshot,
                 true,
-                NOW,
             ))
             .1
         };
@@ -622,8 +615,8 @@ mod tests {
         // Generated names share the "t-" prefix, so it names both; a tail names one.
         let tail = &first.name[first.name.len() - 12..];
         assert_eq!(chosen(tail), Some(first.key.clone()));
-        assert!(resolve(Slash::Model("t-".into()), &thread, &snapshot, true, NOW).is_err());
-        assert!(resolve(Slash::Model(text()), &thread, &snapshot, true, NOW).is_err());
+        assert!(resolve(Slash::Model("t-".into()), &thread, &snapshot, true).is_err());
+        assert!(resolve(Slash::Model(text()), &thread, &snapshot, true).is_err());
         // The mode is kept.
         assert_eq!(
             configured(resolve(
@@ -631,7 +624,6 @@ mod tests {
                 &thread,
                 &snapshot,
                 true,
-                NOW
             ))
             .0,
             thread.mode
@@ -651,7 +643,6 @@ mod tests {
                 thread,
                 &snapshot,
                 true,
-                NOW,
             )
         };
         // No model selected, or one whose listing has no effort choices.
@@ -697,7 +688,7 @@ mod tests {
             });
         }
         let thread = Thread::new(text(), Mode::Chat);
-        let chosen = |query: String| resolve(Slash::Model(query), &thread, &snapshot, true, NOW);
+        let chosen = |query: String| resolve(Slash::Model(query), &thread, &snapshot, true);
         let shared = chosen(first.name.clone()).expect_err("two connections list it");
         assert!(
             shared
@@ -726,7 +717,6 @@ mod tests {
                 &thread,
                 &snapshot,
                 true,
-                NOW,
             )
         };
         for level in ["auto", "default"] {
@@ -764,7 +754,7 @@ mod tests {
             });
         }
         let thread = Thread::new(text(), Mode::Chat);
-        let chosen = |query: String| resolve(Slash::Model(query), &thread, &snapshot, true, NOW);
+        let chosen = |query: String| resolve(Slash::Model(query), &thread, &snapshot, true);
         let shared = chosen(format!("{label}/{}", first.name)).expect_err("both match");
         let key = format!("{}:{}", second.key.provider, second.key.model);
         assert!(shared.message.contains(&key));
@@ -781,24 +771,27 @@ mod tests {
             panic!("/in parses");
         };
         assert_eq!(
-            resolve(once, &thread, &snapshot, true, NOW),
+            resolve(once, &thread, &snapshot, true),
             Ok(Command::ScheduleJob {
                 name: message.clone(),
                 thread: thread.id,
                 text: message.clone(),
-                schedule: Schedule::At { at: NOW + 90 * 60 },
+                schedule: Schedule::In { seconds: 90 * 60 },
             })
         );
         let Ok(Typed::Run(repeating)) = parse(&format!("/every 24h {message}")) else {
             panic!("/every parses");
         };
-        // The first run is one interval from now, not now.
+        // The gateway anchors it, so its first run is one interval later.
         assert!(matches!(
-            resolve(repeating, &thread, &snapshot, true, NOW),
+            resolve(repeating, &thread, &snapshot, true),
             Ok(Command::ScheduleJob {
-                schedule: Schedule::Every { seconds: 86_400, anchor },
+                schedule: Schedule::Every {
+                    seconds: 86_400,
+                    anchor: None
+                },
                 ..
-            }) if anchor == NOW + 86_400
+            })
         ));
         // A long message is named by the start of its first line.
         let long = "x".repeat(200);
@@ -812,7 +805,6 @@ mod tests {
             &thread,
             &snapshot,
             true,
-            NOW,
         )
         else {
             panic!("a long message schedules");
@@ -829,7 +821,6 @@ mod tests {
             &thread,
             &snapshot,
             true,
-            NOW,
         ) else {
             panic!("a wide message schedules");
         };
@@ -850,7 +841,6 @@ mod tests {
             &thread,
             &snapshot,
             true,
-            NOW,
         )
         .expect_err("not an interval");
         assert_eq!(unreadable.kind, ErrorKind::InvalidRequest);

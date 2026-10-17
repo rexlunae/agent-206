@@ -12,7 +12,6 @@
 //! conversation's jobs and removes only those a model added; the user's stay.
 use crate::{
     gateway::{Jobs, MAX_AGENT_JOBS},
-    provider::now,
     tools::{ToolHost, ToolListing, ToolOutput, ToolRequest, ToolScope, ToolSpec},
 };
 use a206_core::{ErrorKind, ErrorReport, Id, Job, JobAuthor, JobOutcome, Schedule, ToolPermission};
@@ -272,7 +271,8 @@ fn schedule(args: &Map<String, Value>) -> Result<Schedule, ErrorReport> {
             seconds: every
                 .as_u64()
                 .ok_or_else(|| fail(ScheduleToolError::Type("every_seconds")))?,
-            anchor: now(),
+            // Anchored by the gateway when it accepts the job.
+            anchor: None,
         }),
         (None, None, Some(cron)) => Ok(Schedule::Cron {
             expression: cron
@@ -306,6 +306,7 @@ fn describe(job: &Job, thread: Id) -> Value {
     };
     let schedule = match &job.schedule {
         Schedule::At { at } => json!({ "at": time(*at) }),
+        Schedule::In { seconds } => json!({ "in_seconds": seconds }),
         Schedule::Every { seconds, .. } => json!({ "every_seconds": seconds }),
         Schedule::Cron { expression, zone } => json!({ "cron": expression, "zone": zone }),
     };
