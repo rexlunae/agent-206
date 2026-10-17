@@ -130,6 +130,7 @@ impl crate::error::Classified for HostFailure {
             HostErrorCode::Unsupported | HostErrorCode::Other => return None,
             HostErrorCode::Io => ErrorKind::Storage,
             HostErrorCode::Timeout => ErrorKind::Timeout,
+            HostErrorCode::Network => ErrorKind::Unavailable,
         })
     }
 }
@@ -162,13 +163,18 @@ pub struct ExtensionTools {
 #[derive(Clone)]
 pub struct ExtensionHost {
     store: Arc<Mutex<Store>>,
+    net: Arc<dyn crate::network::Net>,
     /// Passed to unconfined workers; a Linux worker gets an empty one instead.
     #[cfg_attr(target_os = "linux", allow(dead_code))]
     data_dir: PathBuf,
 }
 impl ExtensionHost {
     pub fn new(store: Arc<Mutex<Store>>, data_dir: PathBuf) -> Self {
-        Self { store, data_dir }
+        Self {
+            store,
+            net: Arc::new(crate::network::Internet),
+            data_dir,
+        }
     }
 
     /// Tools of enabled extensions whose declared capabilities the user has
@@ -334,6 +340,8 @@ impl ExtensionHost {
             workspace: scope.workspace,
             skills_root: self.data_dir.join("skills"),
             store: Arc::clone(&self.store),
+            hosts: manifest.hosts.clone(),
+            net: Arc::clone(&self.net),
             logs: 0,
             last_failure: None,
         };
@@ -475,6 +483,9 @@ struct HostCalls {
     effective: BTreeSet<Capability>,
     workspace: Option<PathBuf>,
     store: Arc<Mutex<Store>>,
+    /// The manifest's network destinations.
+    hosts: Vec<String>,
+    net: Arc<dyn crate::network::Net>,
     logs: u32,
     last_failure: Option<HostFailure>,
 }
@@ -621,6 +632,7 @@ impl HostCalls {
                 let root = self.workspace()?;
                 git_call(move |interrupt| git::diff(root, &path, staged, &interrupt)).await
             }
+            HostRequest::Fetch { url } => fetch::fetch(self.net.as_ref(), &self.hosts, &url).await,
             HostRequest::StateGet { key } => {
                 check_key(&key)?;
                 let value = self
@@ -757,6 +769,7 @@ impl Drop for Interrupt {
         self.set();
     }
 }
+mod fetch;
 mod git;
 mod workspace;
 

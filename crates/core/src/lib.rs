@@ -471,6 +471,9 @@ pub struct PluginSummary {
     pub tools: Vec<extension::ToolSpec>,
     #[serde(default)]
     pub panels: Vec<extension::PanelSpec>,
+    /// Where the `network` permission may connect; `*` is any public host.
+    #[serde(default)]
+    pub hosts: Vec<String>,
 }
 /// A skill installed in the gateway's profile, as the user reviews it.
 /// Text fields are written by the skill's author.

@@ -308,6 +308,14 @@ pub mod host {
             _ => Err(unexpected()),
         }
     }
+    /// `GET` a public HTTPS URL on a host the manifest declares. Any final
+    /// status is a response, not a failure.
+    pub fn fetch(url: &str) -> Result<FetchResponse, HostFailure> {
+        match call(&HostRequest::Fetch { url: url.into() })? {
+            HostReply::Fetched(response) => Ok(response),
+            _ => Err(unexpected()),
+        }
+    }
     fn done(reply: HostReply) -> Result<(), HostFailure> {
         match reply {
             HostReply::Done => Ok(()),

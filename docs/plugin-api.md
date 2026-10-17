@@ -17,9 +17,10 @@ offers the `list_directory`, `read_text_file`, `search_text`,
 `write_text_file` and `edit_text_file` tools and an `overview` panel. The
 write tools need a separate `write_workspace` grant. It also bundles
 `agent206.git` (`plugins/git`) with `git_status`, `git_log` and `git_diff`
-tools under the `git_read` grant. Bundled tools cut text past 192 KiB with a
-notice (the SDK's `excerpt`), so a long result never exceeds the outcome
-limit. User-installed and agent-prepared packages are not implemented yet: the
+tools under the `git_read` grant, and `agent206.web` (`plugins/web`) with a
+`fetch_url` tool under the `network` grant. Bundled tools cut text past
+192 KiB with a notice (the SDK's `excerpt`), so a long result never exceeds
+the outcome limit. User-installed and agent-prepared packages are not implemented yet: the
 worker only loads bundled modules.
 
 The wire types live in `a206-extension-abi`; the guest SDK is
@@ -57,6 +58,19 @@ Rejected before anything runs: unknown fields, an ABI other than 2, an invalid
 id, an empty name/description/version, tool/panel/parameter names that are not
 `[a-z][a-z0-9_]{0,63}`, duplicates, more than 64 declarations of one kind, and
 a tool or panel that uses a capability the manifest does not request.
+
+A manifest that requests `network` must list where it connects, and `hosts`
+without `network` is refused:
+
+```toml
+capabilities = ["network"]
+hosts = ["api.example.org"]   # exact lowercase DNS names, at most 32
+# hosts = ["*"]               # or `*` alone: any public HTTPS host
+```
+
+IP literals, ports, wildcards inside a name, single-label names and
+duplicates are refused. The Extensions page shows the hosts beside the
+permission.
 
 ### Authority
 
@@ -126,6 +140,7 @@ unsafe operation.
 | `git_status` | `git_read` + a project | branch, `HEAD` id, changed paths (staged, unstaged, untracked) | 1,000 entries; 5 s per git call; renames not tracked; submodules ignored |
 | `git_log { max }` | `git_read` + a project | commits from `HEAD`: id, summary, author name (no email), author time | 200 commits |
 | `git_diff { path, staged }` | `git_read` + a project | unified diff of one file (`HEAD`→index when `staged`, else index→working tree; a symbolic link compares its target text), or `binary` | 512 KiB per side (checked before a blob is read), 192 KiB of text, 3 context lines; at most 8,192 input lines combined and 1,000,000 line pairs, otherwise a budget failure |
+| `fetch { url }` | `network` + a declared host | final status (any, not only 2xx), `Content-Type`, body, whether it was cut | 512 KiB body; 8 s including redirects; 5 redirects |
 | `state_get { key }` | nothing | the extension's own value | — |
 | `state_put { key, value }` | nothing | done (`value = None` deletes) | 64 keys, 256 KiB per extension |
 | `log { level, message }` | nothing | done; recorded through tracing | 32 per call, 1 KiB each |
@@ -147,12 +162,21 @@ and `core.worktree` is ignored. They read no system or global git configuration 
 filter, diff, textconv, fsmonitor or credential programs. The working-tree side
 of a diff is the raw file, without line-ending or filter conversion.
 
+A fetch is a `GET` through the same guard as downloads
+(`crates/runtime/src/network.rs`). The URL and every redirect must be
+credential-free HTTPS on port 443 without a fragment, on a host the manifest
+declares, and every address the host resolves to must be public. The
+connection is pinned to those checked addresses, so a second DNS answer cannot
+redirect it. It sends no cookies, credentials or proxy settings. A refusal
+never echoes the URL, because links can carry tokens.
+
 Workspace paths are relative and resolved with cap-std: absolute paths, `..`
 escapes and symlinks that leave the root are refused. Writes also refuse any
 path through `.git` (in any letter case) or through a symlink, and the
 gateway serializes extension writes so an edit cannot interleave with another. A refusal is a typed
 `failed { code, message }` reply (`denied`, `no_workspace`, `not_found`,
-`invalid`, `too_large`, `exists`, `conflict`, `budget`, `unsupported`, `io`, `timeout`;
+`invalid`, `too_large`, `exists`, `conflict`, `budget`, `unsupported`, `io`,
+`timeout`, `network`;
 a host that predates a code sends it as `other`); messages never contain
 host paths. Extension state is stored in the gateway's SQLite database,
 private to each extension id. Extension output is never written to the request
@@ -217,7 +241,7 @@ Tool text is extension output, never instructions.
 | workspace | Multi-hunk patch | `write_workspace` |
 | git | Stage, commit | `git_write` |
 | forge | PRs, reviews, checks, logs | adapter-specific scoped credential handle |
-| network | Fetch through the SSRF guard | `network` + destination |
+| network | Requests other than `GET`, headers, brokered credentials | `network` + destination + secret handle |
 | downloads | Enqueue, cancel, subscribe | destination and origin grants |
 | documents | Open, read, edit, render | document handle + format permissions |
 | browser | Navigate, inspect, test | isolated profile + origin grant |

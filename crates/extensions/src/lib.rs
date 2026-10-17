@@ -8,7 +8,7 @@ pub mod worker;
 
 pub use a206_extension_abi as abi;
 pub use engine::{AbiViolation, BridgeError, EngineError, HostBridge, Limits};
-pub use manifest::{ArgError, Manifest, ManifestError, check_args};
+pub use manifest::{ArgError, Manifest, ManifestError, allows_host, check_args};
 
 use a206_core::{Capability, ErrorKind};
 use std::error::Error;
@@ -26,6 +26,7 @@ pub fn required_capability(request: &abi::HostRequest) -> Option<Capability> {
             Some(Capability::WriteWorkspace)
         }
         R::GitStatus | R::GitLog { .. } | R::GitDiff { .. } => Some(Capability::GitRead),
+        R::Fetch { .. } => Some(Capability::Network),
         R::StateGet { .. }
         | R::StatePut { .. }
         | R::Log { .. }
@@ -54,6 +55,10 @@ const BUNDLED: &[(&str, &[u8])] = &[
     (
         include_str!("../../../plugins/skills/plugin.toml"),
         include_bytes!(concat!(env!("OUT_DIR"), "/a206_plugin_skills.wasm")),
+    ),
+    (
+        include_str!("../../../plugins/web/plugin.toml"),
+        include_bytes!(concat!(env!("OUT_DIR"), "/a206_plugin_web.wasm")),
     ),
 ];
 

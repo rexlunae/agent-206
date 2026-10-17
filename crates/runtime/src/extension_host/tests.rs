@@ -2,6 +2,7 @@
 //! path through the real worker is covered by the app's smoke test.
 use super::*;
 
+mod fetch;
 mod git;
 use a206_extensions::abi::{EntryKind, SearchMatch};
 
@@ -45,6 +46,8 @@ fn calls_for(
         effective: effective.iter().copied().collect(),
         workspace,
         store: Arc::clone(store),
+        hosts: Vec::new(),
+        net: Arc::new(crate::network::Internet),
         logs: 0,
         last_failure: None,
     }
