@@ -1493,18 +1493,31 @@ async fn encrypted_setup_keeps_seeds_private_and_cancellation_discards_them() {
         None,
         String::new(),
     );
-    let code = generator.generate(a206_vault::unix_now());
-    assert!(matches!(
-        secure_call(
+    let mut code = generator.generate(a206_vault::unix_now());
+    for attempt in 0..3 {
+        let reply = secure_call(
             &mut relay,
             &mut channel,
             Q::ConfirmTotp {
-                code: Secret::new(code.clone())
-            }
+                code: Secret::new(code.clone()),
+            },
         )
-        .await,
-        R::Ok
-    ));
+        .await;
+        if matches!(reply, R::Ok) {
+            break;
+        }
+        let fresh = generator.generate(a206_vault::unix_now());
+        // Retry only a genuinely expired time slice, never a stable rejection.
+        assert!(
+            attempt < 2
+                && fresh != code
+                && matches!(reply,
+            R::Error(ref error) if error.code == Code::AuthenticationFailed
+                || error.code == Code::ClockDrift),
+            "{reply:?}"
+        );
+        code = fresh;
+    }
     assert!(
         matches!(secure_call(&mut relay, &mut channel, Q::Status).await, R::Status(s) if s.totp_enrolled == Some(true))
     );

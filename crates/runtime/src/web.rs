@@ -1363,6 +1363,13 @@ mod tests {
                 .windows(manual_key.expose().len())
                 .any(|w| w == manual_key.expose().as_bytes())
         );
+        // Closing an owned local channel must still discard its pending seed
+        // after another tab changes the selected gateway.
+        state
+            .install(GatewayTarget::Ssh {
+                endpoint: "ssh://test-host".to_owned(),
+            })
+            .unwrap();
         let (_, reply) = post::<_, RR>(
             &router,
             &state,

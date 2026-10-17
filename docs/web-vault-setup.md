@@ -62,8 +62,8 @@ flow does not invoke foreign commands or import grants implicitly.
 The common Rust `a206-vault-channel` crate uses Snow 0.10's
 `Noise_NK_25519_ChaChaPoly_SHA256`, with a versioned Agent 206 prologue. The broker
 holds its ephemeral static private key; the browser initiator pins the public key
-obtained in the trusted terminal. The HTTP bridge holds neither transport keys
-nor decrypted requests/replies. The browser still has to trust the application
+obtained in the trusted terminal. The ciphertext relay holds neither transport keys
+nor decrypted setup requests/replies. The browser still has to trust the application
 code and its serving origin: encryption does not make compromised JavaScript safe.
 Loopback authorization and remote HTTPS/TOTP sign-in retain their existing guards.
 
@@ -75,6 +75,15 @@ handshake per socket, so a relay cannot replace a channel and inherit its step-u
 MessagePack plaintext buffers and UI secret wrappers zeroize on drop; Debug
 redacts secret fields. Ordinary snapshots and events contain no seeds/passwords.
 
+Gateway pairing is a separate capability transfer: after minting it through the
+encrypted channel, the browser sends the short-lived pairing token through the
+existing authenticated command bridge to the local gateway. That bridge sees
+the token and is trusted for this operation; this is not an end-to-end encrypted
+browser-to-gateway transfer. The token is redacted, never persisted, and bound by
+the broker to the first gateway process that proves it. Passwords, authenticator
+seeds and credential values do not follow that command path. Do not use this
+setup with a command bridge you do not trust to deliver pairing capabilities.
+
 Stateful Noise nonces reject replay, reordering, tampering and cross-session
 substitution. A lost response voids the browser channel and is never retried as a
 mutation. The UI refreshes actual status on a new channel to show what succeeded.
@@ -84,8 +93,10 @@ timeout and a five-minute idle timeout. Broker sockets preserve per-connection
 step-up and enrollment state. Noise messages are bounded at 65,535 bytes. TLS and
 SSH still provide transport reliability; no packet-loss layer is invented.
 
-This implements browser setup for a gateway local to the web server, including
-browsers using its HTTPS interface. Vault setup for a gateway reached by the web
+This implements initial browser setup on the loopback web interface for a gateway
+local to the web server. HTTPS startup already requires an enrolled authenticator;
+HTTPS clients can subsequently unlock and manage that vault, but cannot bootstrap
+its initial creation or first TOTP enrollment. Vault setup for a gateway reached by the web
 server over SSH remains unavailable and fails closed. Key-file workflows, modern
 vault-envelope migration, recovery codes and full RustyClaw parity remain listed
 in [security-setup.md](security-setup.md); this flow retains the existing encrypted

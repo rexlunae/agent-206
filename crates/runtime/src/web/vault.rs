@@ -48,7 +48,9 @@ pub(super) async fn handle(State(state): State<Web>, headers: HeaderMap, bytes: 
     }
     let request = requests.remove(0);
     let id = request.id;
-    let reply = if !matches!(state.status().active, Some(GatewayTarget::Local)) {
+    let reply = if !matches!(request.body, RelayRequest::Close { .. })
+        && !matches!(state.status().active, Some(GatewayTarget::Local))
+    {
         unavailable(
             "Choose a local gateway first. Remote vault setup over SSH is not available yet.",
         )

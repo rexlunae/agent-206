@@ -302,6 +302,12 @@ mod imp {
             };
             let healthy = match job {
                 Job::Call(request, reply) => {
+                    if matches!(*request, Request::CancelTotp) && connected.version() < 8 {
+                        // Legacy brokers clear pending enrollment on disconnect,
+                        // but cannot decode CancelTotp. Do not send a new opcode.
+                        reply.send(Ok(Reply::Ok)).ignore();
+                        continue;
+                    }
                     let mut result = connected.call(*request).await.map_err(VaultError::from);
                     if connected.version() < 8
                         && let Ok(Reply::Status(status)) = &mut result

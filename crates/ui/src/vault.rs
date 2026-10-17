@@ -377,11 +377,12 @@ impl Panel {
         self.held.write().take()
     }
     fn cancel(mut self) {
+        let pending = self.enrollment.peek().is_some();
         self.held.set(None);
         self.enrollment.set(None);
         self.flow.set(Flow::Idle);
         // Also discard the broker-held pending seed, rather than only hiding it.
-        if self.begin() {
+        if pending && self.begin() {
             spawn(async move {
                 if let Err(error) = self.session().call(Request::CancelTotp).await {
                     self.fail("vault_totp_cancel", "Could not cancel enrollment", &error);
