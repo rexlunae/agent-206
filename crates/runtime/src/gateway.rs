@@ -20,6 +20,7 @@ mod run;
 /// Snapshot bytes a user message needs beyond its text and attachments.
 const MESSAGE_OVERHEAD: usize = 4096;
 mod messengers;
+pub(crate) use mcp_servers::McpClient;
 pub use mcp_servers::{McpOffer, McpOffers};
 pub use run::{RunError, ToolError};
 mod delegation;
@@ -333,7 +334,7 @@ pub struct Gateway {
     messengers: tokio::sync::watch::Sender<Vec<crate::messengers::Desired>>,
     /// Messengers the user disconnected; they connect again only on request.
     messengers_stopped: Arc<Mutex<BTreeSet<String>>>,
-    mcp: Arc<mcp_servers::McpServers>,
+    mcp: McpClient,
     /// This gateway's subagent tools and the hosts their subagents run with.
     delegation: delegation::Binding,
     /// Runs the subagent tools reserved before starting them, by subagent.
@@ -394,6 +395,11 @@ impl Gateway {
         let extension_tools: Arc<dyn crate::tools::ToolHost> = Arc::new(
             crate::extension_tools::ExtensionToolHost::new(extensions.clone()),
         );
+        // So are tools of enabled MCP servers the conversation may use. The
+        // host holds only the MCP client, not this gateway.
+        let mcp = McpClient::new(store.clone());
+        let mcp_tools: Arc<dyn crate::tools::ToolHost> =
+            Arc::new(crate::mcp_tools::McpToolHost::new(mcp.clone()));
         let prompts = Arc::new(crate::prompt_tool::Prompts::new(store.clone()));
         // Approved skills; each conversation still denies the tools until the
         // user permits them.
@@ -415,6 +421,7 @@ impl Gateway {
             paired: Arc::new(tokio::sync::Notify::new()),
             tool_hosts: Arc::new(vec![
                 extension_tools,
+                mcp_tools,
                 Arc::new(crate::exec_tool::ExecHost::new(root)),
                 Arc::new(crate::prompt_tool::PromptHost::new(prompts.clone())),
                 skill_tools,
@@ -425,7 +432,7 @@ impl Gateway {
             pairings: tokio::sync::watch::Sender::new(0),
             messengers: tokio::sync::watch::Sender::new(desired),
             messengers_stopped: Arc::new(Mutex::new(BTreeSet::new())),
-            mcp: Arc::default(),
+            mcp,
             delegation: Default::default(),
             reserved: Arc::default(),
         };
@@ -1568,16 +1575,7 @@ impl Gateway {
         &self.extensions
     }
     fn project_root(&self, id: Id) -> Result<PathBuf> {
-        Ok(self
-            .lock()?
-            .state
-            .projects
-            .iter()
-            .find(|p| p.id == id)
-            .ok_or(GatewayError::NotFound("project not found"))?
-            .root
-            .clone()
-            .into())
+        project_root(&*self.lock()?, id)
     }
     async fn start_download(
         &self,
@@ -1896,6 +1894,19 @@ fn validate_effort(
         )?;
     }
     Ok(())
+}
+
+/// The root directory of project `id`.
+fn project_root(store: &Store, id: Id) -> Result<PathBuf> {
+    Ok(store
+        .state
+        .projects
+        .iter()
+        .find(|p| p.id == id)
+        .ok_or(GatewayError::NotFound("project not found"))?
+        .root
+        .clone()
+        .into())
 }
 
 #[cfg(test)]

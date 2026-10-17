@@ -280,6 +280,7 @@ impl ToolHost for ExtensionToolHost {
                         // Extensions add no policy of their own; the user's
                         // setting (deny when unset) decides.
                         permission: ToolPermission::Allow,
+                        whole_output: false,
                     })
                     .collect(),
                 unavailable: offers.unavailable,

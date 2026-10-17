@@ -114,6 +114,7 @@ pub(crate) fn classify(error: &(dyn Error + 'static)) -> Option<ErrorKind> {
         crate::extension_host::ExtensionError,
         crate::extension_host::packages::PackageError,
         crate::extension_tools::ExtensionToolError,
+        crate::mcp_tools::McpToolError,
         crate::skill_tool::SkillToolError,
         crate::delegation_tool::DelegationToolError,
         crate::gateway::DelegatorError,
@@ -171,6 +172,7 @@ impl Classified for a206_mcp::McpError {
             | ListingTooLarge { .. }
             | OutputTooLarge { .. } => ErrorKind::Protocol,
             Timeout(_) => ErrorKind::Timeout,
+            Abandoned => ErrorKind::Cancelled,
             Disabled
             | ToolDenied
             | ApprovalRequired

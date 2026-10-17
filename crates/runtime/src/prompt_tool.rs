@@ -221,6 +221,7 @@ impl PromptHost {
     }
     fn spec() -> ToolSpec {
         ToolSpec {
+            whole_output: false,
             name: NAME.into(),
             description: "Ask the user a question and wait for the answer. Use it when you \
                 cannot continue without a decision or a fact only the user has. Offer \

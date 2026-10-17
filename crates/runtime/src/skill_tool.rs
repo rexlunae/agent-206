@@ -198,6 +198,8 @@ impl SkillToolHost {
                 description: spec.description,
                 capabilities: spec.capabilities,
                 permission: ToolPermission::Allow,
+                // Skill instructions are atomic model input.
+                whole_output: true,
             })
             .collect())
     }
