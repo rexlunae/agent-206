@@ -301,13 +301,18 @@ async fn a_heartbeat_sends_heartbeat_md_and_a_heartbeat_ok_reply_is_quiet() {
     );
     // An empty checklist has nothing to check, so nothing is sent either.
     let path = project.path().join("HEARTBEAT.md");
-    for blank in [
-        " \n".to_owned(),
-        " ".repeat(2 * a206_runtime::instructions::MAX_FILE),
-    ] {
+    let limit = a206_runtime::instructions::MAX_FILE;
+    for blank in [" \n".to_owned(), " ".repeat(limit)] {
         std::fs::write(&path, blank).unwrap();
         assert_eq!(run_now(&gateway, job.id).await.outcome, JobOutcome::Quiet);
     }
+    // A checklist after more blank space than is read is refused, not
+    // taken for an empty one.
+    std::fs::write(&path, format!("{}- {}", " ".repeat(limit), nonce())).unwrap();
+    assert_eq!(
+        refusal(&run_now(&gateway, job.id).await),
+        ErrorKind::InvalidRequest
+    );
     assert!(messages(&gateway).is_empty());
     assert!(requests.try_recv().is_err(), "a model was asked");
 

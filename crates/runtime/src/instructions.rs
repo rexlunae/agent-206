@@ -176,9 +176,17 @@ pub fn heartbeat(root: PathBuf) -> Result<Option<String>, InstructionError> {
         return Ok(None);
     };
     let text = text_within(&bytes, MAX_FILE).ok_or(InstructionError::NotText)?;
-    // A blank checklist stays blank, however long.
     if text.trim().is_empty() {
-        return Ok(Some(String::new()));
+        // Blank as far as it was read: an empty checklist only when that was
+        // the whole file, since what follows the limit was never examined.
+        return if text.len() < bytes.len() {
+            Err(InstructionError::Truncated {
+                limit: MAX_FILE,
+                size,
+            })
+        } else {
+            Ok(Some(String::new()))
+        };
     }
     let mut checklist = text.to_owned();
     if text.len() < bytes.len() {

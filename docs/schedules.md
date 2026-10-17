@@ -20,6 +20,8 @@ only there: instruction files never include it.
 
 - No project, no read grant, or no `HEARTBEAT.md`: the run is `Refused` with
   the reason (`NotFound` or `PermissionDenied`) and nothing is sent.
+- A larger `HEARTBEAT.md` whose first 32 KiB are blank: `Refused`, since the
+  rest was not read.
 - An empty or blank `HEARTBEAT.md`: the run is `Quiet` and nothing is sent, so a
   checklist can be paused by emptying it.
 - A reply of exactly `HEARTBEAT_OK` (surrounding whitespace aside): `Quiet`.
