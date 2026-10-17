@@ -176,6 +176,9 @@ pub struct MessengerImport {
     /// (a Matrix homeserver). An origin, carried over as the endpoint.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
+    /// The nickname an IRC account signed in with, carried over as the login.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub login: Option<String>,
     /// Chats the source allowed; carried over as this entry's allow-list.
     #[serde(default)]
     pub allowed_chats: BTreeSet<String>,
@@ -214,6 +217,11 @@ pub enum UnsupportedMessenger {
     /// The service needs a server URL and the source names none, or one
     /// that is not an HTTPS (or local HTTP) origin.
     InvalidEndpoint,
+    /// IRC without TLS: the account password would cross the network in
+    /// the clear, so the entry is not carried over.
+    PlainTextIrc,
+    /// The IRC nickname is not one Agent 206 can sign in with.
+    InvalidLogin,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -306,6 +314,7 @@ impl Preview {
             }
             let mut config = MessengerConfig::new(import.name.clone(), kind);
             config.endpoint = import.endpoint.clone();
+            config.login = import.login.clone();
             config.allowed_chats = import.allowed_chats.clone();
             config.allowed_users = import.allowed_users.clone();
             added.push(config.name.clone());

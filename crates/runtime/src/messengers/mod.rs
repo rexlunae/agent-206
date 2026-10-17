@@ -9,6 +9,7 @@
 //! A person in an allowed chat can therefore do whatever the user could do
 //! by typing into that thread, and nothing more.
 mod discord;
+mod irc;
 mod listener;
 mod matrix;
 mod slack;
@@ -44,6 +45,18 @@ pub enum MessengerError {
     NoAppCredential { origin: String },
     #[error("{service} has no official server; set the messenger's endpoint to yours")]
     NoEndpoint { service: &'static str },
+    #[error("the IRC server is not allowed")]
+    IrcServer(#[source] a206_core::messengers::IrcServerError),
+    #[error("the IRC messenger has no login; set it to the bot's registered nickname")]
+    NoLogin,
+    #[error(
+        "the IRC server does not offer SASL sign-in and account tags, which Agent 206 needs to know who sent each message ({code})"
+    )]
+    IrcCapabilities { code: String },
+    #[error(
+        "{chat} is no longer online under the nickname it wrote from, so the reply was not sent"
+    )]
+    RecipientGone { chat: String },
     #[error("the messenger endpoint is not allowed")]
     Endpoint(#[source] a206_core::providers::EndpointError),
     #[error("a messenger endpoint is an origin, without a path")]
@@ -115,6 +128,8 @@ impl crate::error::Classified for MessengerError {
             Self::NoCredential { .. }
             | Self::NoAppCredential { .. }
             | Self::NoEndpoint { .. }
+            | Self::IrcServer(_)
+            | Self::NoLogin
             | Self::NoModel
             | Self::Endpoint(_)
             | Self::EndpointPath => ErrorKind::InvalidRequest,
@@ -133,7 +148,8 @@ impl crate::error::Classified for MessengerError {
             | Self::Reconnect { .. }
             | Self::Backlog { .. } => ErrorKind::Unavailable,
             Self::DiscordIntents => ErrorKind::PermissionDenied,
-            Self::Rejected { .. } => ErrorKind::Provider,
+            Self::Rejected { .. } | Self::IrcCapabilities { .. } => ErrorKind::Provider,
+            Self::RecipientGone { .. } => ErrorKind::Unavailable,
             Self::Status { .. } | Self::Refused { .. } => ErrorKind::Provider,
             Self::Conversation(error) => return crate::error::classify(error.as_ref()),
             Self::Turn(report) => report.kind,
@@ -149,6 +165,9 @@ impl MessengerError {
             Self::NoCredential { .. }
                 | Self::NoAppCredential { .. }
                 | Self::NoEndpoint { .. }
+                | Self::IrcServer(_)
+                | Self::NoLogin
+                | Self::IrcCapabilities { .. }
                 | Self::Endpoint(_)
                 | Self::EndpointPath
                 | Self::BrokerTooOld
@@ -160,7 +179,9 @@ impl MessengerError {
                 | Self::Broker(ClientError::Broker(
                     BrokerError::NotFound
                         | BrokerError::Denied(_)
-                        | BrokerError::Upstream(UpstreamFailure::InvalidBotToken)
+                        | BrokerError::Upstream(
+                            UpstreamFailure::InvalidBotToken | UpstreamFailure::InvalidPassword
+                        )
                 ))
         )
     }
@@ -236,6 +257,7 @@ enum Adapter {
     Matrix(matrix::Matrix),
     Discord(discord::Discord),
     Slack(slack::Slack),
+    Irc(irc::Irc),
 }
 impl Adapter {
     fn new(config: &MessengerConfig, api: Api) -> Self {
@@ -248,6 +270,11 @@ impl Adapter {
                 Self::Discord(discord::Discord::new(api, config.allowed_chats.clone()))
             }
             MessengerKind::Slack => Self::Slack(slack::Slack::new(api)),
+            MessengerKind::Irc => Self::Irc(irc::Irc::new(
+                api,
+                config.login.clone(),
+                config.allowed_chats.clone(),
+            )),
         }
     }
     /// Check the credential and name the account.
@@ -257,6 +284,7 @@ impl Adapter {
             Self::Matrix(adapter) => adapter.connect().await,
             Self::Discord(adapter) => adapter.connect().await,
             Self::Slack(adapter) => adapter.connect().await,
+            Self::Irc(adapter) => adapter.connect().await,
         }
     }
     /// Wait for the next batch after `cursor`.
@@ -266,13 +294,14 @@ impl Adapter {
             Self::Matrix(adapter) => adapter.receive(cursor).await,
             Self::Discord(adapter) => adapter.receive(cursor).await,
             Self::Slack(adapter) => adapter.receive(cursor).await,
+            Self::Irc(adapter) => adapter.receive(cursor).await,
         }
     }
     /// Fails with [`MessengerError::EncryptedRoom`] if an answer could not be
     /// sent to `chat` as it is now.
     async fn check_chat(&self, chat: &str) -> Result<()> {
         match self {
-            Self::Telegram(_) | Self::Discord(_) | Self::Slack(_) => Ok(()),
+            Self::Telegram(_) | Self::Discord(_) | Self::Slack(_) | Self::Irc(_) => Ok(()),
             Self::Matrix(adapter) => adapter.check_room(chat).await,
         }
     }
@@ -282,6 +311,7 @@ impl Adapter {
             // report no invitations.
             Self::Telegram(_) | Self::Discord(_) | Self::Slack(_) => Ok(()),
             Self::Matrix(adapter) => adapter.join(chat).await,
+            Self::Irc(adapter) => adapter.join(chat).await,
         }
     }
     async fn send(&self, chat: &str, text: &str) -> Result<()> {
@@ -290,6 +320,7 @@ impl Adapter {
             Self::Matrix(adapter) => adapter.send(chat, text).await,
             Self::Discord(adapter) => adapter.send(chat, text).await,
             Self::Slack(adapter) => adapter.send(chat, text).await,
+            Self::Irc(adapter) => adapter.send(chat, text).await,
         }
     }
 }
@@ -675,8 +706,11 @@ async fn deliver<H: Host>(
         }
     };
     match sent {
-        // The chat became encrypted during the turn.
-        Err(error) if encrypted(&error) => {
+        // The chat became encrypted during the turn, or the person it was
+        // for no longer holds the nickname: report it and keep listening.
+        Err(error)
+            if encrypted(&error) || matches!(error, MessengerError::RecipientGone { .. }) =>
+        {
             report(host, config, &error);
             Ok(())
         }
@@ -725,21 +759,36 @@ pub(crate) struct Api {
     /// The app-level token's credential, for kinds that receive with one.
     app_credential: Option<String>,
     base: url::Url,
+    /// The exact destination the credentials are bound to.
+    origin: String,
 }
 impl Api {
     fn new(root: PathBuf, pairing: BrokerPairing, config: &MessengerConfig) -> Result<Self> {
         let endpoint = config.endpoint().ok_or(MessengerError::NoEndpoint {
             service: config.kind.label(),
         })?;
-        let base = a206_core::providers::base_url(endpoint).map_err(MessengerError::Endpoint)?;
-        if base.path() != "/" {
-            return Err(MessengerError::EndpointPath);
-        }
+        let (base, origin) = if config.kind.is_irc() {
+            let server = a206_core::messengers::IrcServer::parse(endpoint)
+                .map_err(MessengerError::IrcServer)?;
+            let origin = server.origin();
+            let base = url::Url::parse(&origin).map_err(|_| {
+                MessengerError::IrcServer(a206_core::messengers::IrcServerError::Shape)
+            })?;
+            (base, origin)
+        } else {
+            let base =
+                a206_core::providers::base_url(endpoint).map_err(MessengerError::Endpoint)?;
+            if base.path() != "/" {
+                return Err(MessengerError::EndpointPath);
+            }
+            let origin = base.origin().ascii_serialization();
+            (base, origin)
+        };
         let credential = config
             .credential
             .clone()
             .ok_or_else(|| MessengerError::NoCredential {
-                origin: base.origin().ascii_serialization(),
+                origin: origin.clone(),
             })?;
         Ok(Self {
             service: config.kind.label(),
@@ -748,6 +797,7 @@ impl Api {
             credential,
             app_credential: config.app_credential.clone(),
             base,
+            origin,
         })
     }
     /// `relative` resolved under the endpoint, refusing anything that would
@@ -838,12 +888,18 @@ impl Api {
             self.app_credential
                 .clone()
                 .ok_or_else(|| MessengerError::NoAppCredential {
-                    origin: self.base.origin().ascii_serialization(),
+                    origin: self.origin.clone(),
                 })?
         } else {
             self.credential.clone()
         };
-        let client = self.client(a206_broker::SOCKET_VERSION).await?;
+        let needed = match scheme {
+            SocketScheme::IrcSasl { .. } => a206_broker::IRC_VERSION,
+            SocketScheme::DiscordGateway { .. } | SocketScheme::SlackSocketMode => {
+                a206_broker::SOCKET_VERSION
+            }
+        };
+        let client = self.client(needed).await?;
         let opened = client
             .socket(SocketCall {
                 credential,
@@ -865,6 +921,11 @@ impl Api {
             }
             SocketOpen::Refused {
                 code: Some(code), ..
+            } if IRC_CAPABILITY_CODES.contains(&code.as_str()) => {
+                Err(MessengerError::IrcCapabilities { code })
+            }
+            SocketOpen::Refused {
+                code: Some(code), ..
             } => Err(MessengerError::Rejected { service, code }),
             SocketOpen::Refused { status, code: None } => {
                 Err(MessengerError::Status { service, status })
@@ -873,15 +934,19 @@ impl Api {
     }
 }
 
-/// Error codes (Slack's) that mean the stored token is wrong for the request.
-const UNAUTHORIZED_CODES: [&str; 6] = [
+/// Error codes that mean the stored token is wrong for the request: Slack's,
+/// and the broker's for a refused IRC sign-in.
+const UNAUTHORIZED_CODES: [&str; 7] = [
     "invalid_auth",
     "not_authed",
     "account_inactive",
     "token_revoked",
     "token_expired",
     "not_allowed_token_type",
+    "sasl_failed",
 ];
+/// The broker's codes for an IRC server without the sign-in Agent 206 needs.
+const IRC_CAPABILITY_CODES: [&str; 2] = ["sasl_unavailable", "account_tag_unavailable"];
 
 #[cfg(test)]
 mod tests;
