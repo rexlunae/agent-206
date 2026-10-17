@@ -9,7 +9,11 @@
 //! withdrawn is stopped at once. Approvals are answered only through
 //! [`Command::ResolveApproval`] from a client; the model sees no approval ID
 //! and no tool can resolve one.
-use super::{Gateway, GatewayError, PartialReply, Result, poisoned};
+use super::{
+    Gateway, GatewayError, PartialReply, Result,
+    compaction::{self, CompactionError},
+    poisoned,
+};
 use crate::{
     error::check,
     provider::{self, now},
@@ -390,9 +394,21 @@ impl Gateway {
     }
     async fn rounds(&self, run: &Native) -> Result<Ended> {
         let pairing = self.pairing()?;
+        let prompt = format!(
+            "{}{}",
+            run.prompt,
+            self.load_instructions(run.thread).await?
+        );
         let mut total: Option<Usage> = None;
         let mut calls_used = 0;
         let mut round = 0;
+        // The previous request's input tokens: before the first round, the
+        // last request of the previous run.
+        let mut last_input = self
+            .view(run.thread)?
+            .thread
+            .usage
+            .and_then(|usage| usage.input_tokens);
         loop {
             round += 1;
             // A cancellation between rounds ends the run as Cancelled, before
@@ -404,6 +420,36 @@ impl Gateway {
             // stream a reply the conversation could not store.
             if self.lock()?.remaining()? < NEXT_ROUND {
                 return Ok(Ended::Failed(GatewayError::HistoryFull));
+            }
+            if compaction::over_threshold(last_input, run.info.context_limit) {
+                let compacted = self
+                    .compact(compaction::Request {
+                        thread: run.thread,
+                        config: &run.config,
+                        info: &run.info,
+                        root: &run.root,
+                        cancel: &run.cancel,
+                        trigger: CompactionTrigger::Automatic,
+                        keep_turns: compaction::KEEP_DURING_RUN,
+                        input_tokens: last_input,
+                    })
+                    .await;
+                match compacted {
+                    // The summary request is part of what this run cost.
+                    Ok(usage) => {
+                        total = Some(match total.take() {
+                            None => usage,
+                            Some(sum) => add_usage(sum, &usage),
+                        });
+                    }
+                    // Only the current turns are in context; send them as they are.
+                    Err(GatewayError::Compaction(CompactionError::NothingToCompact)) => {}
+                    Err(GatewayError::Compaction(CompactionError::Cancelled)) => {
+                        return Ok(Ended::Cancelled);
+                    }
+                    Err(error) => return Ok(Ended::Failed(error)),
+                }
+                // The next check uses what this round's request reports.
             }
             let view = self.view(run.thread)?;
             let catalog = tokio::select! {
@@ -425,7 +471,7 @@ impl Gateway {
                 pairing: pairing.as_ref(),
             };
             let (turn, message) = match self
-                .stream_round(run, &view.thread, broker, &offered)
+                .stream_round(run, &prompt, &view.thread, broker, &offered)
                 .await?
             {
                 Some(Ok(turn)) => turn,
@@ -437,6 +483,7 @@ impl Gateway {
                 Some(sum) => add_usage(sum, &turn.usage),
             };
             total = Some(sum.clone());
+            last_input = turn.usage.input_tokens;
             if turn.calls.is_empty() {
                 return Ok(Ended::Complete {
                     last: turn.usage,
@@ -487,6 +534,7 @@ impl Gateway {
     async fn stream_round(
         &self,
         run: &Native,
+        prompt: &str,
         thread: &Thread,
         broker: provider::Broker<'_>,
         offered: &[ToolSpec],
@@ -496,7 +544,7 @@ impl Gateway {
             &run.config,
             broker,
             thread,
-            &run.prompt,
+            prompt,
             &run.info,
             offered,
             &sender,
@@ -542,6 +590,24 @@ impl Gateway {
         };
         store.persist(Some(EventKind::ThreadChanged { id: run.thread }))?;
         Ok(result)
+    }
+    /// Read the project instruction files the conversation may read, record
+    /// their provenance on the thread, and return the prompt section.
+    async fn load_instructions(&self, id: Id) -> Result<String> {
+        let view = self.view(id)?;
+        let loaded = match view.scope.workspace {
+            Some(root) if crate::instructions::permitted(&view.scope.capabilities) => {
+                tokio::task::spawn_blocking(move || crate::instructions::load(root)).await?
+            }
+            _ => crate::instructions::Loaded::default(),
+        };
+        let mut store = self.lock()?;
+        let thread = store.thread_mut(id)?;
+        if thread.instructions != loaded.files {
+            thread.instructions = loaded.files;
+            store.persist(Some(EventKind::ThreadChanged { id }))?;
+        }
+        Ok(loaded.prompt)
     }
     /// Attach the response's calls to its message. Calls whose arguments are
     /// unusable or that repeat an earlier call are settled here; the rest are

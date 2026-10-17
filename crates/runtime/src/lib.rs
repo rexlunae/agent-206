@@ -11,6 +11,7 @@ pub mod exec_tool;
 pub mod extension_host;
 pub mod extension_tools;
 pub mod gateway;
+pub mod instructions;
 pub mod joshua;
 pub mod mcp;
 pub mod mcp_tools;

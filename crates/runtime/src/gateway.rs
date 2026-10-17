@@ -15,11 +15,13 @@ use std::{
     sync::{Arc, Mutex, MutexGuard},
 };
 use tokio::io::AsyncWriteExt;
+mod compaction;
 mod mcp_servers;
 mod run;
 /// Snapshot bytes a user message needs beyond its text and attachments.
 const MESSAGE_OVERHEAD: usize = 4096;
 mod messengers;
+pub use compaction::{CompactionError, THRESHOLD_PERCENT as COMPACTION_THRESHOLD_PERCENT};
 pub(crate) use mcp_servers::McpClient;
 pub use mcp_servers::{McpOffer, McpOffers};
 pub use run::{RunError, ToolError};
@@ -78,6 +80,7 @@ impl PartialReply {
                 at: now(),
                 backend: thread.backend,
                 tool_calls: vec![],
+                compaction: None,
             });
         }
     }
@@ -102,6 +105,7 @@ impl PartialReply {
                 at: now(),
                 backend: thread.backend,
                 tool_calls: vec![],
+                compaction: None,
             });
         }
         self.apply(thread);
@@ -164,6 +168,8 @@ pub enum GatewayError {
     Frame(#[from] transport::FrameError),
     #[error(transparent)]
     Run(#[from] run::RunError),
+    #[error(transparent)]
+    Compaction(#[from] compaction::CompactionError),
     #[error("state could not be encoded")]
     Encode(#[from] rmp_serde::encode::Error),
     #[error("settings could not be encoded")]
@@ -238,6 +244,7 @@ impl crate::error::Classified for GatewayError {
             Self::Prompt(error) => return classify(error),
             Self::Frame(error) => return classify(error),
             Self::Run(error) => return classify(error),
+            Self::Compaction(error) => return classify(error),
             // The cause's own kind (missing, denied, invalid data) is the useful one.
             Self::Receipt(_)
             | Self::Workspace(_)
@@ -1070,33 +1077,7 @@ impl Gateway {
                         current.state != RunState::Running,
                         GatewayError::Conflict("thread is already running"),
                     )?;
-                    let key = current.model.as_ref().ok_or(GatewayError::Invalid(
-                        "connect a provider and select a model first",
-                    ))?;
-                    validate_model(&store.state, key)?;
-                    validate_effort(&store.state, Some(key), current.effort.as_deref())?;
-                    let info = store
-                        .state
-                        .catalogs
-                        .iter()
-                        .flat_map(|c| &c.models)
-                        .find(|m| &m.key == key)
-                        .cloned()
-                        .ok_or(GatewayError::Conflict("model metadata missing"))?;
-                    if let Some(parent) = current.parent {
-                        check(
-                            store.thread(parent)?.subagent_models.contains(key),
-                            GatewayError::Denied("parent revoked this subagent model"),
-                        )?;
-                    }
-                    let config = store
-                        .state
-                        .settings
-                        .providers
-                        .iter()
-                        .find(|p| p.id == key.provider)
-                        .cloned()
-                        .ok_or(GatewayError::NotFound("provider not configured"))?;
+                    let (config, info) = native_model(&store.state, current)?;
                     let prompt = store
                         .state
                         .settings
@@ -1133,6 +1114,7 @@ impl Gateway {
                         at: now(),
                         backend: thread.backend,
                         tool_calls: vec![],
+                        compaction: None,
                     });
                     thread.state = RunState::Running;
                     thread.backend_activity = None;
@@ -1260,6 +1242,7 @@ impl Gateway {
                     limit,
                 )?))
             }
+            Command::CompactThread { thread } => self.compact_thread(thread).await,
             Command::ListTools { thread } => self.list_tools(thread).await,
             Command::SetToolPermission {
                 thread,
@@ -1821,6 +1804,41 @@ fn fail_run(thread: &mut Thread, id: Id, error: &(dyn std::error::Error + 'stati
         thread.backend,
     ));
     thread.error = Some(report);
+}
+/// The provider account and API-reported model metadata a thread's next
+/// model request uses, after checking the model is still permitted.
+fn native_model(snapshot: &Snapshot, thread: &Thread) -> Result<(ProviderConfig, ModelInfo)> {
+    let key = thread.model.as_ref().ok_or(GatewayError::Invalid(
+        "connect a provider and select a model first",
+    ))?;
+    validate_model(snapshot, key)?;
+    validate_effort(snapshot, Some(key), thread.effort.as_deref())?;
+    let info = snapshot
+        .catalogs
+        .iter()
+        .flat_map(|c| &c.models)
+        .find(|m| &m.key == key)
+        .cloned()
+        .ok_or(GatewayError::Conflict("model metadata missing"))?;
+    if let Some(parent) = thread.parent {
+        let parent = snapshot
+            .threads
+            .iter()
+            .find(|t| t.id == parent)
+            .ok_or(GatewayError::NotFound("thread not found"))?;
+        check(
+            parent.subagent_models.contains(key),
+            GatewayError::Denied("parent revoked this subagent model"),
+        )?;
+    }
+    let config = snapshot
+        .settings
+        .providers
+        .iter()
+        .find(|p| p.id == key.provider)
+        .cloned()
+        .ok_or(GatewayError::NotFound("provider not configured"))?;
+    Ok((config, info))
 }
 fn validate_model(snapshot: &Snapshot, key: &ModelKey) -> Result<()> {
     check(

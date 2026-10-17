@@ -623,7 +623,7 @@ pub async fn complete(
     let (url, body) = match config.api {
         ProviderApi::OpenAi => {
             let mut messages = vec![json!({"role": "system", "content": prompt})];
-            for message in &thread.messages {
+            for message in &history(thread) {
                 openai_message(message, &mut messages);
             }
             // Usage arrives in a final chunk only when asked for.
@@ -644,7 +644,7 @@ pub async fn complete(
             // This is a request budget, not a claim about a model's context or output capacity.
             let budget = info.output_limit.unwrap_or(8192).min(8192);
             let mut messages = vec![];
-            for message in &thread.messages {
+            for message in &history(thread) {
                 anthropic_message(message, &mut messages);
             }
             let mut body = json!({"model": model.model, "system": prompt, "max_tokens": budget, "stream": true,
@@ -681,7 +681,7 @@ pub async fn complete(
                 .push(&format!("{resource}:streamGenerateContent"));
             url.query_pairs_mut().append_pair("alt", "sse");
             let mut contents = vec![];
-            for message in &thread.messages {
+            for message in &history(thread) {
                 gemini_content(message, &mut contents);
             }
             let mut body = json!({"systemInstruction": {"parts": [{"text": prompt}]},
@@ -708,6 +708,42 @@ pub async fn complete(
         }
     }
     sink.reply.finish()
+}
+/// Introduces a compaction summary in the history a model receives.
+pub const SUMMARY_PREAMBLE: &str = "[Summary of the earlier conversation, written when it was compacted to save context. The original messages are no longer included.]";
+/// The messages a model receives: the latest compaction summary, if any, and
+/// the messages after it. Every message before a summary is covered by it.
+///
+/// The summary is not sent with a role of its own: it is prefixed to the
+/// first following user message, so every protocol keeps a user-first,
+/// alternating history and no summary gains system-prompt authority. A
+/// summary followed by no user message is sent as a user message alone.
+/// Compaction keeps whole messages, so a call and its result (stored
+/// together on the assistant message) are never separated.
+pub(crate) fn history(thread: &Thread) -> Vec<std::borrow::Cow<'_, Message>> {
+    use std::borrow::Cow;
+    let Some(at) = thread.messages.iter().rposition(|m| m.compaction.is_some()) else {
+        return thread.messages.iter().map(Cow::Borrowed).collect();
+    };
+    let summary = format!("{SUMMARY_PREAMBLE}\n\n{}", thread.messages[at].text);
+    let mut rest = thread.messages[at + 1..].iter();
+    let mut out = vec![];
+    match rest.as_slice().first() {
+        Some(first) if first.role == Role::User => {
+            let mut first = first.clone();
+            first.text = format!("{summary}\n\n---\n\n{}", first.text);
+            out.push(Cow::Owned(first));
+            rest.next();
+        }
+        _ => out.push(Cow::Owned(Message::new(
+            Role::User,
+            summary,
+            thread.messages[at].at,
+            thread.messages[at].backend,
+        ))),
+    }
+    out.extend(rest.map(Cow::Borrowed));
+    out
 }
 /// The text a model receives as one call's result.
 fn tool_result(call: &ToolCall) -> &str {
