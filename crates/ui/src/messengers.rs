@@ -39,12 +39,27 @@ fn tone(state: MessengerState) -> BadgeTone {
     }
 }
 
-/// `provider:model` choices from the current API catalogs, grouped by connection.
-fn model_choices(snapshot: &Snapshot) -> Vec<SelectChoice> {
+/// Seconds since the Unix epoch, for judging catalog freshness. A clock set
+/// before the epoch makes every catalog stale rather than every one fresh.
+fn now() -> u64 {
+    web_time::SystemTime::now()
+        .duration_since(web_time::UNIX_EPOCH)
+        .map_or(u64::MAX, |elapsed| elapsed.as_secs())
+}
+
+/// Models of catalogs that have not expired at `now`: the gateway creates a
+/// chat thread only for one of these.
+fn current_models(snapshot: &Snapshot, now: u64) -> impl Iterator<Item = &a206_core::ModelInfo> {
     snapshot
         .catalogs
         .iter()
+        .filter(move |c| !c.stale(now))
         .flat_map(|c| &c.models)
+}
+
+/// `provider:model` choices from the current API catalogs, grouped by connection.
+fn model_choices(snapshot: &Snapshot, now: u64) -> Vec<SelectChoice> {
+    current_models(snapshot, now)
         .map(|model| {
             let provider = snapshot
                 .settings
@@ -85,14 +100,12 @@ fn MessengerCard(config: MessengerConfig, status: MessengerStatus) -> Element {
     let mode = config.mode;
     let mode_selected = use_memo(use_reactive!(|mode| Some(mode.label().to_owned())));
     let snapshot = state.data.read();
-    let models = model_choices(&snapshot);
-    let model_known = config.model.as_ref().is_none_or(|key| {
-        snapshot
-            .catalogs
-            .iter()
-            .flat_map(|c| &c.models)
-            .any(|m| &m.key == key)
-    });
+    let now = now();
+    let models = model_choices(&snapshot, now);
+    let model_known = config
+        .model
+        .as_ref()
+        .is_none_or(|key| current_models(&snapshot, now).any(|m| &m.key == key));
     let running = matches!(
         status.state,
         MessengerState::Connected | MessengerState::Connecting | MessengerState::WaitingForVault
@@ -114,7 +127,7 @@ fn MessengerCard(config: MessengerConfig, status: MessengerStatus) -> Element {
             div { class: "a206-grid",
                 Field { label: rsx! { "Model for new chats" }, hint: rsx! { "The only model a chat's conversation may use. Without one, chats are told no model is chosen." },
                     if models.is_empty() {
-                        p { class: "a206-muted", "Connect a provider to discover models." }
+                        p { class: "a206-muted", "Connect or refresh a provider to discover models." }
                     } else {
                         Select { label: name!("Model for new chats"), value: ReadSignal::from(model_selected), options: models, placeholder: "Choose model",
                             onchange: { let name = name.clone(); move |value: String| { let model = parse_model(&value); save_messenger(state, &name, |m| m.model = model) } }
@@ -128,14 +141,14 @@ fn MessengerCard(config: MessengerConfig, status: MessengerStatus) -> Element {
                     }
                 }
             }
-            if !model_known { Alert { tone: AlertTone::Warning, title: rsx! { "Model not in the current catalog" }, "The chosen model is not listed by its provider right now, so new chats cannot start until it is listed again or you choose another." } }
+            if !model_known { Alert { tone: AlertTone::Warning, title: rsx! { "Model not in a current catalog" }, "The chosen model is not listed by its provider, or that list has expired. New chats cannot start until you refresh the provider on the Connections page or choose another model." } }
             AllowList { messenger: config.name.clone(), title: "Allowed chats", hint: "Chat ids whose messages reach a conversation.", entries: config.allowed_chats.iter().cloned().collect::<Vec<_>>(), senders: false }
             AllowList { messenger: config.name.clone(), title: "Allowed senders", hint: "User ids accepted in allowed chats. Group chats accept only these senders; once any is listed, private chats do too.", entries: config.allowed_users.iter().cloned().collect::<Vec<_>>(), senders: true }
             if !status.refused.is_empty() {
                 h3 { "Refused recently" }
                 p { class: "a206-muted", "Titles come from the chat service and may be misleading. Allow only chats and people you recognize." }
                 for refused in status.refused.iter().rev() {
-                    RefusedRow { key: "{refused.chat}-{refused.sender:?}", messenger: config.name.clone(), refused: refused.clone(), chat_allowed: config.allowed_chats.contains(&refused.chat) }
+                    RefusedRow { key: "{refused.chat}-{refused.sender:?}", messenger: config.name.clone(), refused: refused.clone(), offer: Offer::for_refused(&config, refused) }
                 }
             }
         }
@@ -198,8 +211,39 @@ fn AllowList(
     }
 }
 
+/// What allowing a refused message would add: its chat, or its sender in an
+/// already allowed chat. `None` when allowing it needs nothing more.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Offer {
+    Chat(String),
+    Sender(String),
+}
+
+impl Offer {
+    fn for_refused(config: &MessengerConfig, refused: &RefusedChat) -> Option<Self> {
+        let chat_allowed = config.allowed_chats.contains(&refused.chat);
+        match &refused.sender {
+            Some(sender) => (chat_allowed && !config.allowed_users.contains(sender))
+                .then(|| Self::Sender(sender.clone())),
+            None => (!chat_allowed).then(|| Self::Chat(refused.chat.clone())),
+        }
+    }
+    fn apply(&self, config: &mut MessengerConfig) {
+        match self {
+            Self::Chat(chat) => config.allowed_chats.insert(chat.clone()),
+            Self::Sender(sender) => config.allowed_users.insert(sender.clone()),
+        };
+    }
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Chat(_) => "Allow chat",
+            Self::Sender(_) => "Allow sender",
+        }
+    }
+}
+
 #[component]
-fn RefusedRow(messenger: String, refused: RefusedChat, chat_allowed: bool) -> Element {
+fn RefusedRow(messenger: String, refused: RefusedChat, offer: Option<Offer>) -> Element {
     let state = use_context::<State>();
     let who = match (&refused.sender, &refused.title) {
         (Some(sender), Some(title)) => {
@@ -216,12 +260,8 @@ fn RefusedRow(messenger: String, refused: RefusedChat, chat_allowed: bool) -> El
     };
     rsx! { div { class: "a206-row a206-between",
         span { "{who} · refused {times}" }
-        if let Some(sender) = refused.sender.clone() {
-            if chat_allowed {
-                Button { size: ButtonSize::Sm, variant: ButtonVariant::Secondary, onclick: move |_| edit_list(state, &messenger, true, |list| { list.insert(sender.clone()); }), "Allow sender" }
-            }
-        } else if !chat_allowed {
-            Button { size: ButtonSize::Sm, variant: ButtonVariant::Secondary, onclick: { let chat = refused.chat.clone(); move |_| edit_list(state, &messenger, false, |list| { list.insert(chat.clone()); }) }, "Allow chat" }
+        if let Some(offer) = offer {
+            Button { size: ButtonSize::Sm, variant: ButtonVariant::Secondary, onclick: { let offer = offer.clone(); move |_| save_messenger(state, &messenger, |m| offer.apply(m)) }, "{offer.label()}" }
         }
     } }
 }
@@ -266,6 +306,76 @@ fn AddMessenger() -> Element {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn refused(chat: &str, sender: Option<&str>) -> RefusedChat {
+        RefusedChat {
+            chat: chat.to_owned(),
+            sender: sender.map(str::to_owned),
+            title: None,
+            count: 1,
+            last_at: 0,
+        }
+    }
+
+    #[test]
+    fn an_offer_admits_exactly_the_refused_message_and_then_disappears() {
+        let id = || Uuid::new_v4().simple().to_string();
+        let mut config = MessengerConfig::new(format!("m-{}", id()), MessengerKind::Telegram);
+        let (chat, sender) = (id(), id());
+        // A refused private chat: allowing the chat admits it.
+        let private = refused(&chat, None);
+        assert!(!config.accepts(&chat, Some(&chat), false));
+        let offer = Offer::for_refused(&config, &private).unwrap();
+        offer.apply(&mut config);
+        assert!(config.accepts(&chat, Some(&chat), false));
+        assert_eq!(Offer::for_refused(&config, &private), None);
+        // A refused group sender in that chat: allowing the sender admits it.
+        let member = refused(&chat, Some(&sender));
+        assert!(!config.accepts(&chat, Some(&sender), true));
+        let offer = Offer::for_refused(&config, &member).unwrap();
+        offer.apply(&mut config);
+        assert!(config.accepts(&chat, Some(&sender), true));
+        assert_eq!(Offer::for_refused(&config, &member), None);
+        // A sender in a chat that is not allowed is offered nothing: allowing
+        // the sender alone would not admit them.
+        assert_eq!(
+            Offer::for_refused(&config, &refused(&id(), Some(&id()))),
+            None
+        );
+    }
+
+    #[test]
+    fn expired_catalogs_offer_no_models() {
+        let key = ModelKey {
+            provider: Uuid::new_v4(),
+            model: Uuid::new_v4().to_string(),
+        };
+        let expires_at = u64::from(Uuid::new_v4().as_fields().1) + 1;
+        let mut snapshot = crate::empty_snapshot();
+        snapshot.catalogs.push(a206_core::Catalog {
+            provider: key.provider,
+            source: Uuid::new_v4().to_string(),
+            fetched_at: 0,
+            expires_at,
+            models: vec![a206_core::ModelInfo {
+                key: key.clone(),
+                name: Uuid::new_v4().to_string(),
+                context_limit: None,
+                output_limit: None,
+                input_cost_per_token: None,
+                output_cost_per_token: None,
+                reasoning: None,
+                reasoning_efforts: vec![],
+            }],
+            balance: None,
+            balance_currency: None,
+            token_balance: None,
+        });
+        assert_eq!(model_choices(&snapshot, expires_at - 1).len(), 1);
+        assert!(current_models(&snapshot, expires_at - 1).any(|m| m.key == key));
+        assert!(model_choices(&snapshot, expires_at).is_empty());
+        assert_eq!(current_models(&snapshot, expires_at).count(), 0);
+    }
 
     #[test]
     fn model_values_round_trip_even_when_ids_contain_colons() {
