@@ -251,6 +251,7 @@ fn sandbox_command(
             .as_deref()
             .map(|workspace| (workspace, holds(Capability::WriteWorkspace))),
         execute: holds(Capability::Execute),
+        programs: &[],
         hidden: &hidden,
         cwd,
         network: if holds(Capability::Network) {

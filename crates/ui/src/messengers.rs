@@ -27,7 +27,7 @@ fn save_messenger(state: State, name: &str, edit: impl FnOnce(&mut MessengerConf
     let mut settings = state.data.read().settings.clone();
     if let Some(entry) = settings.messengers.iter_mut().find(|m| m.name == name) {
         edit(entry);
-        dispatch(state, Command::SaveSettings(settings));
+        dispatch(state, Command::SaveSettings(Box::new(settings)));
     }
 }
 
@@ -146,7 +146,10 @@ fn MessengerCard(now: u64, config: MessengerConfig, status: MessengerStatus) -> 
                 Badge { tone: tone(status.state), "{status.state.label()}" }
                 if let Some(account) = &status.account { span { class: "a206-muted", "Bot account {account}" } }
             }
-            p { class: "a206-muted", match &config.credential { Some(credential) => format!("Token: vault credential {credential}"), None => "No vault credential chosen; it cannot connect.".to_owned() } }
+            CredentialRow { messenger: config.name.clone(), app: false, current: config.credential.clone() }
+            if config.kind.needs_app_credential() {
+                CredentialRow { messenger: config.name.clone(), app: true, current: config.app_credential.clone() }
+            }
             Checkbox { label: rsx! { "Enabled" }, checked: ReadSignal::from(enabled), onchange: { let name = name.clone(); move |on: bool| save_messenger(state, &name, |m| m.enabled = on) } }
             if let Some(report) = status.failure.clone() { ErrorNotice { report, title: "Messenger failed".to_string() } }
             div { class: "a206-grid",
@@ -183,9 +186,40 @@ fn MessengerCard(now: u64, config: MessengerConfig, status: MessengerStatus) -> 
             } else {
                 Button { variant: ButtonVariant::Secondary, availability: if config.enabled { Availability::Enabled } else { Availability::Disabled }, onclick: { let name = name.clone(); move |_| dispatch(state, Command::ConnectMessenger { name: name.clone() }) }, "Connect" }
             }
-            Button { variant: ButtonVariant::Ghost, onclick: move |_| { let mut settings = state.data.read().settings.clone(); settings.messengers.retain(|m| m.name != name); dispatch(state, Command::SaveSettings(settings)); }, "Remove messenger" }
+            Button { variant: ButtonVariant::Ghost, onclick: move |_| { let mut settings = state.data.read().settings.clone(); settings.messengers.retain(|m| m.name != name); dispatch(state, Command::SaveSettings(Box::new(settings))); }, "Remove messenger" }
         }
     } }
+}
+
+/// The vault credential an entry uses, or its app-level one when `app`, with
+/// a field to choose another (an imported entry arrives with none).
+#[component]
+fn CredentialRow(messenger: String, app: bool, current: Option<String>) -> Element {
+    let state = use_context::<State>();
+    let mut draft = use_signal(String::new);
+    let ready = !draft().trim().is_empty();
+    let shown = match (&current, app) {
+        (Some(credential), false) => format!("Token: vault credential {credential}"),
+        (Some(credential), true) => format!("App-level token: vault credential {credential}"),
+        (None, false) => "No vault credential chosen; it cannot connect.".to_owned(),
+        (None, true) => "No app-level token chosen; it cannot receive messages.".to_owned(),
+    };
+    let label = if app {
+        "App-level token credential"
+    } else {
+        "Vault credential"
+    };
+    rsx! {
+        p { class: "a206-muted", "{shown}" }
+        div { class: "a206-row",
+            Input { aria_label: label, value: ReadSignal::from(draft), oninput: move |v| draft.set(v), placeholder: "Credential name" }
+            Button { size: ButtonSize::Sm, variant: ButtonVariant::Secondary, availability: if ready { Availability::Enabled } else { Availability::Disabled }, onclick: move |_| {
+                let value = Some(draft().trim().to_owned());
+                save_messenger(state, &messenger, |m| if app { m.app_credential = value } else { m.credential = value });
+                draft.set(String::new());
+            }, if current.is_some() { "Change credential" } else { "Use credential" } }
+        }
+    }
 }
 
 /// Edit one of an entry's allow-lists: chats, or senders when `senders`.
@@ -297,15 +331,18 @@ fn AddMessenger() -> Element {
     let mut name = use_signal(String::new);
     let mut kind = use_signal(|| Some(MessengerKind::Telegram.label().to_owned()));
     let mut credential = use_signal(String::new);
+    let mut app_credential = use_signal(String::new);
     let mut endpoint = use_signal(String::new);
     let selected = MessengerKind::ALL
         .into_iter()
         .find(|k| Some(k.label()) == kind().as_deref());
     // A federated service has no official server to fall back on.
     let needs_endpoint = selected.is_some_and(|k| k.default_endpoint().is_none());
+    let needs_app = selected.is_some_and(MessengerKind::needs_app_credential);
     let ready = selected.is_some()
         && !name().trim().is_empty()
         && !credential().trim().is_empty()
+        && (!needs_app || !app_credential().trim().is_empty())
         && (!needs_endpoint || !endpoint().trim().is_empty());
     let endpoint_hint = if needs_endpoint {
         "Required: your homeserver's client API origin, with no path."
@@ -323,6 +360,9 @@ fn AddMessenger() -> Element {
                     onchange: move |value: String| kind.set(Some(value))
                 } }
                 Field { label: rsx! { "Vault credential" }, hint: rsx! { "The name of the vault entry holding the token, never the token itself." }, Input { value: ReadSignal::from(credential), oninput: move |v| credential.set(v), placeholder: "Credential name" } }
+                if needs_app {
+                    Field { label: rsx! { "App-level token credential" }, hint: rsx! { "The vault entry holding the app-level token the service sends events with." }, Input { value: ReadSignal::from(app_credential), oninput: move |v| app_credential.set(v), placeholder: "Credential name" } }
+                }
                 Field { label: rsx! { "API endpoint" }, hint: rsx! { "{endpoint_hint}" }, Input { value: ReadSignal::from(endpoint), oninput: move |v| endpoint.set(v), placeholder: selected.and_then(|k| k.default_endpoint()).unwrap_or("https://homeserver.example") } }
             }
         }
@@ -330,10 +370,11 @@ fn AddMessenger() -> Element {
             let Some(service) = selected else { return };
             let mut entry = MessengerConfig::new(name().trim().to_owned(), service);
             entry.credential = Some(credential().trim().to_owned());
+            entry.app_credential = Some(app_credential().trim().to_owned()).filter(|c| service.needs_app_credential() && !c.is_empty());
             entry.endpoint = Some(endpoint().trim().to_owned()).filter(|e| !e.is_empty());
             let mut settings = state.data.read().settings.clone();
             settings.messengers.push(entry);
-            dispatch(state, Command::SaveSettings(settings));
+            dispatch(state, Command::SaveSettings(Box::new(settings)));
         }, "Add messenger" } }
     } }
 }

@@ -30,6 +30,7 @@
 //! them unavailable rather than run commands unconfined.
 // Nothing starts a session where commands are unsupported.
 pub mod keys;
+pub mod programs;
 #[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
 mod sessions;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -93,6 +94,8 @@ pub enum ExecError {
         "`timeout_secs` must be a whole number from 1 to {MAX_TIMEOUT}, or to {MAX_BACKGROUND_TIMEOUT} with `background`"
     )]
     Timeout,
+    #[error(transparent)]
+    Programs(#[from] programs::ProgramsError),
     #[error("`working_dir` must be a relative path inside the project")]
     WorkingDir,
     #[error("`working_dir` needs a project and the ReadWorkspace grant")]
@@ -180,8 +183,10 @@ impl crate::error::Classified for ExecError {
             // Absent and unreadable paths need different recovery.
             Self::Missing { .. } => return None,
             Self::Helper(_) | Self::Setup(_) | Self::Output(_) => ErrorKind::Internal,
-            // The sandbox's own errors know their kinds.
+            // These errors know their own kinds.
             Self::Sandbox(_) | Self::Start(_) => return None,
+            // `transparent` hides it from the chain, so classify it here.
+            Self::Programs(error) => return crate::error::classify(error),
             Self::Spawn(_) | Self::Unsupported => ErrorKind::Unavailable,
             Self::TimedOut { .. } | Self::InputStalled { .. } => ErrorKind::Timeout,
             Self::UnknownSession => ErrorKind::NotFound,
@@ -732,6 +737,15 @@ impl ExecHost {
         if let Some(workspace) = &workspace {
             reject_protected_workspace(workspace, &hidden)?;
         }
+        // Checked again: the directories may have changed since they were saved.
+        let user_home = std::env::var_os("HOME").map(PathBuf::from);
+        let programs = programs::validate(
+            &scope.programs,
+            &[],
+            &hidden,
+            user_home.as_deref(),
+            &self.state_root,
+        )?;
         let control = root.join("control");
         let pair = if call.terminal {
             Some(terminal::Pair::open().map_err(ExecError::Terminal)?)
@@ -750,6 +764,7 @@ impl ExecHost {
                 .map(|workspace| (workspace, holds(Capability::WriteWorkspace))),
             // The tool's own declaration: the call was refused without Execute.
             execute: true,
+            programs: &programs,
             hidden: &hidden,
             cwd: &cwd,
             network: if holds(Capability::Network) {
@@ -769,7 +784,7 @@ impl ExecHost {
             .current_dir(&cwd)
             .env("HOME", &home)
             .env("TMPDIR", &tmp)
-            .env("PATH", "/usr/bin:/bin")
+            .env("PATH", search_path(&programs))
             .env("LANG", LOCALE)
             // Bubblewrap reports setup failures here before the command starts.
             .stderr(Stdio::piped())
@@ -829,6 +844,20 @@ impl ExecHost {
             }),
         }
     }
+}
+
+/// `PATH` for a command: each program directory's `bin`, or the directory
+/// itself when it has none, ahead of the system directories.
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+fn search_path(programs: &[PathBuf]) -> std::ffi::OsString {
+    let mut path = std::ffi::OsString::new();
+    for program in programs {
+        let bin = program.join("bin");
+        path.push(if bin.is_dir() { &bin } else { program });
+        path.push(":");
+    }
+    path.push("/usr/bin:/bin");
+    path
 }
 
 /// The sandbox's process group, killed when dropped.
@@ -962,6 +991,7 @@ mod tests {
                 thread: a206_core::Id::new_v4(),
                 workspace: None,
                 capabilities,
+                programs: vec![],
             };
             let request = ToolRequest {
                 call: a206_core::Id::new_v4().to_string(),
@@ -1127,6 +1157,7 @@ mod tests {
             thread: a206_core::Id::new_v4(),
             workspace: None,
             capabilities: [Capability::Execute].into(),
+            programs: vec![],
         };
         let request = |name: &str, value: Value| ToolRequest {
             call: a206_core::Id::new_v4().to_string(),
@@ -1165,6 +1196,7 @@ mod tests {
             thread: a206_core::Id::new_v4(),
             workspace: None,
             capabilities: Default::default(),
+            programs: vec![],
         };
         let listing = host.list(&scope).await;
         if cfg!(any(target_os = "linux", target_os = "macos")) {

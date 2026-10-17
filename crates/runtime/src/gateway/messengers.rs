@@ -37,6 +37,10 @@ pub(super) fn validate(messengers: &[MessengerConfig]) -> Result<()> {
             GatewayError::Invalid("invalid messenger credential name"),
         )?;
         check(
+            messenger.app_credential.as_deref().is_none_or(field),
+            GatewayError::Invalid("invalid messenger app credential name"),
+        )?;
+        check(
             messenger.allowed_chats.len() <= MAX_ALLOWED_CHATS
                 && messenger.allowed_chats.iter().all(|chat| field(chat)),
             GatewayError::Invalid("a messenger allows at most 256 chats with valid ids"),

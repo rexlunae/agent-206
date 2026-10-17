@@ -226,6 +226,7 @@ fn view(store: &Store, id: Id) -> Result<View> {
         thread: id,
         workspace,
         capabilities: tools::scope_capabilities(&thread, &ancestors.iter().collect::<Vec<_>>()),
+        programs: store.state.settings.program_directories.clone(),
     };
     Ok(View {
         thread,

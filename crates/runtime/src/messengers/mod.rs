@@ -9,7 +9,9 @@
 //! A person in an allowed chat can therefore do whatever the user could do
 //! by typing into that thread, and nothing more.
 mod discord;
+mod listener;
 mod matrix;
+mod slack;
 mod telegram;
 
 use a206_broker::{AuthScheme, HttpMethod, ProviderCall, Reply as BrokerReply, Request, Role};
@@ -36,6 +38,10 @@ pub enum MessengerError {
     SyncGap { service: &'static str },
     #[error("the messenger has no vault credential; add its token and bind it to {origin}")]
     NoCredential { origin: String },
+    #[error(
+        "the messenger has no app-level token; store it in the vault bound to {origin} and set it as the app credential"
+    )]
+    NoAppCredential { origin: String },
     #[error("{service} has no official server; set the messenger's endpoint to yours")]
     NoEndpoint { service: &'static str },
     #[error("the messenger endpoint is not allowed")]
@@ -107,6 +113,7 @@ impl crate::error::Classified for MessengerError {
         Some(match self {
             Self::SyncBudget { .. } | Self::SyncGap { .. } => ErrorKind::Protocol,
             Self::NoCredential { .. }
+            | Self::NoAppCredential { .. }
             | Self::NoEndpoint { .. }
             | Self::NoModel
             | Self::Endpoint(_)
@@ -140,6 +147,7 @@ impl MessengerError {
         matches!(
             self,
             Self::NoCredential { .. }
+                | Self::NoAppCredential { .. }
                 | Self::NoEndpoint { .. }
                 | Self::Endpoint(_)
                 | Self::EndpointPath
@@ -227,6 +235,7 @@ enum Adapter {
     Telegram(telegram::Telegram),
     Matrix(matrix::Matrix),
     Discord(discord::Discord),
+    Slack(slack::Slack),
 }
 impl Adapter {
     fn new(config: &MessengerConfig, api: Api) -> Self {
@@ -238,6 +247,7 @@ impl Adapter {
             MessengerKind::Discord => {
                 Self::Discord(discord::Discord::new(api, config.allowed_chats.clone()))
             }
+            MessengerKind::Slack => Self::Slack(slack::Slack::new(api)),
         }
     }
     /// Check the credential and name the account.
@@ -246,6 +256,7 @@ impl Adapter {
             Self::Telegram(adapter) => adapter.connect().await,
             Self::Matrix(adapter) => adapter.connect().await,
             Self::Discord(adapter) => adapter.connect().await,
+            Self::Slack(adapter) => adapter.connect().await,
         }
     }
     /// Wait for the next batch after `cursor`.
@@ -254,21 +265,22 @@ impl Adapter {
             Self::Telegram(adapter) => adapter.receive(cursor).await,
             Self::Matrix(adapter) => adapter.receive(cursor).await,
             Self::Discord(adapter) => adapter.receive(cursor).await,
+            Self::Slack(adapter) => adapter.receive(cursor).await,
         }
     }
     /// Fails with [`MessengerError::EncryptedRoom`] if an answer could not be
     /// sent to `chat` as it is now.
     async fn check_chat(&self, chat: &str) -> Result<()> {
         match self {
-            Self::Telegram(_) | Self::Discord(_) => Ok(()),
+            Self::Telegram(_) | Self::Discord(_) | Self::Slack(_) => Ok(()),
             Self::Matrix(adapter) => adapter.check_room(chat).await,
         }
     }
     async fn join(&self, chat: &str) -> Result<()> {
         match self {
-            // Telegram and Discord add bots to chats themselves and report
-            // no invitations.
-            Self::Telegram(_) | Self::Discord(_) => Ok(()),
+            // Telegram, Discord and Slack add bots to chats themselves and
+            // report no invitations.
+            Self::Telegram(_) | Self::Discord(_) | Self::Slack(_) => Ok(()),
             Self::Matrix(adapter) => adapter.join(chat).await,
         }
     }
@@ -277,6 +289,7 @@ impl Adapter {
             Self::Telegram(adapter) => adapter.send(chat, text).await,
             Self::Matrix(adapter) => adapter.send(chat, text).await,
             Self::Discord(adapter) => adapter.send(chat, text).await,
+            Self::Slack(adapter) => adapter.send(chat, text).await,
         }
     }
 }
@@ -709,6 +722,8 @@ pub(crate) struct Api {
     root: PathBuf,
     pairing: BrokerPairing,
     credential: String,
+    /// The app-level token's credential, for kinds that receive with one.
+    app_credential: Option<String>,
     base: url::Url,
 }
 impl Api {
@@ -731,6 +746,7 @@ impl Api {
             root,
             pairing,
             credential,
+            app_credential: config.app_credential.clone(),
             base,
         })
     }
@@ -810,13 +826,27 @@ impl Api {
         Ok(client)
     }
 
-    /// Open a WebSocket session named by `url`, with the credential spent
-    /// by the broker as `scheme` says.
-    async fn socket(&self, scheme: SocketScheme, url: url::Url) -> Result<a206_broker::Socket> {
+    /// Open a WebSocket session named by `url`, with the credential (or,
+    /// for `app`, the app-level one) spent by the broker as `scheme` says.
+    async fn socket(
+        &self,
+        scheme: SocketScheme,
+        url: url::Url,
+        app: bool,
+    ) -> Result<a206_broker::Socket> {
+        let credential = if app {
+            self.app_credential
+                .clone()
+                .ok_or_else(|| MessengerError::NoAppCredential {
+                    origin: self.base.origin().ascii_serialization(),
+                })?
+        } else {
+            self.credential.clone()
+        };
         let client = self.client(a206_broker::SOCKET_VERSION).await?;
         let opened = client
             .socket(SocketCall {
-                credential: self.credential.clone(),
+                credential,
                 url: url.to_string(),
                 scheme,
             })

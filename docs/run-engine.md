@@ -181,14 +181,31 @@ background sessions.
 - **Sandbox.** The command runs under `a206-sandbox`: bubblewrap namespaces
   plus Landlock inside on Linux, a generated Seatbelt policy applied by
   `sandbox-exec` on macOS. Both come from one profile, with `/usr/bin` and
-  `/bin` executable (programs elsewhere, such as Homebrew's, are not). The
+  `/bin` executable, plus the program directories the user chose (below). The
   project is mounted only with `ReadWorkspace` and is writable only with
   `WriteWorkspace`; the host network is shared only with `Network`; gateway
   state and the credential stores under `$HOME` stay hidden even inside the
   project. A project equal to or inside protected state is refused. Without project access the command starts in an empty private
-  directory. The environment holds only a private `HOME`, `TMPDIR`, a fixed
-  `PATH` (`/usr/bin:/bin`) and `LANG`; a foreground command's stdin is
-  empty.
+  directory. The environment holds only a private `HOME`, `TMPDIR`, `PATH`
+  (each program directory's `bin`, or the directory itself without one, then
+  `/usr/bin:/bin`) and `LANG`; a foreground command's stdin is empty.
+- **Program directories** (`exec_tool/programs.rs`). The user lists extra
+  directories, such as a Homebrew prefix or a toolchain, in the gateway
+  setting `program_directories` (the Modes settings page or
+  `agent206 settings --apply`). Saving checks each is an absolute, existing
+  directory, not inside gateway state or a hidden credential store, not
+  containing the home directory or gateway state, without `:` (it separates
+  `PATH` entries), and listed once, then stores it canonicalized. Entries
+  already saved are kept as they are, so a toolchain that is gone for now
+  does not block unrelated settings edits. Each command checks them again as it starts and
+  mounts them read-only and executable, with hidden paths inside them
+  covered as in a project, and mounted before the grants so a broader one
+  cannot hide them. A directory that overlaps a writable project or the
+  command's private scratch directory in either direction is refused with
+  `Conflict` (the command could write programs and run them); a read-only
+  project inside one is allowed. Removing a
+  directory stops background sessions that were given it. MCP servers and
+  external backends do not get them.
 - **Results.** The text is the exit status, then stdout and stderr, each cut
   to `MAX_STREAM` UTF-8 bytes after lossy conversion, with a marker; the rest is read and dropped so a
   chatty command cannot stall. A non-zero exit is `is_error`. A command still

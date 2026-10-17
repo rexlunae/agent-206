@@ -14,6 +14,7 @@ fn scope() -> ToolScope {
         thread: Id::new_v4(),
         workspace: None,
         capabilities: Default::default(),
+        programs: vec![],
     }
 }
 async fn call(

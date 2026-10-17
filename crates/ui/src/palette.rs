@@ -1,7 +1,7 @@
 //! The command palette: one keyboard-opened list of every page, conversation
 //! and action the current view offers, filtered as you type.
 use crate::{State, dispatch, route::Route};
-use a206_core::{CodingBackend, Command, Id, Mode, RunState, Snapshot};
+use a206_core::{CodingBackend, Command, Id, Mode, RunState, Snapshot, Thread};
 use fc_dioxus::prelude::*;
 
 /// What choosing an entry does. Each one is something a visible control on a
@@ -39,6 +39,14 @@ impl Entry {
     }
 }
 
+/// Whether `thread` can be summarized now: the same conditions as its own
+/// Compact button.
+pub(crate) fn can_compact(thread: &Thread) -> bool {
+    thread.backend == CodingBackend::Native
+        && thread.state != RunState::Running
+        && thread.model.is_some()
+}
+
 /// Everything the palette offers on `route`: actions on the open conversation,
 /// then a new conversation, every page, and every conversation.
 /// `can_create` is whether the gateway can take a new conversation now.
@@ -73,8 +81,7 @@ pub(crate) fn entries(snapshot: &Snapshot, route: &Route, can_create: bool) -> V
                 Action::Stop(thread.id),
             ));
         }
-        // The same conditions as the conversation's own Compact button.
-        if thread.backend == CodingBackend::Native && !running && thread.model.is_some() {
+        if can_compact(thread) {
             entries.push(
                 Entry::new(
                     title("Summarize earlier messages"),
@@ -190,7 +197,7 @@ pub(crate) fn filter(entries: Vec<Entry>, query: &str) -> Vec<Entry> {
     ranked.into_iter().map(|(_, entry)| entry).collect()
 }
 
-fn run(state: State, action: Action) {
+pub(crate) fn run(state: State, action: Action) {
     match action {
         Action::Open(route) => {
             state.navigator.push(route);
@@ -307,7 +314,7 @@ fn PaletteRow(entry: Entry, current: bool, onchoose: EventHandler<Action>) -> El
 #[cfg(test)]
 mod tests {
     use super::*;
-    use a206_core::{ModelKey, Thread};
+    use a206_core::ModelKey;
     use uuid::Uuid;
 
     fn thread(mode: Mode) -> Thread {

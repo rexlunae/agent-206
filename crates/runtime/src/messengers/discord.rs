@@ -7,12 +7,12 @@
 //! running and queues messages for [`Discord::receive`]. Sessions are not
 //! resumed: after a disconnect the broker identifies again, and messages
 //! sent while the bot was disconnected are not delivered.
+use super::listener::{self, Listener, Queue};
 use super::{Account, Api, Batch, Event, Inbound, MessengerError, Result, split};
 use a206_broker::{AuthScheme, HttpMethod, SocketEvent, SocketScheme};
 use serde::Deserialize;
 use std::collections::{BTreeSet, HashMap};
 use std::time::Duration;
-use tokio::sync::mpsc;
 
 const SERVICE: &str = "Discord";
 /// Discord's limit for one message. Splitting counts UTF-16 code units,
@@ -21,11 +21,6 @@ const MAX_MESSAGE_UNITS: usize = 2000;
 /// Guild messages, direct messages and message content. Message content
 /// is a privileged intent the bot's owner turns on in the developer portal.
 const INTENTS: u64 = (1 << 9) | (1 << 12) | (1 << 15);
-/// Messages waiting for the gateway; past this the session restarts rather
-/// than stop heartbeating.
-const BACKLOG: usize = 1024;
-/// Most events handed to the supervisor at once.
-const MAX_BATCH: usize = 64;
 /// Bounds on the heartbeat interval Discord asks for.
 const MIN_HEARTBEAT: Duration = Duration::from_secs(1);
 const MAX_HEARTBEAT: Duration = Duration::from_secs(600);
@@ -40,25 +35,12 @@ const MAX_KNOWN_CHANNELS: usize = 4096;
 const CLOSE_INVALID_INTENTS: u16 = 4013;
 const CLOSE_DISALLOWED_INTENTS: u16 = 4014;
 
-type Queued = Result<(String, Event)>;
-
 pub(crate) struct Discord {
     api: Api,
     /// Only these channels are ever looked up.
     allowed: BTreeSet<String>,
-    gateway: Option<Gateway>,
+    gateway: Option<Listener>,
     private: Private,
-}
-
-/// The running socket task and what it has queued.
-struct Gateway {
-    /// The account the session was opened for.
-    account: String,
-    events: mpsc::Receiver<Queued>,
-    /// A failure that arrived behind queued events, reported next.
-    failed: Option<MessengerError>,
-    /// Stops the task when the adapter is dropped.
-    _stop: tokio_util::sync::DropGuard,
 }
 
 #[derive(Deserialize)]
@@ -143,25 +125,14 @@ impl Discord {
         if self
             .gateway
             .as_ref()
-            .is_none_or(|gateway| gateway.account != account.id)
+            .is_none_or(|gateway| gateway.account() != account.id)
         {
-            self.gateway = Some(self.start(account.id.clone()));
+            let api = self.api.clone();
+            self.gateway = Some(Listener::start(SERVICE, account.id.clone(), |queue| {
+                serve(api, queue)
+            }));
         }
         Ok(account)
-    }
-
-    fn start(&self, account: String) -> Gateway {
-        let (sender, events) = mpsc::channel(BACKLOG);
-        let stop = tokio_util::sync::CancellationToken::new();
-        // Detached: the drop guard cancels it with the adapter, and it holds
-        // nothing that needs awaiting. Its failure reaches `receive`.
-        tokio::spawn(run(self.api.clone(), sender, stop.clone()));
-        Gateway {
-            account,
-            events,
-            failed: None,
-            _stop: stop.drop_guard(),
-        }
     }
 
     /// The messages the socket queued, waiting for at least one. A session
@@ -172,7 +143,7 @@ impl Discord {
     /// looked up: any other is refused whatever its kind, so a batch waits
     /// at most on channels the user chose, each looked up once.
     pub(crate) async fn receive(&mut self, _cursor: Option<&str>) -> Result<Batch> {
-        let mut batch = self.queued().await?;
+        let mut batch = listener::receive(&mut self.gateway, SERVICE).await?;
         for (_, event) in &mut batch.events {
             // Without a guild id, only a channel Discord itself calls a
             // direct message is private.
@@ -184,44 +155,6 @@ impl Discord {
             }
         }
         Ok(batch)
-    }
-
-    async fn queued(&mut self) -> Result<Batch> {
-        let gateway = self
-            .gateway
-            .as_mut()
-            .ok_or(MessengerError::SocketEnded { service: SERVICE })?;
-        let failure = match gateway.failed.take() {
-            Some(error) => Err(error),
-            None => match gateway.events.recv().await {
-                Some(Ok(first)) => Ok(first),
-                Some(Err(error)) => Err(error),
-                None => Err(MessengerError::SocketEnded { service: SERVICE }),
-            },
-        };
-        let first = match failure {
-            Ok(first) => first,
-            Err(error) => {
-                self.gateway = None;
-                return Err(error);
-            }
-        };
-        let mut events = vec![first];
-        while events.len() < MAX_BATCH {
-            match gateway.events.try_recv() {
-                Ok(Ok(event)) => events.push(event),
-                Ok(Err(error)) => {
-                    gateway.failed = Some(error);
-                    break;
-                }
-                Err(_) => break,
-            }
-        }
-        Ok(Batch {
-            events,
-            complete: true,
-            next: None,
-        })
     }
 
     /// Send `text` to `chat`, split to Discord's limit, with every mention
@@ -262,35 +195,22 @@ fn check(status: u16) -> Result<()> {
     }
 }
 
-/// Serve the socket until it fails or `stop`, queueing its failure last.
-async fn run(api: Api, sender: mpsc::Sender<Queued>, stop: tokio_util::sync::CancellationToken) {
-    let error = tokio::select! {
-        error = serve(&api, &sender) => error,
-        () = stop.cancelled() => return,
-    };
-    if let Err(unsent) = sender.send(Err(error)).await
-        && let Err(error) = unsent.0
-    {
-        // The adapter is gone, so no session is waiting for this failure.
-        tracing::debug!(
-            error = &error as &dyn std::error::Error,
-            "Discord session ended after its messenger stopped"
-        );
-    }
-}
-
 /// Heartbeat and queue messages until something fails.
-async fn serve(api: &Api, sender: &mpsc::Sender<Queued>) -> MessengerError {
-    match session(api, sender).await {
+async fn serve(api: Api, queue: Queue) -> MessengerError {
+    match session(&api, &queue).await {
         Ok(never) => match never {},
         Err(error) => error,
     }
 }
 
-async fn session(api: &Api, sender: &mpsc::Sender<Queued>) -> Result<std::convert::Infallible> {
+async fn session(api: &Api, queue: &Queue) -> Result<std::convert::Infallible> {
     let url = api.url_segments(&["api", "v10", "gateway", "bot"])?;
     let mut socket = api
-        .socket(SocketScheme::DiscordGateway { intents: INTENTS }, url)
+        .socket(
+            SocketScheme::DiscordGateway { intents: INTENTS },
+            url,
+            false,
+        )
         .await?;
     let SocketEvent::Text(hello) = socket.next().await.map_err(MessengerError::Broker)? else {
         return Err(MessengerError::SocketClosed {
@@ -343,17 +263,7 @@ async fn session(api: &Api, sender: &mpsc::Sender<Queued>) -> Result<std::conver
                 Some("MESSAGE_CREATE") => {
                     let message: Message = serde_json::from_value(payload.d).map_err(malformed)?;
                     let key = message.id.clone();
-                    let event = message_event(message, own.as_deref());
-                    match sender.try_send(Ok((key, event))) {
-                        Ok(()) => {}
-                        Err(mpsc::error::TrySendError::Full(_)) => {
-                            return Err(MessengerError::Backlog { service: SERVICE });
-                        }
-                        // The adapter is gone; `run` is being cancelled.
-                        Err(mpsc::error::TrySendError::Closed(_)) => {
-                            return Err(MessengerError::SocketEnded { service: SERVICE });
-                        }
-                    }
+                    queue.push(key, message_event(message, own.as_deref()))?;
                 }
                 _ => {}
             },
