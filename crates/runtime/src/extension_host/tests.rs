@@ -51,6 +51,7 @@ fn calls_for(
         net: Arc::new(crate::network::Internet),
         // Tests never read the machine's own git configuration.
         user_git: || Ok(super::git_commit::UserGit::default()),
+        deadline: tokio::time::Instant::now() + TIMEOUT,
         source: PluginSource::Bundled,
         logs: 0,
         last_failure: None,

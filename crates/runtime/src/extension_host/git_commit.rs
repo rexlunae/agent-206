@@ -48,8 +48,8 @@ const CONVERSIONS: [&str; 6] = [
 #[derive(Default)]
 pub(super) struct UserGit {
     config: gix::config::File,
-    /// The user's excludes file: `core.excludesFile` or git's default.
-    excludes: Option<(PathBuf, Vec<u8>)>,
+    /// Git's default excludes file, used when no `core.excludesFile` is set.
+    default_excludes: Option<PathBuf>,
     home: Option<PathBuf>,
 }
 impl UserGit {
@@ -58,31 +58,24 @@ impl UserGit {
         let config =
             gix::config::File::from_globals().map_err(|e| git_failure("user_config", &e))?;
         let home = gix::path::env::home_dir();
-        let configured = config
-            .path("core.excludesFile")
-            .map(|path| {
-                path.interpolate(gix::config::path::interpolate::Context {
-                    home_dir: home.as_deref(),
-                    ..Default::default()
-                })
-                .map_err(|e| git_failure("user_config", &e))
-            })
-            .transpose()?;
-        let default = || {
-            std::env::var_os("XDG_CONFIG_HOME")
-                .map(PathBuf::from)
-                .or_else(|| home.as_ref().map(|home| home.join(".config")))
-                .map(|base| base.join("git").join("ignore"))
-        };
-        let excludes = match configured.or_else(default) {
-            Some(path) => read_user_file(&path)?.map(|bytes| (path, bytes)),
-            None => None,
-        };
+        let default_excludes = std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .or_else(|| home.as_ref().map(|home| home.join(".config")))
+            .map(|base| base.join("git").join("ignore"));
         Ok(Self {
             config,
-            excludes,
+            default_excludes,
             home,
         })
+    }
+    /// Given user configuration, for tests that must not read the machine's.
+    #[cfg(test)]
+    pub(super) fn given(config: gix::config::File, default_excludes: Option<PathBuf>) -> Self {
+        Self {
+            config,
+            default_excludes,
+            home: None,
+        }
     }
 }
 fn read_user_file(path: &std::path::Path) -> Result<Option<Vec<u8>>, HostFailure> {
@@ -101,21 +94,86 @@ fn read_user_file(path: &std::path::Path) -> Result<Option<Vec<u8>>, HostFailure
     Ok(Some(bytes))
 }
 
-/// A setting from the repository, else from the user.
-struct Settings<'a> {
-    repository: &'a gix::config::File,
-    user: &'a UserGit,
+/// A setting from the repository, else from the user, with every include
+/// git would follow resolved, conditional ones too.
+struct Settings {
+    repository: gix::config::File,
+    user: gix::config::File,
+    home: Option<PathBuf>,
 }
-impl Settings<'_> {
+impl Settings {
+    fn resolve(repo: &gix::Repository, user: &UserGit) -> Result<Self, HostFailure> {
+        let failed = |e: &(dyn std::error::Error + 'static)| git_failure("config", e);
+        let git_dir = repo.git_dir();
+        let read = |name: &str, source| {
+            let path = git_dir.join(name);
+            if path.is_file() {
+                gix::config::File::from_path_no_includes(path, source).map_err(|e| failed(&e))
+            } else {
+                Ok(gix::config::File::default())
+            }
+        };
+        let mut repository = read("config", gix::config::Source::Local)?;
+        // Extension-scoped settings only apply when the repository opts in.
+        if repository
+            .boolean("extensions.worktreeConfig")
+            .unwrap_or(Some(true))
+            .unwrap_or(false)
+        {
+            let worktree = read("config.worktree", gix::config::Source::Worktree)?;
+            repository.append(worktree).map_err(|e| failed(&e))?;
+        }
+        let head = repo.head_name().map_err(|e| failed(&e))?;
+        let mut options = gix::config::file::includes::Options::follow(
+            gix::config::path::interpolate::Context {
+                home_dir: user.home.as_deref(),
+                ..Default::default()
+            },
+            gix::config::file::includes::conditional::Context {
+                git_dir: Some(git_dir),
+                branch_name: head.as_ref().map(|name| name.as_ref()),
+            },
+        )
+        .strict();
+        // Git skips an include whose file is missing; it holds no settings.
+        options.err_on_missing_config_path = false;
+        let options = gix::config::file::init::Options {
+            includes: options,
+            ..Default::default()
+        };
+        // An include that cannot be resolved, such as `onbranch` on a
+        // detached HEAD, refuses the commit instead of being skipped.
+        let mut user_config = user.config.clone();
+        for config in [&mut repository, &mut user_config] {
+            config.resolve_includes(options).map_err(|e| failed(&e))?;
+        }
+        Ok(Self {
+            repository,
+            user: user_config,
+            home: user.home.clone(),
+        })
+    }
     fn string(&self, key: &str) -> Option<BString> {
         self.repository
             .string(key)
-            .or_else(|| self.user.config.string(key))
+            .or_else(|| self.user.string(key))
     }
     /// An unreadable value counts as `true`, so it never weakens a check.
     fn flag(&self, key: &str) -> Option<bool> {
         let read = |config: &gix::config::File| config.boolean(key).unwrap_or(Some(true));
-        read(self.repository).or_else(|| read(&self.user.config))
+        read(&self.repository).or_else(|| read(&self.user))
+    }
+    /// A path setting, with `~` expanded; a relative path is taken from
+    /// `base`. `Err` when it is set but cannot be resolved.
+    fn path(&self, key: &str, base: &std::path::Path) -> Result<Option<PathBuf>, ()> {
+        let Some(value) = self.string(key) else {
+            return Ok(None);
+        };
+        let value = gix::path::from_bstring(value).map_err(drop)?;
+        Ok(Some(match value.strip_prefix("~") {
+            Ok(rest) => self.home.as_ref().ok_or(())?.join(rest),
+            Err(_) => base.join(value),
+        }))
     }
 }
 
@@ -159,17 +217,13 @@ pub(super) fn commit(
             "finish or abort the merge, rebase or other operation in progress first",
         ));
     }
-    let snapshot = repo.config_snapshot();
-    let settings = Settings {
-        repository: snapshot.plumbing(),
-        user,
-    };
+    let settings = Settings::resolve(&repo, user)?;
     if settings.flag("commit.gpgSign").unwrap_or(false) {
         return Err(unsupported(
             "this repository signs commits (commit.gpgSign), which extensions cannot do",
         ));
     }
-    if has_hooks(&repo, &settings, user)? {
+    if has_hooks(&repo, &settings) {
         return Err(unsupported(
             "the repository has commit hooks, which extensions never run",
         ));
@@ -234,7 +288,7 @@ pub(super) fn commit(
         None => ObjectId::empty_tree(repo.object_hash()),
     };
     let mut tree = repo.edit_tree(base).map_err(|e| git_failure("tree", &e))?;
-    let overrides = user_excludes(user, &repo)?;
+    let overrides = user_excludes(&settings, user, &repo)?;
     let mut rules = repo
         .attributes(
             &index,
@@ -401,6 +455,7 @@ pub(super) fn commit(
     };
 
     // Committed: from here on a failure must say so.
+    tracing::info!(commit = %id, "extension made a git commit");
     update_index(&mut index, changes);
     if !write_index(&index, lock, id) {
         return Err(failure(
@@ -451,46 +506,45 @@ fn parent_is_file(
         })
 }
 
-fn has_hooks(
-    repo: &gix::Repository,
-    settings: &Settings<'_>,
-    user: &UserGit,
-) -> Result<bool, HostFailure> {
-    let directory = match settings.string("core.hooksPath") {
-        Some(configured) => {
-            // A hooks path that cannot be resolved is assumed to hold hooks.
-            let Ok(configured) = gix::path::from_bstring(configured) else {
-                return Ok(true);
-            };
-            match configured.strip_prefix("~") {
-                Ok(rest) => match &user.home {
-                    Some(home) => home.join(rest),
-                    None => return Ok(true),
-                },
-                Err(_) if configured.is_relative() => match repo.workdir() {
-                    Some(workdir) => workdir.join(configured),
-                    None => return Ok(true),
-                },
-                Err(_) => configured,
-            }
-        }
-        None => repo.git_dir().join("hooks"),
+fn has_hooks(repo: &gix::Repository, settings: &Settings) -> bool {
+    let base = repo.workdir().unwrap_or(repo.git_dir());
+    let directory = match settings.path("core.hooksPath", base) {
+        Ok(Some(directory)) => directory,
+        Ok(None) => repo.git_dir().join("hooks"),
+        // A hooks path that cannot be resolved is assumed to hold hooks.
+        Err(()) => return true,
     };
-    Ok(COMMIT_HOOKS
+    COMMIT_HOOKS
         .iter()
-        .any(|hook| std::fs::symlink_metadata(directory.join(hook)).is_ok()))
+        .any(|hook| std::fs::symlink_metadata(directory.join(hook)).is_ok())
 }
 
+/// The excludes file git would use: `core.excludesFile` from the
+/// repository or the user, else git's default location.
 fn user_excludes(
+    settings: &Settings,
     user: &UserGit,
     repo: &gix::Repository,
 ) -> Result<Option<gix::ignore::Search>, HostFailure> {
-    let Some((path, bytes)) = &user.excludes else {
+    let base = repo.workdir().unwrap_or(repo.git_dir());
+    let path = match settings.path("core.excludesFile", base) {
+        Ok(Some(path)) => path,
+        Ok(None) => match &user.default_excludes {
+            Some(path) => path.clone(),
+            None => return Ok(None),
+        },
+        Err(()) => {
+            return Err(unsupported(
+                "git's core.excludesFile setting could not be resolved",
+            ));
+        }
+    };
+    let Some(bytes) = read_user_file(&path)? else {
         return Ok(None);
     };
     let mut search = gix::ignore::Search::default();
     search
-        .add_patterns_buffer(bytes, path.clone(), repo.workdir(), Default::default())
+        .add_patterns_buffer(&bytes, path, repo.workdir(), Default::default())
         .map_err(|e| git_failure("user_config", &e))?;
     Ok(Some(search))
 }

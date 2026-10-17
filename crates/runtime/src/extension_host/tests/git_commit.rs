@@ -308,3 +308,112 @@ async fn modes_and_links_are_recorded_without_following_links() {
     assert_eq!(committed(&root, "link").as_deref(), Some("run.sh"));
     assert_eq!(changes(&mut host).await, []);
 }
+
+/// Refusals that depend on configuration git reads beyond the repository's
+/// own file: includes, conditional includes and the user's settings.
+#[test]
+fn settings_git_would_follow_are_honoured() {
+    let user = |text: &str, excludes: Option<std::path::PathBuf>| {
+        host::UserGit::given(text.parse().unwrap(), excludes)
+    };
+    for case in [
+        "include",
+        "conditional",
+        "user excludes",
+        "repository excludes",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = &project(dir.path());
+        committable(root, &[("a.txt", "one\n")]);
+        let signing = dir.path().join("signing.inc");
+        std::fs::write(&signing, "[commit]\n\tgpgSign = true\n").unwrap();
+        let ignore = dir.path().join("ignore");
+        std::fs::write(&ignore, "*.log\n").unwrap();
+        let (settings, path, expected) = match case {
+            "include" => {
+                configure(
+                    root,
+                    &format!("[include]\n\tpath = {}\n", signing.display()),
+                );
+                (user("", None), "a.txt", HostErrorCode::Unsupported)
+            }
+            "conditional" => (
+                user(
+                    &format!(
+                        "[includeIf \"gitdir:{}/\"]\n\tpath = {}\n",
+                        dir.path().display(),
+                        signing.display()
+                    ),
+                    None,
+                ),
+                "a.txt",
+                HostErrorCode::Unsupported,
+            ),
+            "user excludes" => (
+                user("", Some(ignore.clone())),
+                "new.log",
+                HostErrorCode::Invalid,
+            ),
+            _ => {
+                // The repository's own excludes file replaces the user's.
+                let own = dir.path().join("own-ignore");
+                std::fs::write(&own, "*.tmp\n").unwrap();
+                configure(
+                    root,
+                    &format!("[core]\n\texcludesFile = {}\n", own.display()),
+                );
+                (
+                    user("", Some(ignore.clone())),
+                    "new.tmp",
+                    HostErrorCode::Invalid,
+                )
+            }
+        };
+        std::fs::write(root.join(path), unique("text")).unwrap();
+        let before = head(root);
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let refused =
+            host::commit(root.clone(), "m", &[path.into()], &settings, &stop).expect_err(case);
+        assert_eq!(refused.code, expected, "{case}: {}", refused.message);
+        assert_eq!(head(root), before, "{case}");
+    }
+    // Outside the repository's own excludes file, the user's patterns no
+    // longer apply, so the same name commits.
+    let dir = tempfile::tempdir().unwrap();
+    let root = &project(dir.path());
+    committable(root, &[("a.txt", "one\n")]);
+    let ignore = dir.path().join("ignore");
+    std::fs::write(&ignore, "*.log\n").unwrap();
+    let own = dir.path().join("own-ignore");
+    std::fs::write(&own, "*.tmp\n").unwrap();
+    configure(
+        root,
+        &format!("[core]\n\texcludesFile = {}\n", own.display()),
+    );
+    std::fs::write(root.join("new.log"), unique("text")).unwrap();
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let made = host::commit(
+        root.clone(),
+        "m",
+        &["new.log".into()],
+        &host::UserGit::given(Default::default(), Some(ignore)),
+        &stop,
+    );
+    assert!(matches!(made, Ok(HostReply::Committed(_))), "{made:?}");
+}
+
+#[tokio::test]
+async fn a_commit_is_refused_without_time_to_report_it() {
+    let (dir, store) = store();
+    let root = &project(dir.path());
+    committable(root, &[("a.txt", "one\n")]);
+    std::fs::write(root.join("a.txt"), unique("a")).unwrap();
+    let before = head(root);
+    let mut host = writer(&store, root);
+    host.deadline = tokio::time::Instant::now() + GIT_WRITE_RESERVE;
+    assert_eq!(
+        code(host.handle(commit("m", &["a.txt"])).await),
+        Some(HostErrorCode::Budget)
+    );
+    assert_eq!(head(root), before);
+}

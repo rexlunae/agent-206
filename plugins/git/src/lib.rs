@@ -91,7 +91,6 @@ impl Extension for Git {
                 let message = required("message")?;
                 let paths: Vec<&str> = required("paths")?
                     .lines()
-                    .map(str::trim)
                     .filter(|path| !path.is_empty())
                     .collect();
                 let commit = host::git_commit(message, &paths)?;

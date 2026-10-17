@@ -196,7 +196,7 @@ unsafe operation.
 | `git_status` | `git_read` + a project | branch, `HEAD` id, changed paths (staged, unstaged, untracked) | 1,000 entries; 5 s per git call; renames not tracked; submodules ignored |
 | `git_log { max }` | `git_read` + a project | commits from `HEAD`: id, summary, author name (no email), author time | 200 commits |
 | `git_diff { path, staged }` | `git_read` + a project | unified diff of one file (`HEAD`→index when `staged`, else index→working tree; a symbolic link compares its target text), or `binary` | 512 KiB per side (checked before a blob is read), 192 KiB of text, 3 context lines; at most 8,192 input lines combined and 1,000,000 line pairs, otherwise a budget failure |
-| `git_commit { message, paths }` | `git_write` + a project | the new commit: id, summary, author name, time | 1 to 100 paths, 16 KiB message, 512 KiB per file and 8 MiB together; 5 s, but once the commit is written it is reported, even past the deadline; see [Commits](#commits) |
+| `git_commit { message, paths }` | `git_write` + a project | the new commit: id, summary, author name, time | 1 to 100 paths, 16 KiB message, 512 KiB per file and 8 MiB together; 5 s and 3 s before the invocation's deadline, but once the commit is written it is reported, even past that; see [Commits](#commits) |
 | `fetch { url }` | `network` + a declared host | final status (any, not only 2xx), `Content-Type`, body, whether it was cut | 512 KiB body; 8 s including redirects; 5 redirects |
 | `state_get { key }` | nothing | the extension's own value | — |
 | `state_put { key, value }` | nothing | done (`value = None` deletes) | 64 keys, 256 KiB per extension |
@@ -238,12 +238,17 @@ attributes ask for a `filter`, `ident` or `working-tree-encoding`, carriage
 returns in files git would convert (`text`, `eol`, `crlf` or `core.autocrlf`),
 a merge, rebase or similar in progress, conflicts, and split or sparse
 indexes. To decide this, and for `user.name` and `user.email` (required),
-commits read the user's system and global git configuration and excludes file
-as data, with repository settings taking precedence; nothing they name runs.
+commits read the repository's configuration and the user's system and global
+git configuration as data, with repository settings taking precedence and
+every include followed as git would (conditional `gitdir` and `onbranch`
+includes too; one that cannot be resolved refuses the commit), plus the
+excludes file git would use; nothing they name runs.
 The index lock is held throughout, so a concurrent git command makes the call
 fail with `conflict`, and so does `HEAD` moving underneath it; in both cases
 nothing is committed. If the index cannot be written after the commit, the
-failure names the commit that was made.
+failure names the commit that was made. A commit stops before its point of
+no return 3 s ahead of the invocation's deadline, so a commit that is made
+always reaches the guest; with less time left the call fails with `budget`.
 
 A fetch is a `GET` through the same guard as downloads
 (`crates/runtime/src/network.rs`). The URL and every redirect must be

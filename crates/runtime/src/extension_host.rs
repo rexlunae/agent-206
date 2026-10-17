@@ -33,6 +33,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 pub const TIMEOUT: Duration = Duration::from_secs(10);
 /// Wall-clock bound on one git host call, metadata checks included.
 pub const GIT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Time a git write keeps in reserve before the invocation's deadline, for
+/// the commit and index write after its point of no return and the reply.
+pub const GIT_WRITE_RESERVE: Duration = Duration::from_secs(3);
 /// Largest file a guest may read in one call.
 pub const MAX_FILE: u64 = 512 * 1024;
 /// Most entries one directory listing returns.
@@ -564,6 +567,7 @@ impl ExtensionHost {
         {
             return Err(ExtensionError::NoProject);
         }
+        let deadline = tokio::time::Instant::now() + TIMEOUT;
         let host = HostCalls {
             extension: manifest.id.clone(),
             effective: declared.clone(),
@@ -573,6 +577,7 @@ impl ExtensionHost {
             hosts: manifest.hosts.clone(),
             net: Arc::clone(&self.net),
             user_git: git_commit::UserGit::load,
+            deadline,
             source,
             logs: 0,
             last_failure: None,
@@ -583,7 +588,7 @@ impl ExtensionHost {
             invocation: Invocation { abi: ABI, call },
             limits: Limits::default(),
         };
-        tokio::time::timeout(TIMEOUT, self.run_worker(start, host))
+        tokio::time::timeout_at(deadline, self.run_worker(start, host))
             .await
             .map_err(ExtensionError::Timeout)?
     }
@@ -742,6 +747,8 @@ struct HostCalls {
     net: Arc<dyn crate::network::Net>,
     /// Reads the user's own git settings for a commit.
     user_git: fn() -> Result<git_commit::UserGit, HostFailure>,
+    /// When the whole invocation times out and its pending replies are lost.
+    deadline: tokio::time::Instant,
     /// The package this invocation runs; calls stop once it is replaced.
     source: PluginSource,
     logs: u32,
@@ -895,9 +902,25 @@ impl HostCalls {
             HostRequest::GitCommit { message, paths } => {
                 let root = self.workspace()?;
                 let user = self.user_git;
-                git_write_call(move |interrupt| {
-                    git_commit::commit(root, &message, &paths, &user()?, &interrupt)
-                })
+                // Stop early enough that a commit made at the last moment
+                // still reaches the guest before the invocation is dropped.
+                let budget = self
+                    .deadline
+                    .saturating_duration_since(tokio::time::Instant::now())
+                    .saturating_sub(GIT_WRITE_RESERVE)
+                    .min(GIT_TIMEOUT);
+                if budget.is_zero() {
+                    return Err(failure(
+                        HostErrorCode::Budget,
+                        "too little time is left in this call to commit",
+                    ));
+                }
+                git_write_call_with_timeout(
+                    move |interrupt| {
+                        git_commit::commit(root, &message, &paths, &user()?, &interrupt)
+                    },
+                    budget,
+                )
                 .await
             }
             HostRequest::Fetch { url } => fetch::fetch(self.net.as_ref(), &self.hosts, &url).await,
@@ -1013,18 +1036,11 @@ async fn git_call_with_timeout(
 ) -> Result<HostReply, HostFailure> {
     run_git(work, timeout, Late::Refuse).await
 }
-/// Like [`git_call`], for a call that changes the repository. Once past its
-/// point of no return it finishes, and its outcome is reported as it is: a
-/// commit made after the deadline is still a commit. If this future is
-/// dropped, a call that has not reached that point stops without changing
-/// anything.
-async fn git_write_call(
-    work: impl FnOnce(Arc<std::sync::atomic::AtomicBool>) -> Result<HostReply, HostFailure>
-    + Send
-    + 'static,
-) -> Result<HostReply, HostFailure> {
-    git_write_call_with_timeout(work, GIT_TIMEOUT).await
-}
+/// Like [`git_call`], for a call that changes the repository, stopping at
+/// `timeout`. Once past its point of no return it finishes, and its outcome
+/// is reported as it is: a commit made after the deadline is still a commit.
+/// If this future is dropped, a call that has not reached that point stops
+/// without changing anything.
 async fn git_write_call_with_timeout(
     work: impl FnOnce(Arc<std::sync::atomic::AtomicBool>) -> Result<HostReply, HostFailure>
     + Send
