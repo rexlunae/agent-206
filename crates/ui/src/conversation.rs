@@ -1,7 +1,7 @@
 use crate::{State, dispatch, route::Route};
 use a206_core::{
     Capability, CodingBackend, Command, CompactionTrigger, ErrorKind, ErrorReport,
-    InstructionStatus, Mode, ModelKey, Reply, Role, RunState, TextAttachment, Thread,
+    InstructionStatus, Mode, ModelKey, PlanStatus, Reply, Role, RunState, TextAttachment, Thread,
 };
 use fc_dioxus::prelude::*;
 use uuid::Uuid;
@@ -280,6 +280,7 @@ fn Conversation(thread: Thread, target: Option<Uuid>) -> Element {
             }
             for request in &thread.approvals { crate::tools::PendingApproval { key: "{request.id}", thread: id, request: request.clone() } }
             for question in &thread.prompts { crate::prompts::PendingPrompt { key: "{question.id}", thread: id, question: question.clone() } }
+            if !thread.plan.is_empty() { ThreadPlan { thread: thread.clone() } }
             if running { AgentStatus { state: Lifecycle::Running, label: rsx! { {thread.backend_activity.clone().unwrap_or_else(|| format!("{} is working…", thread.backend.label()))} } } }
             if let Some(report) = thread.error.clone().filter(|_| !running && thread.state == RunState::Failed) {
                 crate::error::ErrorNotice { report, title: "Run failed".to_string() }
@@ -622,6 +623,35 @@ fn ThreadFacts(thread: Thread) -> Element {
     } }
 }
 
+/// The checklist the conversation's models keep with `plan_update`.
+#[component]
+fn ThreadPlan(thread: Thread) -> Element {
+    let done = thread
+        .plan
+        .iter()
+        .filter(|step| step.status == PlanStatus::Done)
+        .count();
+    let total = thread.plan.len();
+    rsx! { Card { as_: CardTag::Section, class: "a206-plan", aria_label: "Plan",
+        div { class: "a206-row",
+            strong { "Plan" }
+            span { class: "a206-muted", {format!("{done} of {total} done")} }
+        }
+        Progress { label: name!("Plan steps done"), value: ProgressValue::Of { value: done as f64, max: total as f64 } }
+        ol { class: "a206-plan-steps",
+            for (index, step) in thread.plan.iter().enumerate() {
+                li { key: "{index}", class: "a206-row",
+                    Badge { tone: match step.status { PlanStatus::Done => BadgeTone::Success, PlanStatus::InProgress => BadgeTone::Accent, PlanStatus::Pending => BadgeTone::Neutral },
+                        if step.status == PlanStatus::Done { Icon { name: IconName::Check, size: IconSize::Sm } }
+                        "{step.status.label()}"
+                    }
+                    span { "{step.text}" }
+                }
+            }
+        }
+    } }
+}
+
 /// Compaction and the project instruction files of the latest run.
 #[component]
 fn ContextControls(thread: Thread) -> Element {
@@ -709,4 +739,48 @@ fn rejected(message: &str) -> ErrorReport {
 fn unreadable(error: dioxus::CapturedError) -> ErrorReport {
     ErrorReport::new(ErrorKind::Other, "Could not read the attachment")
         .caused_by(ErrorReport::capture(&**error, |_| None))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use a206_core::PlanStep;
+
+    fn render(thread: Thread) -> String {
+        #[derive(Props, Clone, PartialEq)]
+        struct Shown {
+            thread: Thread,
+        }
+        fn root(props: Shown) -> Element {
+            rsx! { ThreadPlan { thread: props.thread } }
+        }
+        let mut dom = VirtualDom::new_with_props(root, Shown { thread });
+        dom.rebuild_in_place();
+        dioxus_ssr::render(&dom)
+    }
+
+    #[test]
+    fn the_plan_shows_each_step_in_order_with_its_status() {
+        let mut thread = Thread::new(Uuid::new_v4().to_string(), Mode::default());
+        let mut statuses = PlanStatus::ALL.to_vec();
+        statuses.push(PlanStatus::Done);
+        thread.plan = statuses
+            .into_iter()
+            .map(|status| PlanStep {
+                text: Uuid::new_v4().simple().to_string(),
+                status,
+            })
+            .collect();
+        let html = render(thread.clone());
+        let at: Vec<_> = thread
+            .plan
+            .iter()
+            .map(|step| html.find(&step.text).unwrap())
+            .collect();
+        assert!(at.windows(2).all(|pair| pair[0] < pair[1]), "{html}");
+        for status in PlanStatus::ALL {
+            assert!(html.contains(status.label()), "{html}");
+        }
+        assert!(html.contains("2 of 4 done"), "{html}");
+    }
 }
