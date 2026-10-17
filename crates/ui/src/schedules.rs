@@ -10,13 +10,6 @@ use fc_dioxus::prelude::*;
 use jiff::{Timestamp, tz::TimeZone};
 use uuid::Uuid;
 
-/// Seconds since the Unix epoch on this client's clock.
-fn now() -> u64 {
-    web_time::SystemTime::now()
-        .duration_since(web_time::UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_secs())
-}
-
 /// A Unix time in `zone`, as people read it.
 fn show_time(at: u64, zone: &TimeZone) -> String {
     i64::try_from(at)
@@ -36,11 +29,19 @@ fn show_time(at: u64, zone: &TimeZone) -> String {
 fn describe(schedule: &Schedule, zone: &TimeZone) -> String {
     match schedule {
         Schedule::At { at } => format!("Once, {}", show_time(*at, zone)),
-        Schedule::Every { seconds, anchor } => format!(
+        Schedule::In { seconds } => format!("Once, in {}", format_interval(*seconds)),
+        Schedule::Every {
+            seconds,
+            anchor: Some(anchor),
+        } => format!(
             "Every {}, counted from {}",
             format_interval(*seconds),
             show_time(*anchor, zone)
         ),
+        Schedule::Every {
+            seconds,
+            anchor: None,
+        } => format!("Every {}", format_interval(*seconds)),
         Schedule::Cron {
             expression,
             zone: Some(cron_zone),
@@ -153,15 +154,16 @@ fn form_schedule(
     zone: &str,
     every: &str,
     cron: &str,
-    now: u64,
 ) -> Option<Result<Schedule, ScheduleInputError>> {
     match kind {
         Kind::Once if date.trim().is_empty() || time.trim().is_empty() => None,
         Kind::Once => Some(parse_local(date, time, zone).map(|at| Schedule::At { at })),
         Kind::Every if every.trim().is_empty() => None,
+        // The gateway counts the interval from when it accepts the job, by
+        // its own clock.
         Kind::Every => Some(parse_interval(every).map(|seconds| Schedule::Every {
             seconds,
-            anchor: now,
+            anchor: None,
         })),
         Kind::Cron if cron.trim().is_empty() => None,
         Kind::Cron => Some(Ok(Schedule::Cron {
@@ -196,7 +198,7 @@ fn AddJob() -> Element {
         .iter()
         .map(|t| SelectChoice::new(t.id.to_string(), t.title.clone()))
         .collect::<Vec<_>>();
-    let schedule = form_schedule(kind(), &date(), &time(), &zone(), &every(), &cron(), now());
+    let schedule = form_schedule(kind(), &date(), &time(), &zone(), &every(), &cron());
     let invalid = match &schedule {
         Some(Err(error)) => Some(error.to_string()),
         _ => None,
@@ -221,7 +223,7 @@ fn AddJob() -> Element {
                     Field { label: rsx! { "Time" }, Input { r#type: InputType::Time, value: ReadSignal::from(time), oninput: move |v| time.set(v) } }
                 },
                 Kind::Every => rsx! {
-                    Field { label: rsx! { "Interval" }, hint: rsx! { "Such as 90m, 6h or 1d; at least a minute. Counted from now." }, error: invalid.clone().map(|e| rsx! { "{e}" }), Input { value: ReadSignal::from(every), oninput: move |v| every.set(v), placeholder: "1d" } }
+                    Field { label: rsx! { "Interval" }, hint: rsx! { "Such as 90m, 6h or 1d; at least a minute. Counted from when it is scheduled." }, error: invalid.clone().map(|e| rsx! { "{e}" }), Input { value: ReadSignal::from(every), oninput: move |v| every.set(v), placeholder: "1d" } }
                 },
                 Kind::Cron => rsx! {
                     Field { label: rsx! { "Cron expression" }, hint: rsx! { "Five fields, or six with seconds first." }, Input { value: ReadSignal::from(cron), oninput: move |v| cron.set(v), placeholder: "0 9 * * 1-5" } }
@@ -232,9 +234,7 @@ fn AddJob() -> Element {
             }
         } }
         CardFooter { Button { variant: ButtonVariant::Primary, availability: if ready { Availability::Enabled } else { Availability::Disabled }, onclick: move |_| {
-            // Built again now, so an interval counts from the click rather
-            // than from when the form last rendered.
-            let Some(Ok(schedule)) = form_schedule(kind(), &date(), &time(), &zone(), &every(), &cron(), now()) else { return };
+            let Some(Ok(schedule)) = form_schedule(kind(), &date(), &time(), &zone(), &every(), &cron()) else { return };
             let Some(thread) = target else { return };
             dispatch(state, Command::ScheduleJob { name: name().trim().to_owned(), thread, text: text(), schedule });
         }, "Schedule message" } }

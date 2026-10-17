@@ -68,7 +68,7 @@ const YEAR: u64 = 366 * 86_400;
 fn every(seconds: u64) -> Schedule {
     Schedule::Every {
         seconds,
-        anchor: arbitrary() % 1_000_000_000,
+        anchor: Some(arbitrary() % 1_000_000_000),
     }
 }
 fn kind(reply: Reply) -> ErrorKind {
@@ -239,4 +239,51 @@ async fn an_earlier_run_ending_late_leaves_the_latest_result() {
         job(&g, created.id).last.map(|run| run.outcome),
         Some(JobOutcome::Complete)
     );
+}
+
+#[tokio::test]
+async fn relative_schedules_count_from_when_the_gateway_accepts_them() {
+    let state = tempfile::tempdir().unwrap();
+    let g = Gateway::open(state.path()).unwrap();
+    let thread = thread(&g).await;
+    let seconds = schedule::MIN_INTERVAL + arbitrary() % YEAR;
+    // An interval with no anchor is anchored at acceptance, so it first
+    // runs one interval later, whatever the client's clock says.
+    let Reply::Job(repeating) = schedule(
+        &g,
+        thread,
+        Schedule::Every {
+            seconds,
+            anchor: None,
+        },
+    )
+    .await
+    else {
+        panic!("interval job scheduled");
+    };
+    assert_eq!(
+        repeating.schedule,
+        Schedule::Every {
+            seconds,
+            anchor: Some(repeating.created)
+        }
+    );
+    assert_eq!(repeating.next, Some(repeating.created + seconds));
+    // A delay is stored as the time it ends.
+    let Reply::Job(once) = schedule(&g, thread, Schedule::In { seconds }).await else {
+        panic!("delayed job scheduled");
+    };
+    assert_eq!(
+        once.schedule,
+        Schedule::At {
+            at: once.created + seconds
+        }
+    );
+    assert_eq!(once.next, Some(once.created + seconds));
+    for unusable in [0, schedule::MAX_INTERVAL + 1] {
+        assert_eq!(
+            kind(schedule(&g, thread, Schedule::In { seconds: unusable }).await),
+            ErrorKind::InvalidRequest
+        );
+    }
 }

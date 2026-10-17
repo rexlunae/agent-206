@@ -28,6 +28,11 @@ pub enum ScheduleError {
     Range(#[source] jiff::Error),
     #[error("the schedule never comes due again")]
     Never,
+    #[error("a delay must be 1 second to ten years")]
+    Delay,
+    /// A relative schedule the gateway has not placed in time; see [`resolve`].
+    #[error("the schedule has not been placed in time")]
+    Unresolved,
 }
 impl crate::error::Classified for ScheduleError {
     fn kind(&self) -> Option<ErrorKind> {
@@ -35,12 +40,43 @@ impl crate::error::Classified for ScheduleError {
     }
 }
 
+/// Place a relative schedule in time, as accepted at `now` (Unix seconds, by
+/// the gateway's clock): `In` becomes `At`, and an `Every` with no anchor is
+/// anchored at `now`. Other schedules are returned as they are.
+pub fn resolve(schedule: Schedule, now: u64) -> Result<Schedule, ScheduleError> {
+    Ok(match schedule {
+        Schedule::In { seconds } => {
+            if !(1..=MAX_INTERVAL).contains(&seconds) {
+                return Err(ScheduleError::Delay);
+            }
+            Schedule::At {
+                at: now.checked_add(seconds).ok_or(ScheduleError::Never)?,
+            }
+        }
+        Schedule::Every {
+            seconds,
+            anchor: None,
+        } => Schedule::Every {
+            seconds,
+            anchor: Some(now),
+        },
+        placed => placed,
+    })
+}
+
 /// The first time strictly after `after` (Unix seconds) that `schedule` is
-/// due, or `None` if it never is again.
+/// due, or `None` if it never is again. A relative schedule must be
+/// [`resolve`]d first.
 pub fn next_after(schedule: &Schedule, after: u64) -> Result<Option<u64>, ScheduleError> {
     match schedule {
         Schedule::At { at } => Ok((*at > after).then_some(*at)),
-        Schedule::Every { seconds, anchor } => {
+        Schedule::In { .. } | Schedule::Every { anchor: None, .. } => {
+            Err(ScheduleError::Unresolved)
+        }
+        Schedule::Every {
+            seconds,
+            anchor: Some(anchor),
+        } => {
             if !(MIN_INTERVAL..=MAX_INTERVAL).contains(seconds) {
                 return Err(ScheduleError::Interval);
             }
