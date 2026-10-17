@@ -21,8 +21,14 @@ pub(crate) enum Route {
     Workspace {},
     #[route("/conversations")]
     Conversations {},
-    #[route("/conversations/:id?:split")]
-    Chat { id: Uuid, split: Option<Uuid> },
+    /// `message` asks the first column to show one message, for example a
+    /// search result.
+    #[route("/conversations/:id?:split&:message")]
+    Chat {
+        id: Uuid,
+        split: Option<Uuid>,
+        message: Option<Uuid>,
+    },
     #[route("/projects")]
     Projects {},
     #[route("/activity")]
@@ -115,17 +121,36 @@ mod tests {
         let id = Uuid::new_v4();
         let split = Uuid::new_v4();
         for route in [
-            Route::Chat { id, split: None },
+            Route::Chat {
+                id,
+                split: None,
+                message: None,
+            },
             Route::Chat {
                 id,
                 split: Some(split),
+                message: None,
+            },
+            Route::Chat {
+                id,
+                split: None,
+                message: Some(split),
+            },
+            Route::Chat {
+                id,
+                split: Some(split),
+                message: Some(id),
             },
         ] {
             assert_eq!(route.to_string().parse::<Route>().unwrap(), route);
         }
         assert_eq!(
             format!("/conversations/{id}").parse::<Route>().unwrap(),
-            Route::Chat { id, split: None }
+            Route::Chat {
+                id,
+                split: None,
+                message: None
+            }
         );
         for path in ["/conversations/not-a-uuid", "/unknown/page"] {
             assert!(matches!(
@@ -209,6 +234,7 @@ mod tests {
         snapshot: a206_core::Snapshot,
         id: Uuid,
         split: Option<Uuid>,
+        message: Option<Uuid>,
     }
 
     #[derive(Clone, Debug, PartialEq, Routable)]
@@ -290,7 +316,7 @@ mod tests {
         let fixture = use_context::<ThreadFixture>();
         let state = loaded_state(fixture.snapshot.clone());
         use_context_provider(|| state);
-        rsx! { Chat { id: fixture.id, split: fixture.split } }
+        rsx! { Chat { id: fixture.id, split: fixture.split, message: fixture.message } }
     }
 
     fn render_thread(fixture: ThreadFixture) -> String {
@@ -314,6 +340,7 @@ mod tests {
             snapshot,
             id: first.id,
             split: Some(second.id),
+            message: None,
         };
         let html = render_thread(fixture.clone());
         assert_eq!(html.matches("aria-label=\"Message your agent\"").count(), 2);
@@ -338,6 +365,52 @@ mod tests {
             ..fixture
         });
         assert_eq!(html.matches("aria-label=\"Message your agent\"").count(), 1);
+    }
+
+    #[test]
+    fn a_linked_message_is_marked_and_a_missing_one_offers_the_whole_conversation() {
+        let mut thread = a206_core::Thread::new(Uuid::new_v4().to_string(), a206_core::Mode::Chat);
+        let linked = a206_core::Message::new(
+            a206_core::Role::User,
+            Uuid::new_v4().to_string(),
+            0,
+            thread.backend,
+        );
+        let other = a206_core::Message::new(
+            a206_core::Role::User,
+            Uuid::new_v4().to_string(),
+            0,
+            thread.backend,
+        );
+        thread.messages = vec![linked.clone(), other];
+        let mut snapshot = crate::empty_snapshot();
+        snapshot.threads = vec![thread.clone()];
+        let fixture = ThreadFixture {
+            snapshot,
+            id: thread.id,
+            split: None,
+            message: Some(linked.id),
+        };
+        let html = render_thread(fixture.clone());
+        assert_eq!(html.matches("Linked message").count(), 1);
+        let marker = html.find("Linked message").unwrap();
+        let text = html.find(&linked.text).unwrap();
+        assert!(marker < text, "the mark belongs to the linked message");
+        assert!(!html.contains("Message unavailable"));
+
+        let html = render_thread(ThreadFixture {
+            message: Some(Uuid::new_v4()),
+            ..fixture
+        });
+        assert!(html.contains("Message unavailable"));
+        assert!(!html.contains("Linked message"));
+        assert!(html.contains(&linked.text), "the conversation stays open");
+        let whole = Route::Chat {
+            id: thread.id,
+            split: None,
+            message: None,
+        };
+        assert!(html.contains(&format!("href=\"{whole}\"")));
     }
 
     #[derive(Clone, Debug, PartialEq, Routable)]

@@ -308,6 +308,16 @@ pub mod host {
             _ => Err(unexpected()),
         }
     }
+    /// Commit the working-tree content of exactly `paths` on top of `HEAD`.
+    pub fn git_commit(message: &str, paths: &[&str]) -> Result<GitCommit, HostFailure> {
+        match call(&HostRequest::GitCommit {
+            message: message.into(),
+            paths: paths.iter().map(|path| (*path).into()).collect(),
+        })? {
+            HostReply::Committed(commit) => Ok(commit),
+            _ => Err(unexpected()),
+        }
+    }
     /// `GET` a public HTTPS URL on a host the manifest declares. Any final
     /// status is a response, not a failure.
     pub fn fetch(url: &str) -> Result<FetchResponse, HostFailure> {

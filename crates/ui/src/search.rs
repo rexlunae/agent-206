@@ -85,7 +85,7 @@ fn SearchResults(query: String, hits: Vec<MessageHit>) -> Element {
         div { class: "a206-nav-group", aria_label: "Matching messages",
             for hit in hits {
                 LinkButton { key: "{hit.message}", class: "a206-recent-thread", size: ButtonSize::Sm, variant: ButtonVariant::Ghost,
-                    href: Route::Chat { id: hit.thread, split: None }.to_string(),
+                    href: Route::Chat { id: hit.thread, split: None, message: Some(hit.message) }.to_string(),
                     Icon { name: IconName::Search, size: IconSize::Sm }
                     span { class: "a206-nav-title",
                         strong { "{hit.title}" }
@@ -136,7 +136,8 @@ mod tests {
             html.contains(
                 &Route::Chat {
                     id: hit.thread,
-                    split: None
+                    split: None,
+                    message: Some(hit.message),
                 }
                 .to_string()
             )

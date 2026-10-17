@@ -39,7 +39,7 @@ async fn pathological_line_counts_are_refused_before_diff_computation() {
 
 /// A repository at `root` whose single commit holds `files`, with a matching
 /// index and working tree.
-fn repository(root: &std::path::Path, files: &[(&str, &str)]) -> (String, String) {
+pub(super) fn repository(root: &std::path::Path, files: &[(&str, &str)]) -> (String, String) {
     let repo = gix::init(root).unwrap();
     let mut entries: Vec<_> = files
         .iter()
@@ -77,7 +77,7 @@ fn repository(root: &std::path::Path, files: &[(&str, &str)]) -> (String, String
     }
     (name, summary)
 }
-fn unique(prefix: &str) -> String {
+pub(super) fn unique(prefix: &str) -> String {
     format!("{prefix}-{}", uuid::Uuid::new_v4().simple())
 }
 
