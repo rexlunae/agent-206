@@ -19,6 +19,8 @@ fn known(value: Option<bool>) -> &'static str {
 enum Shown {
     Checking,
     State(VaultState),
+    /// Locked just now, but its state could not be read afterwards.
+    Locked,
     Remote(String),
 }
 
@@ -45,11 +47,17 @@ pub(crate) fn WebVault() -> Element {
                 VaultRequest::Lock => "Could not lock the vault",
             };
             match ask(request).await {
-                Ok(VaultReply::State(state)) => {
-                    if request == VaultRequest::Lock {
-                        notice.set(Some("Vault locked."));
+                Ok(VaultReply::State(state)) => shown.set(Shown::State(state)),
+                Ok(VaultReply::Locked { state, refresh }) => {
+                    notice.set(Some("Vault locked."));
+                    shown.set(state.map_or(Shown::Locked, Shown::State));
+                    if let Some(report) = refresh {
+                        record("vault", &report);
+                        failure.set(Some((
+                            "Could not read the vault state after locking it",
+                            report,
+                        )));
                     }
-                    shown.set(Shown::State(state));
                 }
                 Ok(VaultReply::Remote { endpoint }) => shown.set(Shown::Remote(endpoint)),
                 Ok(VaultReply::Error(report)) | Err(report) => {
@@ -74,14 +82,22 @@ pub(crate) fn WebVault() -> Element {
             CardBody {
                 p { "This web server uses the gateway at {endpoint}. Its vault broker runs on that host." }
                 p { class: "a206-muted", "Run `agent206 vault unlock` and `agent206 vault totp enroll` in a terminal on that host." }
+                if let Some((title, report)) = failure() {
+                    ErrorNotice { report, title: title.to_string() }
+                }
+            }
+            CardFooter {
+                Button { variant: ButtonVariant::Ghost, availability, onclick: move |_| run(VaultRequest::Status), "Check again" }
             }
         } };
     }
+    let locked = shown() == Shown::Locked;
     let state = match shown() {
         Shown::State(state) => Some(state),
         _ => None,
     };
     let (label, tone) = match &state {
+        None if locked => ("Locked", BadgeTone::Warning),
         None => ("Checking", BadgeTone::Neutral),
         Some(s) if !s.exists => ("No vault", BadgeTone::Warning),
         Some(s) if !s.unlocked => ("Locked", BadgeTone::Warning),
@@ -93,12 +109,12 @@ pub(crate) fn WebVault() -> Element {
         CardBody {
             if let Some(state) = &state {
                 DescriptionList {
+                    DescriptionItem { term: rsx! { "Vault broker" }, if state.broker_running { "Running" } else { "Not running" } }
                     DescriptionItem { term: rsx! { "Encrypted vault" }, if state.exists { "Created" } else { "Not created yet" } }
                     DescriptionItem { term: rsx! { "Two-factor authentication" }, "{known(state.totp_enrolled)}" }
                     DescriptionItem { term: rsx! { "Agent credential access" }, "{known(state.agent_access)}" }
-                    DescriptionItem { term: rsx! { "Gateway paired" }, "{known(state.gateway_paired)}" }
                 }
-            } else if failure().is_none() {
+            } else if failure().is_none() && !locked {
                 p { class: "a206-muted", role: "status", "Checking the vault…" }
             }
             if let Some(message) = notice() {

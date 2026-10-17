@@ -593,17 +593,18 @@ async fn health(State(state): State<Web>, headers: HeaderMap, bytes: Bytes) -> R
     }
     let request = requests.remove(0);
     // The gateway this bridge uses, not whatever the saved file says now.
-    let remote = state
-        .gateway
-        .read()
-        .unwrap_or_else(PoisonError::into_inner)
-        .target
-        .as_ref()
-        .and_then(|target| target.remote().map(str::to_owned));
+    let target = {
+        let gateway = state.gateway.read().unwrap_or_else(PoisonError::into_inner);
+        match (&gateway.target, &gateway.problem) {
+            (Some(target), _) => Ok(Some(target.clone())),
+            (None, Some(problem)) => Err(problem.clone()),
+            (None, None) => Ok(None),
+        }
+    };
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_secs());
-    let facts = crate::doctor::gather(&state.root, remote, now).await;
+    let facts = crate::doctor::gather_for(&state.root, target, now).await;
     respond(StatusCode::OK, request.id, &crate::doctor::evaluate(&facts))
 }
 
@@ -631,44 +632,80 @@ async fn vault(State(state): State<Web>, headers: HeaderMap, bytes: Bytes) -> Re
     let reply = match remote {
         // That host's broker is not this computer's; never act on the wrong vault.
         Some(endpoint) => VaultReply::Remote { endpoint },
-        None => match broker_vault(&state.root, request.body).await {
-            Ok(vault) => VaultReply::State(vault),
-            Err(error) => VaultReply::Error(crate::error::correlated(
-                match request.body {
-                    VaultRequest::Status => "read vault state",
-                    VaultRequest::Lock => "lock vault",
-                },
-                request.id,
-                &error,
-            )),
-        },
+        None => broker_vault(&state.root, request.id, request.body).await,
     };
     respond(StatusCode::OK, request.id, &reply)
 }
+/// Answer from this computer's broker without starting one: a stopped broker
+/// holds no unlocked vault, so there is nothing to read or lock.
 #[cfg(unix)]
-async fn broker_vault(
-    root: &std::path::Path,
-    request: VaultRequest,
-) -> Result<VaultState, crate::vault::VaultError> {
-    let mut client = crate::vault::connect(root).await?;
-    if request == VaultRequest::Lock {
-        client.call(a206_broker::Request::Lock).await?;
+async fn broker_vault(root: &std::path::Path, id: uuid::Uuid, request: VaultRequest) -> VaultReply {
+    let failed = |operation: &'static str, error: &(dyn std::error::Error + 'static)| {
+        crate::error::correlated(operation, id, error)
+    };
+    let stopped = || VaultState {
+        broker_running: false,
+        exists: a206_broker::vault_path(root).exists(),
+        unlocked: false,
+        totp_enrolled: None,
+        agent_access: None,
+    };
+    let operation = match request {
+        VaultRequest::Status => "read vault state",
+        VaultRequest::Lock => "lock vault",
+    };
+    let mut client = match crate::vault::connect_running(root).await {
+        Ok(Some(client)) => client,
+        Ok(None) if request == VaultRequest::Lock => {
+            return VaultReply::Locked {
+                state: Some(stopped()),
+                refresh: None,
+            };
+        }
+        Ok(None) => return VaultReply::State(stopped()),
+        Err(error) => return VaultReply::Error(failed(operation, &error)),
+    };
+    if request == VaultRequest::Lock
+        && let Err(error) = client.call(a206_broker::Request::Lock).await
+    {
+        return VaultReply::Error(failed(operation, &error));
     }
-    let status = crate::vault::status(&mut client).await?;
-    Ok(VaultState {
-        exists: status.exists,
-        unlocked: status.unlocked,
-        totp_enrolled: status.totp_enrolled,
-        agent_access: status.agent_access,
-        gateway_paired: status.gateway_paired,
-    })
+    let state = crate::vault::status(&mut client)
+        .await
+        .map(|status| VaultState {
+            broker_running: true,
+            exists: status.exists,
+            unlocked: status.unlocked,
+            totp_enrolled: status.totp_enrolled,
+            agent_access: status.agent_access,
+        });
+    match (request, state) {
+        (VaultRequest::Status, Ok(state)) => VaultReply::State(state),
+        (VaultRequest::Status, Err(error)) => VaultReply::Error(failed(operation, &error)),
+        (VaultRequest::Lock, state) => VaultReply::Locked {
+            refresh: state
+                .as_ref()
+                .err()
+                .map(|error| failed("read vault state", error)),
+            state: state.ok(),
+        },
+    }
 }
 #[cfg(not(unix))]
 async fn broker_vault(
     _root: &std::path::Path,
-    _request: VaultRequest,
-) -> Result<VaultState, crate::vault::VaultError> {
-    Err(crate::vault::VaultError::Unsupported)
+    id: uuid::Uuid,
+    request: VaultRequest,
+) -> VaultReply {
+    let operation = match request {
+        VaultRequest::Status => "read vault state",
+        VaultRequest::Lock => "lock vault",
+    };
+    VaultReply::Error(crate::error::correlated(
+        operation,
+        id,
+        &crate::vault::VaultError::Unsupported,
+    ))
 }
 
 /// Sign-in for a server opened to other devices. Only a same-origin request
@@ -1126,6 +1163,36 @@ mod tests {
         // Checking changes nothing.
         assert!(!root.path().join("connection.toml").exists());
         assert!(state.client().is_none());
+
+        // The gateway this bridge uses is checked, not one another client
+        // saved since.
+        state.gateway.write().unwrap().target = Some(GatewayTarget::Local);
+        let endpoint = format!("ssh://u{}@gateway.test", uuid::Uuid::new_v4().simple());
+        connection::save(
+            root.path(),
+            &GatewayConnection {
+                target: GatewayTarget::Ssh {
+                    endpoint: endpoint.clone(),
+                },
+            },
+        )
+        .unwrap();
+        let (_, report) = post::<_, DoctorReport>(&app, &state, "/api/health", ()).await;
+        assert!(
+            report.checks.iter().any(|check| matches!(
+                &check.finding,
+                Finding::GatewayStopped { .. } | Finding::GatewayOffline { .. }
+            )),
+            "{report:?}"
+        );
+        assert!(
+            report.checks.iter().all(|check| !matches!(
+                check.finding,
+                Finding::VaultRemote { .. } | Finding::GatewayNotConfigured
+            )),
+            "{report:?}"
+        );
+        assert!(!format!("{report:?}").contains(&endpoint), "{report:?}");
     }
     #[cfg(unix)]
     #[tokio::test]
@@ -1133,6 +1200,28 @@ mod tests {
         use a206_broker::{Client, Request as BrokerRequest, Role, WireSecret};
         let root = tempfile::tempdir().unwrap();
         let (state, app) = unconfigured(root.path());
+        // Without a broker the vault reads as locked, and none is started.
+        for request in [VaultRequest::Status, VaultRequest::Lock] {
+            let (_, reply) = post::<_, VaultReply>(&app, &state, "/api/vault", request).await;
+            let stopped = VaultState {
+                broker_running: false,
+                exists: false,
+                unlocked: false,
+                totp_enrolled: None,
+                agent_access: None,
+            };
+            let expected = match request {
+                VaultRequest::Status => VaultReply::State(stopped),
+                VaultRequest::Lock => VaultReply::Locked {
+                    state: Some(stopped),
+                    refresh: None,
+                },
+            };
+            assert_eq!(reply, expected);
+        }
+        assert!(!a206_broker::socket_path(root.path()).exists());
+        assert!(!root.path().join("vault").exists());
+
         let broker_root = root.path().to_owned();
         // Deliberately detached: the broker serves until the test runtime ends.
         tokio::spawn(async move { a206_broker::serve(&broker_root).await });
@@ -1181,7 +1270,7 @@ mod tests {
         let VaultReply::State(vault) = reply else {
             panic!("unexpected {reply:?}");
         };
-        assert!(vault.exists && vault.unlocked);
+        assert!(vault.broker_running && vault.exists && vault.unlocked);
         assert_eq!(vault.totp_enrolled, Some(false));
 
         // With a remote gateway in use, this computer's vault is left alone.
@@ -1205,7 +1294,11 @@ mod tests {
         *state.gateway.write().unwrap() = local;
         let (_, reply) =
             post::<_, VaultReply>(&app, &state, "/api/vault", VaultRequest::Lock).await;
-        let VaultReply::State(vault) = reply else {
+        let VaultReply::Locked {
+            state: Some(vault),
+            refresh: None,
+        } = reply
+        else {
             panic!("unexpected {reply:?}");
         };
         assert!(vault.exists && !vault.unlocked);

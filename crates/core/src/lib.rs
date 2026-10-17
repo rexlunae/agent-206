@@ -1082,20 +1082,26 @@ pub enum VaultRequest {
     Lock,
 }
 
-/// What the vault broker reports; `None` is unknown (locked, or an older broker).
+/// What the vault broker reports; `None` is unknown (locked, or no broker).
+/// A stopped broker holds no unlocked vault, so its vault reads as locked.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VaultState {
+    pub broker_running: bool,
     pub exists: bool,
     pub unlocked: bool,
     pub totp_enrolled: Option<bool>,
     pub agent_access: Option<bool>,
-    pub gateway_paired: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum VaultReply {
-    /// The vault's state, after the request.
     State(VaultState),
+    /// The vault is locked. Reading its state afterwards may still fail;
+    /// that failure is reported beside the lock, never instead of it.
+    Locked {
+        state: Option<VaultState>,
+        refresh: Option<ErrorReport>,
+    },
     /// The bridge uses a remote gateway, whose vault lives on that host.
     Remote {
         endpoint: String,

@@ -6,9 +6,13 @@ status changes; `docs/status.md` remains the authoritative implementation ledger
 Scope decisions (2026-10-16): gateway communication keeps RustyClaw's SSH-based
 protocol, and parity work targets desktop and TUI first. The web client reaches
 gateways, local or SSH, through its server-side bridge (2026-10-17), not through
-SSH in the browser. It shares every page with the desktop app through the same
-components and command API; the Gateway page's health checks and the Security
-page's vault card run on the bridge. By design the browser only reads and locks
+SSH in the browser. Its pages are the desktop app's shared fc-dioxus components
+calling the gateway's command API through the bridge; two cards that the desktop
+runs against local processes use their own bridge routes instead: the Gateway
+page's health checks (`/api/health`) and the Security page's vault card
+(`/api/vault`). Chat streaming and tool approvals use the same snapshot polling
+as the desktop but have not been exercised in a browser against a live model
+provider. By design the browser only reads and locks
 the vault: creating, unlocking, pairing and enrolling it need the desktop or
 terminal app, so the vault password never passes through a browser.
 

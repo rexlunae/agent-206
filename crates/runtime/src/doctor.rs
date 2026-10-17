@@ -285,18 +285,11 @@ async fn broker(_root: &Path) -> BrokerFacts {
 /// Ask the broker, never starting one. A missing socket is a stopped broker.
 #[cfg(unix)]
 async fn broker(root: &Path) -> BrokerFacts {
-    use a206_broker::{Client, ClientError, Reply as BrokerReply, Request, Role};
+    use a206_broker::{Reply as BrokerReply, Request};
     let vault_mode = mode(&a206_broker::vault_path(root));
-    let mut client = match Client::connect(root, Role::User).await {
-        Ok(client) => client,
-        Err(ClientError::Io(error))
-            if matches!(
-                error.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
-            ) =>
-        {
-            return BrokerFacts::Stopped { vault_mode };
-        }
+    let mut client = match crate::vault::connect_running(root).await {
+        Ok(Some(client)) => client,
+        Ok(None) => return BrokerFacts::Stopped { vault_mode },
         Err(error) => return BrokerFacts::Unreachable(crate::error::handle("doctor", &error)),
     };
     let status = match client.call(Request::Status).await {
@@ -328,6 +321,17 @@ async fn broker(root: &Path) -> BrokerFacts {
 pub async fn gather(root: &Path, remote: Option<String>, now: u64) -> Facts {
     let target = crate::connection::resolve(root, remote)
         .map_err(|error| crate::error::handle("doctor", &error));
+    gather_for(root, target, now).await
+}
+
+/// Collect facts for `target`, already resolved by a client that keeps its
+/// own active gateway (the web bridge), so a setup file saved since by
+/// another client is not consulted.
+pub async fn gather_for(
+    root: &Path,
+    target: Result<Option<GatewayTarget>, ErrorReport>,
+    now: u64,
+) -> Facts {
     let mut gateway = None;
     let mut snapshot = None;
     if let Ok(Some(target)) = &target {
