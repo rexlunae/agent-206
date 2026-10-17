@@ -31,7 +31,8 @@ flowchart LR
 `a206-core` is renderer-independent state, commands and policy. `a206-protocol`
 is bounded MessagePack framing. `a206-runtime` owns the state machine, journal,
 provider adapter, SSH, ACP/MCP and host services. `a206-extensions` validates
-manifests and runs WASM. `a206-vault` preserves the SecureStore format with a
+manifests and runs WASM. `a206-mcp` validates, sandboxes and talks to
+user-configured MCP servers (`docs/mcp.md`). `a206-vault` preserves the SecureStore format with a
 narrow API. `a206-ui` contains one fc-dioxus component tree. `agent206` selects
 the renderer or service entry point.
 

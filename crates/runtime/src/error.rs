@@ -103,6 +103,7 @@ pub(crate) fn classify(error: &(dyn Error + 'static)) -> Option<ErrorKind> {
         a206_broker::ClientError,
         crate::extension_host::ExtensionError,
         a206_extensions::abi::HostFailure,
+        a206_mcp::McpError,
         a206_protocol::Error,
         a206_sandbox::SandboxError,
         reqwest::Error,
@@ -120,6 +121,45 @@ pub(crate) fn classify(error: &(dyn Error + 'static)) -> Option<ErrorKind> {
         return Some(ErrorKind::Protocol);
     }
     None
+}
+
+impl Classified for a206_mcp::McpError {
+    fn kind(&self) -> Option<ErrorKind> {
+        use a206_mcp::McpError::*;
+        Some(match self {
+            Name
+            | DuplicateName
+            | RelativePath
+            | Nul
+            | Environment
+            | ReservedEnvironment { .. }
+            | Capability { .. }
+            | WriteWithoutRead
+            | ProjectRequired
+            | ProjectUnused
+            | TimeoutRange { .. }
+            | Placement(_)
+            | NonUtf8Path
+            | UnknownTool => ErrorKind::InvalidRequest,
+            // Absent and unreadable paths need different recovery; the I/O cause decides.
+            Missing { .. } => return None,
+            Setup(_) | ProcessId => ErrorKind::Internal,
+            Unsupported | Spawn(_) | NotConnected | Exited => ErrorKind::Unavailable,
+            Initialize(_)
+            | Service(_)
+            | Schema(_)
+            | TooManyTools { .. }
+            | ListingTooLarge { .. }
+            | OutputTooLarge { .. } => ErrorKind::Protocol,
+            Timeout(_) => ErrorKind::Timeout,
+            Disabled
+            | ToolDenied
+            | ApprovalRequired
+            | Denied { .. }
+            | ProjectMismatch
+            | Revoked => ErrorKind::PermissionDenied,
+        })
+    }
 }
 
 impl Classified for a206_sandbox::SandboxError {

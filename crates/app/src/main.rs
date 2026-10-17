@@ -60,6 +60,11 @@ mod native {
             #[arg(long)]
             allow_title_edit: bool,
         },
+        /// Inspect and control configured MCP servers (add them with `settings --apply`).
+        McpServers {
+            #[command(subcommand)]
+            command: McpServerAction,
+        },
         /// Manage the configured local or SSH gateway.
         Gateway {
             #[command(subcommand)]
@@ -197,6 +202,19 @@ mod native {
         Reconnect,
     }
     #[derive(Subcommand)]
+    enum McpServerAction {
+        /// Show each server's state, reported tools and last failure.
+        List,
+        /// Allow a server to start; its tools stay subject to thread grants.
+        Enable { name: String },
+        /// Stop a server and keep it from starting.
+        Disable { name: String },
+        /// Start an enabled server now and list its tools.
+        Connect { name: String },
+        /// Stop a server until it is connected again.
+        Disconnect { name: String },
+    }
+    #[derive(Subcommand)]
     enum ProviderAction {
         Presets,
         Add {
@@ -250,6 +268,26 @@ mod native {
         },
         Stop,
         Status,
+    }
+    /// Settings that turn one MCP server on or off, leaving everything else as is.
+    async fn mcp_server_enabled(
+        client: &a206_runtime::client::Client,
+        name: String,
+        enabled: bool,
+    ) -> anyhow::Result<Command> {
+        let Reply::Snapshot(snapshot) = client.call(Command::Snapshot).await? else {
+            anyhow::bail!("could not read settings");
+        };
+        let mut settings = snapshot.settings;
+        settings
+            .mcp_servers
+            .iter_mut()
+            .find(|server| server.name == name)
+            .ok_or_else(|| {
+                anyhow::anyhow!("no MCP server named {name}; add it with settings --apply")
+            })?
+            .enabled = enabled;
+        Ok(Command::SaveSettings(settings))
     }
     fn default_root() -> anyhow::Result<PathBuf> {
         Ok(PathBuf::from(
@@ -619,6 +657,35 @@ mod native {
                             capabilities,
                         }
                     }
+                    Action::McpServers { command } => match command {
+                        McpServerAction::List => {
+                            let Reply::Snapshot(snapshot) = client.call(Command::Snapshot).await?
+                            else {
+                                anyhow::bail!("could not read MCP server status");
+                            };
+                            #[derive(serde::Serialize)]
+                            struct Servers {
+                                servers: Vec<a206_core::McpServerStatus>,
+                            }
+                            print!(
+                                "{}",
+                                toml::to_string_pretty(&Servers {
+                                    servers: snapshot.mcp_servers
+                                })?
+                            );
+                            return Ok(());
+                        }
+                        McpServerAction::Enable { name } => {
+                            mcp_server_enabled(&client, name, true).await?
+                        }
+                        McpServerAction::Disable { name } => {
+                            mcp_server_enabled(&client, name, false).await?
+                        }
+                        McpServerAction::Connect { name } => Command::ConnectMcpServer { name },
+                        McpServerAction::Disconnect { name } => {
+                            Command::DisconnectMcpServer { name }
+                        }
+                    },
                     Action::Joshua { command } => match command {
                         JoshuaAction::Start {
                             label,
