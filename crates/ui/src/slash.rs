@@ -289,11 +289,22 @@ fn schedule(
             ErrorReport::capture(&error, |_| Some(ErrorKind::InvalidRequest)),
         )
     })?;
-    const NAME: usize = 60;
+    // Short to read, and well inside the gateway's 200-byte name limit
+    // whatever the characters.
+    const CHARS: usize = 60;
+    const BYTES: usize = 120;
     let line = timed.text.lines().next().unwrap_or_default();
-    let name = match line.char_indices().nth(NAME) {
-        Some((end, _)) => format!("{}…", &line[..end]),
-        None => line.to_owned(),
+    let end = line
+        .char_indices()
+        .take(CHARS)
+        .map(|(start, c)| start + c.len_utf8())
+        .take_while(|&end| end <= BYTES)
+        .last()
+        .unwrap_or_default();
+    let name = if end < line.len() {
+        format!("{}…", &line[..end])
+    } else {
+        line.to_owned()
     };
     Ok(Command::ScheduleJob {
         name,
@@ -407,9 +418,11 @@ pub(crate) fn resolve(
         Slash::In(timed) => schedule(thread, timed, |seconds| Schedule::At {
             at: now.saturating_add(seconds),
         }),
+        // The first run is one interval away even when the gateway's clock
+        // is behind this one: a future anchor is itself the first run.
         Slash::Every(timed) => schedule(thread, timed, |seconds| Schedule::Every {
             seconds,
-            anchor: now,
+            anchor: now.saturating_add(seconds),
         }),
     }
 }
@@ -779,16 +792,13 @@ mod tests {
         let Ok(Typed::Run(repeating)) = parse(&format!("/every 24h {message}")) else {
             panic!("/every parses");
         };
-        let repeating = resolve(repeating, &thread, &snapshot, true, NOW);
+        // The first run is one interval from now, not now.
         assert!(matches!(
-            repeating,
+            resolve(repeating, &thread, &snapshot, true, NOW),
             Ok(Command::ScheduleJob {
-                schedule: Schedule::Every {
-                    seconds: 86_400,
-                    anchor: NOW
-                },
+                schedule: Schedule::Every { seconds: 86_400, anchor },
                 ..
-            })
+            }) if anchor == NOW + 86_400
         ));
         // A long message is named by the start of its first line.
         let long = "x".repeat(200);
@@ -809,6 +819,21 @@ mod tests {
         };
         assert_eq!(name, format!("{}…", &long[..60]));
         assert!(sent.starts_with(&long));
+        // Wide characters are cut by bytes as well, at a character boundary.
+        let wide = "é".repeat(100);
+        let Ok(Command::ScheduleJob { name, .. }) = resolve(
+            Slash::In(Timed {
+                interval: "1h".into(),
+                text: wide.clone(),
+            }),
+            &thread,
+            &snapshot,
+            true,
+            NOW,
+        ) else {
+            panic!("a wide message schedules");
+        };
+        assert_eq!(name, format!("{}…", &wide[..120]));
     }
 
     #[test]
