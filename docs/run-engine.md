@@ -231,8 +231,26 @@ conversion, checks before the worker) and `crates/runtime/tests/extension_tools.
 
 It needs only the gateway handle it wraps; the run engine is unchanged.
 
+## Questions for the user (`ask_user`)
+
+`runtime/src/prompt_tool.rs` is a gateway-internal `ToolHost` offering one tool,
+`ask_user`, with `question` (required), up to 8 distinct `choices` and
+`allow_other` (default true; false needs choices). It uses no capability and,
+like every tool, is denied until the user permits it in a conversation. A call
+pushes a `UserPrompt` onto the thread and journals `PromptRequested`, then waits
+while the call shows as Running. Only `Command::AnswerPrompt { thread, prompt,
+answer }` answers it: the thread must match, the answer (`Choice { index }`,
+`Text`, or `Decline`) must fit the question (`UserPrompt::check`, shared with the
+clients), and a question is answered once. The model receives
+`{"answer": text}`, `{"declined": true}`, or, if the call ends unanswered,
+`{"declined": true, "expired": true}`; it never sees the question's id. Dropping
+the call (cancel, permission withdrawn) withdraws the question with
+`PromptResolved { outcome: Expired }`, and a restart clears pending questions.
+An answer approves nothing. Clients: the conversation's question card
+(`ui/src/prompts.rs`, desktop/web/TUI) and `agent206 prompts`.
+
 ## Not implemented
 
 Leaked tool-markup filtering, schema type coercion and repeat-call warnings from
 RustyClaw's healing; Anthropic thinking-block replay alongside tool results;
-`ask_user` prompts; retries; parallel tool execution.
+retries; parallel tool execution.
