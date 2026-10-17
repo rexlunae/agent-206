@@ -343,7 +343,12 @@ pub struct Thread {
     pub grant: Grant,
     pub messages: Vec<Message>,
     pub state: RunState,
+    /// The latest model request alone: what the context window holds.
     pub usage: Option<Usage>,
+    /// Every model request of the latest run summed: what the run cost. A
+    /// count any request did not report makes its total unknown.
+    #[serde(default)]
+    pub run_usage: Option<Usage>,
     #[serde(default)]
     pub effort: Option<String>,
     #[serde(default)]
@@ -376,6 +381,7 @@ impl Thread {
             messages: vec![],
             state: RunState::Idle,
             usage: None,
+            run_usage: None,
             effort: None,
             backend: CodingBackend::Native,
             backend_activity: None,
@@ -471,6 +477,7 @@ impl Snapshot {
                 thread.model = None;
                 thread.effort = None;
                 thread.usage = None;
+                thread.run_usage = None;
             }
             thread
                 .subagent_models

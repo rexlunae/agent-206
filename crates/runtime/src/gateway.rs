@@ -301,6 +301,9 @@ pub struct Gateway {
     tool_hosts: Arc<Vec<Arc<dyn crate::tools::ToolHost>>>,
     /// Runs waiting for the user, by approval ID. Only `ResolveApproval` answers them.
     approvals: Arc<Mutex<BTreeMap<Id, run::Waiter>>>,
+    /// Bumped whenever a tool permission, grant or mode changes, so running
+    /// tool calls and approval waits re-check their authority at once.
+    policy: Arc<tokio::sync::watch::Sender<u64>>,
 }
 /// The broker pairing this gateway holds, with the connection that anchors it.
 struct Paired {
@@ -329,6 +332,7 @@ impl Gateway {
             paired: Arc::new(tokio::sync::Notify::new()),
             tool_hosts: Arc::new(vec![]),
             approvals: Arc::new(Mutex::new(BTreeMap::new())),
+            policy: Arc::new(tokio::sync::watch::Sender::new(0)),
         })
     }
     fn pairing(&self) -> Result<Option<BrokerPairing>> {
@@ -808,6 +812,7 @@ impl Gateway {
                 if thread.model != model {
                     thread.effort = None;
                     thread.usage = None;
+                    thread.run_usage = None;
                 }
                 thread.model = model;
                 thread.subagent_models = subagent_models;
@@ -823,6 +828,7 @@ impl Gateway {
                     .collect();
                 let thread = thread.clone();
                 store.persist(Some(EventKind::ThreadChanged { id }))?;
+                self.policy_changed();
                 Ok(Reply::Thread(Box::new(thread)))
             }
             Command::SetEffort { thread: id, effort } => {
@@ -888,6 +894,7 @@ impl Gateway {
                 thread.backend_activity = None;
                 thread.grant.capabilities = capabilities;
                 store.persist(Some(EventKind::ThreadChanged { id }))?;
+                self.policy_changed();
                 Ok(Reply::Ok)
             }
             Command::Send {
@@ -1029,8 +1036,9 @@ impl Gateway {
                     let thread = store.thread_mut(id)?;
                     run::settle_unfinished(thread);
                     match ended {
-                        run::Ended::Complete(usage) => {
-                            thread.usage = Some(usage);
+                        run::Ended::Complete { last, total } => {
+                            thread.usage = Some(last);
+                            thread.run_usage = Some(total);
                             thread.state = RunState::Complete;
                         }
                         run::Ended::Failed(error) => fail_run(thread, id, &error),
@@ -1098,6 +1106,8 @@ impl Gateway {
                 match result {
                     Some(Ok((text, usage))) => {
                         partial.finish(thread, text);
+                        // A backend reports one total for its whole run.
+                        thread.run_usage = Some(usage.clone());
                         thread.usage = Some(usage);
                         thread.state = RunState::Complete;
                     }

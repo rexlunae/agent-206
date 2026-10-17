@@ -715,11 +715,20 @@ fn tool_result(call: &ToolCall) -> &str {
         .as_deref()
         .unwrap_or("The tool call did not complete.")
 }
-/// A call's arguments as an object, for protocols that send objects.
+/// The field that carries a call's argument text when the model sent
+/// something other than a JSON object.
+pub const UNPARSED_ARGUMENTS: &str = "unparsed_arguments";
+/// A call's arguments as an object, for protocols that replay calls as
+/// objects. Recorded arguments are either the canonical object the call ran
+/// with or, when they could not be used, exactly the text the model sent.
+/// Anthropic and Gemini accept only an object here, so unusable text is
+/// replayed verbatim under [`UNPARSED_ARGUMENTS`]: inventing `{}` would show
+/// the model a call it never made, while the wrapper keeps every byte it
+/// sent beside the error result explaining why the call did not run.
 fn tool_input(call: &ToolCall) -> Value {
     match serde_json::from_str(&call.arguments) {
         Ok(value @ Value::Object(_)) => value,
-        _ => json!({}),
+        _ => json!({UNPARSED_ARGUMENTS: call.arguments}),
     }
 }
 fn openai_message(message: &Message, out: &mut Vec<Value>) {

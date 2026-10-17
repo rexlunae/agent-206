@@ -99,20 +99,33 @@ pub(crate) fn PendingApproval(thread: Uuid, request: ApprovalRequest) -> Element
     }
 }
 
+/// Everything a conversation's effective tool permissions are derived from:
+/// its own and each ancestor's settings, grant and mode, nearest first.
+/// The gateway combines the whole chain, so a parent's change must refresh
+/// a child's listing too.
+type PolicyInputs = Vec<(
+    std::collections::BTreeMap<String, ToolPermission>,
+    a206_core::Grant,
+    a206_core::Mode,
+)>;
+fn policy_revision(threads: &[a206_core::Thread], thread: Uuid) -> PolicyInputs {
+    // The gateway's own bound on delegation depth; a cycle cannot loop here.
+    const MAX_LINEAGE: usize = 33;
+    std::iter::successors(threads.iter().find(|t| t.id == thread), |t| {
+        t.parent
+            .and_then(|parent| threads.iter().find(|p| p.id == parent))
+    })
+    .take(MAX_LINEAGE)
+    .map(|t| (t.tool_permissions.clone(), t.grant.clone(), t.mode))
+    .collect()
+}
+
 /// The tools this conversation could use, with the user's Allow/Ask/Deny for each.
 #[component]
 pub(crate) fn ToolPermissions(thread: Uuid) -> Element {
     let state = use_context::<State>();
-    // Reload when the conversation's permissions or grants change.
-    let revision = use_memo(move || {
-        state
-            .data
-            .read()
-            .threads
-            .iter()
-            .find(|t| t.id == thread)
-            .map(|t| (t.tool_permissions.clone(), t.grant.clone(), t.mode))
-    });
+    // Reload when the permissions, grants or modes this listing depends on change.
+    let revision = use_memo(move || policy_revision(&state.data.read().threads, thread));
     let listing = use_resource(move || async move {
         // Reading subscribes this listing to the conversation's changes.
         revision.read();
@@ -188,6 +201,53 @@ mod tests {
             error: None,
             signature: None,
         }
+    }
+    #[test]
+    fn a_listing_refreshes_when_any_ancestor_changes() {
+        use a206_core::{Capability, Mode, Thread};
+        let tool = Uuid::new_v4().simple().to_string();
+        let mut root = Thread::new(String::new(), Mode::Code);
+        let mut parent = Thread::new(String::new(), Mode::Plan);
+        parent.parent = Some(root.id);
+        let mut child = Thread::new(String::new(), Mode::Plan);
+        child.parent = Some(parent.id);
+        let unrelated = Thread::new(String::new(), Mode::Chat);
+        let child_id = child.id;
+        let mut threads = vec![root.clone(), parent.clone(), child, unrelated];
+        let before = policy_revision(&threads, child_id);
+        assert_eq!(before.len(), 3);
+        // An unrelated conversation changing does not matter.
+        threads[3]
+            .tool_permissions
+            .insert(tool.clone(), ToolPermission::Allow);
+        assert_eq!(policy_revision(&threads, child_id), before);
+        // Each ancestor's settings, grant and mode do.
+        root.tool_permissions
+            .insert(tool.clone(), ToolPermission::Ask);
+        threads[0] = root.clone();
+        let after_root = policy_revision(&threads, child_id);
+        assert_ne!(after_root, before);
+        parent.grant.capabilities.insert(Capability::ReadWorkspace);
+        threads[1] = parent.clone();
+        let after_grant = policy_revision(&threads, child_id);
+        assert_ne!(after_grant, after_root);
+        parent.mode = Mode::Chat;
+        threads[1] = parent;
+        assert_ne!(policy_revision(&threads, child_id), after_grant);
+    }
+    #[test]
+    fn a_tool_reported_failure_shows_its_explanation() {
+        let mut failed = call(ToolCallState::Failed);
+        let explanation = Uuid::new_v4().to_string();
+        failed.error = Some(
+            ErrorReport::new(
+                ErrorKind::Other,
+                format!("tool `{}` reported an error", failed.tool),
+            )
+            .caused_by(ErrorReport::new(ErrorKind::Other, explanation.clone())),
+        );
+        let html = render(failed);
+        assert!(html.contains(&explanation), "{html}");
     }
     #[test]
     fn a_trace_shows_the_tool_its_arguments_and_its_result() {

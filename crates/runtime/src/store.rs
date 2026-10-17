@@ -50,6 +50,8 @@ impl crate::error::Classified for StoreError {
     }
 }
 type Result<T, E = StoreError> = std::result::Result<T, E>;
+/// Largest snapshot kept: one frame, less room for the envelope it travels in.
+const LIMIT: usize = a206_protocol::MAX_FRAME - 65_536;
 
 /// Open the single profile lock used by both startup and offline stop intent.
 pub(crate) fn profile_lock(root: &Path) -> std::io::Result<std::fs::File> {
@@ -179,8 +181,13 @@ impl Store {
         }
         result
     }
+    /// Bytes the snapshot can still grow by before a persist is refused as
+    /// [`StoreError::Full`].
+    pub fn remaining(&self) -> Result<usize> {
+        Ok(LIMIT.saturating_sub(rmp_serde::to_vec_named(&self.state)?.len() + 1))
+    }
     fn persist_inner(&mut self, kind: Option<EventKind>) -> Result<()> {
-        if rmp_serde::to_vec_named(&self.state)?.len() >= a206_protocol::MAX_FRAME - 65_536 {
+        if rmp_serde::to_vec_named(&self.state)?.len() >= LIMIT {
             return Err(StoreError::Full);
         }
         let tx = self.db.transaction()?;

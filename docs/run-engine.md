@@ -20,12 +20,29 @@ tool calls, a budget is used up, or the user cancels:
    or surrounding prose and trailing commas are repaired (`healed`), truncated or
    non-object arguments fail that call, and an identical call later in the same
    response is `Skipped`. Missing or repeated provider call IDs are replaced.
-4. Decide each call in order against the conversation as it is now (a permission
-   revoked mid-run applies to the next call), then run it, ask first, or refuse it.
+   Calls are recorded in order while their arguments fit in the conversation's
+   remaining storage, keeping 128 KiB in reserve for settling calls and the final
+   reply; the rest fail with a `Storage` report and no stored arguments, and the
+   run goes on. Tool outputs are likewise cut to the space above that reserve.
+4. Decide each call in order against the conversation and its ancestors as they
+   are now (a permission, grant or budget narrowed mid-run applies to the next
+   call), then run it, ask first, or refuse it.
 5. Send every call's result text back in the protocol's own shape and repeat.
+   Arguments are replayed as recorded: the canonical object a call ran with, or
+   exactly the text the model sent when it could not be used. OpenAI replays that
+   text as its argument string; Anthropic and Gemini accept only an object, so it
+   is replayed verbatim as `{"unparsed_arguments": "<text>"}` beside the error
+   result, never as an invented `{}`.
+
+`Thread::usage` is the final model request's usage, which is what the context
+widget compares with the model's limit. `Thread::run_usage` sums every request of
+the run for cost; a count any request did not report leaves that total unknown.
 
 Every call ends with model-facing result text and, unless it succeeded, a
-structured `ErrorReport` that clients display. Budget exhaustion fails the run
+structured `ErrorReport` that clients display. When a tool reports its own
+failure (`ToolOutput::is_error`), the model receives the tool's text and the
+report carries it as its cause, bounded like any report message; it is attached
+after the report is logged, so tool output never reaches the logs. Budget exhaustion fails the run
 with a `PermissionDenied` report; cancellation leaves it `Cancelled`. A gateway
 restart cancels unfinished calls and drops pending approvals.
 
@@ -36,11 +53,24 @@ name; an unset tool is denied. The enforced permission is the most restrictive o
 the user's setting, every ancestor conversation's setting, the host's own policy
 (`ToolSpec::permission`, for example an MCP server's per-tool policy), and Deny if
 any capability the tool declares is outside the conversation's grant within its
-mode ceiling. A delegated conversation cannot be set above its parent.
+mode ceiling or outside any ancestor's current grant within that ancestor's
+ceiling. A delegated conversation cannot be set above its parent, and a parent
+narrowed later narrows its descendants at their next decision.
+
+Withdrawn authority also stops work in flight. `SetToolPermission`,
+`ConfigureThread` and `SetBackend` wake every run, which re-decides its running
+call and its pending approval against the conversation and its ancestors. A
+running call that is no longer permitted (Deny, or Ask for a call the user did
+not approve) is dropped, which stops it, and is settled `Denied` with a
+`PermissionDenied` report; a pending approval whose tool is now denied ends with
+`ApprovalResolved { outcome: Revoked }`. The run continues with the refusal as
+that call's result.
 
 `Thread::tool_budget` limits model rounds per run (at least one) and tool calls
-decided per run; both are capped at 256 and a delegated conversation cannot
-exceed its parent.
+decided per run; both are capped at 256 and a delegated conversation cannot be
+set above its parent. The budget enforced at each check is, for rounds and for
+calls independently, the smallest of the conversation's and every ancestor's
+current budget.
 
 Commands: `ListTools`, `SetToolPermission`, `SetToolBudget`, `ResolveApproval`.
 CLI: `agent206 tools list|permit|budget` and `agent206 approvals list|approve|deny`.
@@ -55,6 +85,21 @@ is single-use: a repeated identical call needs a new approval. It expires
 (`ApprovalResolved { outcome: Expired }`) when the run is cancelled or ends.
 Approval IDs never enter model context, and tool hosts receive no handle that
 could answer one.
+
+### Contract for clients and messengers
+
+`Command::Send` through `Gateway::request` resolves only when the run ends: to
+`Reply::Thread` with the finished thread, which is `Complete`, `Cancelled`, or
+`Failed` with its `ErrorReport` in `Thread::error` (a request that is refused
+before a run starts is a `Reply::Error`). While a call waits for approval, `Send`
+simply stays pending. The approval is published in `Thread::approvals` and as an
+`ApprovalRequested` event, never as a chat message; it is answered only by a
+`ResolveApproval` request from a trusted client, sent as another request on the
+same or another connection. `CancelRun` expires it, and `Send` then returns the
+`Cancelled` thread. Covered by
+`send_stays_pending_while_an_approval_waits_and_returns_the_finished_thread` and
+`cancelling_during_an_approval_wait_expires_the_request` in
+`crates/runtime/tests/tool_loop.rs`.
 
 ## Tool hosts
 

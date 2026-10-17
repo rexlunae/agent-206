@@ -3,8 +3,10 @@
 //! user cancels.
 //!
 //! The gateway decides every call; tool hosts only execute what was decided.
-//! Each decision re-reads the conversation, so a permission the user revokes
-//! mid-run applies to the next call. Approvals are answered only through
+//! Each decision re-reads the conversation and its ancestors, so a permission,
+//! grant or budget the user narrows mid-run applies to the next call, and a
+//! call that is running or waiting for approval when its authority is
+//! withdrawn is stopped at once. Approvals are answered only through
 //! [`Command::ResolveApproval`] from a client; the model sees no approval ID
 //! and no tool can resolve one.
 use super::{Gateway, GatewayError, PartialReply, Result, poisoned};
@@ -68,14 +70,21 @@ pub enum ToolError {
     },
     #[error("tool `{0}` reported an error")]
     Reported(String),
+    #[error("permission for tool `{0}` was withdrawn before this call finished; it was stopped")]
+    Revoked(String),
+    #[error(
+        "this call's {bytes} bytes of arguments do not fit in the conversation's remaining storage; it did not run"
+    )]
+    Capacity { bytes: usize },
 }
 impl crate::error::Classified for ToolError {
     fn kind(&self) -> Option<ErrorKind> {
         Some(match self {
             Self::Unavailable(_) => ErrorKind::NotFound,
-            Self::Denied(_) | Self::Capability { .. } | Self::Rejected => {
+            Self::Denied(_) | Self::Capability { .. } | Self::Rejected | Self::Revoked(_) => {
                 ErrorKind::PermissionDenied
             }
+            Self::Capacity { .. } => ErrorKind::Storage,
             Self::Cancelled => ErrorKind::Cancelled,
             Self::Duplicate => ErrorKind::Conflict,
             Self::Reported(_) => ErrorKind::Other,
@@ -93,7 +102,11 @@ pub(super) struct Waiter {
 
 /// How a native run ended.
 pub(super) enum Ended {
-    Complete(Usage),
+    /// `last` is the final model request's usage; `total` sums every request.
+    Complete {
+        last: Usage,
+        total: Usage,
+    },
     Cancelled,
     Failed(GatewayError),
 }
@@ -113,24 +126,28 @@ struct View {
     ancestors: Vec<Thread>,
     scope: ToolScope,
 }
-/// Add usage only while every round reported it; an unreported count makes
-/// the total unknown rather than an undercount.
-fn add_usage(total: &mut Option<Usage>, round: Usage) {
+/// Add one request's usage to a run's total. A count any request did not
+/// report makes the total unknown rather than an undercount.
+fn add_usage(total: Usage, round: &Usage) -> Usage {
     fn add<T: std::ops::Add<Output = T>>(a: Option<T>, b: Option<T>) -> Option<T> {
         Some(a? + b?)
     }
-    *total = Some(match total.take() {
-        None => round,
-        Some(sum) => Usage {
-            input_tokens: add(sum.input_tokens, round.input_tokens),
-            output_tokens: add(sum.output_tokens, round.output_tokens),
-            cost: add(sum.cost, round.cost),
-        },
-    });
+    Usage {
+        input_tokens: add(total.input_tokens, round.input_tokens),
+        output_tokens: add(total.output_tokens, round.output_tokens),
+        cost: add(total.cost, round.cost),
+    }
 }
-fn bounded_output(mut text: String) -> String {
-    if text.len() > tools::MAX_OUTPUT {
-        let mut end = tools::MAX_OUTPUT;
+/// Snapshot bytes a run keeps free for settling every call of a response
+/// (each settled call stores a short report) and for the final reply or
+/// failure. Arguments and outputs may only use the space above it.
+const RESERVE: usize = 128 * 1024;
+/// Cut a tool's output to `limit` bytes (at most [`tools::MAX_OUTPUT`]),
+/// saying so in the text the model and the user see.
+fn bounded_output(mut text: String, limit: usize) -> String {
+    let limit = limit.min(tools::MAX_OUTPUT);
+    if text.len() > limit {
+        let mut end = limit;
         while !text.is_char_boundary(end) {
             end -= 1;
         }
@@ -143,19 +160,41 @@ fn bounded_output(mut text: String) -> String {
 }
 /// Most ancestors followed when combining delegated permissions.
 const MAX_LINEAGE: usize = 32;
-fn view(store: &Store, id: Id) -> Result<View> {
-    let thread = store.thread(id)?.clone();
-    let mut ancestors = vec![];
-    let mut parent = thread.parent;
-    while let Some(next) = parent {
+/// A thread followed by each of its ancestors, nearest first.
+fn lineage(store: &Store, id: Id) -> Result<Vec<&Thread>> {
+    let mut lineage = vec![store.thread(id)?];
+    while let Some(next) = lineage.last().and_then(|t| t.parent) {
         check(
-            ancestors.len() < MAX_LINEAGE,
+            lineage.len() <= MAX_LINEAGE,
             GatewayError::Invalid("conversation delegation is too deep"),
         )?;
-        let ancestor = store.thread(next)?.clone();
-        parent = ancestor.parent;
-        ancestors.push(ancestor);
+        lineage.push(store.thread(next)?);
     }
+    Ok(lineage)
+}
+/// The budget a run enforces: for rounds and for calls independently, the
+/// smallest of the thread's and every ancestor's current budget.
+fn effective_budget(store: &Store, id: Id) -> Result<ToolBudget> {
+    let lineage = lineage(store, id)?;
+    Ok(ToolBudget {
+        rounds: lineage
+            .iter()
+            .map(|t| t.tool_budget.rounds)
+            .min()
+            .unwrap_or(0),
+        tool_calls: lineage
+            .iter()
+            .map(|t| t.tool_budget.tool_calls)
+            .min()
+            .unwrap_or(0),
+    })
+}
+fn view(store: &Store, id: Id) -> Result<View> {
+    let mut lineage = lineage(store, id)?.into_iter().cloned();
+    let thread = lineage
+        .next()
+        .ok_or(GatewayError::NotFound("thread not found"))?;
+    let ancestors: Vec<Thread> = lineage.collect();
     let workspace = thread
         .project
         .and_then(|p| store.state.projects.iter().find(|project| project.id == p))
@@ -163,7 +202,7 @@ fn view(store: &Store, id: Id) -> Result<View> {
     let scope = ToolScope {
         thread: id,
         workspace,
-        capabilities: tools::scope_capabilities(&thread),
+        capabilities: tools::scope_capabilities(&thread, &ancestors.iter().collect::<Vec<_>>()),
     };
     Ok(View {
         thread,
@@ -176,6 +215,14 @@ impl View {
         let ancestors: Vec<_> = self.ancestors.iter().collect();
         tools::decide(spec, &self.thread, &ancestors)
     }
+}
+/// How the user answered an approval request, if they did.
+enum Answer {
+    Decided(ApprovalDecision),
+    /// The tool's authority was withdrawn while the request waited.
+    Revoked,
+    /// The run was cancelled first.
+    Cancelled,
 }
 
 impl Gateway {
@@ -229,7 +276,23 @@ impl Gateway {
             None => thread.tool_permissions.remove(&tool),
         };
         store.persist(Some(EventKind::ThreadChanged { id }))?;
+        drop(store);
+        self.policy_changed();
         Ok(Reply::Ok)
+    }
+    /// Make running calls and approval waits re-check their authority.
+    pub(super) fn policy_changed(&self) {
+        self.policy
+            .send_modify(|revision| *revision = revision.wrapping_add(1));
+    }
+    /// Whether a call may keep running, or keep waiting for approval when
+    /// `approved` is false and `Ask` still applies, under the current policy.
+    fn permits(&self, id: Id, spec: &ToolSpec, approved: bool) -> Result<bool> {
+        Ok(match self.view(id)?.decide(spec).0 {
+            ToolPermission::Allow => true,
+            ToolPermission::Ask => approved,
+            ToolPermission::Deny => false,
+        })
     }
     pub(super) fn set_tool_budget(&self, id: Id, budget: ToolBudget) -> Result<Reply> {
         check(
@@ -290,13 +353,12 @@ impl Gateway {
     }
     async fn rounds(&self, run: &Native) -> Result<Ended> {
         let pairing = self.pairing()?;
-        let mut usage = None;
+        let mut total: Option<Usage> = None;
         let mut calls_used = 0;
         let mut round = 0;
         loop {
             round += 1;
             let view = self.view(run.thread)?;
-            let budget = view.thread.tool_budget;
             let catalog = tokio::select! {
                 catalog = tools::catalog(&self.tool_hosts, &view.scope) => catalog,
                 _ = run.cancel.cancelled() => return Ok(Ended::Cancelled),
@@ -323,15 +385,20 @@ impl Gateway {
                 Some(Err(error)) => return Ok(Ended::Failed(error.into())),
                 None => return Ok(Ended::Cancelled),
             };
-            add_usage(&mut usage, turn.usage);
+            let sum = match total.take() {
+                None => turn.usage.clone(),
+                Some(sum) => add_usage(sum, &turn.usage),
+            };
+            total = Some(sum.clone());
             if turn.calls.is_empty() {
-                return Ok(Ended::Complete(usage.unwrap_or(Usage {
-                    input_tokens: None,
-                    output_tokens: None,
-                    cost: None,
-                })));
+                return Ok(Ended::Complete {
+                    last: turn.usage,
+                    total: sum,
+                });
             }
             let parsed = self.record_calls(run.thread, message, turn.calls)?;
+            // Re-read at each check: a parent may lower its budget mid-run.
+            let budget = effective_budget(&*self.lock()?, run.thread)?;
             if round >= budget.rounds {
                 let error = RunError::Rounds {
                     rounds: budget.rounds,
@@ -347,6 +414,7 @@ impl Gateway {
             }
             for (call, arguments) in parsed {
                 let Some(arguments) = arguments else { continue };
+                let budget = effective_budget(&*self.lock()?, run.thread)?;
                 if calls_used >= budget.tool_calls {
                     let calls = budget.tool_calls;
                     self.stop_calls(
@@ -483,6 +551,26 @@ impl Gateway {
             records.push(record);
         }
         let mut store = self.lock()?;
+        // Keep the snapshot within its limit: calls are recorded in order
+        // while their arguments fit above the reserve; the rest are settled
+        // without their arguments, so the run goes on and the model learns
+        // why they did not run.
+        let mut room = store.remaining()?.saturating_sub(RESERVE);
+        for (record, (_, usable)) in records.iter_mut().zip(&mut decisions) {
+            // An unencodable record could not be stored at all.
+            let size = rmp_serde::to_vec_named(&*record).map_or(usize::MAX, |b| b.len());
+            if size <= room {
+                room -= size;
+                continue;
+            }
+            let bytes = std::mem::take(&mut record.arguments).len();
+            settle(
+                record,
+                ToolCallState::Failed,
+                &ToolError::Capacity { bytes },
+            );
+            *usable = None;
+        }
         message_mut(&mut store, id, message)?.tool_calls = records;
         store.persist(Some(EventKind::ThreadChanged { id }))?;
         Ok(decisions)
@@ -504,9 +592,11 @@ impl Gateway {
         message: Id,
         call: &str,
         event: EventKind,
-        update: impl FnOnce(&mut Thread, &mut ToolCall),
+        update: impl FnOnce(&mut Thread, &mut ToolCall, usize),
     ) -> Result<()> {
         let mut store = self.lock()?;
+        // What an output may use: the space above the reserve.
+        let room = store.remaining()?.saturating_sub(RESERVE);
         let thread = store.thread_mut(id)?;
         let mut record = thread
             .messages
@@ -515,7 +605,7 @@ impl Gateway {
             .and_then(|m| m.tool_calls.iter().find(|c| c.id == call))
             .cloned()
             .ok_or(GatewayError::NotFound("tool call not found"))?;
-        update(thread, &mut record);
+        update(thread, &mut record, room);
         if let Some(slot) = thread
             .messages
             .iter_mut()
@@ -539,6 +629,8 @@ impl Gateway {
     ) -> Result<bool> {
         let id = run.thread;
         let changed = EventKind::ThreadChanged { id };
+        // Subscribed before deciding, so no change after the decision is missed.
+        let mut policy = self.policy.subscribe();
         let record = {
             let store = self.lock()?;
             store
@@ -551,7 +643,7 @@ impl Gateway {
                 .ok_or(GatewayError::NotFound("tool call not found"))?
         };
         let refuse = |error: ToolError| {
-            self.update_call(id, message, &call, changed.clone(), |_, record| {
+            self.update_call(id, message, &call, changed.clone(), |_, record, _| {
                 settle(record, ToolCallState::Denied, &error)
             })
         };
@@ -575,24 +667,30 @@ impl Gateway {
             }
             ToolPermission::Allow => false,
             ToolPermission::Ask => {
-                match self.ask(run, message, &record, &routed.spec).await? {
-                    None => return Ok(false),
-                    Some(ApprovalDecision::Deny) => {
+                match self
+                    .ask(run, message, &record, &routed.spec, &mut policy)
+                    .await?
+                {
+                    Answer::Cancelled => return Ok(false),
+                    Answer::Revoked => {
+                        refuse(ToolError::Revoked(record.tool.clone()))?;
+                        return Ok(true);
+                    }
+                    Answer::Decided(ApprovalDecision::Deny) => {
                         refuse(ToolError::Rejected)?;
                         return Ok(true);
                     }
-                    Some(ApprovalDecision::Approve) => {}
+                    Answer::Decided(ApprovalDecision::Approve) => {}
                 }
                 // The user may have revoked the tool while deciding.
-                let view = self.view(id)?;
-                if view.decide(&routed.spec).0 == ToolPermission::Deny {
+                if !self.permits(id, &routed.spec, true)? {
                     refuse(ToolError::Denied(record.tool.clone()))?;
                     return Ok(true);
                 }
                 true
             }
         };
-        self.update_call(id, message, &call, changed.clone(), |_, record| {
+        self.update_call(id, message, &call, changed.clone(), |_, record, _| {
             record.state = ToolCallState::Running;
         })?;
         let request = ToolRequest {
@@ -601,49 +699,81 @@ impl Gateway {
             arguments: arguments.object,
             approved,
         };
+        // The scope as of now, after any approval wait.
+        let scope = self.view(id)?.scope;
         let span = tracing::info_span!("tool_call", thread = %id, tool = %record.tool);
-        let result = tokio::select! {
-            // Dropping the host's future on cancellation stops the call.
-            result = tracing::Instrument::instrument(routed.host.call(&view.scope, request), span) => result,
-            _ = run.cancel.cancelled() => return Ok(false),
-        };
-        self.update_call(id, message, &call, changed, |_, record| match result {
-            Ok(output) if !output.is_error => {
-                record.state = ToolCallState::Succeeded;
-                record.output = Some(bounded_output(output.text));
+        let mut running = std::pin::pin!(tracing::Instrument::instrument(
+            routed.host.call(&scope, request),
+            span
+        ));
+        // Dropping the host's future stops the call, on cancellation and on
+        // revocation alike.
+        let result = loop {
+            tokio::select! {
+                result = &mut running => break result,
+                _ = run.cancel.cancelled() => return Ok(false),
+                // The sender lives as long as the gateway, so this branch
+                // only runs for a change.
+                Ok(()) = policy.changed() => {
+                    if !self.permits(id, &routed.spec, approved)? {
+                        refuse(ToolError::Revoked(record.tool.clone()))?;
+                        return Ok(true);
+                    }
+                }
             }
-            Ok(output) => {
-                settle(
+        };
+        self.update_call(
+            id,
+            message,
+            &call,
+            changed,
+            |_, record, room| match result {
+                Ok(output) if !output.is_error => {
+                    record.state = ToolCallState::Succeeded;
+                    record.output = Some(bounded_output(output.text, room));
+                }
+                Ok(output) => {
+                    let text = bounded_output(output.text, room);
+                    settle(
+                        record,
+                        ToolCallState::Failed,
+                        &ToolError::Reported(record.tool.clone()),
+                    );
+                    // The tool's own explanation: the model gets it whole, the
+                    // user an excerpt (bounded by the report) as the report's
+                    // cause. It is attached after the report was logged, so tool
+                    // output never reaches the logs.
+                    record.error = record.error.take().map(|report| {
+                        report.caused_by(ErrorReport::new(ErrorKind::Other, text.clone()))
+                    });
+                    record.output = Some(text);
+                }
+                Err(cause) => settle(
                     record,
                     ToolCallState::Failed,
-                    &ToolError::Reported(record.tool.clone()),
-                );
-                // The tool's own failure text is what the model needs.
-                record.output = Some(bounded_output(output.text));
-            }
-            Err(cause) => settle(
-                record,
-                ToolCallState::Failed,
-                &ToolError::Host {
-                    tool: record.tool.clone(),
-                    cause,
-                },
-            ),
-        })?;
+                    &ToolError::Host {
+                        tool: record.tool.clone(),
+                        cause,
+                    },
+                ),
+            },
+        )?;
         Ok(true)
     }
-    /// Publish an approval request and wait for the user. `None` when the run
-    /// was cancelled first; the request then expires.
+    /// Publish an approval request and wait for the user. The request expires
+    /// when the run is cancelled and is revoked when the tool stops being
+    /// permitted meanwhile.
     async fn ask(
         &self,
         run: &Native,
         message: Id,
         record: &ToolCall,
         spec: &ToolSpec,
-    ) -> Result<Option<ApprovalDecision>> {
+        policy: &mut tokio::sync::watch::Receiver<u64>,
+    ) -> Result<Answer> {
         let id = run.thread;
         let approval = Id::new_v4();
-        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let (sender, mut receiver) = tokio::sync::oneshot::channel();
         self.approvals.lock().map_err(poisoned("approval"))?.insert(
             approval,
             Waiter {
@@ -670,7 +800,7 @@ impl Gateway {
                 thread: id,
                 approval,
             },
-            |thread, call| {
+            |thread, call, _| {
                 call.state = ToolCallState::AwaitingApproval;
                 thread.approvals.push(request);
             },
@@ -682,20 +812,35 @@ impl Gateway {
                 .remove(&approval);
             return Err(error);
         }
-        let decision = tokio::select! {
-            decision = receiver => decision.ok(),
-            _ = run.cancel.cancelled() => None,
+        let answer = loop {
+            tokio::select! {
+                decision = &mut receiver => break match decision {
+                    Ok(decision) => Answer::Decided(decision),
+                    // Only expiry drops the waiter without answering.
+                    Err(_) => Answer::Cancelled,
+                },
+                _ = run.cancel.cancelled() => break Answer::Cancelled,
+                Ok(()) = policy.changed() => {
+                    // The request keeps waiting while Ask or Allow applies;
+                    // only a denial withdraws it.
+                    if !self.permits(id, spec, true)? {
+                        break Answer::Revoked;
+                    }
+                }
+            }
         };
         // Expire the request whatever happened: a late answer finds nothing.
         self.approvals
             .lock()
             .map_err(poisoned("approval"))?
             .remove(&approval);
-        let outcome = match decision {
-            Some(ApprovalDecision::Approve) => ApprovalOutcome::Approved,
-            Some(ApprovalDecision::Deny) => ApprovalOutcome::Denied,
-            None => ApprovalOutcome::Expired,
+        let outcome = match answer {
+            Answer::Decided(ApprovalDecision::Approve) => ApprovalOutcome::Approved,
+            Answer::Decided(ApprovalDecision::Deny) => ApprovalOutcome::Denied,
+            Answer::Revoked => ApprovalOutcome::Revoked,
+            Answer::Cancelled => ApprovalOutcome::Expired,
         };
+        let cancelled = matches!(answer, Answer::Cancelled);
         self.update_call(
             id,
             message,
@@ -705,14 +850,14 @@ impl Gateway {
                 approval,
                 outcome,
             },
-            |thread, call| {
+            |thread, call, _| {
                 thread.approvals.retain(|pending| pending.id != approval);
-                if decision.is_none() {
+                if cancelled {
                     settle(call, ToolCallState::Cancelled, &ToolError::Cancelled);
                 }
             },
         )?;
-        Ok(decision)
+        Ok(answer)
     }
 }
 impl Gateway {

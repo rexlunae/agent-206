@@ -189,6 +189,35 @@ fn calls_response(api: ProviderApi, calls: &[Call], signature: &str) -> String {
         }
     }
 }
+/// Set the usage an Anthropic response reports.
+fn with_usage(events: String, input: u64, output: u64) -> String {
+    events
+        .replace("\"input_tokens\":1", &format!("\"input_tokens\":{input}"))
+        .replace(
+            "\"output_tokens\":1",
+            &format!("\"output_tokens\":{output}"),
+        )
+}
+/// A token count generated at runtime.
+fn count() -> u64 {
+    (Id::new_v4().as_u128() % 100_000) as u64 + 1
+}
+/// The arguments a request replays for an earlier `call`: OpenAI's string,
+/// or the input object of the other protocols.
+fn replayed_arguments(api: ProviderApi, body: &Value, call: &str) -> Option<Value> {
+    body["messages"]
+        .as_array()?
+        .iter()
+        .find_map(|message| match api {
+            ProviderApi::OpenAi => message["tool_calls"]
+                .as_array()?
+                .iter()
+                .find_map(|c| (c["id"] == call).then(|| c["function"]["arguments"].clone())),
+            _ => message["content"].as_array()?.iter().find_map(|block| {
+                (block["type"] == "tool_use" && block["id"] == call).then(|| block["input"].clone())
+            }),
+        })
+}
 /// The tool names a request offered, whatever its protocol.
 fn offered(api: ProviderApi, body: &Value) -> Vec<String> {
     let names = match api {
@@ -277,15 +306,14 @@ impl ToolHost for TestHost {
                 self.marker,
                 Value::Object(request.arguments.clone())
             );
+            // Tools named `fail_…` report their own failure.
+            let is_error = request.name.starts_with("fail_");
             self.calls.send((scope.clone(), request)).unwrap();
             if blocking {
                 let _flag = DropFlag(self.dropped.clone());
                 std::future::pending::<()>().await;
             }
-            Ok(ToolOutput {
-                text,
-                is_error: false,
-            })
+            Ok(ToolOutput { text, is_error })
         })
     }
 }
@@ -322,6 +350,8 @@ async fn rig(api: ProviderApi, tools: Vec<ToolSpec>, blocking: Option<String>) -
     let (opened, requests) = mpsc::channel(8);
     let router = Router::new()
         .fallback(handle)
+        // Requests near the conversation's storage limit are several MiB.
+        .layer(axum::extract::DefaultBodyLimit::disable())
         .with_state(Scripted { opened, catalog });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -1001,6 +1031,20 @@ async fn malformed_arguments_are_healed_when_safe_and_reported_otherwise() {
         }
         let truncated = result_for(api, &second.body, &calls[1].id).unwrap();
         assert!(truncated.contains("cut off"), "{truncated}");
+        // The unusable call is replayed exactly as the model sent it.
+        let replayed = replayed_arguments(api, &second.body, &calls[1].id).unwrap();
+        let expected = match api {
+            ProviderApi::OpenAi => json!(calls[1].arguments),
+            _ => json!({ a206_runtime::provider::UNPARSED_ARGUMENTS: calls[1].arguments }),
+        };
+        assert_eq!(replayed, expected, "{api:?}");
+        // The repaired call is replayed as the object it ran with.
+        let repaired = replayed_arguments(api, &second.body, &calls[0].id).unwrap();
+        let object = match api {
+            ProviderApi::OpenAi => serde_json::from_str(repaired.as_str().unwrap()).unwrap(),
+            _ => repaired,
+        };
+        assert_eq!(object, json!({"value": value}), "{api:?}");
         second.respond(text_response(api, &nonce())).await;
         let thread = finished(task).await;
         let recorded = calls_of(&thread);
@@ -1068,4 +1112,430 @@ async fn delegated_conversations_cannot_permit_more_than_their_parent() {
         panic!("tool listing failed");
     };
     assert_eq!(list.tools[0].effective, ToolPermission::Deny);
+}
+
+/// Create a subagent of `parent` permitted to use `tool`, as the rig's thread.
+async fn delegate(rig: &mut Rig, mode: Mode, requested: &[Capability], tool: &str) -> Id {
+    let parent = rig.thread;
+    rig.permit(tool, ToolPermission::Allow).await;
+    let Reply::Thread(child) = rig
+        .run(Command::CreateSubagent {
+            parent,
+            title: nonce(),
+            mode,
+            model: rig.model.clone(),
+            requested: requested.iter().copied().collect(),
+        })
+        .await
+    else {
+        panic!("subagent creation failed");
+    };
+    rig.thread = child.id;
+    rig.permit(tool, ToolPermission::Allow).await;
+    parent
+}
+async fn wait_for_call(rig: &mut Rig) -> (ToolScope, ToolRequest) {
+    tokio::time::timeout(PATIENCE, rig.calls.recv())
+        .await
+        .unwrap_or_else(wait("the tool to start"))
+        .unwrap()
+}
+
+#[tokio::test]
+async fn send_stays_pending_while_an_approval_waits_and_returns_the_finished_thread() {
+    let api = ProviderApi::OpenAi;
+    let name = nonce();
+    let mut rig = rig(api, vec![tool(&name, ToolPermission::Allow, &[])], None).await;
+    rig.permit(&name, ToolPermission::Ask).await;
+    let before = rig.thread().messages.len();
+    let task = rig.send();
+    let first = rig.next_request().await;
+    let value = nonce();
+    let call = Call::new(&name, json!({"value": value}));
+    first
+        .respond(calls_response(api, std::slice::from_ref(&call), ""))
+        .await;
+    let approval = rig.pending_approval().await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !task.is_finished(),
+        "Send replied while its approval waited"
+    );
+    // The prompt is an approval request, never a chat message.
+    let thread = rig.thread();
+    assert_eq!(
+        thread.messages.len(),
+        before + 2,
+        "user message and reply only"
+    );
+    for message in &thread.messages {
+        assert!(!message.text.contains(&approval.id.to_string()));
+        assert!(!message.text.contains(&approval.digest));
+    }
+    // Another request, from a trusted client, answers it.
+    assert_eq!(
+        rig.resolve(&approval, &approval.digest, ApprovalDecision::Approve)
+            .await,
+        Reply::Ok
+    );
+    let second = rig.next_request().await;
+    assert!(!task.is_finished(), "Send replied before the run finished");
+    let text = nonce();
+    second.respond(text_response(api, &text)).await;
+    let thread = finished(task).await;
+    assert_eq!(thread.state, RunState::Complete, "{:?}", thread.error);
+    assert!(thread.approvals.is_empty());
+    let recorded = calls_of(&thread);
+    assert_eq!(recorded[0].state, ToolCallState::Succeeded);
+    let output = format!("{}:{}", rig.marker, json!({"value": value}));
+    assert_eq!(recorded[0].output.as_deref(), Some(output.as_str()));
+    assert_eq!(thread.messages.last().unwrap().text, text);
+}
+
+#[tokio::test]
+async fn revoking_a_tool_stops_its_running_call_and_its_approval_wait() {
+    let api = ProviderApi::OpenAi;
+    let (running, waiting) = (nonce(), nonce());
+    let mut rig = rig(
+        api,
+        vec![
+            tool(&running, ToolPermission::Allow, &[]),
+            tool(&waiting, ToolPermission::Allow, &[]),
+        ],
+        Some(running.clone()),
+    )
+    .await;
+    rig.permit(&running, ToolPermission::Allow).await;
+    let task = rig.send();
+    let first = rig.next_request().await;
+    let call = Call::new(&running, json!({}));
+    first
+        .respond(calls_response(api, std::slice::from_ref(&call), ""))
+        .await;
+    wait_for_call(&mut rig).await;
+    assert!(!rig.dropped.load(Ordering::SeqCst));
+    // Narrowing Allow to Ask withdraws authority from a call nobody approved.
+    rig.permit(&running, ToolPermission::Ask).await;
+    let second = rig.next_request().await;
+    assert!(
+        rig.dropped.load(Ordering::SeqCst),
+        "the revoked call kept running"
+    );
+    let result = result_for(api, &second.body, &call.id).unwrap();
+    assert!(result.contains("withdrawn"), "{result}");
+    second.respond(text_response(api, &nonce())).await;
+    let thread = finished(task).await;
+    assert_eq!(thread.state, RunState::Complete);
+    let recorded = calls_of(&thread);
+    assert_eq!(recorded[0].state, ToolCallState::Denied);
+    assert_eq!(error_kind(&recorded[0]), ErrorKind::PermissionDenied);
+
+    // An approval wait is withdrawn as soon as the tool is denied.
+    rig.permit(&waiting, ToolPermission::Ask).await;
+    let task = rig.send();
+    let first = rig.next_request().await;
+    let call = Call::new(&waiting, json!({}));
+    first
+        .respond(calls_response(api, std::slice::from_ref(&call), ""))
+        .await;
+    let approval = rig.pending_approval().await;
+    assert_eq!(
+        rig.run(Command::SetToolPermission {
+            thread: rig.thread,
+            tool: waiting.clone(),
+            permission: None,
+        })
+        .await,
+        Reply::Ok
+    );
+    let second = rig.next_request().await;
+    assert!(rig.thread().approvals.is_empty());
+    assert!(rig.events().await.contains(&EventKind::ApprovalResolved {
+        thread: rig.thread,
+        approval: approval.id,
+        outcome: ApprovalOutcome::Revoked,
+    }));
+    let late = rig
+        .resolve(&approval, &approval.digest, ApprovalDecision::Approve)
+        .await;
+    assert!(matches!(late, Reply::Error(ref r) if r.kind == ErrorKind::NotFound));
+    second.respond(text_response(api, &nonce())).await;
+    let thread = finished(task).await;
+    assert_eq!(thread.state, RunState::Complete);
+    let revoked = calls_of(&thread).pop().unwrap();
+    assert_eq!(revoked.state, ToolCallState::Denied);
+    assert_eq!(error_kind(&revoked), ErrorKind::PermissionDenied);
+    assert!(rig.executed().is_empty(), "the withdrawn call ran");
+}
+
+#[tokio::test]
+async fn a_parent_losing_a_grant_stops_its_childs_running_call() {
+    let api = ProviderApi::OpenAi;
+    let name = nonce();
+    let mut rig = rig(
+        api,
+        vec![tool(
+            &name,
+            ToolPermission::Allow,
+            &[Capability::ReadWorkspace],
+        )],
+        Some(name.clone()),
+    )
+    .await;
+    let workspace = tempfile::tempdir().unwrap();
+    let Reply::Project(project) = rig
+        .run(Command::CreateProject {
+            name: nonce(),
+            root: workspace.path().to_string_lossy().into(),
+        })
+        .await
+    else {
+        panic!("project creation failed");
+    };
+    let manager = project.manager;
+    let configured = rig
+        .run(Command::ConfigureThread {
+            id: manager,
+            mode: Mode::Plan,
+            model: Some(rig.model.clone()),
+            subagent_models: [rig.model.clone()].into(),
+        })
+        .await;
+    assert!(matches!(configured, Reply::Thread(_)), "{configured:?}");
+    let grant = |capabilities: &[Capability]| Command::SetBackend {
+        thread: manager,
+        backend: CodingBackend::Native,
+        capabilities: capabilities.iter().copied().collect(),
+    };
+    assert_eq!(
+        rig.run(grant(&[Capability::ReadWorkspace])).await,
+        Reply::Ok
+    );
+    rig.thread = manager;
+    delegate(&mut rig, Mode::Plan, &[Capability::ReadWorkspace], &name).await;
+
+    let task = rig.send();
+    let first = rig.next_request().await;
+    let call = Call::new(&name, json!({}));
+    first
+        .respond(calls_response(api, std::slice::from_ref(&call), ""))
+        .await;
+    let (scope, _) = wait_for_call(&mut rig).await;
+    assert_eq!(scope.capabilities, [Capability::ReadWorkspace].into());
+    // The parent loses the grant while its child's call runs.
+    assert_eq!(rig.run(grant(&[])).await, Reply::Ok);
+    let second = rig.next_request().await;
+    assert!(
+        rig.dropped.load(Ordering::SeqCst),
+        "the child's call kept running"
+    );
+    assert!(
+        offered(api, &second.body).is_empty(),
+        "a denied tool was offered"
+    );
+    second.respond(text_response(api, &nonce())).await;
+    let thread = finished(task).await;
+    assert_eq!(thread.state, RunState::Complete);
+    let recorded = calls_of(&thread);
+    assert_eq!(recorded[0].state, ToolCallState::Denied);
+    assert_eq!(error_kind(&recorded[0]), ErrorKind::PermissionDenied);
+    let Reply::Tools(list) = rig.run(Command::ListTools { thread: rig.thread }).await else {
+        panic!("tool listing failed");
+    };
+    assert_eq!(list.tools[0].effective, ToolPermission::Deny);
+    assert_eq!(list.tools[0].missing, [Capability::ReadWorkspace].into());
+}
+
+#[tokio::test]
+async fn a_parent_lowering_its_budget_limits_its_child() {
+    let api = ProviderApi::OpenAi;
+    let name = nonce();
+    let mut rig = rig(api, vec![tool(&name, ToolPermission::Allow, &[])], None).await;
+    let parent = delegate(&mut rig, Mode::Chat, &[], &name).await;
+    let set = |budget| Command::SetToolBudget {
+        thread: parent,
+        budget,
+    };
+    // Calls: the child's own budget allows both, the parent's only one.
+    let parent_budget = ToolBudget {
+        rounds: ToolBudget::default().rounds,
+        tool_calls: 1,
+    };
+    assert_eq!(rig.run(set(parent_budget)).await, Reply::Ok);
+    assert!(rig.thread().tool_budget.tool_calls > 1);
+    let task = rig.send();
+    let request = rig.next_request().await;
+    let calls = [
+        Call::new(&name, json!({"value": nonce()})),
+        Call::new(&name, json!({"value": nonce()})),
+    ];
+    request.respond(calls_response(api, &calls, "")).await;
+    let thread = finished(task).await;
+    assert_eq!(thread.state, RunState::Failed);
+    assert!(
+        thread
+            .error
+            .as_ref()
+            .unwrap()
+            .message
+            .contains("1 tool calls"),
+        "{:?}",
+        thread.error
+    );
+    assert_eq!(rig.executed().len(), 1);
+
+    // Rounds, independently of calls.
+    let parent_budget = ToolBudget {
+        rounds: 1,
+        tool_calls: ToolBudget::default().tool_calls,
+    };
+    assert_eq!(rig.run(set(parent_budget)).await, Reply::Ok);
+    let task = rig.send();
+    let request = rig.next_request().await;
+    request
+        .respond(calls_response(
+            api,
+            &[Call::new(&name, json!({"value": nonce()}))],
+            "",
+        ))
+        .await;
+    let thread = finished(task).await;
+    assert_eq!(thread.state, RunState::Failed);
+    assert!(
+        thread
+            .error
+            .as_ref()
+            .unwrap()
+            .message
+            .contains("1 model rounds"),
+        "{:?}",
+        thread.error
+    );
+    assert!(rig.executed().is_empty());
+}
+
+#[tokio::test]
+async fn a_tool_reported_error_reaches_the_user_with_its_explanation() {
+    let api = ProviderApi::Anthropic;
+    let name = format!("fail_{}", nonce());
+    let mut rig = rig(api, vec![tool(&name, ToolPermission::Allow, &[])], None).await;
+    rig.permit(&name, ToolPermission::Allow).await;
+    let task = rig.send();
+    let first = rig.next_request().await;
+    let value = nonce();
+    let call = Call::new(&name, json!({"value": value}));
+    first
+        .respond(calls_response(api, std::slice::from_ref(&call), ""))
+        .await;
+    let second = rig.next_request().await;
+    let explanation = format!("{}:{}", rig.marker, json!({"value": value}));
+    assert_eq!(
+        result_for(api, &second.body, &call.id),
+        Some(explanation.clone())
+    );
+    second.respond(text_response(api, &nonce())).await;
+    let thread = finished(task).await;
+    let recorded = &calls_of(&thread)[0];
+    assert_eq!(recorded.state, ToolCallState::Failed);
+    let report = recorded.error.as_ref().unwrap();
+    // Typed: the gateway's report first, the tool's own words as its cause.
+    assert!(report.message.contains("reported an error"), "{report:?}");
+    let cause = report.source.as_deref().expect("the tool's explanation");
+    assert_eq!(cause.message, explanation);
+}
+
+#[tokio::test]
+async fn the_context_shows_the_last_request_while_cost_counts_the_whole_run() {
+    let api = ProviderApi::Anthropic;
+    let name = nonce();
+    let mut rig = rig(api, vec![tool(&name, ToolPermission::Allow, &[])], None).await;
+    rig.permit(&name, ToolPermission::Allow).await;
+    let task = rig.send();
+    let (first_in, first_out, last_in, last_out) = (count(), count(), count(), count());
+    let first = rig.next_request().await;
+    first
+        .respond(with_usage(
+            calls_response(api, &[Call::new(&name, json!({}))], ""),
+            first_in,
+            first_out,
+        ))
+        .await;
+    let second = rig.next_request().await;
+    second
+        .respond(with_usage(text_response(api, &nonce()), last_in, last_out))
+        .await;
+    let thread = finished(task).await;
+    assert_eq!(thread.state, RunState::Complete);
+    let last = thread.usage.unwrap();
+    assert_eq!(
+        (last.input_tokens, last.output_tokens),
+        (Some(last_in), Some(last_out))
+    );
+    let total = thread.run_usage.unwrap();
+    assert_eq!(
+        (total.input_tokens, total.output_tokens),
+        (Some(first_in + last_in), Some(first_out + last_out))
+    );
+}
+
+#[tokio::test]
+async fn calls_that_do_not_fit_in_storage_are_settled_and_the_run_goes_on() {
+    let api = ProviderApi::OpenAi;
+    // No tool is offered: every call is refused cheaply, so only the
+    // recorded arguments fill the conversation.
+    let mut rig = rig(api, vec![], None).await;
+    assert_eq!(
+        rig.run(Command::SetToolBudget {
+            thread: rig.thread,
+            budget: ToolBudget {
+                rounds: 8,
+                tool_calls: ToolBudget::MAX,
+            },
+        })
+        .await,
+        Reply::Ok
+    );
+    let large = |n: usize| -> Vec<Call> {
+        (0..n)
+            .map(|_| {
+                let filler = "a".repeat(a206_runtime::tool_calls::MAX_ARGUMENTS - 8 * 1024);
+                Call::new(&nonce(), json!({"value": format!("{}{filler}", nonce())}))
+            })
+            .collect()
+    };
+    let task = rig.send();
+    let first = rig.next_request().await;
+    first
+        .respond(calls_response(
+            api,
+            &large(a206_runtime::tool_calls::MAX_CALLS),
+            "",
+        ))
+        .await;
+    let second = rig.next_request().await;
+    let overflow = large(16);
+    second.respond(calls_response(api, &overflow, "")).await;
+    let third = rig.next_request().await;
+    for call in &overflow {
+        assert!(
+            result_for(api, &third.body, &call.id).is_some(),
+            "every call gets a result"
+        );
+    }
+    third.respond(text_response(api, &nonce())).await;
+    let thread = finished(task).await;
+    assert_eq!(thread.state, RunState::Complete, "{:?}", thread.error);
+    let recorded = calls_of(&thread);
+    let settled: Vec<_> = recorded
+        .iter()
+        .filter(|c| c.state == ToolCallState::Failed)
+        .collect();
+    assert!(!settled.is_empty(), "nothing exceeded the storage limit");
+    for call in settled {
+        assert_eq!(error_kind(call), ErrorKind::Storage);
+        assert!(call.arguments.is_empty());
+        assert!(overflow.iter().any(|c| c.id == call.id));
+    }
+    // The conversation is still stored and readable.
+    assert!(rig.gateway.snapshot().is_ok());
 }

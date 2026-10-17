@@ -152,6 +152,9 @@ pub enum ApprovalOutcome {
     Denied,
     /// The run was cancelled or ended before the user answered.
     Expired,
+    /// The tool's permission or the conversation's grant was withdrawn while
+    /// the request was waiting; the call did not run.
+    Revoked,
 }
 
 /// A tool a conversation could use, with how its permission was decided.

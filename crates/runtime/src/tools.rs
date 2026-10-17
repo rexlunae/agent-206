@@ -201,27 +201,35 @@ pub(crate) async fn catalog(hosts: &[Arc<dyn ToolHost>], scope: &ToolScope) -> C
 }
 
 /// The capabilities a conversation's tools may use: its grant within its
-/// mode's ceiling. Delegated threads were already attenuated at creation.
-pub(crate) fn scope_capabilities(thread: &Thread) -> BTreeSet<Capability> {
-    let ceiling = thread.mode.ceiling();
-    thread
-        .grant
-        .capabilities
-        .iter()
-        .filter(|c| ceiling.contains(c))
-        .copied()
-        .collect()
+/// mode's ceiling, intersected with every ancestor's current grant within
+/// that ancestor's ceiling. A delegated thread was attenuated when it was
+/// created; intersecting again at each decision means a grant its parent
+/// loses later is lost by the child too.
+pub(crate) fn scope_capabilities(thread: &Thread, ancestors: &[&Thread]) -> BTreeSet<Capability> {
+    let own = |t: &Thread| -> BTreeSet<Capability> {
+        let ceiling = t.mode.ceiling();
+        t.grant
+            .capabilities
+            .iter()
+            .filter(|c| ceiling.contains(c))
+            .copied()
+            .collect()
+    };
+    ancestors.iter().fold(own(thread), |granted, ancestor| {
+        granted.intersection(&own(ancestor)).copied().collect()
+    })
 }
 
 /// The permission the gateway enforces for `spec` in `thread`: the most
 /// restrictive of the user's setting (unset is deny), every ancestor's
-/// setting, the host's policy, and deny if any capability is missing.
+/// setting, the host's policy, and deny if any capability is missing from
+/// the grant of the thread or of any ancestor.
 pub(crate) fn decide(
     spec: &ToolSpec,
     thread: &Thread,
     ancestors: &[&Thread],
 ) -> (ToolPermission, BTreeSet<Capability>) {
-    let granted = scope_capabilities(thread);
+    let granted = scope_capabilities(thread, ancestors);
     let missing: BTreeSet<_> = spec.capabilities.difference(&granted).copied().collect();
     let setting = |t: &Thread| {
         t.tool_permissions
@@ -306,6 +314,39 @@ mod tests {
         thread.grant.capabilities.insert(Capability::Network);
         let network = spec(&name, Allow, &[Capability::Network]);
         assert_eq!(decide(&network, &thread, &[]).0, Deny);
+    }
+    #[test]
+    fn a_child_loses_every_capability_an_ancestor_loses() {
+        use ToolPermission::*;
+        let name = Id::new_v4().simple().to_string();
+        let read = spec(&name, Allow, &[Capability::ReadWorkspace]);
+        let with_read = |mode| {
+            let mut thread = Thread::new(String::new(), mode);
+            thread.grant.capabilities.insert(Capability::ReadWorkspace);
+            thread.tool_permissions.insert(name.clone(), Allow);
+            thread
+        };
+        let child = with_read(Mode::Plan);
+        let mut parent = with_read(Mode::Plan);
+        let mut root = with_read(Mode::Code);
+        assert_eq!(decide(&read, &child, &[&parent, &root]).0, Allow);
+        // The grandparent loses the grant after the child was created.
+        root.grant.capabilities.clear();
+        let (effective, missing) = decide(&read, &child, &[&parent, &root]);
+        assert_eq!(
+            (effective, missing),
+            (Deny, [Capability::ReadWorkspace].into())
+        );
+        assert!(scope_capabilities(&child, &[&parent, &root]).is_empty());
+        // So does an ancestor whose mode no longer allows it.
+        root.grant.capabilities.insert(Capability::ReadWorkspace);
+        parent.mode = Mode::Chat;
+        assert_eq!(decide(&read, &child, &[&parent, &root]).0, Deny);
+        parent.mode = Mode::Plan;
+        assert_eq!(
+            scope_capabilities(&child, &[&parent, &root]),
+            [Capability::ReadWorkspace].into()
+        );
     }
     struct Fixed(Vec<ToolSpec>);
     impl ToolHost for Fixed {
