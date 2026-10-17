@@ -406,6 +406,8 @@ fn Inspector(thread: Thread) -> Element {
             crate::tools::ToolPermissions { thread: id }
         }
         Divider {}
+        crate::subagents::Subagents { thread: id }
+        Divider {}
         h3 { "Subagent models" }
         p { class: "a206-muted", "Choose which models this conversation may delegate to." }
         if snapshot.catalogs.iter().all(|c| c.models.is_empty()) { p { class: "a206-number", "Connect a provider to discover models." } }
