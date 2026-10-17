@@ -3,13 +3,17 @@
 use super::*;
 use crate::store::Store;
 use a206_core::{ExtensionProposal, Id};
-use std::sync::Mutex;
+use std::sync::{
+    Mutex,
+    atomic::{AtomicUsize, Ordering},
+};
 
 /// Stands in for the skill tool host: offers exactly what it is given.
 #[derive(Default)]
-struct Skills(Mutex<ToolListing>);
+struct Skills(Mutex<ToolListing>, AtomicUsize);
 impl ToolHost for Skills {
     fn list<'a>(&'a self, _: &'a ToolScope) -> BoxFuture<'a, ToolListing> {
+        self.1.fetch_add(1, Ordering::SeqCst);
         Box::pin(async move { self.0.lock().unwrap().clone() })
     }
     fn call<'a>(
@@ -259,12 +263,15 @@ async fn proposals_say_which_conversation_prepared_them() {
             .iter()
             .all(|e| e["id"] != here.summary.id)
     );
-    // Listing one extension shows only proposals for that extension.
+    // Listing one extension shows only proposals for that extension, and
+    // listing another than the skills builtin does not wait on a skill scan.
+    let scans = rig.skills.1.load(Ordering::SeqCst);
     let one = rig
         .call(json!({"extension": WORKSPACE}), &[])
         .await
         .unwrap();
     assert!(one["waiting_for_review"].as_array().unwrap().is_empty());
+    assert_eq!(rig.skills.1.load(Ordering::SeqCst), scans);
 }
 
 #[tokio::test]
