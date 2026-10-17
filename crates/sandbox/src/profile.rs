@@ -101,6 +101,10 @@ pub struct Profile<'a> {
     /// Pass the runtime's stderr to the gateway once it starts, after
     /// bubblewrap's own diagnostics; otherwise it is discarded.
     pub stderr: bool,
+    /// The pseudo-terminal device the runtime's stdin and stdout are, which
+    /// becomes its controlling terminal; its stderr goes there too. Only
+    /// this terminal and `/dev/tty` are added to what it may open.
+    pub terminal: Option<&'a Path>,
 }
 
 /// The network a runtime may use.
@@ -141,6 +145,10 @@ impl Profile<'_> {
         }
         add(PathBuf::from("/proc"), Access::Read);
         add(PathBuf::from("/dev/null"), Access::Device);
+        if self.terminal.is_some() {
+            // Its own controlling terminal; bubblewrap's `/dev` has no other.
+            add(PathBuf::from("/dev/tty"), Access::Terminal);
+        }
         for device in READ_DEVICES {
             add(PathBuf::from(device), Access::Read);
         }
@@ -208,6 +216,7 @@ impl Profile<'_> {
             },
             status: self.status_socket(),
             stderr: self.stderr,
+            terminal: self.terminal.is_some(),
             rules: self.rules()?,
         })
     }
@@ -332,11 +341,23 @@ impl Profile<'_> {
 
     /// The `sandbox-exec` command that starts the runtime under this
     /// profile's Seatbelt policy, in `cwd`. Without `stderr` the runtime's
-    /// stderr is discarded, as the Linux helper does.
+    /// stderr is discarded, as the Linux helper does. With a `terminal` the
+    /// command starts its own session, so it must not be put in a process
+    /// group first.
     #[cfg(target_os = "macos")]
     pub fn command(&self) -> Result<std::process::Command, SandboxError> {
         std::fs::metadata(crate::SANDBOX_EXEC).map_err(SandboxError::SandboxExec)?;
-        let mut command = std::process::Command::new(crate::SANDBOX_EXEC);
+        // `sandbox-exec` replaces itself with the runtime, so a terminal must
+        // already be the controlling one: this executable's launcher makes
+        // it so, then becomes `sandbox-exec`.
+        let mut command = match self.terminal {
+            Some(_) => {
+                let mut command = std::process::Command::new(self.helper);
+                command.args([crate::TERMINAL_COMMAND, crate::SANDBOX_EXEC]);
+                command
+            }
+            None => std::process::Command::new(crate::SANDBOX_EXEC),
+        };
         command
             .arg("-p")
             .arg(self.seatbelt()?)
@@ -419,6 +440,7 @@ mod tests {
                 cwd: &self.scratch,
                 network: NetworkAccess::Proxy(1),
                 stderr: false,
+                terminal: None,
             }
         }
     }
@@ -455,6 +477,24 @@ mod tests {
         let none = layout.profile(None, &[], false).rules().unwrap();
         assert!(access(&none, &layout.project).is_empty());
         assert!(access(&none, &bin).is_empty());
+    }
+
+    #[test]
+    fn only_a_terminal_session_may_open_its_controlling_terminal() {
+        let layout = layout();
+        let tty = Path::new("/dev/tty");
+        let piped = layout.profile(None, &[], true);
+        assert!(access(&piped.rules().unwrap(), tty).is_empty());
+        assert!(!piped.spec().unwrap().terminal);
+        let device = layout.scratch.join("pts");
+        let terminal = Profile {
+            terminal: Some(&device),
+            ..piped
+        };
+        assert_eq!(access(&terminal.rules().unwrap(), tty), [Access::Terminal]);
+        // The device itself is not mounted on Linux; the inherited copy is used.
+        assert!(access(&terminal.rules().unwrap(), &device).is_empty());
+        assert!(terminal.spec().unwrap().terminal);
     }
 
     #[test]

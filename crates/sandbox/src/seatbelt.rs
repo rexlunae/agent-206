@@ -108,6 +108,12 @@ impl Profile<'_> {
             ));
             traversed.push(Path::new(SHELL_SELECTION));
         }
+        if let Some(terminal) = self.terminal {
+            rule(format!(
+                "(allow file-read* file-write* file-ioctl (literal {}) (literal \"/dev/tty\"))\n",
+                quote(terminal)?
+            ));
+        }
         match self.network {
             NetworkAccess::None => {}
             NetworkAccess::Proxy(port) => rule(format!(
@@ -198,6 +204,7 @@ mod tests {
                 cwd: &self.scratch,
                 network: NetworkAccess::None,
                 stderr: false,
+                terminal: None,
             }
         }
     }
@@ -240,6 +247,24 @@ mod tests {
         };
         assert_eq!(exec(&none), 1);
         assert_eq!(exec(&write), 2);
+    }
+
+    #[test]
+    fn only_a_terminal_session_may_use_its_terminal() {
+        let paths = paths();
+        let piped = paths.profile(None, true);
+        assert!(!piped.seatbelt().unwrap().contains("file-ioctl"));
+        let device = paths.scratch.join("ttys");
+        let terminal = Profile {
+            terminal: Some(&device),
+            ..piped
+        }
+        .seatbelt()
+        .unwrap();
+        assert!(terminal.contains(&format!(
+            "(allow file-read* file-write* file-ioctl (literal {}) (literal \"/dev/tty\"))",
+            quoted(&device)
+        )));
     }
 
     #[test]

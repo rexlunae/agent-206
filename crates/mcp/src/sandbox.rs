@@ -260,6 +260,7 @@ fn sandbox_command(
         },
         // MCP servers' stderr is discarded on every platform.
         stderr: false,
+        terminal: None,
     };
     Ok(Command::from(profile.command().map_err(McpError::Sandbox)?))
 }

@@ -388,6 +388,8 @@ fn Conversation(thread: Thread, target: Option<Uuid>) -> Element {
                     ThreadFacts { thread: thread.clone() }
                     ContextControls { thread: thread.clone() }
                     BackendControls { thread: thread.clone() }
+                    // Here too, so split view, which has no inspector, keeps it.
+                    crate::subagents::Subagents { thread: id }
                 }
             }
         }
@@ -406,6 +408,8 @@ fn Inspector(thread: Thread) -> Element {
             Divider {}
             crate::tools::ToolPermissions { thread: id }
         }
+        Divider {}
+        crate::subagents::Subagents { thread: id }
         Divider {}
         h3 { "Subagent models" }
         p { class: "a206-muted", "Choose which models this conversation may delegate to." }
