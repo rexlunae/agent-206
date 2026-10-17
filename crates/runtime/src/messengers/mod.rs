@@ -159,6 +159,11 @@ pub(crate) struct Inbound {
 /// Something a poll delivered.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Event {
+    /// Room discovery only, without authority to join or start a turn.
+    Discovered {
+        chat: String,
+        title: Option<String>,
+    },
     Message(Inbound),
     /// An invitation to join `chat`, accepted only if the chat is allowed.
     Invite {
@@ -532,6 +537,10 @@ async fn deliver<H: Host>(
     event: Event,
 ) -> Result<()> {
     let inbound = match event {
+        Event::Discovered { chat, title } => {
+            refuse(host, config, &chat, None, title);
+            return Ok(());
+        }
         Event::Ignored => return Ok(()),
         Event::Invite { chat, title } => {
             if config.allowed_chats.contains(&chat) {

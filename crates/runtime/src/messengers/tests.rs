@@ -1083,8 +1083,18 @@ async fn unrelated_rooms_do_not_starve_allowed_messages_and_large_state_is_scann
         .unwrap()
         .push_back(json!({"join": joined}));
     let batch = adapter.receive(Some("previous")).await.unwrap();
-    assert_eq!(batch.events.len(), 1);
-    assert!(matches!(&batch.events[0].1, Event::Message(message) if message.chat == room));
+    assert_eq!(batch.events.len(), 64);
+    assert_eq!(batch.next.as_deref(), Some("previous"));
+    assert!(
+        batch
+            .events
+            .iter()
+            .all(|(_, event)| matches!(event, Event::Discovered { .. }))
+    );
+    let batch = adapter.receive(Some("previous")).await.unwrap();
+    assert_eq!(batch.events.len(), 37);
+    assert!(matches!(&batch.events[36].1, Event::Message(message) if message.chat == room));
+    assert_eq!(batch.next.as_deref(), Some("s1"));
     assert!(server.page_queries.lock().unwrap().is_empty());
     let mut state: Vec<_> = (0..2_000)
         .map(|_| json!({"type": "m.room.member", "content": {"membership": "join"}}))
@@ -1114,4 +1124,40 @@ async fn unrelated_rooms_do_not_starve_allowed_messages_and_large_state_is_scann
         .insert(room.clone(), json!([{"content": {}}]));
     assert!(adapter.send(&room, "malformed state").await.is_err());
     assert_eq!(server.sent.lock().unwrap().len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn matrix_drains_all_pending_invitations_before_confirming_the_sync() {
+    let (server, origin, _dir, credential, host, _anchor) = matrix_setup().await;
+    let config = matrix_config("pending", &origin, &credential, &[]);
+    let mut adapter = matrix::Matrix::new(
+        Api::new(host.root.clone(), host.pairing.clone(), &config).unwrap(),
+        Default::default(),
+    );
+    adapter.connect().await.unwrap();
+    let invites: serde_json::Map<String, Value> = (0..130)
+        .map(|_| (matrix_id('!', "example.test"), json!({})))
+        .collect();
+    server
+        .syncs
+        .lock()
+        .unwrap()
+        .push_back(json!({"invite": invites}));
+    let mut seen = BTreeSet::new();
+    for expected in [64, 64, 2] {
+        // Revalidating the same account must not discard the pending queue.
+        adapter.connect().await.unwrap();
+        let batch = adapter.receive(None).await.unwrap();
+        assert_eq!(batch.events.len(), expected);
+        for (_, event) in batch.events {
+            let Event::Discovered { chat, .. } = event else {
+                panic!("discovery must not cause a turn or a join")
+            };
+            assert!(seen.insert(chat));
+        }
+        assert_eq!(batch.next.as_deref(), (expected == 2).then_some("s1"));
+    }
+    assert_eq!(seen.len(), 130);
+    assert_eq!(server.sync_queries.lock().unwrap().len(), 1);
+    assert!(server.joined.lock().unwrap().is_empty());
 }

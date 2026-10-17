@@ -135,8 +135,13 @@ agent206 messenger enable home
   (including invitations and backfill), and 32 pagination requests across
   all rooms. Overflow or cyclic pagination fails the batch and preserves
   the previous cursor; it never silently skips messages.
-  Unrelated joined rooms are discarded before charging these budgets; at
-  most 64 other invitations are surfaced for user review per sync. Full
+  Unrelated rooms contribute discovery only, outside the allowed-room work
+  budget. Up to 4,096 unapproved room IDs are retained and surfaced for
+  user review in chunks of 64 across polls. The old cursor is held until
+  every discovery is surfaced; authorized turns and joins are delivered
+  only in the final chunk, so reconnecting during discovery cannot repeat
+  them. Larger discovery sets produce a budget error without confirming
+  the sync. Full
   room state is scanned with constant additional memory under the broker's
   byte limit, separately from sync-event budgets, so large membership lists
   do not prevent checking encryption.

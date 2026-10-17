@@ -15,7 +15,7 @@
 use super::{Account, Api, Batch, Event, Inbound, MessengerError, Result, split};
 use a206_broker::{AuthScheme, HttpMethod};
 use serde::Deserialize;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 const SERVICE: &str = "Matrix";
 /// Milliseconds the homeserver holds a sync open; well inside the broker's
@@ -26,6 +26,7 @@ const TIMELINE_LIMIT: u32 = 50;
 const MAX_ROOMS: usize = 64;
 const MAX_EVENTS: usize = 1_000;
 const MAX_PAGES: usize = 32;
+const MAX_DISCOVERIES: usize = 4_096;
 /// Parts a long reply is split into, in UTF-16 code units. Matrix limits an
 /// event to 64 KiB including its JSON envelope.
 const MAX_MESSAGE_UNITS: usize = 8000;
@@ -34,8 +35,33 @@ const CLIENT: [&str; 3] = ["_matrix", "client", "v3"];
 pub(crate) struct Matrix {
     api: Api,
     allowed: BTreeSet<String>,
+    pending: Option<Pending>,
     /// The bot's own user id, whose messages are never answered.
     user: Option<String>,
+}
+
+/// Discovery is drained before authorized effects. Until the final chunk,
+/// keep the old cursor: reconnecting can repeat a refusal, never a turn.
+struct Pending {
+    discoveries: VecDeque<(String, Event)>,
+    events: Vec<(String, Event)>,
+    previous: Option<String>,
+    next: String,
+}
+impl Pending {
+    fn chunk(&mut self) -> Batch {
+        let mut events: Vec<_> = self
+            .discoveries
+            .drain(..self.discoveries.len().min(MAX_ROOMS))
+            .collect();
+        let next = if self.discoveries.is_empty() {
+            events.append(&mut self.events);
+            Some(self.next.clone())
+        } else {
+            self.previous.clone()
+        };
+        Batch { events, next }
+    }
 }
 
 #[derive(Deserialize)]
@@ -163,6 +189,7 @@ impl Matrix {
         Self {
             api,
             allowed,
+            pending: None,
             user: None,
         }
     }
@@ -208,6 +235,9 @@ impl Matrix {
         let id = me
             .user_id
             .ok_or(MessengerError::NoAccountId { service: SERVICE })?;
+        if self.user.as_ref() != Some(&id) {
+            self.pending = None;
+        }
         self.user = Some(id.clone());
         Ok(Account {
             name: Some(id.clone()),
@@ -219,6 +249,16 @@ impl Matrix {
     /// it returns at once, delivers only pending invitations, and its cursor
     /// marks where answering starts.
     pub(crate) async fn receive(&mut self, since: Option<&str>) -> Result<Batch> {
+        if let Some(pending) = &mut self.pending {
+            if pending.previous.as_deref() == since {
+                let batch = pending.chunk();
+                if pending.discoveries.is_empty() {
+                    self.pending = None;
+                }
+                return Ok(batch);
+            }
+            self.pending = None;
+        }
         let filter = serde_json::json!({
             "presence": {"types": []},
             "account_data": {"types": []},
@@ -243,6 +283,31 @@ impl Matrix {
             url.query_pairs_mut().append_pair("since", since);
         }
         let mut sync: Sync = self.request(HttpMethod::Get, url, None).await?;
+        let unrelated = sync
+            .rooms
+            .join
+            .keys()
+            .chain(sync.rooms.invite.keys())
+            .filter(|room| !self.allowed.contains(*room))
+            .count();
+        if unrelated > MAX_DISCOVERIES {
+            return Err(MessengerError::SyncBudget { service: SERVICE });
+        }
+        let mut discoveries: VecDeque<_> = sync
+            .rooms
+            .join
+            .iter()
+            .filter(|(room, _)| !self.allowed.contains(*room))
+            .map(|(room, _)| {
+                (
+                    format!("room {room}"),
+                    Event::Discovered {
+                        chat: room.clone(),
+                        title: None,
+                    },
+                )
+            })
+            .collect();
         // Unrelated joined rooms have no delivery authority. Discard them
         // before charging the work budget, so they cannot starve allowed rooms.
         sync.rooms
@@ -250,28 +315,27 @@ impl Matrix {
             .retain(|room, _| self.allowed.contains(room));
         // Keep bounded discovery of pending, unapproved invitations. These
         // can only reach the user's refused-room list, never a conversation.
-        let refused: Vec<_> = sync
-            .rooms
-            .invite
-            .iter()
-            .filter(|(room, _)| !self.allowed.contains(*room))
-            .take(MAX_ROOMS)
-            .map(|(room, invited)| {
-                (
-                    format!("invite {room}"),
-                    Event::Invite {
-                        chat: room.clone(),
-                        title: invited
-                            .invite_state
-                            .events
-                            .iter()
-                            .take(50)
-                            .find(|e| e.kind == "m.room.name")
-                            .and_then(|e| e.content.name.clone()),
-                    },
-                )
-            })
-            .collect();
+        discoveries.extend(
+            sync.rooms
+                .invite
+                .iter()
+                .filter(|(room, _)| !self.allowed.contains(*room))
+                .map(|(room, invited)| {
+                    (
+                        format!("invite {room}"),
+                        Event::Discovered {
+                            chat: room.clone(),
+                            title: invited
+                                .invite_state
+                                .events
+                                .iter()
+                                .take(50)
+                                .find(|e| e.kind == "m.room.name")
+                                .and_then(|e| e.content.name.clone()),
+                        },
+                    )
+                }),
+        );
         sync.rooms
             .invite
             .retain(|room, _| self.allowed.contains(room));
@@ -296,7 +360,7 @@ impl Matrix {
         }
         let mut pages = 0;
         let mut seen = BTreeSet::new();
-        let mut events = refused;
+        let mut events = Vec::new();
         for (room, invited) in sync.rooms.invite {
             let title = invited
                 .invite_state
@@ -333,10 +397,17 @@ impl Matrix {
                 }
             }
         }
-        Ok(Batch {
+        let mut pending = Pending {
+            discoveries,
             events,
-            next: Some(sync.next_batch),
-        })
+            previous: since.map(str::to_owned),
+            next: sync.next_batch,
+        };
+        let batch = pending.chunk();
+        if !pending.discoveries.is_empty() {
+            self.pending = Some(pending);
+        }
+        Ok(batch)
     }
 
     /// Fill the gap preceding a limited timeline, oldest first. Sync tokens
