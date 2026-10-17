@@ -90,7 +90,7 @@ pub enum DelegationToolError {
     TooDeep { limit: usize },
     #[error("this conversation already has {limit} subagents running; wait for one to finish")]
     TooMany { limit: usize },
-    #[error("the subagent is still running; wait for it or cancel it first")]
+    #[error("the subagent is starting; wait for it to begin, then send again")]
     Busy,
     #[error("`seconds` must be 1–{MAX_WAIT}")]
     WaitRange,
@@ -251,7 +251,7 @@ impl DelegationHost {
             ),
             spec(
                 SEND,
-                "Send a subagent whose run has ended another message; it continues in the background.",
+                "Send a subagent another message. A subagent whose run has ended continues in the background; a running one reads it before its next model request and answers it before ending.",
                 json!({
                     "type": "object",
                     "properties": {"thread": thread, "message": {"type": "string"}},
@@ -363,7 +363,11 @@ impl DelegationHost {
                 let message = text(arguments, "message")
                     .and_then(|t| t.ok_or(DelegationToolError::Missing("message")))
                     .map_err(fail)?;
-                if child.state == RunState::Running || self.started(child.id).is_some() {
+                if child.state == RunState::Running {
+                    self.delegator.steer(child.id, message).await?;
+                    return Ok(json!({"thread": child.id, "state": "running", "steered": true}));
+                }
+                if self.started(child.id).is_some() {
                     return Err(fail(DelegationToolError::Busy));
                 }
                 if self.running(&children) >= MAX_RUNNING {

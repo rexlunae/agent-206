@@ -75,6 +75,25 @@ pub fn Workspace(id: Uuid, split: Option<Uuid>, message: Option<Uuid>) -> Elemen
         }
     }
 }
+/// What a conversation's composer offers.
+#[derive(Debug, PartialEq)]
+struct Composer {
+    /// A response is running or being requested: Send becomes Stop.
+    running: bool,
+    /// Enter adds the draft to the running response.
+    steerable: bool,
+}
+/// `sending` is this composer's `Send`, pending until its run ends;
+/// `steering` is a `Steer` it has not yet had answered.
+fn composer(thread: &Thread, sending: bool, steering: bool) -> Composer {
+    let active = thread.state == RunState::Running;
+    Composer {
+        running: active || sending,
+        // A native run takes further messages while it works, including the
+        // run this composer started, one steered message at a time.
+        steerable: active && thread.backend == CodingBackend::Native && !steering,
+    }
+}
 /// One conversation; `target` is a message to scroll to and mark.
 #[component]
 fn Conversation(thread: Thread, target: Option<Uuid>) -> Element {
@@ -86,7 +105,9 @@ fn Conversation(thread: Thread, target: Option<Uuid>) -> Element {
     let mut reading_files = use_signal(|| false);
     let mut file_input_version = use_signal(|| 0_u64);
     let mut submitting = use_signal(|| false);
-    let running = thread.state == RunState::Running || submitting();
+    let mut steering = use_signal(|| false);
+    let Composer { running, steerable } = composer(&thread, submitting(), steering());
+    let steered: Vec<String> = thread.steering.iter().map(|m| m.text.clone()).collect();
     let has_model = thread.model.is_some();
     let selected_model = thread.model.clone();
     let id = thread.id;
@@ -144,6 +165,27 @@ fn Conversation(thread: Thread, target: Option<Uuid>) -> Element {
                 return;
             }
         };
+        if steerable && !text.is_empty() {
+            steering.set(true);
+            draft.set(String::new());
+            spawn(async move {
+                match crate::call(Command::Steer {
+                    thread: id,
+                    text: text.clone(),
+                })
+                .await
+                {
+                    Ok(_) => state.error.set(None),
+                    Err(error) => {
+                        draft.set(text);
+                        state.error.set(Some(error));
+                    }
+                }
+                steering.set(false);
+                crate::refresh(state).await;
+            });
+            return;
+        }
         if !running
             && has_model
             && !reading_files()
@@ -340,9 +382,16 @@ fn Conversation(thread: Thread, target: Option<Uuid>) -> Element {
                 },
                 Textarea { class: "a206-compose-input", aria_label: "Message your agent", rows: "1", autosize: true,
                     placeholder: if has_model { "Describe what you'd like to do… (/ for commands)" } else { "Choose a model to start… (/ for commands)" },
-                    value: ReadSignal::from(draft), readonly: running,
+                    value: ReadSignal::from(draft), readonly: running && !steerable,
                     oninput: move |value| { draft.set(value); if command_error.peek().is_some() { command_error.set(None); } },
                 }
+                }
+                if !steered.is_empty() {
+                    List { class: "a206-steered", aria_label: "Messages waiting for the running response",
+                        for (index, text) in steered.iter().enumerate() {
+                            ListItem { key: "{index}", overline: rsx! { "Read before its next step" }, headline: rsx! { "{text}" } }
+                        }
+                    }
                 }
                 if !attachments.read().is_empty() {
                     div { class: "a206-attachment-chips", aria_label: "Attached text documents",
@@ -424,6 +473,14 @@ fn Conversation(thread: Thread, target: Option<Uuid>) -> Element {
                         }
                         LinkButton { icon_label: name!("Edit mode prompts"), title: "Edit mode prompts", size: ButtonSize::Sm, variant: ButtonVariant::Ghost,
                             href: Route::Prompts {}.to_string(), Icon { name: IconName::Settings } }
+                        if steerable {
+                            IconButton { icon: IconName::Send, label: name!("Add to the running response"),
+                                title: "Add to the running response · Enter",
+                                size: ButtonSize::Sm, variant: ButtonVariant::Ghost,
+                                availability: if draft().trim().is_empty() { Availability::Disabled } else { Availability::Enabled },
+                                onclick: move |_| submit(),
+                            }
+                        }
                         IconButton { icon: if running { IconName::Stop } else { IconName::ArrowUp }, label: if running { name!("Stop response") } else { name!("Send message") },
                             title: if running { "Stop response" } else { "Send · Enter (Shift+Enter for a new line)" },
                             class: "a206-compose-send", size: ButtonSize::Sm, variant: ButtonVariant::Primary,
@@ -792,6 +849,43 @@ fn unreadable(error: dioxus::CapturedError) -> ErrorReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn the_composer_steers_the_run_it_started_one_message_at_a_time() {
+        let mut thread = Thread::new(Uuid::new_v4().to_string(), Mode::Chat);
+        let offers = |thread: &Thread, sending, steering| composer(thread, sending, steering);
+        // Before the gateway reports the run, a pending Send only stops.
+        assert_eq!(
+            offers(&thread, true, false),
+            Composer {
+                running: true,
+                steerable: false
+            }
+        );
+        thread.state = RunState::Running;
+        // This composer's own Send stays pending for the whole run.
+        assert_eq!(
+            offers(&thread, true, false),
+            Composer {
+                running: true,
+                steerable: true
+            }
+        );
+        assert_eq!(
+            offers(&thread, false, false),
+            Composer {
+                running: true,
+                steerable: true
+            }
+        );
+        // Until a steered message is accepted, no second one is sent.
+        assert!(!offers(&thread, true, true).steerable);
+        thread.backend = CodingBackend::ALL
+            .into_iter()
+            .find(|b| *b != CodingBackend::Native)
+            .unwrap();
+        assert!(!offers(&thread, false, false).steerable);
+    }
+
     use a206_core::PlanStep;
 
     fn render(thread: Thread) -> String {
