@@ -19,6 +19,7 @@ use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio_util::sync::CancellationToken;
 use zeroize::Zeroizing;
 
+mod irc;
 mod socket;
 
 const MAX_NAME: usize = 256;
@@ -218,6 +219,11 @@ fn origins(destinations: Vec<String>) -> Result<Vec<String>, BrokerError> {
     destinations
         .iter()
         .map(|d| {
+            if d.starts_with("ircs:") || d.starts_with("irc:") {
+                return a206_core::messengers::IrcServer::parse(d)
+                    .map(|server| server.origin())
+                    .map_err(|_| BrokerError::Invalid(InvalidRequest::Destination));
+            }
             let url = url::Url::parse(d)
                 .map_err(|_| BrokerError::Invalid(InvalidRequest::Destination))?;
             allowed_scheme(&url).map_err(|_| BrokerError::Invalid(InvalidRequest::Destination))?;
@@ -741,8 +747,24 @@ fn request_url(url: &str) -> Result<url::Url, BrokerError> {
 /// Validate a socket call and take its credential for the exact origin.
 fn socket(shared: &Shared, session: &Session, call: SocketCall) -> Handled {
     let (vault, epoch) = paired(shared, session)?;
-    let url = request_url(&call.url)?;
-    let origin = url.origin().ascii_serialization();
+    let (url, origin) = match &call.scheme {
+        SocketScheme::IrcSasl { login } => {
+            if !a206_core::messengers::valid_irc_nick(login) {
+                return Err(BrokerError::Invalid(InvalidRequest::IrcLogin));
+            }
+            let server = a206_core::messengers::IrcServer::parse(&call.url)
+                .map_err(|_| BrokerError::Invalid(InvalidRequest::IrcServer))?;
+            let origin = server.origin();
+            let url = url::Url::parse(&origin)
+                .map_err(|_| BrokerError::Invalid(InvalidRequest::IrcServer))?;
+            (url, origin)
+        }
+        SocketScheme::DiscordGateway { .. } | SocketScheme::SlackSocketMode => {
+            let url = request_url(&call.url)?;
+            let origin = url.origin().ascii_serialization();
+            (url, origin)
+        }
+    };
     // Read with the pairing check, so a later lock, replacement or void
     // always ends this session.
     let cancel = shared.in_flight(epoch);

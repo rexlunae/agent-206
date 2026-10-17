@@ -189,6 +189,12 @@ fn print_preview(preview: &Preview) {
                 UnsupportedMessenger::InvalidEndpoint => {
                     "skipped: it names no server, or one that is not an HTTPS origin"
                 }
+                UnsupportedMessenger::PlainTextIrc => {
+                    "skipped: it connects without TLS, which would send its password in the clear"
+                }
+                UnsupportedMessenger::InvalidLogin => {
+                    "skipped: its nickname is not one Agent 206 can sign in with"
+                }
             },
         };
         println!(

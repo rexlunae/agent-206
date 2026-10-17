@@ -233,12 +233,16 @@ impl ProviderStream<'_> {
 }
 
 impl Client {
-    /// Open a WebSocket session through the broker. The connection carries
-    /// only this session from then on, so it is consumed. Refused with
-    /// [`ClientError::SocketUnsupported`] before anything is sent when the
-    /// broker predates sockets.
+    /// Open a WebSocket or IRC session through the broker. The connection
+    /// carries only this session from then on, so it is consumed. Refused
+    /// with [`ClientError::SocketUnsupported`] before anything is sent when
+    /// the broker predates sockets, or IRC for an IRC session.
     pub async fn socket(mut self, call: SocketCall) -> Result<SocketOpen, ClientError> {
-        if self.version < SOCKET_VERSION {
+        let needed = match call.scheme {
+            SocketScheme::IrcSasl { .. } => IRC_VERSION,
+            SocketScheme::DiscordGateway { .. } | SocketScheme::SlackSocketMode => SOCKET_VERSION,
+        };
+        if self.version < needed {
             return Err(ClientError::SocketUnsupported);
         }
         let id = self.send(Request::SocketOpen(call)).await?;

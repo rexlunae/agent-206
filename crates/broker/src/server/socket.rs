@@ -70,6 +70,13 @@ struct Properties {
     device: &'static str,
 }
 
+/// A WebSocket scheme: how to ask where to connect, and what to say first.
+#[derive(Clone, Copy)]
+enum Web {
+    Discord { intents: u64 },
+    Slack,
+}
+
 /// The first message Discord sends: `{"op": 10, ...}` (Hello).
 #[derive(Deserialize)]
 struct Opcode {
@@ -86,13 +93,21 @@ pub(super) async fn tunnel(
     writer: &mut OwnedWriteHalf,
     inbox: &mut Inbox,
 ) -> std::io::Result<()> {
+    let web = match &out.scheme {
+        SocketScheme::IrcSasl { login } => {
+            let login = login.clone();
+            return super::irc::tunnel(shared, out, login, id, writer, inbox).await;
+        }
+        SocketScheme::DiscordGateway { intents } => Web::Discord { intents: *intents },
+        SocketScheme::SlackSocketMode => Web::Slack,
+    };
     let cancel = out.cancel.clone();
     let opened = tokio::select! {
         biased;
         _ = cancel.cancelled() => Err(revoked(shared)),
         _ = shared.stop.cancelled() => return Ok(()),
         closed = inbox.closed() => return closed,
-        opened = open(shared, &out) => opened,
+        opened = open(shared, &out, web) => opened,
     };
     drop(out);
     let (mut ws, mut identify) = match opened {
@@ -214,14 +229,10 @@ fn socket_error(error: tungstenite::Error) -> BrokerError {
 }
 
 /// Ask the service where to connect, then connect there.
-async fn open(shared: &super::Shared, out: &SocketOut) -> Result<Opened, BrokerError> {
-    let (method, header) = match out.scheme {
-        SocketScheme::DiscordGateway { .. } => {
-            (HttpMethod::Get, format!("Bot {}", out.token.as_str()))
-        }
-        SocketScheme::SlackSocketMode => {
-            (HttpMethod::Post, format!("Bearer {}", out.token.as_str()))
-        }
+async fn open(shared: &super::Shared, out: &SocketOut, web: Web) -> Result<Opened, BrokerError> {
+    let (method, header) = match web {
+        Web::Discord { .. } => (HttpMethod::Get, format!("Bot {}", out.token.as_str())),
+        Web::Slack => (HttpMethod::Post, format!("Bearer {}", out.token.as_str())),
     };
     let response = request(
         shared.client(&out.url),
@@ -265,8 +276,8 @@ async fn open(shared: &super::Shared, out: &SocketOut) -> Result<Opened, BrokerE
         .url
         .ok_or(BrokerError::Upstream(UpstreamFailure::SocketProtocol))?;
     let mut url = socket_url(&out.url, &url)?;
-    let identify = match out.scheme {
-        SocketScheme::DiscordGateway { intents } => {
+    let identify = match web {
+        Web::Discord { intents } => {
             url.query_pairs_mut().clear().extend_pairs(DISCORD_QUERY);
             let identify = Identify {
                 op: 2,
@@ -284,7 +295,7 @@ async fn open(shared: &super::Shared, out: &SocketOut) -> Result<Opened, BrokerE
                 .map_err(|_| BrokerError::Upstream(UpstreamFailure::InvalidHeader))?;
             Some(Zeroizing::new(identify))
         }
-        SocketScheme::SlackSocketMode => None,
+        Web::Slack => None,
     };
     let config = WebSocketConfig::default()
         .max_message_size(Some(MAX_SOCKET_MESSAGE))
