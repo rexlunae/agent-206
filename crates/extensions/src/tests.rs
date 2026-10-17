@@ -1170,6 +1170,17 @@ fn page_reader_reads_the_largest_page_within_its_fuel() {
         repeat("<a href=\"/x\">y</a>"),
         repeat("<a href=\"../a/./b/../c?d\">y</a>"),
         repeat("<nav><a href=\"/x\"><ul><li>y</li></ul></a></nav>"),
+        format!(
+            "<a href=\"https://a.example/{}\">t</a> {}",
+            "x".repeat(150_000),
+            repeat("word ")
+        ),
+        format!(
+            "<a href=\"https://a.example/{}\">t</a> {}",
+            "x".repeat(40_000),
+            repeat("word ")
+        ),
+        repeat(&format!("<a href=\"/{}\">t</a>", "x".repeat(2_000))),
         repeat("plain words of text here and there "),
         repeat("a&amp;b &lt; "),
         repeat("<p></p>"),

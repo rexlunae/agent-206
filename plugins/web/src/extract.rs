@@ -25,8 +25,9 @@ pub const BUDGET: u64 = 36_000_000;
 const BYTE_COST: u64 = 150;
 const TAG_COST: u64 = 4_500;
 const LINK_COST: u64 = 14_000;
-/// Further fuel for parsing and resolving a link's URL.
+/// Further fuel for parsing and resolving a link's URL, and per byte of it.
 const RESOLVE_COST: u64 = 20_000;
+const URL_BYTE_COST: u64 = 600;
 const REFERENCE_COST: u64 = 1_500;
 const WORD_COST: u64 = 600;
 /// Most text read between two checks of the budget.
@@ -91,6 +92,7 @@ pub fn extract(html: &str, base: Option<&str>, format: Format, budget: u64) -> P
         title: None,
         description: None,
         work: 0,
+        budget,
     };
     let mut at = 0;
     let mut cut = false;
@@ -189,8 +191,9 @@ struct State {
     link: Option<String>,
     title: Option<String>,
     description: Option<String>,
-    /// Fuel spent so far, approximately.
+    /// Fuel spent so far, approximately, and the most it may spend.
     work: u64,
+    budget: u64,
 }
 
 impl State {
@@ -373,7 +376,7 @@ impl State {
             "td" | "th" => self.emit(|out| out.space()),
             "a" if markdown && self.link.is_none() => {
                 if let Some(target) =
-                    attribute(attributes, "href").and_then(|href| self.absolute(&href).map(escape))
+                    attribute(attributes, "href").and_then(|href| self.absolute(&href))
                 {
                     self.emit(|out| out.inline("["));
                     self.link = Some(target);
@@ -447,12 +450,22 @@ impl State {
         if href.trim().is_empty() || href.trim_start().starts_with('#') {
             return None;
         }
-        self.work += RESOLVE_COST;
+        // Parsing is paid for before it starts; a link the budget cannot
+        // pay for keeps only its text.
+        let cost = URL_BYTE_COST
+            .saturating_mul(href.len() as u64)
+            .saturating_add(RESOLVE_COST);
+        if self.work.saturating_add(cost) > self.budget {
+            return None;
+        }
+        self.work += cost;
         // Resolved as a browser resolves it (backslashes, dot segments,
         // percent-encoding), so the link leads where the page's does.
-        let url = match &self.base {
-            Some(base) => base.join(href),
-            None => url::Url::parse(href),
+        let url = match (&self.base, href.trim_start().strip_prefix("//")) {
+            (Some(base), _) => base.join(href),
+            // A protocol-relative link names its host, so it needs no base.
+            (None, Some(rest)) => url::Url::parse(&["https://", rest].concat()),
+            (None, None) => url::Url::parse(href),
         }
         .ok()?;
         matches!(url.scheme(), "https" | "http").then(|| escape(url.into()))
@@ -895,6 +908,10 @@ See the other, x, no and rel.\n\nUse cargo:\n\nfn  main() {\n    x();\n}\n\nafte
         // cannot be resolved correctly, so only its text is kept.
         assert_eq!(link("/x", None), "t");
         assert_eq!(link("https://x.example/", None), "[t](https://x.example/)");
+        assert_eq!(link("//x.example/g", None), "[t](https://x.example/g)");
+        // A link is resolved only while the budget can pay for parsing it.
+        assert!(link(&"a".repeat(40_000), Some(BASE)).starts_with("[t](https://"));
+        assert_eq!(link(&"a".repeat(100_000), Some(BASE)), "t");
     }
 
     #[test]
