@@ -648,14 +648,17 @@ async fn walks_return_whole_paths_in_byte_order() {
 async fn long_paths_end_a_find_before_its_reply_outgrows_the_worker_bound() {
     let (dir, store) = store();
     let root = dir.path().join("project");
-    // About 1.2 KiB of directories above each file.
-    let mut deep = std::path::PathBuf::new();
+    // About 1.2 KiB of directories above each file, made one level at a
+    // time: the whole path is longer than macOS accepts in one call.
+    std::fs::create_dir_all(&root).unwrap();
+    let mut deep = cap_std::fs::Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
     for _ in 0..6 {
-        deep.push("d".repeat(200));
+        let name = "d".repeat(200);
+        deep.create_dir(&name).unwrap();
+        deep = deep.open_dir(&name).unwrap();
     }
-    std::fs::create_dir_all(root.join(&deep)).unwrap();
     for index in 0..workspace::MAX_FOUND {
-        std::fs::write(root.join(&deep).join(format!("{index:04}.rs")), "").unwrap();
+        deep.create(format!("{index:04}.rs")).unwrap();
     }
     let mut host = workspace_calls(&store, Some(root.clone()), &[Capability::ReadWorkspace]);
     let reply = host
