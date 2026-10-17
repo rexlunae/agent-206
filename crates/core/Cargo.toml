@@ -13,5 +13,6 @@ url.workspace = true
 zeroize.workspace = true
 [dev-dependencies]
 rmp-serde.workspace = true
+toml.workspace = true
 [lints]
 workspace = true
