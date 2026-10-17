@@ -21,11 +21,12 @@ impl Gateway {
     fn set_plan(&self, thread: Id, plan: Vec<PlanStep>, result: usize) -> Result<()> {
         let mut store = self.lock()?;
         let size = |plan: &[PlanStep]| rmp_serde::to_vec_named(plan).map(|bytes| bytes.len());
-        let grows = size(&plan)?.saturating_sub(size(&store.thread(thread)?.plan)?);
+        let (new, old) = (size(&plan)?, size(&store.thread(thread)?.plan)?);
         // The plan changes only when the call's result still fits above the
         // run's reserve, so a call that changed the plan never reports failure.
+        // Room a smaller plan frees counts toward it.
         check(
-            grows + result + super::run::RESERVE <= store.remaining()?,
+            new + result + super::run::RESERVE <= store.remaining()? + old,
             GatewayError::HistoryFull,
         )?;
         store.thread_mut(thread)?.plan = plan;
@@ -104,5 +105,16 @@ mod tests {
         assert_eq!(plan(&gateway), kept);
         plans.set(id, next.clone(), result).unwrap();
         assert_eq!(plan(&gateway), next);
+        // Clearing frees the plan's room, which a result may then use.
+        let freed = rmp_serde::to_vec_named(&next).unwrap().len()
+            - rmp_serde::to_vec_named(&Vec::<PlanStep>::new())
+                .unwrap()
+                .len();
+        let left = gateway.lock().unwrap().remaining().unwrap();
+        let room = left + freed - super::super::run::RESERVE;
+        assert!(plans.set(id, vec![], room + 1).is_err());
+        assert_eq!(plan(&gateway), next);
+        plans.set(id, vec![], room).unwrap();
+        assert!(plan(&gateway).is_empty());
     }
 }
