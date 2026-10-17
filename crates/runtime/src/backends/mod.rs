@@ -60,22 +60,8 @@ pub enum BackendError {
     Helper(#[source] std::io::Error),
     #[error("could not prepare the backend's OS isolation")]
     Sandbox(#[from] a206_sandbox::SandboxError),
-    #[error("the sandbox could not start the backend")]
-    SandboxFailed(#[source] ErrorReport),
-    #[error("the sandbox exited ({status}) before the backend started: {diagnostic}")]
-    SandboxExited {
-        status: std::process::ExitStatus,
-        /// Bubblewrap's own explanation, as it printed it.
-        diagnostic: String,
-    },
-    #[error("could not read the sandbox helper's report")]
-    SandboxReport(#[source] std::io::Error),
-    #[error("the sandbox helper sent a malformed report")]
-    SandboxMalformed(#[source] rmp_serde::decode::Error),
-    #[error("the sandbox helper speaks version {version}, not this gateway's")]
-    SandboxVersion { version: u32 },
-    #[error("the sandbox did not report readiness in time")]
-    SandboxTimeout(#[source] tokio::time::error::Elapsed),
+    #[error(transparent)]
+    SandboxStart(#[from] crate::sandbox::StartError),
     #[error("backend has no usable process ID")]
     ProcessId,
     #[error("could not start the backend's credential proxy")]
@@ -122,17 +108,12 @@ impl crate::error::Classified for BackendError {
             | Self::NonUtf8Path => ErrorKind::InvalidRequest,
             // Absent and unreadable paths need different recovery; the I/O cause decides.
             Self::Missing { .. } => return None,
-            Self::Credentialed
-            | Self::Delegation
-            | Self::Unsupported
-            | Self::Spawn(_)
-            | Self::SandboxExited { .. } => ErrorKind::Unavailable,
-            // The sandbox's own error or report knows its kind.
-            Self::Sandbox(_) | Self::SandboxFailed(_) => return None,
-            Self::SandboxReport(_) | Self::SandboxMalformed(_) | Self::SandboxVersion { .. } => {
-                ErrorKind::Protocol
+            Self::Credentialed | Self::Delegation | Self::Unsupported | Self::Spawn(_) => {
+                ErrorKind::Unavailable
             }
-            Self::SandboxTimeout(_) => ErrorKind::Timeout,
+            // The sandbox's own error knows its kind.
+            Self::Sandbox(_) => return None,
+            Self::SandboxStart(error) => return crate::error::classify(error),
             Self::Helper(_) => ErrorKind::Internal,
             Self::Setup(_)
             | Self::Configuration(_)
