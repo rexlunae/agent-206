@@ -247,19 +247,34 @@ async fn listings_stay_whole_json_below_the_output_cap() {
         .await;
         assert!(matches!(reply, Reply::Job(_)), "{reply:?}");
     }
-    let listed = call(&host, mine, LIST, json!({})).unwrap();
-    assert!(listed.to_string().len() < crate::tools::MAX_OUTPUT);
-    let shown = listed["scheduled"].as_array().unwrap();
-    let omitted = listed["omitted"].as_u64().unwrap() as usize;
-    assert!(omitted > 0 && !shown.is_empty());
-    assert_eq!(shown.len() + omitted, count);
-    for job in shown {
-        let text = job["message"].as_str().unwrap();
-        assert!(text.len() <= MESSAGE_BYTES && message.starts_with(text));
-        assert!(
-            text.len() + 1 >= MESSAGE_BYTES,
-            "cut at the last whole character"
-        );
-        assert_eq!(job["message_bytes"], message.len());
+    // Pages follow `next_skip` to every job exactly once.
+    let mut seen = std::collections::BTreeSet::new();
+    let mut pages = 0;
+    let mut skip = json!(null);
+    loop {
+        let listed = call(&host, mine, LIST, json!({ "skip": skip })).unwrap();
+        pages += 1;
+        assert!(listed.to_string().len() < crate::tools::MAX_OUTPUT);
+        assert_eq!(listed["total"], count);
+        let shown = listed["scheduled"].as_array().unwrap();
+        assert!(!shown.is_empty());
+        for job in shown {
+            assert!(seen.insert(job["id"].as_str().unwrap().to_owned()));
+            let text = job["message"].as_str().unwrap();
+            assert!(text.len() <= MESSAGE_BYTES && message.starts_with(text));
+            assert!(
+                text.len() + 1 >= MESSAGE_BYTES,
+                "cut at the last whole character"
+            );
+            assert_eq!(job["message_bytes"], message.len());
+        }
+        if listed["next_skip"].is_null() {
+            break;
+        }
+        skip = listed["next_skip"].clone();
     }
+    assert!(pages > 1, "the listing needed more than one page");
+    assert_eq!(seen.len(), count);
+    let error = call(&host, mine, LIST, json!({"skip": "later"})).unwrap_err();
+    assert_eq!(error.kind, ErrorKind::InvalidRequest);
 }

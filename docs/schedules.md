@@ -57,8 +57,11 @@ conversation until the user permits them:
   must be a whole second, so a message never arrives before the time approved.
 - `schedule_list` lists the conversation's jobs, the user's included, marked
   `added_by: user` or `you`. Results show the first 512 bytes of each message
-  with its full `message_bytes`, and a listing stops at 48 KiB with `omitted`
-  counting the rest, so every result is complete JSON below the output cap.
+  with its full `message_bytes`. A listing stops at 48 KiB with `next_skip`,
+  which `schedule_list { skip }` continues from, so every listing is complete
+  JSON below the output cap and every job is reachable. Only the listing is
+  marked whole output: adding and removing commit before they return, so their
+  small results are never turned into a failure for lack of room.
 - `schedule_remove { id }` removes a job a model of this conversation added; the
   user's jobs and other conversations' jobs are not found.
 

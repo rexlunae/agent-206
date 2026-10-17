@@ -27,7 +27,7 @@ pub const LIST: &str = "schedule_list";
 pub const REMOVE: &str = "schedule_remove";
 /// Longest message text a result shows; `message_bytes` gives the full size.
 pub const MESSAGE_BYTES: usize = 512;
-/// Most bytes of jobs one `schedule_list` returns; `omitted` counts the rest.
+/// Most bytes of jobs one `schedule_list` returns; `next_skip` continues it.
 pub const LIST_BYTES: usize = 48 * 1024;
 
 /// Why a schedule tool call failed.
@@ -82,8 +82,10 @@ impl ScheduleHost {
             parameters,
             capabilities: Default::default(),
             permission,
-            // Each result is one JSON value, bounded below the output cap.
-            whole_output: true,
+            // A listing is one JSON value bounded below the output cap, and
+            // useless cut. Adding and removing commit before they return, so
+            // their small results are never turned into a failure.
+            whole_output: name == LIST,
         };
         vec![
             spec(
@@ -106,8 +108,14 @@ impl ScheduleHost {
             ),
             spec(
                 LIST,
-                "List the messages scheduled to this conversation, by the user or by you.",
-                json!({"type": "object", "properties": {}, "additionalProperties": false}),
+                "List the messages scheduled to this conversation, by the user or by you. A long listing stops early with `next_skip`; call again with `skip` set to it for the rest.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "skip": {"type": "integer", "minimum": 0, "description": "How many jobs to skip; `next_skip` from the previous listing."}
+                    },
+                    "additionalProperties": false
+                }),
                 ToolPermission::Allow,
             ),
             spec(
@@ -140,11 +148,18 @@ impl ScheduleHost {
                 Ok(describe(&job, thread))
             }
             LIST => {
-                allow(args, &[])?;
+                allow(args, &["skip"])?;
+                let skip = match optional(args, "skip") {
+                    None => 0,
+                    Some(skip) => skip
+                        .as_u64()
+                        .and_then(|skip| usize::try_from(skip).ok())
+                        .ok_or_else(|| fail(ScheduleToolError::Type("skip")))?,
+                };
                 let jobs = self.jobs.list(thread)?;
                 let mut scheduled = Vec::new();
                 let mut bytes = 0;
-                for job in &jobs {
+                for job in jobs.iter().skip(skip) {
                     let entry = describe(job, thread);
                     bytes += entry.to_string().len() + 1;
                     if bytes > LIST_BYTES {
@@ -152,8 +167,10 @@ impl ScheduleHost {
                     }
                     scheduled.push(entry);
                 }
+                let next = skip.saturating_add(scheduled.len());
                 Ok(json!({
-                    "omitted": jobs.len() - scheduled.len(),
+                    "total": jobs.len(),
+                    "next_skip": (next < jobs.len()).then_some(next),
                     "scheduled": scheduled,
                     "you_may_add": MAX_AGENT_JOBS.saturating_sub(
                         jobs.iter().filter(|job| job.author == JobAuthor::Agent { thread }).count()
