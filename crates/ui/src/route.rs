@@ -563,4 +563,25 @@ pub(crate) mod tests {
         assert_eq!(html.matches(">Allow sender<").count(), 2, "{html}");
         assert!(html.contains(&stranger));
     }
+
+    #[test]
+    fn irc_messenger_cards_name_the_login_they_sign_in_with() {
+        use a206_core::{MessengerConfig, MessengerKind};
+        let id = || Uuid::new_v4().simple().to_string();
+        let login = format!("bot{}", &id()[..8]);
+        let mut config = MessengerConfig::new(format!("m-{}", id()), MessengerKind::Irc);
+        config.login = Some(login.clone());
+        config.endpoint = Some(format!("ircs://{}.test", id()));
+        let mut snapshot = crate::empty_snapshot();
+        snapshot.settings.messengers = vec![config];
+        fn app() -> Element {
+            rsx! { Router::<MessengerRoute> {} }
+        }
+        let mut dom = VirtualDom::new(app);
+        dom.provide_root_context(snapshot);
+        dom.provide_root_context(Rc::new(MemoryHistory::default()) as Rc<dyn History>);
+        dom.rebuild_in_place();
+        let html = dioxus_ssr::render(&dom);
+        assert!(html.contains(&format!("Signs in as {login}")), "{html}");
+    }
 }

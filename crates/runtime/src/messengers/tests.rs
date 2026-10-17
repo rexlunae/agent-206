@@ -1854,3 +1854,239 @@ async fn slack_reconnects_on_request_and_needs_both_tokens() {
     stop.cancel();
     supervisor.await.unwrap();
 }
+
+/// A stand-in IRC server on loopback: it signs the bot in with SASL PLAIN
+/// when the password matches, then sends `script` once the bot has joined
+/// its channels, answers `WHOIS` from `accounts` (nickname to account) and
+/// records every line it receives.
+#[derive(Clone, Default)]
+struct IrcServer {
+    password: String,
+    channels: usize,
+    script: Arc<Mutex<Vec<String>>>,
+    accounts: Arc<Mutex<HashMap<String, String>>>,
+    received: Arc<Mutex<Vec<String>>>,
+}
+
+async fn serve_irc(server: IrcServer) -> String {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("irc://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let server = server.clone();
+            tokio::spawn(async move {
+                let (reader, mut writer) = stream.into_split();
+                let mut lines = BufReader::new(reader).lines();
+                let (mut nick, mut joined) = (String::new(), 0);
+                while let Ok(Some(line)) = lines.next_line().await {
+                    server.received.lock().unwrap().push(line.clone());
+                    let mut send = vec![];
+                    if let Some(name) = line.strip_prefix("NICK ") {
+                        nick = name.to_owned();
+                    } else if line == "CAP LS 302" {
+                        send.push(":irc.test CAP * LS :sasl account-tag message-tags".to_owned());
+                    } else if let Some(caps) = line.strip_prefix("CAP REQ :") {
+                        send.push(format!(":irc.test CAP * ACK :{caps}"));
+                    } else if line == "AUTHENTICATE PLAIN" {
+                        send.push("AUTHENTICATE +".to_owned());
+                    } else if let Some(payload) = line.strip_prefix("AUTHENTICATE ") {
+                        use base64::Engine;
+                        let plain = base64::engine::general_purpose::STANDARD
+                            .decode(payload)
+                            .unwrap();
+                        let ok = plain == format!("\0{nick}\0{}", server.password).as_bytes();
+                        send.push(format!(
+                            ":irc.test {} {nick} :SASL",
+                            if ok { 903 } else { 904 }
+                        ));
+                    } else if line == "CAP END" {
+                        send.push(format!(":irc.test 001 {nick} :Welcome"));
+                    } else if line.starts_with("JOIN ") {
+                        joined += 1;
+                    } else if let Some(whois) = line.strip_prefix("WHOIS ") {
+                        if let Some(account) = server.accounts.lock().unwrap().get(whois) {
+                            send.push(format!(
+                                ":irc.test 330 {nick} {whois} {account} :is logged in as"
+                            ));
+                        }
+                        send.push(format!(":irc.test 318 {nick} {whois} :End of WHOIS"));
+                    }
+                    if joined == server.channels && line.starts_with("JOIN ") {
+                        send.append(&mut server.script.lock().unwrap());
+                    }
+                    for line in send {
+                        let line = line.replace("{nick}", &nick);
+                        if writer
+                            .write_all(format!("{line}\r\n").as_bytes())
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                }
+            });
+        }
+    });
+    origin
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn irc_answers_signed_in_people_and_checks_nicknames_before_direct_replies() {
+    let nickname = || format!("n{}", &random().replace('-', "")[..10]);
+    let (login, member, friend, moved) = (nickname(), nickname(), nickname(), nickname());
+    let (friend_nick, moved_nick, impostor) = (nickname(), nickname(), nickname());
+    let channel = format!("#{}", nickname());
+    let server = IrcServer {
+        password: random(),
+        channels: 1,
+        ..IrcServer::default()
+    };
+    let (q1, q2, q3) = (random(), random(), random());
+    let token = nickname();
+    server.script.lock().unwrap().extend([
+        // Not signed in to services: no sender, so a group refuses it.
+        format!(":{}!u@h PRIVMSG {channel} :{}", nickname(), random()),
+        format!(
+            "@account={} :m!u@h PRIVMSG {} :\u{1}VERSION\u{1}",
+            member, channel
+        ),
+        format!(
+            "@account={} :m!u@h PRIVMSG {} :{q1}",
+            member.to_uppercase(),
+            channel.to_uppercase()
+        ),
+        format!(
+            "@account={} :o!u@h PRIVMSG {channel} :{}",
+            nickname(),
+            random()
+        ),
+        format!("PING :{token}"),
+        format!("@account={friend} :{friend_nick}!u@h PRIVMSG {{nick}} :{q2}"),
+        format!("@account={moved} :{moved_nick}!u@h PRIVMSG {{nick}} :{q3}"),
+    ]);
+    {
+        let mut accounts = server.accounts.lock().unwrap();
+        accounts.insert(friend_nick.clone(), friend.clone());
+        // Someone else has the nickname by the time the reply is ready.
+        accounts.insert(moved_nick.clone(), impostor);
+    }
+    let origin = serve_irc(server.clone()).await;
+    let (dir, credential, pairing, _anchor) = broker(&origin, &server.password).await;
+    let host = Recorder {
+        root: dir.path().to_owned(),
+        pairing,
+        pairings: Arc::new(watch::Sender::new(0)),
+        threads: Arc::default(),
+        turns: Arc::default(),
+        statuses: Arc::default(),
+        connects: Arc::default(),
+        changed: Arc::default(),
+    };
+    let entry = MessengerConfig {
+        kind: MessengerKind::Irc,
+        login: Some(login.clone()),
+        allowed_chats: BTreeSet::from([channel.clone(), friend.clone(), moved.clone()]),
+        allowed_users: BTreeSet::from([member.clone(), friend.clone(), moved.clone()]),
+        ..config("irc", &origin, &credential, 0)
+    };
+    let name = entry.name.clone();
+    let (_desired, receiver) = watch::channel(vec![Desired {
+        config: entry,
+        run: true,
+    }]);
+    let stop = CancellationToken::new();
+    let supervisor = tokio::spawn(supervise(host.clone(), receiver, FAST, stop.clone()));
+    let has = |line: &str| server.received.lock().unwrap().iter().any(|l| l == line);
+    host.until(|h| {
+        has(&format!("PRIVMSG {friend_nick} :reply to {q2}"))
+            && h.turns.lock().unwrap().len() == 3
+            && h.status(&name).failure.is_some()
+    })
+    .await;
+    let status = host.status(&name);
+    assert_eq!(status.state, MessengerState::Connected);
+    assert_eq!(status.account.as_deref(), Some(login.as_str()));
+    let turns: Vec<String> = host
+        .turns
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(_, t)| t.clone())
+        .collect();
+    assert_eq!(turns, [q1.clone(), q2.clone(), q3.clone()]);
+    assert!(has(&format!("JOIN {channel}")));
+    assert!(has(&format!("PONG :{token}")));
+    assert!(has(&format!("PRIVMSG {channel} :reply to {q1}")));
+    assert!(has(&format!("WHOIS {moved_nick}")));
+    // The nickname now belongs to someone else: nothing is sent to it.
+    assert!(
+        !server
+            .received
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|l| l.starts_with(&format!("PRIVMSG {moved_nick}")))
+    );
+    let failure = status.failure.unwrap();
+    assert!(failure.message.contains(&moved), "{failure:?}");
+    let refused: Vec<_> = status
+        .refused
+        .iter()
+        .map(|r| (r.chat.clone(), r.sender.clone()))
+        .collect();
+    assert_eq!(refused.len(), 2, "{refused:?}");
+    assert!(refused.iter().all(|(chat, _)| *chat == channel));
+    assert!(refused.contains(&(channel.clone(), None)));
+    // The password went only to the broker's sign-in.
+    assert!(
+        !server
+            .received
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|l| l.contains(&server.password))
+    );
+    stop.cancel();
+    supervisor.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn irc_without_a_login_waits_for_the_user() {
+    let server = IrcServer {
+        password: random(),
+        ..IrcServer::default()
+    };
+    let origin = serve_irc(server.clone()).await;
+    let (dir, credential, pairing, _anchor) = broker(&origin, &server.password).await;
+    let host = Recorder {
+        root: dir.path().to_owned(),
+        pairing,
+        pairings: Arc::new(watch::Sender::new(0)),
+        threads: Arc::default(),
+        turns: Arc::default(),
+        statuses: Arc::default(),
+        connects: Arc::default(),
+        changed: Arc::default(),
+    };
+    let entry = MessengerConfig {
+        kind: MessengerKind::Irc,
+        ..config("irc", &origin, &credential, 0)
+    };
+    let name = entry.name.clone();
+    let (_desired, receiver) = watch::channel(vec![Desired {
+        config: entry,
+        run: true,
+    }]);
+    let stop = CancellationToken::new();
+    let supervisor = tokio::spawn(supervise(host.clone(), receiver, FAST, stop.clone()));
+    host.until(|h| h.status(&name).state == MessengerState::Failed)
+        .await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(host.connects(&name), 1);
+    assert!(server.received.lock().unwrap().is_empty());
+    stop.cancel();
+    supervisor.await.unwrap();
+}

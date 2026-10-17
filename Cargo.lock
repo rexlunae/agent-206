@@ -15,25 +15,30 @@ dependencies = [
 name = "a206-broker"
 version = "0.1.0"
 dependencies = [
+ "a206-core",
  "a206-protocol",
  "a206-vault",
  "axum",
+ "base64 0.22.1",
  "fs2",
  "futures-util",
  "nix 0.31.3",
  "reqwest",
+ "rustls",
  "serde",
  "serde_bytes",
  "serde_json",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
+ "tokio-rustls",
  "tokio-tungstenite 0.28.0",
  "tokio-util",
  "totp-rs",
  "tracing",
  "url",
  "uuid",
+ "webpki-roots 1.0.9",
  "zeroize",
 ]
 

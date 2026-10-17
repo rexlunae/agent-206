@@ -56,8 +56,11 @@ pub struct Options {
     /// events with (Slack's xapp- token).
     #[arg(long)]
     app_credential: Option<String>,
+    /// Account name the bot signs in with (IRC: its registered nickname).
+    #[arg(long)]
+    login: Option<String>,
     /// API base URL, when not the service's official endpoint. Required for
-    /// Matrix: the homeserver's client API origin.
+    /// Matrix (the homeserver's client API origin) and IRC (ircs://host:port).
     #[arg(long)]
     endpoint: Option<String>,
     /// Provider id for new chat threads; requires --model.
@@ -77,6 +80,9 @@ impl Options {
         }
         if let Some(credential) = self.app_credential {
             config.app_credential = Some(credential);
+        }
+        if let Some(login) = self.login {
+            config.login = Some(login);
         }
         if let Some(endpoint) = self.endpoint {
             config.endpoint = Some(endpoint);
@@ -117,6 +123,16 @@ fn entry<'a>(settings: &'a mut Settings, name: &str) -> Result<&'a mut Messenger
     }
 }
 
+/// A chat or sender as the messenger compares it: IRC names fold the way
+/// the network compares them, so `#Rust` allows `#rust`.
+fn fold(entry: &MessengerConfig, name: String) -> String {
+    if entry.kind.is_irc() {
+        a206_core::messengers::irc_lowercase(&name)
+    } else {
+        name
+    }
+}
+
 /// The settings `action` saves, or `None` for actions that are not edits.
 fn edit(mut settings: Settings, action: MessengerAction) -> Result<Option<Settings>> {
     match action {
@@ -140,18 +156,26 @@ fn edit(mut settings: Settings, action: MessengerAction) -> Result<Option<Settin
         MessengerAction::Enable { name } => entry(&mut settings, &name)?.enabled = true,
         MessengerAction::Disable { name } => entry(&mut settings, &name)?.enabled = false,
         MessengerAction::Allow { name, chat } => {
-            entry(&mut settings, &name)?.allowed_chats.insert(chat);
+            let entry = entry(&mut settings, &name)?;
+            let chat = fold(entry, chat);
+            entry.allowed_chats.insert(chat);
         }
         MessengerAction::Disallow { name, chat } => {
-            if !entry(&mut settings, &name)?.allowed_chats.remove(&chat) {
+            let entry = entry(&mut settings, &name)?;
+            let chat = fold(entry, chat);
+            if !entry.allowed_chats.remove(&chat) {
                 bail!("{name} does not allow chat {chat}");
             }
         }
         MessengerAction::AllowSender { name, sender } => {
-            entry(&mut settings, &name)?.allowed_users.insert(sender);
+            let entry = entry(&mut settings, &name)?;
+            let sender = fold(entry, sender);
+            entry.allowed_users.insert(sender);
         }
         MessengerAction::DisallowSender { name, sender } => {
-            if !entry(&mut settings, &name)?.allowed_users.remove(&sender) {
+            let entry = entry(&mut settings, &name)?;
+            let sender = fold(entry, sender);
+            if !entry.allowed_users.remove(&sender) {
                 bail!("{name} does not allow sender {sender}");
             }
         }
@@ -212,6 +236,7 @@ mod tests {
         Options {
             credential: Some(random()),
             app_credential: None,
+            login: None,
             endpoint: None,
             provider: None,
             model: None,
@@ -326,5 +351,46 @@ mod tests {
             options.mode = Some(random());
         }
         assert!(edit(Settings::default(), action).is_err());
+    }
+
+    #[test]
+    fn irc_entries_take_a_login_and_fold_names_like_the_network() {
+        let (name, login) = (random(), random());
+        let action = MessengerAction::Add {
+            name: name.clone(),
+            kind: "irc".into(),
+            options: Options {
+                login: Some(login.clone()),
+                ..options()
+            },
+        };
+        let settings = edit(Settings::default(), action).unwrap().unwrap();
+        assert_eq!(settings.messengers[0].kind, MessengerKind::Irc);
+        assert_eq!(settings.messengers[0].login, Some(login));
+        let chat = format!("#{}", random().to_uppercase());
+        let allow = MessengerAction::Allow {
+            name: name.clone(),
+            chat: chat.clone(),
+        };
+        let settings = edit(settings, allow).unwrap().unwrap();
+        assert!(
+            settings.messengers[0]
+                .allowed_chats
+                .contains(&chat.to_lowercase())
+        );
+        let sender = random().to_uppercase();
+        let allow = MessengerAction::AllowSender {
+            name: name.clone(),
+            sender: sender.clone(),
+        };
+        let settings = edit(settings, allow).unwrap().unwrap();
+        assert!(
+            settings.messengers[0]
+                .allowed_users
+                .contains(&sender.to_lowercase())
+        );
+        let disallow = MessengerAction::Disallow { name, chat };
+        let settings = edit(settings, disallow).unwrap().unwrap();
+        assert!(settings.messengers[0].allowed_chats.is_empty());
     }
 }

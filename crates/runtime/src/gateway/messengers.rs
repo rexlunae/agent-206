@@ -23,15 +23,23 @@ pub(super) fn validate(messengers: &[MessengerConfig]) -> Result<()> {
             GatewayError::Invalid("messenger names must be unique"),
         )?;
         let endpoint = messenger.endpoint().ok_or(GatewayError::Invalid(
-            "this messenger needs the URL of its server (for Matrix, the homeserver)",
+            "this messenger needs the URL of its server (for Matrix, the homeserver; for IRC, ircs://host:port)",
         ))?;
-        let endpoint = a206_core::providers::base_url(endpoint)?;
-        // The broker puts a Telegram token in the first path segment, so a
-        // base path would move behind it; every kind keeps to an origin.
-        check(
-            endpoint.path() == "/",
-            GatewayError::Invalid("a messenger endpoint is an origin, without a path"),
-        )?;
+        if messenger.kind.is_irc() {
+            validate_irc(messenger, endpoint)?;
+        } else {
+            let endpoint = a206_core::providers::base_url(endpoint)?;
+            // The broker puts a Telegram token in the first path segment, so a
+            // base path would move behind it; every kind keeps to an origin.
+            check(
+                endpoint.path() == "/",
+                GatewayError::Invalid("a messenger endpoint is an origin, without a path"),
+            )?;
+            check(
+                messenger.login.is_none(),
+                GatewayError::Invalid("only IRC messengers sign in with a login"),
+            )?;
+        }
         check(
             messenger.credential.as_deref().is_none_or(field),
             GatewayError::Invalid("invalid messenger credential name"),
@@ -51,6 +59,45 @@ pub(super) fn validate(messengers: &[MessengerConfig]) -> Result<()> {
             GatewayError::Invalid("a messenger allows at most 256 senders with valid ids"),
         )?;
     }
+    Ok(())
+}
+
+/// An IRC entry names a TLS server and a nickname, and allows channels and
+/// services accounts written as the network compares them, so a listed name
+/// always matches and always stays one command parameter.
+fn validate_irc(messenger: &MessengerConfig, endpoint: &str) -> Result<()> {
+    use a206_core::messengers::{IrcServer, irc_lowercase, valid_irc_channel, valid_irc_nick};
+    IrcServer::parse(endpoint).map_err(GatewayError::IrcServer)?;
+    check(
+        messenger.login.as_deref().is_some_and(valid_irc_nick),
+        GatewayError::Invalid(
+            "an IRC messenger needs a login: the bot's registered nickname (letters, digits and []\\^_`{|}-, at most 32)",
+        ),
+    )?;
+    check(
+        messenger
+            .allowed_chats
+            .iter()
+            .all(|chat| valid_irc_channel(chat) || valid_irc_nick(chat)),
+        GatewayError::Invalid(
+            "IRC chats are channels (#name) or, for direct messages, services account names",
+        ),
+    )?;
+    check(
+        messenger
+            .allowed_users
+            .iter()
+            .all(|user| valid_irc_nick(user)),
+        GatewayError::Invalid("IRC senders are services account names"),
+    )?;
+    check(
+        messenger
+            .allowed_chats
+            .iter()
+            .chain(&messenger.allowed_users)
+            .all(|name| irc_lowercase(name) == *name),
+        GatewayError::Invalid("write IRC channels and account names in lowercase"),
+    )?;
     Ok(())
 }
 
