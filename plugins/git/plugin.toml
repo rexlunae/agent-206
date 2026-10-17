@@ -1,9 +1,9 @@
 id = "agent206.git"
 name = "Git"
-description = "Shows the status, history and diffs of a project's git repository, without running anything the repository configures."
+description = "Shows the status, history and diffs of a project's git repository and commits named files, without running anything the repository configures."
 version = "0.1.0"
 abi = 2
-capabilities = ["git_read"]
+capabilities = ["git_read", "git_write"]
 
 [[tools]]
 name = "git_status"
@@ -35,3 +35,20 @@ required = true
 name = "staged"
 type = "boolean"
 description = "Diff the staged change instead of the unstaged one. Defaults to false."
+
+[[tools]]
+name = "git_commit"
+description = "Commit the current working-tree content of exactly the named files on top of HEAD, like `git commit --only`. A named file that no longer exists is removed. Other staged changes stay staged. Refused when the repository signs commits, has commit hooks, is mid-merge or has no user.name and user.email."
+capabilities = ["git_write"]
+
+[[tools.params]]
+name = "message"
+type = "string"
+description = "The commit message."
+required = true
+
+[[tools.params]]
+name = "paths"
+type = "string"
+description = "Files to commit, one per line, relative to the repository root."
+required = true

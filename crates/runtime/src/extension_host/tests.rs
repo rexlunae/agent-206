@@ -4,6 +4,7 @@ use super::*;
 
 mod fetch;
 mod git;
+mod git_commit;
 use a206_extensions::abi::{EntryKind, SearchMatch};
 
 fn store() -> (tempfile::TempDir, Arc<Mutex<Store>>) {
@@ -48,6 +49,9 @@ fn calls_for(
         store: Arc::clone(store),
         hosts: Vec::new(),
         net: Arc::new(crate::network::Internet),
+        // Tests never read the machine's own git configuration.
+        user_git: || Ok(super::git_commit::UserGit::default()),
+        deadline: tokio::time::Instant::now() + TIMEOUT,
         source: PluginSource::Bundled,
         logs: 0,
         last_failure: None,

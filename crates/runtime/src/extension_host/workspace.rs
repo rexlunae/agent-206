@@ -255,7 +255,7 @@ fn is_git(name: impl AsRef<std::ffi::OsStr>) -> bool {
 /// replace cannot interleave with another extension's write. Writes run on
 /// blocking threads and never hold it across an `.await`.
 static WRITES: std::sync::Mutex<()> = std::sync::Mutex::new(());
-fn write_lock() -> std::sync::MutexGuard<'static, ()> {
+pub(super) fn write_lock() -> std::sync::MutexGuard<'static, ()> {
     // The lock guards no data, so a panic while held leaves nothing torn.
     WRITES
         .lock()
@@ -332,6 +332,58 @@ pub(super) fn read_worktree(root: PathBuf, path: &str) -> Result<Option<Vec<u8>>
             Err(failure) => Err(failure),
         },
     }
+}
+/// A working-tree file as a commit records it.
+pub(super) enum Tracked {
+    File { bytes: Vec<u8>, executable: bool },
+    Link(Vec<u8>),
+}
+/// The file at `path` as git would commit it, reached without following a
+/// symbolic link anywhere on the way; `None` when nothing is there.
+pub(super) fn tracked(root: PathBuf, path: &str) -> Result<Option<Tracked>, HostFailure> {
+    use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
+    let (directory, name) = match writable(root, path) {
+        Err(failure) if failure.code == HostErrorCode::NotFound => return Ok(None),
+        found => found?,
+    };
+    let metadata = match directory.symlink_metadata(&name) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        found => found.map_err(|e| io_failure(&e))?,
+    };
+    if metadata.is_symlink() {
+        let target = directory
+            .read_link_contents(&name)
+            .map_err(|e| io_failure(&e))?;
+        return Ok(Some(Tracked::Link(
+            target.into_os_string().into_encoded_bytes(),
+        )));
+    }
+    if !metadata.is_file() {
+        return Err(not_regular());
+    }
+    let mut options = OpenOptions::new();
+    options.read(true).follow(FollowSymlinks::No);
+    #[cfg(unix)]
+    {
+        use cap_std::fs::OpenOptionsExt;
+        options.custom_flags(nix::fcntl::OFlag::O_NONBLOCK.bits());
+    }
+    let file = directory
+        .open_with(&name, &options)
+        .map_err(|e| io_failure(&e))?;
+    let metadata = file.metadata().map_err(|e| io_failure(&e))?;
+    if !metadata.is_file() {
+        return Err(not_regular());
+    }
+    #[cfg(unix)]
+    let executable = {
+        use cap_std::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    };
+    #[cfg(not(unix))]
+    let executable = false;
+    let bytes = read_bounded(file)?.ok_or_else(too_large)?;
+    Ok(Some(Tracked::File { bytes, executable }))
 }
 /// The parent directory and file name of a path the guest may write.
 fn writable(root: PathBuf, path: &str) -> Result<(Dir, String), HostFailure> {
