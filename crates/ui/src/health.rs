@@ -1,9 +1,13 @@
 //! The Gateway page's health checks: the same read-only report as
-//! `agent206 doctor`, for the desktop and terminal clients. Running the
-//! checks starts nothing and changes nothing.
+//! `agent206 doctor`. Desktop and terminal clients run the checks themselves;
+//! the web client asks its bridge, which checks the profile, gateway and vault
+//! broker on its own computer. Running the checks starts nothing and changes
+//! nothing.
 use crate::error::{ErrorNotice, record};
-use a206_core::ErrorReport;
-use a206_runtime::doctor::{DoctorReport, Health as Level};
+use a206_core::{
+    ErrorReport,
+    doctor::{DoctorReport, Health as Level},
+};
 use fc_dioxus::prelude::*;
 
 fn tone(level: Level) -> BadgeTone {
@@ -23,23 +27,31 @@ fn label(level: Level) -> &'static str {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+async fn check() -> Result<DoctorReport, ErrorReport> {
+    let Some((root, remote)) = crate::PROFILE.lock().ok().and_then(|p| p.clone()) else {
+        return Err(ErrorReport::new(
+            a206_core::ErrorKind::Unavailable,
+            "this client was started without a profile",
+        ));
+    };
+    a206_runtime::doctor::check_detached(root, remote)
+        .await
+        .map_err(|error| a206_runtime::error::report(&error))
+}
+#[cfg(target_arch = "wasm32")]
+async fn check() -> Result<DoctorReport, ErrorReport> {
+    crate::web_request("/api/health", ()).await
+}
+
 #[component]
 pub(crate) fn HealthChecks() -> Element {
     let mut report = use_signal(|| None::<Result<DoctorReport, ErrorReport>>);
     let mut running = use_signal(|| false);
     let run = move |_| {
-        let Some((root, remote)) = crate::PROFILE.lock().ok().and_then(|p| p.clone()) else {
-            report.set(Some(Err(ErrorReport::new(
-                a206_core::ErrorKind::Unavailable,
-                "this client was started without a profile",
-            ))));
-            return;
-        };
         running.set(true);
         spawn(async move {
-            let result = a206_runtime::doctor::check_detached(root, remote)
-                .await
-                .map_err(|error| a206_runtime::error::report(&error));
+            let result = check().await;
             if let Err(error) = &result {
                 record("doctor", error);
             }
@@ -51,7 +63,7 @@ pub(crate) fn HealthChecks() -> Element {
         CardHeader { CardTitle { "Health checks" } }
         CardBody {
             match &*report.read() {
-                None => rsx! { p { class: "a206-muted", "Check the profile, gateway, vault broker and provider accounts. Nothing is started or changed." } },
+                None => rsx! { p { class: "a206-muted", if cfg!(target_arch = "wasm32") { "Check the web server's profile, gateway, vault broker and provider accounts. Nothing is started or changed." } else { "Check the profile, gateway, vault broker and provider accounts. Nothing is started or changed." } } },
                 Some(Err(error)) => rsx! { ErrorNotice { report: error.clone(), title: "Health checks could not run".to_string() } },
                 Some(Ok(report)) => rsx! {
                     ul { class: "a206-stack", aria_label: "Health check results",

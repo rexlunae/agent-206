@@ -161,6 +161,9 @@ fn ExtensionCard(plugin: PluginSummary, onopen: EventHandler<Open>) -> Element {
                 for capability in plugin.capabilities.iter().copied() {
                     ExtensionSwitch { key: "{capability:?}", extension: id.clone(), capability: Some(capability) }
                 }
+                if !plugin.hosts.is_empty() {
+                    p { class: "a206-muted", "{network_destinations(&plugin.hosts)}" }
+                }
             }
             if !plugin.tools.is_empty() {
                 p { class: "a206-eyebrow", "Tools for agents" }
@@ -182,6 +185,15 @@ fn ExtensionCard(plugin: PluginSummary, onopen: EventHandler<Open>) -> Element {
             }
         }
     } }
+}
+
+/// Where an extension's network permission may connect, as the user reads it.
+fn network_destinations(hosts: &[String]) -> String {
+    if hosts.iter().any(|host| host == "*") {
+        "Network: any public HTTPS site; private and local addresses are always refused.".into()
+    } else {
+        format!("Network: only {}", hosts.join(", "))
+    }
 }
 
 /// Render panel nodes with fc-dioxus components. Text is always text.

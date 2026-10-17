@@ -1,5 +1,5 @@
 //! Read-only health checks shared by `agent206 doctor`, `agent206 setup` and
-//! the desktop and terminal clients: the profile directory, the configured
+//! the desktop, terminal and web clients: the profile directory, the configured
 //! gateway, the vault broker and each provider account.
 //!
 //! [`gather`] collects facts without starting a gateway or broker, unlocking
@@ -10,302 +10,9 @@ use a206_core::{
     ErrorReport, GatewayPhase, GatewayReport, GatewayTarget, ProviderConfig, Reply, Snapshot,
 };
 use a206_vault::{CredentialKind, CredentialMeta};
-use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Health {
-    Ok,
-    /// Works, but weaker or less complete than it should be.
-    Warning,
-    /// Not known from here; never reported as healthy.
-    Unknown,
-    /// Something the user must fix before this part works.
-    Problem,
-}
-
-/// What a check found. Each variant carries the facts it is about, so
-/// clients can match on it; [`std::fmt::Display`] is its user-facing text.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "finding", rename_all = "snake_case")]
-pub enum Finding {
-    ProfileMissing {
-        path: PathBuf,
-    },
-    ProfileOpen {
-        path: PathBuf,
-        mode: u32,
-    },
-    ProfileReady {
-        path: PathBuf,
-    },
-    GatewayNotConfigured,
-    GatewaySetupInvalid,
-    GatewayRunning {
-        target: String,
-        version: String,
-    },
-    GatewayStopped {
-        target: String,
-    },
-    GatewayOffline {
-        target: String,
-    },
-    /// The vault broker runs on the gateway host; check it there.
-    VaultRemote {
-        target: String,
-    },
-    /// This platform has no vault broker yet.
-    VaultUnsupported,
-    VaultMissing,
-    VaultBrokerStopped,
-    VaultBrokerUnreachable,
-    VaultFileOpen {
-        mode: u32,
-    },
-    VaultLocked,
-    VaultUnlocked,
-    TotpEnrolled,
-    TotpNotEnrolled,
-    TotpUnknown,
-    PairingActive,
-    PairingMissing,
-    PairingUnknown,
-    WorkspaceUnknown,
-    NoProviders,
-    ProviderReady {
-        label: String,
-        models: usize,
-    },
-    ProviderCredentialMissing {
-        label: String,
-        credential: String,
-    },
-    ProviderCredentialUntyped {
-        label: String,
-        credential: String,
-    },
-    ProviderCredentialDisabled {
-        label: String,
-        credential: String,
-    },
-    ProviderCredentialKind {
-        label: String,
-        credential: String,
-    },
-    ProviderCredentialUnbound {
-        label: String,
-        credential: String,
-        origin: String,
-    },
-    ProviderCredentialUnknown {
-        label: String,
-        credential: String,
-    },
-    ProviderEndpointInvalid {
-        label: String,
-    },
-    ProviderNoCatalog {
-        label: String,
-    },
-    ProviderCatalogStale {
-        label: String,
-        models: usize,
-    },
-}
-
-impl Finding {
-    pub fn health(&self) -> Health {
-        use Finding::*;
-        match self {
-            ProfileReady { .. }
-            | GatewayRunning { .. }
-            | VaultUnlocked
-            | TotpEnrolled
-            | PairingActive
-            | ProviderReady { .. } => Health::Ok,
-            ProfileOpen { .. }
-            | GatewayStopped { .. }
-            | VaultLocked
-            | VaultBrokerStopped
-            | TotpNotEnrolled
-            | ProviderCatalogStale { .. }
-            | ProviderNoCatalog { .. } => Health::Warning,
-            VaultRemote { .. }
-            | VaultUnsupported
-            | TotpUnknown
-            | PairingUnknown
-            | WorkspaceUnknown
-            | ProviderCredentialUnknown { .. } => Health::Unknown,
-            ProfileMissing { .. }
-            | GatewayNotConfigured
-            | GatewaySetupInvalid
-            | GatewayOffline { .. }
-            | VaultMissing
-            | VaultBrokerUnreachable
-            | VaultFileOpen { .. }
-            | PairingMissing
-            | NoProviders
-            | ProviderCredentialMissing { .. }
-            | ProviderCredentialUntyped { .. }
-            | ProviderCredentialDisabled { .. }
-            | ProviderCredentialKind { .. }
-            | ProviderCredentialUnbound { .. }
-            | ProviderEndpointInvalid { .. } => Health::Problem,
-        }
-    }
-
-    /// The command that addresses this finding, when one exists.
-    pub fn recovery(&self) -> Option<String> {
-        use Finding::*;
-        Some(match self {
-            ProfileMissing { .. } | GatewayNotConfigured => {
-                "agent206 setup --local (or --ssh ssh://user@host)".into()
-            }
-            ProfileOpen { path, .. } => format!("chmod 700 {}", path.display()),
-            GatewaySetupInvalid => "agent206 gateway setup --local (or --ssh ...)".into(),
-            GatewayStopped { .. } => "agent206 gateway start".into(),
-            GatewayOffline { .. } => "agent206 gateway status".into(),
-            VaultRemote { target } => format!("agent206 doctor (run on {target})"),
-            VaultMissing => "agent206 setup, or agent206 import rustyclaw --apply".into(),
-            VaultBrokerStopped | VaultLocked => "agent206 vault unlock".into(),
-            VaultBrokerUnreachable => "agent206 vault stop, then agent206 vault unlock".into(),
-            VaultFileOpen { .. } => "chmod 600 the vault file and 700 its directory".into(),
-            TotpNotEnrolled => "agent206 vault totp enroll".into(),
-            PairingMissing => "agent206 vault pair".into(),
-            NoProviders => "agent206 providers presets, then agent206 providers add".into(),
-            ProviderCredentialMissing { credential, .. } => {
-                format!("agent206 vault add {credential} --destination <provider origin>")
-            }
-            ProviderCredentialUntyped { credential, .. } => {
-                format!("agent206 vault adopt {credential} --destination <provider origin>")
-            }
-            ProviderCredentialDisabled { credential, .. } => {
-                format!("agent206 vault enable {credential}")
-            }
-            ProviderCredentialUnbound {
-                credential, origin, ..
-            } => format!("agent206 vault bind {credential} {origin}"),
-            ProviderCredentialUnknown { .. } => "agent206 vault unlock".into(),
-            ProviderNoCatalog { .. } | ProviderCatalogStale { .. } => {
-                "agent206 refresh-models <provider id>".into()
-            }
-            _ => return None,
-        })
-    }
-}
-
-impl std::fmt::Display for Finding {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        use Finding::*;
-        match self {
-            ProfileMissing { path } => write!(f, "profile {} does not exist yet", path.display()),
-            ProfileOpen { path, mode } => write!(
-                f,
-                "profile {} is readable by other users (mode {mode:o})",
-                path.display()
-            ),
-            ProfileReady { path } => write!(f, "profile {} is private", path.display()),
-            GatewayNotConfigured => f.write_str("no gateway is configured for this profile"),
-            GatewaySetupInvalid => f.write_str("the saved gateway setup cannot be used"),
-            GatewayRunning { target, version } => {
-                write!(f, "gateway {target} is running version {version}")
-            }
-            GatewayStopped { target } => write!(f, "gateway {target} is stopped"),
-            GatewayOffline { target } => write!(f, "gateway {target} cannot be reached"),
-            VaultRemote { target } => write!(
-                f,
-                "the vault broker runs on {target}; check it on that host"
-            ),
-            VaultUnsupported => f.write_str("vault controls are not available on this platform"),
-            VaultMissing => f.write_str("no vault has been created"),
-            VaultBrokerStopped => f.write_str("the vault broker is not running"),
-            VaultBrokerUnreachable => f.write_str("the vault broker did not answer"),
-            VaultFileOpen { mode } => {
-                write!(
-                    f,
-                    "the vault file is readable by other users (mode {mode:o})"
-                )
-            }
-            VaultLocked => f.write_str("the vault is locked"),
-            VaultUnlocked => f.write_str("the vault is unlocked"),
-            TotpEnrolled => f.write_str("two-factor authentication is enrolled"),
-            TotpNotEnrolled => f.write_str("two-factor authentication is not enrolled"),
-            TotpUnknown => {
-                f.write_str("two-factor enrollment is unknown while the vault is locked")
-            }
-            PairingActive => f.write_str("the gateway is paired with the unlocked vault"),
-            PairingMissing => {
-                f.write_str("the gateway is not paired with the vault, so credentials are unusable")
-            }
-            PairingUnknown => f.write_str("gateway pairing is unknown"),
-            WorkspaceUnknown => {
-                f.write_str("provider accounts are unknown until the gateway is running")
-            }
-            NoProviders => f.write_str("no provider account is configured"),
-            ProviderReady { label, models } => {
-                write!(f, "{label}: ready, {models} models from its API")
-            }
-            ProviderCredentialMissing { label, credential } => {
-                write!(f, "{label}: credential {credential} is not in the vault")
-            }
-            ProviderCredentialUntyped { label, credential } => write!(
-                f,
-                "{label}: credential {credential} is an untyped entry from an older vault"
-            ),
-            ProviderCredentialDisabled { label, credential } => {
-                write!(f, "{label}: credential {credential} is disabled")
-            }
-            ProviderCredentialKind { label, credential } => write!(
-                f,
-                "{label}: credential {credential} is not an API key or token"
-            ),
-            ProviderCredentialUnbound {
-                label,
-                credential,
-                origin,
-            } => write!(
-                f,
-                "{label}: credential {credential} may not be sent to {origin}"
-            ),
-            ProviderCredentialUnknown { label, credential } => write!(
-                f,
-                "{label}: credential {credential} cannot be checked while the vault is locked"
-            ),
-            ProviderEndpointInvalid { label } => write!(f, "{label}: endpoint is not a valid URL"),
-            ProviderNoCatalog { label } => write!(f, "{label}: no model catalog from its API yet"),
-            ProviderCatalogStale { label, models } => {
-                write!(f, "{label}: model catalog ({models} models) has expired")
-            }
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Check {
-    pub health: Health,
-    #[serde(flatten)]
-    pub finding: Finding,
-    /// The failure behind the finding, kept structured for display.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub error: Option<ErrorReport>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct DoctorReport {
-    pub checks: Vec<Check>,
-}
-impl DoctorReport {
-    /// The worst health of any check; `Ok` for an empty report.
-    pub fn health(&self) -> Health {
-        self.checks
-            .iter()
-            .map(|check| check.health)
-            .max()
-            .unwrap_or(Health::Ok)
-    }
-}
+pub use a206_core::doctor::{Check, DoctorReport, Finding, Health};
 
 /// What the broker said, or why it could not be asked.
 #[derive(Debug, Clone, PartialEq)]
@@ -578,18 +285,11 @@ async fn broker(_root: &Path) -> BrokerFacts {
 /// Ask the broker, never starting one. A missing socket is a stopped broker.
 #[cfg(unix)]
 async fn broker(root: &Path) -> BrokerFacts {
-    use a206_broker::{Client, ClientError, Reply as BrokerReply, Request, Role};
+    use a206_broker::{Reply as BrokerReply, Request};
     let vault_mode = mode(&a206_broker::vault_path(root));
-    let mut client = match Client::connect(root, Role::User).await {
-        Ok(client) => client,
-        Err(ClientError::Io(error))
-            if matches!(
-                error.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
-            ) =>
-        {
-            return BrokerFacts::Stopped { vault_mode };
-        }
+    let mut client = match crate::vault::connect_running(root).await {
+        Ok(Some(client)) => client,
+        Ok(None) => return BrokerFacts::Stopped { vault_mode },
         Err(error) => return BrokerFacts::Unreachable(crate::error::handle("doctor", &error)),
     };
     let status = match client.call(Request::Status).await {
@@ -621,6 +321,17 @@ async fn broker(root: &Path) -> BrokerFacts {
 pub async fn gather(root: &Path, remote: Option<String>, now: u64) -> Facts {
     let target = crate::connection::resolve(root, remote)
         .map_err(|error| crate::error::handle("doctor", &error));
+    gather_for(root, target, now).await
+}
+
+/// Collect facts for `target`, already resolved by a client that keeps its
+/// own active gateway (the web bridge), so a setup file saved since by
+/// another client is not consulted.
+pub async fn gather_for(
+    root: &Path,
+    target: Result<Option<GatewayTarget>, ErrorReport>,
+    now: u64,
+) -> Facts {
     let mut gateway = None;
     let mut snapshot = None;
     if let Ok(Some(target)) = &target {
