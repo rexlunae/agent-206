@@ -8,7 +8,8 @@
 //! cannot widen its own authority or approve a call.
 //!
 //! The WASM extension adapter (`crate::extension_tools`), the MCP client
-//! adapter (`crate::mcp_tools`) and native exec (`crate::exec_tool`) are
+//! adapter (`crate::mcp_tools`), native command execution
+//! (`crate::exec_tool`) and approved skills (`crate::skill_tool`) are
 //! registered by default.
 use a206_core::{
     Capability, ErrorKind, ErrorReport, Id, Thread, ToolList, ToolOffer, ToolPermission,

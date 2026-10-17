@@ -77,12 +77,12 @@ pub enum ToolError {
     )]
     Capacity { bytes: usize },
     #[error(
-        "{tool} returned {bytes} bytes, more than the {room} that fit; its output is only useful whole, so none of it was kept"
+        "tool `{tool}` returned {bytes} bytes, exceeding the available {limit}-byte output budget; its output is only useful whole, so none of it was delivered"
     )]
-    OutputTooLarge {
+    CompleteOutput {
         tool: String,
         bytes: usize,
-        room: usize,
+        limit: usize,
     },
 }
 impl crate::error::Classified for ToolError {
@@ -92,7 +92,7 @@ impl crate::error::Classified for ToolError {
             Self::Denied(_) | Self::Capability { .. } | Self::Rejected | Self::Revoked(_) => {
                 ErrorKind::PermissionDenied
             }
-            Self::Capacity { .. } | Self::OutputTooLarge { .. } => ErrorKind::Storage,
+            Self::Capacity { .. } | Self::CompleteOutput { .. } => ErrorKind::Storage,
             Self::Cancelled => ErrorKind::Cancelled,
             Self::Duplicate => ErrorKind::Conflict,
             Self::Reported(_) => ErrorKind::Other,
@@ -788,23 +788,8 @@ impl Gateway {
             &call,
             changed,
             |_, record, room| match result {
-                Ok(output)
-                    if routed.spec.whole_output
-                        && output.text.len() > room.min(tools::MAX_OUTPUT) =>
-                {
-                    settle(
-                        record,
-                        ToolCallState::Failed,
-                        &ToolError::OutputTooLarge {
-                            tool: record.tool.clone(),
-                            bytes: output.text.len(),
-                            room: room.min(tools::MAX_OUTPUT),
-                        },
-                    )
-                }
                 Ok(output) if !output.is_error => {
-                    record.state = ToolCallState::Succeeded;
-                    record.output = Some(bounded_output(output.text, room));
+                    finish_success(record, output.text, room, routed.spec.whole_output)
                 }
                 Ok(output) => {
                     let text = bounded_output(output.text, room);
@@ -972,4 +957,74 @@ fn settle(call: &mut ToolCall, state: ToolCallState, why: &ToolError) {
     call.state = state;
     call.output = Some(report.detail());
     call.error = Some(report);
+}
+
+/// A tool whose output is only useful whole ([`ToolSpec::whole_output`], such
+/// as skill instructions) fails rather than being cut. Available storage can
+/// be smaller than the global output cap, so both bounds are checked at
+/// settlement time.
+fn finish_success(record: &mut ToolCall, text: String, room: usize, whole: bool) {
+    let limit = room.min(tools::MAX_OUTPUT);
+    if whole && text.len() > limit {
+        settle(
+            record,
+            ToolCallState::Failed,
+            &ToolError::CompleteOutput {
+                tool: record.tool.clone(),
+                bytes: text.len(),
+                limit,
+            },
+        );
+    } else {
+        record.state = ToolCallState::Succeeded;
+        record.output = Some(bounded_output(text, room));
+    }
+}
+#[cfg(test)]
+mod output_tests {
+    use super::*;
+    fn record(name: &str) -> ToolCall {
+        ToolCall {
+            id: Id::new_v4().to_string(),
+            generated_id: false,
+            tool: name.into(),
+            arguments: "{}".into(),
+            digest: String::new(),
+            healed: false,
+            state: ToolCallState::Running,
+            output: None,
+            error: None,
+            signature: None,
+        }
+    }
+    #[test]
+    fn complete_skill_results_fail_when_conversation_room_is_smaller() {
+        let text = Id::new_v4().to_string();
+        for name in [crate::skill_tool::INFO, crate::skill_tool::LIST] {
+            let mut call = record(name);
+            finish_success(&mut call, text.clone(), text.len() - 1, true);
+            assert_eq!(call.state, ToolCallState::Failed);
+            assert_eq!(call.error.as_ref().unwrap().kind, ErrorKind::Storage);
+            assert!(!call.output.as_ref().unwrap().contains(&text));
+            let mut call = record(name);
+            finish_success(&mut call, text.clone(), text.len(), true);
+            assert_eq!(call.state, ToolCallState::Succeeded);
+            assert_eq!(call.output, Some(text.clone()));
+        }
+    }
+    #[test]
+    fn complete_results_obey_global_limit_and_other_tools_keep_excerpting() {
+        let mut skill = record(crate::skill_tool::INFO);
+        finish_success(
+            &mut skill,
+            "x".repeat(tools::MAX_OUTPUT + 1),
+            usize::MAX,
+            true,
+        );
+        assert_eq!(skill.state, ToolCallState::Failed);
+        let mut ordinary = record("other_tool");
+        finish_success(&mut ordinary, "1234567890".into(), 5, false);
+        assert_eq!(ordinary.state, ToolCallState::Succeeded);
+        assert!(ordinary.output.unwrap().contains("truncated"));
+    }
 }

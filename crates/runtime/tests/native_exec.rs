@@ -1,8 +1,9 @@
-//! The native `execute_command` tool through the real OS sandbox. The harness
-//! is custom because on Linux this binary is re-run as the sandbox's helper.
-#[cfg(target_os = "linux")]
+//! The native `execute_command` tool through the real OS sandbox (bubblewrap
+//! and Landlock on Linux, Seatbelt on macOS). The harness is custom because on
+//! Linux this binary is re-run as the sandbox's helper.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use a206_core::{Capability, ErrorKind, Id};
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use a206_runtime::{
     exec_tool::{ExecHost, MAX_STREAM, NAME},
     tools::{ToolHost, ToolOutput, ToolRequest, ToolScope},
@@ -12,7 +13,7 @@ fn main() -> std::process::ExitCode {
     if let Some(result) = a206_sandbox::dispatch() {
         return result.expect("sandbox helper could not report to the gateway");
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(commands_hold_only_the_conversations_grants());
@@ -23,7 +24,7 @@ fn main() -> std::process::ExitCode {
     std::process::ExitCode::SUCCESS
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn scope(workspace: Option<&std::path::Path>, capabilities: &[Capability]) -> ToolScope {
     ToolScope {
         thread: Id::new_v4(),
@@ -32,7 +33,7 @@ fn scope(workspace: Option<&std::path::Path>, capabilities: &[Capability]) -> To
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 async fn run(
     host: &ExecHost,
     scope: &ToolScope,
@@ -53,14 +54,14 @@ async fn run(
     .await
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 async fn sh(host: &ExecHost, scope: &ToolScope, command: &str) -> ToolOutput {
     run(host, scope, serde_json::json!({ "command": command }))
         .await
         .unwrap()
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 async fn commands_hold_only_the_conversations_grants() {
     let state = tempfile::tempdir().unwrap();
     let host = ExecHost::new(state.path());
@@ -156,7 +157,7 @@ async fn commands_hold_only_the_conversations_grants() {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 async fn network_follows_the_grant() {
     let state = tempfile::tempdir().unwrap();
     let host = ExecHost::new(state.path());
@@ -175,7 +176,7 @@ async fn network_follows_the_grant() {
     assert!(!online.is_error, "{}", online.text);
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 async fn output_status_and_time_are_bounded() {
     let state = tempfile::tempdir().unwrap();
     let host = ExecHost::new(state.path());
@@ -200,6 +201,18 @@ async fn output_status_and_time_are_bounded() {
     assert!(output.text.len() <= 64 * 1024);
     assert!(output.text.contains("[stdout cut to"));
     assert!(output.text.contains("preserved-stderr"));
+
+    // A background process left behind cannot keep the call open: it ends
+    // with the shell, well before this timeout.
+    let output = run(
+        &host,
+        &scope,
+        serde_json::json!({ "command": "(sleep 60 &); echo left", "timeout_secs": 30 }),
+    )
+    .await
+    .unwrap();
+    assert!(!output.is_error, "{}", output.text);
+    assert!(output.text.contains("left"));
 
     let error = run(
         &host,
