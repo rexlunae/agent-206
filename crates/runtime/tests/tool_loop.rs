@@ -1386,3 +1386,190 @@ async fn output_that_must_be_whole_fails_rather_than_being_cut() {
     assert!(!kept.contains("oooo"), "{kept}");
     assert_eq!(record(&calls[1].id).state, ToolCallState::Succeeded);
 }
+
+// ── Subagents ───────────────────────────────────────────────────────────────
+
+use a206_runtime::delegation_tool as subagents;
+
+/// The next two requests: the parent's, which carries `call`'s result, and
+/// the one from the subagent's run.
+async fn parent_and_child(rig: &mut Rig, api: ProviderApi, call: &str) -> (Opened, Opened) {
+    let first = rig.next_request().await;
+    let second = rig.next_request().await;
+    if result_for(api, &first.body, call).is_some() {
+        (first, second)
+    } else {
+        (second, first)
+    }
+}
+fn result_json(api: ProviderApi, body: &Value, call: &str) -> Value {
+    serde_json::from_str(&result_for(api, body, call).unwrap()).unwrap()
+}
+fn thread_of(rig: &Rig, id: Id) -> Thread {
+    let state = rig.gateway.snapshot().unwrap();
+    state.threads.into_iter().find(|t| t.id == id).unwrap()
+}
+
+#[tokio::test]
+async fn subagents_run_their_task_with_no_more_than_their_parents_permissions() {
+    let api = ProviderApi::OpenAi;
+    let name = nonce();
+    let mut rig = rig(api, vec![tool(&name, ToolPermission::Allow, &[])], None).await;
+    for tool in [name.as_str(), subagents::SPAWN, subagents::WAIT] {
+        rig.permit(tool, ToolPermission::Allow).await;
+    }
+    let task = rig.send();
+    let first = rig.next_request().await;
+    let mut offered_first = offered(api, &first.body);
+    offered_first.sort();
+    let mut expected = vec![
+        name.clone(),
+        subagents::SPAWN.into(),
+        subagents::WAIT.into(),
+    ];
+    expected.sort();
+    assert_eq!(offered_first, expected);
+    let instructions = nonce();
+    let spawn = Call::new(subagents::SPAWN, json!({"task": instructions}));
+    first
+        .respond(calls_response(api, std::slice::from_ref(&spawn), &nonce()))
+        .await;
+
+    let (parent, child) = parent_and_child(&mut rig, api, &spawn.id).await;
+    // The subagent sees its task, and the parent's tools but not delegation.
+    assert!(child.body.to_string().contains(&instructions));
+    assert_eq!(offered(api, &child.body), vec![name.clone()]);
+    let answer = nonce();
+    child.respond(text_response(api, &answer)).await;
+    let spawned = result_json(api, &parent.body, &spawn.id);
+    let id: Id = spawned["thread"].as_str().unwrap().parse().unwrap();
+    assert_eq!(spawned["state"], "running");
+
+    let waiting = Call::new(subagents::WAIT, json!({"thread": id}));
+    parent
+        .respond(calls_response(
+            api,
+            std::slice::from_ref(&waiting),
+            &nonce(),
+        ))
+        .await;
+    let third = rig.next_request().await;
+    let waited = result_json(api, &third.body, &waiting.id);
+    assert_eq!(waited["state"], "complete", "{waited}");
+    assert_eq!(waited["reply"], answer.as_str());
+    third.respond(text_response(api, &nonce())).await;
+    let thread = finished(task).await;
+    assert_eq!(thread.state, RunState::Complete, "{:?}", thread.error);
+
+    let child = thread_of(&rig, id);
+    assert_eq!(child.parent, Some(rig.thread));
+    assert_eq!(child.model.as_ref(), Some(&rig.model));
+    assert_eq!(
+        child.tool_permissions.keys().cloned().collect::<Vec<_>>(),
+        vec![name]
+    );
+}
+
+#[tokio::test]
+async fn cancelling_a_run_cancels_its_subagents() {
+    let api = ProviderApi::OpenAi;
+    let mut rig = rig(api, vec![], None).await;
+    for tool in [subagents::SPAWN, subagents::WAIT] {
+        rig.permit(tool, ToolPermission::Allow).await;
+    }
+    let task = rig.send();
+    let first = rig.next_request().await;
+    let spawn = Call::new(subagents::SPAWN, json!({"task": nonce()}));
+    first
+        .respond(calls_response(api, std::slice::from_ref(&spawn), &nonce()))
+        .await;
+    let (parent, _child) = parent_and_child(&mut rig, api, &spawn.id).await;
+    let id: Id = result_json(api, &parent.body, &spawn.id)["thread"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    // The parent waits on a subagent whose model never answers.
+    let waiting = Call::new(
+        subagents::WAIT,
+        json!({"thread": id, "seconds": subagents::MAX_WAIT}),
+    );
+    parent
+        .respond(calls_response(
+            api,
+            std::slice::from_ref(&waiting),
+            &nonce(),
+        ))
+        .await;
+    tokio::time::timeout(PATIENCE, async {
+        while thread_of(&rig, id).state != RunState::Running {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(wait("the subagent to run"));
+
+    let cancel = rig.run(Command::CancelRun { thread: rig.thread }).await;
+    assert_eq!(cancel, Reply::Ok);
+    assert_eq!(finished(task).await.state, RunState::Cancelled);
+    tokio::time::timeout(PATIENCE, async {
+        while thread_of(&rig, id).state != RunState::Cancelled {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(wait("the subagent to be cancelled"));
+}
+
+#[tokio::test]
+async fn subagent_tools_stay_within_permitted_models_and_the_callers_own_subagents() {
+    let api = ProviderApi::OpenAi;
+    let mut rig = rig(api, vec![], None).await;
+    for tool in [subagents::SPAWN, subagents::STATUS] {
+        rig.permit(tool, ToolPermission::Allow).await;
+    }
+    let task = rig.send();
+    let first = rig.next_request().await;
+    let stranger = Call::new(subagents::STATUS, json!({"thread": Id::new_v4()}));
+    let unpermitted = Call::new(subagents::SPAWN, json!({"task": nonce(), "model": nonce()}));
+    first
+        .respond(calls_response(
+            api,
+            &[stranger.clone(), unpermitted.clone()],
+            &nonce(),
+        ))
+        .await;
+    let second = rig.next_request().await;
+    assert!(result_for(api, &second.body, &stranger.id).is_some());
+    second.respond(text_response(api, &nonce())).await;
+    let thread = finished(task).await;
+    let calls = calls_of(&thread);
+    assert_eq!(calls.len(), 2);
+    assert_eq!(error_kind(&calls[0]), ErrorKind::NotFound);
+    assert_eq!(error_kind(&calls[1]), ErrorKind::PermissionDenied);
+    assert!(
+        rig.gateway
+            .snapshot()
+            .unwrap()
+            .threads
+            .iter()
+            .all(|t| t.parent != Some(rig.thread)),
+        "no subagent was created"
+    );
+
+    // Without subagent models the tools are not offered at all.
+    let configured = rig
+        .run(Command::ConfigureThread {
+            id: rig.thread,
+            mode: Mode::Chat,
+            model: Some(rig.model.clone()),
+            subagent_models: Default::default(),
+        })
+        .await;
+    assert!(matches!(configured, Reply::Thread(_)));
+    let task = rig.send();
+    let first = rig.next_request().await;
+    assert!(offered(api, &first.body).is_empty());
+    first.respond(text_response(api, &nonce())).await;
+    finished(task).await;
+}

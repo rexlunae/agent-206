@@ -237,6 +237,48 @@ Tests: `crates/runtime/src/extension_tools/tests.rs` (listing, naming,
 conversion, checks before the worker) and `crates/runtime/tests/extension_tools.rs`
 (native runs through the real worker; the test binary doubles as the worker).
 
+### Subagents
+
+`crate::delegation_tool` offers `subagent_spawn`, `subagent_send`,
+`subagent_list`, `subagent_status`, `subagent_wait` and `subagent_cancel`
+(RustyClaw's `sessions_spawn/send/list/history/kill`). They are listed only to
+conversations the user gave subagent models, and, like every tool, are denied
+until the user permits them on that conversation.
+
+- A subagent is an ordinary delegated thread created through `CreateSubagent`:
+  its model must be in the caller's subagent model set (default: the caller's
+  own model when permitted, or the only permitted one), and its grant is the
+  caller's grant ∩ the requested capabilities ∩ its mode's ceiling.
+- It starts with the caller's tool permissions except the subagent tools, and
+  no subagent models, so it cannot delegate further unless the user configures
+  that. Decisions still take the minimum along the delegation chain, so a later
+  change to the parent's permissions or budget applies to the child at once.
+- A model addresses only its own conversation's direct subagents. A conversation
+  descended from 3 others cannot spawn, and at most 8 of a conversation's
+  subagents run at once.
+- `subagent_spawn` and `subagent_send` start the run in the background through
+  `Send`, so it is admitted, journaled and shown like any other run, approvals
+  included; a message the gateway refuses is reported by `subagent_status`.
+  `subagent_wait` waits at most 600 seconds and is cancel-safe; it follows a
+  run the user started in the subagent's thread too, re-reading it every
+  250 ms.
+- `CancelRun` cancels the thread's run and the runs of every thread delegated
+  from it, whoever started them. A subagent run is reserved under its parent's
+  run token before `subagent_spawn`/`subagent_send` returns, and only that
+  tool's own `Send` admits the run with it (other messages to the subagent
+  neither take nor drop it). Cancelling the parent therefore also cancels a
+  subagent whose run has not been admitted yet.
+
+The host holds a `Delegator`, not the gateway: it can create, message, cancel
+and read subagents and nothing that changes a grant, permission or approval. The
+delegator reaches the gateway's tool hosts through a weak link, so the hosts
+holding it never keep a closed gateway alive. A gateway that gains a tool host
+(`with_tool_host`) gets subagent tools bound to its own host list, so its other
+clones keep theirs. Tests: `crates/runtime/tests/tool_loop.rs` (spawn,
+inherited permissions, wait, cascading cancel, refusals),
+`delegation_tool/tests.rs` and `gateway/delegation/tests.rs` (reservations,
+clones, waiting on user-started runs).
+
 ### MCP servers
 
 `McpToolHost` (`crates/runtime/src/mcp_tools.rs`) is registered by `Gateway::open`

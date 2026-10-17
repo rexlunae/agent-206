@@ -5,12 +5,13 @@
 //! the gateway checks the user's per-tool permission, the host's own policy
 //! and the conversation's grant first, and asks the user for `Ask` tools.
 //! Hosts receive no handle to the gateway, the vault or approvals, so a tool
-//! cannot widen its own authority or approve a call.
+//! cannot widen its own authority or approve a call; the subagent tools hold
+//! only a [`Delegator`](crate::gateway::Delegator), which cannot either.
 //!
 //! The WASM extension adapter (`crate::extension_tools`), the MCP client
 //! adapter (`crate::mcp_tools`), native command execution
-//! (`crate::exec_tool`) and approved skills (`crate::skill_tool`) are
-//! registered by default.
+//! (`crate::exec_tool`), approved skills (`crate::skill_tool`) and subagents
+//! (`crate::delegation_tool`) are registered by default.
 use a206_core::{
     Capability, ErrorKind, ErrorReport, Id, Thread, ToolList, ToolOffer, ToolPermission,
     UnavailableTools,

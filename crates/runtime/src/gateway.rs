@@ -23,8 +23,10 @@ mod messengers;
 pub(crate) use mcp_servers::McpClient;
 pub use mcp_servers::{McpOffer, McpOffers};
 pub use run::{RunError, ToolError};
+mod delegation;
 mod skills;
 pub use crate::skill_tool::SkillOffer;
+pub use delegation::{Caller, Child, Delegator, DelegatorError, Reservation};
 
 /// Streamed reply text that is not final yet. It is published as the
 /// thread's assistant message at most every [`PartialReply::INTERVAL`], so a
@@ -331,6 +333,10 @@ pub struct Gateway {
     /// Messengers the user disconnected; they connect again only on request.
     messengers_stopped: Arc<Mutex<BTreeSet<String>>>,
     mcp: McpClient,
+    /// This gateway's subagent tools and the hosts their subagents run with.
+    delegation: delegation::Binding,
+    /// Runs the subagent tools reserved before starting them, by subagent.
+    reserved: delegation::Reserved,
 }
 /// The broker pairing this gateway holds, with the connection that anchors it.
 struct Paired {
@@ -340,6 +346,21 @@ struct Paired {
 }
 /// Minimum seconds between automatic refreshes of one stale catalog.
 const REFRESH_RETRY: u64 = 300;
+/// What the request journal keeps of a command: an installed module is
+/// recorded by its SHA-256 rather than copied, which still tells a retry
+/// apart from a different request reusing its id.
+fn journal_form(command: &Command) -> std::borrow::Cow<'_, Command> {
+    match command {
+        Command::InstallExtension { manifest, module } => {
+            std::borrow::Cow::Owned(Command::InstallExtension {
+                manifest: manifest.clone(),
+                module: Sha256::digest(module).to_vec(),
+            })
+        }
+        command => std::borrow::Cow::Borrowed(command),
+    }
+}
+
 impl Gateway {
     pub fn open(root: &Path) -> Result<Self, StoreError> {
         let mut store = Store::open(root)?;
@@ -382,7 +403,7 @@ impl Gateway {
         // user permits them.
         let skill_tools: Arc<dyn crate::tools::ToolHost> =
             Arc::new(crate::skill_tool::SkillToolHost::new(store.clone(), root));
-        Ok(Self {
+        let mut gateway = Self {
             admission: Arc::new(Mutex::new(Admission::default())),
             shutdown_committed: Arc::new(tokio::sync::Mutex::new(false)),
             started: std::time::Instant::now(),
@@ -410,7 +431,13 @@ impl Gateway {
             messengers: tokio::sync::watch::Sender::new(desired),
             messengers_stopped: Arc::new(Mutex::new(BTreeSet::new())),
             mcp,
-        })
+            delegation: Default::default(),
+            reserved: Arc::default(),
+        };
+        // Subagent tools; each conversation still denies them until the user
+        // permits them, and they are offered only with subagent models.
+        gateway.bind_delegation();
+        Ok(gateway)
     }
     fn pairing(&self) -> Result<Option<BrokerPairing>> {
         Ok(self
@@ -554,7 +581,7 @@ impl Gateway {
         );
         let begin = if mutation {
             self.lock()
-                .and_then(|mut store| Ok(store.begin(id, &request.body)?))
+                .and_then(|mut store| Ok(store.begin(id, &journal_form(&request.body))?))
         } else {
             Ok(None)
         };
@@ -1019,8 +1046,7 @@ impl Gateway {
                         && text.len() <= 128 * 1024,
                     GatewayError::Invalid("message must be 1–131072 bytes"),
                 )?;
-                let token = tokio_util::sync::CancellationToken::new();
-                let (config, thread, prompt, info, backend, workspace, root) = {
+                let (token, config, thread, prompt, info, backend, workspace, root) = {
                     let mut store = self.lock()?;
                     // Admit the message only with room for it and for the
                     // run's first round, which applies the same bound, so an
@@ -1106,12 +1132,10 @@ impl Gateway {
                     // The previous run's cost is not this run's.
                     thread.run_usage = None;
                     let copy = thread.clone();
-                    self.running
-                        .lock()
-                        .map_err(poisoned("run"))?
-                        .insert(id, token.clone());
+                    // A subagent run its parent reserved is cancelled with it.
+                    let token = delegation::admit(self, id)?;
                     store.persist(Some(EventKind::ThreadChanged { id }))?;
-                    (config, copy, prompt, info, backend, workspace, root)
+                    (token, config, copy, prompt, info, backend, workspace, root)
                 };
                 let Some(backend) = backend else {
                     let ended = self
@@ -1241,14 +1265,7 @@ impl Gateway {
                 self.prompts.answer(thread, prompt, answer)?;
                 Ok(Reply::Ok)
             }
-            Command::CancelRun { thread } => {
-                let running = self.running.lock().map_err(poisoned("run"))?;
-                let token = running
-                    .get(&thread)
-                    .ok_or(GatewayError::NotFound("thread is not running"))?;
-                token.cancel();
-                Ok(Reply::Ok)
-            }
+            Command::CancelRun { thread } => delegation::cancel_run(self, thread),
             Command::CreateProject { name, root } => {
                 check(
                     !name.trim().is_empty(),
@@ -1449,6 +1466,17 @@ impl Gateway {
                 drop(store);
                 // Running extension calls and approval waits re-check that
                 // their tool is still offered.
+                self.policy_changed();
+                Ok(Reply::Ok)
+            }
+            Command::InstallExtension { manifest, module } => {
+                let summary = self.extensions.install(manifest, module).await?;
+                self.policy_changed();
+                Ok(Reply::Extension(Box::new(summary)))
+            }
+            Command::UninstallExtension { extension } => {
+                self.extensions.uninstall(extension).await?;
+                // Running calls and approval waits re-check their tool.
                 self.policy_changed();
                 Ok(Reply::Ok)
             }
