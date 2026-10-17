@@ -143,8 +143,9 @@ exact call.
 
 ### Native exec
 
-`ExecHost` (`crates/runtime/src/exec_tool.rs`) is registered by `Gateway::open`
-and offers one tool, `execute_command`.
+`ExecHost` (`crates/runtime/src/exec_tool/`) is registered by `Gateway::open`
+and offers `execute_command`, plus `process` and `process_write` for
+background sessions.
 
 - **Policy.** The spec declares only `Execute` and the host policy is `Ask`, so
   the tool is offered only to conversations granted Execute and every call
@@ -153,8 +154,9 @@ and offers one tool, `execute_command`.
   and Execute before starting anything, even on a direct call.
 - **Arguments.** `command` (run with `sh -c`, 1 byte to 16 KiB, no NUL),
   optional `working_dir` relative to the project root (no `..`, absolute paths
-  or symlinks leading out) and `timeout_secs` (1–600, default 30). Anything
-  else, including unknown keys, is `InvalidRequest` before anything starts.
+  or symlinks leading out), `timeout_secs` (1–600, default 30) and
+  `background` (then 1–3600, default 600). Anything else, including unknown
+  keys, is `InvalidRequest` before anything starts.
 - **Sandbox.** The command runs under `a206-sandbox`: bubblewrap namespaces
   plus Landlock inside on Linux, a generated Seatbelt policy applied by
   `sandbox-exec` on macOS. Both come from one profile, with `/usr/bin` and
@@ -164,7 +166,8 @@ and offers one tool, `execute_command`.
   state and the credential stores under `$HOME` stay hidden even inside the
   project. A project equal to or inside protected state is refused. Without project access the command starts in an empty private
   directory. The environment holds only a private `HOME`, `TMPDIR`, a fixed
-  `PATH` (`/usr/bin:/bin`) and `LANG`; stdin is empty.
+  `PATH` (`/usr/bin:/bin`) and `LANG`; a foreground command's stdin is
+  empty.
 - **Results.** The text is the exit status, then stdout and stderr, each cut
   to `MAX_STREAM` UTF-8 bytes after lossy conversion, with a marker; the rest is read and dropped so a
   chatty command cannot stall. A non-zero exit is `is_error`. A command still
@@ -173,15 +176,50 @@ and offers one tool, `execute_command`.
 - **Cancellation.** Dropping the call kills the sandbox's process group; on
   Linux the sandbox's PID namespace ends with it, taking every descendant
   along. macOS has no PID namespace, so the group is also killed as soon as
-  the shell exits; a process that leaves the group with `setsid` can outlive
-  the call there, still confined by the same policy.
-- **Other platforms.** Windows does not offer the tool; the listing reports
+  the shell exits; a process that leaves the group with `setsid`, or one
+  being forked at the moment the group is killed, can outlive the call
+  there, still confined by the same policy.
+- **Background sessions** (`exec_tool/sessions.rs`). With `background` the
+  call returns a session id once the sandbox is up (a sandbox failure still
+  reaches the call), and the command keeps running under the same profile
+  until it exits, is killed, reaches its timeout or the host is dropped with
+  the gateway. Its stdin is a pipe only in this mode. A session belongs to the
+  conversation that started it: any other conversation, a subagent included,
+  gets `NotFound` for it, as for an unknown id. `process` (Execute, host
+  policy Allow) lists sessions by id and status (not command text, which may
+  hold what the conversation should not see again) and polls, kills or
+  removes one; `poll` drains the output written since the last poll, keeping
+  at most `MAX_STREAM` unread bytes per stream and counting what it drops.
+  Each stream's text in one poll stays within `MAX_STREAM` even when invalid
+  UTF-8 is replaced; what does not fit waits for the next poll. A failure to
+  read a stream is reported by every later poll as an error. `process_write`
+  (Execute, host policy Ask, so every input is approved like a command)
+  writes at most 64 KiB and optionally closes stdin. One 5 s deadline covers
+  queueing and writing; past it the call is a `Timeout`, the input is
+  withdrawn (a part already written stays written, as the error says), and
+  a finished session is a `Conflict`. A conversation holds at most 8 sessions
+  and the host 64; a new one removes the conversation's oldest finished
+  session only once its own sandbox has started, never a running one or
+  another conversation's output, and is otherwise refused with `Conflict`.
+  When the user changes a conversation's mode or backend grants, the gateway
+  asks every tool host to rescope (`ToolHost::rescope`): a session whose
+  sandbox holds a capability (Execute, ReadWorkspace, WriteWorkspace,
+  Network) or project the conversation, or one of its ancestors, no longer
+  grants is stopped and reported as such, and a command still starting is
+  stopped with `PermissionDenied`. Because a call runs with the scope taken
+  when it started, the gateway rescopes again when a call returns after
+  policy changed during it. There is no terminal, so `send_keys`
+  (key chords for interactive programs) is not offered.
+- **Other platforms.** Windows does not offer these tools; the listing reports
   `native exec` unavailable rather than run commands unconfined.
 
 Tests: `crates/runtime/tests/native_exec.rs` drives the host through the real
 sandbox on Linux and macOS CI (grants, hidden state, symlinked working
 directories, network, exit status, output and time bounds, leftover
-background processes; on Linux the test binary doubles as the helper), and
+background processes; background sessions' input, output, ownership, kill,
+timeout, limits, input deadlines, stopping on a withdrawn grant and end
+with their host; on Linux the test binary doubles as
+the helper), and
 `crates/sandbox/src/seatbelt.rs` tests the macOS policy text on every platform.
 
 ### WASM extensions
