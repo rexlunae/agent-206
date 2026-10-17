@@ -460,6 +460,44 @@ mod tests {
     }
 
     #[test]
+    fn scheduled_message_entries_name_the_job_and_its_conversation() {
+        let mut snapshot = crate::empty_snapshot();
+        let thread = Thread::new(Id::new_v4().simple().to_string(), Mode::Chat);
+        let job = a206_core::schedule::Job {
+            id: Id::new_v4(),
+            name: Id::new_v4().simple().to_string(),
+            thread: thread.id,
+            text: String::new(),
+            schedule: a206_core::schedule::Schedule::At { at: 0 },
+            enabled: true,
+            created: 0,
+            next: None,
+            last: None,
+            author: Default::default(),
+        };
+        snapshot.threads.push(thread.clone());
+        snapshot.jobs.push(job.clone());
+        let entry = describe(&EventKind::JobChanged { id: job.id }, &snapshot);
+        assert_eq!(
+            entry.text,
+            format!(
+                "Scheduled message {} changed in “{}”",
+                job.name, thread.title
+            )
+        );
+        assert_eq!(
+            entry.link,
+            Some(Route::Chat {
+                id: thread.id,
+                split: None
+            })
+        );
+        let removed = describe(&EventKind::JobChanged { id: Id::new_v4() }, &snapshot);
+        assert_eq!(removed.text, "A removed scheduled message changed");
+        assert_eq!(removed.link, None);
+    }
+
+    #[test]
     fn ages_round_down_to_the_largest_whole_unit() {
         assert_eq!(ago(100, 100), "Just now");
         assert_eq!(ago(100, 200), "Just now");
