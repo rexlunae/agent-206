@@ -5,7 +5,7 @@
 use a206_core::{Capability, ErrorKind, Id};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use a206_runtime::{
-    exec_tool::{ExecHost, MAX_PER_THREAD, MAX_STREAM, NAME, PROCESS, PROCESS_WRITE},
+    exec_tool::{ExecHost, MAX_INPUT, MAX_PER_THREAD, MAX_STREAM, NAME, PROCESS, PROCESS_WRITE},
     tools::{ToolHost, ToolOutput, ToolRequest, ToolScope},
 };
 
@@ -20,6 +20,8 @@ fn main() -> std::process::ExitCode {
         runtime.block_on(network_follows_the_grant());
         runtime.block_on(output_status_and_time_are_bounded());
         runtime.block_on(background_sessions_follow_their_conversation());
+        runtime.block_on(background_sessions_stop_when_their_grant_is_withdrawn());
+        runtime.block_on(stalled_input_fails_within_its_deadline());
         runtime.block_on(background_sessions_end_with_their_host());
         println!("native exec: ok");
     }
@@ -114,7 +116,7 @@ async fn idle(host: &ExecHost, scope: &ToolScope, session: &str) {
             .lines()
             .find(|line| line.starts_with(session))
             .unwrap_or_else(|| panic!("{session} is not listed: {}", listed.text));
-        if !line.contains("  running  ") {
+        if !line.ends_with("  running") {
             return;
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -464,7 +466,94 @@ async fn background_sessions_follow_their_conversation() {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+async fn background_sessions_stop_when_their_grant_is_withdrawn() {
+    let state = tempfile::tempdir().unwrap();
+    let host = ExecHost::new(state.path());
+    let granted = scope(None, &[Capability::Execute, Capability::Network]);
+    let kept = spawn(
+        &host,
+        &granted,
+        serde_json::json!({ "command": "sleep 600" }),
+    )
+    .await;
+    let other = scope(None, &[Capability::Execute]);
+    let unaffected = spawn(&host, &other, serde_json::json!({ "command": "sleep 600" })).await;
+    // A wider grant, or another conversation's change, leaves it running.
+    let mut wider = granted.clone();
+    wider.capabilities.insert(Capability::ReadWorkspace);
+    host.rescope(&|id| {
+        (id == granted.thread)
+            .then(|| wider.clone())
+            .or(Some(other.clone()))
+    });
+    let polled = process(&host, &granted, "poll", &kept).await.unwrap();
+    assert!(polled.text.starts_with("running"), "{}", polled.text);
+    // Withdrawing Network stops it; the other conversation keeps its own.
+    let mut narrower = granted.clone();
+    narrower.capabilities.remove(&Capability::Network);
+    host.rescope(&|id| {
+        Some(if id == granted.thread {
+            narrower.clone()
+        } else {
+            other.clone()
+        })
+    });
+    let ended = finish(&host, &granted, &kept).await;
+    assert!(ended.is_error);
+    assert!(
+        ended.text.contains("permissions were withdrawn"),
+        "{}",
+        ended.text
+    );
+    let polled = process(&host, &other, "poll", &unaffected).await.unwrap();
+    assert!(polled.text.starts_with("running"), "{}", polled.text);
+    // A conversation that is gone takes its sessions with it.
+    host.rescope(&|_| None);
+    let ended = finish(&host, &other, &unaffected).await;
+    assert!(
+        ended.text.contains("permissions were withdrawn"),
+        "{}",
+        ended.text
+    );
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+async fn stalled_input_fails_within_its_deadline() {
+    let state = tempfile::tempdir().unwrap();
+    let host = ExecHost::new(state.path());
+    let scope = scope(None, &[Capability::Execute]);
+    // The command never reads, so its pipe fills and later writes queue.
+    let session = spawn(&host, &scope, serde_json::json!({ "command": "sleep 600" })).await;
+    let data = "x".repeat(MAX_INPUT);
+    let writes = (0..7).map(|_| {
+        call(
+            &host,
+            &scope,
+            PROCESS_WRITE,
+            serde_json::json!({ "session": session, "data": data }),
+        )
+    });
+    // Each write has its own short deadline, queueing included; this bound
+    // only catches a write that waits for a place in the queue forever.
+    let results = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        futures_util::future::join_all(writes),
+    )
+    .await
+    .expect("a write waited past its deadline");
+    let stalled = results
+        .iter()
+        .filter(|result| matches!(result, Err(error) if error.kind == ErrorKind::Timeout))
+        .count();
+    assert!(stalled >= 5, "{results:?}");
+    // The rest were written; nothing failed another way.
+    assert_eq!(results.iter().filter(|r| r.is_err()).count(), stalled);
+    process(&host, &scope, "kill", &session).await.unwrap();
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 async fn background_sessions_end_with_their_host() {
+    use std::io::Read;
     let state = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
     let host = ExecHost::new(state.path());
@@ -476,16 +565,42 @@ async fn background_sessions_end_with_their_host() {
             Capability::WriteWorkspace,
         ],
     );
+    // The command holds the writing end of a FIFO for as long as it runs,
+    // so the reader sees its end as end of file rather than after a delay.
+    let fifo = project.path().join("held");
+    let made = std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .unwrap();
+    assert!(made.success());
     spawn(
         &host,
         &scope,
-        serde_json::json!({ "command": "sleep 2; echo late > late.txt" }),
+        serde_json::json!({ "command": "exec 3> held; echo started >&3; sleep 600" }),
     )
     .await;
+    let (running, started) = tokio::sync::oneshot::channel();
+    let reader = tokio::task::spawn_blocking(move || {
+        let mut held = std::fs::File::open(fifo).unwrap();
+        let mut first = [0u8; 8];
+        held.read_exact(&mut first).unwrap();
+        running.send(first).unwrap();
+        let mut rest = Vec::new();
+        held.read_to_end(&mut rest).unwrap();
+        rest
+    });
+    let patience = std::time::Duration::from_secs(60);
+    let first = tokio::time::timeout(patience, started)
+        .await
+        .expect("the command did not start")
+        .unwrap();
+    assert_eq!(&first, b"started\n");
     drop(host);
-    tokio::time::sleep(std::time::Duration::from_secs(4)).await;
-    assert!(
-        !project.path().join("late.txt").exists(),
-        "a session must not outlive the gateway's host"
-    );
+    // The read ends only once nothing of the command is left; the bound
+    // only catches a session that outlives its host.
+    let rest = tokio::time::timeout(patience, reader)
+        .await
+        .expect("a session must not outlive the gateway's host")
+        .unwrap();
+    assert!(rest.is_empty());
 }

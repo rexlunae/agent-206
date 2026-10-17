@@ -299,6 +299,17 @@ impl Gateway {
         self.policy_changed();
         Ok(Reply::Ok)
     }
+    /// Let every tool host stop work, such as a background command, that a
+    /// conversation's grants no longer cover. Call without the state lock.
+    pub(super) fn grants_changed(&self) -> Result<()> {
+        let store = self.lock()?;
+        // A conversation that cannot be viewed no longer exists.
+        let scope = |id| view(&store, id).ok().map(|view| view.scope);
+        for host in self.tool_hosts.iter() {
+            host.rescope(&scope);
+        }
+        Ok(())
+    }
     /// Make running calls and approval waits re-check their authority.
     pub(super) fn policy_changed(&self) {
         self.policy

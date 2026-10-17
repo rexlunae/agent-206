@@ -11,8 +11,9 @@ use a206_runtime::{
 use futures_util::future::BoxFuture;
 use serde_json::{Value, json};
 use std::{
+    collections::{BTreeMap, BTreeSet},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
@@ -60,7 +61,11 @@ struct TestHost {
     blocking: Option<String>,
     calls: mpsc::UnboundedSender<(ToolScope, ToolRequest)>,
     dropped: Arc<AtomicBool>,
+    rescoped: Rescoped,
 }
+/// Conversations whose scope `rescope` records, with the capabilities it
+/// last saw for each (`None` before any rescope, or once one is gone).
+type Rescoped = Arc<Mutex<BTreeMap<Id, Option<Option<BTreeSet<Capability>>>>>>;
 /// Sets its flag when the future holding it is dropped.
 struct DropFlag(Arc<AtomicBool>);
 impl Drop for DropFlag {
@@ -99,6 +104,11 @@ impl ToolHost for TestHost {
             Ok(ToolOutput { text, is_error })
         })
     }
+    fn rescope(&self, scope: &dyn Fn(Id) -> Option<ToolScope>) {
+        for (id, seen) in self.rescoped.lock().unwrap().iter_mut() {
+            *seen = Some(scope(*id).map(|scope| scope.capabilities));
+        }
+    }
 }
 fn tool(name: &str, permission: ToolPermission, capabilities: &[Capability]) -> ToolSpec {
     ToolSpec {
@@ -122,11 +132,13 @@ struct Rig {
     calls: mpsc::UnboundedReceiver<(ToolScope, ToolRequest)>,
     marker: String,
     dropped: Arc<AtomicBool>,
+    rescoped: Rescoped,
 }
 async fn rig(api: ProviderApi, tools: Vec<ToolSpec>, blocking: Option<String>) -> Rig {
     let (sender, calls) = mpsc::unbounded_channel();
     let marker = nonce();
     let dropped = Arc::new(AtomicBool::new(false));
+    let rescoped = Rescoped::default();
     let state = tempfile::tempdir().unwrap();
     let gateway = Gateway::open(state.path())
         .unwrap()
@@ -136,6 +148,7 @@ async fn rig(api: ProviderApi, tools: Vec<ToolSpec>, blocking: Option<String>) -
             blocking,
             calls: sender,
             dropped: dropped.clone(),
+            rescoped: rescoped.clone(),
         }));
     let (model, requests) = connect(&gateway, api).await;
     let mut rig = Rig {
@@ -147,6 +160,7 @@ async fn rig(api: ProviderApi, tools: Vec<ToolSpec>, blocking: Option<String>) -
         calls,
         marker,
         dropped,
+        rescoped,
     };
     let Reply::Thread(thread) = rig
         .run(Command::CreateThread {
@@ -1064,6 +1078,57 @@ async fn a_parent_losing_a_grant_stops_its_childs_running_call() {
     let offer = list.tools.iter().find(|tool| tool.name == name).unwrap();
     assert_eq!(offer.effective, ToolPermission::Deny);
     assert_eq!(offer.missing, [Capability::ReadWorkspace].into());
+}
+
+#[tokio::test]
+async fn changing_a_grant_lets_tool_hosts_stop_work_it_no_longer_covers() {
+    let rig = rig(ProviderApi::OpenAi, vec![], None).await;
+    let workspace = tempfile::tempdir().unwrap();
+    let Reply::Project(project) = rig
+        .run(Command::CreateProject {
+            name: nonce(),
+            root: workspace.path().to_string_lossy().into(),
+        })
+        .await
+    else {
+        panic!("project creation failed");
+    };
+    let manager = project.manager;
+    let configured = rig
+        .run(Command::ConfigureThread {
+            id: manager,
+            mode: Mode::Plan,
+            model: Some(rig.model.clone()),
+            subagent_models: [rig.model.clone()].into(),
+        })
+        .await;
+    assert!(matches!(configured, Reply::Thread(_)), "{configured:?}");
+    let gone = Id::new_v4();
+    rig.rescoped
+        .lock()
+        .unwrap()
+        .extend([(manager, None), (gone, None)]);
+    let seen = |id| rig.rescoped.lock().unwrap()[&id].clone();
+    let grant = |capabilities: &[Capability]| Command::SetBackend {
+        thread: manager,
+        backend: CodingBackend::Native,
+        capabilities: capabilities.iter().copied().collect(),
+    };
+    assert_eq!(
+        rig.run(grant(&[Capability::ReadWorkspace])).await,
+        Reply::Ok
+    );
+    assert_eq!(
+        seen(manager),
+        Some(Some([Capability::ReadWorkspace].into()))
+    );
+    assert_eq!(
+        seen(gone),
+        Some(None),
+        "a missing conversation has no scope"
+    );
+    assert_eq!(rig.run(grant(&[])).await, Reply::Ok);
+    assert_eq!(seen(manager), Some(Some(BTreeSet::new())));
 }
 
 #[tokio::test]

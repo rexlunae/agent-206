@@ -20,7 +20,8 @@
 //! the same sandbox and under the same approval, and the conversation that
 //! started it follows it with `process` (list, poll, kill, remove) and gives
 //! it input with `process_write`, which the user approves like a command
-//! (`sessions`).
+//! (`sessions`). A session stops as soon as its conversation no longer grants
+//! what its sandbox was given.
 //!
 //! Platforms without that isolation do not offer these tools: they report
 //! them unavailable rather than run commands unconfined.
@@ -125,8 +126,12 @@ pub enum ExecError {
     InputClosed,
     #[error("could not give the session its input")]
     Input(#[source] std::io::Error),
-    #[error("the command did not take its input within {seconds} s")]
+    #[error(
+        "the command did not take its input within {seconds} s; part of it may have reached the command"
+    )]
     InputStalled { seconds: u64 },
+    #[error("the conversation's permissions changed while the command started; it was stopped")]
+    Revoked,
     #[error(
         "commands are disabled on this platform until equivalent OS filesystem and network isolation is implemented"
     )]
@@ -135,7 +140,7 @@ pub enum ExecError {
 impl crate::error::Classified for ExecError {
     fn kind(&self) -> Option<ErrorKind> {
         Some(match self {
-            Self::Denied | Self::ProtectedWorkspace => ErrorKind::PermissionDenied,
+            Self::Denied | Self::ProtectedWorkspace | Self::Revoked => ErrorKind::PermissionDenied,
             Self::NotAString(_)
             | Self::NotABool(_)
             | Self::Action
@@ -352,7 +357,7 @@ impl ExecHost {
             name: PROCESS.into(),
             description: format!(
                 "Follow this conversation's background commands from `{NAME}`. `list` shows each \
-                 session's id, status and command; `poll` returns its status and the output \
+                 session's id and status; `poll` returns its status and the output \
                  written since the last poll (each stream keeps at most {MAX_STREAM} unread \
                  bytes, dropping the oldest); `kill` stops it; `remove` stops it if needed and \
                  forgets it. A conversation holds at most {MAX_PER_THREAD} sessions; starting \
@@ -377,8 +382,9 @@ impl ExecHost {
             name: PROCESS_WRITE.into(),
             description: "Write text to the standard input of one of this conversation's \
                           background commands, then close its input if `close` is set. Every \
-                          call needs the user's approval, like a command. Fails if the command \
-                          does not take the input within a few seconds."
+                          call needs the user's approval, like a command. If the command does \
+                          not take the input within a few seconds the call fails and the rest of \
+                          the input is withdrawn."
                 .into(),
             parameters: json!({
                 "type": "object",
@@ -484,6 +490,9 @@ impl ToolHost for ExecHost {
                 .map_err(|error| crate::error::report(&error))
         })
     }
+    fn rescope(&self, scope: &dyn Fn(a206_core::Id) -> Option<ToolScope>) {
+        self.sessions.rescope(scope);
+    }
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -561,12 +570,12 @@ impl ExecHost {
     /// is up, so a sandbox failure still reaches this call.
     async fn background(&self, scope: &ToolScope, call: Call) -> Result<ToolOutput, ExecError> {
         // Refuse before starting anything; `adopt` checks again under its lock.
-        self.sessions.reserve(scope.thread)?;
+        let ticket = self.sessions.reserve(scope)?;
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(call.timeout);
         let started = self.start(scope, &call, deadline).await?;
-        let id =
-            self.sessions
-                .adopt(scope.thread, call.command, started, call.timeout, deadline)?;
+        let id = self
+            .sessions
+            .adopt(ticket, started, call.timeout, deadline)?;
         Ok(ToolOutput {
             text: format!(
                 "Started background session {id}; it is stopped after {} s. Follow it with \
