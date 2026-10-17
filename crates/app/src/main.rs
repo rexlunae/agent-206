@@ -402,6 +402,15 @@ mod native {
             write: bool,
             #[arg(long)]
             execute: bool,
+            /// Agent 206 backend only: read git history (git status, log, diff).
+            #[arg(long)]
+            git_read: bool,
+            /// Agent 206 backend only: commit (implies --git-read).
+            #[arg(long)]
+            git_write: bool,
+            /// Agent 206 backend only: fetch from the network; commands may use it too.
+            #[arg(long)]
+            network: bool,
         },
     }
     fn backend_kind(value: &str) -> anyhow::Result<CodingBackend> {
@@ -820,12 +829,18 @@ mod native {
                                 read,
                                 write,
                                 execute,
+                                git_read,
+                                git_write,
+                                network,
                             },
                     } => {
                         let capabilities = [
                             (read || write, Capability::ReadWorkspace),
                             (write, Capability::WriteWorkspace),
                             (execute, Capability::Execute),
+                            (git_read || git_write, Capability::GitRead),
+                            (git_write, Capability::GitWrite),
+                            (network, Capability::Network),
                         ]
                         .into_iter()
                         .filter_map(|(allowed, capability)| allowed.then_some(capability))
