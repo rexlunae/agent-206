@@ -187,8 +187,6 @@ pub struct ExtensionTool {
 pub struct Catalog {
     pub plugins: Vec<PluginSummary>,
     pub proposals: Vec<a206_core::ExtensionProposal>,
-    /// The user has approved at least one skill (it may have changed since).
-    pub approved_skills: bool,
 }
 /// Capabilities that only make sense inside a project: a call declaring any
 /// of them is refused without one.
@@ -378,7 +376,6 @@ impl ExtensionHost {
         Ok(Catalog {
             plugins: store.state.plugins.clone(),
             proposals: store.state.extension_proposals.clone(),
-            approved_skills: !store.state.settings.enabled_skills.is_empty(),
         })
     }
     fn plugins(&self) -> Result<Vec<PluginSummary>, ExtensionError> {

@@ -3,7 +3,23 @@
 use super::*;
 use crate::store::Store;
 use a206_core::{ExtensionProposal, Id};
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
+
+/// Stands in for the skill tool host: offers exactly what it is given.
+#[derive(Default)]
+struct Skills(Mutex<ToolListing>);
+impl ToolHost for Skills {
+    fn list<'a>(&'a self, _: &'a ToolScope) -> BoxFuture<'a, ToolListing> {
+        Box::pin(async move { self.0.lock().unwrap().clone() })
+    }
+    fn call<'a>(
+        &'a self,
+        _: &'a ToolScope,
+        request: ToolRequest,
+    ) -> BoxFuture<'a, Result<ToolOutput, ErrorReport>> {
+        Box::pin(async move { Err(crate::error::report(&ListError::UnknownTool(request.name))) })
+    }
+}
 
 const WORKSPACE: &str = "agent206.workspace";
 
@@ -11,6 +27,7 @@ struct Rig {
     dir: tempfile::TempDir,
     store: Arc<Mutex<Store>>,
     host: ListHost,
+    skills: Arc<Skills>,
     thread: Id,
     /// The conversation has a project.
     project: bool,
@@ -18,11 +35,16 @@ struct Rig {
 fn rig() -> Rig {
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(Mutex::new(Store::open(&dir.path().join("data")).unwrap()));
-    let host = ListHost::new(ExtensionHost::new(store.clone(), dir.path().into()));
+    let skills = Arc::new(Skills::default());
+    let host = ListHost::new(
+        ExtensionHost::new(store.clone(), dir.path().into()),
+        skills.clone(),
+    );
     Rig {
         dir,
         store,
         host,
+        skills,
         thread: Id::new_v4(),
         project: true,
     }
@@ -237,6 +259,12 @@ async fn proposals_say_which_conversation_prepared_them() {
             .iter()
             .all(|e| e["id"] != here.summary.id)
     );
+    // Listing one extension shows only proposals for that extension.
+    let one = rig
+        .call(json!({"extension": WORKSPACE}), &[])
+        .await
+        .unwrap();
+    assert!(one["waiting_for_review"].as_array().unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -255,7 +283,7 @@ async fn project_and_skill_requirements_are_reported() {
     );
     rig.project = true;
 
-    // The skill tools are offered only while the user has approved a skill.
+    // The skill tools carry the skill host's own verdict, whatever is pinned.
     let skills = rig.plugin(crate::skill_tool::EXTENSION);
     rig.edit(crate::skill_tool::EXTENSION, |p| {
         p.enabled = true;
@@ -265,20 +293,42 @@ async fn project_and_skill_requirements_are_reported() {
     let listing = rig.listed(&all).await;
     for spec in &skills.tools {
         let entry = tool(&listing, crate::skill_tool::EXTENSION, &spec.name);
-        assert_eq!(entry["name"], spec.name.as_str());
-        assert_eq!(blocked(entry), ["The user has not approved any skill."]);
+        assert!(entry["name"].is_null(), "{entry}");
+        assert_eq!(
+            blocked(entry),
+            ["The user has no approved skill that is unchanged since approval."]
+        );
     }
-    let name = Id::new_v4().simple().to_string();
-    rig.store
-        .lock()
-        .unwrap()
-        .state
-        .settings
-        .enabled_skills
-        .insert(name, Id::new_v4().simple().to_string());
+    let failure = format!("skills unreadable {}", Id::new_v4().simple());
+    rig.skills.0.lock().unwrap().unavailable = vec![UnavailableTools {
+        source: crate::skill_tool::SOURCE.into(),
+        error: ErrorReport::new(ErrorKind::Storage, failure.clone()),
+    }];
+    let listing = rig.listed(&all).await;
+    let first = &skills.tools[0].name;
+    assert_eq!(
+        blocked(tool(&listing, crate::skill_tool::EXTENSION, first)),
+        [failure]
+    );
+    *rig.skills.0.lock().unwrap() = ToolListing {
+        tools: skills
+            .tools
+            .iter()
+            .map(|t| ToolSpec {
+                name: t.name.clone(),
+                description: t.description.clone(),
+                parameters: json!({"type": "object"}),
+                capabilities: t.capabilities.clone(),
+                permission: ToolPermission::Allow,
+                whole_output: true,
+            })
+            .collect(),
+        unavailable: vec![],
+    };
     let listing = rig.listed(&all).await;
     for spec in &skills.tools {
         let entry = tool(&listing, crate::skill_tool::EXTENSION, &spec.name);
+        assert_eq!(entry["name"], spec.name.as_str());
         assert!(blocked(entry).is_empty(), "{entry}");
     }
 }
@@ -287,9 +337,10 @@ async fn project_and_skill_requirements_are_reported() {
 async fn a_large_catalog_fits_one_result_and_names_what_it_left_out() {
     let rig = rig();
     let base = rig.plugin(WORKSPACE);
-    // Each entry is large enough that several cannot fit together.
+    // Even shortened, each entry keeps a full short description, so this
+    // many cannot fit together.
     let text = "x".repeat(tools::MAX_OUTPUT / 4);
-    let ids: Vec<String> = (0..8)
+    let ids: Vec<String> = (0..=BUDGET / SHORT_DESCRIPTION)
         .map(|_| format!("test.{}", Id::new_v4().simple()))
         .collect();
     {
@@ -353,4 +404,19 @@ async fn a_large_catalog_fits_one_result_and_names_what_it_left_out() {
         tool(&one, omitted[0], &base.tools[0].name)["description"],
         base.tools[0].description.as_str()
     );
+
+    // An extension whose own description alone is too large is still listed
+    // on its own, shortened, with its tools and blockers.
+    let huge = format!("test.{}", Id::new_v4().simple());
+    {
+        let mut plugin = base.clone();
+        plugin.id = huge.clone();
+        plugin.description = "y".repeat(tools::MAX_OUTPUT);
+        rig.store.lock().unwrap().state.plugins.push(plugin);
+    }
+    let output = rig.call(json!({"extension": huge}), &[]).await.unwrap();
+    let entry = extension(&output, &huge);
+    assert_eq!(entry["descriptions_shortened"], true);
+    assert!(entry["description"].as_str().unwrap().len() < tools::MAX_OUTPUT);
+    assert_eq!(entry["tools"].as_array().unwrap().len(), base.tools.len());
 }

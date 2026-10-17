@@ -22,7 +22,10 @@ use a206_core::{
 };
 use futures_util::future::BoxFuture;
 use serde_json::{Map, Value, json};
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 pub const NAME: &str = "extension_list";
 
@@ -35,6 +38,8 @@ pub enum ListError {
     NotAString(&'static str),
     #[error("no extension `{0}` is installed")]
     NotInstalled(String),
+    #[error("the listing of extension `{0}` does not fit in one tool result")]
+    TooLarge(String),
     #[error("unknown tool `{0}`")]
     UnknownTool(String),
     #[error(transparent)]
@@ -45,6 +50,7 @@ impl crate::error::Classified for ListError {
         Some(match self {
             Self::Unexpected(_) | Self::NotAString(_) => ErrorKind::InvalidRequest,
             Self::UnknownTool(_) | Self::NotInstalled(_) => ErrorKind::NotFound,
+            Self::TooLarge(_) => ErrorKind::InvalidRequest,
             Self::Extension(error) => return crate::error::classify(error),
         })
     }
@@ -53,10 +59,13 @@ impl crate::error::Classified for ListError {
 /// Offers `extension_list` to native runs.
 pub struct ListHost {
     extensions: ExtensionHost,
+    /// The host offering the skills builtin's tools under their stable
+    /// names; asked what it offers rather than second-guessed.
+    skills: Arc<dyn ToolHost>,
 }
 impl ListHost {
-    pub fn new(extensions: ExtensionHost) -> Self {
-        Self { extensions }
+    pub fn new(extensions: ExtensionHost, skills: Arc<dyn ToolHost>) -> Self {
+        Self { extensions, skills }
     }
     fn spec() -> ToolSpec {
         ToolSpec {
@@ -84,7 +93,7 @@ impl ListHost {
             whole_output: true,
         }
     }
-    fn list_extensions(
+    async fn list_extensions(
         &self,
         scope: &ToolScope,
         arguments: &Map<String, Value>,
@@ -100,19 +109,29 @@ impl ListHost {
         let mut catalog = self.extensions.catalog()?;
         if let Some(id) = only {
             catalog.plugins.retain(|plugin| plugin.id == id);
+            catalog
+                .proposals
+                .retain(|proposal| proposal.summary.id == id);
             if catalog.plugins.is_empty() {
                 return Err(ListError::NotInstalled(id.into()));
             }
         }
         let (names, unavailable) = crate::extension_tools::offered_names(&self.extensions);
+        let skills = self.skills.list(scope).await;
         let context = Context {
             scope,
             names: &names,
             unavailable: &unavailable,
-            approved_skills: catalog.approved_skills,
+            skills: &skills,
         };
+        let listing = listing(&context, &catalog, only.is_some());
+        if let Some(id) = only
+            && listing["extensions"].as_array().is_none_or(Vec::is_empty)
+        {
+            return Err(ListError::TooLarge(id.into()));
+        }
         Ok(ToolOutput {
-            text: listing(&context, &catalog, only.is_some()).to_string(),
+            text: listing.to_string(),
             is_error: false,
         })
     }
@@ -127,7 +146,8 @@ struct Context<'a> {
     scope: &'a ToolScope,
     names: &'a BTreeMap<(String, String), String>,
     unavailable: &'a [UnavailableTools],
-    approved_skills: bool,
+    /// What the skill tool host offers this conversation.
+    skills: &'a ToolListing,
 }
 
 /// The listing the model receives. Names and descriptions are written by each
@@ -143,7 +163,7 @@ fn listing(context: &Context<'_>, catalog: &Catalog, detailed: bool) -> Value {
         let mut size = entry.to_string().len();
         if detailed && size > BUDGET {
             entry = extension(context, plugin, false);
-            entry["tool_descriptions_omitted"] = json!(true);
+            entry["descriptions_shortened"] = json!(true);
             size = entry.to_string().len();
         }
         if used + size > BUDGET {
@@ -194,11 +214,19 @@ fn extension(context: &Context<'_>, plugin: &PluginSummary, detailed: bool) -> V
         .map(|tool| {
             let mut blocked = blocked(plugin, &tool.capabilities, context.scope);
             let name = if skills {
-                // Offered under its stable names, and only while a skill is approved.
-                if !context.approved_skills {
-                    blocked.push("The user has not approved any skill.".into());
+                // Offered under its stable names, only while an approved
+                // skill is unchanged; the skill host decides.
+                let offered = context.skills.tools.iter().any(|t| t.name == tool.name);
+                if !offered && blocked.is_empty() {
+                    blocked.extend(context.skills.unavailable.iter().map(|u| display(&u.error)));
+                    if blocked.is_empty() {
+                        blocked.push(
+                            "The user has no approved skill that is unchanged since approval."
+                                .into(),
+                        );
+                    }
                 }
-                Some(tool.name.clone())
+                offered.then(|| tool.name.clone())
             } else {
                 context
                     .names
@@ -228,10 +256,17 @@ fn extension(context: &Context<'_>, plugin: &PluginSummary, detailed: bool) -> V
         .iter()
         .map(|panel| json!({"id": panel.id, "title": panel.title}))
         .collect();
+    // The compact form keeps an author's long description from crowding out
+    // the tools; a listing of one extension gives it whole when it fits.
+    let description = if detailed {
+        plugin.description.as_str()
+    } else {
+        shortened(&plugin.description, SHORT_DESCRIPTION)
+    };
     let mut entry = json!({
         "id": plugin.id,
         "name": plugin.name,
-        "description": plugin.description,
+        "description": description,
         "version": plugin.version,
         "source": match plugin.source {
             PluginSource::Bundled => "bundled",
@@ -247,6 +282,20 @@ fn extension(context: &Context<'_>, plugin: &PluginSummary, detailed: bool) -> V
         entry["errors"] = json!(failures);
     }
     entry
+}
+
+/// Longest extension description in the compact form.
+const SHORT_DESCRIPTION: usize = 1024;
+/// `text` cut to at most `limit` bytes at a character boundary, marked when cut.
+fn shortened(text: &str, limit: usize) -> &str {
+    if text.len() <= limit {
+        return text;
+    }
+    let mut end = limit;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
 }
 
 /// What keeps a tool needing `needs` from being called in `scope`.
@@ -306,7 +355,7 @@ impl ToolHost for ListHost {
     ) -> BoxFuture<'a, Result<ToolOutput, ErrorReport>> {
         Box::pin(async move {
             let result = if request.name == NAME {
-                self.list_extensions(scope, &request.arguments)
+                self.list_extensions(scope, &request.arguments).await
             } else {
                 Err(ListError::UnknownTool(request.name))
             };

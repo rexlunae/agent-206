@@ -104,15 +104,17 @@ packages waiting for review and whether this conversation prepared them. Each
 tool carries the name it is offered under (`name`, or `null` when it is not
 offered), and `blocked_by` lists what stands in the way: the extension is
 disabled, the user has not granted it a permission, this conversation does not
-allow one or has no project, or (for the skill tools) no skill is approved. An
+allow one or has no project, or (for the skill tools, as the skill tool host itself reports) no approved skill is unchanged. An
 extension whose package cannot be loaded lists its errors. The listing does not
 claim a tool is callable: the model's own tool list says that, and a tool with
 nothing in `blocked_by` may still need the user's permission in the
 conversation. Names and descriptions are written by each extension's author.
 
-The full listing leaves out tool descriptions and stops before the 64 KiB
-result limit, naming the extensions it left out (`omitted`); passing
-`extension = "<id>"` lists one extension with its tool descriptions.
+The full listing leaves out tool descriptions, shortens extension descriptions
+to 1 KiB and stops before the 64 KiB result limit, naming the extensions it
+left out (`omitted`). Passing `extension = "<id>"` lists that one extension and
+its proposals with full descriptions, or shortened ones
+(`descriptions_shortened`) when they do not fit.
 
 The listing reads records and changes nothing, so it uses no capability; like
 every tool it is denied until the user permits it in the conversation. It is
