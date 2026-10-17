@@ -6,8 +6,11 @@
 //!
 //! Adapted from RustyClaw's `StreamSanitizer` (`tool_healing.rs`, MIT).
 
-/// The most undecided text held before it is decided as if the stream had
-/// ended, so a long line is not copied again for every chunk.
+/// How far ahead the filter looks to decide a line, so a long line is not
+/// copied again for every chunk: inline code must close within this many
+/// bytes after a tag, and a fence line whose marker run or trailing
+/// whitespace is longer is not a fence. The limit is on the text, not on the
+/// chunks, so every chunking of a reply is filtered the same way.
 const MAX_HOLD: usize = 4096;
 
 /// Open and close tags of leaked tool-call blocks.
@@ -26,9 +29,8 @@ const TAGS: [(&str, &str); 6] = [
 /// fence or a backtick run is held until a later chunk decides it. Held text
 /// is short except in two cases: a tag after an unclosed backtick run waits
 /// for the run's close or the line's end, and a possible closing fence waits
-/// for its line to end. Either is decided as if the stream had ended once
-/// [`MAX_HOLD`] bytes are waiting. [`Filter::finish`] releases held text and
-/// drops an unterminated block.
+/// for its line to end. Both look at most [`MAX_HOLD`] bytes ahead.
+/// [`Filter::finish`] releases held text and drops an unterminated block.
 #[derive(Debug, Default)]
 pub struct Filter {
     /// Text not decided yet, or inside a block the tail that could begin its
@@ -120,7 +122,7 @@ impl Filter {
         }
         if !self.mid_line {
             match fence_mark(rest) {
-                Mark::Undecided if self.decide(text, at) => return self.pass_line(text, at, out),
+                Mark::Undecided if self.ended => return self.pass_line(text, at, out),
                 Mark::Undecided => return Step::Hold(at),
                 Mark::Fence(mark, bare) => {
                     match self.fence {
@@ -129,7 +131,7 @@ impl Filter {
                             match bare {
                                 Some(true) => self.fence = None,
                                 Some(false) => {}
-                                None if self.decide(text, at) => self.fence = None,
+                                None if self.ended => self.fence = None,
                                 None => return Step::Hold(at),
                             }
                         }
@@ -177,7 +179,7 @@ impl Filter {
                         // An opening backtick run is code only once a run of
                         // the same length closes it on this line.
                         if let Some(run) = self.code {
-                            match closes(tail, run, self.decide(text, i)) {
+                            match closes(tail, run, self.ended) {
                                 Some(true) => {
                                     i += 1;
                                     continue;
@@ -258,6 +260,9 @@ fn fence_mark(line: &str) -> Mark {
         return Mark::None;
     }
     let len = bytes[indent..].iter().take_while(|&&b| b == mark).count();
+    if len > MAX_HOLD {
+        return Mark::None;
+    }
     if indent + len == bytes.len() {
         return Mark::Undecided;
     }
@@ -266,13 +271,15 @@ fn fence_mark(line: &str) -> Mark {
     }
     let after = &bytes[indent + len..];
     let end = after.iter().position(|&b| b == b'\n');
-    let bare = after[..end.unwrap_or(after.len())]
-        .iter()
-        .all(|&b| matches!(b, b' ' | b'\t' | b'\r'));
-    Mark::Fence(
-        Fence { mark, len },
-        (end.is_some() || !bare).then_some(bare),
-    )
+    let trailing = &after[..end.unwrap_or(after.len())];
+    let bare = if !trailing.iter().all(|&b| matches!(b, b' ' | b'\t' | b'\r'))
+        || trailing.len() > MAX_HOLD
+    {
+        Some(false)
+    } else {
+        end.map(|_| true)
+    };
+    Mark::Fence(Fence { mark, len }, bare)
 }
 
 /// Whether a backtick run of `run` closes inline code later on this line
@@ -281,6 +288,9 @@ fn closes(text: &str, run: usize, complete: bool) -> Option<bool> {
     let bytes = text.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
+        if i > MAX_HOLD {
+            return Some(false);
+        }
         match bytes[i] {
             b'\n' => return Some(false),
             b'`' => {
@@ -435,6 +445,25 @@ mod tests {
         assert_eq!(out, "");
         assert_eq!(filter.feed("</tool_call>b\n"), "b\n");
         assert_eq!(filter.removed(), 1);
+    }
+
+    #[test]
+    fn lookahead_limits_do_not_depend_on_chunking() {
+        let long = "a".repeat(MAX_HOLD);
+        // Inline code closing too far after the tag is not code.
+        let text = format!("` <tool_call>x</tool_call> {long}`");
+        assert_eq!(every_split(&text), (format!("`  {long}`"), 1));
+        let text = format!("`<tool_call>x</tool_call>{}`", &long[..MAX_HOLD - 40]);
+        assert_eq!(every_split(&text), (text.clone(), 0));
+        // A closing fence candidate with too much trailing space is code.
+        let spaces = " ".repeat(MAX_HOLD + 1);
+        let text =
+            format!("```\n```{spaces}\n<tool_call>q</tool_call>\n```\n<tool_call>l</tool_call>");
+        let kept = format!("```\n```{spaces}\n<tool_call>q</tool_call>\n```\n");
+        assert_eq!(every_split(&text), (kept, 1));
+        // A marker run that long is not a fence.
+        let text = format!("{}\n<tool_call>e</tool_call>\n", "`".repeat(MAX_HOLD + 1));
+        assert_eq!(every_split(&text).1, 1);
     }
 
     #[test]

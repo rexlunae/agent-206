@@ -572,7 +572,7 @@ found: text that could begin a tag is held until the next delta decides it,
 and held text that never became a tag is the stream's last delta. A block
 the stream never closes is dropped. Markup inside fenced code blocks (closed
 only by a line of nothing but the fence) and inline code (a backtick run
-matched later on its line, looked for in at most 4 KiB) is left alone, since a reply that explains tool
+matched later on its line within 4 KiB of the tag) is left alone, since a reply that explains tool
 calls quotes it there. A reply that held nothing but such markup fails with "the model
 wrote its tool call as text instead of calling the tool" instead of appearing
 empty, and each removal is logged with the number of blocks.
