@@ -65,6 +65,12 @@ const TESTS: &[(&str, Test)] = &[
     ("a_retried_install_replays_its_receipt", || {
         Box::pin(a_retried_install_replays_its_receipt())
     }),
+    ("an_agent_prepared_package_waits_for_the_user", || {
+        Box::pin(an_agent_prepared_package_waits_for_the_user())
+    }),
+    ("agents_cannot_leave_unbounded_proposals", || {
+        Box::pin(agents_cannot_leave_unbounded_proposals())
+    }),
 ];
 
 fn main() {
@@ -133,7 +139,7 @@ const API: ProviderApi = ProviderApi::OpenAi;
 struct Rig {
     gateway: Gateway,
     state: tempfile::TempDir,
-    _workspace: tempfile::TempDir,
+    workspace: tempfile::TempDir,
     thread: Id,
     requests: mpsc::Receiver<Opened>,
     /// The name of a file in the project and its generated contents.
@@ -163,7 +169,7 @@ async fn rig() -> Rig {
     let rig = Rig {
         gateway,
         state,
-        _workspace: workspace,
+        workspace,
         thread: project.manager,
         requests,
         file,
@@ -882,4 +888,170 @@ async fn approved_skills_reach_the_model_through_the_skill_tools() {
     second.respond(text_response(api, &nonce())).await;
     let thread = finished(task).await;
     assert_eq!(thread.state, RunState::Complete, "{:?}", thread.error);
+}
+
+// ── Agent-prepared packages ─────────────────────────────────────────────────
+
+impl Rig {
+    /// Write `package` into the project and return the call proposing it.
+    fn prepared(&self, (manifest, module): (String, Vec<u8>)) -> Call {
+        let dir = nonce();
+        let root = self.workspace.path().join(&dir);
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("plugin.toml"), manifest).unwrap();
+        std::fs::write(root.join("module.wasm"), module).unwrap();
+        Call::new(
+            a206_runtime::propose_tool::NAME,
+            json!({"manifest": format!("{dir}/plugin.toml"), "module": format!("{dir}/module.wasm")}),
+        )
+    }
+    fn proposals(&self) -> Vec<ExtensionProposal> {
+        self.gateway.snapshot().unwrap().extension_proposals
+    }
+    fn stored(&self, digest: &str) -> bool {
+        self.state.path().join("extensions").join(digest).exists()
+    }
+}
+
+async fn an_agent_prepared_package_waits_for_the_user() {
+    let mut rig = rig().await;
+    rig.tool = a206_runtime::propose_tool::NAME.into();
+    let id = format!("test.{}", nonce());
+    // The user installed and granted the first version themselves.
+    let Reply::Extension(first) = install(&rig.gateway, package(&id, "1.0.0")).await else {
+        panic!("install failed");
+    };
+    let grant = Command::GrantExtension {
+        extension: id.clone(),
+        capabilities: [Capability::ReadWorkspace].into(),
+    };
+    rig.ok(grant).await;
+
+    // Denied until this conversation permits the tool.
+    let update = rig.prepared(package(&id, "2.0.0"));
+    let (thread, _) = rig.round_trip(std::slice::from_ref(&update)).await;
+    assert_eq!(
+        calls_of(&thread).last().unwrap().state,
+        ToolCallState::Denied
+    );
+    assert!(rig.proposals().is_empty());
+
+    rig.permit(ToolPermission::Allow).await;
+    let escape = Call::new(
+        &rig.tool,
+        json!({"manifest": "../plugin.toml", "module": "module.wasm"}),
+    );
+    // Each call gets its own id, so its result is found unambiguously.
+    let update = rig.prepared(package(&id, "2.0.0"));
+    let (thread, results) = rig.round_trip(&[update, escape]).await;
+    assert_eq!(thread.state, RunState::Complete, "{:?}", thread.error);
+    let calls = calls_of(&thread);
+    let (proposed, escaped) = (&calls[calls.len() - 2], &calls[calls.len() - 1]);
+    assert_eq!(
+        proposed.state,
+        ToolCallState::Succeeded,
+        "{:?}",
+        proposed.error
+    );
+    assert!(results[0].as_deref().unwrap().contains(&id));
+    assert_eq!(escaped.state, ToolCallState::Failed);
+    assert_eq!(error_kind(escaped), ErrorKind::InvalidRequest);
+
+    // Proposing changed nothing the user had installed or granted.
+    let proposals = rig.proposals();
+    assert_eq!(proposals.len(), 1, "{proposals:?}");
+    let proposal = proposals[0].clone();
+    assert_eq!(proposal.thread, rig.thread);
+    assert_eq!(proposal.summary.id, id);
+    assert!(!proposal.summary.enabled && proposal.summary.granted.is_empty());
+    assert!(
+        rig.gateway
+            .snapshot()
+            .unwrap()
+            .plugins
+            .contains(&PluginSummary {
+                granted: [Capability::ReadWorkspace].into(),
+                enabled: false,
+                ..*first.clone()
+            })
+    );
+    assert!(rig.stored(&proposal.digest));
+
+    // Installing it is the user's step; the update keeps no earlier grants.
+    let Reply::Extension(installed) = rig
+        .run(Command::InstallProposal {
+            digest: proposal.digest.clone(),
+        })
+        .await
+    else {
+        panic!("installing the proposal failed");
+    };
+    assert_eq!(installed.version, "2.0.0");
+    assert!(!installed.enabled && installed.granted.is_empty());
+    assert_eq!(installed_digest(&installed), proposal.digest);
+    assert!(rig.proposals().is_empty());
+    assert!(!rig.stored(&installed_digest(&first)));
+    let again = failure(
+        rig.run(Command::InstallProposal {
+            digest: proposal.digest.clone(),
+        })
+        .await,
+    );
+    assert_eq!(again.kind, ErrorKind::NotFound);
+
+    // The installed package itself cannot be proposed again.
+    let update = rig.prepared(package(&id, "2.0.0"));
+    let (thread, _) = rig.round_trip(std::slice::from_ref(&update)).await;
+    let last = calls_of(&thread).last().unwrap().clone();
+    assert_eq!(error_kind(&last), ErrorKind::Conflict, "{:?}", last.error);
+
+    // A dismissed proposal leaves nothing behind.
+    let newer = rig.prepared(package(&id, "3.0.0"));
+    rig.round_trip(std::slice::from_ref(&newer)).await;
+    let [proposal] = rig.proposals().try_into().unwrap();
+    let dismiss = || Command::DismissProposal {
+        digest: proposal.digest.clone(),
+    };
+    rig.ok(dismiss()).await;
+    assert!(rig.proposals().is_empty());
+    assert!(!rig.stored(&proposal.digest));
+    assert_eq!(failure(rig.run(dismiss()).await).kind, ErrorKind::NotFound);
+    assert_eq!(
+        rig.gateway
+            .snapshot()
+            .unwrap()
+            .plugins
+            .iter()
+            .find(|p| p.id == id),
+        Some(&*installed)
+    );
+}
+
+async fn agents_cannot_leave_unbounded_proposals() {
+    let mut rig = rig().await;
+    rig.tool = a206_runtime::propose_tool::NAME.into();
+    rig.permit(ToolPermission::Allow).await;
+    let calls: Vec<Call> = (0..=MAX_EXTENSION_PROPOSALS)
+        .map(|_| rig.prepared(package(&format!("test.{}", nonce()), "1.0.0")))
+        .collect();
+    let (thread, _) = rig.round_trip(&calls).await;
+    let results = calls_of(&thread);
+    let (last, rest) = results.split_last().unwrap();
+    assert!(
+        rest.iter()
+            .all(|call| call.state == ToolCallState::Succeeded)
+    );
+    assert_eq!(error_kind(last), ErrorKind::Conflict, "{:?}", last.error);
+    let proposals = rig.proposals();
+    assert_eq!(proposals.len(), MAX_EXTENSION_PROPOSALS);
+    // A newer version of a waiting proposal replaces it rather than adding one.
+    let first = &proposals[0];
+    let replacement = rig.prepared(package(&first.summary.id, "2.0.0"));
+    let (thread, _) = rig.round_trip(std::slice::from_ref(&replacement)).await;
+    let last = calls_of(&thread).last().unwrap().clone();
+    assert_eq!(last.state, ToolCallState::Succeeded, "{:?}", last.error);
+    let proposals = rig.proposals();
+    assert_eq!(proposals.len(), MAX_EXTENSION_PROPOSALS);
+    assert!(!proposals.iter().any(|p| p.digest == first.digest));
+    assert!(!rig.stored(&first.digest));
 }
