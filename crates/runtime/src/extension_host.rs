@@ -182,6 +182,20 @@ pub struct ExtensionTool {
     pub spec: ToolSpec,
 }
 
+/// What [`ExtensionHost::catalog`] reads.
+#[derive(Debug, Clone)]
+pub struct Catalog {
+    pub plugins: Vec<PluginSummary>,
+    pub proposals: Vec<a206_core::ExtensionProposal>,
+}
+/// Capabilities that only make sense inside a project: a call declaring any
+/// of them is refused without one.
+pub const PROJECT_CAPABILITIES: [Capability; 4] = [
+    Capability::ReadWorkspace,
+    Capability::WriteWorkspace,
+    Capability::GitRead,
+    Capability::GitWrite,
+];
 /// One enabled extension's tools, or why they could not be read.
 #[derive(Debug)]
 pub struct ExtensionTools {
@@ -355,6 +369,15 @@ impl ExtensionHost {
         }
     }
 
+    /// Every installed extension and every package waiting for review, as
+    /// the user sees them on the Extensions page.
+    pub fn catalog(&self) -> Result<Catalog, ExtensionError> {
+        let store = self.store.lock().map_err(|_| ExtensionError::Poisoned)?;
+        Ok(Catalog {
+            plugins: store.state.plugins.clone(),
+            proposals: store.state.extension_proposals.clone(),
+        })
+    }
     fn plugins(&self) -> Result<Vec<PluginSummary>, ExtensionError> {
         Ok(self
             .store
@@ -557,14 +580,7 @@ impl ExtensionHost {
                 });
             }
         }
-        let workspace_capabilities = [
-            Capability::ReadWorkspace,
-            Capability::WriteWorkspace,
-            Capability::GitRead,
-            Capability::GitWrite,
-        ];
-        if scope.workspace.is_none() && workspace_capabilities.iter().any(|c| declared.contains(c))
-        {
+        if scope.workspace.is_none() && PROJECT_CAPABILITIES.iter().any(|c| declared.contains(c)) {
             return Err(ExtensionError::NoProject);
         }
         let deadline = tokio::time::Instant::now() + TIMEOUT;

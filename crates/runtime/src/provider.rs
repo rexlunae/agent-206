@@ -36,7 +36,11 @@ pub enum ProviderError {
     #[error("provider request failed")]
     Transport(#[source] reqwest::Error),
     #[error("provider returned HTTP {status}")]
-    Status { status: u16 },
+    Status {
+        status: u16,
+        /// How long the provider asked the client to wait, when it said.
+        retry_after: Option<Duration>,
+    },
     #[error("provider response is too large")]
     ResponseTooLarge,
     #[error("provider response is not valid JSON")]
@@ -197,6 +201,7 @@ async fn response_json(response: reqwest::Response) -> Result<Value> {
         status.is_success(),
         ProviderError::Status {
             status: status.as_u16(),
+            retry_after: None,
         },
     )?;
     let mut stream = response.bytes_stream();
@@ -210,6 +215,15 @@ async fn response_json(response: reqwest::Response) -> Result<Value> {
         bytes.extend_from_slice(&part);
     }
     serde_json::from_slice(&bytes).map_err(ProviderError::Json)
+}
+/// What one model request asks: the conversation's history, the system
+/// prompt, the model it was validated against and the tools offered.
+#[derive(Clone, Copy)]
+pub struct Ask<'a> {
+    pub thread: &'a Thread,
+    pub prompt: &'a str,
+    pub info: &'a ModelInfo,
+    pub tools: &'a [crate::tools::ToolSpec],
 }
 /// Where credentialed requests go: the profile whose vault broker holds the
 /// key, and the pairing a trusted client gave the gateway for this unlock.
@@ -260,7 +274,10 @@ async fn brokered(
     };
     check(
         (200..300).contains(&status),
-        ProviderError::Status { status },
+        ProviderError::Status {
+            status,
+            retry_after: None,
+        },
     )?;
     check(body.len() <= MAX_RESPONSE, ProviderError::ResponseTooLarge)?;
     serde_json::from_slice(&body).map_err(ProviderError::Json)
@@ -612,12 +629,16 @@ pub struct Turn {
 pub async fn complete(
     config: &ProviderConfig,
     broker: Broker<'_>,
-    thread: &Thread,
-    prompt: &str,
-    info: &ModelInfo,
-    tools: &[crate::tools::ToolSpec],
+    ask: Ask<'_>,
     progress: &tokio::sync::mpsc::Sender<crate::backends::Progress>,
+    retry: &crate::retry::RetryPolicy,
 ) -> Result<Turn> {
+    let Ask {
+        thread,
+        prompt,
+        info,
+        tools,
+    } = ask;
     let model = thread.model.as_ref().ok_or(ProviderError::NoModel)?;
     check(model == &info.key, ProviderError::ModelMismatch)?;
     let (url, body) = match config.api {
@@ -696,18 +717,55 @@ pub async fn complete(
             (url, body)
         }
     };
-    let mut sink = Sink {
-        decoder: crate::sse::Decoder::default(),
-        reply: StreamedReply::new(config.api),
-        progress,
-    };
-    match &config.credential {
-        None => stream_direct(config, url, &body, &mut sink).await?,
-        Some(credential) => {
-            stream_brokered(config, broker, credential, url, &body, &mut sink).await?
-        }
+    let mut attempt = 1;
+    loop {
+        let mut sink = Sink {
+            decoder: crate::sse::Decoder::default(),
+            reply: StreamedReply::new(config.api),
+            progress,
+            received: false,
+        };
+        let streamed = match &config.credential {
+            None => stream_direct(config, url.clone(), &body, &mut sink).await,
+            Some(credential) => {
+                stream_brokered(config, broker, credential, url.clone(), &body, &mut sink).await
+            }
+        };
+        let error = match streamed {
+            Ok(()) => return sink.reply.finish(),
+            Err(error) => error,
+        };
+        // Once anything arrived the failure is final: a retry would stream
+        // text or tool calls again.
+        let jitter = f64::from(Id::new_v4().as_u128() as u16) / 65536.0;
+        let Some(wait) = (!sink.received)
+            .then(|| retry.delay(&error, attempt, jitter))
+            .flatten()
+        else {
+            return Err(error);
+        };
+        tracing::warn!(
+            error = &error as &dyn std::error::Error,
+            attempt,
+            attempts = retry.attempts,
+            wait_ms = wait.as_millis() as u64,
+            "retrying the model request"
+        );
+        let status = crate::retry::Reason::of(&error).and_then(|reason| reason.status);
+        let why = match status {
+            Some(status) => format!("The provider answered HTTP {status}"),
+            None => "The provider could not be reached".to_owned(),
+        };
+        attempt += 1;
+        progress
+            .send(crate::backends::Progress::Activity(format!(
+                "{why}; retrying (attempt {attempt} of {})",
+                retry.attempts
+            )))
+            .await
+            .ignore();
+        tokio::time::sleep(wait).await;
     }
-    sink.reply.finish()
 }
 /// Introduces a compaction summary in the history a model receives.
 pub const SUMMARY_PREAMBLE: &str = "[Summary of the earlier conversation, written when it was compacted to save context. The original messages are no longer included.]";
@@ -859,9 +917,12 @@ struct Sink<'a> {
     decoder: crate::sse::Decoder,
     reply: StreamedReply,
     progress: &'a tokio::sync::mpsc::Sender<crate::backends::Progress>,
+    /// Any response bytes arrived.
+    received: bool,
 }
 impl Sink<'_> {
     async fn feed(&mut self, bytes: &[u8]) -> Result<()> {
+        self.received |= !bytes.is_empty();
         let mut events = vec![];
         // Text completed before a decoding error is still forwarded, so what
         // survives a failure does not depend on network read boundaries.
@@ -897,6 +958,7 @@ async fn stream_direct(
         status.is_success(),
         ProviderError::Status {
             status: status.as_u16(),
+            retry_after: crate::retry::retry_after(response.headers()),
         },
     )?;
     let mut stream = response.bytes_stream();
@@ -934,7 +996,10 @@ async fn stream_brokered(
         };
         check(
             (200..300).contains(&status),
-            ProviderError::Status { status },
+            ProviderError::Status {
+                status,
+                retry_after: None,
+            },
         )?;
         return sink.feed(&body).await;
     }
@@ -945,7 +1010,10 @@ async fn stream_brokered(
     let status = stream.status();
     check(
         (200..300).contains(&status),
-        ProviderError::Status { status },
+        ProviderError::Status {
+            status,
+            retry_after: None,
+        },
     )?;
     while let Some(bytes) = stream.next().await.map_err(ProviderError::Broker)? {
         sink.feed(&bytes).await?;

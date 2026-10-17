@@ -334,6 +334,8 @@ pub struct Gateway {
     refreshed: Arc<Mutex<BTreeMap<Id, u64>>>,
     paired: Arc<tokio::sync::Notify>,
     tool_hosts: Arc<Vec<Arc<dyn crate::tools::ToolHost>>>,
+    /// How model requests are retried.
+    retry: crate::retry::RetryPolicy,
     /// Runs waiting for the user, by approval ID. Only `ResolveApproval` answers them.
     approvals: Arc<Mutex<BTreeMap<Id, run::Waiter>>>,
     /// Questions `ask_user` calls are waiting on. Only `AnswerPrompt` answers them.
@@ -423,6 +425,10 @@ impl Gateway {
         // user permits them.
         let skill_tools: Arc<dyn crate::tools::ToolHost> =
             Arc::new(crate::skill_tool::SkillToolHost::new(store.clone(), root));
+        // Listing reads what the Extensions page shows and changes nothing.
+        let list_tools: Arc<dyn crate::tools::ToolHost> = Arc::new(
+            crate::extension_list_tool::ListHost::new(extensions.clone(), skill_tools.clone()),
+        );
         let mut gateway = Self {
             admission: Arc::new(Mutex::new(Admission::default())),
             shutdown_committed: Arc::new(tokio::sync::Mutex::new(false)),
@@ -437,6 +443,7 @@ impl Gateway {
             pair_requests: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             refreshed: Arc::new(Mutex::new(BTreeMap::new())),
             paired: Arc::new(tokio::sync::Notify::new()),
+            retry: crate::retry::RetryPolicy::DEFAULT,
             tool_hosts: Arc::new(vec![
                 extension_tools,
                 mcp_tools,
@@ -444,6 +451,7 @@ impl Gateway {
                 Arc::new(crate::prompt_tool::PromptHost::new(prompts.clone())),
                 skill_tools,
                 propose_tools,
+                list_tools,
             ]),
             approvals: Arc::new(Mutex::new(BTreeMap::new())),
             prompts,
