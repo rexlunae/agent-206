@@ -1,5 +1,4 @@
 //! Real subprocess/protocol tests; all model facts are discovered from a live API.
-#![cfg(target_os = "macos")]
 use a206_core::*;
 use a206_protocol::Request;
 use a206_runtime::gateway::Gateway;
@@ -217,8 +216,7 @@ fn main() {
     assert!(status.success());
     executable
 }
-#[tokio::test]
-async fn drives_both_agent_protocols_in_the_real_os_sandbox() {
+pub async fn drives_both_agent_protocols_in_the_real_os_sandbox() {
     let directory = tempfile::tempdir().unwrap();
     let installation = directory.path().join("runtime");
     std::fs::create_dir(&installation).unwrap();
@@ -492,14 +490,32 @@ async fn drives_both_agent_protocols_in_the_real_os_sandbox() {
                 );
             }
             // The root is reaped; the process group is killed, including the descendant.
-            assert!(nix::sys::signal::kill(nix::unistd::Pid::from_raw(pids[0]), None).is_err());
-            tokio::time::timeout(std::time::Duration::from_secs(5), async {
-                while nix::sys::signal::kill(nix::unistd::Pid::from_raw(pids[1]), None).is_ok() {
-                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-                }
-            })
-            .await
-            .unwrap();
+            #[cfg(target_os = "macos")]
+            {
+                assert!(nix::sys::signal::kill(nix::unistd::Pid::from_raw(pids[0]), None).is_err());
+                tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    while nix::sys::signal::kill(nix::unistd::Pid::from_raw(pids[1]), None).is_ok()
+                    {
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    }
+                })
+                .await
+                .unwrap();
+            }
+            // Linux runtimes report PIDs from their own namespace, so look for
+            // any host process still running the fixture instead.
+            #[cfg(target_os = "linux")]
+            {
+                assert_eq!(pids.len(), 2);
+                let fixture = std::fs::canonicalize(&executable).unwrap();
+                tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    while running(&fixture) {
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    }
+                })
+                .await
+                .unwrap();
+            }
         } else {
             let Reply::Thread(result) =
                 tokio::time::timeout(std::time::Duration::from_secs(5), job)
@@ -572,4 +588,14 @@ async fn drives_both_agent_protocols_in_the_real_os_sandbox() {
         assert_eq!(result.state, RunState::Complete, "{:?}", result.messages);
     }
     server.abort();
+}
+/// Whether any host process was started from `executable`.
+#[cfg(target_os = "linux")]
+fn running(executable: &Path) -> bool {
+    std::fs::read_dir("/proc").unwrap().flatten().any(|entry| {
+        std::fs::read(entry.path().join("cmdline")).is_ok_and(|cmdline| {
+            cmdline.split(|byte| *byte == 0).next()
+                == Some(executable.as_os_str().as_encoded_bytes())
+        })
+    })
 }

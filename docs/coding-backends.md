@@ -102,8 +102,15 @@ agent206 backend select "$THREAD_ID" native
 
 ## Current boundaries and limits
 
-The macOS implementation uses Seatbelt. Linux and Windows launch fails closed until
-equivalent filesystem and network isolation is implemented. Processes start in a
+The macOS implementation uses Seatbelt. On Linux (`crates/sandbox`), bubblewrap
+places the runtime in new user, PID, IPC, UTS, cgroup and network namespaces with a
+mount namespace holding only system libraries, the installation, scratch space and
+the granted project; Landlock then confines reads, writes and execution to the same
+allowlist from inside. The network namespace has only loopback, where a helper relays
+the proxy port to the gateway over a Unix socket. Linux launch fails with a
+displayed error, never a weaker sandbox, when `/usr/bin/bwrap` is missing, Landlock
+is not enforced (Linux 5.13+ with Landlock enabled), or a protected path inside a
+writable grant cannot be hidden. Windows launch fails closed. Processes start in a
 scratch working directory with a new private home and cleared environment. They
 cannot inherit existing agent accounts, hooks, plugins, project settings or MCP
 servers. Granted project paths are included explicitly in the task. Common user
@@ -142,7 +149,7 @@ not license the Claude runtime; each component retains its own terms.
 
 Tests exercise generated model facts from running API servers, native provider
 pagination and text mapping, and independent mock Codex/ACP peer executables inside
-the real macOS sandbox. They verify actual file/network denials, scoped read/write,
+the real macOS or Linux sandbox. They verify actual file/network denials, scoped read/write,
 symlink protection, permission denial, cross-session isolation, malformed/oversized
 output, cancellation of root/descendant processes and configuration revocation.
 They do not establish compatibility with installed vendor releases or authenticated
