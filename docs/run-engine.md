@@ -273,6 +273,9 @@ the helper), and
 Tests: `crates/runtime/src/extension_tools/tests.rs` (listing, naming,
 conversion, checks before the worker) and `crates/runtime/tests/extension_tools.rs`
 (native runs through the real worker; the test binary doubles as the worker).
+`crates/runtime/tests/memory_tools.rs` does the same for the bundled memory
+extension: nothing offered or callable without the user's grant, search and
+get confined to memory files, and saving only with the separate write grant.
 
 ### Subagents
 
@@ -398,7 +401,8 @@ tools get, `ToolScope::capabilities`). Otherwise nothing is read. The reviewed
 list, in prompt order, is `AGENTS.md`, `CLAUDE.md`, `SOUL.md`, `IDENTITY.md`,
 `TOOLS.md` (`crates/runtime/src/instructions.rs`). RustyClaw's `USER.md`,
 `MEMORY.md`, `HEARTBEAT.md` and daily memory files are personal or scheduling state
-and are not read.
+and are not read into the prompt; a conversation the user lets use the bundled
+`agent206.memory` tools can search and read `MEMORY.md` and `memory/` on demand.
 
 - Files are opened through cap-std from the project root: absolute paths, `..` and
   symlinks that leave the project are refused; a symlink within the project is
