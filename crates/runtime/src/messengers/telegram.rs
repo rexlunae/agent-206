@@ -150,7 +150,11 @@ impl Telegram {
                 (update.update_id.to_string(), event)
             })
             .collect();
-        Ok(Batch { events, next })
+        Ok(Batch {
+            events,
+            next,
+            complete: true,
+        })
     }
 
     /// Send `text` to `chat`, split to Telegram's message limit.

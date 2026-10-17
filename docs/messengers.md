@@ -137,10 +137,14 @@ agent206 messenger enable home
   the previous cursor; it never silently skips messages.
   Unrelated rooms contribute discovery only, outside the allowed-room work
   budget. Up to 4,096 unapproved room IDs are retained and surfaced for
-  user review in chunks of 64 across polls. The old cursor is held until
-  every discovery is surfaced; authorized turns and joins are delivered
+  the recent-refusal feed in chunks of 64 across polls. **The review list
+  retains only the latest 16 refused chats or senders**, not a full room
+  directory; older entries are replaced. Other room IDs can be added
+  manually under Allowed chats or through the CLI. The old cursor is held until
+  every discovery reaches that feed; authorized turns and joins are delivered
   only in the final chunk, so reconnecting during discovery cannot repeat
-  them. Larger discovery sets produce a budget error without confirming
+  them. Deduplication keys survive intermediate chunks and reconnects until
+  the actual sync token advances. Larger discovery sets produce a budget error without confirming
   the sync. Full
   room state is scanned with constant additional memory under the broker's
   byte limit, separately from sync-event budgets, so large membership lists

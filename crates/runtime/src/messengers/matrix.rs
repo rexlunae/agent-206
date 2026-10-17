@@ -60,7 +60,11 @@ impl Pending {
         } else {
             self.previous.clone()
         };
-        Batch { events, next }
+        Batch {
+            events,
+            next,
+            complete: self.discoveries.is_empty(),
+        }
     }
 }
 

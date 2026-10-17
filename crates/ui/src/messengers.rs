@@ -164,7 +164,7 @@ fn MessengerCard(now: u64, config: MessengerConfig, status: MessengerStatus) -> 
             AllowList { messenger: config.name.clone(), title: "Allowed senders", hint: "User ids accepted in allowed chats. Group chats accept only these senders; once any is listed, private chats do too.", entries: config.allowed_users.iter().cloned().collect::<Vec<_>>(), senders: true }
             if !status.refused.is_empty() {
                 h3 { "Refused recently" }
-                p { class: "a206-muted", "Titles come from the chat service and may be misleading. Allow only chats and people you recognize." }
+                p { class: "a206-muted", "The latest {a206_core::messengers::MAX_REFUSED_CHATS} refused chats or senders are shown. Older entries are replaced; add other room IDs under Allowed chats. Titles come from the chat service and may be misleading. Allow only chats and people you recognize." }
                 for refused in status.refused.iter().rev() {
                     RefusedRow { key: "{refused.chat}-{refused.sender:?}", messenger: config.name.clone(), refused: refused.clone(), offer: Offer::for_refused(&config, refused) }
                 }

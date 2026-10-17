@@ -578,6 +578,7 @@ struct Homeserver {
     joined: Arc<Mutex<Vec<String>>>,
     /// Room, transaction id and content of each sent event.
     sent: Arc<Mutex<Vec<(String, String, Value)>>>,
+    send_statuses: Arc<Mutex<VecDeque<u16>>>,
 }
 
 fn check_bearer(server: &Homeserver, headers: &axum::http::HeaderMap) {
@@ -674,7 +675,16 @@ async fn serve_homeserver(server: Homeserver) -> String {
             .lock()
             .unwrap()
             .push((room, transaction, content));
-        Json(json!({ "event_id": format!("${}", random()) }))
+        let status = server
+            .send_statuses
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or(200);
+        (
+            StatusCode::from_u16(status).unwrap(),
+            Json(json!({ "event_id": format!("${}", random()) })),
+        )
     };
     let router = Router::new()
         .route("/_matrix/client/v3/account/whoami", get(whoami))
@@ -1160,4 +1170,44 @@ async fn matrix_drains_all_pending_invitations_before_confirming_the_sync() {
     assert_eq!(seen.len(), 130);
     assert_eq!(server.sync_queries.lock().unwrap().len(), 1);
     assert!(server.joined.lock().unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn matrix_reconnect_after_a_final_chunk_failure_never_repeats_a_turn() {
+    let (server, origin, _dir, credential, host, _anchor) = matrix_setup().await;
+    let room = matrix_id('!', "example.test");
+    let member = matrix_id('@', "example.test");
+    let mut rooms: serde_json::Map<String, Value> = (0..65)
+        .map(|_| (matrix_id('!', "example.test"), json!({})))
+        .collect();
+    rooms.insert(
+        room.clone(),
+        json!({"timeline": {"events": [text_event(&member, "m.text", &random())]}}),
+    );
+    let replay = json!({"join": rooms});
+    server
+        .syncs
+        .lock()
+        .unwrap()
+        .extend([json!({}), replay.clone(), replay]);
+    server.send_statuses.lock().unwrap().push_back(500);
+    let mut config = matrix_config("retry-chunks", &origin, &credential, &[&room]);
+    config.allowed_users.insert(member);
+    let (_desired, receiver) = watch::channel(vec![Desired { config, run: true }]);
+    let stop = CancellationToken::new();
+    let supervisor = tokio::spawn(supervise(host.clone(), receiver, FAST, stop.clone()));
+    host.until(|_| server.sync_queries.lock().unwrap().len() >= 4)
+        .await;
+    stop.cancel();
+    supervisor.await.unwrap();
+    assert_eq!(
+        host.turns.lock().unwrap().len(),
+        1,
+        "a failed send must not charge a second turn"
+    );
+    assert_eq!(server.sent.lock().unwrap().len(), 1);
+    let queries = server.sync_queries.lock().unwrap();
+    assert_eq!(queries[1]["since"], "s1");
+    assert_eq!(queries[2]["since"], "s1");
+    assert_eq!(queries[3]["since"], "s3");
 }

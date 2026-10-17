@@ -178,6 +178,9 @@ pub(crate) enum Event {
 /// batch delivered again after a failure skips what was already handled.
 pub(crate) struct Batch {
     pub events: Vec<(String, Event)>,
+    /// False for an intermediate discovery chunk. Retain deduplication keys
+    /// until the complete upstream batch is acknowledged, even after retries.
+    pub complete: bool,
     /// The cursor that confirms this whole batch.
     pub next: Option<String>,
 }
@@ -497,8 +500,10 @@ async fn session<H: Host>(
                 deliver(host, config, &adapter, event).await?;
             }
         }
-        position.next = batch.next;
-        position.handled.clear();
+        if batch.complete {
+            position.next = batch.next;
+            position.handled.clear();
+        }
     }
 }
 
