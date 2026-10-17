@@ -361,10 +361,14 @@ agent206 messenger enable phone
   so the first message from someone can be allowed from there.
 - **What is read and sent.** Only text messages are answered; reactions,
   edits, deletions, receipts, typing, stories and messages synced from the
-  account's other devices are ignored, and each message is handled once.
-  Replies go to the same ACI or group in parts of at most 2000 characters,
-  at most eight, each sent after signal-cli accepted the previous one. A
-  request the daemon does not answer within a minute fails.
+  account's other devices are ignored, and each message is handled once,
+  also when signal-cli delivers it again after a reconnect. A message with
+  group information is never taken for a direct chat. Replies go to the
+  same ACI or group in parts of at most 2000 characters, at most eight
+  (longer replies end with a note that they were cut), each sent after
+  signal-cli accepted the previous one. A request the daemon does not
+  answer within a minute fails; when the daemon refuses one, its reason is
+  shown on one line with anything shaped like a credential removed.
 - **Delivery.** With `--receive-mode=manual` messages that arrive while the
   gateway is stopped wait with Signal and are answered once it reconnects;
   a daemon receiving on its own may have taken them already. As with every

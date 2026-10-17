@@ -22,6 +22,7 @@ use a206_core::messengers::{
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::{mpsc, oneshot};
@@ -34,10 +35,14 @@ const MAX_LINE: usize = 1 << 20;
 const MAX_MESSAGE: usize = 2000;
 /// Most parts one reply is sent as.
 const MAX_PARTS: usize = 8;
+/// Ends a reply that did not fit in [`MAX_PARTS`] messages.
+const CUT_SHORT: &str = "\n(reply cut short; read the rest in Agent 206)";
 /// How long the daemon may take to answer a request.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// Replies waiting for the session.
 const OUTGOING: usize = 16;
+/// Characters of a signal-cli refusal kept for display.
+const MAX_REFUSAL: usize = 300;
 /// Recent message keys remembered, so a message delivered twice (for
 /// example by a second subscription) is answered once.
 const RECENT: usize = 1024;
@@ -49,6 +54,10 @@ pub(crate) struct Signal {
     daemon: std::result::Result<SignalDaemon, a206_core::messengers::SignalDaemonError>,
     login: Option<String>,
     session: Option<Session>,
+    /// Messages seen lately, kept across subscriptions so one signal-cli
+    /// delivers again after a reconnect is not answered twice. The login
+    /// cannot change without a new adapter, so these are all its account's.
+    recent: Arc<Mutex<Recent>>,
 }
 
 struct Session {
@@ -73,6 +82,7 @@ impl Signal {
             daemon,
             login,
             session: None,
+            recent: Arc::default(),
         }
     }
 
@@ -93,6 +103,7 @@ impl Signal {
         let mut rpc = Rpc {
             reader: BufReader::new(reader),
             writer: Writer { writer, next: 0 },
+            early: Vec::new(),
         };
         let accounts = rpc.call_now("listAccounts", json!({})).await?;
         let served = accounts.as_array().is_some_and(|accounts| {
@@ -112,8 +123,9 @@ impl Signal {
             name: Some(login.clone()),
         };
         let (outgoing, requests) = mpsc::channel(OUTGOING);
+        let recent = Arc::clone(&self.recent);
         let listener = Listener::start(SERVICE, account.id.clone(), move |queue| {
-            serve(rpc, login, requests, queue)
+            serve(rpc, login, requests, queue, recent)
         });
         self.session = Some(Session {
             listener,
@@ -189,6 +201,9 @@ async fn open(daemon: &SignalDaemon) -> Result<Box<dyn Io>> {
 struct Rpc {
     reader: BufReader<tokio::io::ReadHalf<Box<dyn Io>>>,
     writer: Writer,
+    /// Notifications that arrived while `call_now` waited, in order, for
+    /// the session to handle first.
+    early: Vec<Incoming>,
 }
 
 /// What the daemon sent: an answer to a request, or a notification.
@@ -215,7 +230,8 @@ struct RpcError {
 
 impl Rpc {
     /// Call `method` before the session starts, when nothing else is
-    /// waiting: the result, skipping any notification sent meanwhile.
+    /// waiting: the result. Notifications sent meanwhile are kept for the
+    /// session, since a message signal-cli delivered is not delivered again.
     async fn call_now(&mut self, method: &str, params: Value) -> Result<Value> {
         let id = self.writer.request(method, params).await?;
         let answer = async {
@@ -223,6 +239,9 @@ impl Rpc {
                 let incoming = read(&mut self.reader).await?;
                 if incoming.id.as_ref().and_then(Value::as_str) == Some(id.as_str()) {
                     return answered(incoming);
+                }
+                if incoming.method.is_some() {
+                    self.early.push(incoming);
                 }
             }
         };
@@ -258,9 +277,23 @@ fn answered(incoming: Incoming) -> Result<Value> {
     match incoming.error {
         Some(error) => Err(MessengerError::SignalRefused {
             code: error.code,
-            message: error.message,
+            message: refusal_text(&error.message),
         }),
         None => Ok(incoming.result.unwrap_or(Value::Null)),
+    }
+}
+
+/// signal-cli's explanation as it may be shown and logged: one line, of
+/// bounded length, with anything shaped like a credential removed.
+fn refusal_text(message: &str) -> String {
+    let line: String = message
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .take(MAX_REFUSAL)
+        .collect();
+    match a206_leak_scan::redact(&line) {
+        Some(redacted) => redacted.text,
+        None => line,
     }
 }
 
@@ -270,8 +303,9 @@ async fn serve(
     login: String,
     requests: mpsc::Receiver<Reply>,
     queue: Queue,
+    recent: Arc<Mutex<Recent>>,
 ) -> MessengerError {
-    match session(rpc, login, requests, queue).await {
+    match session(rpc, login, requests, queue, recent).await {
         Ok(never) => match never {},
         Err(error) => error,
     }
@@ -284,11 +318,16 @@ async fn session(
     login: String,
     mut requests: mpsc::Receiver<Reply>,
     queue: Queue,
+    recent: Arc<Mutex<Recent>>,
 ) -> Result<std::convert::Infallible> {
     let Rpc {
         mut reader,
         writer: mut rpc,
+        early,
     } = rpc;
+    for message in early {
+        notified(&message, &login, &recent, &queue)?;
+    }
     let (lines, mut incoming) = mpsc::channel::<Result<Incoming>>(64);
     // Aborted when the session ends (`_reading`), so it never outlives the
     // connection it reads; it holds nothing that needs awaiting.
@@ -306,7 +345,6 @@ async fn session(
     let mut waiting: HashMap<String, (oneshot::Sender<Result<()>>, VecDeque<Value>)> =
         HashMap::new();
     let mut deadlines: VecDeque<(tokio::time::Instant, String)> = VecDeque::new();
-    let mut recent = Recent::default();
     loop {
         let deadline = deadlines.front().map(|(at, _)| *at);
         tokio::select! {
@@ -328,15 +366,7 @@ async fn session(
                     }
                     continue;
                 }
-                if message.method.as_deref() != Some("receive") {
-                    continue;
-                }
-                let Some((key, event)) = message.params.as_ref().and_then(|p| received(p, &login)) else {
-                    continue;
-                };
-                if recent.insert(&key) {
-                    queue.push(key, event)?;
-                }
+                notified(&message, &login, &recent, &queue)?;
             }
             reply = requests.recv() => {
                 // The adapter went away with its listener.
@@ -361,6 +391,26 @@ async fn session(
             }
         }
     }
+}
+
+/// Queue a `receive` notification's message unless it was seen lately,
+/// in this subscription or an earlier one.
+fn notified(message: &Incoming, login: &str, recent: &Mutex<Recent>, queue: &Queue) -> Result<()> {
+    if message.method.as_deref() != Some("receive") {
+        return Ok(());
+    }
+    let Some((key, event)) = message.params.as_ref().and_then(|p| received(p, login)) else {
+        return Ok(());
+    };
+    // Held only for the check; nothing is awaited under it.
+    let new = recent
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(&key);
+    if new {
+        queue.push(key, event)?;
+    }
+    Ok(())
 }
 
 /// Aborts the reading task when the session ends.
@@ -466,10 +516,11 @@ fn received(params: &Value, login: &str) -> Option<(String, Event)> {
         .and_then(Value::as_str)
         .filter(|name| !name.is_empty())
         .map(str::to_owned);
+    // A message with any group information belongs to that group, never
+    // to the sender's direct chat, whether or not its id can be read.
     let group = data
         .get("groupInfo")
-        .and_then(|info| info.get("groupId"))
-        .and_then(Value::as_str);
+        .map(|info| info.get("groupId").and_then(Value::as_str).unwrap_or(""));
     let inbound = match group {
         Some(group) if valid_signal_group(group) => Inbound {
             chat: group.to_owned(),
@@ -496,11 +547,21 @@ fn received(params: &Value, login: &str) -> Option<(String, Event)> {
 /// `send` params for each part of `text` to `chat`: a group by id, or the
 /// ACI a direct chat names.
 fn send_params(login: &str, chat: &str, text: &str) -> Vec<Value> {
-    let mut parts: Vec<&str> = super::split(text, MAX_MESSAGE)
+    let mut parts: Vec<String> = super::split(text, MAX_MESSAGE)
         .into_iter()
         .filter(|part| !part.trim().is_empty())
+        .map(str::to_owned)
         .collect();
-    parts.truncate(MAX_PARTS);
+    if parts.len() > MAX_PARTS {
+        // The last part makes room to say the reply was cut short.
+        parts.truncate(MAX_PARTS);
+        let last = parts.pop().unwrap_or_default();
+        let kept = super::split(&last, MAX_MESSAGE - CUT_SHORT.len())
+            .into_iter()
+            .next()
+            .unwrap_or_default();
+        parts.push(format!("{kept}{CUT_SHORT}"));
+    }
     parts
         .into_iter()
         .map(|part| {
@@ -582,6 +643,20 @@ mod tests {
                 Some((_, Event::Ignored))
             ));
         }
+        // Group information without a readable id is still not a direct chat.
+        for info in [
+            json!({}),
+            json!({ "groupId": 5 }),
+            json!({ "groupId": aci() }),
+        ] {
+            assert!(matches!(
+                received(
+                    &envelope(json!({ "message": text, "groupInfo": info })),
+                    login
+                ),
+                Some((_, Event::Ignored))
+            ));
+        }
         // Without an authenticated sender there is nobody to answer.
         let mut anonymous = envelope(json!({ "message": text }));
         anonymous["envelope"]["sourceUuid"] = json!(null);
@@ -610,5 +685,38 @@ mod tests {
             [json!({ "account": login, "groupId": group, "message": "hi" })]
         );
         assert!(send_params(login, &to, " \n ").is_empty());
+        // Too long for every part: the last says the reply was cut short.
+        let longer = "word ".repeat(MAX_MESSAGE * MAX_PARTS);
+        let cut = send_params(login, &to, &longer);
+        assert_eq!(cut.len(), MAX_PARTS);
+        assert!(
+            cut.iter()
+                .all(|p| p["message"].as_str().unwrap().encode_utf16().count() <= MAX_MESSAGE)
+        );
+        assert!(
+            cut[MAX_PARTS - 1]["message"]
+                .as_str()
+                .unwrap()
+                .ends_with(CUT_SHORT)
+        );
+        assert!(
+            !direct.last().unwrap()["message"]
+                .as_str()
+                .unwrap()
+                .ends_with(CUT_SHORT)
+        );
+    }
+
+    #[test]
+    fn daemon_refusals_are_shown_as_one_bounded_line_without_credentials() {
+        let token = format!(
+            "ghp_{}",
+            uuid::Uuid::new_v4().simple().to_string().repeat(2)
+        );
+        let text = refusal_text(&format!("bad\nrequest {token}"));
+        assert!(!text.contains(&token) && !text.contains('\n'), "{text}");
+        assert!(text.starts_with("bad request "));
+        let long = refusal_text(&"x".repeat(MAX_REFUSAL * 2));
+        assert_eq!(long.chars().count(), MAX_REFUSAL);
     }
 }

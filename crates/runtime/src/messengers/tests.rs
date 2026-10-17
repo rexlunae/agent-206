@@ -9,6 +9,7 @@ use axum::{
 };
 use serde_json::{Value, json};
 use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
 fn random() -> String {
@@ -2133,12 +2134,19 @@ async fn irc_without_a_login_waits_for_the_user() {
 }
 
 /// A stand-in signal-cli daemon on a Unix socket: it serves `accounts`,
-/// answers `subscribeReceive` and then sends `script`, and records every
-/// request it receives.
+/// sends `early` before answering `subscribeReceive` and `script` after,
+/// and records every request it receives. With `hang_up_after`, the first
+/// connection closes after answering that many `send`s, and the next
+/// subscription sends `replay`.
 #[derive(Clone, Default)]
 struct SignalDaemon {
     accounts: Vec<String>,
+    early: Arc<Mutex<Vec<Value>>>,
     script: Arc<Mutex<Vec<Value>>>,
+    replay: Arc<Mutex<Vec<Value>>>,
+    hang_up_after: usize,
+    sent: Arc<std::sync::atomic::AtomicUsize>,
+    hung_up: Arc<std::sync::atomic::AtomicBool>,
     received: Arc<Mutex<Vec<Value>>>,
 }
 
@@ -2168,8 +2176,12 @@ async fn serve_signal(dir: &std::path::Path, daemon: SignalDaemon) -> String {
                             send.push(json!({ "jsonrpc": "2.0", "id": id, "result": accounts }));
                         }
                         Some("subscribeReceive") => {
+                            send.append(&mut daemon.early.lock().unwrap());
                             send.push(json!({ "jsonrpc": "2.0", "id": id, "result": 0 }));
                             send.append(&mut daemon.script.lock().unwrap());
+                            if daemon.hung_up.load(Ordering::SeqCst) {
+                                send.append(&mut daemon.replay.lock().unwrap());
+                            }
                         }
                         Some("send") => {
                             send.push(
@@ -2188,6 +2200,12 @@ async fn serve_signal(dir: &std::path::Path, daemon: SignalDaemon) -> String {
                         if writer.write_all(&line).await.is_err() {
                             return;
                         }
+                    }
+                    if request["method"] == "send"
+                        && daemon.sent.fetch_add(1, Ordering::SeqCst) + 1 == daemon.hang_up_after
+                        && !daemon.hung_up.swap(true, Ordering::SeqCst)
+                    {
+                        return;
                     }
                 }
             });
@@ -2325,6 +2343,78 @@ async fn signal_answers_listed_people_through_the_users_own_daemon() {
         received
             .iter()
             .any(|r| r["method"] == "subscribeReceive" && r["params"]["account"] == number)
+    );
+    stop.cancel();
+    supervisor.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn signal_keeps_early_messages_and_answers_none_twice_across_a_reconnect() {
+    let number = format!("+1555{}", 1_000_000 + std::process::id() % 1_000_000);
+    let friend = Id::new_v4().hyphenated().to_string();
+    let (q1, q2, q3) = (random(), random(), random());
+    let (dir, _credential, pairing, _anchor) = broker("https://unused.invalid", &random()).await;
+    let daemon = SignalDaemon {
+        accounts: vec![number.clone()],
+        hang_up_after: 2,
+        ..SignalDaemon::default()
+    };
+    let message = |timestamp, text: &String| {
+        signal_message(&number, &friend, timestamp, json!({ "message": text }))
+    };
+    // Sent before the subscription is confirmed.
+    daemon.early.lock().unwrap().push(message(1, &q1));
+    daemon.script.lock().unwrap().push(message(2, &q2));
+    // After the reconnect: an answered message again, then a new one.
+    daemon
+        .replay
+        .lock()
+        .unwrap()
+        .extend([message(2, &q2), message(3, &q3)]);
+    let endpoint = serve_signal(dir.path(), daemon.clone()).await;
+    let host = signal_host(&dir, pairing);
+    let entry = MessengerConfig {
+        enabled: true,
+        endpoint: Some(endpoint),
+        login: Some(number.clone()),
+        allowed_chats: BTreeSet::from([friend.clone()]),
+        allowed_users: BTreeSet::from([friend.clone()]),
+        model: Some(ModelKey {
+            provider: Id::new_v4(),
+            model: random(),
+        }),
+        ..MessengerConfig::new("signal".to_owned(), MessengerKind::Signal)
+    };
+    let (_desired, receiver) = watch::channel(vec![Desired {
+        config: entry,
+        run: true,
+    }]);
+    let stop = CancellationToken::new();
+    let supervisor = tokio::spawn(supervise(host.clone(), receiver, FAST, stop.clone()));
+    let sends = || -> Vec<Value> {
+        daemon
+            .received
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r["method"] == "send")
+            .map(|r| r["params"]["message"].clone())
+            .collect()
+    };
+    host.until(|_| sends().len() == 3).await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(daemon.hung_up.load(Ordering::SeqCst));
+    let turns: Vec<String> = host
+        .turns
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(_, t)| t.clone())
+        .collect();
+    assert_eq!(turns, [q1.clone(), q2.clone(), q3.clone()]);
+    assert_eq!(
+        sends(),
+        [q1, q2, q3].map(|q| json!(format!("reply to {q}")))
     );
     stop.cancel();
     supervisor.await.unwrap();
