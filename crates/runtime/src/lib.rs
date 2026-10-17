@@ -16,6 +16,7 @@ pub mod mcp;
 pub mod messengers;
 pub mod network;
 pub mod process;
+pub mod prompt_tool;
 pub mod provider;
 pub mod sandbox;
 pub mod service;

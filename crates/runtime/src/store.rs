@@ -143,8 +143,10 @@ impl Store {
             })
             .collect();
         for thread in &mut store.state.threads {
-            // No run survives a restart, so neither do its approvals or calls.
+            // No run survives a restart, so neither do its approvals,
+            // questions or calls.
             thread.approvals.clear();
+            thread.prompts.clear();
             for call in thread.messages.iter_mut().flat_map(|m| &mut m.tool_calls) {
                 if !call.state.is_final() {
                     let report = a206_core::ErrorReport::new(
@@ -388,8 +390,10 @@ mod tests {
         assert_eq!(restored.state.settings.revision, 1);
     }
     #[test]
-    fn restart_expires_approvals_and_cancels_unfinished_tool_calls() {
-        use a206_core::{ApprovalRequest, Message, Mode, Role, Thread, ToolCall, ToolCallState};
+    fn restart_expires_approvals_and_questions_and_cancels_unfinished_tool_calls() {
+        use a206_core::{
+            ApprovalRequest, Message, Mode, Role, Thread, ToolCall, ToolCallState, UserPrompt,
+        };
         let directory = tempfile::tempdir().unwrap();
         let mut store = Store::open(directory.path()).unwrap();
         let mut thread = Thread::new(Id::new_v4().to_string(), Mode::Chat);
@@ -421,6 +425,14 @@ mod tests {
             capabilities: Default::default(),
             requested_at: 0,
         });
+        thread.prompts.push(UserPrompt {
+            id: Id::new_v4(),
+            call: Id::new_v4().to_string(),
+            question: Id::new_v4().to_string(),
+            choices: vec![],
+            other: true,
+            requested_at: 0,
+        });
         thread.messages.push(message);
         thread.state = RunState::Running;
         let id = thread.id;
@@ -430,6 +442,7 @@ mod tests {
         let restored = Store::open(directory.path()).unwrap();
         let thread = restored.thread(id).unwrap();
         assert!(thread.approvals.is_empty());
+        assert!(thread.prompts.is_empty());
         let states: Vec<_> = thread.messages[0]
             .tool_calls
             .iter()
