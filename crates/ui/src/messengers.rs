@@ -12,27 +12,7 @@ use uuid::Uuid;
 #[component]
 pub fn Messengers() -> Element {
     let state = use_context::<State>();
-    // Catalogs expire without the snapshot changing, so the page keeps its
-    // own clock: it wakes at the next expiry (at most a minute away) and
-    // renders the cards with the new time.
-    let mut clock = use_signal(now);
-    use_future(move || async move {
-        loop {
-            let at = *clock.peek();
-            let next = state
-                .data
-                .peek()
-                .catalogs
-                .iter()
-                .map(|c| c.expires_at)
-                .filter(|&expires| expires > at)
-                .min();
-            let wait = next.map_or(60, |expires| (expires - at).min(60));
-            futures_timer::Delay::new(std::time::Duration::from_secs(wait)).await;
-            clock.set(now());
-        }
-    });
-    let now = clock();
+    let now = use_catalog_clock(state)();
     let snapshot = state.data.read();
     rsx! { PageFrame { kicker: "Messengers", title: "Talk to a thread from chat.", description: "Each allowed chat gets its own conversation, which runs with that conversation's permissions and model. Bot tokens stay in the vault.",
         for messenger in &snapshot.settings.messengers {
@@ -68,9 +48,36 @@ pub(crate) fn now() -> u64 {
         .map_or(u64::MAX, |elapsed| elapsed.as_secs())
 }
 
+/// The time for judging catalog freshness, as a signal. Catalogs expire
+/// without the snapshot changing, so this wakes at the next expiry (at most
+/// a minute away) and components reading it render with the new time.
+pub(crate) fn use_catalog_clock(state: State) -> Signal<u64> {
+    let mut clock = use_signal(now);
+    use_future(move || async move {
+        loop {
+            let at = *clock.peek();
+            let next = state
+                .data
+                .peek()
+                .catalogs
+                .iter()
+                .map(|c| c.expires_at)
+                .filter(|&expires| expires > at)
+                .min();
+            let wait = next.map_or(60, |expires| (expires - at).min(60));
+            futures_timer::Delay::new(std::time::Duration::from_secs(wait)).await;
+            clock.set(now());
+        }
+    });
+    clock
+}
+
 /// Models of catalogs that have not expired at `now`: the gateway creates a
 /// chat thread only for one of these.
-fn current_models(snapshot: &Snapshot, now: u64) -> impl Iterator<Item = &a206_core::ModelInfo> {
+pub(crate) fn current_models(
+    snapshot: &Snapshot,
+    now: u64,
+) -> impl Iterator<Item = &a206_core::ModelInfo> {
     snapshot
         .catalogs
         .iter()

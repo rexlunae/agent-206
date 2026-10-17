@@ -197,6 +197,24 @@ impl CodingBackend {
             Self::ClaudeAgent => "Claude Agent",
         }
     }
+    /// What the user can grant a conversation on this backend, in display
+    /// order. Agent 206 enforces git and network grants in its own tools; an
+    /// external runtime is confined only by project access and commands, so
+    /// it is never offered a grant it could not be held to.
+    pub fn grantable(self) -> &'static [Capability] {
+        use Capability::*;
+        match self {
+            Self::Native => &[
+                ReadWorkspace,
+                WriteWorkspace,
+                Execute,
+                GitRead,
+                GitWrite,
+                Network,
+            ],
+            Self::Codex | Self::ClaudeAgent => &[ReadWorkspace, WriteWorkspace, Execute],
+        }
+    }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BackendConfig {
@@ -477,6 +495,42 @@ pub struct Thread {
     /// run to reach its next round, where they join `messages` in order.
     #[serde(default)]
     pub steering: Vec<Message>,
+    /// The checklist the conversation's models keep with `plan_update`,
+    /// shown to the user beside the conversation. Empty when there is none.
+    #[serde(default)]
+    pub plan: Vec<PlanStep>,
+}
+/// One step of a conversation's plan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanStep {
+    pub text: String,
+    pub status: PlanStatus,
+}
+/// How far a plan step has got.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanStatus {
+    Pending,
+    InProgress,
+    Done,
+}
+impl PlanStatus {
+    pub const ALL: [Self; 3] = [Self::Pending, Self::InProgress, Self::Done];
+    /// The name models and the API use.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::InProgress => "in_progress",
+            Self::Done => "done",
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Pending => "Not started",
+            Self::InProgress => "In progress",
+            Self::Done => "Done",
+        }
+    }
 }
 /// A pre-compaction memory flush offered to a native run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -520,6 +574,7 @@ impl Thread {
             compacting: None,
             memory_flush: None,
             steering: vec![],
+            plan: vec![],
         }
     }
 }
@@ -1384,6 +1439,10 @@ pub struct VaultState {
     pub unlocked: bool,
     pub totp_enrolled: Option<bool>,
     pub agent_access: Option<bool>,
+    /// Whether the broker holds a gateway pairing for this unlock; unknown
+    /// while locked or from an older bridge.
+    #[serde(default)]
+    pub gateway_paired: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

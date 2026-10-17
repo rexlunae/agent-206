@@ -1,7 +1,7 @@
 use crate::{State, dispatch, route::Route};
 use a206_core::{
     Capability, CodingBackend, Command, CompactionTrigger, ErrorKind, ErrorReport,
-    InstructionStatus, Mode, ModelKey, Reply, Role, RunState, TextAttachment, Thread,
+    InstructionStatus, Mode, ModelKey, PlanStatus, Reply, Role, RunState, TextAttachment, Thread,
 };
 use fc_dioxus::prelude::*;
 use uuid::Uuid;
@@ -322,6 +322,7 @@ fn Conversation(thread: Thread, target: Option<Uuid>) -> Element {
             }
             for request in &thread.approvals { crate::tools::PendingApproval { key: "{request.id}", thread: id, request: request.clone() } }
             for question in &thread.prompts { crate::prompts::PendingPrompt { key: "{question.id}", thread: id, question: question.clone() } }
+            if !thread.plan.is_empty() { ThreadPlan { thread: thread.clone() } }
             if running { AgentStatus { state: Lifecycle::Running, label: rsx! { {thread.backend_activity.clone().unwrap_or_else(|| format!("{} is working…", thread.backend.label()))} } } }
             if let Some(report) = thread.error.clone().filter(|_| !running && thread.state == RunState::Failed) {
                 crate::error::ErrorNotice { report, title: "Run failed".to_string() }
@@ -550,15 +551,18 @@ fn BackendControls(thread: Thread) -> Element {
     rsx! { div { class: "a206-stack",
         h3 { "Agent engine" }
         Select { label: name!("Coding-agent backend"), value: ReadSignal::from(selected), options, availability,
-            onchange: move |value: String| { if let Some(backend) = CodingBackend::ALL.into_iter().find(|kind| kind.label() == value) { dispatch(state, Command::SetBackend { thread: id, backend, capabilities: grants.clone() }); } }
+            // A grant the new backend cannot be held to is dropped, not refused.
+            onchange: move |value: String| { if let Some(backend) = CodingBackend::ALL.into_iter().find(|kind| kind.label() == value) { dispatch(state, Command::SetBackend { thread: id, backend, capabilities: grants.iter().copied().filter(|c| backend.grantable().contains(c)).collect() }); } }
         }
         LinkButton { variant: ButtonVariant::Ghost, size: ButtonSize::Sm, href: Route::Providers {}.to_string(), "Manage connections" }
-        if thread.backend != CodingBackend::Native {
+        if thread.backend == CodingBackend::Native {
+            p { class: "a206-muted", "Tools are off until you grant them here, and each tool still needs your permission in this conversation. The mode limits what can be granted here." }
+        } else {
             p { class: "a206-muted", "Project tools are off until you grant them. External subagents and direct network access are disabled." }
-            if thread.project.is_none() { p { class: "a206-muted", "Open a project coordinator to grant workspace tools." } }
-            for capability in [Capability::ReadWorkspace, Capability::WriteWorkspace, Capability::Execute] {
-                BackendGrant { key: "{capability:?}", thread: id, capability }
-            }
+        }
+        if thread.project.is_none() { p { class: "a206-muted", "Open a project coordinator to grant workspace and git tools." } }
+        for capability in thread.backend.grantable().iter().copied() {
+            BackendGrant { key: "{capability:?}", thread: id, capability }
         }
     } }
 }
@@ -582,22 +586,32 @@ fn BackendGrant(thread: Uuid, capability: Capability) -> Element {
     let snapshot = state.data.read();
     let current = snapshot.threads.iter().find(|t| t.id == thread);
     let enabled = current.is_some_and(|t| {
-        t.project.is_some()
+        (t.project.is_some() || capability == Capability::Network)
             && t.parent.is_none()
             && t.state != RunState::Running
             && t.mode.ceiling().contains(&capability)
     });
-    let label = match capability {
-        Capability::ReadWorkspace => "Read project files",
-        Capability::WriteWorkspace => "Edit project files",
-        Capability::Execute => "Run project commands",
-        _ => "Unavailable",
-    };
+    let label = capability.label();
     rsx! { Checkbox { label: rsx! { "{label}" }, checked: ReadSignal::from(checked), availability: if enabled { Availability::Enabled } else { Availability::Disabled }, onchange: move |allowed| {
         if let Some(current) = state.data.read().threads.iter().find(|t| t.id == thread).cloned() {
             let mut capabilities = current.grant.capabilities;
-            if allowed { capabilities.insert(capability); if capability == Capability::WriteWorkspace { capabilities.insert(Capability::ReadWorkspace); } }
-            else { capabilities.remove(&capability); if capability == Capability::ReadWorkspace { capabilities.clear(); } }
+            // Writing needs reading: granting a write grant adds its read grant,
+            // and withdrawing a read grant withdraws what depends on it.
+            if allowed {
+                capabilities.insert(capability);
+                match capability {
+                    Capability::WriteWorkspace => { capabilities.insert(Capability::ReadWorkspace); }
+                    Capability::GitWrite => { capabilities.insert(Capability::GitRead); }
+                    _ => {}
+                }
+            } else {
+                capabilities.remove(&capability);
+                match capability {
+                    Capability::ReadWorkspace => { capabilities.remove(&Capability::WriteWorkspace); capabilities.remove(&Capability::Execute); }
+                    Capability::GitRead => { capabilities.remove(&Capability::GitWrite); }
+                    _ => {}
+                }
+            }
             dispatch(state, Command::SetBackend { thread, backend: current.backend, capabilities });
         }
     } } }
@@ -662,6 +676,35 @@ fn ThreadFacts(thread: Thread) -> Element {
             strong { "Tool permissions" }
             if thread.grant.capabilities.is_empty() { span { class: "a206-muted", "None granted" } }
             for grant in &thread.grant.capabilities { Badge { "{grant:?}" } }
+        }
+    } }
+}
+
+/// The checklist the conversation's models keep with `plan_update`.
+#[component]
+fn ThreadPlan(thread: Thread) -> Element {
+    let done = thread
+        .plan
+        .iter()
+        .filter(|step| step.status == PlanStatus::Done)
+        .count();
+    let total = thread.plan.len();
+    rsx! { Card { as_: CardTag::Section, class: "a206-plan", aria_label: "Plan",
+        div { class: "a206-row",
+            strong { "Plan" }
+            span { class: "a206-muted", {format!("{done} of {total} done")} }
+        }
+        Progress { label: name!("Plan steps done"), value: ProgressValue::Of { value: done as f64, max: total as f64 } }
+        ol { class: "a206-plan-steps",
+            for (index, step) in thread.plan.iter().enumerate() {
+                li { key: "{index}", class: "a206-row",
+                    Badge { tone: match step.status { PlanStatus::Done => BadgeTone::Success, PlanStatus::InProgress => BadgeTone::Accent, PlanStatus::Pending => BadgeTone::Neutral },
+                        if step.status == PlanStatus::Done { Icon { name: IconName::Check, size: IconSize::Sm } }
+                        "{step.status.label()}"
+                    }
+                    span { "{step.text}" }
+                }
+            }
         }
     } }
 }
@@ -758,8 +801,6 @@ fn unreadable(error: dioxus::CapturedError) -> ErrorReport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use a206_core::Mode;
-
     #[test]
     fn the_composer_steers_the_run_it_started_one_message_at_a_time() {
         let mut thread = Thread::new(Uuid::new_v4().to_string(), Mode::Chat);
@@ -795,5 +836,45 @@ mod tests {
             .find(|b| *b != CodingBackend::Native)
             .unwrap();
         assert!(!offers(&thread, false, false).steerable);
+    }
+
+    use a206_core::PlanStep;
+
+    fn render(thread: Thread) -> String {
+        #[derive(Props, Clone, PartialEq)]
+        struct Shown {
+            thread: Thread,
+        }
+        fn root(props: Shown) -> Element {
+            rsx! { ThreadPlan { thread: props.thread } }
+        }
+        let mut dom = VirtualDom::new_with_props(root, Shown { thread });
+        dom.rebuild_in_place();
+        dioxus_ssr::render(&dom)
+    }
+
+    #[test]
+    fn the_plan_shows_each_step_in_order_with_its_status() {
+        let mut thread = Thread::new(Uuid::new_v4().to_string(), Mode::default());
+        let mut statuses = PlanStatus::ALL.to_vec();
+        statuses.push(PlanStatus::Done);
+        thread.plan = statuses
+            .into_iter()
+            .map(|status| PlanStep {
+                text: Uuid::new_v4().simple().to_string(),
+                status,
+            })
+            .collect();
+        let html = render(thread.clone());
+        let at: Vec<_> = thread
+            .plan
+            .iter()
+            .map(|step| html.find(&step.text).unwrap())
+            .collect();
+        assert!(at.windows(2).all(|pair| pair[0] < pair[1]), "{html}");
+        for status in PlanStatus::ALL {
+            assert!(html.contains(status.label()), "{html}");
+        }
+        assert!(html.contains("2 of 4 done"), "{html}");
     }
 }

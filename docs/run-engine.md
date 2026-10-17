@@ -442,6 +442,28 @@ the call (cancel, permission withdrawn) withdraws the question with
 An answer approves nothing. Clients: the conversation's question card
 (`ui/src/prompts.rs`, desktop/web/TUI) and `agent206 prompts`.
 
+## Plans (`plan_update`)
+
+`runtime/src/plan_tool.rs` is a gateway-internal `ToolHost` offering
+`plan_update`, after RustyClaw's `todo` tool. Its one argument, `steps`, is the
+whole checklist in order: up to 50 steps, each `{text, status}` with 1–500 bytes
+of text (trimmed) and a status of `pending`, `in_progress` or `done`. A call
+replaces `Thread::plan` and journals `ThreadChanged`; an empty list clears it.
+A malformed call fails as `InvalidRequest` and leaves the plan as it was, and a
+plan is changed only when the call's result still fits above the run's storage reserve; otherwise the call fails as history full and the plan stays as it was.
+The result is the plan with `done` and `total` counts. Replacing the whole
+plan means a model never edits a step it has not seen. The plan uses no
+capability, grants nothing, and like every tool is denied until the user permits
+it.
+
+The plan stays with the conversation across runs, restarts and compaction. The
+system prompt does not repeat it while a successful `plan_update` remains in the
+history the model receives, so updates do not change the prompt. Once a
+compaction has summarized every such call away, each round's system prompt adds
+a "Current plan" section with the steps and statuses, for as long as the tool is
+offered. Clients: a plan card above the composer in the shared conversation view
+(`ui/src/conversation.rs`, desktop/web/TUI) and `agent206 plan THREAD`.
+
 ## Context
 
 ### Project instruction files
