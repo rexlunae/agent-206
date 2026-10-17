@@ -43,6 +43,10 @@ fn instants_and_wall_clock_times_become_unix_seconds() {
         Err(ScheduleInputError::Zone { .. })
     ));
     assert!(matches!(
+        parse_local(&date, &format!("{clock}:00.5"), "UTC"),
+        Err(ScheduleInputError::FractionalTime(_))
+    ));
+    assert!(matches!(
         parse_local("someday", &clock, "UTC"),
         Err(ScheduleInputError::Local { .. })
     ));

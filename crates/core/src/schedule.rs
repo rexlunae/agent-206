@@ -160,10 +160,16 @@ pub fn parse_local(date: &str, time: &str, zone: &str) -> Result<u64, ScheduleIn
         zone: zone.to_owned(),
         cause,
     })?;
-    let zoned = zone
-        .to_ambiguous_zoned(civil)
-        .later()
-        .map_err(|cause| ScheduleInputError::Local { input, cause })?;
+    let zoned =
+        zone.to_ambiguous_zoned(civil)
+            .later()
+            .map_err(|cause| ScheduleInputError::Local {
+                input: input.clone(),
+                cause,
+            })?;
+    if zoned.timestamp().subsec_nanosecond() != 0 {
+        return Err(ScheduleInputError::FractionalTime(input));
+    }
     unix(zoned.timestamp())
 }
 

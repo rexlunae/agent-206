@@ -202,11 +202,8 @@ fn AddJob() -> Element {
         _ => None,
     };
     let target = thread().and_then(|id| id.parse::<Uuid>().ok());
-    let valid = schedule.and_then(Result::ok);
-    let ready = !name().trim().is_empty()
-        && !text().trim().is_empty()
-        && target.is_some()
-        && valid.is_some();
+    let valid = matches!(schedule, Some(Ok(_)));
+    let ready = !name().trim().is_empty() && !text().trim().is_empty() && target.is_some() && valid;
     let kind_label = use_memo(move || Some(kind().label().to_owned()));
     rsx! { Card { variant: CardVariant::Elevated,
         CardHeader { CardTitle { "Schedule a message" } CardSubtitle { "The gateway checks the schedule and the conversation when you add it." } }
@@ -235,7 +232,10 @@ fn AddJob() -> Element {
             }
         } }
         CardFooter { Button { variant: ButtonVariant::Primary, availability: if ready { Availability::Enabled } else { Availability::Disabled }, onclick: move |_| {
-            let (Some(thread), Some(schedule)) = (target, valid.clone()) else { return };
+            // Built again now, so an interval counts from the click rather
+            // than from when the form last rendered.
+            let Some(Ok(schedule)) = form_schedule(kind(), &date(), &time(), &zone(), &every(), &cron(), now()) else { return };
+            let Some(thread) = target else { return };
             dispatch(state, Command::ScheduleJob { name: name().trim().to_owned(), thread, text: text(), schedule });
         }, "Schedule message" } }
     } }
