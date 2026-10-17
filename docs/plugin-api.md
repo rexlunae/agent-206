@@ -22,7 +22,8 @@ tools under the `git_read` grant, and `agent206.web` (`plugins/web`) with a
 `fetch_url` tool under the `network` grant. Bundled tools cut text past
 192 KiB with a notice (the SDK's `excerpt`), so a long result never exceeds
 the outcome limit. Users can also install third-party packages (see
-[Installed packages](#installed-packages)); agent-prepared packages are not implemented yet.
+[Installed packages](#installed-packages)), including packages agents prepare
+for review ([Agent-prepared packages](#agent-prepared-packages)).
 
 The wire types live in `a206-extension-abi`; the guest SDK is
 `a206-extension-sdk`; manifests, the interpreter and the worker are
@@ -56,8 +57,30 @@ or by choosing both files on the Extensions page; both send
 - The Extensions page marks installed packages as "Installed by you" with their
   id and digest, so an installed package cannot pass for a bundled one by name.
 
-Not yet: agent-prepared packages, registry or URL installs, signatures, and a
-pre-install audit.
+### Agent-prepared packages
+
+An agent that built an extension in a project offers it with the native
+`extension_propose` tool, naming the project's `plugin.toml` and `.wasm` files.
+Like every tool it is denied until the user permits it in the conversation, and
+it reads the two files under `read_workspace`, confined to the project root.
+
+- The package is validated exactly as for an install and stored under its
+  digest, but recorded in `Snapshot.extension_proposals` with the conversation
+  that prepared it, not among the extensions. A proposal is never offered,
+  loaded or granted anything. The tool can neither install, enable nor grant.
+- At most 8 proposals wait at once. A package with the id of a waiting proposal
+  replaces it, and proposing the package already installed is refused.
+- The user reviews it on the Extensions page ("Prepared by an agent", with its
+  digest, conversation, requested permissions and tools) or with
+  `agent206 extension list`. `Command::InstallProposal { digest }` (Install, or
+  `extension install-proposal <digest>`) verifies the stored files and installs
+  it disabled with nothing granted. An update an agent prepared also drops every
+  grant of the version it replaces, so the user reviews each permission again.
+  `Command::DismissProposal` (Dismiss, or `extension dismiss <digest>`) deletes it.
+- Unrecorded package files are pruned when the gateway starts; recorded
+  proposals are kept.
+
+Not yet: registry or URL installs, signatures, and a pre-install audit.
 
 ### Manifest
 

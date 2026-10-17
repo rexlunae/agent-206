@@ -49,6 +49,16 @@ impl Fixture {
             .map(|_| "connected".to_owned())
             .map_err(|error| error.kind().to_string())
     }
+    #[tool(description = "Open a Unix socket connection, then close it.")]
+    async fn connect_socket(&self, params: Parameters<File>) -> Result<String, String> {
+        #[cfg(unix)]
+        let connected = std::os::unix::net::UnixStream::connect(&params.0.path).map(|_| ());
+        #[cfg(not(unix))]
+        let connected: std::io::Result<()> = Err(std::io::ErrorKind::Unsupported.into());
+        connected
+            .map(|()| "connected".to_owned())
+            .map_err(|error| error.kind().to_string())
+    }
     #[tool(description = "Run a program without arguments and report its exit status.")]
     async fn run(&self, params: Parameters<Program>) -> Result<String, String> {
         std::process::Command::new(&params.0.program)
