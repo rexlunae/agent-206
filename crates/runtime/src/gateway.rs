@@ -1154,10 +1154,18 @@ impl Gateway {
                     let copy = thread.clone();
                     // A subagent run its parent reserved is cancelled with it.
                     let token = delegation::admit(self, id)?;
-                    if backend.is_none() {
-                        self.open_steering(id)?;
+                    let admitted = (|| -> Result<()> {
+                        if backend.is_none() {
+                            self.open_steering(id)?;
+                        }
+                        store.persist(Some(EventKind::ThreadChanged { id }))?;
+                        Ok(())
+                    })();
+                    if let Err(error) = admitted {
+                        // The thread stays as last saved: no run to cancel or steer.
+                        self.withdraw(id);
+                        return Err(error);
                     }
-                    store.persist(Some(EventKind::ThreadChanged { id }))?;
                     (token, config, copy, prompt, info, backend, workspace, root)
                 };
                 let Some(backend) = backend else {
@@ -1176,7 +1184,6 @@ impl Gateway {
                     let mut store = self.lock()?;
                     let thread = store.thread_mut(id)?;
                     run::settle_unfinished(thread);
-                    self.settle_steering(thread)?;
                     match ended {
                         run::Ended::Complete { last, total } => {
                             thread.usage = Some(last);
@@ -1186,6 +1193,8 @@ impl Gateway {
                         run::Ended::Failed(error) => fail_run(thread, id, &error),
                         run::Ended::Cancelled => thread.state = RunState::Cancelled,
                     }
+                    // After the outcome: the run never read these.
+                    self.settle_steering(thread)?;
                     let thread = thread.clone();
                     store.persist(Some(EventKind::RunEnded {
                         thread: id,

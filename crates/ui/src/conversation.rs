@@ -75,6 +75,25 @@ pub fn Workspace(id: Uuid, split: Option<Uuid>, message: Option<Uuid>) -> Elemen
         }
     }
 }
+/// What a conversation's composer offers.
+#[derive(Debug, PartialEq)]
+struct Composer {
+    /// A response is running or being requested: Send becomes Stop.
+    running: bool,
+    /// Enter adds the draft to the running response.
+    steerable: bool,
+}
+/// `sending` is this composer's `Send`, pending until its run ends;
+/// `steering` is a `Steer` it has not yet had answered.
+fn composer(thread: &Thread, sending: bool, steering: bool) -> Composer {
+    let active = thread.state == RunState::Running;
+    Composer {
+        running: active || sending,
+        // A native run takes further messages while it works, including the
+        // run this composer started, one steered message at a time.
+        steerable: active && thread.backend == CodingBackend::Native && !steering,
+    }
+}
 /// One conversation; `target` is a message to scroll to and mark.
 #[component]
 fn Conversation(thread: Thread, target: Option<Uuid>) -> Element {
@@ -85,11 +104,8 @@ fn Conversation(thread: Thread, target: Option<Uuid>) -> Element {
     let mut reading_files = use_signal(|| false);
     let mut file_input_version = use_signal(|| 0_u64);
     let mut submitting = use_signal(|| false);
-    let running = thread.state == RunState::Running || submitting();
-    // A native run takes further messages while it works.
-    let steerable = thread.state == RunState::Running
-        && thread.backend == CodingBackend::Native
-        && !submitting();
+    let mut steering = use_signal(|| false);
+    let Composer { running, steerable } = composer(&thread, submitting(), steering());
     let steered: Vec<String> = thread.steering.iter().map(|m| m.text.clone()).collect();
     let has_model = thread.model.is_some();
     let selected_model = thread.model.clone();
@@ -119,7 +135,7 @@ fn Conversation(thread: Thread, target: Option<Uuid>) -> Element {
     let mut submit = move || {
         let text = draft().trim().to_owned();
         if steerable && !text.is_empty() {
-            submitting.set(true);
+            steering.set(true);
             draft.set(String::new());
             spawn(async move {
                 match crate::call(Command::Steer {
@@ -134,7 +150,7 @@ fn Conversation(thread: Thread, target: Option<Uuid>) -> Element {
                         state.error.set(Some(error));
                     }
                 }
-                submitting.set(false);
+                steering.set(false);
                 crate::refresh(state).await;
             });
             return;
@@ -737,4 +753,47 @@ fn rejected(message: &str) -> ErrorReport {
 fn unreadable(error: dioxus::CapturedError) -> ErrorReport {
     ErrorReport::new(ErrorKind::Other, "Could not read the attachment")
         .caused_by(ErrorReport::capture(&**error, |_| None))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use a206_core::Mode;
+
+    #[test]
+    fn the_composer_steers_the_run_it_started_one_message_at_a_time() {
+        let mut thread = Thread::new(Uuid::new_v4().to_string(), Mode::Chat);
+        let offers = |thread: &Thread, sending, steering| composer(thread, sending, steering);
+        // Before the gateway reports the run, a pending Send only stops.
+        assert_eq!(
+            offers(&thread, true, false),
+            Composer {
+                running: true,
+                steerable: false
+            }
+        );
+        thread.state = RunState::Running;
+        // This composer's own Send stays pending for the whole run.
+        assert_eq!(
+            offers(&thread, true, false),
+            Composer {
+                running: true,
+                steerable: true
+            }
+        );
+        assert_eq!(
+            offers(&thread, false, false),
+            Composer {
+                running: true,
+                steerable: true
+            }
+        );
+        // Until a steered message is accepted, no second one is sent.
+        assert!(!offers(&thread, true, true).steerable);
+        thread.backend = CodingBackend::ALL
+            .into_iter()
+            .find(|b| *b != CodingBackend::Native)
+            .unwrap();
+        assert!(!offers(&thread, false, false).steerable);
+    }
 }

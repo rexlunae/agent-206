@@ -1853,6 +1853,78 @@ async fn steering_is_refused_without_a_run_and_kept_when_a_run_is_cancelled() {
 }
 
 #[tokio::test]
+async fn a_steered_message_left_by_a_failed_run_follows_its_failure() {
+    let api = ProviderApi::OpenAi;
+    let mut rig = rig(api, vec![], None).await;
+    // One round: the reply uses it, so the steered message cannot be answered.
+    let budget = ToolBudget {
+        rounds: 1,
+        tool_calls: 1,
+    };
+    let reply = rig
+        .run(Command::SetToolBudget {
+            thread: rig.thread,
+            budget,
+        })
+        .await;
+    assert_eq!(reply, Reply::Ok);
+    let task = rig.send();
+    let first = rig.next_request().await;
+    let steered = nonce();
+    assert_eq!(rig.steer(rig.thread, &steered).await, Reply::Ok);
+    let answer = nonce();
+    first.respond(text_response(api, &answer)).await;
+    let thread = finished(task).await;
+    assert_eq!(thread.state, RunState::Failed);
+    assert!(thread.steering.is_empty());
+    let texts: Vec<_> = thread
+        .messages
+        .iter()
+        .map(|m| (m.role.clone(), m.text.as_str()))
+        .collect();
+    let [
+        ..,
+        (Role::Assistant, said),
+        (Role::System, _),
+        (Role::User, left),
+    ] = texts.as_slice()
+    else {
+        panic!("expected reply, failure, then the steered message: {texts:?}");
+    };
+    assert_eq!((*said, *left), (answer.as_str(), steered.as_str()));
+}
+
+#[tokio::test]
+async fn a_run_whose_start_was_not_saved_takes_no_messages_and_cannot_be_cancelled() {
+    let api = ProviderApi::OpenAi;
+    let mut rig = rig(api, vec![], None).await;
+    // Another connection makes every snapshot write fail, as a full or
+    // failing disk would; the committed snapshot stays readable.
+    let db = rusqlite::Connection::open(rig._state.path().join("state.sqlite3")).unwrap();
+    db.execute_batch(
+        "CREATE TRIGGER refuse BEFORE UPDATE ON snapshot BEGIN SELECT RAISE(ABORT, 'refused'); END;",
+    )
+    .unwrap();
+    let Reply::Error(_) = rig.send().await.unwrap() else {
+        panic!("a run whose start could not be saved must be refused");
+    };
+    assert_eq!(rig.thread().state, RunState::Idle);
+    refused(rig.steer(rig.thread, &nonce()).await, ErrorKind::Conflict);
+    refused(
+        rig.run(Command::CancelRun { thread: rig.thread }).await,
+        ErrorKind::NotFound,
+    );
+    // Once writes work again the conversation runs as usual.
+    db.execute_batch("DROP TRIGGER refuse;").unwrap();
+    let task = rig.send();
+    rig.next_request()
+        .await
+        .respond(text_response(api, &nonce()))
+        .await;
+    assert_eq!(finished(task).await.state, RunState::Complete);
+}
+
+#[tokio::test]
 async fn subagent_send_steers_a_running_subagent() {
     let api = ProviderApi::OpenAi;
     let mut rig = rig(api, vec![], None).await;

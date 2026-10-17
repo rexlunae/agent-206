@@ -11,7 +11,7 @@ use super::{
     Gateway, GatewayError, MESSAGE_OVERHEAD, Result, check, now, poisoned, run::NEXT_ROUND,
 };
 use a206_core::{EventKind, Id, Message, Reply, Role, Thread};
-use std::sync::MutexGuard;
+use std::sync::{MutexGuard, PoisonError};
 
 /// Longest steered message, as for `Send`.
 const MAX_TEXT: usize = 128 * 1024;
@@ -25,6 +25,19 @@ impl Gateway {
     pub(super) fn open_steering(&self, thread: Id) -> Result<()> {
         self.accepting()?.insert(thread);
         Ok(())
+    }
+    /// Undo a run's admission that failed before it was saved, so neither
+    /// `CancelRun` nor `Steer` sees a run that never started. A poisoned
+    /// lock is taken anyway: removing the entry is still right.
+    pub(super) fn withdraw(&self, thread: Id) {
+        self.running
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&thread);
+        self.accepting
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&thread);
     }
     /// Queue `text` for `thread`'s running native run.
     pub(super) fn steer(&self, thread: Id, text: String) -> Result<Reply> {

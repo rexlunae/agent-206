@@ -67,7 +67,11 @@ model has just answered without tool calls continues for a message waiting then,
 within its round budget. The run stops taking messages in the same critical
 section in which it finds none waiting, so a message is either answered or
 refused. Messages left when a run fails or is cancelled, or when the gateway
-restarts, stay in the conversation after it rather than being dropped.
+restarts, stay in the conversation after its outcome (a failure's report
+included) rather than being dropped. A message steered while the run's last
+round answers cannot be answered within the round budget, so the run fails
+with the typed round-budget error and the message follows it. A run whose start
+cannot be saved is withdrawn, so it takes no messages and cannot be cancelled.
 
 ## Permissions
 
