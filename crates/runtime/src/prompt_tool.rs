@@ -108,32 +108,46 @@ impl Prompts {
             .send(answer)
             .map_err(|_| PromptError::NotPending)
     }
-    /// Publish `prompt` in `thread` and register its waiter.
+    /// Register the waiter for `prompt`, then publish it in `thread`, so a
+    /// client that sees the question can always answer it.
     fn ask(&self, thread: Id, prompt: UserPrompt) -> Result<Asked<'_>, PromptError> {
         let (sender, receiver) = oneshot::channel();
         let id = prompt.id;
-        {
-            let mut store = self.store.lock().unwrap_or_else(PoisonError::into_inner);
-            store
-                .thread_mut(thread)
-                .map_err(PromptError::Thread)?
-                .prompts
-                .push(prompt.clone());
-            store
-                .persist(Some(EventKind::PromptRequested { thread, prompt: id }))
-                .map_err(PromptError::Store)?;
-        }
         self.waiting
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .insert(
                 id,
                 Waiting {
-                    prompt,
+                    prompt: prompt.clone(),
                     thread,
                     answer: sender,
                 },
             );
+        let published = {
+            let mut store = self.store.lock().unwrap_or_else(PoisonError::into_inner);
+            match store.thread_mut(thread) {
+                Err(error) => Err(PromptError::Thread(error)),
+                Ok(state) => {
+                    state.prompts.push(prompt);
+                    store
+                        .persist(Some(EventKind::PromptRequested { thread, prompt: id }))
+                        .map_err(|error| {
+                            if let Ok(state) = store.thread_mut(thread) {
+                                state.prompts.retain(|pending| pending.id != id);
+                            }
+                            PromptError::Store(error)
+                        })
+                }
+            }
+        };
+        if let Err(error) = published {
+            self.waiting
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(&id);
+            return Err(error);
+        }
         Ok(Asked {
             prompts: self,
             thread,

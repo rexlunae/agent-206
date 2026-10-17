@@ -36,12 +36,13 @@ pub(crate) fn PendingPrompt(thread: Uuid, question: Question) -> Element {
                 prompt,
                 answer,
             };
-            // On success the gateway withdraws the question and this card
-            // goes with it; on failure it stays so the user can try again.
+            // A question is answered once, so after success the card stays
+            // disabled until the next snapshot removes it; on failure the
+            // user can try again.
             if let Err(report) = crate::call(command).await {
                 failure.set(Some(report));
+                sending.set(false);
             }
-            sending.set(false);
         });
     });
     let send_text = move || answer(PromptAnswer::Text { text: text() });
