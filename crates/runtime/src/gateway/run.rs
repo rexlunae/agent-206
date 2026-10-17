@@ -22,7 +22,12 @@ use crate::{
     tools::{self, ToolHost, ToolRequest, ToolScope, ToolSpec},
 };
 use a206_core::*;
+use a206_output_rules::Rules;
 use std::{collections::BTreeSet, path::PathBuf, sync::Arc};
+
+/// The directory in the gateway's state directory that holds the user's
+/// output rules (`*.toml`, see docs/output-rules.md).
+pub const OUTPUT_RULES: &str = "output-rules";
 use tokio_util::sync::CancellationToken;
 
 /// A run that stopped because it used up the conversation's budget.
@@ -412,6 +417,9 @@ impl Gateway {
     }
     async fn rounds(&self, run: &Native) -> Result<Ended> {
         let pairing = self.pairing()?;
+        // Read once per run, so an edited rule file applies from the next run.
+        let directory = run.root.join(OUTPUT_RULES);
+        let rules = tokio::task::spawn_blocking(move || Rules::load(&directory)).await??;
         let prompt = format!(
             "{}{}",
             run.prompt,
@@ -584,7 +592,7 @@ impl Gateway {
                 }
                 calls_used += 1;
                 if !self
-                    .decide_call(run, &catalog, message, call, arguments)
+                    .decide_call(run, &catalog, &rules, message, call, arguments)
                     .await?
                 {
                     self.stop_calls(run.thread, message, &ToolError::Cancelled)?;
@@ -740,6 +748,7 @@ impl Gateway {
                 output: None,
                 error: None,
                 signature: streamed.signature,
+                reduction: None,
             };
             let usable = match parsed {
                 Err(error) => {
@@ -832,6 +841,7 @@ impl Gateway {
         &self,
         run: &Native,
         catalog: &tools::Catalog,
+        rules: &Rules,
         message: Id,
         call: String,
         arguments: tool_calls::Arguments,
@@ -902,6 +912,12 @@ impl Gateway {
         self.update_call(id, message, &call, changed.clone(), |_, record, _| {
             record.state = ToolCallState::Running;
         })?;
+        // The command line a rule may match on, for tools that run one.
+        let command = arguments
+            .object
+            .get("command")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
         let request = ToolRequest {
             call: call.clone(),
             name: record.tool.clone(),
@@ -956,6 +972,13 @@ impl Gateway {
             refuse(ToolError::Revoked(record.tool.clone()))?;
             return Ok(true);
         }
+        let whole = routed.spec.whole_output;
+        let reduce = |record: &mut ToolCall, text: String| {
+            let (text, reduction) =
+                reduce_output(rules, &record.tool, command.as_deref(), text, whole);
+            record.reduction = reduction;
+            text
+        };
         self.update_call(
             id,
             message,
@@ -963,10 +986,12 @@ impl Gateway {
             changed,
             |_, record, room| match result {
                 Ok(output) if !output.is_error => {
-                    finish_success(record, output.text, room, routed.spec.whole_output)
+                    let text = reduce(record, output.text);
+                    finish_success(record, text, room, whole)
                 }
                 Ok(output) => {
-                    let text = bounded_output(output.text, room);
+                    let text = reduce(record, output.text);
+                    let text = bounded_output(text, room);
                     settle(
                         record,
                         ToolCallState::Failed,
@@ -1133,6 +1158,49 @@ fn settle(call: &mut ToolCall, state: ToolCallState, why: &ToolError) {
     call.error = Some(report);
 }
 
+/// The result the model receives after the output rules, and how a rule
+/// changed it. Results only useful whole are never reduced.
+fn reduce_output(
+    rules: &Rules,
+    tool: &str,
+    command: Option<&str>,
+    text: String,
+    whole: bool,
+) -> (String, Option<OutputReduction>) {
+    if whole {
+        return (text, None);
+    }
+    let input = a206_output_rules::Input {
+        tool,
+        command,
+        output: &text,
+    };
+    let Some(reduced) = rules.reduce(&input) else {
+        return (text, None);
+    };
+    tracing::debug!(
+        tool,
+        rule = %reduced.rule,
+        original = text.len(),
+        reduced = reduced.text.len(),
+        "output rule reduced a tool result"
+    );
+    let reduction = OutputReduction {
+        rule: reduced.rule,
+        user_rule: reduced.origin == a206_output_rules::Origin::User,
+        original_bytes: text.len() as u64,
+        counts: reduced
+            .counts
+            .into_iter()
+            .map(|count| OutputCount {
+                name: count.name,
+                count: count.count as u64,
+            })
+            .collect(),
+    };
+    (reduced.text, Some(reduction))
+}
+
 /// A tool whose output is only useful whole ([`ToolSpec::whole_output`], such
 /// as skill instructions) fails rather than being cut. Available storage can
 /// be smaller than the global output cap, so both bounds are checked at
@@ -1157,6 +1225,63 @@ fn finish_success(record: &mut ToolCall, text: String, room: usize, whole: bool)
 #[cfg(test)]
 mod output_tests {
     use super::*;
+    /// The shipped rules read the command tool's own result layout: its
+    /// status line and stream headings survive, only noise goes.
+    #[test]
+    fn shipped_rules_reduce_command_results_and_keep_their_layout() {
+        use crate::exec_tool::{NAME, stream_text};
+        let (passed, failed) = (Id::new_v4().simple(), Id::new_v4().simple());
+        let stdout = format!("test {passed} ... ok\ntest {failed} ... FAILED\n");
+        let stderr = "   Compiling a v0.1.0\nerror: test failed\n";
+        let status = "exit status: 101";
+        let text = format!(
+            "{status}\n{}\n{}",
+            stream_text("stdout", stdout.as_bytes(), false),
+            stream_text("stderr", stderr.as_bytes(), false)
+        );
+        let (reduced, reduction) = reduce_output(
+            &Rules::builtin(),
+            NAME,
+            Some("cargo test"),
+            text.clone(),
+            false,
+        );
+        let reduction = reduction.expect("the cargo rule applies");
+        assert_eq!(reduction.rule, "cargo");
+        assert!(!reduction.user_rule);
+        assert_eq!(reduction.original_bytes, text.len() as u64);
+        for kept in [
+            status,
+            "--- stdout ---",
+            "--- stderr ---",
+            "error: test failed",
+        ] {
+            assert!(reduced.contains(kept), "{kept} missing from {reduced}");
+        }
+        assert!(reduced.contains(&failed.to_string()));
+        assert!(!reduced.contains(&passed.to_string()));
+        assert!(!reduced.contains("Compiling"));
+        // Results only useful whole, and other tools, pass through.
+        let (same, none) = reduce_output(
+            &Rules::builtin(),
+            NAME,
+            Some("cargo test"),
+            text.clone(),
+            true,
+        );
+        assert_eq!((same.as_str(), none), (text.as_str(), None));
+        let other = Id::new_v4().to_string();
+        assert_eq!(
+            reduce_output(
+                &Rules::builtin(),
+                &other,
+                Some("cargo test"),
+                text.clone(),
+                false
+            ),
+            (text, None)
+        );
+    }
     fn record(name: &str) -> ToolCall {
         ToolCall {
             id: Id::new_v4().to_string(),
@@ -1169,6 +1294,7 @@ mod output_tests {
             output: None,
             error: None,
             signature: None,
+            reduction: None,
         }
     }
     #[test]

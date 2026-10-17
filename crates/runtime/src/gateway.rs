@@ -25,7 +25,7 @@ mod messengers;
 pub use compaction::{CompactionError, THRESHOLD_PERCENT as COMPACTION_THRESHOLD_PERCENT};
 pub(crate) use mcp_servers::McpClient;
 pub use mcp_servers::{McpOffer, McpOffers};
-pub use run::{RunError, ToolError};
+pub use run::{OUTPUT_RULES, RunError, ToolError};
 mod delegation;
 mod plans;
 mod schedules;
@@ -167,6 +167,8 @@ pub enum GatewayError {
     #[error(transparent)]
     Skill(#[from] a206_skills::SkillError),
     #[error(transparent)]
+    OutputRules(#[from] a206_output_rules::RulesError),
+    #[error(transparent)]
     Prompt(#[from] crate::prompt_tool::PromptError),
     #[error(transparent)]
     Programs(#[from] crate::exec_tool::programs::ProgramsError),
@@ -251,6 +253,7 @@ impl crate::error::Classified for GatewayError {
             Self::Extension(error) => return classify(error),
             Self::Mcp(error) => return classify(error),
             Self::Skill(error) => return classify(error),
+            Self::OutputRules(error) => return classify(error),
             Self::Prompt(error) => return classify(error),
             Self::Programs(error) => return classify(error),
             Self::Schedule(error) => return classify(error),

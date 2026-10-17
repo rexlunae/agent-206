@@ -1,0 +1,110 @@
+# Output rules shipped with Agent 206. Each drops noise a model does not need
+# from a common command's output and keeps everything that carries signal.
+# A rule with the same `id` in the user's output-rules directory replaces
+# one of these; `enabled = false` there turns it off.
+
+[[rule]]
+id = "git.status"
+family = "git"
+description = "Drop git status hints; keep the branch and every changed path."
+priority = 100
+[rule.match]
+tools = ["execute_command"]
+git_subcommands = ["status"]
+[rule.filters]
+skip = [
+    '^\s*\(use "git ',
+    '^\s*\(commit or discard ',
+    '^\s*\(create/copy files and use "git add"',
+]
+[rule.transforms]
+strip_ansi = true
+fold_blank_runs = true
+trim_empty_edges = true
+
+[[rule]]
+id = "git.diff"
+family = "git"
+description = "Keep the start and end of a very long diff."
+priority = 90
+[rule.match]
+tools = ["execute_command"]
+git_subcommands = ["diff", "show"]
+[rule.transforms]
+strip_ansi = true
+[rule.summarize]
+head = 400
+tail = 100
+
+[[rule]]
+id = "cargo"
+family = "cargo"
+# Not `cargo run`: the program's own output must reach the model as printed.
+description = "Drop cargo progress and passing tests; keep warnings, errors, failures and results."
+priority = 80
+[rule.match]
+tools = ["execute_command"]
+argv0 = ["cargo"]
+argv_any = [["build"], ["check"], ["test"], ["clippy"], ["nextest"]]
+[rule.filters]
+skip = [
+    '^\s*Compiling ',
+    '^\s*Checking ',
+    '^\s*Downloading ',
+    '^\s*Downloaded ',
+    '^\s*Fetching ',
+    '^\s*Updating ',
+    '^\s*Locking ',
+    '^\s*Adding ',
+    '^\s*Blocking waiting for file lock',
+    '^\s*Building \[',
+    '^test .* \.\.\. ok$',
+    '^\s*PASS \[',
+]
+[rule.transforms]
+strip_ansi = true
+fold_blank_runs = true
+trim_empty_edges = true
+[[rule.counters]]
+name = "warnings"
+pattern = '^warning'
+[[rule.counters]]
+name = "errors"
+pattern = '^error'
+[[rule.counters]]
+name = "failed tests"
+pattern = '^test .* \.\.\. FAILED$'
+
+[[rule]]
+id = "npm.install"
+family = "npm"
+description = "Drop package manager progress and deprecation notices."
+priority = 70
+[rule.match]
+tools = ["execute_command"]
+argv0 = ["npm", "pnpm", "yarn"]
+argv_any = [["install"], ["i"], ["add"], ["ci"]]
+[rule.filters]
+skip = [
+    '^npm warn deprecated ',
+    '^\s*[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]',
+    '^Progress: resolved ',
+]
+[rule.transforms]
+strip_ansi = true
+fold_blank_runs = true
+trim_empty_edges = true
+
+[[rule]]
+id = "ls"
+family = "filesystem"
+description = "Keep the start and end of a very long directory listing."
+priority = 50
+[rule.match]
+tools = ["execute_command"]
+argv0 = ["ls"]
+[rule.transforms]
+strip_ansi = true
+[rule.summarize]
+head = 300
+tail = 30

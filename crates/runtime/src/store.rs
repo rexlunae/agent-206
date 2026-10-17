@@ -515,6 +515,7 @@ mod tests {
             output: None,
             error: None,
             signature: None,
+            reduction: None,
         };
         message.tool_calls = vec![
             call(ToolCallState::AwaitingApproval),

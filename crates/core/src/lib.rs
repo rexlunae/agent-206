@@ -18,8 +18,8 @@ pub use ignore::Ignore;
 pub use prompts::{AnswerError, PromptAnswer, PromptOutcome, UserPrompt};
 pub use search::{MessageHit, SearchError};
 pub use tools::{
-    ApprovalDecision, ApprovalOutcome, ApprovalRequest, ToolBudget, ToolCall, ToolCallState,
-    ToolList, ToolOffer, ToolPermission, UnavailableTools,
+    ApprovalDecision, ApprovalOutcome, ApprovalRequest, OutputCount, OutputReduction, ToolBudget,
+    ToolCall, ToolCallState, ToolList, ToolOffer, ToolPermission, UnavailableTools,
 };
 
 pub type Id = Uuid;
