@@ -87,6 +87,12 @@ pub enum McpError {
         "MCP servers are disabled on this platform until equivalent OS filesystem and network isolation is implemented"
     )]
     Unsupported,
+    #[error("could not locate this executable, which confines MCP servers")]
+    Helper(#[source] std::io::Error),
+    #[error("could not prepare OS isolation for the MCP server")]
+    Sandbox(#[source] a206_sandbox::SandboxError),
+    #[error("the MCP server's sandbox did not start")]
+    SandboxStart(#[source] a206_sandbox::StartError),
     #[error("could not start the MCP server")]
     Spawn(#[source] std::io::Error),
     #[error("MCP server has no usable process ID")]

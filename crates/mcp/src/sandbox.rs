@@ -13,9 +13,12 @@ use tokio::process::{Child, Command};
 
 /// A running server process. Dropping it kills the server's process group.
 pub struct Launch {
-    _child: Child,
+    child: Child,
     #[cfg(unix)]
     group: Mutex<Option<nix::unistd::Pid>>,
+    /// Dropping it stops listening for the sandbox helper.
+    #[cfg(target_os = "linux")]
+    control: a206_sandbox::Control,
     _scratch: tempfile::TempDir,
 }
 impl Launch {
@@ -43,7 +46,7 @@ pub async fn spawn(
     state_root: &Path,
     limits: Limits,
 ) -> Result<Session, McpError> {
-    let (launch, stdout, stdin) = launch(server, project_root, state_root)?;
+    let (launch, stdout, stdin) = launch(server, project_root, state_root).await?;
     Session::start(
         (LineLimited::new(stdout, limits.max_line_bytes), stdin),
         Some(launch),
@@ -55,12 +58,12 @@ pub async fn spawn(
 struct Placement {
     executable: PathBuf,
     #[cfg_attr(
-        not(target_os = "macos"),
+        not(any(target_os = "macos", target_os = "linux")),
         expect(dead_code, reason = "read by the sandbox profile")
     )]
     root: PathBuf,
     #[cfg_attr(
-        not(target_os = "macos"),
+        not(any(target_os = "macos", target_os = "linux")),
         expect(dead_code, reason = "read by the sandbox profile")
     )]
     state: PathBuf,
@@ -125,7 +128,8 @@ type Pipes = (
     tokio::process::ChildStdin,
 );
 
-fn launch(
+/// Cancelling this kills the server it was starting.
+async fn launch(
     server: &McpServerConfig,
     project_root: Option<&Path>,
     state_root: &Path,
@@ -154,7 +158,10 @@ fn launch(
     if placement.workspace.is_none() {
         std::fs::create_dir(&cwd).map_err(McpError::Setup)?;
     }
-    let mut command = sandbox_command(server, &placement, &scratch_root)?;
+    let mut command = sandbox_command(server, &placement, &scratch_root, &cwd)?;
+    #[cfg(target_os = "linux")]
+    let control = a206_sandbox::Control::bind(&scratch_root.join("control"), None)
+        .map_err(McpError::SandboxStart)?;
     let bin = placement
         .executable
         .parent()
@@ -181,7 +188,11 @@ fn launch(
         .kill_on_drop(true);
     #[cfg(unix)]
     command.process_group(0);
-    let mut child = command.spawn().map_err(McpError::Spawn)?;
+    // Bubblewrap and the helper report setup failures here before the server
+    // starts; the server's own stderr stays discarded.
+    #[cfg(target_os = "linux")]
+    command.stderr(Stdio::piped());
+    let child = command.spawn().map_err(McpError::Spawn)?;
     #[cfg(unix)]
     let group = nix::unistd::Pid::from_raw(
         child
@@ -189,20 +200,27 @@ fn launch(
             .and_then(|id| i32::try_from(id).ok())
             .ok_or(McpError::ProcessId)?,
     );
+    // Dropping `launch` on failure kills whatever the sandbox started.
+    let mut launch = Launch {
+        child,
+        #[cfg(unix)]
+        group: Mutex::new(Some(group)),
+        #[cfg(target_os = "linux")]
+        control,
+        _scratch: scratch,
+    };
+    #[cfg(target_os = "linux")]
+    launch
+        .control
+        .ready(&mut launch.child)
+        .await
+        .map_err(McpError::SandboxStart)?;
     // Both are piped above, so the handles are always present.
-    let (Some(stdout), Some(stdin)) = (child.stdout.take(), child.stdin.take()) else {
+    let (Some(stdout), Some(stdin)) = (launch.child.stdout.take(), launch.child.stdin.take())
+    else {
         unreachable!("stdio is piped")
     };
-    Ok((
-        Launch {
-            _child: child,
-            #[cfg(unix)]
-            group: Mutex::new(Some(group)),
-            _scratch: scratch,
-        },
-        stdout,
-        stdin,
-    ))
+    Ok((launch, stdout, stdin))
 }
 
 #[cfg(target_os = "macos")]
@@ -210,6 +228,7 @@ fn sandbox_command(
     server: &McpServerConfig,
     placement: &Placement,
     scratch: &Path,
+    _cwd: &Path,
 ) -> Result<Command, McpError> {
     // A JSON string literal is also a valid SBPL string literal.
     let quote = |path: &Path| -> Result<String, McpError> {
@@ -288,15 +307,7 @@ fn sandbox_command(
     // Ambient agent configuration and common credential stores stay hidden even
     // inside a broad workspace.
     if let Some(home) = std::env::var_os("HOME") {
-        for suffix in [
-            ".ssh",
-            ".aws",
-            ".config/gcloud",
-            ".codex",
-            ".claude",
-            ".agent206",
-            "Library/Keychains",
-        ] {
+        for suffix in a206_sandbox::HIDDEN_HOME_PATHS {
             policy.push_str(&format!(
                 "(deny file-read* file-write* (subpath {}))\n",
                 quote(&PathBuf::from(&home).join(suffix))?
@@ -307,11 +318,59 @@ fn sandbox_command(
     command.args(["-p", &policy]).arg(&placement.executable);
     Ok(command)
 }
-#[cfg(not(target_os = "macos"))]
+/// Bubblewrap and Landlock (`a206_sandbox`), with the same grants as the
+/// macOS profile. The helper is this executable, which must call
+/// `a206_sandbox::dispatch` first.
+#[cfg(target_os = "linux")]
+fn sandbox_command(
+    server: &McpServerConfig,
+    placement: &Placement,
+    scratch: &Path,
+    cwd: &Path,
+) -> Result<Command, McpError> {
+    let helper = std::env::current_exe()
+        .and_then(std::fs::canonicalize)
+        .map_err(McpError::Helper)?;
+    let holds = |c| server.capabilities.contains(&c);
+    let mut hidden: Vec<PathBuf> = std::env::var_os("HOME")
+        // A home that cannot be resolved is still hidden at its literal path.
+        .map(|home| std::fs::canonicalize(&home).unwrap_or_else(|_| PathBuf::from(home)))
+        .map(|home| {
+            a206_sandbox::HIDDEN_HOME_PATHS
+                .iter()
+                .map(|suffix| home.join(suffix))
+                .collect()
+        })
+        .unwrap_or_default();
+    hidden.push(placement.state.clone());
+    let control = scratch.join("control");
+    let profile = a206_sandbox::Profile {
+        helper: &helper,
+        executable: &placement.executable,
+        root: &placement.root,
+        scratch,
+        control: &control,
+        workspace: placement
+            .workspace
+            .as_deref()
+            .map(|workspace| (workspace, holds(Capability::WriteWorkspace))),
+        execute: holds(Capability::Execute),
+        hidden: &hidden,
+        cwd,
+        network: if holds(Capability::Network) {
+            a206_sandbox::NetworkAccess::Host
+        } else {
+            a206_sandbox::NetworkAccess::None
+        },
+    };
+    Ok(Command::from(profile.command().map_err(McpError::Sandbox)?))
+}
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn sandbox_command(
     _server: &McpServerConfig,
     _placement: &Placement,
     _scratch: &Path,
+    _cwd: &Path,
 ) -> Result<Command, McpError> {
     Err(McpError::Unsupported)
 }
