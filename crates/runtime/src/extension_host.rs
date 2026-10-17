@@ -887,6 +887,33 @@ impl HostCalls {
                 let root = self.workspace()?;
                 blocking(move || workspace::search(root, &path, &query, max_matches)).await
             }
+            HostRequest::SearchPattern {
+                path,
+                pattern,
+                regex,
+                ignore_case,
+                include,
+                max_matches,
+            } => {
+                let root = self.workspace()?;
+                blocking(move || {
+                    let options = workspace::Pattern {
+                        regex,
+                        ignore_case,
+                        include: include.as_deref(),
+                    };
+                    workspace::search_pattern(root, &path, &pattern, options, max_matches)
+                })
+                .await
+            }
+            HostRequest::Find {
+                path,
+                glob,
+                max_results,
+            } => {
+                let root = self.workspace()?;
+                blocking(move || workspace::find(root, &path, &glob, max_results)).await
+            }
             HostRequest::WriteFile {
                 path,
                 contents,
