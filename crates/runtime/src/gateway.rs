@@ -896,7 +896,7 @@ impl Gateway {
                 let thread = Thread::new(title, mode);
                 let mut store = self.lock()?;
                 store.state.threads.push(thread.clone());
-                store.persist(Some(EventKind::ThreadChanged { id: thread.id }))?;
+                store.persist(Some(EventKind::ThreadCreated { id: thread.id }))?;
                 Ok(Reply::Thread(Box::new(thread)))
             }
             Command::SetSubagentModel { id, model, allowed } => {
@@ -934,7 +934,7 @@ impl Gateway {
                 )?;
                 let mut store = self.lock()?;
                 store.thread_mut(id)?.title = title;
-                store.persist(Some(EventKind::ThreadChanged { id }))?;
+                store.persist(Some(EventKind::ThreadRenamed { id }))?;
                 Ok(Reply::Ok)
             }
             Command::ConfigureThread {
@@ -1166,7 +1166,10 @@ impl Gateway {
                         run::Ended::Cancelled => thread.state = RunState::Cancelled,
                     }
                     let thread = thread.clone();
-                    store.persist(Some(EventKind::ThreadChanged { id }))?;
+                    store.persist(Some(EventKind::RunEnded {
+                        thread: id,
+                        state: thread.state.clone(),
+                    }))?;
                     return Ok(Reply::Thread(Box::new(thread)));
                 };
                 let (sender, mut progress) = tokio::sync::mpsc::channel(32);
@@ -1244,7 +1247,10 @@ impl Gateway {
                     }
                 }
                 let thread = thread.clone();
-                store.persist(Some(EventKind::ThreadChanged { id }))?;
+                store.persist(Some(EventKind::RunEnded {
+                    thread: id,
+                    state: thread.state.clone(),
+                }))?;
                 Ok(Reply::Thread(Box::new(thread)))
             }
             Command::SearchMessages { query, limit } => {
@@ -1333,7 +1339,7 @@ impl Gateway {
                     &mode.ceiling(),
                 );
                 store.state.threads.push(thread.clone());
-                store.persist(Some(EventKind::ThreadChanged { id: thread.id }))?;
+                store.persist(Some(EventKind::ThreadCreated { id: thread.id }))?;
                 Ok(Reply::Thread(Box::new(thread)))
             }
             Command::Download {
@@ -2127,6 +2133,57 @@ mod tests {
             panic!("activity failed");
         };
         assert!(zero.more && zero.events.len() == 1);
+    }
+
+    #[tokio::test]
+    async fn creating_and_renaming_a_conversation_are_activity() {
+        let directory = tempfile::tempdir().unwrap();
+        let gateway = Gateway::open(directory.path()).unwrap();
+        let run = |body| {
+            let gateway = &gateway;
+            async move {
+                gateway
+                    .request(Request {
+                        id: Id::new_v4(),
+                        body,
+                    })
+                    .await
+                    .body
+            }
+        };
+        let Reply::Thread(thread) = run(Command::CreateThread {
+            title: Id::new_v4().to_string(),
+            mode: Mode::Chat,
+        })
+        .await
+        else {
+            panic!("create failed");
+        };
+        let id = thread.id;
+        assert_eq!(
+            run(Command::RenameThread {
+                id,
+                title: Id::new_v4().to_string(),
+            })
+            .await,
+            Reply::Ok
+        );
+        let Reply::Activity(page) = run(Command::Activity {
+            before: None,
+            limit: 10,
+        })
+        .await
+        else {
+            panic!("activity failed");
+        };
+        let kinds: Vec<_> = page.events.into_iter().map(|event| event.kind).collect();
+        assert_eq!(
+            kinds,
+            [
+                EventKind::ThreadRenamed { id },
+                EventKind::ThreadCreated { id }
+            ]
+        );
     }
 
     #[tokio::test]

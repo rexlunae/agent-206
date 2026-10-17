@@ -183,7 +183,7 @@ impl Host for Gateway {
         let id = thread.id;
         store.state.threads.push(thread);
         store
-            .persist(Some(EventKind::ThreadChanged { id }))
+            .persist(Some(EventKind::ThreadCreated { id }))
             .map_err(|e| conversation(e.into()))?;
         Ok(id)
     }
