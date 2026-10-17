@@ -49,6 +49,28 @@ macro_rules! export {
     };
 }
 
+/// Longest tool text a guest should return: the outcome limit less room for
+/// its framing and any notice a tool appends.
+pub const MAX_TOOL_TEXT: usize = 192 * 1024;
+
+/// Cut long text at a character boundary and say so, rather than fail the
+/// call by exceeding the outcome limit.
+pub fn excerpt(mut text: String) -> String {
+    if text.len() <= MAX_TOOL_TEXT {
+        return text;
+    }
+    let total = text.len();
+    let mut end = MAX_TOOL_TEXT;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.truncate(end);
+    text.push_str(&format!(
+        "\n\n[truncated: showing the first {end} of {total} bytes]"
+    ));
+    text
+}
+
 /// A string argument. The host has already checked declared types, so a
 /// value of another type is reported rather than coerced.
 pub fn string_arg<'a>(args: &'a Args, name: &str) -> Result<Option<&'a str>, GuestError> {
@@ -243,6 +265,30 @@ pub mod host {
     /// Create a directory and any missing parents.
     pub fn create_directory(path: &str) -> Result<(), HostFailure> {
         done(call(&HostRequest::CreateDirectory { path: path.into() })?)
+    }
+    /// The branch, `HEAD` and changed paths of the workspace's repository.
+    pub fn git_status() -> Result<GitStatus, HostFailure> {
+        match call(&HostRequest::GitStatus)? {
+            HostReply::GitStatus(status) => Ok(status),
+            _ => Err(unexpected()),
+        }
+    }
+    /// Up to `max` commits reachable from `HEAD`, newest first.
+    pub fn git_log(max: u32) -> Result<Vec<GitCommit>, HostFailure> {
+        match call(&HostRequest::GitLog { max })? {
+            HostReply::Commits(commits) => Ok(commits),
+            _ => Err(unexpected()),
+        }
+    }
+    /// A unified diff of one file, staged or unstaged.
+    pub fn git_diff(path: &str, staged: bool) -> Result<GitDiff, HostFailure> {
+        match call(&HostRequest::GitDiff {
+            path: path.into(),
+            staged,
+        })? {
+            HostReply::Diff(diff) => Ok(diff),
+            _ => Err(unexpected()),
+        }
     }
     fn done(reply: HostReply) -> Result<(), HostFailure> {
         match reply {

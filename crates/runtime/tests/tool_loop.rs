@@ -1,12 +1,13 @@
 //! The native run engine's tool loop against scripted provider streams and a
 //! test-only tool host. Every identifier, argument and result is generated at
 //! runtime.
+mod support;
+
 use a206_core::*;
 use a206_runtime::{
     gateway::Gateway,
     tools::{ToolHost, ToolListing, ToolOutput, ToolRequest, ToolScope, ToolSpec},
 };
-use axum::{Json, Router, extract::State, http::Method};
 use futures_util::future::BoxFuture;
 use serde_json::{Value, json};
 use std::{
@@ -16,179 +17,9 @@ use std::{
     },
     time::Duration,
 };
+use support::*;
 use tokio::sync::mpsc;
 
-const PROTOCOLS: [ProviderApi; 3] = [
-    ProviderApi::OpenAi,
-    ProviderApi::Anthropic,
-    ProviderApi::Gemini,
-];
-fn nonce() -> String {
-    Id::new_v4().simple().to_string()
-}
-fn wait<T>(what: &'static str) -> impl FnOnce(tokio::time::error::Elapsed) -> T {
-    move |_| panic!("timed out waiting for {what}")
-}
-const PATIENCE: Duration = Duration::from_secs(10);
-
-// ── Scripted provider ───────────────────────────────────────────────────────
-
-/// One streamed request the test answers by writing its body.
-struct Opened {
-    body: Value,
-    feed: mpsc::Sender<Vec<u8>>,
-}
-impl Opened {
-    async fn respond(self, events: String) {
-        self.feed.send(events.into_bytes()).await.unwrap();
-        // Dropping the feed ends the response body.
-    }
-}
-#[derive(Clone)]
-struct Scripted {
-    opened: mpsc::Sender<Opened>,
-    catalog: Value,
-}
-async fn handle(
-    State(api): State<Scripted>,
-    method: Method,
-    body: axum::body::Bytes,
-) -> axum::response::Response {
-    use axum::response::IntoResponse;
-    if method == Method::GET {
-        return Json(api.catalog).into_response();
-    }
-    let (feed, pieces) = mpsc::channel::<Vec<u8>>(8);
-    let opened = Opened {
-        body: serde_json::from_slice(&body).unwrap(),
-        feed,
-    };
-    api.opened.send(opened).await.unwrap();
-    let body = futures_util::stream::unfold(pieces, |mut pieces| async move {
-        let piece = pieces.recv().await?;
-        Some((Ok::<_, std::io::Error>(piece), pieces))
-    });
-    (
-        [("content-type", "text/event-stream")],
-        axum::body::Body::from_stream(body),
-    )
-        .into_response()
-}
-fn sse(name: Option<&str>, value: Value) -> String {
-    let name = name.map(|n| format!("event: {n}\n")).unwrap_or_default();
-    format!("{name}data: {value}\n\n")
-}
-/// A complete response carrying only text.
-fn text_response(api: ProviderApi, text: &str) -> String {
-    match api {
-        ProviderApi::OpenAi => [
-            sse(None, json!({"choices": [{"index": 0, "delta": {"content": text}}]})),
-            sse(None, json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]})),
-            "data: [DONE]\n\n".into(),
-        ]
-        .concat(),
-        ProviderApi::Anthropic => [
-            sse(Some("message_start"), json!({"type": "message_start", "message": {"usage": {"input_tokens": 1}}})),
-            sse(Some("content_block_delta"), json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": text}})),
-            sse(Some("message_delta"), json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 1}})),
-            sse(Some("message_stop"), json!({"type": "message_stop"})),
-        ]
-        .concat(),
-        ProviderApi::Gemini => sse(
-            None,
-            json!({"candidates": [{"content": {"parts": [{"text": text}]}, "finishReason": "STOP"}]}),
-        ),
-    }
-}
-/// A tool call as the model sends it: ID, tool name, raw argument text.
-#[derive(Clone)]
-struct Call {
-    id: String,
-    tool: String,
-    arguments: String,
-}
-impl Call {
-    fn new(tool: &str, arguments: Value) -> Self {
-        Self {
-            id: format!("call_{}", nonce()),
-            tool: tool.into(),
-            arguments: arguments.to_string(),
-        }
-    }
-    fn raw(tool: &str, arguments: &str) -> Self {
-        Self {
-            id: format!("call_{}", nonce()),
-            tool: tool.into(),
-            arguments: arguments.into(),
-        }
-    }
-}
-/// A complete response requesting `calls`, with each call's arguments split
-/// across deltas where the protocol streams them. Gemini parts carry
-/// `signature` as their thought signature.
-fn calls_response(api: ProviderApi, calls: &[Call], signature: &str) -> String {
-    let split = |text: &str| {
-        let mut middle = text.len() / 2;
-        while !text.is_char_boundary(middle) {
-            middle -= 1;
-        }
-        (text[..middle].to_owned(), text[middle..].to_owned())
-    };
-    match api {
-        ProviderApi::OpenAi => {
-            let mut events = vec![sse(
-                None,
-                json!({"choices": [{"index": 0, "delta": {"role": "assistant"}}]}),
-            )];
-            for (index, call) in calls.iter().enumerate() {
-                let (head, tail) = split(&call.arguments);
-                events.push(sse(None, json!({"choices": [{"index": 0, "delta": {"tool_calls": [{"index": index, "id": call.id, "type": "function", "function": {"name": call.tool, "arguments": ""}}]}}]})));
-                for piece in [head, tail] {
-                    events.push(sse(None, json!({"choices": [{"index": 0, "delta": {"tool_calls": [{"index": index, "function": {"arguments": piece}}]}}]})));
-                }
-            }
-            events.push(sse(
-                None,
-                json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}),
-            ));
-            events.push("data: [DONE]\n\n".into());
-            events.concat()
-        }
-        ProviderApi::Anthropic => {
-            let mut events = vec![sse(
-                Some("message_start"),
-                json!({"type": "message_start", "message": {"usage": {"input_tokens": 1}}}),
-            )];
-            for (index, call) in calls.iter().enumerate() {
-                let (head, tail) = split(&call.arguments);
-                events.push(sse(Some("content_block_start"), json!({"type": "content_block_start", "index": index, "content_block": {"type": "tool_use", "id": call.id, "name": call.tool, "input": {}}})));
-                for piece in [head, tail] {
-                    events.push(sse(Some("content_block_delta"), json!({"type": "content_block_delta", "index": index, "delta": {"type": "input_json_delta", "partial_json": piece}})));
-                }
-                events.push(sse(
-                    Some("content_block_stop"),
-                    json!({"type": "content_block_stop", "index": index}),
-                ));
-            }
-            events.push(sse(Some("message_delta"), json!({"type": "message_delta", "delta": {"stop_reason": "tool_use"}, "usage": {"output_tokens": 1}})));
-            events.push(sse(Some("message_stop"), json!({"type": "message_stop"})));
-            events.concat()
-        }
-        ProviderApi::Gemini => {
-            let parts: Vec<_> = calls
-                .iter()
-                .map(|call| {
-                    let args: Value = serde_json::from_str(&call.arguments).unwrap();
-                    json!({"functionCall": {"id": call.id, "name": call.tool, "args": args}, "thoughtSignature": signature})
-                })
-                .collect();
-            sse(
-                None,
-                json!({"candidates": [{"content": {"role": "model", "parts": parts}, "finishReason": "STOP"}]}),
-            )
-        }
-    }
-}
 /// Set the usage an Anthropic response reports.
 fn with_usage(events: String, input: u64, output: u64) -> String {
     events
@@ -217,54 +48,6 @@ fn replayed_arguments(api: ProviderApi, body: &Value, call: &str) -> Option<Valu
                 (block["type"] == "tool_use" && block["id"] == call).then(|| block["input"].clone())
             }),
         })
-}
-/// The tool names a request offered, whatever its protocol.
-fn offered(api: ProviderApi, body: &Value) -> Vec<String> {
-    let names = match api {
-        ProviderApi::OpenAi => body["tools"].as_array().map(|tools| {
-            tools
-                .iter()
-                .map(|t| t["function"]["name"].clone())
-                .collect::<Vec<_>>()
-        }),
-        ProviderApi::Anthropic => body["tools"]
-            .as_array()
-            .map(|tools| tools.iter().map(|t| t["name"].clone()).collect()),
-        ProviderApi::Gemini => body["tools"][0]["functionDeclarations"]
-            .as_array()
-            .map(|tools| tools.iter().map(|t| t["name"].clone()).collect()),
-    };
-    names
-        .unwrap_or_default()
-        .into_iter()
-        .map(|name| name.as_str().unwrap().to_owned())
-        .collect()
-}
-/// The result text a request carries for `call`, whatever its protocol.
-fn result_for(api: ProviderApi, body: &Value, call: &str) -> Option<String> {
-    let messages = match api {
-        ProviderApi::Gemini => body["contents"].as_array()?,
-        _ => body["messages"].as_array()?,
-    };
-    messages.iter().find_map(|message| match api {
-        ProviderApi::OpenAi => (message["role"] == "tool" && message["tool_call_id"] == call)
-            .then(|| message["content"].as_str().unwrap().to_owned()),
-        ProviderApi::Anthropic => message["content"].as_array()?.iter().find_map(|block| {
-            (block["type"] == "tool_result" && block["tool_use_id"] == call)
-                .then(|| block["content"].as_str().unwrap().to_owned())
-        }),
-        ProviderApi::Gemini => message["parts"].as_array()?.iter().find_map(|part| {
-            let response = &part["functionResponse"];
-            (response["id"] == call).then(|| {
-                let result = &response["response"];
-                result["output"]
-                    .as_str()
-                    .or(result["error"].as_str())
-                    .unwrap()
-                    .to_owned()
-            })
-        }),
-    })
 }
 
 // ── Test-only tool host ─────────────────────────────────────────────────────
@@ -340,23 +123,6 @@ struct Rig {
     dropped: Arc<AtomicBool>,
 }
 async fn rig(api: ProviderApi, tools: Vec<ToolSpec>, blocking: Option<String>) -> Rig {
-    let model = nonce();
-    let catalog = match api {
-        ProviderApi::Gemini => {
-            json!({"models": [{"name": format!("models/{model}"), "supportedGenerationMethods": ["generateContent"]}]})
-        }
-        _ => json!({"data": [{"id": model}]}),
-    };
-    let (opened, requests) = mpsc::channel(8);
-    let router = Router::new()
-        .fallback(handle)
-        // Requests near the conversation's storage limit are several MiB.
-        .layer(axum::extract::DefaultBodyLimit::disable())
-        .with_state(Scripted { opened, catalog });
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    // Detached: the server lives as long as the test's runtime.
-    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
     let (sender, calls) = mpsc::unbounded_channel();
     let marker = nonce();
     let dropped = Arc::new(AtomicBool::new(false));
@@ -370,33 +136,17 @@ async fn rig(api: ProviderApi, tools: Vec<ToolSpec>, blocking: Option<String>) -
             calls: sender,
             dropped: dropped.clone(),
         }));
-    let provider = Id::new_v4();
-    let mut settings = Settings::default();
-    settings.providers.push(ProviderConfig {
-        id: provider,
-        label: nonce(),
-        base_url: format!("http://{address}/v1"),
-        credential: None,
-        api,
-    });
+    let (model, requests) = connect(&gateway, api).await;
     let mut rig = Rig {
         gateway,
         _state: state,
         thread: Id::nil(),
-        model: ModelKey {
-            provider,
-            model: String::new(),
-        },
+        model,
         requests,
         calls,
         marker,
         dropped,
     };
-    assert_eq!(rig.run(Command::SaveSettings(settings)).await, Reply::Ok);
-    let Reply::Catalog(catalog) = rig.run(Command::RefreshCatalog { provider }).await else {
-        panic!("catalog refresh failed");
-    };
-    rig.model = catalog.models[0].key.clone();
     let Reply::Thread(thread) = rig
         .run(Command::CreateThread {
             title: nonce(),
@@ -420,13 +170,7 @@ async fn rig(api: ProviderApi, tools: Vec<ToolSpec>, blocking: Option<String>) -
 }
 impl Rig {
     async fn run(&self, body: Command) -> Reply {
-        self.gateway
-            .request(a206_protocol::Request {
-                id: Id::new_v4(),
-                body,
-            })
-            .await
-            .body
+        request(&self.gateway, body).await
     }
     async fn permit(&self, tool: &str, permission: ToolPermission) {
         let reply = self
@@ -440,27 +184,10 @@ impl Rig {
     }
     /// Start a run in the background; its reply is the finished thread.
     fn send(&self) -> tokio::task::JoinHandle<Reply> {
-        let gateway = self.gateway.clone();
-        let thread = self.thread;
-        tokio::spawn(async move {
-            gateway
-                .request(a206_protocol::Request {
-                    id: Id::new_v4(),
-                    body: Command::Send {
-                        thread,
-                        text: nonce(),
-                        attachments: vec![],
-                    },
-                })
-                .await
-                .body
-        })
+        send(&self.gateway, self.thread)
     }
     async fn next_request(&mut self) -> Opened {
-        tokio::time::timeout(PATIENCE, self.requests.recv())
-            .await
-            .unwrap_or_else(wait("a provider request"))
-            .unwrap()
+        next_request(&mut self.requests).await
     }
     fn thread(&self) -> Thread {
         let state = self.gateway.snapshot().unwrap();
@@ -506,31 +233,6 @@ impl Rig {
         .await
     }
 }
-async fn finished(task: tokio::task::JoinHandle<Reply>) -> Thread {
-    match tokio::time::timeout(PATIENCE, task)
-        .await
-        .unwrap_or_else(wait("the run to finish"))
-        .unwrap()
-    {
-        Reply::Thread(thread) => *thread,
-        other => panic!("run reply: {other:?}"),
-    }
-}
-/// The tool calls of the run's assistant messages, in order.
-fn calls_of(thread: &Thread) -> Vec<ToolCall> {
-    thread
-        .messages
-        .iter()
-        .flat_map(|m| m.tool_calls.clone())
-        .collect()
-}
-fn error_kind(call: &ToolCall) -> ErrorKind {
-    call.error
-        .as_ref()
-        .expect("a refused call carries a report")
-        .kind
-}
-
 // ── Tests ───────────────────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -1097,7 +799,14 @@ async fn delegated_conversations_cannot_permit_more_than_their_parent() {
     let Reply::Tools(list) = rig.run(Command::ListTools { thread: child.id }).await else {
         panic!("tool listing failed");
     };
-    assert_eq!(list.tools[0].effective, ToolPermission::Ask);
+    assert_eq!(
+        list.tools
+            .iter()
+            .find(|tool| tool.name == name)
+            .unwrap()
+            .effective,
+        ToolPermission::Ask
+    );
     // Narrowing the parent later narrows the child as well.
     assert_eq!(
         rig.run(Command::SetToolPermission {
@@ -1111,7 +820,14 @@ async fn delegated_conversations_cannot_permit_more_than_their_parent() {
     let Reply::Tools(list) = rig.run(Command::ListTools { thread: child.id }).await else {
         panic!("tool listing failed");
     };
-    assert_eq!(list.tools[0].effective, ToolPermission::Deny);
+    assert_eq!(
+        list.tools
+            .iter()
+            .find(|tool| tool.name == name)
+            .unwrap()
+            .effective,
+        ToolPermission::Deny
+    );
 }
 
 /// Create a subagent of `parent` permitted to use `tool`, as the rig's thread.
@@ -1344,8 +1060,9 @@ async fn a_parent_losing_a_grant_stops_its_childs_running_call() {
     let Reply::Tools(list) = rig.run(Command::ListTools { thread: rig.thread }).await else {
         panic!("tool listing failed");
     };
-    assert_eq!(list.tools[0].effective, ToolPermission::Deny);
-    assert_eq!(list.tools[0].missing, [Capability::ReadWorkspace].into());
+    let offer = list.tools.iter().find(|tool| tool.name == name).unwrap();
+    assert_eq!(offer.effective, ToolPermission::Deny);
+    assert_eq!(offer.missing, [Capability::ReadWorkspace].into());
 }
 
 #[tokio::test]

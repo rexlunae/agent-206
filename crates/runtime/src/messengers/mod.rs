@@ -1,19 +1,20 @@
 //! Messengers: chat services that reach threads through the gateway.
 //!
-//! Each enabled messenger runs as one supervised task. It spends its bot
-//! token only through the vault broker, for the service's API origin, so the
-//! gateway never holds the value. A message from a chat the user has not
+//! Each enabled messenger runs as one supervised task. It spends its bot or
+//! access token only through the vault broker, for the service's API origin,
+//! so the gateway never holds the value. A message from a chat the user has not
 //! allowed is refused and listed in the messenger's status; an allowed chat
 //! is bound to one thread, and each message becomes one ordinary turn there
 //! through [`Host::converse`], under that thread's mode, grants and approvals.
 //! A person in an allowed chat can therefore do whatever the user could do
 //! by typing into that thread, and nothing more.
+mod matrix;
 mod telegram;
 
 use a206_broker::{AuthScheme, HttpMethod, ProviderCall, Reply as BrokerReply, Request, Role};
 use a206_core::{BrokerPairing, ChatBinding, ErrorKind, Id, MessengerConfig, MessengerKind};
 use a206_core::{MessengerState, MessengerStatus};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -23,14 +24,24 @@ use tokio_util::sync::CancellationToken;
 /// Why a messenger could not connect, receive or deliver.
 #[derive(Debug, thiserror::Error)]
 pub enum MessengerError {
-    #[error("the messenger has no vault credential; add its bot token and bind it to {origin}")]
+    #[error(
+        "{service} sync exceeds the room, event or pagination budget; the cursor was not advanced"
+    )]
+    SyncBudget { service: &'static str },
+    #[error(
+        "{service} returned an incomplete timeline that could not be recovered; the cursor was not advanced"
+    )]
+    SyncGap { service: &'static str },
+    #[error("the messenger has no vault credential; add its token and bind it to {origin}")]
     NoCredential { origin: String },
+    #[error("{service} has no official server; set the messenger's endpoint to yours")]
+    NoEndpoint { service: &'static str },
     #[error("the messenger endpoint is not allowed")]
     Endpoint(#[source] a206_core::providers::EndpointError),
     #[error("a messenger endpoint is an origin, without a path")]
     EndpointPath,
     #[error(
-        "the running vault broker predates messengers; stop it with `agent206 vault stop` and unlock again"
+        "the running vault broker predates this messenger; stop it with `agent206 vault stop` and unlock again"
     )]
     BrokerTooOld,
     #[error("could not reach the vault broker")]
@@ -39,7 +50,7 @@ pub enum MessengerError {
     Broker(#[source] a206_broker::ClientError),
     #[error("the vault broker sent an unexpected reply")]
     UnexpectedReply,
-    #[error("{service} rejected the bot token; store a valid one in the vault")]
+    #[error("{service} rejected the token; store a valid one in the vault")]
     Unauthorized { service: &'static str },
     #[error(
         "{service} refused polling because another client or a webhook uses this bot; stop the other client or delete the webhook"
@@ -57,6 +68,10 @@ pub enum MessengerError {
     Refused { service: &'static str },
     #[error("{service} did not identify the bot account")]
     NoAccountId { service: &'static str },
+    #[error(
+        "room {chat} is end-to-end encrypted, which Agent 206 does not support yet; it neither reads nor answers there"
+    )]
+    EncryptedRoom { chat: String },
     #[error("choose a model for this messenger before allowing chats")]
     NoModel,
     #[error("the thread could not answer the message")]
@@ -69,16 +84,20 @@ pub enum MessengerError {
 impl crate::error::Classified for MessengerError {
     fn kind(&self) -> Option<ErrorKind> {
         Some(match self {
-            Self::NoCredential { .. } | Self::NoModel | Self::Endpoint(_) | Self::EndpointPath => {
-                ErrorKind::InvalidRequest
-            }
+            Self::SyncBudget { .. } | Self::SyncGap { .. } => ErrorKind::Protocol,
+            Self::NoCredential { .. }
+            | Self::NoEndpoint { .. }
+            | Self::NoModel
+            | Self::Endpoint(_)
+            | Self::EndpointPath => ErrorKind::InvalidRequest,
             Self::TurnAborted(_) => ErrorKind::Internal,
             Self::BrokerTooOld | Self::VaultUnavailable(_) => ErrorKind::Unavailable,
             Self::Broker(error) => return crate::error::classify(error),
             Self::UnexpectedReply | Self::Malformed { .. } | Self::NoAccountId { .. } => {
                 ErrorKind::Protocol
             }
-            Self::Unauthorized { .. } => ErrorKind::PermissionDenied,
+            // Answering in plain text there would downgrade the room.
+            Self::Unauthorized { .. } | Self::EncryptedRoom { .. } => ErrorKind::PermissionDenied,
             Self::PollingConflict { .. } => ErrorKind::Conflict,
             Self::Status { .. } | Self::Refused { .. } => ErrorKind::Provider,
             Self::Conversation(error) => return crate::error::classify(error.as_ref()),
@@ -93,6 +112,7 @@ impl MessengerError {
         matches!(
             self,
             Self::NoCredential { .. }
+                | Self::NoEndpoint { .. }
                 | Self::Endpoint(_)
                 | Self::EndpointPath
                 | Self::BrokerTooOld
@@ -131,6 +151,97 @@ pub(crate) struct Inbound {
     /// The chat's title or the sender's name: untrusted display text.
     pub title: Option<String>,
     pub text: String,
+    /// End-to-end encrypted, so `text` is empty: it cannot be read here, and
+    /// a plain-text answer would downgrade the chat.
+    pub encrypted: bool,
+}
+
+/// Something a poll delivered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Event {
+    /// Room discovery only, without authority to join or start a turn.
+    Discovered {
+        chat: String,
+        title: Option<String>,
+    },
+    Message(Inbound),
+    /// An invitation to join `chat`, accepted only if the chat is allowed.
+    Invite {
+        chat: String,
+        title: Option<String>,
+    },
+    /// Nothing to handle (a service event without a text message).
+    Ignored,
+}
+
+/// One poll's events in order. Each has a key unique within its batch, so a
+/// batch delivered again after a failure skips what was already handled.
+pub(crate) struct Batch {
+    pub events: Vec<(String, Event)>,
+    /// False for an intermediate discovery chunk. Retain deduplication keys
+    /// until the complete upstream batch is acknowledged, even after retries.
+    pub complete: bool,
+    /// The cursor that confirms this whole batch.
+    pub next: Option<String>,
+}
+
+/// The account the credential currently names. Cursors belong to one
+/// account, so a cursor is only meaningful for the same `id`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Account {
+    pub id: String,
+    pub name: Option<String>,
+}
+
+/// A connected chat service.
+enum Adapter {
+    Telegram(telegram::Telegram),
+    Matrix(matrix::Matrix),
+}
+impl Adapter {
+    fn new(config: &MessengerConfig, api: Api) -> Self {
+        match config.kind {
+            MessengerKind::Telegram => Self::Telegram(telegram::Telegram::new(api)),
+            MessengerKind::Matrix => {
+                Self::Matrix(matrix::Matrix::new(api, config.allowed_chats.clone()))
+            }
+        }
+    }
+    /// Check the credential and name the account.
+    async fn connect(&mut self) -> Result<Account> {
+        match self {
+            Self::Telegram(adapter) => adapter.connect().await,
+            Self::Matrix(adapter) => adapter.connect().await,
+        }
+    }
+    /// Wait for the next batch after `cursor`.
+    async fn receive(&mut self, cursor: Option<&str>) -> Result<Batch> {
+        match self {
+            Self::Telegram(adapter) => adapter.receive(cursor).await,
+            Self::Matrix(adapter) => adapter.receive(cursor).await,
+        }
+    }
+    /// Fails with [`MessengerError::EncryptedRoom`] if an answer could not be
+    /// sent to `chat` as it is now.
+    async fn check_chat(&self, chat: &str) -> Result<()> {
+        match self {
+            Self::Telegram(_) => Ok(()),
+            Self::Matrix(adapter) => adapter.check_room(chat).await,
+        }
+    }
+    async fn join(&self, chat: &str) -> Result<()> {
+        match self {
+            // Telegram adds bots to chats itself and reports no invitations.
+            Self::Telegram(_) => Ok(()),
+            Self::Matrix(adapter) => adapter.join(chat).await,
+        }
+    }
+    async fn send(&self, chat: &str, text: &str) -> Result<()> {
+        match self {
+            Self::Telegram(adapter) => adapter.send(chat, text).await,
+            Self::Matrix(adapter) => adapter.send(chat, text).await,
+        }
+    }
 }
 
 /// What a messenger needs from the gateway and the run engine. The gateway
@@ -318,32 +429,39 @@ async fn run<H: Host>(
     }
 }
 
-/// How far one bot's updates are handled. Update ids are per bot, and an
-/// offset confirms every earlier id, so it is never sent to another bot.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// How far one account's updates are handled. Cursors are per account, and
+/// a cursor confirms everything before it, so it is never sent for another.
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct Cursor {
-    bot: i64,
-    next: Option<i64>,
+    account: String,
+    next: Option<String>,
+    /// Keys of the events handled from the batch after `next`, should that
+    /// batch be delivered again.
+    handled: BTreeSet<String>,
 }
 
 impl Cursor {
-    /// The cursor to poll `bot` with: this one if it is the same bot,
-    /// otherwise a fresh one that confirms nothing.
-    fn for_bot(current: Option<Self>, bot: i64) -> Self {
+    /// The cursor to poll `account` with: this one if it is the same
+    /// account, otherwise a fresh one that confirms nothing.
+    fn for_account(current: Option<Self>, account: &str) -> Self {
         current
-            .filter(|cursor| cursor.bot == bot)
-            .unwrap_or(Self { bot, next: None })
+            .filter(|cursor| cursor.account == account)
+            .unwrap_or_else(|| Self {
+                account: account.to_owned(),
+                next: None,
+                handled: BTreeSet::new(),
+            })
     }
 }
 
-/// Connect and serve until an error. Resets `delay` once connected and
-/// advances the cursor past each update as its handling starts, so a message
-/// is handled at most once while the gateway runs.
+/// Connect and serve until an error. Resets `delay` once connected and marks
+/// each event handled as its handling starts, so a message is handled at
+/// most once while the gateway runs, even if its batch arrives again.
 ///
 /// The credential is looked up by the broker on every request, so its value
-/// can be replaced by another bot's token at any time. The bot is checked
-/// again before each poll, and a different bot starts from a fresh cursor
-/// instead of confirming updates it never delivered.
+/// can be replaced by another account's token at any time. The account is
+/// checked again before each poll, and a different one starts from a fresh
+/// cursor instead of confirming updates it never delivered.
 async fn session<H: Host>(
     host: &H,
     config: &MessengerConfig,
@@ -353,9 +471,7 @@ async fn session<H: Host>(
     backoff: Backoff,
 ) -> Result<()> {
     let api = Api::new(host.root(), pairing, config)?;
-    let mut adapter = match config.kind {
-        MessengerKind::Telegram => telegram::Telegram::new(api),
-    };
+    let mut adapter = Adapter::new(config, api);
     let mut account = adapter.connect().await?;
     host.update(&config.name, |s| {
         s.state = MessengerState::Connected;
@@ -369,54 +485,109 @@ async fn session<H: Host>(
             let current = adapter.connect().await?;
             if current != account {
                 if current.id != account.id {
-                    tracing::info!("the messenger credential now names another bot");
+                    tracing::info!("the messenger credential now names another account");
                 }
                 host.update(&config.name, |s| s.account = current.name.clone());
                 account = current;
             }
         }
         checked = false;
-        let position = cursor.insert(Cursor::for_bot(*cursor, account.id));
-        let batch = adapter.receive(position.next).await?;
-        for (update, inbound) in batch.updates {
-            position.next = Some(update.saturating_add(1));
-            if let Some(inbound) = inbound {
-                deliver(host, config, &adapter, inbound).await?;
+        let current = Cursor::for_account(cursor.take(), &account.id);
+        let position = cursor.insert(current);
+        let batch = adapter.receive(position.next.as_deref()).await?;
+        for (key, event) in batch.events {
+            if position.handled.insert(key) {
+                deliver(host, config, &adapter, event).await?;
             }
+        }
+        if batch.complete {
+            position.next = batch.next;
+            position.handled.clear();
         }
     }
 }
 
-/// Route one message: refuse it, or run a turn in the chat's thread and send
-/// the reply back. A failed turn is reported to the chat and the status, and
-/// does not stop the messenger.
+/// Record a message or invitation that is not allowed in the status.
+fn refuse<H: Host>(
+    host: &H,
+    config: &MessengerConfig,
+    chat: &str,
+    sender: Option<&str>,
+    title: Option<String>,
+) {
+    // Name the sender only when the chat itself is allowed.
+    let sender = sender.filter(|_| config.allowed_chats.contains(chat));
+    tracing::info!(chat, sender, "refused a message that is not allowed");
+    let at = crate::provider::now();
+    host.update(&config.name, |s| s.refuse(chat, sender, title, at));
+}
+
+/// Report a failure that does not stop the messenger in its status.
+fn report<H: Host>(host: &H, config: &MessengerConfig, error: &MessengerError) -> String {
+    let report = crate::error::handle("messenger_turn", error);
+    let detail = report.detail();
+    host.update(&config.name, |s| s.failure = Some(report));
+    detail
+}
+
+/// Route one event: refuse it, join an allowed chat, or run a turn in the
+/// chat's thread and send the reply back. A failed turn is reported to the
+/// chat and the status, and does not stop the messenger. Nothing is ever
+/// sent in plain text to an encrypted chat; that is reported in the status
+/// only.
 async fn deliver<H: Host>(
     host: &H,
     config: &MessengerConfig,
-    adapter: &telegram::Telegram,
-    inbound: Inbound,
+    adapter: &Adapter,
+    event: Event,
 ) -> Result<()> {
+    let inbound = match event {
+        Event::Discovered { chat, title } => {
+            refuse(host, config, &chat, None, title);
+            return Ok(());
+        }
+        Event::Ignored => return Ok(()),
+        Event::Invite { chat, title } => {
+            if config.allowed_chats.contains(&chat) {
+                return adapter.join(&chat).await;
+            }
+            refuse(host, config, &chat, None, title);
+            return Ok(());
+        }
+        Event::Message(inbound) => inbound,
+    };
     if !config.accepts(&inbound.chat, inbound.sender.as_deref(), inbound.group) {
-        // Name the sender only when the chat itself is allowed.
-        let sender = inbound
-            .sender
-            .as_deref()
-            .filter(|_| config.allowed_chats.contains(&inbound.chat));
-        tracing::info!(chat = %inbound.chat, sender, "refused a message that is not allowed");
-        let at = crate::provider::now();
-        host.update(&config.name, |s| {
-            s.refuse(&inbound.chat, sender, inbound.title, at)
-        });
+        refuse(
+            host,
+            config,
+            &inbound.chat,
+            inbound.sender.as_deref(),
+            inbound.title,
+        );
         return Ok(());
+    }
+    let chat = inbound.chat.clone();
+    let encrypted = |error: &MessengerError| matches!(error, MessengerError::EncryptedRoom { .. });
+    let checked = if inbound.encrypted {
+        Err(MessengerError::EncryptedRoom { chat: chat.clone() })
+    } else {
+        adapter.check_chat(&chat).await
+    };
+    match checked {
+        Err(error) if encrypted(&error) => {
+            report(host, config, &error);
+            return Ok(());
+        }
+        checked => checked?,
     }
     let binding = ChatBinding {
         messenger: config.name.clone(),
-        chat: inbound.chat.clone(),
+        chat: chat.clone(),
     };
     let title = inbound
         .title
         .clone()
-        .unwrap_or_else(|| format!("{} chat {}", config.kind.label(), inbound.chat));
+        .unwrap_or_else(|| format!("{} chat {chat}", config.kind.label()));
     let turn = async {
         if config.model.is_none() {
             return Err(MessengerError::NoModel);
@@ -424,18 +595,58 @@ async fn deliver<H: Host>(
         let thread = host.thread_for(config, &binding, &title)?;
         host.converse(thread, inbound.text).await
     };
-    match turn.await {
-        Ok(Some(reply)) => adapter.send(&inbound.chat, &reply).await,
+    let sent = match turn.await {
+        Ok(Some(reply)) => adapter.send(&chat, &reply).await,
         Ok(None) => Ok(()),
         Err(error) => {
-            let report = crate::error::handle("messenger_turn", &error);
             // The chat is where this turn started, so its failure is shown
             // there too, as display text.
-            let notice = format!("Agent 206 could not answer: {}", report.detail());
-            host.update(&config.name, |s| s.failure = Some(report));
-            adapter.send(&inbound.chat, &notice).await
+            let notice = format!(
+                "Agent 206 could not answer: {}",
+                report(host, config, &error)
+            );
+            adapter.send(&chat, &notice).await
         }
+    };
+    match sent {
+        // The chat became encrypted during the turn.
+        Err(error) if encrypted(&error) => {
+            report(host, config, &error);
+            Ok(())
+        }
+        sent => sent,
     }
+}
+
+/// Split `text` into parts of at most `limit` UTF-16 code units, preferring
+/// to break after a newline, never inside a character.
+fn split(text: &str, limit: usize) -> Vec<&str> {
+    let mut parts = vec![];
+    let mut rest = text;
+    while !rest.is_empty() {
+        let mut units = 0;
+        let mut end = rest.len();
+        let mut newline = None;
+        for (index, c) in rest.char_indices() {
+            if units + c.len_utf16() > limit {
+                end = index;
+                break;
+            }
+            units += c.len_utf16();
+            if c == '\n' {
+                newline = Some(index + 1);
+            }
+        }
+        if end < rest.len()
+            && let Some(newline) = newline
+        {
+            end = newline;
+        }
+        let (part, tail) = rest.split_at(end);
+        parts.push(part);
+        rest = tail;
+    }
+    parts
 }
 
 /// Destination-bound requests through the vault broker for one messenger.
@@ -447,8 +658,10 @@ pub(crate) struct Api {
 }
 impl Api {
     fn new(root: PathBuf, pairing: BrokerPairing, config: &MessengerConfig) -> Result<Self> {
-        let base =
-            a206_core::providers::base_url(config.endpoint()).map_err(MessengerError::Endpoint)?;
+        let endpoint = config.endpoint().ok_or(MessengerError::NoEndpoint {
+            service: config.kind.label(),
+        })?;
+        let base = a206_core::providers::base_url(endpoint).map_err(MessengerError::Endpoint)?;
         if base.path() != "/" {
             return Err(MessengerError::EndpointPath);
         }
@@ -479,6 +692,16 @@ impl Api {
         }
         Ok(url)
     }
+    /// The endpoint with `segments` appended, each percent-encoded, so an id
+    /// cannot change the path's shape.
+    fn url_segments(&self, segments: &[&str]) -> Result<url::Url> {
+        let mut url = self.base.clone();
+        url.path_segments_mut()
+            .map_err(|()| MessengerError::Endpoint(a206_core::providers::EndpointError::Shape))?
+            .pop_if_empty()
+            .extend(segments);
+        Ok(url)
+    }
     /// Send a request with the credential attached by `auth`; the status and
     /// body (empty for an error status, which the broker never relays).
     async fn call(
@@ -491,7 +714,11 @@ impl Api {
         let mut client = a206_broker::Client::connect(&self.root, Role::Gateway)
             .await
             .map_err(MessengerError::VaultUnavailable)?;
-        if client.version() < a206_broker::MESSENGER_VERSION {
+        let needed = match method {
+            HttpMethod::Put => a206_broker::PUT_VERSION,
+            HttpMethod::Get | HttpMethod::Post => a206_broker::MESSENGER_VERSION,
+        };
+        if client.version() < needed {
             return Err(MessengerError::BrokerTooOld);
         }
         client

@@ -49,10 +49,11 @@ pub enum MessengerAction {
 
 #[derive(clap::Args)]
 pub struct Options {
-    /// Vault credential holding the bot token, never the token itself.
+    /// Vault credential holding the bot or access token, never the token itself.
     #[arg(long)]
     credential: Option<String>,
-    /// API base URL, when not the service's official endpoint.
+    /// API base URL, when not the service's official endpoint. Required for
+    /// Matrix: the homeserver's client API origin.
     #[arg(long)]
     endpoint: Option<String>,
     /// Provider id for new chat threads; requires --model.
@@ -90,7 +91,16 @@ fn kind(value: &str) -> Result<MessengerKind> {
     MessengerKind::ALL
         .into_iter()
         .find(|k| k.label().eq_ignore_ascii_case(value))
-        .ok_or_else(|| anyhow::anyhow!("unknown messenger kind; Agent 206 supports telegram"))
+        .ok_or_else(|| {
+            let kinds: Vec<_> = MessengerKind::ALL
+                .iter()
+                .map(|k| k.label().to_lowercase())
+                .collect();
+            anyhow::anyhow!(
+                "unknown messenger kind; Agent 206 supports {}",
+                kinds.join(", ")
+            )
+        })
 }
 
 fn entry<'a>(settings: &'a mut Settings, name: &str) -> Result<&'a mut MessengerConfig> {

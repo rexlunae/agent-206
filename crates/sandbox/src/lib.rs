@@ -40,13 +40,13 @@ pub use elf::interpreter;
 pub use gateway::Control;
 pub use gateway::StartError;
 #[cfg(unix)]
-pub use profile::{HIDDEN_HOME_PATHS, NetworkAccess, Profile};
+pub use profile::{HIDDEN_HOME_PATHS, NetworkAccess, Profile, hidden_home_paths};
 
 /// First argument that turns a process into the in-sandbox helper.
 pub const HELPER_COMMAND: &str = "__a206-sandbox-helper";
 /// Version of [`Spec`] and [`Status`]; the helper and the gateway are the same
 /// executable, so a mismatch means a corrupted or foreign invocation.
-pub const SPEC_VERSION: u32 = 3;
+pub const SPEC_VERSION: u32 = 4;
 /// Bubblewrap is resolved from this fixed system path, never from `PATH`.
 pub const BUBBLEWRAP: &str = "/usr/bin/bwrap";
 /// Largest status message the gateway accepts from a helper.
@@ -101,6 +101,8 @@ pub struct Spec {
     pub network: Network,
     /// Unix socket on which the helper reports [`Status`].
     pub status: PathBuf,
+    /// Whether the runtime keeps the helper's stderr; otherwise it is null.
+    pub stderr: bool,
     pub rules: Vec<Rule>,
 }
 

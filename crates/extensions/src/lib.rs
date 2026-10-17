@@ -24,6 +24,7 @@ pub fn required_capability(request: &abi::HostRequest) -> Option<Capability> {
         R::WriteFile { .. } | R::EditFile { .. } | R::CreateDirectory { .. } => {
             Some(Capability::WriteWorkspace)
         }
+        R::GitStatus | R::GitLog { .. } | R::GitDiff { .. } => Some(Capability::GitRead),
         R::StateGet { .. } | R::StatePut { .. } | R::Log { .. } => None,
     }
 }
@@ -36,10 +37,16 @@ pub struct Builtin {
 }
 
 /// Manifest and module of each bundled extension, built by `build.rs`.
-const BUNDLED: &[(&str, &[u8])] = &[(
-    include_str!("../../../plugins/workspace/plugin.toml"),
-    include_bytes!(concat!(env!("OUT_DIR"), "/a206_plugin_workspace.wasm")),
-)];
+const BUNDLED: &[(&str, &[u8])] = &[
+    (
+        include_str!("../../../plugins/workspace/plugin.toml"),
+        include_bytes!(concat!(env!("OUT_DIR"), "/a206_plugin_workspace.wasm")),
+    ),
+    (
+        include_str!("../../../plugins/git/plugin.toml"),
+        include_bytes!(concat!(env!("OUT_DIR"), "/a206_plugin_git.wasm")),
+    ),
+];
 
 pub fn builtins() -> Result<Vec<Builtin>, ManifestError> {
     BUNDLED

@@ -36,7 +36,9 @@ async fn unsafe_entries_are_refused_and_saved_ones_start_stopped() {
             ..Settings::default()
         }
     };
-    let cases: [fn(&mut MessengerConfig); 6] = [
+    let cases: [fn(&mut MessengerConfig); 7] = [
+        // A Matrix homeserver is never assumed.
+        |c| c.kind = MessengerKind::Matrix,
         |c| c.name = c.name.to_uppercase(),
         |c| c.endpoint = Some(format!("ftp://{}.example", Id::new_v4())),
         // The token goes first in the path, so a base path is refused.

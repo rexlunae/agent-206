@@ -83,8 +83,12 @@ fn start(
     std::process::Command::new(&spec.executable)
         .args(args)
         // The gateway reads this process's stderr for diagnostics until it is
-        // ready, then stops; the runtime never writes there.
-        .stderr(std::process::Stdio::null())
+        // ready; only a runtime whose stderr the gateway wants writes there.
+        .stderr(if spec.stderr {
+            std::process::Stdio::inherit()
+        } else {
+            std::process::Stdio::null()
+        })
         .spawn()
         .map_err(SandboxError::Spawn)
 }

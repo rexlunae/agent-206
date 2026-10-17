@@ -85,6 +85,7 @@ pub(crate) fn classify(error: &(dyn Error + 'static)) -> Option<ErrorKind> {
         crate::client::ClientError,
         crate::connection::ConnectionError,
         crate::control::ControlError,
+        crate::exec_tool::ExecError,
         crate::gateway::GatewayError,
         crate::joshua::JoshuaError,
         crate::messengers::MessengerError,
@@ -110,8 +111,10 @@ pub(crate) fn classify(error: &(dyn Error + 'static)) -> Option<ErrorKind> {
         a206_broker::BrokerError,
         a206_broker::ClientError,
         crate::extension_host::ExtensionError,
+        crate::extension_tools::ExtensionToolError,
         a206_extensions::abi::HostFailure,
         a206_mcp::McpError,
+        a206_skills::SkillError,
         a206_protocol::Error,
         a206_sandbox::SandboxError,
         a206_sandbox::StartError,
@@ -169,6 +172,22 @@ impl Classified for a206_mcp::McpError {
             | Denied { .. }
             | ProjectMismatch
             | Revoked => ErrorKind::PermissionDenied,
+        })
+    }
+}
+
+impl Classified for a206_skills::SkillError {
+    fn kind(&self) -> Option<ErrorKind> {
+        use a206_skills::SkillError::*;
+        Some(match self {
+            Directory(_) | Read(_) => return None,
+            NotFound => ErrorKind::NotFound,
+            Name | Path | TooMany { .. } | TooLarge { .. } | FileTooLarge { .. } => {
+                ErrorKind::InvalidRequest
+            }
+            NotText(_) | NoFrontmatter | Frontmatter(_) | Metadata(_) | NameMismatch
+            | Unreviewed => ErrorKind::InvalidRequest,
+            Disabled | Changed => ErrorKind::PermissionDenied,
         })
     }
 }

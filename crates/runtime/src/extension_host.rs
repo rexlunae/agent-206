@@ -31,6 +31,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// Wall-clock bound on one invocation, host calls included.
 pub const TIMEOUT: Duration = Duration::from_secs(10);
+/// Wall-clock bound on one git host call, metadata checks included.
+pub const GIT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Largest file a guest may read in one call.
 pub const MAX_FILE: u64 = 512 * 1024;
 /// Most entries one directory listing returns.
@@ -149,6 +151,13 @@ pub struct ExtensionTool {
     pub spec: ToolSpec,
 }
 
+/// One enabled extension's tools, or why they could not be read.
+#[derive(Debug)]
+pub struct ExtensionTools {
+    pub extension: String,
+    pub tools: Result<Vec<ToolSpec>, ExtensionError>,
+}
+
 #[derive(Clone)]
 pub struct ExtensionHost {
     store: Arc<Mutex<Store>>,
@@ -183,7 +192,37 @@ impl ExtensionHost {
             .collect())
     }
 
+    /// Each enabled extension's tools whose declared capabilities the user
+    /// has granted, read from its validated manifest (the declaration
+    /// [`Self::call_tool`] checks against). An extension whose manifest cannot
+    /// be loaded is reported on its own; the others are still listed.
+    pub fn tool_sources(&self) -> Result<Vec<ExtensionTools>, ExtensionError> {
+        Ok(self
+            .plugins()?
+            .into_iter()
+            .filter(|plugin| plugin.enabled)
+            .map(|plugin| {
+                let tools = self.manifest(&plugin.id).map(|manifest| {
+                    manifest
+                        .tools
+                        .into_iter()
+                        .filter(|tool| tool.capabilities.is_subset(&plugin.granted))
+                        .collect()
+                });
+                ExtensionTools {
+                    extension: plugin.id,
+                    tools,
+                }
+            })
+            .collect())
+    }
+
     /// Run a tool. Arguments are checked against its declaration first.
+    ///
+    /// Dropping the future stops the call: the worker child is killed
+    /// (`kill_on_drop`) and nothing of the invocation keeps running except a
+    /// bounded workspace read already handed to the blocking pool, whose
+    /// result is discarded. Extension state written before the drop stays.
     pub async fn call_tool(
         &self,
         extension: &str,
@@ -278,7 +317,11 @@ impl ExtensionHost {
                 });
             }
         }
-        let workspace_capabilities = [Capability::ReadWorkspace, Capability::WriteWorkspace];
+        let workspace_capabilities = [
+            Capability::ReadWorkspace,
+            Capability::WriteWorkspace,
+            Capability::GitRead,
+        ];
         if scope.workspace.is_none() && workspace_capabilities.iter().any(|c| declared.contains(c))
         {
             return Err(ExtensionError::NoProject);
@@ -496,6 +539,18 @@ impl HostCalls {
                 let root = self.workspace()?;
                 blocking(move || workspace::create_directory(root, &path)).await
             }
+            HostRequest::GitStatus => {
+                let root = self.workspace()?;
+                git_call(move |interrupt| git::status(root, interrupt)).await
+            }
+            HostRequest::GitLog { max } => {
+                let root = self.workspace()?;
+                git_call(move |interrupt| git::log(root, max, &interrupt)).await
+            }
+            HostRequest::GitDiff { path, staged } => {
+                let root = self.workspace()?;
+                git_call(move |interrupt| git::diff(root, &path, staged, &interrupt)).await
+            }
             HostRequest::StateGet { key } => {
                 check_key(&key)?;
                 let value = self
@@ -579,13 +634,60 @@ fn bounded(text: &str, limit: usize) -> &str {
 async fn blocking(
     work: impl FnOnce() -> Result<HostReply, HostFailure> + Send + 'static,
 ) -> Result<HostReply, HostFailure> {
-    tokio::task::spawn_blocking(work)
-        .await
-        .unwrap_or_else(|error| {
-            crate::error::handle("extension_host_call", &error);
-            Err(failure(HostErrorCode::Io, "host call failed"))
-        })
+    joined_reply(tokio::task::spawn_blocking(work).await)
 }
+fn joined_reply(
+    joined: Result<Result<HostReply, HostFailure>, tokio::task::JoinError>,
+) -> Result<HostReply, HostFailure> {
+    joined.unwrap_or_else(|error| {
+        crate::error::handle("extension_host_call", &error);
+        Err(failure(HostErrorCode::Io, "host call failed"))
+    })
+}
+/// Run a blocking git call that stops at `GIT_TIMEOUT` or when this future
+/// is dropped (the invocation timed out or was revoked). A blocking task
+/// cannot be aborted, so the interrupt flag is how it learns to end; on
+/// timeout the flag is raised and the call awaited until it returns.
+async fn git_call(
+    work: impl FnOnce(Arc<std::sync::atomic::AtomicBool>) -> Result<HostReply, HostFailure>
+    + Send
+    + 'static,
+) -> Result<HostReply, HostFailure> {
+    git_call_with_timeout(work, GIT_TIMEOUT).await
+}
+async fn git_call_with_timeout(
+    work: impl FnOnce(Arc<std::sync::atomic::AtomicBool>) -> Result<HostReply, HostFailure>
+    + Send
+    + 'static,
+    timeout: Duration,
+) -> Result<HostReply, HostFailure> {
+    let interrupt = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop = Interrupt(Arc::clone(&interrupt));
+    let mut call = tokio::task::spawn_blocking(move || work(interrupt));
+    match tokio::time::timeout(timeout, &mut call).await {
+        Ok(joined) => joined_reply(joined),
+        Err(_) => {
+            stop.set();
+            // Join for cleanup and diagnostics, but a late success cannot undo
+            // the deadline that has already expired.
+            let _completed = joined_reply(call.await);
+            Err(failure(HostErrorCode::Budget, "the git call took too long"))
+        }
+    }
+}
+/// Raises a scan's interrupt flag when set or dropped.
+struct Interrupt(Arc<std::sync::atomic::AtomicBool>);
+impl Interrupt {
+    fn set(&self) {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+impl Drop for Interrupt {
+    fn drop(&mut self) {
+        self.set();
+    }
+}
+mod git;
 mod workspace;
 
 #[cfg(test)]

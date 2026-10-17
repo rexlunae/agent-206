@@ -300,6 +300,28 @@ impl Gateway {
             ToolPermission::Deny => false,
         })
     }
+    /// [`Self::permits`], and also whether the tool's host still offers it
+    /// to the conversation as it did: a host's own authority (an extension
+    /// disabled or ungranted, a server disconnected) can be withdrawn too.
+    async fn still_permits(
+        &self,
+        id: Id,
+        name: &str,
+        spec: &ToolSpec,
+        approved: bool,
+    ) -> Result<bool> {
+        if !self.permits(id, spec, approved)? {
+            return Ok(false);
+        }
+        let scope = self.view(id)?.scope;
+        let catalog = tools::catalog(&self.tool_hosts, &scope).await;
+        match catalog.tools.get(name) {
+            Some(now) if now.spec.capabilities == spec.capabilities => {
+                self.permits(id, &now.spec, approved)
+            }
+            _ => Ok(false),
+        }
+    }
     pub(super) fn set_tool_budget(&self, id: Id, budget: ToolBudget) -> Result<Reply> {
         check(
             (1..=ToolBudget::MAX).contains(&budget.rounds) && budget.tool_calls <= ToolBudget::MAX,
@@ -731,7 +753,10 @@ impl Gateway {
                 // The sender lives as long as the gateway, so this branch
                 // only runs for a change.
                 Ok(()) = policy.changed() => {
-                    if !self.permits(id, &routed.spec, approved)? {
+                    if !self
+                        .still_permits(id, &record.tool, &routed.spec, approved)
+                        .await?
+                    {
                         refuse(ToolError::Revoked(record.tool.clone()))?;
                         return Ok(true);
                     }
@@ -839,7 +864,7 @@ impl Gateway {
                 Ok(()) = policy.changed() => {
                     // The request keeps waiting while Ask or Allow applies;
                     // only a denial withdraws it.
-                    if !self.permits(id, spec, true)? {
+                    if !self.still_permits(id, &record.tool, spec, true).await? {
                         break Answer::Revoked;
                     }
                 }

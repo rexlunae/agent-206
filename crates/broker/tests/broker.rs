@@ -1342,3 +1342,61 @@ async fn telegram_tokens_go_in_the_path_and_odd_tokens_are_refused() {
     );
     assert_eq!(seen.lock().unwrap().len(), 1);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn put_requests_carry_their_body_and_the_bearer_token() {
+    use axum::{Router, body::Bytes, http::HeaderMap, routing::put};
+    let seen = Arc::new(Mutex::new(Vec::<(Option<String>, Vec<u8>)>::new()));
+    let app = {
+        let seen = seen.clone();
+        Router::new().route(
+            "/send",
+            put(move |headers: HeaderMap, body: Bytes| {
+                let seen = seen.clone();
+                async move {
+                    let auth = headers
+                        .get("authorization")
+                        .and_then(|v| v.to_str().ok())
+                        .map(str::to_owned);
+                    seen.lock().unwrap().push((auth, body.to_vec()));
+                    "{}"
+                }
+            }),
+        )
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let (_dir, root, _task) = start().await;
+    let mut a = user(&root).await;
+    a.call(unlock(&random(), None, true)).await.unwrap();
+    let (name, token) = (random(), random());
+    a.call(Request::PutCredential {
+        name: name.clone(),
+        meta: meta(vec![origin.clone()]),
+        value: WireValue::Single(WireSecret::new(token.clone())),
+        replace: false,
+    })
+    .await
+    .unwrap();
+    let mut gateway = paired_gateway(&mut a, &root).await;
+    assert!(gateway.version() >= PUT_VERSION);
+    let body = format!("{{\"body\":\"{}\"}}", random()).into_bytes();
+    let reply = gateway
+        .call(Request::Provider(ProviderCall {
+            credential: name,
+            method: HttpMethod::Put,
+            url: format!("{origin}/send"),
+            auth: AuthScheme::Bearer,
+            anthropic_version: None,
+            body: Some(body.clone()),
+        }))
+        .await
+        .unwrap();
+    assert!(matches!(reply, Reply::Provider { status: 200, .. }));
+    assert_eq!(
+        *seen.lock().unwrap(),
+        [(Some(format!("Bearer {token}")), body)]
+    );
+}

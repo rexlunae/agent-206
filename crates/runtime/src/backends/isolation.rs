@@ -325,7 +325,7 @@ fn sandbox_command(
         quote(state)?
     ));
     // Deny ambient agent configuration and common credential stores even inside a broad workspace.
-    for hidden in hidden_home_paths() {
+    for hidden in a206_sandbox::hidden_home_paths() {
         policy.push_str(&format!(
             "(deny file-read* file-write* (subpath {}))\n",
             quote(&hidden)?
@@ -334,22 +334,6 @@ fn sandbox_command(
     let mut command = Command::new("/usr/bin/sandbox-exec");
     command.args(["-p", &policy]).arg(executable);
     Ok(command)
-}
-/// Credential stores and agent configuration that stay hidden from a runtime
-/// even when its granted project contains them. A symlinked home resolves to
-/// the canonical paths the grants are compared with.
-#[cfg(unix)]
-fn hidden_home_paths() -> Vec<PathBuf> {
-    std::env::var_os("HOME")
-        // A home that cannot be resolved is still denied by its literal path.
-        .map(|home| std::fs::canonicalize(&home).unwrap_or_else(|_| PathBuf::from(home)))
-        .map(|home| {
-            a206_sandbox::HIDDEN_HOME_PATHS
-                .iter()
-                .map(|suffix| PathBuf::from(&home).join(suffix))
-                .collect()
-        })
-        .unwrap_or_default()
 }
 #[cfg(target_os = "linux")]
 fn sandbox_command(
@@ -365,7 +349,7 @@ fn sandbox_command(
         .and_then(std::fs::canonicalize)
         .map_err(BackendError::Helper)?;
     let capabilities = &thread.grant.capabilities;
-    let mut hidden = hidden_home_paths();
+    let mut hidden = a206_sandbox::hidden_home_paths();
     hidden.push(state.to_path_buf());
     let control = scratch.join("control");
     let start = scratch.join("workspace");
@@ -382,6 +366,7 @@ fn sandbox_command(
         hidden: &hidden,
         cwd: &start,
         network: a206_sandbox::NetworkAccess::Proxy(port),
+        stderr: false,
     };
     Ok(Command::from(profile.command()?))
 }
