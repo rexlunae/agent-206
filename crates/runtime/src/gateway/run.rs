@@ -12,7 +12,7 @@
 use super::{
     Gateway, GatewayError, PartialReply, Result,
     compaction::{self, CompactionError},
-    poisoned,
+    memory_flush, poisoned,
 };
 use crate::{
     error::check,
@@ -421,7 +421,34 @@ impl Gateway {
             if self.lock()?.remaining()? < NEXT_ROUND {
                 return Ok(Ended::Failed(GatewayError::HistoryFull));
             }
-            if compaction::over_threshold(last_input, run.info.context_limit) {
+            let mut view = self.view(run.thread)?;
+            let catalog = tokio::select! {
+                catalog = tools::catalog(&self.tool_hosts, &view.scope) => catalog,
+                _ = run.cancel.cancelled() => return Ok(Ended::Cancelled),
+            };
+            for unavailable in &catalog.unavailable {
+                let _source = tracing::warn_span!("tools", source = %unavailable.source).entered();
+                crate::error::record("list_tools", &unavailable.error);
+            }
+            let offered: Vec<ToolSpec> = catalog
+                .tools
+                .values()
+                .filter(|routed| view.decide(&routed.spec).0 != ToolPermission::Deny)
+                .map(|routed| routed.spec.clone())
+                .collect();
+            let over = compaction::over_threshold(last_input, run.info.context_limit);
+            // Flush only with a round left after it to answer in.
+            let flush = over
+                && memory_flush::due(&view.thread)
+                && round < effective_budget(&*self.lock()?, run.thread)?.rounds
+                && offered
+                    .iter()
+                    .any(|spec| spec.name == memory_flush::save_tool());
+            if flush {
+                let mut store = self.lock()?;
+                memory_flush::mark(store.thread_mut(run.thread)?);
+                store.persist(Some(EventKind::ThreadChanged { id: run.thread }))?;
+            } else if over {
                 let compacted = self
                     .compact(compaction::Request {
                         thread: run.thread,
@@ -449,29 +476,26 @@ impl Gateway {
                     }
                     Err(error) => return Ok(Ended::Failed(error)),
                 }
+                // Send what the compaction left.
+                view = self.view(run.thread)?;
                 // The next check uses what this round's request reports.
             }
-            let view = self.view(run.thread)?;
-            let catalog = tokio::select! {
-                catalog = tools::catalog(&self.tool_hosts, &view.scope) => catalog,
-                _ = run.cancel.cancelled() => return Ok(Ended::Cancelled),
+            let flushing;
+            let round_prompt = if flush {
+                flushing = format!(
+                    "{prompt}{}",
+                    memory_flush::instruction(&memory_flush::today())
+                );
+                &flushing
+            } else {
+                &prompt
             };
-            for unavailable in &catalog.unavailable {
-                let _source = tracing::warn_span!("tools", source = %unavailable.source).entered();
-                crate::error::record("list_tools", &unavailable.error);
-            }
-            let offered: Vec<ToolSpec> = catalog
-                .tools
-                .values()
-                .filter(|routed| view.decide(&routed.spec).0 != ToolPermission::Deny)
-                .map(|routed| routed.spec.clone())
-                .collect();
             let broker = provider::Broker {
                 root: &run.root,
                 pairing: pairing.as_ref(),
             };
             let (turn, message) = match self
-                .stream_round(run, &prompt, &view.thread, broker, &offered)
+                .stream_round(run, round_prompt, &view.thread, broker, &offered)
                 .await?
             {
                 Some(Ok(turn)) => turn,

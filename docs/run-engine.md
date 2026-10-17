@@ -428,13 +428,27 @@ previous summary first.
   replies with it. Cancellation (`CancelRun`, shutdown) abandons the summary
   request and leaves the run `Cancelled` or the manual compaction failed with
   `Cancelled`.
+- **Memory flush** (`gateway/memory_flush.rs`). When an automatic compaction is
+  due and the round would offer the bundled `memory_save` tool (extension enabled
+  and granted, the conversation's permission not Deny), the gateway first sends one
+  round with the full context and a flush instruction added to that round's system
+  prompt: save lasting notes with `memory_save` (suggesting `memory/YYYY-MM-DD.md`
+  in the gateway's local date), then continue with the user's request. The user's
+  turn is kept; the model answers in the same run. Saves go through the ordinary
+  tool path, so an `Ask` permission asks the user. The compaction then happens
+  before the next round, or at the start of the next run if the model just
+  answered. The flush is offered once per summary (`Thread::memory_flush` records
+  the latest summary at the time, so restarts and later runs do not repeat it), and
+  only when the round budget leaves a round to answer in. Manual compaction has no
+  flush. Follows RustyClaw's `memory_flush.rs`, but triggers at the compaction
+  threshold instead of a fixed token count before it.
 - Compaction does not reduce the conversation's stored size.
 
 Tests: `crates/runtime/tests/context.rs` (scripted OpenAI, Anthropic and Gemini
-streams) and unit tests in `compaction.rs` and `instructions.rs`.
+streams) and unit tests in `compaction.rs`, `memory_flush.rs` and `instructions.rs`.
 
 ## Not implemented
 
 Leaked tool-markup filtering, schema type coercion and repeat-call warnings from
-RustyClaw's healing; pre-compaction memory flush; Anthropic thinking-block replay alongside tool results;
+RustyClaw's healing; Anthropic thinking-block replay alongside tool results;
 retries; parallel tool execution.

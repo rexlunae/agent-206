@@ -5,6 +5,7 @@ mod support;
 
 use a206_core::*;
 use a206_runtime::{
+    extension_tools::tool_name,
     gateway::{COMPACTION_THRESHOLD_PERCENT, Gateway},
     instructions,
     tools::{ToolHost, ToolListing, ToolOutput, ToolRequest, ToolScope, ToolSpec},
@@ -579,6 +580,135 @@ async fn compaction_is_refused_while_a_run_is_in_progress() {
         .await;
     let thread = finished(run).await;
     assert!(summaries(&thread).is_empty());
+}
+
+// ── Pre-compaction memory flush ─────────────────────────────────────────────
+
+/// The heading the flush instruction adds to a round's system prompt.
+const FLUSH: &str = "Pre-compaction memory flush";
+
+/// A rig offering a stand-in for the bundled memory save tool, whose turns
+/// so far ended above the threshold. Returns the save tool's name, the
+/// earliest turn's texts and the input tokens just above the threshold.
+async fn flush_rig(api: ProviderApi) -> (Rig, String, (String, String), u64) {
+    let limit = limit();
+    let save = tool_name("agent206.memory", "memory_save");
+    let host = EchoHost {
+        name: save.clone(),
+        marker: nonce(),
+    };
+    let mut rig = rig(api, Some(limit), Some(host)).await;
+    let first = rig.turn(1).await;
+    rig.turn(1).await;
+    let over = around_threshold(limit).1;
+    rig.turn(over).await;
+    (rig, save, first, over)
+}
+
+#[tokio::test]
+async fn a_memory_flush_round_precedes_the_compaction_once() {
+    for api in PROTOCOLS {
+        let (mut rig, save, first, over) = flush_rig(api).await;
+
+        // Above the threshold, the run's first request is the flush round:
+        // the full context, the save tool, and the instruction.
+        let asked = nonce();
+        let run = rig.send(rig.thread, &asked);
+        let flushing = rig.next().await;
+        let system = system_of(api, &flushing.body);
+        assert!(system.contains(FLUSH), "{api:?}: {system}");
+        assert!(system.contains(&save), "{api:?}");
+        assert!(offered(api, &flushing.body).contains(&save), "{api:?}");
+        for text in [&first.0, &first.1, &asked] {
+            assert!(mentions(&flushing.body, text), "{api:?}");
+        }
+        let call = Call::new(&save, json!({"path": "memory/n.md", "text": nonce()}));
+        flushing
+            .respond(calls_response(api, std::slice::from_ref(&call), &nonce()))
+            .await;
+        // The model still answers in the same run, without the instruction.
+        let answering = rig.next().await;
+        assert!(!system_of(api, &answering.body).contains(FLUSH), "{api:?}");
+        assert!(
+            result_for(api, &answering.body, &call.id).is_some(),
+            "{api:?}"
+        );
+        answering
+            .respond(text_response_reporting(api, &nonce(), over))
+            .await;
+        let thread = finished(run).await;
+        assert_eq!(thread.state, RunState::Complete, "{api:?}");
+        assert!(summaries(&thread).is_empty(), "{api:?}");
+        assert!(thread.memory_flush.is_some(), "{api:?}");
+
+        // The next run compacts without offering the flush again.
+        let run = rig.send(rig.thread, &nonce());
+        let summary_request = rig.next().await;
+        assert!(mentions(&summary_request.body, &first.0), "{api:?}");
+        assert!(offered(api, &summary_request.body).is_empty(), "{api:?}");
+        summary_request.respond(text_response(api, &nonce())).await;
+        let compacted = rig.next().await;
+        assert!(!system_of(api, &compacted.body).contains(FLUSH), "{api:?}");
+        assert!(!mentions(&compacted.body, &first.0), "{api:?}");
+        compacted.respond(text_response(api, &nonce())).await;
+        let thread = finished(run).await;
+        assert_eq!(summaries(&thread).len(), 1, "{api:?}");
+        // The next summary gets a flush of its own.
+        assert_ne!(
+            thread.memory_flush,
+            Some(MemoryFlush {
+                after: thread.latest_compaction()
+            }),
+            "{api:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn no_flush_without_permission_to_save() {
+    let api = ProviderApi::OpenAi;
+    let (mut rig, save, first, _) = flush_rig(api).await;
+    let denied = rig
+        .run(Command::SetToolPermission {
+            thread: rig.thread,
+            tool: save,
+            permission: None,
+        })
+        .await;
+    assert_eq!(denied, Reply::Ok);
+    let run = rig.send(rig.thread, &nonce());
+    let summary_request = rig.next().await;
+    assert!(mentions(&summary_request.body, &first.0));
+    summary_request.respond(text_response(api, &nonce())).await;
+    let compacted = rig.next().await;
+    assert!(!system_of(api, &compacted.body).contains(FLUSH));
+    compacted.respond(text_response(api, &nonce())).await;
+    let thread = finished(run).await;
+    assert_eq!(summaries(&thread).len(), 1);
+    assert_eq!(thread.memory_flush, None);
+}
+
+#[tokio::test]
+async fn no_flush_when_the_round_budget_leaves_no_room_to_answer() {
+    let api = ProviderApi::OpenAi;
+    let (mut rig, ..) = flush_rig(api).await;
+    let mut budget = rig.thread().tool_budget;
+    budget.rounds = 1;
+    let set = rig
+        .run(Command::SetToolBudget {
+            thread: rig.thread,
+            budget,
+        })
+        .await;
+    assert!(matches!(set, Reply::Ok | Reply::Thread(_)), "{set:?}");
+    let run = rig.send(rig.thread, &nonce());
+    let summary_request = rig.next().await;
+    assert!(!system_of(api, &summary_request.body).contains(FLUSH));
+    summary_request.respond(text_response(api, &nonce())).await;
+    rig.next().await.respond(text_response(api, &nonce())).await;
+    let thread = finished(run).await;
+    assert_eq!(summaries(&thread).len(), 1);
+    assert_eq!(thread.memory_flush, None);
 }
 
 // ── Project instruction files ───────────────────────────────────────────────
