@@ -789,6 +789,7 @@ mod tests {
             downloads: vec![],
             plugins: vec![],
             messengers: vec![],
+            mcp_servers: vec![],
             last_event: 0,
             managed_joshua_provider: None,
         }

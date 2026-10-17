@@ -5,6 +5,7 @@ mod error;
 mod extensions;
 #[cfg(not(target_arch = "wasm32"))]
 mod health;
+mod mcp;
 mod pages;
 mod route;
 mod settings;
@@ -105,6 +106,7 @@ fn empty_snapshot() -> Snapshot {
         messengers: vec![],
         last_event: 0,
         managed_joshua_provider: None,
+        mcp_servers: vec![],
     }
 }
 /// Send a command; a gateway-reported failure arrives as `Err` with its causes.

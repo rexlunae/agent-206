@@ -164,6 +164,8 @@ pub mod providers;
 pub use messengers::{
     ChatBinding, MessengerConfig, MessengerKind, MessengerState, MessengerStatus, RefusedChat,
 };
+pub mod mcp;
+pub use mcp::{McpServerConfig, McpServerState, McpServerStatus, McpToolInfo, ToolPolicy};
 pub use providers::{ProviderApi, ProviderPreset, ProviderPresetList};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -252,6 +254,7 @@ pub struct Settings {
     pub backends: Vec<BackendConfig>,
     #[serde(default)]
     pub messengers: Vec<MessengerConfig>,
+    pub mcp_servers: Vec<McpServerConfig>,
     pub prompts: Vec<ModePrompt>,
     pub theme_design: String,
     pub theme_palette: Option<String>,
@@ -266,6 +269,7 @@ impl Default for Settings {
             provider_presets: ProviderPresetList::default(),
             backends: vec![],
             messengers: vec![],
+            mcp_servers: vec![],
             prompts: Mode::ALL
                 .into_iter()
                 .map(|mode| ModePrompt {
@@ -437,6 +441,9 @@ pub struct Snapshot {
     /// Runtime state of configured messengers; never a grant.
     #[serde(default)]
     pub messengers: Vec<MessengerStatus>,
+    /// Runtime state of configured MCP servers; never a grant.
+    #[serde(default)]
+    pub mcp_servers: Vec<McpServerStatus>,
 }
 impl Snapshot {
     /// Retire only the connection owned by the managed process, including its model grants.
@@ -478,6 +485,7 @@ pub enum EventKind {
     BackendActivity { thread: Id, title: String },
     ProjectChanged { id: Id },
     MessengerChanged { name: String },
+    McpServerChanged { name: String },
     ExtensionChanged { id: String },
 }
 
@@ -624,6 +632,14 @@ pub enum Command {
     DisconnectMessenger {
         name: String,
     },
+    /// Start an enabled MCP server and list its tools (user operation).
+    ConnectMcpServer {
+        name: String,
+    },
+    /// Stop an MCP server; it stays stopped until the user connects it again.
+    DisconnectMcpServer {
+        name: String,
+    },
 }
 impl Command {
     /// A stable operation name for logs and diagnostics; never includes arguments.
@@ -659,6 +675,8 @@ impl Command {
             Self::PairBroker { .. } => "pair_broker",
             Self::ConnectMessenger { .. } => "connect_messenger",
             Self::DisconnectMessenger { .. } => "disconnect_messenger",
+            Self::ConnectMcpServer { .. } => "connect_mcp_server",
+            Self::DisconnectMcpServer { .. } => "disconnect_mcp_server",
         }
     }
 }
