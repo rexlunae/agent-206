@@ -6,10 +6,10 @@ credential layout, access policies, TOTP handling, authentication limits, the
 `Ignore` result-discard convention, the MCP client's configuration, connection
 and tool-result model, the provider identifiers and credential names the
 RustyClaw import adapter maps, the extension model of declared actions,
-persisted per-extension state and recorded panel interactions, the Linux
-bubblewrap/Landlock sandbox design (crates/sandbox), and tool-call argument
-repair and in-response de-duplication (`tool_healing.rs`) are adapted from
-RustyClaw,
+persisted per-extension state and recorded panel interactions, the skill
+format, frontmatter and gating rules, the Linux bubblewrap/Landlock sandbox
+design (crates/sandbox), and tool-call argument repair and in-response
+de-duplication (`tool_healing.rs`) are adapted from RustyClaw,
 https://github.com/rexlunae/RustyClaw,
 Copyright (c) 2026 Erica Stith, MIT License (included in LICENSE).
 
