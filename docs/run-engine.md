@@ -519,6 +519,28 @@ The rules are read when a run starts; a file that cannot be read or parsed
 fails the run before the model is asked, with the file and the parser's cause
 in the error.
 
+## Credentials in tool results
+
+Before the output rules run, every tool result is passed through
+`crates/leak-scan` (after RustyClaw's `LeakDetector`), which replaces text
+shaped like a credential with `[redacted <kind>]`. The kinds are provider API
+keys (Anthropic, OpenAI, Google, SendGrid, Stripe), AWS access keys, GitHub
+and GitLab tokens, Slack, Telegram and Discord bot tokens, private-key blocks
+(removed whole, to the end of the text when the block is cut off), bearer
+tokens, JWTs and passwords in URLs (only the password: `postgres://user:[redacted
+url_password]@host`). This applies to successful results, failures a tool
+reports, every link of a host failure's report, and whole-output results too,
+so the removed text reaches neither the model nor the stored conversation.
+`ToolCall::redactions` records each kind and how often it was removed, never
+the text, and the tool trace says "Credentials removed before the model saw
+this result". Output rules then see only the cleaned text.
+
+Matching is by shape, so this is defense in depth: a secret that looks like
+ordinary text is not found, and nothing here replaces keeping credentials in
+the vault. Removal cannot be turned off. The arguments a model writes are not
+scanned (it can only repeat what it already saw), and neither are project
+instruction files, user messages or attachments.
+
 ## Context
 
 ### Project instruction files
@@ -648,4 +670,5 @@ Leaked tool-markup filtering, schema type coercion and repeat-call warnings from
 RustyClaw's healing; Anthropic thinking-block replay alongside tool results;
 parallel tool execution; RustyClaw's project-layer output rules
 (`<workspace>/.tokenjuice/rules/`) and a way to list or edit output rules from
-the GUI or CLI.
+the GUI or CLI; credential scanning of instruction files, attachments and
+outbound requests, and user-defined credential shapes.

@@ -17,8 +17,9 @@ tokenization and the `MEMORY.md` + `memory/` file scope of `memory_search`,
 `memory_get` and note saving (`memory.rs`, `tools/memory_tools.rs`;
 plugins/memory), and the key names and escape sequences of background
 process keystrokes (`process_manager.rs` `translate_keys`), and the tool-output
-rule model and shipped rules (`crates/tokenjuice`; crates/output-rules) are
-adapted from
+rule model and shipped rules (`crates/tokenjuice`; crates/output-rules), and
+the credential kinds removed from tool results
+(`security/leak_detector.rs`; crates/leak-scan) are adapted from
 RustyClaw,
 https://github.com/rexlunae/RustyClaw,
 Copyright (c) 2026 Erica Stith, MIT License (included in LICENSE).
