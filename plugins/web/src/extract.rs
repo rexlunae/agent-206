@@ -25,8 +25,8 @@ pub const BUDGET: u64 = 36_000_000;
 const BYTE_COST: u64 = 150;
 const TAG_COST: u64 = 4_500;
 const LINK_COST: u64 = 14_000;
-/// Further fuel for resolving a page-relative link's path.
-const RELATIVE_COST: u64 = 20_000;
+/// Further fuel for parsing and resolving a link's URL.
+const RESOLVE_COST: u64 = 20_000;
 const REFERENCE_COST: u64 = 1_500;
 const WORD_COST: u64 = 600;
 /// Most text read between two checks of the budget.
@@ -80,7 +80,7 @@ const MAX_NAME: usize = 12;
 pub fn extract(html: &str, base: Option<&str>, format: Format, budget: u64) -> Page {
     let mut state = State {
         format,
-        base: base.and_then(|base| origin(base).map(|origin| (origin, base))),
+        base: base.and_then(|base| url::Url::parse(base).ok()),
         all: Out::default(),
         main: Out::default(),
         main_depth: 0,
@@ -172,10 +172,10 @@ pub fn extract(html: &str, base: Option<&str>, format: Format, budget: u64) -> P
     }
 }
 
-struct State<'a> {
+struct State {
     format: Format,
-    /// The page's origin (`scheme://host`) and its whole address.
-    base: Option<(&'a str, &'a str)>,
+    /// The page's address, which relative links resolve against.
+    base: Option<url::Url>,
     all: Out,
     /// Text inside `<main>` or `<article>`, which wins when there is any.
     main: Out,
@@ -193,7 +193,7 @@ struct State<'a> {
     work: u64,
 }
 
-impl State<'_> {
+impl State {
     fn charge(&mut self, bytes: usize) {
         self.work = self
             .work
@@ -444,32 +444,18 @@ impl State<'_> {
     /// `href` as an absolute `http(s)` URL, or `None` for anything else
     /// (scripts, mail, fragments, or a relative link without a base).
     fn absolute(&mut self, href: &str) -> Option<String> {
-        let href = href.trim();
-        if href.starts_with("https://") || href.starts_with("http://") {
-            return Some(href.to_string());
-        }
-        if let Some(rest) = href.strip_prefix("//") {
-            return Some(["https://", rest].concat());
-        }
-        let scheme = href
-            .find(':')
-            .is_some_and(|colon| !href[..colon].contains(['/', '?', '#']));
-        if href.is_empty() || href.starts_with('#') || scheme {
+        if href.trim().is_empty() || href.trim_start().starts_with('#') {
             return None;
         }
-        let (origin, base) = self.base?;
-        self.work += RELATIVE_COST;
-        if href.starts_with('/') {
-            return Some([origin, &remove_dots(href)].concat());
+        self.work += RESOLVE_COST;
+        // Resolved as a browser resolves it (backslashes, dot segments,
+        // percent-encoding), so the link leads where the page's does.
+        let url = match &self.base {
+            Some(base) => base.join(href),
+            None => url::Url::parse(href),
         }
-        let after = &base[origin.len()..];
-        let path = &after[..after.find(['?', '#']).unwrap_or(after.len())];
-        if href.starts_with('?') {
-            let path = if path.is_empty() { "/" } else { path };
-            return Some([origin, path, href].concat());
-        }
-        let directory = path.rfind('/').map_or("/", |slash| &path[..=slash]);
-        Some([origin, &remove_dots(&[directory, href].concat())].concat())
+        .ok()?;
+        matches!(url.scheme(), "https" | "http").then(|| escape(url.into()))
     }
 }
 
@@ -572,20 +558,11 @@ fn attribute(attributes: &str, wanted: &str) -> Option<String> {
     None
 }
 
-/// `scheme://host` of an `http(s)` URL.
-fn origin(url: &str) -> Option<&str> {
-    let after = url.find("://")? + 3;
-    let end = url[after..]
-        .find(['/', '?', '#'])
-        .map_or(url.len(), |end| after + end);
-    url.starts_with("http").then(|| &url[..end])
-}
-
-/// A URL as a Markdown link destination. Bytes a browser percent-encodes
-/// in a request anyway (whitespace, controls, `<>"` and backticks) are
-/// encoded. Parentheses are kept as written, since a server may tell them
-/// from `%28`/`%29` (a signed link, say); Markdown accepts them when they
-/// balance, so they are encoded only when they do not.
+/// A resolved URL as a Markdown link destination. The URL parser has
+/// already percent-encoded what a browser would; what is left as written
+/// is kept, since a server may tell `(` from `%28` (a signed link, say).
+/// Only what would end or break the destination is encoded: parentheses
+/// that do not balance, and a backslash that would escape the next byte.
 fn escape(url: String) -> String {
     let mut depth = 0i32;
     let balanced = url.bytes().all(|byte| {
@@ -596,20 +573,20 @@ fn escape(url: String) -> String {
         };
         depth >= 0
     }) && depth == 0;
-    let unsafe_byte = |byte: u8| {
-        byte <= b' '
-            // A backslash would escape the Markdown after it.
-            || matches!(byte, b'<' | b'>' | b'"' | b'`' | b'\\' | 0x7f)
-            || (!balanced && matches!(byte, b'(' | b')'))
+    let bytes = url.as_bytes();
+    let unsafe_at = |at: usize| match bytes[at] {
+        b'(' | b')' => !balanced,
+        b'\\' => bytes.get(at + 1).is_some_and(u8::is_ascii_punctuation),
+        byte => byte <= b' ' || matches!(byte, b'<' | b'>' | 0x7f),
     };
-    if !url.bytes().any(unsafe_byte) {
+    if !(0..bytes.len()).any(unsafe_at) {
         return url;
     }
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
     let mut out = String::with_capacity(url.len() + 8);
-    for c in url.chars() {
+    for (at, c) in url.char_indices() {
         match u8::try_from(c) {
-            Ok(byte) if unsafe_byte(byte) => {
+            Ok(byte) if unsafe_at(at) => {
                 out.push('%');
                 out.push(char::from(HEX[usize::from(byte >> 4)]));
                 out.push(char::from(HEX[usize::from(byte & 15)]));
@@ -618,32 +595,6 @@ fn escape(url: String) -> String {
         }
     }
     out
-}
-
-/// An absolute path (with any query or fragment) with its `.` and `..`
-/// segments resolved, as a browser does.
-fn remove_dots(path: &str) -> String {
-    let (path, tail) = path.split_at(path.find(['?', '#']).unwrap_or(path.len()));
-    let parts: Vec<&str> = path.split('/').skip(1).collect();
-    let mut kept: Vec<&str> = Vec::with_capacity(parts.len());
-    for (index, part) in parts.iter().enumerate() {
-        let last = index + 1 == parts.len();
-        match *part {
-            "." => {}
-            ".." => {
-                kept.pop();
-            }
-            part => {
-                kept.push(part);
-                continue;
-            }
-        }
-        // `a/.` and `a/..` name a directory, so they keep a final slash.
-        if last {
-            kept.push("");
-        }
-    }
-    ["/", &kept.join("/"), tail].concat()
 }
 
 /// Text with its character references decoded. Unknown names stay as they
@@ -922,7 +873,10 @@ See the other, x, no and rel.\n\nUse cargo:\n\nfn  main() {\n    x();\n}\n\nafte
             ),
             ("a(1)?s=x", "https://site.example/docs/a(1)?s=x"),
             ("a)(", "https://site.example/docs/a%29%28"),
-            ("a(\\)", "https://site.example/docs/a(%5C)"),
+            // A backslash is a path separator in an http(s) URL, and kept
+            // in a query unless it would escape what follows.
+            ("a(\\)", "https://site.example/docs/a(/)"),
+            ("?q=a\\)\\b", "https://site.example/docs/page?q=a%5C%29\\b"),
             (
                 "https://x.example/a&quot;b<c>",
                 "https://x.example/a%22b%3Cc%3E",
