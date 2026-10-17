@@ -115,6 +115,20 @@ async fn broker(
     BrokerPairing,
     crate::provider::PairingAnchor,
 ) {
+    let (dir, mut names, pairing, anchor) = broker_with(origin, &[token]).await;
+    (dir, names.remove(0), pairing, anchor)
+}
+
+/// A broker with each token stored as its own credential bound to `origin`.
+async fn broker_with(
+    origin: &str,
+    tokens: &[&str],
+) -> (
+    tempfile::TempDir,
+    Vec<String>,
+    BrokerPairing,
+    crate::provider::PairingAnchor,
+) {
     use a206_broker::*;
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().to_owned();
@@ -131,22 +145,26 @@ async fn broker(
     })
     .await
     .unwrap();
-    let name = random();
-    user.call(Request::PutCredential {
-        name: name.clone(),
-        meta: a206_vault::CredentialMeta {
-            label: name.clone(),
-            kind: a206_vault::CredentialKind::Token,
-            policy: a206_vault::AccessPolicy::WithApproval,
-            description: None,
-            disabled: false,
-            destinations: vec![origin.to_owned()],
-        },
-        value: WireValue::Single(WireSecret::new(token.to_owned())),
-        replace: false,
-    })
-    .await
-    .unwrap();
+    let mut names = vec![];
+    for token in tokens {
+        let name = random();
+        user.call(Request::PutCredential {
+            name: name.clone(),
+            meta: a206_vault::CredentialMeta {
+                label: name.clone(),
+                kind: a206_vault::CredentialKind::Token,
+                policy: a206_vault::AccessPolicy::WithApproval,
+                description: None,
+                disabled: false,
+                destinations: vec![origin.to_owned()],
+            },
+            value: WireValue::Single(WireSecret::new((*token).to_owned())),
+            replace: false,
+        })
+        .await
+        .unwrap();
+        names.push(name);
+    }
     let BrokerReply::GatewayPairing { token } = user.call(Request::PairGateway).await.unwrap()
     else {
         panic!("expected a pairing");
@@ -155,7 +173,7 @@ async fn broker(
     let anchor = crate::provider::verify_pairing(&root, &pairing)
         .await
         .unwrap();
-    (dir, name, pairing, anchor)
+    (dir, names, pairing, anchor)
 }
 
 /// Records what the supervisor asks of the gateway.
@@ -1517,6 +1535,306 @@ async fn discord_reconnects_when_asked_or_unacknowledged_and_stops_on_intents() 
     assert_eq!(api.identifies.lock().unwrap().len(), identifies);
     assert_eq!(host.status(name).state, MessengerState::Failed);
     drop(desired);
+    stop.cancel();
+    supervisor.await.unwrap();
+}
+
+/// What the stand-in Slack Web API and Socket Mode serve and record.
+#[derive(Clone, Default)]
+struct SlackApi {
+    bot_token: String,
+    app_token: String,
+    user_id: String,
+    user: String,
+    origin: Arc<Mutex<String>>,
+    /// Envelopes the open socket sends, in order.
+    envelopes: Arc<Mutex<VecDeque<Value>>>,
+    acks: Arc<Mutex<Vec<String>>>,
+    opens: Arc<Mutex<u32>>,
+    /// Channel and body of each posted message.
+    sent: Arc<Mutex<Vec<(String, Value)>>>,
+}
+
+fn bearer(headers: &axum::http::HeaderMap) -> Option<String> {
+    headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(str::to_owned)
+}
+
+async fn serve_slack(api: SlackApi) -> String {
+    use axum::extract::ws::{Message as Ws, WebSocketUpgrade};
+    use axum::http::HeaderMap;
+    use axum::routing::any;
+    let auth_test = |State(api): State<SlackApi>, headers: HeaderMap| async move {
+        if bearer(&headers) != Some(api.bot_token.clone()) {
+            return Json(json!({"ok": false, "error": "invalid_auth"}));
+        }
+        Json(json!({"ok": true, "user_id": api.user_id, "user": api.user}))
+    };
+    let open = |State(api): State<SlackApi>, headers: HeaderMap| async move {
+        // Only the app-level token opens a socket.
+        if bearer(&headers) != Some(api.app_token.clone()) {
+            return Json(json!({"ok": false, "error": "not_allowed_token_type"}));
+        }
+        *api.opens.lock().unwrap() += 1;
+        let origin = api.origin.lock().unwrap().replace("http", "ws");
+        Json(json!({"ok": true, "url": format!("{origin}/socket?ticket={}", random())}))
+    };
+    let post_message =
+        |State(api): State<SlackApi>, headers: HeaderMap, Json(body): Json<Value>| async move {
+            assert_eq!(
+                bearer(&headers),
+                Some(api.bot_token.clone()),
+                "no bot token"
+            );
+            let channel = body["channel"].as_str().unwrap().to_owned();
+            api.sent.lock().unwrap().push((channel, body));
+            Json(json!({"ok": true}))
+        };
+    let socket = |State(api): State<SlackApi>, upgrade: WebSocketUpgrade| async move {
+        upgrade.on_upgrade(move |mut socket| async move {
+            let hello = json!({"type": "hello"});
+            socket.send(Ws::text(hello.to_string())).await.unwrap();
+            loop {
+                let next = api.envelopes.lock().unwrap().pop_front();
+                if let Some(envelope) = next {
+                    let disconnect = envelope["type"] == "disconnect";
+                    socket.send(Ws::text(envelope.to_string())).await.unwrap();
+                    if disconnect {
+                        return;
+                    }
+                    continue;
+                }
+                let received =
+                    tokio::time::timeout(std::time::Duration::from_millis(10), socket.recv()).await;
+                match received {
+                    Err(_) => {}
+                    Ok(Some(Ok(Ws::Text(text)))) => {
+                        let ack: Value = serde_json::from_str(text.as_str()).unwrap();
+                        let id = ack["envelope_id"].as_str().unwrap().to_owned();
+                        api.acks.lock().unwrap().push(id);
+                    }
+                    Ok(Some(Ok(_))) => {}
+                    Ok(_) => return,
+                }
+            }
+        })
+    };
+    let router = Router::new()
+        .route("/api/auth.test", post(auth_test))
+        .route("/api/apps.connections.open", post(open))
+        .route("/api/chat.postMessage", post(post_message))
+        .route("/socket", any(socket))
+        .with_state(api.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    *api.origin.lock().unwrap() = origin.clone();
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    origin
+}
+
+fn slack_event(channel: &str, channel_type: &str, user: &str, text: &str) -> Value {
+    json!({
+        "type": "events_api",
+        "envelope_id": random(),
+        "payload": {"event": {
+            "type": "message",
+            "channel": channel,
+            "channel_type": channel_type,
+            "user": user,
+            "text": text,
+            "ts": format!("{}.{}", std::process::id(), Id::new_v4().as_u128() % 1_000_000),
+        }},
+    })
+}
+
+/// A Slack messenger whose bot and app tokens are separate vault credentials.
+async fn slack_setup(
+    channels: &[&str],
+) -> (
+    SlackApi,
+    MessengerConfig,
+    tempfile::TempDir,
+    Recorder,
+    crate::provider::PairingAnchor,
+) {
+    let api = SlackApi {
+        bot_token: random(),
+        app_token: random(),
+        user_id: random(),
+        user: random(),
+        ..SlackApi::default()
+    };
+    let origin = serve_slack(api.clone()).await;
+    let (dir, names, pairing, anchor) =
+        broker_with(&origin, &[&api.bot_token, &api.app_token]).await;
+    let host = Recorder {
+        root: dir.path().to_owned(),
+        pairing,
+        pairings: Arc::new(watch::Sender::new(0)),
+        threads: Arc::default(),
+        turns: Arc::default(),
+        statuses: Arc::default(),
+        connects: Arc::default(),
+        changed: Arc::default(),
+    };
+    let config = MessengerConfig {
+        kind: MessengerKind::Slack,
+        app_credential: Some(names[1].clone()),
+        allowed_chats: channels.iter().map(|c| (*c).to_owned()).collect(),
+        ..config("slack", &origin, &names[0], 0)
+    };
+    (api, config, dir, host, anchor)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn slack_acknowledges_everything_and_answers_allowed_people_once() {
+    let (dm, channel, other) = (random(), random(), random());
+    let (api, mut entry, _dir, host, _anchor) = slack_setup(&[&dm, &channel]).await;
+    let (member, stranger) = (random(), random());
+    entry.allowed_users.insert(member.clone());
+    let name = entry.name.clone();
+    let own = slack_event(&channel, "channel", &api.user_id, &random());
+    let mut bot = slack_event(&channel, "channel", &member, &random());
+    bot["payload"]["event"]["bot_id"] = json!(random());
+    let mut edit = slack_event(&channel, "channel", &member, &random());
+    edit["payload"]["event"]["subtype"] = json!("message_changed");
+    let question = format!("{} &lt;tag&gt; &amp;", random());
+    let group = slack_event(&channel, "channel", &member, &question);
+    // Delivered again under a new envelope, as after a missed acknowledgement.
+    let mut again = group.clone();
+    again["envelope_id"] = json!(random());
+    let dm_text = random();
+    let envelopes = vec![
+        own,
+        bot,
+        edit,
+        json!({"type": "slash_commands", "envelope_id": random(), "payload": {}}),
+        slack_event(&other, "channel", &member, &random()),
+        slack_event(&channel, "channel", &stranger, &random()),
+        group,
+        again,
+        slack_event(&dm, "im", &stranger, &dm_text),
+    ];
+    let ids: Vec<String> = envelopes
+        .iter()
+        .map(|e| e["envelope_id"].as_str().unwrap().to_owned())
+        .collect();
+    api.envelopes.lock().unwrap().extend(envelopes);
+    let (_desired, receiver) = watch::channel(vec![Desired {
+        config: entry,
+        run: true,
+    }]);
+    let stop = CancellationToken::new();
+    let supervisor = tokio::spawn(supervise(host.clone(), receiver, FAST, stop.clone()));
+    host.until(|h| {
+        api.sent.lock().unwrap().len() == 1
+            && h.status(&name).refused.len() == 3
+            && api.acks.lock().unwrap().len() == ids.len()
+    })
+    .await;
+    assert_eq!(*api.acks.lock().unwrap(), ids);
+    let status = host.status(&name);
+    assert_eq!(status.state, MessengerState::Connected);
+    assert_eq!(status.account, Some(format!("@{}", api.user)));
+    let refused: Vec<_> = status
+        .refused
+        .iter()
+        .map(|r| (r.chat.clone(), r.sender.clone()))
+        .collect();
+    // A direct message from someone unlisted is refused while senders are listed.
+    assert_eq!(
+        refused,
+        [
+            (other, None),
+            (channel.clone(), Some(stranger.clone())),
+            (dm, Some(stranger)),
+        ]
+    );
+    // Answered once, with Slack's escapes undone for the model.
+    let turns: Vec<String> = host
+        .turns
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|t| t.1.clone())
+        .collect();
+    let typed = question
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&");
+    assert_eq!(turns, std::slice::from_ref(&typed));
+    let sent = api.sent.lock().unwrap().clone();
+    assert_eq!(sent[0].0, channel);
+    // Markup in the reply is escaped, so it cannot mention or link.
+    let escaped = format!("reply to {typed}")
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;");
+    assert_eq!(sent[0].1["text"], escaped);
+    assert_eq!(*api.opens.lock().unwrap(), 1);
+    stop.cancel();
+    supervisor.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn slack_reconnects_on_request_and_needs_both_tokens() {
+    let channel = random();
+    let (api, entry, _dir, host, _anchor) = slack_setup(&[&channel]).await;
+    let name = entry.name.clone();
+    let (desired, receiver) = watch::channel(vec![Desired {
+        config: entry.clone(),
+        run: true,
+    }]);
+    let stop = CancellationToken::new();
+    let supervisor = tokio::spawn(supervise(host.clone(), receiver, FAST, stop.clone()));
+    host.until(|_| *api.opens.lock().unwrap() == 1).await;
+    // Slack asks for a refresh: a new socket, and messages still arrive.
+    api.envelopes
+        .lock()
+        .unwrap()
+        .push_back(json!({"type": "disconnect", "reason": "refresh_requested"}));
+    host.until(|_| *api.opens.lock().unwrap() == 2).await;
+    let author = random();
+    api.envelopes
+        .lock()
+        .unwrap()
+        .push_back(slack_event(&channel, "im", &author, &random()));
+    host.until(|_| api.sent.lock().unwrap().len() == 1).await;
+
+    // Without an app-level token it waits for the user instead of retrying.
+    desired.send_replace(vec![Desired {
+        config: MessengerConfig {
+            app_credential: None,
+            ..entry.clone()
+        },
+        run: true,
+    }]);
+    host.until(|h| h.status(&name).state == MessengerState::Failed)
+        .await;
+    assert_eq!(
+        host.status(&name).failure.unwrap().kind,
+        ErrorKind::InvalidRequest
+    );
+    // The bot token in place of the app token is refused as unauthorized.
+    desired.send_replace(vec![Desired {
+        config: MessengerConfig {
+            app_credential: entry.credential.clone(),
+            ..entry
+        },
+        run: true,
+    }]);
+    host.until(|h| {
+        h.status(&name)
+            .failure
+            .is_some_and(|f| f.kind == ErrorKind::PermissionDenied)
+    })
+    .await;
+    let opens = *api.opens.lock().unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(*api.opens.lock().unwrap(), opens);
     stop.cancel();
     supervisor.await.unwrap();
 }

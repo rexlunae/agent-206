@@ -140,6 +140,9 @@ fn MessengerCard(now: u64, config: MessengerConfig, status: MessengerStatus) -> 
                 if let Some(account) = &status.account { span { class: "a206-muted", "Bot account {account}" } }
             }
             p { class: "a206-muted", match &config.credential { Some(credential) => format!("Token: vault credential {credential}"), None => "No vault credential chosen; it cannot connect.".to_owned() } }
+            if config.kind.needs_app_credential() {
+                p { class: "a206-muted", match &config.app_credential { Some(credential) => format!("App-level token: vault credential {credential}"), None => "No app-level token chosen; it cannot receive messages.".to_owned() } }
+            }
             Checkbox { label: rsx! { "Enabled" }, checked: ReadSignal::from(enabled), onchange: { let name = name.clone(); move |on: bool| save_messenger(state, &name, |m| m.enabled = on) } }
             if let Some(report) = status.failure.clone() { ErrorNotice { report, title: "Messenger failed".to_string() } }
             div { class: "a206-grid",
@@ -290,15 +293,18 @@ fn AddMessenger() -> Element {
     let mut name = use_signal(String::new);
     let mut kind = use_signal(|| Some(MessengerKind::Telegram.label().to_owned()));
     let mut credential = use_signal(String::new);
+    let mut app_credential = use_signal(String::new);
     let mut endpoint = use_signal(String::new);
     let selected = MessengerKind::ALL
         .into_iter()
         .find(|k| Some(k.label()) == kind().as_deref());
     // A federated service has no official server to fall back on.
     let needs_endpoint = selected.is_some_and(|k| k.default_endpoint().is_none());
+    let needs_app = selected.is_some_and(MessengerKind::needs_app_credential);
     let ready = selected.is_some()
         && !name().trim().is_empty()
         && !credential().trim().is_empty()
+        && (!needs_app || !app_credential().trim().is_empty())
         && (!needs_endpoint || !endpoint().trim().is_empty());
     let endpoint_hint = if needs_endpoint {
         "Required: your homeserver's client API origin, with no path."
@@ -316,6 +322,9 @@ fn AddMessenger() -> Element {
                     onchange: move |value: String| kind.set(Some(value))
                 } }
                 Field { label: rsx! { "Vault credential" }, hint: rsx! { "The name of the vault entry holding the token, never the token itself." }, Input { value: ReadSignal::from(credential), oninput: move |v| credential.set(v), placeholder: "Credential name" } }
+                if needs_app {
+                    Field { label: rsx! { "App-level token credential" }, hint: rsx! { "The vault entry holding the app-level token the service sends events with." }, Input { value: ReadSignal::from(app_credential), oninput: move |v| app_credential.set(v), placeholder: "Credential name" } }
+                }
                 Field { label: rsx! { "API endpoint" }, hint: rsx! { "{endpoint_hint}" }, Input { value: ReadSignal::from(endpoint), oninput: move |v| endpoint.set(v), placeholder: selected.and_then(|k| k.default_endpoint()).unwrap_or("https://homeserver.example") } }
             }
         }
@@ -323,6 +332,7 @@ fn AddMessenger() -> Element {
             let Some(service) = selected else { return };
             let mut entry = MessengerConfig::new(name().trim().to_owned(), service);
             entry.credential = Some(credential().trim().to_owned());
+            entry.app_credential = Some(app_credential().trim().to_owned()).filter(|c| service.needs_app_credential() && !c.is_empty());
             entry.endpoint = Some(endpoint().trim().to_owned()).filter(|e| !e.is_empty());
             let mut settings = state.data.read().settings.clone();
             settings.messengers.push(entry);

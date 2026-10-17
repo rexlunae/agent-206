@@ -55,7 +55,7 @@ struct Config {
 
 /// The fields of a RustyClaw `[[messengers]]` entry this importer uses. Its
 /// secrets (tokens, passwords, app passwords) are not deserialized; `token`,
-/// `access_token` and `password` are only checked for presence.
+/// `access_token`, `password` and `app_token` are only checked for presence.
 #[derive(Deserialize)]
 struct Messenger {
     #[serde(default)]
@@ -70,6 +70,9 @@ struct Messenger {
     access_token: Option<IgnoredAny>,
     #[serde(default)]
     password: Option<IgnoredAny>,
+    /// Slack's app-level token for Socket Mode.
+    #[serde(default)]
+    app_token: Option<IgnoredAny>,
     /// Matrix homeserver URL.
     #[serde(default)]
     homeserver: Option<String>,
@@ -200,6 +203,7 @@ fn messenger_kind(id: &str) -> Option<MessengerKind> {
         "telegram" => Some(MessengerKind::Telegram),
         "matrix" => Some(MessengerKind::Matrix),
         "discord" => Some(MessengerKind::Discord),
+        "slack" => Some(MessengerKind::Slack),
         _ => None,
     }
 }
@@ -302,7 +306,8 @@ fn plan_messengers(settings: &Settings, source: Vec<Messenger>) -> Vec<Messenger
                 },
                 token_left_behind: messenger.token.is_some()
                     || messenger.access_token.is_some()
-                    || messenger.password.is_some(),
+                    || messenger.password.is_some()
+                    || messenger.app_token.is_some(),
                 action,
             }
         })
@@ -862,6 +867,40 @@ allowed_users = ["{user}"]
         assert_eq!(guild.endpoint(), MessengerKind::Discord.default_endpoint());
         assert_eq!(guild.allowed_chats, BTreeSet::from([channel]));
         assert_eq!(guild.allowed_users, BTreeSet::from([user]));
+    }
+
+    #[test]
+    fn slack_apps_arrive_disabled_without_either_token() {
+        let (token, app_token, channel) = (random(), random(), random());
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            &dir.path().join("config.toml"),
+            &format!(
+                r#"
+[[messengers]]
+name = "workspace"
+messenger_type = "slack"
+enabled = true
+token = "{token}"
+app_token = "{app_token}"
+allowed_chats = ["{channel}"]
+"#
+            ),
+        );
+        let mut settings = Settings::default();
+        let preview = preview(dir.path(), &settings, None).unwrap();
+        let [workspace] = &preview.messengers[..] else {
+            panic!("{:?}", preview.messengers)
+        };
+        assert_eq!(workspace.kind, Some(MessengerKind::Slack));
+        assert!(workspace.token_left_behind);
+        let text = toml::to_string(&preview).unwrap();
+        assert!(!text.contains(&token) && !text.contains(&app_token));
+        assert_eq!(preview.apply_messengers(&mut settings), ["workspace"]);
+        let workspace = &settings.messengers[0];
+        assert!(!workspace.enabled);
+        assert!(workspace.credential.is_none() && workspace.app_credential.is_none());
+        assert_eq!(workspace.allowed_chats, BTreeSet::from([channel]));
     }
 
     #[test]
