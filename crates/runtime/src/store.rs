@@ -116,6 +116,7 @@ impl Store {
                 managed_joshua_provider: None,
                 messengers: vec![],
                 mcp_servers: vec![],
+                extension_proposals: vec![],
             }
         };
         let mut store = Self {

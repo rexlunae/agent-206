@@ -704,3 +704,34 @@ async fn oversized_skill_index_keeps_its_size_error_at_the_wasm_boundary() {
         Some(HostErrorCode::TooLarge)
     );
 }
+
+#[tokio::test]
+async fn starting_keeps_proposed_packages_but_prunes_unrecorded_ones() {
+    let (dir, store) = store();
+    let host = ExtensionHost::new(Arc::clone(&store), dir.path().into());
+    let builtin = a206_extensions::builtin("agent206.workspace")
+        .unwrap()
+        .unwrap();
+    let id = format!("test.{}", uuid::Uuid::new_v4().simple());
+    let manifest = include_str!("../../../../plugins/workspace/plugin.toml").replacen(
+        "id = \"agent206.workspace\"",
+        &format!("id = \"{id}\""),
+        1,
+    );
+    let proposal = host
+        .propose(uuid::Uuid::new_v4(), manifest, builtin.wasm.to_vec(), 0)
+        .await
+        .unwrap();
+    let packages = packages::directory(dir.path());
+    let stray = packages.join(uuid::Uuid::new_v4().simple().to_string().repeat(2));
+    std::fs::create_dir(&stray).unwrap();
+    // A gateway start prunes what nothing records, and only that.
+    ExtensionHost::new(Arc::clone(&store), dir.path().into());
+    assert!(packages.join(&proposal.digest).exists());
+    assert!(!stray.exists());
+    // A proposal is not an installed extension: it cannot run.
+    assert!(matches!(
+        host.load(&id),
+        Err(ExtensionError::NotInstalled(_))
+    ));
+}

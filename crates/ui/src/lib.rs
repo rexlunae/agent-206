@@ -129,6 +129,7 @@ pub(crate) fn empty_snapshot() -> Snapshot {
         last_event: 0,
         managed_joshua_provider: None,
         mcp_servers: vec![],
+        extension_proposals: vec![],
     }
 }
 /// Send a command; a gateway-reported failure arrives as `Err` with its causes.
