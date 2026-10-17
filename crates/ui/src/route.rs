@@ -86,6 +86,33 @@ impl Route {
             Self::Welcome {} => IconName::Check,
         }
     }
+    /// The sidebar's page groups, also what the command palette can open.
+    pub(crate) fn navigation() -> [Vec<Self>; 3] {
+        [
+            vec![
+                Self::Workspace {},
+                Self::Projects {},
+                Self::Conversations {},
+                Self::Activity {},
+            ],
+            vec![
+                Self::Documents {},
+                Self::Browser {},
+                Self::Downloads {},
+                Self::Schedules {},
+                Self::Extensions {},
+            ],
+            vec![
+                Self::Welcome {},
+                Self::Gateway {},
+                Self::Providers {},
+                Self::Messengers {},
+                Self::Joshua {},
+                Self::Prompts {},
+                Self::Security {},
+            ],
+        ]
+    }
     pub(crate) fn label(&self) -> &'static str {
         match self {
             Self::Workspace {} => "Workspace",
