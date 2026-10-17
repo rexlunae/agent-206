@@ -1,14 +1,19 @@
 //! Renderer-independent state, authority and command contracts.
 #![forbid(unsafe_code)]
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use uuid::Uuid;
 
 pub mod error;
 pub mod extension;
 pub mod ignore;
+pub mod tools;
 pub use error::{ErrorKind, ErrorReport};
 pub use ignore::Ignore;
+pub use tools::{
+    ApprovalDecision, ApprovalOutcome, ApprovalRequest, ToolBudget, ToolCall, ToolCallState,
+    ToolList, ToolOffer, ToolPermission, UnavailableTools,
+};
 
 pub type Id = Uuid;
 
@@ -315,6 +320,22 @@ pub struct Message {
     pub at: u64,
     #[serde(default)]
     pub backend: CodingBackend,
+    /// Tool calls an assistant message requested, with their outcomes.
+    #[serde(default)]
+    pub tool_calls: Vec<ToolCall>,
+}
+impl Message {
+    pub fn new(role: Role, text: String, at: u64, backend: CodingBackend) -> Self {
+        Self {
+            id: Id::new_v4(),
+            role,
+            text,
+            attachments: vec![],
+            at,
+            backend,
+            tool_calls: vec![],
+        }
+    }
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Usage {
@@ -334,7 +355,12 @@ pub struct Thread {
     pub grant: Grant,
     pub messages: Vec<Message>,
     pub state: RunState,
+    /// The latest model request alone: what the context window holds.
     pub usage: Option<Usage>,
+    /// Every model request of the latest run summed: what the run cost. A
+    /// count any request did not report makes its total unknown.
+    #[serde(default)]
+    pub run_usage: Option<Usage>,
     #[serde(default)]
     pub effort: Option<String>,
     #[serde(default)]
@@ -344,6 +370,14 @@ pub struct Thread {
     /// Why the most recent run failed, cleared when a new run starts.
     #[serde(default)]
     pub error: Option<ErrorReport>,
+    /// The user's per-tool permissions; a tool not listed is denied.
+    #[serde(default)]
+    pub tool_permissions: BTreeMap<String, ToolPermission>,
+    #[serde(default)]
+    pub tool_budget: ToolBudget,
+    /// Tool calls of the current run waiting for the user.
+    #[serde(default)]
+    pub approvals: Vec<ApprovalRequest>,
     /// The messenger chat this thread converses with, if any.
     #[serde(default)]
     pub chat: Option<Box<ChatBinding>>,
@@ -362,10 +396,14 @@ impl Thread {
             messages: vec![],
             state: RunState::Idle,
             usage: None,
+            run_usage: None,
             effort: None,
             backend: CodingBackend::Native,
             backend_activity: None,
             error: None,
+            tool_permissions: BTreeMap::new(),
+            tool_budget: ToolBudget::default(),
+            approvals: vec![],
             chat: None,
         }
     }
@@ -461,6 +499,7 @@ impl Snapshot {
                 thread.model = None;
                 thread.effort = None;
                 thread.usage = None;
+                thread.run_usage = None;
             }
             thread
                 .subagent_models
@@ -479,15 +518,40 @@ pub struct Event {
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum EventKind {
-    ThreadChanged { id: Id },
-    CatalogChanged { provider: Id },
+    ThreadChanged {
+        id: Id,
+    },
+    CatalogChanged {
+        provider: Id,
+    },
     DownloadChanged(Download),
     SettingsChanged,
-    BackendActivity { thread: Id, title: String },
-    ProjectChanged { id: Id },
-    MessengerChanged { name: String },
-    McpServerChanged { name: String },
-    ExtensionChanged { id: String },
+    BackendActivity {
+        thread: Id,
+        title: String,
+    },
+    ProjectChanged {
+        id: Id,
+    },
+    MessengerChanged {
+        name: String,
+    },
+    McpServerChanged {
+        name: String,
+    },
+    ExtensionChanged {
+        id: String,
+    },
+    /// A tool call is waiting for the user; the request is in the thread.
+    ApprovalRequested {
+        thread: Id,
+        approval: Id,
+    },
+    ApprovalResolved {
+        thread: Id,
+        approval: Id,
+        outcome: ApprovalOutcome,
+    },
 }
 
 /// A capability the vault broker issues to the gateway for one unlock, so the
@@ -562,6 +626,28 @@ pub enum Command {
     },
     CancelRun {
         thread: Id,
+    },
+    /// The tools this conversation could use and how each is permitted.
+    ListTools {
+        thread: Id,
+    },
+    /// Set (or with `None`, clear back to deny) one tool's permission.
+    SetToolPermission {
+        thread: Id,
+        tool: String,
+        permission: Option<ToolPermission>,
+    },
+    SetToolBudget {
+        thread: Id,
+        budget: ToolBudget,
+    },
+    /// Answer a pending approval. `digest` must be the one the user was
+    /// shown, so a decision applies only to that exact call.
+    ResolveApproval {
+        thread: Id,
+        approval: Id,
+        digest: String,
+        decision: ApprovalDecision,
     },
     CreateProject {
         name: String,
@@ -660,6 +746,10 @@ impl Command {
             Self::SetEffort { .. } => "set_effort",
             Self::Send { .. } => "send",
             Self::CancelRun { .. } => "cancel_run",
+            Self::ListTools { .. } => "list_tools",
+            Self::SetToolPermission { .. } => "set_tool_permission",
+            Self::SetToolBudget { .. } => "set_tool_budget",
+            Self::ResolveApproval { .. } => "resolve_approval",
             Self::CreateProject { .. } => "create_project",
             Self::CreateSubagent { .. } => "create_subagent",
             Self::Events { .. } => "events",
@@ -684,7 +774,7 @@ impl Command {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Reply {
     Snapshot(Box<Snapshot>),
-    Thread(Thread),
+    Thread(Box<Thread>),
     Project(Project),
     Catalog(Catalog),
     Events(Vec<Event>),
@@ -695,6 +785,7 @@ pub enum Reply {
     /// Wire-compatible with the earlier `Error { message }` variant.
     Error(ErrorReport),
     Gateway(GatewayInfo),
+    Tools(ToolList),
 }
 impl Reply {
     /// Separate a gateway-reported failure from a successful reply.
