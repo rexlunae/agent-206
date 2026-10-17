@@ -59,13 +59,16 @@ mod backend {
         }
     }
     pub(crate) async fn status() -> Result<SetupStatus, ErrorReport> {
-        let (_, pinned) = profile()?;
         // Report the gateway in use, not a file another client may have rewritten.
-        let active = TARGET.lock().ok().and_then(|target| target.clone());
+        let (active, pinned) = TARGET
+            .lock()
+            .ok()
+            .and_then(|target| target.clone())
+            .map_or((None, false), |(target, pinned)| (Some(target), pinned));
         let problem = SETUP_ERROR.lock().ok().and_then(|problem| problem.clone());
         Ok(SetupStatus {
-            pinned: pinned.is_some() && active.is_some(),
             active,
+            pinned,
             problem,
         })
     }
@@ -99,7 +102,7 @@ mod backend {
         }
         // The controller owns its own threads, so it is created here on the UI
         // thread rather than on the short-lived setup worker.
-        crate::connect(root, &target);
+        crate::connect(root, &target, false);
         Ok(())
     }
 }

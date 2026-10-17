@@ -40,8 +40,9 @@ pub fn configure(root: std::path::PathBuf, remote: Option<String>) {
     if let Ok(mut profile) = PROFILE.lock() {
         *profile = Some((root.clone(), remote.clone()));
     }
+    let pinned = remote.is_some();
     match a206_runtime::connection::resolve(&root, remote) {
-        Ok(Some(target)) => connect(root, &target),
+        Ok(Some(target)) => connect(root, &target, pinned),
         Ok(None) => {}
         Err(error) => {
             if let Ok(mut slot) = SETUP_ERROR.lock() {
@@ -51,11 +52,13 @@ pub fn configure(root: std::path::PathBuf, remote: Option<String>) {
         }
     }
 }
-/// The target `CLIENT` talks to, for the setup screen.
+/// The target `CLIENT` talks to, and whether it came from `--remote`, for the
+/// setup screen.
 #[cfg(not(target_arch = "wasm32"))]
-static TARGET: std::sync::Mutex<Option<a206_core::GatewayTarget>> = std::sync::Mutex::new(None);
+static TARGET: std::sync::Mutex<Option<(a206_core::GatewayTarget, bool)>> =
+    std::sync::Mutex::new(None);
 #[cfg(not(target_arch = "wasm32"))]
-fn connect(root: std::path::PathBuf, target: &a206_core::GatewayTarget) {
+fn connect(root: std::path::PathBuf, target: &a206_core::GatewayTarget, pinned: bool) {
     if let Ok(mut client) = CLIENT.lock() {
         *client = Some(a206_runtime::control::GatewayController::new(
             root,
@@ -63,7 +66,7 @@ fn connect(root: std::path::PathBuf, target: &a206_core::GatewayTarget) {
         ));
     }
     if let Ok(mut active) = TARGET.lock() {
-        *active = Some(target.clone());
+        *active = Some((target.clone(), pinned));
     }
 }
 /// True until this client has a gateway to talk to.
