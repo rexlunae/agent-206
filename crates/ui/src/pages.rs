@@ -198,7 +198,8 @@ pub fn Security() -> Element {
         Alert { title: rsx! { "Security implementation status" }, "Provider API keys are used only inside the separate vault broker, for the exact origins you bind them to. Adding and changing credentials and their policies, and removing two-factor authentication, still run from `agent206 vault`. The agent approval flow is not built yet, so agents still cannot use credentials and privileged extension imports remain unavailable." }
     } }
 }
-/// Vault setup talks to this computer's broker, so only native clients have it.
+/// Native clients run vault setup against their broker; the web client reads
+/// and locks the web server's vault through its bridge.
 #[component]
 fn VaultControls() -> Element {
     #[cfg(not(target_arch = "wasm32"))]
@@ -207,9 +208,7 @@ fn VaultControls() -> Element {
     }
     #[cfg(target_arch = "wasm32")]
     {
-        rsx! { Card { variant: CardVariant::Subtle, CardHeader { CardTitle { "Vault" } }
-            CardBody { p { "Unlock the vault and enroll two-factor authentication from the desktop or terminal app, or with `agent206 vault` on the gateway host. The browser never handles the vault password." } }
-        } }
+        rsx! { crate::web_vault::WebVault {} }
     }
 }
 #[component]

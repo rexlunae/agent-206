@@ -1073,6 +1073,36 @@ pub enum SetupReply {
     Error(ErrorReport),
 }
 
+/// The web client's view of the vault on the bridge's computer. Unlocking,
+/// creating and enrolling need the vault password or an enrollment key, which
+/// never pass through a browser, so only reading and locking are offered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VaultRequest {
+    Status,
+    Lock,
+}
+
+/// What the vault broker reports; `None` is unknown (locked, or an older broker).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VaultState {
+    pub exists: bool,
+    pub unlocked: bool,
+    pub totp_enrolled: Option<bool>,
+    pub agent_access: Option<bool>,
+    pub gateway_paired: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VaultReply {
+    /// The vault's state, after the request.
+    State(VaultState),
+    /// The bridge uses a remote gateway, whose vault lives on that host.
+    Remote {
+        endpoint: String,
+    },
+    Error(ErrorReport),
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -20,6 +20,8 @@ mod sign_in;
 use sign_in::SignOut;
 #[cfg(not(target_arch = "wasm32"))]
 mod vault;
+#[cfg(target_arch = "wasm32")]
+mod web_vault;
 use a206_core::{
     Command, ErrorKind, ErrorReport, GatewayAction, GatewayPhase, GatewayReport, Mode, Reply,
     Settings, Snapshot,
