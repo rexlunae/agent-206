@@ -250,6 +250,7 @@ fn Conversation(thread: Thread) -> Element {
             } }
             }
             for request in &thread.approvals { crate::tools::PendingApproval { key: "{request.id}", thread: id, request: request.clone() } }
+            for question in &thread.prompts { crate::prompts::PendingPrompt { key: "{question.id}", thread: id, question: question.clone() } }
             if running { AgentStatus { state: Lifecycle::Running, label: rsx! { {thread.backend_activity.clone().unwrap_or_else(|| format!("{} is working…", thread.backend.label()))} } } }
             if let Some(report) = thread.error.clone().filter(|_| !running && thread.state == RunState::Failed) {
                 crate::error::ErrorNotice { report, title: "Run failed".to_string() }

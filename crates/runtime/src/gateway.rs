@@ -154,6 +154,8 @@ pub enum GatewayError {
     #[error(transparent)]
     Skill(#[from] a206_skills::SkillError),
     #[error(transparent)]
+    Prompt(#[from] crate::prompt_tool::PromptError),
+    #[error(transparent)]
     Frame(#[from] transport::FrameError),
     #[error(transparent)]
     Run(#[from] run::RunError),
@@ -228,6 +230,7 @@ impl crate::error::Classified for GatewayError {
             Self::Extension(error) => return classify(error),
             Self::Mcp(error) => return classify(error),
             Self::Skill(error) => return classify(error),
+            Self::Prompt(error) => return classify(error),
             Self::Frame(error) => return classify(error),
             Self::Run(error) => return classify(error),
             // The cause's own kind (missing, denied, invalid data) is the useful one.
@@ -315,6 +318,8 @@ pub struct Gateway {
     tool_hosts: Arc<Vec<Arc<dyn crate::tools::ToolHost>>>,
     /// Runs waiting for the user, by approval ID. Only `ResolveApproval` answers them.
     approvals: Arc<Mutex<BTreeMap<Id, run::Waiter>>>,
+    /// Questions `ask_user` calls are waiting on. Only `AnswerPrompt` answers them.
+    prompts: Arc<crate::prompt_tool::Prompts>,
     /// Bumped whenever a tool permission, grant or mode changes, so running
     /// tool calls and approval waits re-check their authority at once.
     policy: Arc<tokio::sync::watch::Sender<u64>>,
@@ -366,6 +371,7 @@ impl Gateway {
         let extension_tools: Arc<dyn crate::tools::ToolHost> = Arc::new(
             crate::extension_tools::ExtensionToolHost::new(extensions.clone()),
         );
+        let prompts = Arc::new(crate::prompt_tool::Prompts::new(store.clone()));
         // Approved skills; each conversation still denies the tools until the
         // user permits them.
         let skill_tools: Arc<dyn crate::tools::ToolHost> =
@@ -387,9 +393,11 @@ impl Gateway {
             tool_hosts: Arc::new(vec![
                 extension_tools,
                 Arc::new(crate::exec_tool::ExecHost::new(root)),
+                Arc::new(crate::prompt_tool::PromptHost::new(prompts.clone())),
                 skill_tools,
             ]),
             approvals: Arc::new(Mutex::new(BTreeMap::new())),
+            prompts,
             policy: Arc::new(tokio::sync::watch::Sender::new(0)),
             pairings: tokio::sync::watch::Sender::new(0),
             messengers: tokio::sync::watch::Sender::new(desired),
@@ -1218,6 +1226,14 @@ impl Gateway {
                 digest,
                 decision,
             } => self.resolve_approval(thread, approval, &digest, decision),
+            Command::AnswerPrompt {
+                thread,
+                prompt,
+                answer,
+            } => {
+                self.prompts.answer(thread, prompt, answer)?;
+                Ok(Reply::Ok)
+            }
             Command::CancelRun { thread } => {
                 let running = self.running.lock().map_err(poisoned("run"))?;
                 let token = running
