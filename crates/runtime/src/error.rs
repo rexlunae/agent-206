@@ -247,7 +247,8 @@ impl Classified for a206_broker::ClientError {
             C::Io(_) | C::Closed => Some(ErrorKind::Unavailable),
             C::Protocol(_) | C::Stream(_) => Some(ErrorKind::Protocol),
             // The provider layer falls back before this can reach a client.
-            C::StreamUnsupported => Some(ErrorKind::Unavailable),
+            C::StreamUnsupported | C::SocketUnsupported => Some(ErrorKind::Unavailable),
+            C::SocketMessage => Some(ErrorKind::InvalidRequest),
             // `transparent` hides the reply from the chain, so classify it here.
             C::Broker(reply) => reply.kind(),
         }
