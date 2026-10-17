@@ -1560,3 +1560,63 @@ async fn calls_that_do_not_fit_in_storage_are_settled_and_the_run_goes_on() {
     // The conversation is still stored and readable.
     assert!(rig.gateway.snapshot().is_ok());
 }
+
+#[tokio::test]
+async fn a_message_is_admitted_only_with_room_for_its_reply() {
+    let api = ProviderApi::OpenAi;
+    let mut rig = rig(api, vec![], None).await;
+    let mut accepted = 0;
+    // Messages shrink after each refusal, so the conversation ends within a
+    // small message of the admission limit.
+    let mut size = 120 * 1024;
+    loop {
+        let before = rig.thread().messages.len();
+        let mut text = nonce();
+        text.push_str(&"c".repeat(size));
+        let gateway = rig.gateway.clone();
+        let thread = rig.thread;
+        let mut task = tokio::spawn(async move {
+            gateway
+                .request(a206_protocol::Request {
+                    id: Id::new_v4(),
+                    body: Command::Send {
+                        thread,
+                        text,
+                        attachments: vec![],
+                    },
+                })
+                .await
+                .body
+        });
+        // An accepted message reaches the provider; a refused one replies
+        // at once. Either way nothing waits on time.
+        tokio::select! {
+            request = rig.requests.recv() => {
+                let request = request.unwrap();
+                let reply = nonce();
+                request.respond(text_response(api, &reply)).await;
+                let thread = finished(task).await;
+                assert_eq!(thread.state, RunState::Complete, "{:?}", thread.error);
+                assert_eq!(thread.messages.last().unwrap().text, reply);
+                accepted += 1;
+            }
+            refused = &mut task => {
+                let refused = refused.unwrap();
+                assert!(
+                    matches!(refused, Reply::Error(ref r) if r.kind == ErrorKind::Storage),
+                    "{refused:?}"
+                );
+                // A refused message is not stored and the conversation is
+                // left as it was.
+                let thread = rig.thread();
+                assert_eq!(thread.messages.len(), before);
+                assert_eq!(thread.state, RunState::Complete);
+                if size < 1024 {
+                    break;
+                }
+                size /= 2;
+            }
+        }
+    }
+    assert!(accepted > 0);
+}

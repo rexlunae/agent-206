@@ -143,7 +143,7 @@ fn add_usage(total: Usage, round: &Usage) -> Usage {
 const SETTLEMENT: usize = 128 * 1024;
 /// Snapshot bytes that must be free to start a round: the longest reply the
 /// provider accepts, its metadata and the settlement of its calls.
-const NEXT_ROUND: usize = provider::MAX_REPLY_TEXT + SETTLEMENT;
+pub(super) const NEXT_ROUND: usize = provider::MAX_REPLY_TEXT + SETTLEMENT;
 /// Snapshot bytes a response's call arguments and outputs never use: the
 /// settlement of those calls, then the next round. Recording calls therefore
 /// never stops the run from storing the model's next reply.

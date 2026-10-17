@@ -17,6 +17,8 @@ use std::{
 use tokio::io::AsyncWriteExt;
 mod mcp_servers;
 mod run;
+/// Snapshot bytes a user message needs beyond its text and attachments.
+const MESSAGE_OVERHEAD: usize = 4096;
 pub use mcp_servers::{McpOffer, McpOffers};
 pub use run::{RunError, ToolError};
 
@@ -946,12 +948,13 @@ impl Gateway {
                 let token = tokio_util::sync::CancellationToken::new();
                 let (config, thread, prompt, info, backend, workspace, root) = {
                     let mut store = self.lock()?;
+                    // Admit the message only with room for it and for the
+                    // run's first round, which applies the same bound, so an
+                    // accepted message is never left without a reply for lack
+                    // of storage.
                     check(
-                        rmp_serde::to_vec_named(&store.state)?.len()
-                            + text.len()
-                            + attachment_size
-                            + 262_144
-                            < a206_protocol::MAX_FRAME,
+                        store.remaining()?
+                            >= text.len() + attachment_size + MESSAGE_OVERHEAD + run::NEXT_ROUND,
                         GatewayError::HistoryFull,
                     )?;
                     let current = store.thread(id)?;
