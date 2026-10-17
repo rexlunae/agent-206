@@ -218,6 +218,7 @@ impl Classified for a206_output_rules::RulesError {
             | Parse { .. }
             | MissingId { .. }
             | TooLong { .. }
+            | Summary { .. }
             | Pattern { .. }
             | Duplicate { .. }
             | TooMany => ErrorKind::InvalidRequest,

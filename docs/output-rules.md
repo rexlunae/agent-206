@@ -14,9 +14,9 @@ build logs and command output use less context. They are implemented in
 
    | Id | Applies to | What it does |
    | --- | --- | --- |
-   | `git.status` | `git status` | Drops `(use "git …")` hints and blank runs; keeps the branch and every path; counts modified and untracked paths |
+   | `git.status` | `git status` | Drops `(use "git …")` hints and blank runs; keeps the branch and every path |
    | `git.diff` | `git diff`, `git show` | Keeps the first 400 and last 100 lines of a longer diff |
-   | `cargo` | `cargo build/check/test/clippy/run/nextest` | Drops progress lines and passing tests; keeps warnings, errors, failures and results; counts them |
+   | `cargo` | `cargo build/check/test/clippy/nextest` (not `run`, whose program output stays as printed) | Drops progress lines and passing tests; keeps warnings, errors, failures and results; counts them |
    | `npm.install` | `npm`/`pnpm`/`yarn` `install`, `i`, `add`, `ci` | Drops spinners, progress and deprecation notices |
    | `ls` | `ls` | Keeps the first 300 and last 30 lines of a longer listing |
 
@@ -30,7 +30,7 @@ user's choice, not the repository's.
 
 Rules are read when a run starts, so an edited file applies from the next run.
 A file that cannot be read, is larger than 256 KiB, is not valid TOML, has an
-unknown key, a rule without an `id`, an id or counter name over 128 bytes, more than 16 counters, an invalid pattern, or an `id` used twice
+unknown key, a rule without an `id`, an id or counter name over 128 bytes, more than 16 counters, a `head` or `tail` over 100000 lines, an invalid pattern, or an `id` used twice
 across user files fails the run before the model is asked, with the file and
 the cause in the error. At most 256 user rules are loaded.
 
@@ -67,7 +67,7 @@ trim_empty_edges = true     # drop blank lines at the start and end
 head = 200
 tail = 50
 
-[[rule.counters]]           # counted over the lines kept
+[[rule.counters]]           # counted over the lines the model is shown
 name = "errors"
 pattern = '^.*error'
 flags = "i"                 # i, m, s or x
@@ -79,7 +79,7 @@ Patterns are Rust `regex` syntax, which runs in linear time. A rule with no
 The program a rule matches is found in the call's `command` argument: the last
 command of a `;`, `&&` or `||` list, the first command of a pipeline, without
 leading `NAME=value` assignments or `env`, `time`, `command`, `exec`, `nice` or
-`nohup`, and without its directory. Quotes are honoured; nothing is expanded.
+`nohup` (with their options), and without its directory. Quotes are honoured; nothing is expanded.
 So `cd crate && RUST_LOG=debug cargo test 2>&1 | tail` matches as
 `cargo test 2>&1`.
 

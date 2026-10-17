@@ -13,6 +13,8 @@ const MAX_PATTERN_SIZE: usize = 1 << 20;
 pub const MAX_NAME: usize = 128;
 /// Most counters one rule keeps.
 pub const MAX_COUNTERS: usize = 16;
+/// Most lines `head` or `tail` keeps.
+pub const MAX_SUMMARY: usize = 100_000;
 
 /// Where a rule came from. User rules win ties.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -51,6 +53,11 @@ pub enum RulesError {
         path.display()
     )]
     TooLong { path: PathBuf },
+    #[error(
+        "output rule `{id}` in {} keeps too many lines: `head` and `tail` are each at most {MAX_SUMMARY}",
+        path.display()
+    )]
+    Summary { path: PathBuf, id: String },
     #[error("output rule `{id}` in {} has an invalid pattern", path.display())]
     Pattern {
         path: PathBuf,
@@ -281,6 +288,12 @@ pub(crate) fn parse(
                     .any(|counter| counter.name.len() > MAX_NAME)
             {
                 return Err(RulesError::TooLong { path: path() });
+            }
+            if rule.summarize.head > MAX_SUMMARY || rule.summarize.tail > MAX_SUMMARY {
+                return Err(RulesError::Summary {
+                    path: path(),
+                    id: rule.id,
+                });
             }
             let invalid = |source| RulesError::Pattern {
                 path: path(),

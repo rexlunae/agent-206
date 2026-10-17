@@ -21,12 +21,6 @@ skip = [
 strip_ansi = true
 fold_blank_runs = true
 trim_empty_edges = true
-[[rule.counters]]
-name = "modified"
-pattern = '^\s*modified:'
-[[rule.counters]]
-name = "untracked"
-pattern = '^\?\? '
 
 [[rule]]
 id = "git.diff"
@@ -45,12 +39,13 @@ tail = 100
 [[rule]]
 id = "cargo"
 family = "cargo"
+# Not `cargo run`: the program's own output must reach the model as printed.
 description = "Drop cargo progress and passing tests; keep warnings, errors, failures and results."
 priority = 80
 [rule.match]
 tools = ["execute_command"]
 argv0 = ["cargo"]
-argv_any = [["build"], ["check"], ["test"], ["clippy"], ["run"], ["nextest"]]
+argv_any = [["build"], ["check"], ["test"], ["clippy"], ["nextest"]]
 [rule.filters]
 skip = [
     '^\s*Compiling ',

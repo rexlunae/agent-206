@@ -1,8 +1,19 @@
 //! Finding the program a shell command line runs, only to choose a rule.
 //! Nothing here runs or rewrites the command.
 
-/// Wrappers that run the next word as the program.
-const WRAPPERS: [&str; 6] = ["env", "time", "command", "exec", "nice", "nohup"];
+/// Wrappers that run a later word as the program, with their options that
+/// take the next word as a value.
+const WRAPPERS: [(&str, &[&str]); 6] = [
+    (
+        "env",
+        &["-u", "--unset", "-C", "--chdir", "-S", "--split-string"],
+    ),
+    ("time", &["-o", "--output", "-f", "--format"]),
+    ("command", &[]),
+    ("exec", &["-a"]),
+    ("nice", &["-n", "--adjustment"]),
+    ("nohup", &[]),
+];
 /// Git options that take the next word as their value.
 const GIT_VALUE_OPTIONS: [&str; 5] = ["-C", "-c", "--git-dir", "--work-tree", "--namespace"];
 
@@ -71,11 +82,30 @@ pub fn program(line: &str) -> Vec<String> {
         .rev()
         .find(|command| !command.is_empty())
         .unwrap_or_default();
-    let skip = argv
-        .iter()
-        .take_while(|word| assignment(word) || WRAPPERS.contains(&word.as_str()))
-        .count();
-    argv.drain(..skip);
+    let mut skip = 0;
+    while let Some(word) = argv.get(skip) {
+        if assignment(word) {
+            skip += 1;
+        } else if let Some((_, valued)) = WRAPPERS.iter().find(|(name, _)| name == word) {
+            skip += 1;
+            // The wrapper's options, up to `--` or the first other word.
+            while let Some(option) = argv.get(skip).filter(|word| word.starts_with('-')) {
+                skip += if option == "--" {
+                    1
+                } else if valued.contains(&option.as_str()) {
+                    2
+                } else {
+                    1
+                };
+                if option == "--" {
+                    break;
+                }
+            }
+        } else {
+            break;
+        }
+    }
+    argv.drain(..skip.min(argv.len()));
     if let Some(first) = argv.first_mut()
         && let Some((_, name)) = first.rsplit_once('/')
         && !name.is_empty()

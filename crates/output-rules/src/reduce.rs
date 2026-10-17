@@ -36,30 +36,39 @@ pub(crate) fn reduce(rule: &Compiled, output: &str) -> Option<(String, Vec<Count
             .map_or(start, |at| at + 1);
         lines = lines[start..end].to_vec();
     }
+    let (head, tail) = (rule.summarize.head, rule.summarize.tail);
+    // Rule files bound both, so the sum cannot overflow; saturate anyway.
+    let summarized = (head > 0 || tail > 0) && head.saturating_add(tail) < lines.len();
+    let (shown, left_out) = if summarized {
+        let left_out = lines.len() - head - tail;
+        let mut shown = lines[..head].to_vec();
+        shown.extend_from_slice(&lines[head + left_out..]);
+        (shown, left_out)
+    } else {
+        (lines, 0)
+    };
+    // Counted over what the model is shown.
     let counts = rule
         .counters
         .iter()
         .map(|(name, pattern)| Count {
             name: name.clone(),
-            count: lines.iter().filter(|line| pattern.is_match(line)).count(),
+            count: shown.iter().filter(|line| pattern.is_match(line)).count(),
         })
         .collect::<Vec<_>>();
-    let kept = lines.len();
-    let (head, tail) = (rule.summarize.head, rule.summarize.tail);
-    let summarized = (head > 0 || tail > 0) && head + tail < kept;
     let mut reduced = if summarized {
-        let marker = format!("… [{} lines left out]", kept - head - tail);
-        let mut out = lines[..head].to_vec();
+        let marker = format!("… [{left_out} lines left out]");
+        let mut out = shown[..head].to_vec();
         out.push(&marker);
-        out.extend_from_slice(&lines[kept - tail..]);
+        out.extend_from_slice(&shown[head..]);
         out.join("\n")
     } else {
-        lines.join("\n")
+        shown.join("\n")
     };
     if reduced == output || Some(reduced.as_str()) == output.strip_suffix('\n') {
         return None;
     }
-    let shown = if summarized { head + tail } else { kept };
+    let shown = shown.len();
     reduced.push_str(&format!(
         "\n[output rule `{}` kept {shown} of {total} lines{}]",
         rule.id,

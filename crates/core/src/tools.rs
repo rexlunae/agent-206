@@ -133,7 +133,7 @@ pub struct OutputReduction {
     pub user_rule: bool,
     /// The size of the result before the rule applied.
     pub original_bytes: u64,
-    /// The rule's named counts over the lines it kept.
+    /// The rule's named counts over the lines the model is shown.
     #[serde(default)]
     pub counts: Vec<OutputCount>,
 }

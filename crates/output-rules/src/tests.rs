@@ -52,17 +52,18 @@ fn git_status_drops_hints_and_keeps_the_branch_and_paths() {
     assert!(reduced.text.contains(&format!("?? {branch}.txt")));
     assert!(!reduced.text.contains("(use \"git"));
     assert!(!reduced.text.contains("\n\n\n"));
-    let counts: Vec<_> = reduced
-        .counts
-        .iter()
-        .map(|c| (c.name.as_str(), c.count))
-        .collect();
-    assert_eq!(counts, [("modified", 1), ("untracked", 1)]);
+    assert!(reduced.counts.is_empty());
     assert!(
         reduced
             .text
-            .ends_with("[output rule `git.status` kept 5 of 8 lines; modified: 1; untracked: 1]")
+            .ends_with("[output rule `git.status` kept 5 of 8 lines]")
     );
+}
+
+#[test]
+fn cargo_run_output_reaches_the_model_as_printed() {
+    let output = format!("test {} ... ok\n   Compiling x\n", word());
+    assert_eq!(Rules::builtin().reduce(&run("cargo run", &output)), None);
 }
 
 #[test]
@@ -119,6 +120,11 @@ fn programs_are_found_in_lists_pipelines_and_wrappers() {
     assert_eq!(program("time ls &> out"), ["ls", "&>", "out"]);
     assert_eq!(program("echo '&& git status'"), ["echo", "&& git status"]);
     assert!(program("  ").is_empty());
+    // Wrapper options, and the values some of them take, are not the program.
+    assert_eq!(program("env -i -u HOME A=1 cargo test"), ["cargo", "test"]);
+    assert_eq!(program("nice -n 5 time -p git status"), ["git", "status"]);
+    assert_eq!(program("env -- ls"), ["ls"]);
+    assert!(program("env -u").is_empty());
     let git = |line: &str| command::git_subcommand(&super::program(line)).map(str::to_owned);
     assert_eq!(
         git("git -C dir -c a=b --no-pager diff --stat").as_deref(),
@@ -175,6 +181,24 @@ tail = 1
             "{}\n{}\n… [3 lines left out]\n{}\n[output rule `long` kept 3 of 6 lines]",
             lines[0], lines[1], lines[5]
         )
+    );
+    // Counters count only what the model is shown.
+    let counted = user(&[&format!(
+        "[[rule]]\nid = \"c\"\n[rule.summarize]\nhead = 1\ntail = 1\n[[rule.counters]]\nname = \"hits\"\npattern = '^{}'\n",
+        lines[2]
+    )])
+    .unwrap()
+    .reduce(&Input {
+        tool: "x",
+        command: None,
+        output: &output,
+    })
+    .unwrap();
+    assert_eq!(counted.counts[0].count, 0);
+    assert!(
+        counted.text.ends_with("kept 2 of 6 lines; hits: 0]"),
+        "{}",
+        counted.text
     );
     // Short output is untouched.
     let short = lines[..3].join("\n");
@@ -249,6 +273,17 @@ fn invalid_rule_files_are_refused_with_their_cause() {
             ..
         }
     ));
+    for (head, tail) in [(MAX_SUMMARY + 1, 0), (0, usize::MAX)] {
+        let summary = user(&[&format!(
+            "[[rule]]\nid = \"{id}\"\n[rule.summarize]\nhead = {head}\ntail = {tail}\n"
+        )])
+        .unwrap_err();
+        assert!(
+            matches!(&summary, RulesError::Summary { id: found, .. } if *found == id),
+            "{summary:?}"
+        );
+    }
+    assert!(user(&[&format!("[[rule]]\nid = \"{id}\"\n[rule.summarize]\nhead = {MAX_SUMMARY}\ntail = {MAX_SUMMARY}\n")]).is_ok());
     let missing = user(&["[[rule]]\nid = \" \"\n"]).unwrap_err();
     assert!(matches!(missing, RulesError::MissingId { .. }));
     let long = |id: String, counters: usize, name: usize| {

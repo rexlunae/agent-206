@@ -22,7 +22,7 @@ mod reduce;
 mod rule;
 
 pub use command::program;
-pub use rule::{MAX_COUNTERS, MAX_NAME, Origin, PatternError, RulesError};
+pub use rule::{MAX_COUNTERS, MAX_NAME, MAX_SUMMARY, Origin, PatternError, RulesError};
 
 /// Largest rule file read, in bytes.
 pub const MAX_RULE_FILE: u64 = 256 * 1024;
@@ -48,7 +48,7 @@ pub struct Reduced {
     /// The id of the rule that applied.
     pub rule: String,
     pub origin: Origin,
-    /// The rule's counters over the lines it kept, in rule order.
+    /// The rule's counters over the lines the model is shown, in rule order.
     pub counts: Vec<Count>,
 }
 
