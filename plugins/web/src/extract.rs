@@ -25,6 +25,8 @@ pub const BUDGET: u64 = 36_000_000;
 const BYTE_COST: u64 = 150;
 const TAG_COST: u64 = 4_500;
 const LINK_COST: u64 = 14_000;
+/// Further fuel for resolving a page-relative link's path.
+const RELATIVE_COST: u64 = 20_000;
 const REFERENCE_COST: u64 = 1_500;
 const WORD_COST: u64 = 600;
 /// Most text read between two checks of the budget.
@@ -73,12 +75,12 @@ fn block(name: &str) -> bool {
 /// Longest tag name compared; every name this module knows is shorter.
 const MAX_NAME: usize = 12;
 
-/// The readable text of `html`, fetched from `base` (used to make relative
-/// links absolute).
-pub fn extract(html: &str, base: &str, format: Format, budget: u64) -> Page {
+/// The readable text of `html`. Relative links are made absolute against
+/// `base`, the page's address; without one, only absolute links are kept.
+pub fn extract(html: &str, base: Option<&str>, format: Format, budget: u64) -> Page {
     let mut state = State {
         format,
-        origin: origin(base),
+        base: base.and_then(|base| origin(base).map(|origin| (origin, base))),
         all: Out::default(),
         main: Out::default(),
         main_depth: 0,
@@ -172,7 +174,8 @@ pub fn extract(html: &str, base: &str, format: Format, budget: u64) -> Page {
 
 struct State<'a> {
     format: Format,
-    origin: Option<&'a str>,
+    /// The page's origin (`scheme://host`) and its whole address.
+    base: Option<(&'a str, &'a str)>,
     all: Out,
     /// Text inside `<main>` or `<article>`, which wins when there is any.
     main: Out,
@@ -264,7 +267,11 @@ impl State<'_> {
             }
             _ => "",
         };
-        let (attributes, end) = tag_end(html, name_start + name_len);
+        let Some((attributes, end)) = tag_end(html, name_start + name_len) else {
+            // The tag never ends: none of it is page text, and its partial
+            // attributes are not worth reading.
+            return html.len();
+        };
         if closing {
             self.close(name);
             return end;
@@ -278,6 +285,11 @@ impl State<'_> {
             if !self_closing {
                 self.dropped.push(name.to_string());
             }
+            return end;
+        }
+        if !self.dropped.is_empty() {
+            // Inside dropped content nothing else is opened, so its links,
+            // lists and `<title>` (as in an `<svg>`) leave the page alone.
             return end;
         }
         if name == "title" {
@@ -431,7 +443,7 @@ impl State<'_> {
 
     /// `href` as an absolute `http(s)` URL, or `None` for anything else
     /// (scripts, mail, fragments, or a relative link without a base).
-    fn absolute(&self, href: &str) -> Option<String> {
+    fn absolute(&mut self, href: &str) -> Option<String> {
         let href = href.trim();
         if href.starts_with("https://") || href.starts_with("http://") {
             return Some(href.to_string());
@@ -439,27 +451,45 @@ impl State<'_> {
         if let Some(rest) = href.strip_prefix("//") {
             return Some(["https://", rest].concat());
         }
-        if href.starts_with('/') {
-            return self.origin.map(|origin| [origin, href].concat());
+        let scheme = href
+            .find(':')
+            .is_some_and(|colon| !href[..colon].contains(['/', '?', '#']));
+        if href.is_empty() || href.starts_with('#') || scheme {
+            return None;
         }
-        None
+        let (origin, base) = self.base?;
+        self.work += RELATIVE_COST;
+        if href.starts_with('/') {
+            return Some([origin, &remove_dots(href)].concat());
+        }
+        let after = &base[origin.len()..];
+        let path = &after[..after.find(['?', '#']).unwrap_or(after.len())];
+        if href.starts_with('?') {
+            let path = if path.is_empty() { "/" } else { path };
+            return Some([origin, path, href].concat());
+        }
+        let directory = path.rfind('/').map_or("/", |slash| &path[..=slash]);
+        Some([origin, &remove_dots(&[directory, href].concat())].concat())
     }
 }
 
 /// The attributes text of a tag and where it ends, honouring quotes so a
-/// `>` inside a value does not end it.
-fn tag_end(html: &str, from: usize) -> (&str, usize) {
-    let mut quote = None;
-    for (offset, byte) in html.as_bytes()[from..].iter().enumerate() {
-        match (quote, byte) {
-            (Some(q), b) if *b == q => quote = None,
-            (Some(_), _) => {}
-            (None, b'"' | b'\'') => quote = Some(*byte),
-            (None, b'>') => return (&html[from..from + offset], from + offset + 1),
-            (None, _) => {}
+/// `>` inside a value does not end it; `None` when nothing ends it.
+fn tag_end(html: &str, from: usize) -> Option<(&str, usize)> {
+    let bytes = html.as_bytes();
+    let mut at = from;
+    // Jumps between the bytes that matter, which the interpreter does far
+    // more cheaply than stepping through every byte with a quote state.
+    loop {
+        at += bytes[at..]
+            .iter()
+            .position(|&byte| matches!(byte, b'>' | b'"' | b'\''))?;
+        let byte = bytes[at];
+        if byte == b'>' {
+            return Some((&html[from..at], at + 1));
         }
+        at += 1 + bytes[at + 1..].iter().position(|&next| next == byte)? + 1;
     }
-    (&html[from..], html.len())
 }
 
 /// Where the raw text of `name` opened at `from` ends: past `</name`'s `>`.
@@ -469,9 +499,15 @@ fn raw_end(html: &str, from: usize, name: &str) -> usize {
     // A search for one byte is far cheaper in the interpreter than for "</".
     while let Some(found) = html[at..].find('<') {
         let start = at + found + 1;
-        let candidate = bytes.get(start + 1..start + 1 + name.len());
+        let after = start + 1 + name.len();
+        let candidate = bytes.get(start + 1..after);
+        // `</scripture>` does not close a script: the name must end there.
+        let ends = bytes
+            .get(after)
+            .is_none_or(|&byte| byte == b'>' || byte == b'/' || byte.is_ascii_whitespace());
         if bytes.get(start) == Some(&b'/')
             && candidate.is_some_and(|tag| tag.eq_ignore_ascii_case(name.as_bytes()))
+            && ends
         {
             return html[start..]
                 .find('>')
@@ -543,6 +579,32 @@ fn origin(url: &str) -> Option<&str> {
         .find(['/', '?', '#'])
         .map_or(url.len(), |end| after + end);
     url.starts_with("http").then(|| &url[..end])
+}
+
+/// An absolute path (with any query or fragment) with its `.` and `..`
+/// segments resolved, as a browser does.
+fn remove_dots(path: &str) -> String {
+    let (path, tail) = path.split_at(path.find(['?', '#']).unwrap_or(path.len()));
+    let parts: Vec<&str> = path.split('/').skip(1).collect();
+    let mut kept: Vec<&str> = Vec::with_capacity(parts.len());
+    for (index, part) in parts.iter().enumerate() {
+        let last = index + 1 == parts.len();
+        match *part {
+            "." => {}
+            ".." => {
+                kept.pop();
+            }
+            part => {
+                kept.push(part);
+                continue;
+            }
+        }
+        // `a/.` and `a/..` name a directory, so they keep a final slash.
+        if last {
+            kept.push("");
+        }
+    }
+    ["/", &kept.join("/"), tail].concat()
 }
 
 /// Text with its character references decoded. Unknown names stay as they
@@ -715,7 +777,7 @@ mod tests {
     const BASE: &str = "https://site.example/docs/page?x=1";
 
     fn markdown(html: &str) -> String {
-        extract(html, BASE, Format::Markdown, BUDGET).text
+        extract(html, Some(BASE), Format::Markdown, BUDGET).text
     }
 
     #[test]
@@ -726,7 +788,7 @@ mod tests {
 <body><header><a href="/">Home</a></header><nav><ul><li>Menu</li></ul></nav>
 <main><h1>Heading</h1><p>First <b>bold</b> line.</p><!-- hidden --><p>Second</p></main>
 <aside>Ads</aside><footer>Copyright</footer><form><button>Go</button></form></body></html>"#;
-        let page = extract(html, BASE, Format::Markdown, BUDGET);
+        let page = extract(html, Some(BASE), Format::Markdown, BUDGET);
         assert_eq!(page.title.as_deref(), Some("The Title"));
         assert_eq!(page.description.as_deref(), Some("About & more"));
         assert_eq!(page.text, "# Heading\n\nFirst bold line.\n\nSecond");
@@ -744,11 +806,12 @@ mod tests {
         assert_eq!(
             markdown(html),
             "## Title\n\n- a\n- b\n\n  1. c\n  2. d\n\n\
-See [the other](https://site.example/other), [x](https://x.example/y), no and rel.\n\n\
+See [the other](https://site.example/other), [x](https://x.example/y), no and \
+[rel](https://site.example/docs/rel).\n\n\
 Use `cargo`:\n\n```\nfn  main() {\n    x();\n}\n```\n\n---\n\nafter\nline"
         );
         assert_eq!(
-            extract(html, BASE, Format::Text, BUDGET).text,
+            extract(html, Some(BASE), Format::Text, BUDGET).text,
             "Title\n\n- a\n- b\n\n  1. c\n  2. d\n\n\
 See the other, x, no and rel.\n\nUse cargo:\n\nfn  main() {\n    x();\n}\n\nafter\nline"
         );
@@ -782,9 +845,9 @@ See the other, x, no and rel.\n\nUse cargo:\n\nfn  main() {\n    x();\n}\n\nafte
     #[test]
     fn a_spent_budget_cuts_the_page_between_words() {
         let html = "<p>one two three four five six seven eight nine ten</p>";
-        let whole = extract(html, BASE, Format::Text, BUDGET);
+        let whole = extract(html, Some(BASE), Format::Text, BUDGET);
         assert!(!whole.cut);
-        let cut = extract(html, BASE, Format::Text, TAG_COST + 20 * BYTE_COST);
+        let cut = extract(html, Some(BASE), Format::Text, TAG_COST + 20 * BYTE_COST);
         assert!(cut.cut);
         assert!(
             !cut.text.is_empty()
@@ -793,6 +856,71 @@ See the other, x, no and rel.\n\nUse cargo:\n\nfn  main() {\n    x();\n}\n\nafte
             "{cut:?}"
         );
         assert!(!cut.text.ends_with(' '));
-        assert!(extract(html, BASE, Format::Text, 0).cut);
+        assert!(extract(html, Some(BASE), Format::Text, 0).cut);
+    }
+
+    #[test]
+    fn relative_links_resolve_against_the_page_and_need_its_address() {
+        let link = |href: &str, base: Option<&str>| {
+            extract(
+                &format!("<a href=\"{href}\">t</a>"),
+                base,
+                Format::Markdown,
+                BUDGET,
+            )
+            .text
+        };
+        for (href, expected) in [
+            ("chapter.html", "https://site.example/docs/chapter.html"),
+            ("./a/../b?c=1#d", "https://site.example/docs/b?c=1#d"),
+            ("../../../up", "https://site.example/up"),
+            ("..", "https://site.example/"),
+            ("?page=2", "https://site.example/docs/page?page=2"),
+            ("/x/./y/..", "https://site.example/x/"),
+        ] {
+            assert_eq!(link(href, Some(BASE)), format!("[t]({expected})"), "{href}");
+        }
+        assert_eq!(
+            link("?q", Some("https://site.example")),
+            "[t](https://site.example/?q)"
+        );
+        for href in ["#top", "mailto:a@site.example", "", "data:text/plain,x"] {
+            assert_eq!(link(href, Some(BASE)), "t", "{href}");
+        }
+        // Without the page's address (after a redirect), a relative link
+        // cannot be resolved correctly, so only its text is kept.
+        assert_eq!(link("/x", None), "t");
+        assert_eq!(link("https://x.example/", None), "[t](https://x.example/)");
+    }
+
+    #[test]
+    fn dropped_content_changes_nothing_around_it() {
+        let html = "<p>intro</p><nav><a href=\"/menu\">Menu</a><main>x</main><ul><li>m</li>\
+<pre>p</pre><svg><title>icon</title></svg></nav><p><a href=\"/article\">Article</a></p>\
+<title>Real</title>";
+        let page = extract(html, Some(BASE), Format::Markdown, BUDGET);
+        assert_eq!(
+            page.text,
+            "intro\n\n[Article](https://site.example/article)"
+        );
+        assert_eq!(page.title.as_deref(), Some("Real"));
+        assert_eq!(
+            extract("<TITLE>News</TITLE >", None, Format::Text, BUDGET)
+                .title
+                .as_deref(),
+            Some("News")
+        );
+    }
+
+    #[test]
+    fn raw_text_ends_only_at_its_own_closing_tag() {
+        assert_eq!(
+            markdown("<script>a(); </scripture>hidden()</script><p>Article</p>"),
+            "Article"
+        );
+        assert_eq!(
+            markdown("<style></styles>b{}</style/>shown<script></script"),
+            "shown"
+        );
     }
 }

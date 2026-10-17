@@ -280,6 +280,11 @@ pub struct FetchResponse {
     pub body: ByteBuf,
     /// The body was cut at the host's bound.
     pub truncated: bool,
+    /// A redirect was followed, so the response is from another address
+    /// (which, like the request's, is never returned). Absent from older
+    /// hosts.
+    #[serde(default)]
+    pub redirected: bool,
 }
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SearchResult {

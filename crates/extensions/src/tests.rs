@@ -418,6 +418,7 @@ fn web_tool_reports_status_type_and_text() {
             content_type: Some("text/plain".into()),
             body: body.clone().into(),
             truncated: true,
+            redirected: false,
         })
     });
     let invocation = tool("fetch_url", &[("url", Value::Str(format!("{url}#part")))]);
@@ -448,6 +449,7 @@ fn web_tool_keeps_text_cut_mid_character() {
             content_type: None,
             body: body.clone().into(),
             truncated: true,
+            redirected: false,
         })
     });
     let invocation = tool(
@@ -1010,6 +1012,13 @@ fn patch_tool_refuses_a_malformed_diff_without_a_host_call() {
 }
 
 fn web_page(body: Vec<u8>, content_type: &str) -> impl FnMut(&HostRequest) -> HostReply + 'static {
+    redirected_page(body, content_type, false)
+}
+fn redirected_page(
+    body: Vec<u8>,
+    content_type: &str,
+    redirected: bool,
+) -> impl FnMut(&HostRequest) -> HostReply + 'static {
     let content_type = content_type.to_string();
     move |_| {
         HostReply::Fetched(FetchResponse {
@@ -1017,6 +1026,7 @@ fn web_page(body: Vec<u8>, content_type: &str) -> impl FnMut(&HostRequest) -> Ho
             content_type: Some(content_type.clone()),
             body: body.clone().into(),
             truncated: false,
+            redirected,
         })
     }
 }
@@ -1071,6 +1081,55 @@ fn page_reader_returns_readable_markdown_and_metadata() {
         "\n\n{words}\n[the response continues; it was cut at a limit]"
     )));
 
+    // A limit that falls inside the first character shows no text, but the
+    // page is not called unreadable.
+    let (bridge, _) = mock(web_page("é".repeat(4).into_bytes(), "text/plain"));
+    let invocation = tool(
+        "read_web_page",
+        &[
+            ("url", Value::Str("https://a.example/".into())),
+            ("max_bytes", Value::Int(1)),
+        ],
+    );
+    let (outcome, _) = engine::run(builtin.wasm, &invocation, Limits::default(), bridge);
+    let Ok(Outcome::Tool(output)) = outcome else {
+        panic!("expected tool output, got {outcome:?}");
+    };
+    assert!(
+        output
+            .text
+            .ends_with("\n\n\n[the response continues; it was cut at a limit]"),
+        "{}",
+        output.text
+    );
+
+    // After a redirect the page's own address is unknown, so relative links
+    // keep only their text; absolute ones are still links.
+    let (path, other) = (unique("path"), format!("https://{}.example/", unique("o")));
+    let html = format!("<p><a href=\"/{path}\">rel</a> <a href=\"{other}\">abs</a></p>");
+    for (redirected, expected) in [
+        (
+            false,
+            format!("[rel](https://a.example/{path}) [abs]({other})"),
+        ),
+        (true, format!("rel [abs]({other})")),
+    ] {
+        let (bridge, _) = mock(redirected_page(
+            html.clone().into_bytes(),
+            "text/html",
+            redirected,
+        ));
+        let invocation = tool(
+            "read_web_page",
+            &[("url", Value::Str("https://a.example/".into()))],
+        );
+        let (outcome, _) = engine::run(builtin.wasm, &invocation, Limits::default(), bridge);
+        let Ok(Outcome::Tool(output)) = outcome else {
+            panic!("expected tool output, got {outcome:?}");
+        };
+        assert!(output.text.ends_with(&expected), "{}", output.text);
+    }
+
     let (bridge, seen) = mock(web_page(Vec::new(), "text/html"));
     let invocation = tool(
         "read_web_page",
@@ -1109,6 +1168,8 @@ fn page_reader_reads_the_largest_page_within_its_fuel() {
         ),
         repeat("<span>x</span>"),
         repeat("<a href=\"/x\">y</a>"),
+        repeat("<a href=\"../a/./b/../c?d\">y</a>"),
+        repeat("<nav><a href=\"/x\"><ul><li>y</li></ul></a></nav>"),
         repeat("plain words of text here and there "),
         repeat("a&amp;b &lt; "),
         repeat("<p></p>"),

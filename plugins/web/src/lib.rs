@@ -73,7 +73,10 @@ fn read_web_page(url: &str, args: &Args) -> Result<ToolOutput, GuestError> {
         .as_deref()
         .is_none_or(|kind| kind.to_ascii_lowercase().contains("html"));
     let (content, page_title, description, cut_source) = if html {
-        let page = extract::extract(body, url, format, extract::BUDGET);
+        // After a redirect the page's address is not known (the host never
+        // returns it), so relative links cannot be resolved.
+        let base = (!response.redirected).then_some(url);
+        let page = extract::extract(body, base, format, extract::BUDGET);
         (page.text, page.title, page.description, page.cut)
     } else {
         (body.to_string(), None, None, false)
@@ -86,11 +89,10 @@ fn read_web_page(url: &str, args: &Args) -> Result<ToolOutput, GuestError> {
         }
     }
     text.push_str("\n\n");
-    let shown = prefix(&content, max);
-    text.push_str(if shown.is_empty() {
+    text.push_str(if content.is_empty() {
         "[the page has no readable text]"
     } else {
-        shown
+        prefix(&content, max)
     });
     if content.len() > max || cut_source || response.truncated {
         text.push_str(CUT);
