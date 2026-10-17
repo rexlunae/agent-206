@@ -1020,14 +1020,8 @@ impl Gateway {
                     thread.parent.is_none(),
                     GatewayError::Denied("delegated threads cannot change backend grants"),
                 )?;
-                let supported: BTreeSet<_> = [
-                    Capability::ReadWorkspace,
-                    Capability::WriteWorkspace,
-                    Capability::Execute,
-                ]
-                .into();
                 check(
-                    capabilities.is_subset(&supported)
+                    capabilities.iter().all(|c| backend.grantable().contains(c))
                         && capabilities.is_subset(&thread.mode.ceiling()),
                     GatewayError::Denied("backend capability is unavailable in this mode"),
                 )?;
@@ -1037,7 +1031,14 @@ impl Gateway {
                     GatewayError::Invalid("write access also requires read access"),
                 )?;
                 check(
-                    capabilities.is_empty() || thread.project.is_some(),
+                    !capabilities.contains(&Capability::GitWrite)
+                        || capabilities.contains(&Capability::GitRead),
+                    GatewayError::Invalid("changing git history also requires reading it"),
+                )?;
+                // Only the network reaches beyond the project.
+                check(
+                    capabilities.iter().all(|c| *c == Capability::Network)
+                        || thread.project.is_some(),
                     GatewayError::Invalid("associate a project before granting workspace tools"),
                 )?;
                 if backend != CodingBackend::Native {
