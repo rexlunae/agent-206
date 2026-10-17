@@ -19,6 +19,8 @@ use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio_util::sync::CancellationToken;
 use zeroize::Zeroizing;
 
+mod socket;
+
 const MAX_NAME: usize = 256;
 const MAX_DESTINATIONS: usize = 16;
 
@@ -118,9 +120,18 @@ struct Outbound {
     stream: bool,
 }
 
+/// A socket session to open: the credential is attached for `url`'s origin.
+struct SocketOut {
+    url: url::Url,
+    scheme: SocketScheme,
+    token: Zeroizing<String>,
+    cancel: CancellationToken,
+}
+
 enum Outcome {
     Reply(Reply),
     Send(Box<Outbound>),
+    Socket(Box<SocketOut>),
 }
 
 type Handled = Result<Outcome, BrokerError>;
@@ -284,12 +295,20 @@ fn handle(shared: &Shared, session: &mut Session, request: Request) -> Handled {
         (_, Request::Status)
         | (
             Role::Gateway,
-            Request::GatewayAuth { .. } | Request::Provider(_) | Request::ProviderStream(_),
+            Request::GatewayAuth { .. }
+            | Request::Provider(_)
+            | Request::ProviderStream(_)
+            | Request::SocketOpen(_)
+            | Request::SocketSend { .. },
         ) => {}
         (Role::Gateway, _)
         | (
             Role::User,
-            Request::GatewayAuth { .. } | Request::Provider(_) | Request::ProviderStream(_),
+            Request::GatewayAuth { .. }
+            | Request::Provider(_)
+            | Request::ProviderStream(_)
+            | Request::SocketOpen(_)
+            | Request::SocketSend { .. },
         ) => {
             return Err(BrokerError::Forbidden);
         }
@@ -678,12 +697,19 @@ fn handle(shared: &Shared, session: &mut Session, request: Request) -> Handled {
         }
         Request::Provider(call) => provider(shared, session, call, false),
         Request::ProviderStream(call) => provider(shared, session, call, true),
+        Request::SocketOpen(call) => socket(shared, session, call),
+        // A connection carrying a socket never reaches here with one.
+        Request::SocketSend { .. } => Err(BrokerError::Invalid(InvalidRequest::NoSocket)),
     }
 }
 
-/// Validate a provider call and attach its credential for the exact origin.
-fn provider(shared: &Shared, session: &Session, call: ProviderCall, stream: bool) -> Handled {
-    // Unpaired callers learn nothing, not even whether a URL is valid.
+/// The unlocked vault, still held, and the epoch, once this connection is
+/// shown to hold the current pairing. Unpaired callers learn nothing else,
+/// not even whether a URL is valid.
+fn paired<'a>(
+    shared: &'a Shared,
+    session: &Session,
+) -> Result<(MutexGuard<'a, Vault>, u64), BrokerError> {
     let vault = shared.vault();
     if vault.is_locked() {
         return Err(BrokerError::Locked);
@@ -698,12 +724,45 @@ fn provider(shared: &Shared, session: &Session, call: ProviderCall, stream: bool
     if current.is_none() || session.paired != current {
         return Err(BrokerError::GatewayNotPaired);
     }
-    let url = url::Url::parse(&call.url)
-        .map_err(|_| BrokerError::Invalid(InvalidRequest::ProviderUrl))?;
+    Ok((vault, epoch))
+}
+
+/// An HTTPS (or loopback HTTP) URL without credentials or a fragment.
+fn request_url(url: &str) -> Result<url::Url, BrokerError> {
+    let url =
+        url::Url::parse(url).map_err(|_| BrokerError::Invalid(InvalidRequest::ProviderUrl))?;
     allowed_scheme(&url)?;
     if url.fragment().is_some() {
         return Err(BrokerError::Invalid(InvalidRequest::ProviderUrl));
     }
+    Ok(url)
+}
+
+/// Validate a socket call and take its credential for the exact origin.
+fn socket(shared: &Shared, session: &Session, call: SocketCall) -> Handled {
+    let (vault, epoch) = paired(shared, session)?;
+    let url = request_url(&call.url)?;
+    let origin = url.origin().ascii_serialization();
+    // Read with the pairing check, so a later lock, replacement or void
+    // always ends this session.
+    let cancel = shared.in_flight(epoch);
+    let token = vault
+        .use_for_destination(&call.credential, &origin, |s| {
+            Zeroizing::new(s.expose(str::to_owned))
+        })
+        .map_err(vault_error)?;
+    Ok(Outcome::Socket(Box::new(SocketOut {
+        url,
+        scheme: call.scheme,
+        token,
+        cancel,
+    })))
+}
+
+/// Validate a provider call and attach its credential for the exact origin.
+fn provider(shared: &Shared, session: &Session, call: ProviderCall, stream: bool) -> Handled {
+    let (vault, epoch) = paired(shared, session)?;
+    let url = request_url(&call.url)?;
     if call
         .body
         .as_ref()
@@ -719,13 +778,14 @@ fn provider(shared: &Shared, session: &Session, call: ProviderCall, stream: bool
         .use_for_destination(&call.credential, &origin, |s| {
             Zeroizing::new(match call.auth {
                 AuthScheme::Bearer => format!("Bearer {}", s.expose(str::to_owned)),
+                AuthScheme::DiscordBot => format!("Bot {}", s.expose(str::to_owned)),
                 _ => s.expose(str::to_owned),
             })
         })
         .map_err(vault_error)?;
     drop(vault);
     let (url, header) = match call.auth {
-        AuthScheme::Bearer => (url, Some(("authorization", value))),
+        AuthScheme::Bearer | AuthScheme::DiscordBot => (url, Some(("authorization", value))),
         AuthScheme::ApiKeyHeader => (url, Some(("x-api-key", value))),
         AuthScheme::GoogleApiKey => (url, Some(("x-goog-api-key", value))),
         AuthScheme::TelegramBot => (telegram_url(url, &value)?, None),
@@ -1063,6 +1123,11 @@ async fn session(
                 return Ok(());
             }
             Ok(Outcome::Send(out)) => send(shared, *out).await.unwrap_or_else(Reply::Error),
+            Ok(Outcome::Socket(out)) => {
+                // The session is the rest of this connection.
+                socket::tunnel(shared, *out, request.id, &mut writer, &mut inbox).await?;
+                return Ok(());
+            }
             Err(error) => {
                 tracing::info!(
                     error = &error as &dyn std::error::Error,

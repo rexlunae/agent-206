@@ -48,13 +48,16 @@ pub enum MessengerKind {
     Telegram,
     /// Matrix client-server API on the user's homeserver, polled with `/sync`.
     Matrix,
+    /// Discord bot: events over the Gateway WebSocket, answers with the REST API.
+    Discord,
 }
 impl MessengerKind {
-    pub const ALL: [Self; 2] = [Self::Telegram, Self::Matrix];
+    pub const ALL: [Self; 3] = [Self::Telegram, Self::Matrix, Self::Discord];
     pub fn label(self) -> &'static str {
         match self {
             Self::Telegram => "Telegram",
             Self::Matrix => "Matrix",
+            Self::Discord => "Discord",
         }
     }
     /// The service's official API endpoint, used unless an entry names
@@ -63,6 +66,7 @@ impl MessengerKind {
         match self {
             Self::Telegram => Some("https://api.telegram.org"),
             Self::Matrix => None,
+            Self::Discord => Some("https://discord.com"),
         }
     }
     /// How the user obtains the token the vault stores for this kind.
@@ -73,6 +77,9 @@ impl MessengerKind {
             }
             Self::Matrix => {
                 "Sign the bot account in to your homeserver and store its access token in the vault, bound to the homeserver origin"
+            }
+            Self::Discord => {
+                "Create a bot in the Discord developer portal, turn on its Message Content intent, and store its token in the vault, bound to the API origin"
             }
         }
     }
