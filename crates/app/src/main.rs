@@ -162,6 +162,12 @@ mod native {
         RefreshModels {
             provider: uuid::Uuid,
         },
+        /// Find messages containing every word of QUERY, newest first.
+        Search {
+            query: String,
+            #[arg(long, default_value_t = 20)]
+            limit: u32,
+        },
         Project {
             name: String,
             root: PathBuf,
@@ -1028,6 +1034,7 @@ mod native {
                         }
                     }
                     Action::RefreshModels { provider } => Command::RefreshCatalog { provider },
+                    Action::Search { query, limit } => Command::SearchMessages { query, limit },
                     Action::Project { name, root } => Command::CreateProject {
                         name,
                         root: root.to_string_lossy().into_owned(),
@@ -1079,6 +1086,13 @@ mod native {
                     Reply::Text(text) => println!("{text}"),
                     Reply::Panel(view) => println!("{}", crate::extension_cli::render(&view)),
                     Reply::Ok => println!("OK"),
+                    Reply::Messages(hits) => {
+                        #[derive(serde::Serialize)]
+                        struct Hits {
+                            hits: Vec<a206_core::MessageHit>,
+                        }
+                        print!("{}", toml::to_string_pretty(&Hits { hits })?);
+                    }
                     reply => println!("{}", toml::to_string_pretty(&reply)?),
                 }
                 Ok(())

@@ -10,6 +10,7 @@ mod messengers;
 mod pages;
 mod prompts;
 mod route;
+mod search;
 mod settings;
 mod skills;
 mod tools;

@@ -20,6 +20,7 @@ mod run;
 /// Snapshot bytes a user message needs beyond its text and attachments.
 const MESSAGE_OVERHEAD: usize = 4096;
 mod messengers;
+pub(crate) use mcp_servers::McpClient;
 pub use mcp_servers::{McpOffer, McpOffers};
 pub use run::{RunError, ToolError};
 mod delegation;
@@ -158,6 +159,8 @@ pub enum GatewayError {
     #[error(transparent)]
     Prompt(#[from] crate::prompt_tool::PromptError),
     #[error(transparent)]
+    Search(#[from] a206_core::SearchError),
+    #[error(transparent)]
     Frame(#[from] transport::FrameError),
     #[error(transparent)]
     Run(#[from] run::RunError),
@@ -202,7 +205,7 @@ impl crate::error::Classified for GatewayError {
     fn kind(&self) -> Option<ErrorKind> {
         use crate::error::classify;
         Some(match self {
-            Self::Invalid(_) | Self::DownloadUrl(_) => ErrorKind::InvalidRequest,
+            Self::Invalid(_) | Self::DownloadUrl(_) | Self::Search(_) => ErrorKind::InvalidRequest,
             Self::NotFound(_) => ErrorKind::NotFound,
             Self::Conflict(_) => ErrorKind::Conflict,
             Self::Denied(_) => ErrorKind::PermissionDenied,
@@ -331,7 +334,7 @@ pub struct Gateway {
     messengers: tokio::sync::watch::Sender<Vec<crate::messengers::Desired>>,
     /// Messengers the user disconnected; they connect again only on request.
     messengers_stopped: Arc<Mutex<BTreeSet<String>>>,
-    mcp: Arc<mcp_servers::McpServers>,
+    mcp: McpClient,
     /// This gateway's subagent tools and the hosts their subagents run with.
     delegation: delegation::Binding,
     /// Runs the subagent tools reserved before starting them, by subagent.
@@ -395,6 +398,11 @@ impl Gateway {
         // Proposing grants nothing; installing a proposal is a user operation.
         let propose_tools: Arc<dyn crate::tools::ToolHost> =
             Arc::new(crate::propose_tool::ProposeHost::new(extensions.clone()));
+        // So are tools of enabled MCP servers the conversation may use. The
+        // host holds only the MCP client, not this gateway.
+        let mcp = McpClient::new(store.clone());
+        let mcp_tools: Arc<dyn crate::tools::ToolHost> =
+            Arc::new(crate::mcp_tools::McpToolHost::new(mcp.clone()));
         let prompts = Arc::new(crate::prompt_tool::Prompts::new(store.clone()));
         // Approved skills; each conversation still denies the tools until the
         // user permits them.
@@ -416,6 +424,7 @@ impl Gateway {
             paired: Arc::new(tokio::sync::Notify::new()),
             tool_hosts: Arc::new(vec![
                 extension_tools,
+                mcp_tools,
                 Arc::new(crate::exec_tool::ExecHost::new(root)),
                 Arc::new(crate::prompt_tool::PromptHost::new(prompts.clone())),
                 skill_tools,
@@ -427,7 +436,7 @@ impl Gateway {
             pairings: tokio::sync::watch::Sender::new(0),
             messengers: tokio::sync::watch::Sender::new(desired),
             messengers_stopped: Arc::new(Mutex::new(BTreeSet::new())),
-            mcp: Arc::default(),
+            mcp,
             delegation: Default::default(),
             reserved: Arc::default(),
         };
@@ -573,6 +582,8 @@ impl Gateway {
                 | Command::Skills
                 | Command::ReadSkill { .. }
                 | Command::ListTools { .. }
+                // Read-only; its reply copies message text.
+                | Command::SearchMessages { .. }
                 // Never journal a pairing: request bodies are persisted.
                 | Command::PairBroker { .. }
         );
@@ -1241,6 +1252,14 @@ impl Gateway {
                 store.persist(Some(EventKind::ThreadChanged { id }))?;
                 Ok(Reply::Thread(Box::new(thread)))
             }
+            Command::SearchMessages { query, limit } => {
+                let store = self.store.lock().map_err(poisoned("store"))?;
+                Ok(Reply::Messages(a206_core::search::search(
+                    &store.state.threads,
+                    &query,
+                    limit,
+                )?))
+            }
             Command::ListTools { thread } => self.list_tools(thread).await,
             Command::SetToolPermission {
                 thread,
@@ -1569,16 +1588,7 @@ impl Gateway {
         &self.extensions
     }
     fn project_root(&self, id: Id) -> Result<PathBuf> {
-        Ok(self
-            .lock()?
-            .state
-            .projects
-            .iter()
-            .find(|p| p.id == id)
-            .ok_or(GatewayError::NotFound("project not found"))?
-            .root
-            .clone()
-            .into())
+        project_root(&*self.lock()?, id)
     }
     async fn start_download(
         &self,
@@ -1899,6 +1909,19 @@ fn validate_effort(
     Ok(())
 }
 
+/// The root directory of project `id`.
+fn project_root(store: &Store, id: Id) -> Result<PathBuf> {
+    Ok(store
+        .state
+        .projects
+        .iter()
+        .find(|p| p.id == id)
+        .ok_or(GatewayError::NotFound("project not found"))?
+        .root
+        .clone()
+        .into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1925,6 +1948,63 @@ mod tests {
             .unwrap();
         assert!(crate::service::is_stopped(directory.path()));
         assert!(worker.await.unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn message_search_reads_live_state_and_refuses_empty_queries() {
+        let directory = tempfile::tempdir().unwrap();
+        let gateway = Gateway::open(directory.path()).unwrap();
+        let term = Id::new_v4().simple().to_string();
+        let add = |at| {
+            let mut store = gateway.lock().unwrap();
+            let mut thread = Thread::new(Id::new_v4().to_string(), Mode::Chat);
+            thread.messages.push(a206_core::Message::new(
+                a206_core::Role::Assistant,
+                format!("{} {term}", Id::new_v4()),
+                at,
+                thread.backend,
+            ));
+            store.state.threads.push(thread);
+            store.persist(None).unwrap();
+        };
+        add(1);
+        let id = Id::new_v4();
+        let search = || {
+            gateway.request(Request {
+                id,
+                body: Command::SearchMessages {
+                    query: term.to_uppercase(),
+                    limit: a206_core::search::MAX_HITS,
+                },
+            })
+        };
+        let Reply::Messages(first) = search().await.body else {
+            panic!("search failed");
+        };
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].matched, term);
+        // Searches are not journaled: the same request ID sees new messages.
+        add(2);
+        let Reply::Messages(second) = search().await.body else {
+            panic!("search failed");
+        };
+        assert_eq!(second.iter().map(|hit| hit.at).collect::<Vec<_>>(), [2, 1]);
+        let request = Id::new_v4();
+        let reply = gateway
+            .request(Request {
+                id: request,
+                body: Command::SearchMessages {
+                    query: " ".into(),
+                    limit: 1,
+                },
+            })
+            .await
+            .body;
+        assert!(
+            matches!(reply, Reply::Error(ref report)
+                if report.kind == ErrorKind::InvalidRequest && report.correlation == Some(request)),
+            "{reply:?}"
+        );
     }
 
     #[tokio::test]

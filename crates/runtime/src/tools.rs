@@ -8,12 +8,11 @@
 //! cannot widen its own authority or approve a call; the subagent tools hold
 //! only a [`Delegator`](crate::gateway::Delegator), which cannot either.
 //!
-//! The WASM extension adapter (`crate::extension_tools`), native command
-//! execution (`crate::exec_tool`), approved skills (`crate::skill_tool`) and
-//! subagents (`crate::delegation_tool`) are registered by default, with
-//! `ask_user` (`crate::prompt_tool`) and `extension_propose`
-//! (`crate::propose_tool`); the MCP client (`mcp_offers` / `call_mcp_tool`)
-//! is planned.
+//! The WASM extension adapter (`crate::extension_tools`), the MCP client
+//! adapter (`crate::mcp_tools`), native command execution
+//! (`crate::exec_tool`), approved skills (`crate::skill_tool`) and subagents
+//! (`crate::delegation_tool`) are registered by default, with `ask_user`
+//! (`crate::prompt_tool`) and `extension_propose` (`crate::propose_tool`).
 use a206_core::{
     Capability, ErrorKind, ErrorReport, Id, Thread, ToolList, ToolOffer, ToolPermission,
     UnavailableTools,
@@ -50,6 +49,10 @@ pub struct ToolSpec {
     /// The host's own policy, for example a user-configured MCP server entry.
     /// The gateway never enforces anything less restrictive than this.
     pub permission: ToolPermission,
+    /// The output is only useful whole (an instruction text, a listing the
+    /// model acts on): a result that does not fit is settled as a failed call
+    /// rather than cut short.
+    pub whole_output: bool,
 }
 
 /// The authority a call runs under.
@@ -286,6 +289,7 @@ mod tests {
             parameters: serde_json::json!({"type": "object"}),
             capabilities: caps.iter().copied().collect(),
             permission,
+            whole_output: false,
         }
     }
     #[test]

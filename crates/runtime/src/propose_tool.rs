@@ -95,6 +95,7 @@ impl ProposeHost {
             }),
             capabilities: [Capability::ReadWorkspace].into(),
             permission: ToolPermission::Allow,
+            whole_output: false,
         }
     }
     async fn propose(

@@ -13,6 +13,7 @@ pub mod extension_tools;
 pub mod gateway;
 pub mod joshua;
 pub mod mcp;
+pub mod mcp_tools;
 pub mod messengers;
 pub mod network;
 pub mod process;
