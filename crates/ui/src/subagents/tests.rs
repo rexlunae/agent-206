@@ -82,15 +82,22 @@ fn a_cycle_in_parent_links_ends_instead_of_recursing() {
 }
 
 #[test]
-fn a_long_chain_of_delegations_is_shown_to_its_end() {
+fn a_long_chain_shows_its_first_levels_and_continues_from_the_last() {
     let root = thread(None, RunState::Idle);
     let mut chain = vec![root.clone()];
-    for _ in 0..12 {
+    for _ in 0..1_000 {
         let parent = chain.last().map(|t| t.id);
         chain.push(thread(parent, RunState::Idle));
     }
-    let html = render(chain.clone(), root.id);
-    for t in &chain[1..] {
-        assert!(html.contains(&format!("/conversations/{}", t.id)), "{html}");
+    let linked = |html: &str, t: &Thread| html.contains(&format!("/conversations/{}", t.id));
+    // From any conversation, the next LEVELS levels are shown, the last of
+    // them marked as having more; opening it shows the following ones.
+    for start in [0, LEVELS, chain.len() - 2] {
+        let html = render(chain.clone(), chain[start].id);
+        let shown = &chain[start + 1..chain.len().min(start + 1 + LEVELS)];
+        assert!(shown.iter().all(|t| linked(&html, t)), "{html}");
+        let rest = &chain[(start + 1 + LEVELS).min(chain.len())..];
+        assert!(rest.iter().all(|t| !linked(&html, t)));
+        assert_eq!(html.contains("More subagents inside"), !rest.is_empty());
     }
 }

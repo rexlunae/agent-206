@@ -6,6 +6,10 @@ use fc_dioxus::prelude::*;
 use std::collections::BTreeSet;
 use uuid::Uuid;
 
+/// Levels nested in one view. Deeper subagents are not dropped: the last
+/// level shown says it has more, and opening it shows the next levels.
+const LEVELS: usize = 6;
+
 fn state(state: &RunState) -> (BadgeTone, &'static str) {
     match state {
         RunState::Idle => (BadgeTone::Neutral, "Idle"),
@@ -47,15 +51,15 @@ pub(crate) fn Subagents(thread: Uuid) -> Element {
         if below.is_empty() {
             p { class: "a206-muted", "No subagents yet." }
         } else {
-            NavList { Branch { threads: below, seen: BTreeSet::from([thread]) } }
+            NavList { Branch { threads: below, level: 1, seen: BTreeSet::from([thread]) } }
         }
     } }
 }
 
+/// `seen` holds this branch's ancestors, so a cycle in malformed parent
+/// links ends instead of recursing.
 #[component]
-/// Every descendant is shown, however deep; `seen` holds this branch's
-/// ancestors, so a cycle in malformed parent links ends instead of recursing.
-fn Branch(threads: Vec<Thread>, seen: BTreeSet<Uuid>) -> Element {
+fn Branch(threads: Vec<Thread>, level: usize, seen: BTreeSet<Uuid>) -> Element {
     let state = use_context::<State>();
     rsx! {
         for thread in threads.into_iter().filter(|t| !seen.contains(&t.id)) {
@@ -63,9 +67,11 @@ fn Branch(threads: Vec<Thread>, seen: BTreeSet<Uuid>) -> Element {
               let (tone, label) = self::state(&thread.state);
               let mut seen = seen.clone();
               seen.insert(thread.id);
+              let more = !below.is_empty() && level >= LEVELS;
               rsx! { NavLink { key: "{thread.id}", label: thread.title.clone(), href: Route::Chat { id: thread.id, split: None, message: None }.to_string(),
-                  meta: rsx! { Badge { tone, "{label}" } " " Badge { tone: BadgeTone::Accent, "{thread.mode.label()}" } },
-                  nested: (!below.is_empty()).then(|| rsx! { NavList { nested: true, Branch { threads: below, seen } } }),
+                  meta: rsx! { Badge { tone, "{label}" } " " Badge { tone: BadgeTone::Accent, "{thread.mode.label()}" }
+                      if more { " " Badge { "More subagents inside" } } },
+                  nested: (!below.is_empty() && !more).then(|| rsx! { NavList { nested: true, Branch { threads: below, level: level + 1, seen } } }),
               } }
             }
         }
