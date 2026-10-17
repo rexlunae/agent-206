@@ -911,3 +911,100 @@ fn memory_save_creates_a_note_through_write_calls() {
         ]
     );
 }
+
+#[test]
+fn patch_tool_sends_parsed_files_and_reports_what_was_written() {
+    let (path, old, new) = (unique("src/f"), unique("old"), unique("new"));
+    let diff = format!("--- a/{path}\n+++ b/{path}\n@@ -2 +2 @@\n-{old}\n+{new}\n");
+    let run = |reply: HostReply, check_only: bool| {
+        let (bridge, seen) = mock(move |_| reply.clone());
+        let (outcome, _) = engine::run(
+            workspace().wasm,
+            &tool(
+                "apply_patch",
+                &[
+                    ("patch", Value::Str(diff.clone())),
+                    ("check_only", Value::Bool(check_only)),
+                ],
+            ),
+            Limits::default(),
+            bridge,
+        );
+        (outcome, seen.take())
+    };
+    let expected = |check_only| {
+        vec![HostRequest::PatchFiles {
+            files: vec![FilePatch {
+                path: path.clone(),
+                change: FileChange::Modify,
+                hunks: vec![Hunk {
+                    old_start: 2,
+                    lines: vec![
+                        PatchLine::Remove(format!("{old}\n")),
+                        PatchLine::Add(format!("{new}\n")),
+                    ],
+                }],
+            }],
+            check_only,
+        }]
+    };
+
+    let written = PatchResult {
+        changed: vec![path.clone()],
+        failed: None,
+    };
+    let (outcome, seen) = run(HostReply::Patched(written), false);
+    let Ok(Outcome::Tool(output)) = outcome else {
+        panic!("expected tool output, got {outcome:?}");
+    };
+    assert_eq!(output.text, format!("changed {path} (1 hunk)"));
+    assert_eq!(seen, expected(false));
+
+    let (outcome, seen) = run(HostReply::Patched(PatchResult::default()), true);
+    let Ok(Outcome::Tool(output)) = outcome else {
+        panic!("expected tool output, got {outcome:?}");
+    };
+    assert!(output.text.contains("would") && output.text.contains(&path));
+    assert_eq!(seen, expected(true));
+
+    // A write that fails after another succeeded names both, so a partial
+    // patch is never reported as none or as all.
+    let (earlier, message) = (unique("earlier"), unique("message"));
+    let partial = PatchResult {
+        changed: vec![earlier.clone()],
+        failed: Some(PatchFailure {
+            path: path.clone(),
+            failure: HostFailure {
+                code: HostErrorCode::Io,
+                message: message.clone(),
+            },
+        }),
+    };
+    let (outcome, _) = run(HostReply::Patched(partial), false);
+    let Ok(Outcome::Failed(error)) = outcome else {
+        panic!("expected a failure, got {outcome:?}");
+    };
+    assert_eq!(error.code, HostErrorCode::Io.as_str());
+    for part in [&path, &earlier, &message] {
+        assert!(error.message.contains(part.as_str()), "{}", error.message);
+    }
+}
+
+#[test]
+fn patch_tool_refuses_a_malformed_diff_without_a_host_call() {
+    let (bridge, seen) = mock(|_| HostReply::Done);
+    let (outcome, _) = engine::run(
+        workspace().wasm,
+        &tool(
+            "apply_patch",
+            &[("patch", Value::Str(unique("not a diff")))],
+        ),
+        Limits::default(),
+        bridge,
+    );
+    let Ok(Outcome::Failed(error)) = outcome else {
+        panic!("expected a failure, got {outcome:?}");
+    };
+    assert_eq!(error.code, "invalid_patch");
+    assert!(seen.borrow().is_empty());
+}

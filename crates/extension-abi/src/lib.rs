@@ -205,6 +205,16 @@ pub enum HostRequest {
     },
     /// Create a directory and any missing parents.
     CreateDirectory { path: String },
+    /// Apply line-based changes to UTF-8 files: every file is checked
+    /// before any is written, and with `check_only` none is. The reply is
+    /// [`HostReply::Patched`]; a file that cannot be patched or written is
+    /// named in [`PatchResult::failed`]. A request refused as a whole (no
+    /// files, too many, or an invalid or repeated path) is
+    /// [`HostReply::Failed`].
+    PatchFiles {
+        files: Vec<FilePatch>,
+        check_only: bool,
+    },
     /// The branch, `HEAD` and changed paths of the workspace's repository.
     GitStatus,
     /// The most recent commits reachable from `HEAD`, newest first.
@@ -247,6 +257,7 @@ pub enum HostReply {
     Diff(GitDiff),
     /// The commit a [`HostRequest::GitCommit`] made.
     Committed(GitCommit),
+    Patched(PatchResult),
     Fetched(FetchResponse),
     State(Option<ByteBuf>),
     Done,
@@ -288,6 +299,56 @@ pub struct FoundEntry {
     /// Workspace-relative, `/`-separated.
     pub path: String,
     pub kind: EntryKind,
+}
+/// One file's part of a [`HostRequest::PatchFiles`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FilePatch {
+    /// Workspace-relative, `/`-separated; at most once per request.
+    pub path: String,
+    pub change: FileChange,
+    /// Applied in order; they may not overlap.
+    pub hunks: Vec<Hunk>,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileChange {
+    /// The file must not exist; the hunks apply to an empty file.
+    Create,
+    Modify,
+    /// The hunks must remove everything, and the file is deleted.
+    Delete,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Hunk {
+    /// 1-based line where the hunk's old lines start, or 0 when unknown.
+    /// The host applies the hunk where its old lines match nearest to it,
+    /// and refuses a hunk without a position whose old lines match twice.
+    pub old_start: u32,
+    pub lines: Vec<PatchLine>,
+}
+/// A hunk line. Its text ends with `\n` unless it is a file's last line
+/// without one. Old lines match a file's line regardless of `\r\n` or a
+/// missing final newline; added lines take the file's line ending.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PatchLine {
+    Context(String),
+    Remove(String),
+    Add(String),
+}
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PatchResult {
+    /// Files written, in request order; none with `check_only`.
+    pub changed: Vec<String>,
+    /// The file that could not be patched or written. Files not in
+    /// `changed` were left as they were; `changed` is empty unless a write
+    /// failed after other files were already written.
+    pub failed: Option<PatchFailure>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PatchFailure {
+    pub path: String,
+    pub failure: HostFailure,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SearchMatch {

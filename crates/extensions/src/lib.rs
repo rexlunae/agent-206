@@ -24,9 +24,10 @@ pub fn required_capability(request: &abi::HostRequest) -> Option<Capability> {
         | R::Search { .. }
         | R::SearchPattern { .. }
         | R::Find { .. } => Some(Capability::ReadWorkspace),
-        R::WriteFile { .. } | R::EditFile { .. } | R::CreateDirectory { .. } => {
-            Some(Capability::WriteWorkspace)
-        }
+        R::WriteFile { .. }
+        | R::EditFile { .. }
+        | R::CreateDirectory { .. }
+        | R::PatchFiles { .. } => Some(Capability::WriteWorkspace),
         R::GitStatus | R::GitLog { .. } | R::GitDiff { .. } => Some(Capability::GitRead),
         R::GitCommit { .. } => Some(Capability::GitWrite),
         R::Fetch { .. } => Some(Capability::Network),
