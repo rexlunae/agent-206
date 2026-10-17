@@ -155,6 +155,9 @@ impl Store {
             // conversation, after it.
             let mut steered = std::mem::take(&mut thread.steering);
             thread.messages.append(&mut steered);
+            // Nor does a pause, which held a run.
+            thread.paused = false;
+            thread.held = false;
             for call in thread.messages.iter_mut().flat_map(|m| &mut m.tool_calls) {
                 if !call.state.is_final() {
                     let report = a206_core::ErrorReport::new(
@@ -474,7 +477,7 @@ mod tests {
         assert_eq!(restored.state.settings.revision, 1);
     }
     #[test]
-    fn restart_keeps_messages_steered_to_an_interrupted_run_after_it() {
+    fn restart_keeps_messages_steered_to_an_interrupted_run_after_it_and_lifts_its_pause() {
         use a206_core::{CodingBackend, Message, Mode, Role, Thread};
         let directory = tempfile::tempdir().unwrap();
         let mut store = Store::open(directory.path()).unwrap();
@@ -485,6 +488,7 @@ mod tests {
         let steered = message(Id::new_v4().to_string());
         thread.messages.push(earlier.clone());
         thread.steering.push(steered.clone());
+        (thread.paused, thread.held) = (true, true);
         let id = thread.id;
         store.state.threads.push(thread);
         store.persist(None).unwrap();
@@ -494,6 +498,7 @@ mod tests {
         assert_eq!(thread.state, RunState::Failed);
         assert!(thread.steering.is_empty());
         assert_eq!(thread.messages, vec![earlier, steered]);
+        assert!(!thread.paused && !thread.held);
     }
     #[test]
     fn restart_expires_approvals_and_questions_and_cancels_unfinished_tool_calls() {
@@ -515,6 +520,7 @@ mod tests {
             output: None,
             error: None,
             signature: None,
+            reduction: None,
         };
         message.tool_calls = vec![
             call(ToolCallState::AwaitingApproval),

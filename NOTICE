@@ -16,7 +16,9 @@ extension's BM25 search with heading/20-line section chunking, its word
 tokenization and the `MEMORY.md` + `memory/` file scope of `memory_search`,
 `memory_get` and note saving (`memory.rs`, `tools/memory_tools.rs`;
 plugins/memory), and the key names and escape sequences of background
-process keystrokes (`process_manager.rs` `translate_keys`) are adapted from
+process keystrokes (`process_manager.rs` `translate_keys`), and the tool-output
+rule model and shipped rules (`crates/tokenjuice`; crates/output-rules) are
+adapted from
 RustyClaw,
 https://github.com/rexlunae/RustyClaw,
 Copyright (c) 2026 Erica Stith, MIT License (included in LICENSE).

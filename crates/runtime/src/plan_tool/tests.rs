@@ -79,6 +79,7 @@ fn update(state: ToolCallState) -> Message {
         output: None,
         error: None,
         signature: None,
+        reduction: None,
     });
     message
 }
