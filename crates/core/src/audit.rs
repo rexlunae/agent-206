@@ -87,7 +87,7 @@ impl AuditField {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct AuditFinding {
     pub rule: AuditRule,
     pub location: AuditLocation,
@@ -105,15 +105,45 @@ impl AuditReport {
     pub fn is_clean(&self) -> bool {
         self.findings.is_empty() && self.more == 0
     }
-    /// Add a finding unless it repeats one already recorded.
+    /// Add a distinct finding: keep it while under the cap, else count it.
+    /// Callers deduplicate, since a counted finding is no longer here to
+    /// compare against.
     pub fn push(&mut self, finding: AuditFinding) {
-        if self.findings.contains(&finding) {
-            return;
-        }
         if self.findings.len() < MAX_AUDIT_FINDINGS {
             self.findings.push(finding);
         } else {
             self.more = self.more.saturating_add(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The CLI prints reports as TOML, so every location must serialize.
+    #[test]
+    fn a_report_with_findings_serializes_as_toml() {
+        #[derive(Serialize)]
+        struct Listing {
+            audit: AuditReport,
+        }
+        let item = format!("tool{}", MAX_AUDIT_FINDINGS + 1);
+        let mut audit = AuditReport::default();
+        audit.push(AuditFinding {
+            rule: AuditRule::RemoteScript,
+            location: AuditLocation::Line(7),
+        });
+        audit.push(AuditFinding {
+            rule: AuditRule::HiddenText,
+            location: AuditLocation::Field {
+                item: Some(item.clone()),
+                field: AuditField::ToolDescription,
+            },
+        });
+        let text = toml::to_string_pretty(&Listing { audit }).unwrap();
+        assert!(text.contains("line = 7"), "{text}");
+        assert!(text.contains(&item), "{text}");
+        assert!(text.contains("tool_description"), "{text}");
     }
 }
