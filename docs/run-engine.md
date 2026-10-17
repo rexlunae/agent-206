@@ -220,6 +220,40 @@ Tests: `crates/runtime/src/extension_tools/tests.rs` (listing, naming,
 conversion, checks before the worker) and `crates/runtime/tests/extension_tools.rs`
 (native runs through the real worker; the test binary doubles as the worker).
 
+### Subagents
+
+`crate::delegation_tool` offers `subagent_spawn`, `subagent_send`,
+`subagent_list`, `subagent_status`, `subagent_wait` and `subagent_cancel`
+(RustyClaw's `sessions_spawn/send/list/history/kill`). They are listed only to
+conversations the user gave subagent models, and, like every tool, are denied
+until the user permits them on that conversation.
+
+- A subagent is an ordinary delegated thread created through `CreateSubagent`:
+  its model must be in the caller's subagent model set (default: the caller's
+  own model when permitted, or the only permitted one), and its grant is the
+  caller's grant ∩ the requested capabilities ∩ its mode's ceiling.
+- It starts with the caller's tool permissions except the subagent tools, and
+  no subagent models, so it cannot delegate further unless the user configures
+  that. Decisions still take the minimum along the delegation chain, so a later
+  change to the parent's permissions or budget applies to the child at once.
+- A model addresses only its own conversation's direct subagents. A conversation
+  descended from 3 others cannot spawn, and at most 8 of a conversation's
+  subagents run at once.
+- `subagent_spawn` and `subagent_send` start the run in the background through
+  `Send`, so it is admitted, journaled and shown like any other run, approvals
+  included; a message the gateway refuses is reported by `subagent_status`.
+  `subagent_wait` waits at most 600 seconds and is cancel-safe.
+- `CancelRun` cancels the thread's run and the runs of every thread delegated
+  from it, whoever started them.
+
+The host holds a `Delegator`, not the gateway: it can create, message, cancel
+and read subagents and nothing that changes a grant, permission or approval. The
+delegator reaches the gateway's tool hosts through a weak link, so the hosts
+holding it never keep a closed gateway alive. Waiting tracks runs this host
+started; a run the user started is reported as it stands. Tests:
+`crates/runtime/tests/tool_loop.rs` (spawn, inherited permissions, wait,
+cascading cancel, refusals) and `delegation_tool/tests.rs`.
+
 ### Adapters still to write
 
 - MCP client (PR #16): `list` maps `Gateway::mcp_offers(thread)` to specs named

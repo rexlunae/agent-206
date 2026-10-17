@@ -22,8 +22,10 @@ const MESSAGE_OVERHEAD: usize = 4096;
 mod messengers;
 pub use mcp_servers::{McpOffer, McpOffers};
 pub use run::{RunError, ToolError};
+mod delegation;
 mod skills;
 pub use crate::skill_tool::SkillOffer;
+pub use delegation::{Caller, Child, Delegator, DelegatorError};
 
 /// Streamed reply text that is not final yet. It is published as the
 /// thread's assistant message at most every [`PartialReply::INTERVAL`], so a
@@ -325,6 +327,8 @@ pub struct Gateway {
     /// Messengers the user disconnected; they connect again only on request.
     messengers_stopped: Arc<Mutex<BTreeSet<String>>>,
     mcp: Arc<mcp_servers::McpServers>,
+    /// The tool hosts subagent runs use, weakly held by the delegation tools.
+    delegation: delegation::HostLink,
 }
 /// The broker pairing this gateway holds, with the connection that anchors it.
 struct Paired {
@@ -370,7 +374,7 @@ impl Gateway {
         // user permits them.
         let skill_tools: Arc<dyn crate::tools::ToolHost> =
             Arc::new(crate::skill_tool::SkillToolHost::new(store.clone(), root));
-        Ok(Self {
+        let mut gateway = Self {
             admission: Arc::new(Mutex::new(Admission::default())),
             shutdown_committed: Arc::new(tokio::sync::Mutex::new(false)),
             started: std::time::Instant::now(),
@@ -395,7 +399,14 @@ impl Gateway {
             messengers: tokio::sync::watch::Sender::new(desired),
             messengers_stopped: Arc::new(Mutex::new(BTreeSet::new())),
             mcp: Arc::default(),
-        })
+            delegation: Arc::default(),
+        };
+        // Subagent tools; each conversation still denies them until the user
+        // permits them, and they are offered only with subagent models.
+        let delegation = crate::delegation_tool::DelegationHost::new(gateway.delegator());
+        Arc::make_mut(&mut gateway.tool_hosts).push(Arc::new(delegation));
+        gateway.link_delegation();
+        Ok(gateway)
     }
     fn pairing(&self) -> Result<Option<BrokerPairing>> {
         Ok(self
@@ -1218,14 +1229,7 @@ impl Gateway {
                 digest,
                 decision,
             } => self.resolve_approval(thread, approval, &digest, decision),
-            Command::CancelRun { thread } => {
-                let running = self.running.lock().map_err(poisoned("run"))?;
-                let token = running
-                    .get(&thread)
-                    .ok_or(GatewayError::NotFound("thread is not running"))?;
-                token.cancel();
-                Ok(Reply::Ok)
-            }
+            Command::CancelRun { thread } => delegation::cancel_run(self, thread),
             Command::CreateProject { name, root } => {
                 check(
                     !name.trim().is_empty(),
