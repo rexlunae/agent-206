@@ -592,7 +592,7 @@ fn price(value: Option<&Value>) -> Option<f64> {
         .filter(|v| v.is_finite() && *v >= 0.0)
 }
 /// The longest reply text the conversation accepts.
-const MAX_REPLY_TEXT: usize = 128 * 1024;
+pub const MAX_REPLY_TEXT: usize = 128 * 1024;
 /// One model response: its text, the tool calls it requested, and usage.
 #[derive(Debug)]
 pub struct Turn {

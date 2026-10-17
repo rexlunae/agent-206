@@ -138,10 +138,16 @@ fn add_usage(total: Usage, round: &Usage) -> Usage {
         cost: add(total.cost, round.cost),
     }
 }
-/// Snapshot bytes a run keeps free for settling every call of a response
-/// (each settled call stores a short report) and for the final reply or
-/// failure. Arguments and outputs may only use the space above it.
-const RESERVE: usize = 128 * 1024;
+/// Snapshot bytes kept for settling every call of one response (each settled
+/// call stores a short report) and for a failure report.
+const SETTLEMENT: usize = 128 * 1024;
+/// Snapshot bytes that must be free to start a round: the longest reply the
+/// provider accepts, its metadata and the settlement of its calls.
+const NEXT_ROUND: usize = provider::MAX_REPLY_TEXT + SETTLEMENT;
+/// Snapshot bytes a response's call arguments and outputs never use: the
+/// settlement of those calls, then the next round. Recording calls therefore
+/// never stops the run from storing the model's next reply.
+const RESERVE: usize = SETTLEMENT + NEXT_ROUND;
 /// Cut a tool's output to `limit` bytes (at most [`tools::MAX_OUTPUT`]),
 /// saying so in the text the model and the user see.
 fn bounded_output(mut text: String, limit: usize) -> String {
@@ -358,6 +364,11 @@ impl Gateway {
         let mut round = 0;
         loop {
             round += 1;
+            // Every round's reply must fit; refuse the round rather than
+            // stream a reply the conversation could not store.
+            if self.lock()?.remaining()? < NEXT_ROUND {
+                return Ok(Ended::Failed(GatewayError::HistoryFull));
+            }
             let view = self.view(run.thread)?;
             let catalog = tokio::select! {
                 catalog = tools::catalog(&self.tool_hosts, &view.scope) => catalog,

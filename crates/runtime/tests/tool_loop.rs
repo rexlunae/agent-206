@@ -1156,7 +1156,9 @@ async fn send_stays_pending_while_an_approval_waits_and_returns_the_finished_thr
         .respond(calls_response(api, std::slice::from_ref(&call), ""))
         .await;
     let approval = rig.pending_approval().await;
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // No timing is relied on: a correct Send can never have finished here,
+    // and the reply asserted below is the finished thread only if Send
+    // waited for the approval and the rest of the run.
     assert!(
         !task.is_finished(),
         "Send replied while its approval waited"
@@ -1476,6 +1478,14 @@ async fn the_context_shows_the_last_request_while_cost_counts_the_whole_run() {
         (total.input_tokens, total.output_tokens),
         (Some(first_in + last_in), Some(first_out + last_out))
     );
+    // A run that fails reports no cost rather than the previous run's.
+    let task = rig.send();
+    let failing = rig.next_request().await;
+    let cut_off = text_response(api, &nonce()).replace("message_stop", "ping");
+    failing.respond(with_usage(cut_off, count(), count())).await;
+    let thread = finished(task).await;
+    assert_eq!(thread.state, RunState::Failed);
+    assert_eq!(thread.run_usage, None);
 }
 
 #[tokio::test]
@@ -1522,9 +1532,20 @@ async fn calls_that_do_not_fit_in_storage_are_settled_and_the_run_goes_on() {
             "every call gets a result"
         );
     }
-    third.respond(text_response(api, &nonce())).await;
+    // Small calls fill the conversation to within a few hundred bytes of
+    // what calls may use.
+    let small: Vec<Call> = (0..a206_runtime::tool_calls::MAX_CALLS)
+        .map(|_| Call::new(&nonce(), json!({"value": nonce()})))
+        .collect();
+    third.respond(calls_response(api, &small, "")).await;
+    let fourth = rig.next_request().await;
+    // The longest reply the provider accepts still fits after the calls.
+    let mut reply = nonce();
+    reply.push_str(&"b".repeat(a206_runtime::provider::MAX_REPLY_TEXT - reply.len()));
+    fourth.respond(text_response(api, &reply)).await;
     let thread = finished(task).await;
     assert_eq!(thread.state, RunState::Complete, "{:?}", thread.error);
+    assert_eq!(thread.messages.last().unwrap().text, reply);
     let recorded = calls_of(&thread);
     let settled: Vec<_> = recorded
         .iter()

@@ -1026,6 +1026,8 @@ impl Gateway {
                     thread.state = RunState::Running;
                     thread.backend_activity = None;
                     thread.error = None;
+                    // The previous run's cost is not this run's.
+                    thread.run_usage = None;
                     let copy = thread.clone();
                     self.running
                         .lock()

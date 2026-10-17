@@ -21,9 +21,13 @@ tool calls, a budget is used up, or the user cancels:
    non-object arguments fail that call, and an identical call later in the same
    response is `Skipped`. Missing or repeated provider call IDs are replaced.
    Calls are recorded in order while their arguments fit in the conversation's
-   remaining storage, keeping 128 KiB in reserve for settling calls and the final
-   reply; the rest fail with a `Storage` report and no stored arguments, and the
-   run goes on. Tool outputs are likewise cut to the space above that reserve.
+   remaining storage, keeping a reserve for settling this response's calls and
+   for the next round (the longest reply the provider path accepts, its metadata
+   and its own settlement); the rest fail with a `Storage` report and no stored
+   arguments, and the run goes on. Tool outputs are likewise cut to the space
+   above that reserve. A round never starts without room for its reply; if that
+   room is gone the run fails with `HistoryFull` instead of streaming a reply it
+   could not store.
 4. Decide each call in order against the conversation and its ancestors as they
    are now (a permission, grant or budget narrowed mid-run applies to the next
    call), then run it, ask first, or refuse it.
@@ -37,6 +41,8 @@ tool calls, a budget is used up, or the user cancels:
 `Thread::usage` is the final model request's usage, which is what the context
 widget compares with the model's limit. `Thread::run_usage` sums every request of
 the run for cost; a count any request did not report leaves that total unknown.
+It is cleared when a message is sent and set only when the run completes, so a
+failed or cancelled run shows no cost rather than the previous run's.
 
 Every call ends with model-facing result text and, unless it succeeded, a
 structured `ErrorReport` that clients display. When a tool reports its own
