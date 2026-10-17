@@ -112,8 +112,29 @@ fn on_path(name: &str) -> bool {
     std::env::var_os("PATH").is_some_and(|path| in_search_path(name, &path))
 }
 fn in_search_path(name: &str, path: &std::ffi::OsStr) -> bool {
+    #[cfg(windows)]
+    let extensions = std::env::var_os("PATHEXT").unwrap_or_else(|| ".COM;.EXE;.BAT;.CMD".into());
+    #[cfg(windows)]
+    let extensions = Some(extensions.as_os_str());
+    #[cfg(not(windows))]
+    let extensions = None;
+    search_path(name, path, extensions)
+}
+fn search_path(name: &str, path: &std::ffi::OsStr, extensions: Option<&std::ffi::OsStr>) -> bool {
     !name.contains(['/', '\\'])
-        && std::env::split_paths(path).any(|dir| executable(&dir.join(name)))
+        && std::env::split_paths(path).any(|dir| {
+            executable(&dir.join(name))
+                || extensions.is_some_and(|extensions| {
+                    extensions
+                        .to_string_lossy()
+                        .split(';')
+                        .map(str::trim)
+                        .filter(|extension| {
+                            extension.starts_with('.') && !extension.contains(['/', '\\'])
+                        })
+                        .any(|extension| executable(&dir.join(format!("{name}{extension}"))))
+                })
+        })
 }
 /// A regular file this process may run; Windows has no execute bit.
 fn executable(path: &Path) -> bool {

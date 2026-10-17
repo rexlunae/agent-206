@@ -15,6 +15,10 @@ mod tools;
 #[cfg(target_arch = "wasm32")]
 use a206_core::Ignore;
 mod setup;
+#[cfg(target_arch = "wasm32")]
+mod sign_in;
+#[cfg(target_arch = "wasm32")]
+use sign_in::SignOut;
 #[cfg(not(target_arch = "wasm32"))]
 mod vault;
 use a206_core::{
@@ -104,6 +108,9 @@ pub(crate) struct State {
     pub theme: Signal<ThemeChoice>,
     /// First-time (or changed) gateway setup is showing instead of the workspace.
     pub setup: Signal<bool>,
+    /// A server opened to other devices is asking this browser to sign in.
+    #[cfg(target_arch = "wasm32")]
+    pub sign_in: Signal<bool>,
 }
 fn empty_snapshot() -> Snapshot {
     Snapshot {
@@ -160,6 +167,18 @@ pub(crate) async fn web_request<T: serde::Serialize, R: serde::de::DeserializeOw
     path: &str,
     body: T,
 ) -> Result<R, ErrorReport> {
+    let bearer =
+        web_session().map_err(|message| ErrorReport::new(ErrorKind::PermissionDenied, message))?;
+    web_post(path, body, Some(bearer)).await
+}
+/// Post one MessagePack request to the bridge, with this browser's bearer
+/// when it has one (sign-in needs none).
+#[cfg(target_arch = "wasm32")]
+pub(crate) async fn web_post<T: serde::Serialize, R: serde::de::DeserializeOwned>(
+    path: &str,
+    body: T,
+    bearer: Option<String>,
+) -> Result<R, ErrorReport> {
     let request = a206_protocol::Request {
         id: Uuid::new_v4(),
         body,
@@ -169,12 +188,13 @@ pub(crate) async fn web_request<T: serde::Serialize, R: serde::de::DeserializeOw
         .location()
         .origin()
         .map_err(|_| unavailable("browser origin unavailable"))?;
-    let bearer =
-        web_session().map_err(|message| ErrorReport::new(ErrorKind::PermissionDenied, message))?;
-    let response = reqwest::Client::new()
+    let mut post = reqwest::Client::new()
         .post(format!("{origin}{path}"))
-        .header("Content-Type", "application/msgpack")
-        .bearer_auth(&bearer)
+        .header("Content-Type", "application/msgpack");
+    if let Some(bearer) = &bearer {
+        post = post.bearer_auth(bearer);
+    }
+    let response = post
         .body(a206_protocol::encode(&request).map_err(|e| captured(ErrorKind::Protocol)(&e))?)
         .send()
         .await
@@ -191,12 +211,18 @@ pub(crate) async fn web_request<T: serde::Serialize, R: serde::de::DeserializeOw
             ));
         }
         if matches!(response.status().as_u16(), 401 | 403) {
-            // A restarted bridge issues a new bearer; drop the stale one so the
-            // next authorization link is not shadowed by it.
-            forget_web_session(&bearer);
+            // A restarted bridge issues a new bearer and sessions expire; drop
+            // the stale one so the next authorization or sign-in replaces it.
+            if let Some(bearer) = &bearer {
+                forget_web_session(bearer);
+            }
             return Err(ErrorReport::new(
                 ErrorKind::PermissionDenied,
-                "This browser is not authorized for the running web bridge. Open the authorization URL printed by `agent206 web`; restart it for a new link if that one was already used.",
+                if sign_in::network() {
+                    "Your sign-in has ended. Sign in again with a code from your authenticator app."
+                } else {
+                    "This browser is not authorized for the running web bridge. Open the authorization URL printed by `agent206 web`; restart it for a new link if that one was already used."
+                },
             ));
         }
         return Err(unavailable(format!(
@@ -308,12 +334,7 @@ fn web_session() -> Result<String, String> {
         .hash()
         .map_err(|_| "session URL unavailable")?;
     if let Some(token) = fragment.strip_prefix("#a206=") {
-        if token.len() != 32 || !token.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return Err("invalid browser session".into());
-        }
-        storage
-            .set_item("a206.session", token)
-            .map_err(|_| "browser storage unavailable")?;
+        store_web_session(token)?;
         let history = window
             .history()
             .map_err(|_| "browser history unavailable")?;
@@ -340,8 +361,23 @@ fn web_session() -> Result<String, String> {
         .get_item("a206.session")
         .map_err(|_| "browser storage unavailable")?
         .ok_or_else(|| {
-            "Open the authorization URL printed by `agent206 web` to connect this browser.".into()
+            if sign_in::network() {
+                "Sign in with a code from your authenticator app.".into()
+            } else {
+                "Open the authorization URL printed by `agent206 web` to connect this browser."
+                    .into()
+            }
         })
+}
+/// Keep a bearer from the authorization link or a sign-in.
+#[cfg(target_arch = "wasm32")]
+fn store_web_session(token: &str) -> Result<(), String> {
+    if token.len() != 32 || !token.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("invalid browser session".into());
+    }
+    web_storage()?
+        .set_item("a206.session", token)
+        .map_err(|_| "browser storage unavailable".into())
 }
 pub(crate) fn dispatch(mut state: State, command: Command) {
     let navigate = matches!(
@@ -510,6 +546,8 @@ fn Shell() -> Element {
     let gateway_busy = use_signal(|| None);
     let gateway_generation = use_signal(|| 0);
     let setup = use_signal(setup_required);
+    #[cfg(target_arch = "wasm32")]
+    let sign_in = use_signal(|| false);
     let mut theme = use_context::<Signal<ThemeChoice>>();
     let state = State {
         data,
@@ -523,23 +561,44 @@ fn Shell() -> Element {
         loaded,
         theme,
         setup,
+        #[cfg(target_arch = "wasm32")]
+        sign_in,
         navigator: navigator(),
     };
     use_context_provider(|| state);
     use_future(move || async move {
-        // The web bridge may not have a gateway yet; ask before polling one.
-        // If the bridge cannot be asked, polling reports why.
+        // The web bridge may not have a gateway yet; it is asked once this
+        // browser may use it, before any gateway is polled.
         #[cfg(target_arch = "wasm32")]
-        if let Ok(status) = setup::status().await
-            && status.required()
-        {
-            let mut setup = state.setup;
-            setup.set(true);
-        }
+        let mut asked = false;
         let mut themed = false;
         loop {
+            #[cfg(target_arch = "wasm32")]
+            let signing_in = {
+                sign_in::detect().await;
+                let mut sign_in = state.sign_in;
+                if sign_in::required() && !*sign_in.peek() {
+                    sign_in.set(true);
+                }
+                let signing_in = *sign_in.peek();
+                // If the bridge cannot be asked, polling reports why, and it
+                // is asked again next time.
+                if !signing_in
+                    && !asked
+                    && let Ok(status) = setup::status().await
+                {
+                    asked = true;
+                    if status.required() {
+                        let mut setup = state.setup;
+                        setup.set(true);
+                    }
+                }
+                signing_in
+            };
+            #[cfg(not(target_arch = "wasm32"))]
+            let signing_in = false;
             // Never poll (or launch) a gateway before the user has chosen one.
-            if !*state.setup.peek() {
+            if !signing_in && !*state.setup.peek() {
                 refresh(state).await;
                 // Apply each gateway's theme once its first snapshot arrives
                 // (switching gateways resets `loaded`).
@@ -555,6 +614,11 @@ fn Shell() -> Element {
             futures_timer::Delay::new(std::time::Duration::from_secs(2)).await;
         }
     });
+    // The sign-in screen replaces the workspace until this browser signs in.
+    #[cfg(target_arch = "wasm32")]
+    let signing_in = sign_in();
+    #[cfg(not(target_arch = "wasm32"))]
+    let signing_in = false;
     rsx! {
         div { class: "a206-shell a206-app",
             Header {}
@@ -569,7 +633,7 @@ fn Shell() -> Element {
                 Split { label: name!("Workspace navigation width"), default_value: 18.0, min: 12.0, max: 32.0,
                     primary: rsx! { Sidebar {} },
                     secondary: rsx! { main { class: "a206-main", id: "workspace-main",
-                        if setup() { GatewaySetupGate {} } else { Outlet::<Route> {} }
+                        if signing_in { SignInGate {} } else if setup() { GatewaySetupGate {} } else { Outlet::<Route> {} }
                     } }
                 }
             }
@@ -582,6 +646,23 @@ fn Shell() -> Element {
             }
         }
     }
+}
+#[component]
+fn SignInGate() -> Element {
+    #[cfg(target_arch = "wasm32")]
+    {
+        rsx! { sign_in::SignIn {} }
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        rsx! {}
+    }
+}
+/// Signing out is offered only by web servers that sign browsers in.
+#[cfg(not(target_arch = "wasm32"))]
+#[component]
+fn SignOut() -> Element {
+    rsx! {}
 }
 #[component]
 fn GatewaySetupGate() -> Element {
@@ -603,6 +684,7 @@ fn Header() -> Element {
             Badge { tone: BadgeTone::Accent, "{route.label()}" }
             LinkButton { size: ButtonSize::Sm, variant: ButtonVariant::Ghost, href: Route::Gateway {}.to_string(), Icon { name: Route::Gateway {}.icon() } "Gateway" }
             LinkButton { size: ButtonSize::Sm, variant: ButtonVariant::Ghost, href: Route::Appearance {}.to_string(), Icon { name: IconName::Settings } "Theme" }
+            SignOut {}
             Button { size: ButtonSize::Sm, variant: ButtonVariant::Primary, availability: if (state.connected)() && state.gateway_busy.read().is_none() { Availability::Enabled } else { Availability::Disabled }, onclick: move |_| dispatch(state, Command::CreateThread { title: "New conversation".into(), mode: Mode::Chat }), "+ New chat" }
         }
     } }

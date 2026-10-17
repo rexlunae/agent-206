@@ -178,3 +178,33 @@ fn index_escapes_author_text() {
     let text = index([("one", Some("a <b>\n\"c\" & d"))]);
     assert!(text.contains("<skill name=\"one\">a &lt;b&gt; &quot;c&quot; &amp; d</skill>"));
 }
+
+#[test]
+fn windows_program_extensions_are_searched_without_changing_the_environment() {
+    let directory = tempfile::tempdir().unwrap();
+    let name = uuid::Uuid::new_v4().simple().to_string();
+    let program = directory.path().join(format!("{name}.EXE"));
+    std::fs::write(&program, "").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let path = directory.path().as_os_str();
+    assert!(!search_path(&name, path, None));
+    assert!(search_path(
+        &name,
+        path,
+        Some(std::ffi::OsStr::new(".CMD;.EXE"))
+    ));
+    assert!(!search_path(
+        &name,
+        path,
+        Some(std::ffi::OsStr::new(".CMD"))
+    ));
+    assert!(!search_path(
+        &format!("../{name}"),
+        path,
+        Some(std::ffi::OsStr::new(".EXE"))
+    ));
+}

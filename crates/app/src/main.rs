@@ -193,12 +193,28 @@ mod native {
             #[command(subcommand)]
             command: crate::vault_cli::VaultAction,
         },
-        /// Serve the shared web client on an authorized loopback session.
+        /// Serve the shared web client. By default only this computer can
+        /// open it, through a one-time link; `--listen` opens it to other
+        /// devices over HTTPS with sign-in by the vault's authenticator.
         Web {
             #[arg(long)]
             static_dir: PathBuf,
-            #[arg(long, default_value_t = 8206)]
+            /// Loopback port.
+            #[arg(long, default_value_t = 8206, conflicts_with = "listen")]
             port: u16,
+            /// Address and port to serve other devices on, such as 0.0.0.0:8443.
+            #[arg(long, requires = "names")]
+            listen: Option<std::net::SocketAddr>,
+            /// A host name or IP address other devices use to reach this
+            /// server; repeat for several. Requests for other names are refused.
+            #[arg(long = "name", requires = "listen")]
+            names: Vec<String>,
+            /// PEM certificate chain to serve instead of a generated self-signed one.
+            #[arg(long, requires_all = ["listen", "tls_key"])]
+            tls_cert: Option<PathBuf>,
+            /// PEM private key for `--tls-cert`.
+            #[arg(long, requires_all = ["listen", "tls_cert"])]
+            tls_key: Option<PathBuf>,
         },
         Render {
             output: PathBuf,
@@ -619,13 +635,33 @@ mod native {
                         anyhow::bail!("choose gateway start, stop, restart, status or reconnect")
                     };
                 }
-                if let Action::Web { static_dir, port } = action {
+                if let Action::Web {
+                    static_dir,
+                    port,
+                    listen,
+                    names,
+                    tls_cert,
+                    tls_key,
+                } = action
+                {
+                    use a206_runtime::web::{Certificate, Exposure, NetworkOptions};
+                    let exposure = match listen {
+                        None => Exposure::Loopback { port },
+                        Some(listen) => Exposure::Network(NetworkOptions {
+                            listen,
+                            names,
+                            certificate: match (tls_cert, tls_key) {
+                                (Some(cert), Some(key)) => Certificate::Files { cert, key },
+                                _ => Certificate::Generated,
+                            },
+                        }),
+                    };
                     // The bridge offers first-time setup to the browser itself.
                     return Ok(a206_runtime::web::serve(
                         root.clone(),
                         args.remote.clone(),
                         static_dir,
-                        port,
+                        exposure,
                     )
                     .await?);
                 }

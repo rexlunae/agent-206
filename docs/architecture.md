@@ -315,6 +315,27 @@ could otherwise be sent to a local development server inside the preview browser
 App chrome cannot be framed. This is a single-user loopback bridge, not a public
 hosting/authentication system.
 
+### Other devices
+
+`agent206 web --listen ADDR --name HOST…` serves the same bridge to other devices.
+It is opt-in and replaces the loopback link: there is no `/connect` route, and
+plain HTTP is not served. The certificate is the user's PEM chain and key, or a
+self-signed one generated for exactly the listed names (one directory per name
+set under `web/tls/`, owner-only, renewed 30 days before its 397-day expiry);
+the server prints its SHA-256 fingerprint for comparison with the browser's.
+Every API request must name a listed host and come from `https://` that host,
+which also defeats DNS rebinding. `/api/sign-in` needs only that same-origin
+check: it reports the sign-in method, accepts an authenticator code or ends the
+presenting session. Codes go to the vault broker over a fresh user connection
+as a TOTP-only step-up (never a password), so its throttle, replay protection
+and unlocked-vault requirement apply; the connection, and its step-up, end with
+the attempt. The bridge never starts a broker for an unauthenticated request.
+A success returns a random bearer for this browser, kept in memory by the
+bridge for 12 hours (at most 32 at once; the oldest is dropped) and in the
+origin's localStorage by the browser. Startup refuses a profile without a vault
+or with an unlocked vault that has no authenticator; a locked vault is allowed
+and sign-in waits for it to be unlocked.
+
 The bridge is also the browser's gateway client. It connects to the profile's
 saved gateway, local or SSH, and until one is saved it answers commands with a
 structured not-configured error and serves gateway setup (`/api/setup`). SSH
