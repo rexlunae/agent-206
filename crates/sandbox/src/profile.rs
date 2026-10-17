@@ -1,5 +1,5 @@
 //! The mount namespace and Landlock allowlist for one runtime launch.
-use crate::{Access, BUBBLEWRAP, Rule, SPEC_VERSION, SandboxError, Spec};
+use crate::{Access, BUBBLEWRAP, Network, Rule, SPEC_VERSION, SandboxError, Spec};
 use std::{
     ffi::OsString,
     path::{Path, PathBuf},
@@ -41,6 +41,20 @@ const SYSTEM_ETC: &[&str] = &[
     "/etc/ld.so.conf.d",
     "/etc/localtime",
 ];
+/// Name resolution and certificates for a runtime granted the host network.
+/// These are bound and allowed at their own paths, even when they are links.
+const NETWORK_ETC: &[&str] = &[
+    "/etc/resolv.conf",
+    "/etc/hosts",
+    "/etc/nsswitch.conf",
+    "/etc/host.conf",
+    "/etc/gai.conf",
+    "/etc/services",
+    "/etc/protocols",
+    "/etc/ssl",
+    "/etc/ca-certificates",
+    "/etc/pki",
+];
 /// Extra configuration that system tools expect once Execute is granted.
 const EXECUTE_ETC: &[&str] = &["/etc/alternatives", "/etc/passwd", "/etc/group"];
 /// Directories whose programs the Execute capability allows.
@@ -68,9 +82,18 @@ pub struct Profile<'a> {
     /// Paths that stay invisible even inside a granted directory.
     pub hidden: &'a [PathBuf],
     pub cwd: &'a Path,
-    /// Loopback port of the runtime's credential proxy; `None` leaves it
-    /// without any network.
-    pub port: Option<u16>,
+    pub network: NetworkAccess,
+}
+
+/// The network a runtime may use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetworkAccess {
+    /// None at all.
+    None,
+    /// Only its credential proxy on this loopback port.
+    Proxy(u16),
+    /// The host's network, which only the user can grant.
+    Host,
 }
 
 impl Profile<'_> {
@@ -127,6 +150,16 @@ impl Profile<'_> {
                 },
             );
         }
+        if self.network == NetworkAccess::Host {
+            for path in NETWORK_ETC {
+                let path = Path::new(path);
+                match std::fs::metadata(path) {
+                    Ok(_) => add(path.to_path_buf(), Access::Read),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(source) => return Err(inspect(path, source)),
+                }
+            }
+        }
         if self.execute {
             for path in EXECUTE_DIRECTORIES.iter() {
                 if let Some(path) = existing(Path::new(path))? {
@@ -147,10 +180,14 @@ impl Profile<'_> {
         Ok(Spec {
             version: SPEC_VERSION,
             executable: self.executable.to_path_buf(),
-            proxy: self.port.map(|port| crate::Proxy {
-                port,
-                socket: self.proxy_socket(),
-            }),
+            network: match self.network {
+                NetworkAccess::None => Network::None,
+                NetworkAccess::Proxy(port) => Network::Proxy(crate::Proxy {
+                    port,
+                    socket: self.proxy_socket(),
+                }),
+                NetworkAccess::Host => Network::Host,
+            },
             status: self.status_socket(),
             rules: self.rules()?,
         })
@@ -174,6 +211,9 @@ impl Profile<'_> {
         .into_iter()
         .map(OsString::from)
         .collect();
+        if self.network == NetworkAccess::Host {
+            args.push("--share-net".into());
+        }
         let bind = |args: &mut Vec<OsString>, option: &str, path: &Path| {
             args.extend([option.into(), path.into(), path.into()]);
         };
@@ -194,7 +234,12 @@ impl Profile<'_> {
         let etc = SYSTEM_ETC
             .iter()
             .chain(if self.execute { EXECUTE_ETC } else { &[] });
-        for path in etc {
+        let network_etc: &[&str] = if self.network == NetworkAccess::Host {
+            NETWORK_ETC
+        } else {
+            &[]
+        };
+        for path in etc.chain(network_etc) {
             bind(&mut args, "--ro-bind-try", Path::new(path));
         }
         bind(&mut args, "--ro-bind", self.root);
@@ -334,7 +379,7 @@ mod tests {
                 execute,
                 hidden,
                 cwd: &self.scratch,
-                port: Some(1),
+                network: NetworkAccess::Proxy(1),
             }
         }
     }
@@ -396,8 +441,8 @@ mod tests {
         assert!(!args.iter().any(|arg| arg == "--share-net"));
         let spec = crate::Spec::decode(args.last().unwrap().to_str().unwrap()).unwrap();
         assert_eq!(
-            spec.proxy,
-            Some(crate::Proxy {
+            spec.network,
+            Network::Proxy(crate::Proxy {
                 port: 1,
                 socket: layout.control.join("proxy.sock")
             })
@@ -454,7 +499,7 @@ mod tests {
         let layout = layout();
         let profile = Profile {
             root: &layout.executable,
-            port: None,
+            network: NetworkAccess::None,
             ..layout.profile(None, &[], false)
         };
         let rules = profile.rules().unwrap();
@@ -463,6 +508,25 @@ mod tests {
         let args = profile.arguments().unwrap();
         assert!(!args.iter().any(|arg| arg == layout.root.as_os_str()));
         let spec = crate::Spec::decode(args.last().unwrap().to_str().unwrap()).unwrap();
-        assert_eq!(spec.proxy, None);
+        assert_eq!(spec.network, Network::None);
+        assert!(!args.iter().any(|arg| arg == "--share-net"));
+    }
+
+    #[test]
+    fn only_a_host_network_grant_shares_the_network() {
+        let layout = layout();
+        let profile = Profile {
+            network: NetworkAccess::Host,
+            ..layout.profile(None, &[], false)
+        };
+        let args = profile.arguments().unwrap();
+        assert!(args.iter().any(|arg| arg == "--share-net"));
+        let spec = crate::Spec::decode(args.last().unwrap().to_str().unwrap()).unwrap();
+        assert_eq!(spec.network, Network::Host);
+        assert!(
+            !args
+                .iter()
+                .any(|arg| arg == layout.control.join("proxy.sock").as_os_str())
+        );
     }
 }

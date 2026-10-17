@@ -6,6 +6,7 @@ mod extensions;
 #[cfg(not(target_arch = "wasm32"))]
 mod health;
 mod mcp;
+mod messengers;
 mod pages;
 mod route;
 mod settings;
@@ -638,7 +639,7 @@ fn Sidebar() -> Element {
         }
         div { class: "a206-sidebar-footer a206-nav-group",
             NavHeading { "Control center" }
-            for item in [Route::Gateway {}, Route::Providers {}, Route::Joshua {}, Route::Prompts {}, Route::Security {}] {
+            for item in [Route::Gateway {}, Route::Providers {}, Route::Messengers {}, Route::Joshua {}, Route::Prompts {}, Route::Security {}] {
                 LinkButton { size: ButtonSize::Sm, variant: ButtonVariant::Ghost, class: if route == item { "a206-nav-active" } else { "" }, href: item.to_string(), Icon { name: item.icon(), size: IconSize::Sm } "{item.label()}" }
             }
         }
