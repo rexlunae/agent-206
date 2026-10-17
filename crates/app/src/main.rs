@@ -161,6 +161,10 @@ mod native {
             #[command(subcommand)]
             command: ApprovalAction,
         },
+        /// Show the checklist a conversation's models keep with `plan_update`.
+        Plan {
+            thread: uuid::Uuid,
+        },
         /// Answer questions agents asked with `ask_user`.
         Prompts {
             #[command(subcommand)]
@@ -983,6 +987,25 @@ mod native {
                             budget: ToolBudget { rounds, tool_calls },
                         },
                     },
+                    Action::Plan { thread } => {
+                        let Reply::Snapshot(snapshot) = client.call(Command::Snapshot).await? else {
+                            anyhow::bail!("failed to read the conversation");
+                        };
+                        let thread = snapshot
+                            .threads
+                            .into_iter()
+                            .find(|t| t.id == thread)
+                            .ok_or_else(|| anyhow::anyhow!("conversation not found"))?;
+                        #[derive(serde::Serialize)]
+                        struct Plan {
+                            steps: Vec<a206_core::PlanStep>,
+                        }
+                        print!(
+                            "{}",
+                            toml::to_string_pretty(&Plan { steps: thread.plan })?
+                        );
+                        return Ok(());
+                    }
                     Action::Approvals { command } => match command {
                         ApprovalAction::List { thread } => {
                             let Reply::Snapshot(snapshot) = client.call(Command::Snapshot).await?
