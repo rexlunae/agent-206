@@ -2,6 +2,7 @@
 use crate::pages::Gateway;
 use crate::{
     PageFrame, Shell,
+    activity::Activity,
     conversation::Workspace as Chat,
     messengers::Messengers,
     pages::{
@@ -24,6 +25,8 @@ pub(crate) enum Route {
     Chat { id: Uuid, split: Option<Uuid> },
     #[route("/projects")]
     Projects {},
+    #[route("/activity")]
+    Activity {},
     #[route("/connections")]
     Providers {},
     #[route("/messengers")]
@@ -56,6 +59,7 @@ impl Route {
             Self::Workspace {} | Self::NotFound { .. } => IconName::Home,
             Self::Chat { .. } | Self::Conversations {} => IconName::Sparkles,
             Self::Projects {} => IconName::Folder,
+            Self::Activity {} => IconName::Clock,
             Self::Providers {} => IconName::Link,
             Self::Messengers {} => IconName::Send,
             Self::Downloads {} => IconName::Download,
@@ -74,6 +78,7 @@ impl Route {
             Self::Chat { .. } => "Conversation",
             Self::Conversations {} => "Conversations",
             Self::Projects {} => "Projects",
+            Self::Activity {} => "Activity",
             Self::Providers {} => "Connections",
             Self::Messengers {} => "Messengers",
             Self::Downloads {} => "Downloads",

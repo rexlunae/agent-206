@@ -9,6 +9,8 @@ mod doctor_cli;
 mod extension_cli;
 #[cfg(not(target_arch = "wasm32"))]
 mod messenger_cli;
+#[cfg(not(target_arch = "wasm32"))]
+mod schedule_cli;
 #[cfg(all(unix, not(target_arch = "wasm32")))]
 mod setup_cli;
 #[cfg(all(unix, not(target_arch = "wasm32")))]
@@ -121,6 +123,11 @@ mod native {
             #[command(subcommand)]
             command: crate::messenger_cli::MessengerAction,
         },
+        /// Send messages to a conversation at set times.
+        Schedule {
+            #[command(subcommand)]
+            command: crate::schedule_cli::ScheduleAction,
+        },
         /// Show gateway and workspace status without starting a service.
         Status,
         /// Export the current workspace snapshot as TOML.
@@ -166,6 +173,15 @@ mod native {
         },
         RefreshModels {
             provider: uuid::Uuid,
+        },
+        /// Gateway activity newest first, without conversation and download
+        /// progress notices; pass the last `sequence` printed as --before for
+        /// the next page.
+        Activity {
+            #[arg(long)]
+            before: Option<u64>,
+            #[arg(long, default_value_t = 20)]
+            limit: u32,
         },
         /// Find messages containing every word of QUERY, newest first.
         Search {
@@ -717,6 +733,9 @@ mod native {
                 if let Action::Messenger { command } = action {
                     return crate::messenger_cli::run(&client, command).await;
                 }
+                if let Action::Schedule { command } = action {
+                    return crate::schedule_cli::run(&client, command).await;
+                }
                 let command = match action {
                     Action::Providers {
                         command: ProviderAction::Presets,
@@ -1041,6 +1060,7 @@ mod native {
                     }
                     Action::RefreshModels { provider } => Command::RefreshCatalog { provider },
                     Action::Search { query, limit } => Command::SearchMessages { query, limit },
+                    Action::Activity { before, limit } => Command::Activity { before, limit },
                     Action::Project { name, root } => Command::CreateProject {
                         name,
                         root: root.to_string_lossy().into_owned(),
@@ -1099,6 +1119,7 @@ mod native {
                         }
                         print!("{}", toml::to_string_pretty(&Hits { hits })?);
                     }
+                    Reply::Activity(page) => print!("{}", toml::to_string_pretty(&page)?),
                     reply => println!("{}", toml::to_string_pretty(&reply)?),
                 }
                 Ok(())

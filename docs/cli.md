@@ -31,10 +31,13 @@ without launching a gateway. With no subcommand, the app launches the desktop; `
 | skills / registries | skills list/show/enable --digest/disable (approval pinned to the reviewed content, docs/skills.md); extension list, grant ID [--capability C…], enable/disable ID, panel ID PANEL [--project P] [--press BUTTON], tool ID TOOL [--project P] [--args TOML], install MANIFEST MODULE (arrives disabled, nothing granted; installing a new version updates it), uninstall ID, install-proposal DIGEST and dismiss DIGEST for packages agents prepared (list shows them), all through the gateway's extension policy | Registry install/search, skill install, export |
 | swarm / projects | project NAME ROOT creates a coordinator; snapshots retain linked threads | Delegation/task/project orchestration and scoped steering/control commands |
 | messenger | messenger list/add/set/remove/enable/disable/allow/disallow/allow-sender/disallow-sender/connect/disconnect: entries are added disabled with no chat allowed; kinds are telegram and matrix (matrix needs --endpoint, its homeserver); the token is a vault credential name; edits go through the revision-checked settings API (docs/messengers.md); the GUI Messengers page uses the same settings and commands | More services |
+| cron | schedule list/add/pause/resume/run/remove: add THREAD --name --text with one of --at, --every [--anchor] or --cron [--zone] (docs/schedules.md) | GUI page; agent-requested jobs |
 | doctor | doctor [--toml]: non-mutating checks of the profile, gateway, vault broker, pairing and provider credentials/catalogs; exits non-zero when something must be fixed; never starts the gateway or broker | Explicit reviewed fixes (--repair) |
 
 Other current commands include Joshua start/stop/status, backend configure/select,
-downloads, Git status, document reads, durable events, ACP/MCP, web and render.
+downloads, Git status, document reads, durable events, `activity [--before SEQ]
+[--limit N]` (the gateway's notable events newest first as a TOML page, without
+conversation or download progress notices), ACP/MCP, web and render.
 Use `agent206 --help` and subcommand help for the actual supported tree.
 
 Status/reconnect must not launch a missing or deliberately stopped gateway.
