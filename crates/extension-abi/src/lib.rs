@@ -191,6 +191,11 @@ pub enum HostRequest {
     /// A unified diff of one file: `HEAD` against the index when `staged`,
     /// otherwise the index against the working tree.
     GitDiff { path: String, staged: bool },
+    /// Commit the working-tree content of exactly `paths` on top of `HEAD`,
+    /// like `git commit --only`: a path missing from the working tree is
+    /// removed, the index is updated to match for those paths, and other
+    /// staged changes stay staged.
+    GitCommit { message: String, paths: Vec<String> },
     /// `GET` a credential-free HTTPS URL on the standard port. The host, and
     /// every redirect's, must be one the manifest declares, and every
     /// resolved address must be public. No cookies, credentials or proxies.
@@ -218,6 +223,8 @@ pub enum HostReply {
     GitStatus(GitStatus),
     Commits(Vec<GitCommit>),
     Diff(GitDiff),
+    /// The commit a [`HostRequest::GitCommit`] made.
+    Committed(GitCommit),
     Fetched(FetchResponse),
     State(Option<ByteBuf>),
     Done,

@@ -400,6 +400,7 @@ pub(crate) fn dispatch(mut state: State, command: Command) {
                     destination = Some(Route::Chat {
                         id: thread.id,
                         split: None,
+                        message: None,
                     });
                 }
                 state.status.set(String::new());
@@ -712,7 +713,7 @@ fn Sidebar() -> Element {
             if snapshot.threads.is_empty() { p { class: "a206-muted", "A fresh start." } }
             for thread in snapshot.threads.iter().rev().take(12) {
                 { let id = thread.id; rsx! {
-                    LinkButton { key: "{id}", size: ButtonSize::Sm, variant: ButtonVariant::Ghost, class: if matches!(route, Route::Chat { id: current, .. } if current == id) { "a206-nav-active" } else { "" }, href: Route::Chat { id, split: None }.to_string(),
+                    LinkButton { key: "{id}", size: ButtonSize::Sm, variant: ButtonVariant::Ghost, class: if matches!(route, Route::Chat { id: current, .. } if current == id) { "a206-nav-active" } else { "" }, href: Route::Chat { id, split: None, message: None }.to_string(),
                         Icon { name: if thread.parent.is_some() { IconName::ArrowEnd } else { IconName::Sparkles }, size: IconSize::Sm } span { class: "a206-nav-title", "{thread.title}" } Badge { tone: BadgeTone::Accent, "{thread.mode.label()}" }
                     }
                 } }

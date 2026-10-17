@@ -323,7 +323,7 @@ fn ProposalCard(proposal: ExtensionProposal) -> Element {
             }
             p { class: "a206-muted", code { "{summary.id}" } }
             match conversation {
-                Some(title) => rsx! { div { class: "a206-row", span { class: "a206-muted", "From the conversation" } LinkButton { size: ButtonSize::Sm, variant: ButtonVariant::Ghost, href: crate::Route::Chat { id: proposal.thread, split: None }.to_string(), "{title}" } } },
+                Some(title) => rsx! { div { class: "a206-row", span { class: "a206-muted", "From the conversation" } LinkButton { size: ButtonSize::Sm, variant: ButtonVariant::Ghost, href: crate::Route::Chat { id: proposal.thread, split: None, message: None }.to_string(), "{title}" } } },
                 None => rsx! { p { class: "a206-muted", "From a conversation that no longer exists." } },
             }
             if let Some(installed) = replaces {
