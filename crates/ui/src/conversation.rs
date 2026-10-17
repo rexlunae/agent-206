@@ -86,6 +86,11 @@ fn Conversation(thread: Thread, target: Option<Uuid>) -> Element {
     let mut file_input_version = use_signal(|| 0_u64);
     let mut submitting = use_signal(|| false);
     let running = thread.state == RunState::Running || submitting();
+    // A native run takes further messages while it works.
+    let steerable = thread.state == RunState::Running
+        && thread.backend == CodingBackend::Native
+        && !submitting();
+    let steered: Vec<String> = thread.steering.iter().map(|m| m.text.clone()).collect();
     let has_model = thread.model.is_some();
     let selected_model = thread.model.clone();
     let id = thread.id;
@@ -113,6 +118,27 @@ fn Conversation(thread: Thread, target: Option<Uuid>) -> Element {
     });
     let mut submit = move || {
         let text = draft().trim().to_owned();
+        if steerable && !text.is_empty() {
+            submitting.set(true);
+            draft.set(String::new());
+            spawn(async move {
+                match crate::call(Command::Steer {
+                    thread: id,
+                    text: text.clone(),
+                })
+                .await
+                {
+                    Ok(_) => state.error.set(None),
+                    Err(error) => {
+                        draft.set(text);
+                        state.error.set(Some(error));
+                    }
+                }
+                submitting.set(false);
+                crate::refresh(state).await;
+            });
+            return;
+        }
         if !running
             && has_model
             && !reading_files()
@@ -292,8 +318,15 @@ fn Conversation(thread: Thread, target: Option<Uuid>) -> Element {
                 },
                 Textarea { class: "a206-compose-input", aria_label: "Message your agent", rows: "1", autosize: true,
                     placeholder: if has_model { "Describe what you'd like to do…" } else { "Choose a model to start…" },
-                    value: ReadSignal::from(draft), oninput: move |value| draft.set(value), readonly: running,
+                    value: ReadSignal::from(draft), oninput: move |value| draft.set(value), readonly: running && !steerable,
                 }
+                }
+                if !steered.is_empty() {
+                    List { class: "a206-steered", aria_label: "Messages waiting for the running response",
+                        for (index, text) in steered.iter().enumerate() {
+                            ListItem { key: "{index}", overline: rsx! { "Read before its next step" }, headline: rsx! { "{text}" } }
+                        }
+                    }
                 }
                 if !attachments.read().is_empty() {
                     div { class: "a206-attachment-chips", aria_label: "Attached text documents",
@@ -375,6 +408,14 @@ fn Conversation(thread: Thread, target: Option<Uuid>) -> Element {
                         }
                         LinkButton { icon_label: name!("Edit mode prompts"), title: "Edit mode prompts", size: ButtonSize::Sm, variant: ButtonVariant::Ghost,
                             href: Route::Prompts {}.to_string(), Icon { name: IconName::Settings } }
+                        if steerable {
+                            IconButton { icon: IconName::Send, label: name!("Add to the running response"),
+                                title: "Add to the running response · Enter",
+                                size: ButtonSize::Sm, variant: ButtonVariant::Ghost,
+                                availability: if draft().trim().is_empty() { Availability::Disabled } else { Availability::Enabled },
+                                onclick: move |_| submit(),
+                            }
+                        }
                         IconButton { icon: if running { IconName::Stop } else { IconName::ArrowUp }, label: if running { name!("Stop response") } else { name!("Send message") },
                             title: if running { "Stop response" } else { "Send · Enter (Shift+Enter for a new line)" },
                             class: "a206-compose-send", size: ButtonSize::Sm, variant: ButtonVariant::Primary,

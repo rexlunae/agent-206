@@ -29,6 +29,7 @@ pub use run::{RunError, ToolError};
 mod delegation;
 mod schedules;
 mod skills;
+mod steering;
 pub use crate::skill_tool::SkillOffer;
 pub use delegation::{Caller, Child, Delegator, DelegatorError, Reservation};
 pub use schedules::{Jobs, MAX_AGENT_JOBS};
@@ -325,6 +326,8 @@ pub struct Gateway {
     extensions: crate::extension_host::ExtensionHost,
     downloads: Arc<Mutex<BTreeMap<Id, tokio_util::sync::CancellationToken>>>,
     running: Arc<Mutex<BTreeMap<Id, tokio_util::sync::CancellationToken>>>,
+    /// Native runs taking `Steer` messages; changed under the store lock.
+    accepting: Arc<Mutex<BTreeSet<Id>>>,
     /// Held only in memory: a restart needs a fresh pairing from the user.
     pairing: Arc<Mutex<Option<Paired>>>,
     /// Orders PairBroker commands, so a slow older verification never
@@ -439,6 +442,7 @@ impl Gateway {
             store,
             downloads: Arc::new(Mutex::new(BTreeMap::new())),
             running: Arc::new(Mutex::new(BTreeMap::new())),
+            accepting: Arc::new(Mutex::new(BTreeSet::new())),
             pairing: Arc::new(Mutex::new(None)),
             pair_requests: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             refreshed: Arc::new(Mutex::new(BTreeMap::new())),
@@ -1150,6 +1154,9 @@ impl Gateway {
                     let copy = thread.clone();
                     // A subagent run its parent reserved is cancelled with it.
                     let token = delegation::admit(self, id)?;
+                    if backend.is_none() {
+                        self.open_steering(id)?;
+                    }
                     store.persist(Some(EventKind::ThreadChanged { id }))?;
                     (token, config, copy, prompt, info, backend, workspace, root)
                 };
@@ -1169,6 +1176,7 @@ impl Gateway {
                     let mut store = self.lock()?;
                     let thread = store.thread_mut(id)?;
                     run::settle_unfinished(thread);
+                    self.settle_steering(thread)?;
                     match ended {
                         run::Ended::Complete { last, total } => {
                             thread.usage = Some(last);
@@ -1525,6 +1533,7 @@ impl Gateway {
             Command::SetJobEnabled { id, enabled } => self.set_job_enabled(id, enabled),
             Command::RemoveJob { id } => self.remove_job(id),
             Command::RunJob { id } => self.run_job(id),
+            Command::Steer { thread, text } => self.steer(thread, text),
             Command::InstallProposal { digest } => {
                 let summary = self.extensions.install_proposal(digest).await?;
                 self.policy_changed();

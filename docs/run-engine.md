@@ -52,6 +52,23 @@ after the report is logged, so tool output never reaches the logs. Budget exhaus
 with a `PermissionDenied` report; cancellation leaves it `Cancelled`. A gateway
 restart cancels unfinished calls and drops pending approvals.
 
+### Steering a run
+
+`Steer { thread, text }` adds a message to a native run while it works, from the
+composer (Enter while the response runs), `agent206 steer THREAD TEXT` or a
+parent's `subagent_send`. It is refused with a conflict when the conversation
+has no native run taking messages (none is going, it is ending, or it belongs to
+another coding engine) and is sized like `Send`, room for its reply included.
+The message waits in `Thread::steering` and joins the conversation as an
+ordinary user message at the start of the next round: after the cancellation and
+storage checks and before the compaction check, so it is counted and never
+summarized away, and never between a reply and its tool results. A run whose
+model has just answered without tool calls continues for a message waiting then,
+within its round budget. The run stops taking messages in the same critical
+section in which it finds none waiting, so a message is either answered or
+refused. Messages left when a run fails or is cancelled, or when the gateway
+restarts, stay in the conversation after it rather than being dropped.
+
 ## Permissions
 
 `Thread::tool_permissions` holds the user's Allow/Ask/Deny per model-facing tool
@@ -326,7 +343,8 @@ until the user permits them on that conversation.
 - A model addresses only its own conversation's direct subagents. A conversation
   descended from 3 others cannot spawn, and at most 8 of a conversation's
   subagents run at once.
-- `subagent_spawn` and `subagent_send` start the run in the background through
+- `subagent_send` to a subagent whose run is going steers it (`Steer`);
+  otherwise `subagent_spawn` and `subagent_send` start the run in the background through
   `Send`, so it is admitted, journaled and shown like any other run, approvals
   included; a message the gateway refuses is reported by `subagent_status`.
   `subagent_wait` waits at most 600 seconds and is cancel-safe; it follows a
@@ -345,7 +363,7 @@ delegator reaches the gateway's tool hosts through a weak link, so the hosts
 holding it never keep a closed gateway alive. A gateway that gains a tool host
 (`with_tool_host`) gets subagent tools bound to its own host list, so its other
 clones keep theirs. Tests: `crates/runtime/tests/tool_loop.rs` (spawn,
-inherited permissions, wait, cascading cancel, refusals),
+inherited permissions, wait, cascading cancel, refusals, steering),
 `delegation_tool/tests.rs` and `gateway/delegation/tests.rs` (reservations,
 clones, waiting on user-started runs).
 
