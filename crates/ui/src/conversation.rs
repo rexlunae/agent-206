@@ -5,8 +5,23 @@ use a206_core::{
 };
 use fc_dioxus::prelude::*;
 use uuid::Uuid;
+/// Scrolls a linked message into view where the renderer can scroll.
+async fn reveal(mounted: MountedEvent) {
+    match mounted.data().scroll_to(ScrollBehavior::Instant).await {
+        Ok(()) => {}
+        // The terminal renderer cannot scroll an element into view; the
+        // message is still marked.
+        Err(MountedError::NotSupported) => {}
+        Err(error) => {
+            tracing::warn!(
+                error = &error as &dyn std::error::Error,
+                "could not scroll to the linked message"
+            );
+        }
+    }
+}
 #[component]
-pub fn Workspace(id: Uuid, split: Option<Uuid>) -> Element {
+pub fn Workspace(id: Uuid, split: Option<Uuid>, message: Option<Uuid>) -> Element {
     let state = use_context::<State>();
     let snapshot = state.data.read();
     let thread = snapshot.threads.iter().find(|t| t.id == id).cloned();
@@ -21,7 +36,7 @@ pub fn Workspace(id: Uuid, split: Option<Uuid>) -> Element {
                 strong { "Conversations" }
                 div { class: "a206-row a206-chat-actions",
                     NativeSelect { class: "a206-split-selector", size: InputSize::Sm, aria_label: "Open a second conversation", value: visible_split.map(|id| id.to_string()).unwrap_or_default(),
-                        onchange: move |value: String| { state.navigator.push(Route::Chat { id, split: Uuid::parse_str(&value).ok().filter(|second| *second != id) }); },
+                        onchange: move |value: String| { state.navigator.push(Route::Chat { id, split: Uuid::parse_str(&value).ok().filter(|second| *second != id), message: None }); },
                         option { value: "", selected: visible_split.is_none(), "Split view…" }
                         for other in snapshot.threads.iter().filter(|t| t.id != id) { option { value: "{other.id}", selected: visible_split == Some(other.id), "{other.title}" } }
                     }
@@ -30,18 +45,23 @@ pub fn Workspace(id: Uuid, split: Option<Uuid>) -> Element {
             }
             if split.is_some_and(|second| second != id) && secondary.is_none() {
                 Alert { title: rsx! { "Second conversation unavailable" }, "It may have been removed or belong to another gateway.",
-                    LinkButton { href: Route::Chat { id, split: None }.to_string(), variant: ButtonVariant::Ghost, "Close split view" }
+                    LinkButton { href: Route::Chat { id, split: None, message: None }.to_string(), variant: ButtonVariant::Ghost, "Close split view" }
+                }
+            }
+            if message.is_some_and(|message| !thread.messages.iter().any(|m| m.id == message)) {
+                Alert { title: rsx! { "Message unavailable" }, "That message is no longer in this conversation.",
+                    LinkButton { href: Route::Chat { id, split, message: None }.to_string(), variant: ButtonVariant::Ghost, "Show the whole conversation" }
                 }
             }
             div { class: "a206-chat-layout",
                 if let Some(second) = secondary {
                     Split { key: "columns:{thread.id}", label: name!("Conversation columns"), default_value: 50.0, min: 25.0, max: 75.0,
-                        primary: rsx! { Conversation { key: "{thread.id}", thread } },
-                        secondary: rsx! { Conversation { key: "{second.id}", thread: second } }
+                        primary: rsx! { Conversation { key: "{thread.id}", thread, target: message } },
+                        secondary: rsx! { Conversation { key: "{second.id}", thread: second, target: None } }
                     }
                 } else {
                     Split { key: "inspector:{thread.id}", label: name!("Conversation and inspector"), default_value: 73.0, min: 45.0, max: 85.0,
-                        primary: rsx! { Conversation { key: "{thread.id}", thread: thread.clone() } },
+                        primary: rsx! { Conversation { key: "{thread.id}", thread: thread.clone(), target: message } },
                         secondary: rsx! { Inspector { thread } }
                     }
                 }
@@ -55,8 +75,9 @@ pub fn Workspace(id: Uuid, split: Option<Uuid>) -> Element {
         }
     }
 }
+/// One conversation; `target` is a message to scroll to and mark.
 #[component]
-fn Conversation(thread: Thread) -> Element {
+fn Conversation(thread: Thread, target: Option<Uuid>) -> Element {
     let mut state = use_context::<State>();
     let mut draft = use_signal(String::new);
     let mut attachments = use_signal(Vec::<TextAttachment>::new);
@@ -243,6 +264,11 @@ fn Conversation(thread: Thread) -> Element {
                         if let Some(compaction) = &message.compaction {
                             Badge { tone: BadgeTone::Accent,
                                 {format!("{} {} earlier messages", match compaction.trigger { CompactionTrigger::Automatic => "Automatically summarized", CompactionTrigger::Manual => "Summarized" }, compaction.messages)}
+                            }
+                        }
+                        if target == Some(message.id) {
+                            span { onmounted: move |mounted: MountedEvent| async move { reveal(mounted).await },
+                                Badge { tone: BadgeTone::Accent, Icon { name: IconName::Search, size: IconSize::Sm } "Linked message" }
                             }
                         }
                         p { class: "a206-message-text", "{message.text}" }
