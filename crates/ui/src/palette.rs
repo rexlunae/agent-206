@@ -44,13 +44,30 @@ impl Entry {
 /// `can_create` is whether the gateway can take a new conversation now.
 pub(crate) fn entries(snapshot: &Snapshot, route: &Route, can_create: bool) -> Vec<Entry> {
     let mut entries = vec![];
-    if let Route::Chat { id, .. } = route
-        && let Some(thread) = snapshot.threads.iter().find(|t| t.id == *id)
+    // Both conversations of a split view are on screen, so both offer their
+    // actions, named by title when there are two.
+    let visible: Vec<Id> = match route {
+        Route::Chat { id, split, .. } => std::iter::once(*id)
+            .chain(split.filter(|second| second != id))
+            .collect(),
+        _ => vec![],
+    };
+    let named = visible.len() > 1;
+    for thread in visible
+        .iter()
+        .filter_map(|id| snapshot.threads.iter().find(|t| t.id == *id))
     {
+        let title = |action: &str| {
+            if named {
+                format!("{action}: {}", thread.title)
+            } else {
+                action.to_owned()
+            }
+        };
         let running = thread.state == RunState::Running;
         if running {
             entries.push(Entry::new(
-                "Stop response",
+                title("Stop response"),
                 "This conversation",
                 IconName::Stop,
                 Action::Stop(thread.id),
@@ -60,7 +77,7 @@ pub(crate) fn entries(snapshot: &Snapshot, route: &Route, can_create: bool) -> V
         if thread.backend == CodingBackend::Native && !running && thread.model.is_some() {
             entries.push(
                 Entry::new(
-                    "Summarize earlier messages",
+                    title("Summarize earlier messages"),
                     "This conversation",
                     IconName::Edit,
                     Action::Compact(thread.id),
@@ -82,7 +99,7 @@ pub(crate) fn entries(snapshot: &Snapshot, route: &Route, can_create: bool) -> V
             "Search messages",
             "Actions",
             IconName::Search,
-            Action::Open(Route::Workspace {}),
+            Action::Open(Route::Conversations {}),
         )
         .detail("Find text in any conversation"),
     );
@@ -105,7 +122,7 @@ pub(crate) fn entries(snapshot: &Snapshot, route: &Route, can_create: bool) -> V
             split: None,
             message: None,
         };
-        if matches!(route, Route::Chat { id, .. } if *id == thread.id) {
+        if visible.contains(&thread.id) {
             continue;
         }
         entries.push(
@@ -190,6 +207,24 @@ fn run(state: State, action: Action) {
     }
 }
 
+/// What a key pressed in the filter field does, with `count` matches and
+/// `current` highlighted.
+#[derive(Debug, PartialEq)]
+enum Keyed {
+    Highlight(usize),
+    Run,
+    Pass,
+}
+
+fn keyed(key: &Key, composing: bool, count: usize, current: usize) -> Keyed {
+    match key {
+        Key::ArrowDown if count > 0 => Keyed::Highlight((current + 1) % count),
+        Key::ArrowUp if count > 0 => Keyed::Highlight((current + count - 1) % count),
+        Key::Enter if !composing && count > 0 => Keyed::Run,
+        _ => Keyed::Pass,
+    }
+}
+
 /// Whether a key event opens the palette: Ctrl+K, or ⌘K on macOS.
 pub(crate) fn opens(event: &KeyboardEvent) -> bool {
     let modifiers = event.modifiers();
@@ -226,21 +261,23 @@ pub(crate) fn CommandPalette(open: Signal<bool>, route: Route) -> Element {
             title: rsx! { "Go to or run" },
             description: rsx! { "Type to filter. Up and down choose, Enter runs, Escape closes." },
             div { class: "a206-stack",
-                onkeydown: move |event: KeyboardEvent| match event.key() {
-                    Key::ArrowDown if count > 0 => { event.prevent_default(); selected.set((current + 1) % count); }
-                    Key::ArrowUp if count > 0 => { event.prevent_default(); selected.set((current + count - 1) % count); }
-                    Key::Enter if !event.is_composing() => {
-                        event.prevent_default();
-                        if let Some(action) = first.clone() { choose(action); }
-                    }
-                    _ => {}
-                },
-                Input { value: ReadSignal::from(query), oninput: move |value| { query.set(value); selected.set(0); },
-                    aria_label: "Pages, conversations and actions", placeholder: "Search pages, conversations and actions",
-                    "autofocus": "true", autocomplete: "off", "spellcheck": "false",
-                    aria_controls: "{list}", aria_describedby: "{status}" }
+                // Only the filter field's keys: a focused result button keeps
+                // its own Enter.
+                div { onkeydown: move |event: KeyboardEvent| match keyed(&event.key(), event.is_composing(), count, current) {
+                        Keyed::Highlight(index) => { event.prevent_default(); selected.set(index); }
+                        Keyed::Run => {
+                            event.prevent_default();
+                            if let Some(action) = first.clone() { choose(action); }
+                        }
+                        Keyed::Pass => {}
+                    },
+                    Input { value: ReadSignal::from(query), oninput: move |value| { query.set(value); selected.set(0); },
+                        aria_label: "Pages, conversations and actions", placeholder: "Search pages, conversations and actions",
+                        "autofocus": "true", autocomplete: "off", "spellcheck": "false",
+                        aria_controls: "{list}", aria_describedby: "{status}" }
+                }
                 p { id: "{status}", class: "a206-muted", role: "status",
-                    match &highlighted { Some(title) => format!("{count} matches. Enter opens {title}."), None => "Nothing matches.".to_string() }
+                    match &highlighted { Some(title) => format!("{count} matches. Enter chooses {title}."), None => "Nothing matches.".to_string() }
                 }
                 List { id: "{list}", class: "a206-palette-results", aria_label: "Matches",
                     for (index, entry) in shown.into_iter().enumerate() {
@@ -421,6 +458,67 @@ mod tests {
         assert_eq!(titles(&filter(detailed, "convers")), ["Report"]);
     }
 
+    #[test]
+    fn a_split_view_offers_both_conversations_actions_by_title() {
+        let model = || ModelKey {
+            provider: Uuid::new_v4(),
+            model: format!("m-{}", Uuid::new_v4().simple()),
+        };
+        let mut first = thread(Mode::Chat);
+        first.model = Some(model());
+        let mut second = thread(Mode::Code);
+        second.model = Some(model());
+        second.state = RunState::Running;
+        let other = thread(Mode::Chat);
+        let snap = snapshot(vec![first.clone(), second.clone(), other.clone()]);
+        let route = Route::Chat {
+            id: first.id,
+            split: Some(second.id),
+            message: None,
+        };
+        let offered = entries_for(&snap, route);
+        let stop = offered
+            .iter()
+            .find(|e| e.action == Action::Stop(second.id))
+            .map(|e| e.title.clone());
+        assert_eq!(stop, Some(format!("Stop response: {}", second.title)));
+        let compact = offered
+            .iter()
+            .find(|e| e.action == Action::Compact(first.id))
+            .map(|e| e.title.clone());
+        assert_eq!(
+            compact,
+            Some(format!("Summarize earlier messages: {}", first.title))
+        );
+        // Neither visible conversation is offered as a place to go.
+        let places = titles(&offered);
+        assert!(!places.contains(&first.title.as_str()));
+        assert!(!places.contains(&second.title.as_str()));
+        assert!(places.contains(&other.title.as_str()));
+    }
+
+    #[test]
+    fn search_messages_opens_the_page_that_has_message_search() {
+        let snap = snapshot(vec![]);
+        let search = entries(&snap, &Route::Workspace {}, true)
+            .into_iter()
+            .find(|e| e.title == "Search messages")
+            .map(|e| e.action);
+        assert_eq!(search, Some(Action::Open(Route::Conversations {})));
+    }
+
+    #[test]
+    fn filter_keys_wrap_the_highlight_and_enter_runs_only_a_match() {
+        assert_eq!(keyed(&Key::ArrowDown, false, 3, 2), Keyed::Highlight(0));
+        assert_eq!(keyed(&Key::ArrowUp, false, 3, 0), Keyed::Highlight(2));
+        assert_eq!(keyed(&Key::ArrowDown, false, 0, 0), Keyed::Pass);
+        assert_eq!(keyed(&Key::Enter, false, 3, 1), Keyed::Run);
+        // Nothing to run, or an input method still composing.
+        assert_eq!(keyed(&Key::Enter, false, 0, 0), Keyed::Pass);
+        assert_eq!(keyed(&Key::Enter, true, 3, 1), Keyed::Pass);
+        assert_eq!(keyed(&Key::Tab, false, 3, 1), Keyed::Pass);
+    }
+
     #[derive(Clone, Debug, PartialEq, Routable)]
     enum PageRoute {
         #[route("/")]
@@ -450,7 +548,7 @@ mod tests {
         dom.rebuild_in_place();
         let html = dioxus_ssr::render(&dom);
         assert!(html.contains("Go to or run"), "{html}");
-        assert!(html.contains("Enter opens New conversation"), "{html}");
+        assert!(html.contains("Enter chooses New conversation"), "{html}");
         assert!(html.contains(&conversation.title), "{html}");
         assert!(html.contains("a206-palette-current"), "{html}");
     }

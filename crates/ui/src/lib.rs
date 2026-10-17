@@ -635,6 +635,16 @@ fn Shell() -> Element {
     let route = use_route::<Route>();
     // The palette reaches workspace pages, which sign-in and setup replace.
     let navigable = !signing_in && !setup();
+    // Close it when they do, so it does not reappear unasked afterwards.
+    use_effect(move || {
+        #[cfg(target_arch = "wasm32")]
+        let gated = sign_in() || setup();
+        #[cfg(not(target_arch = "wasm32"))]
+        let gated = setup();
+        if gated && *palette.peek() {
+            palette.set(false);
+        }
+    });
     rsx! {
         // Focusable so Ctrl+K reaches it wherever in the window focus is.
         div { class: "a206-shell a206-app", tabindex: "-1",
