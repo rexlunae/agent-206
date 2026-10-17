@@ -43,7 +43,7 @@ impl Spec {
     }
 }
 
-pub(crate) const COMMANDS: [Spec; 9] = [
+pub(crate) const COMMANDS: [Spec; 11] = [
     Spec {
         name: "new",
         argument: Argument::None,
@@ -63,6 +63,16 @@ pub(crate) const COMMANDS: [Spec; 9] = [
         name: "stop",
         argument: Argument::None,
         about: "Stop the running response",
+    },
+    Spec {
+        name: "pause",
+        argument: Argument::None,
+        about: "Pause the running response before its next model round",
+    },
+    Spec {
+        name: "resume",
+        argument: Argument::None,
+        about: "Let a paused response continue",
     },
     Spec {
         name: "mode",
@@ -97,6 +107,8 @@ pub(crate) enum Slash {
     Rename(String),
     Compact,
     Stop,
+    Pause,
+    Resume,
     Mode(String),
     Model(String),
     /// `None` is the automatic effort the selector calls Auto.
@@ -158,6 +170,8 @@ pub(crate) fn parse(draft: &str) -> Result<Typed, ErrorReport> {
         "rename" => Slash::Rename(argument),
         "compact" => Slash::Compact,
         "stop" => Slash::Stop,
+        "pause" => Slash::Pause,
+        "resume" => Slash::Resume,
         "mode" => Slash::Mode(argument),
         "model" => Slash::Model(argument),
         "effort" => Slash::Effort((!argument.is_empty()).then_some(argument)),
@@ -350,6 +364,18 @@ pub(crate) fn resolve(
         )),
         Slash::Stop if running => Ok(Command::CancelRun { thread: thread.id }),
         Slash::Stop => Err(refused("Nothing is running in this conversation")),
+        // The same conditions as the conversation's own Pause and Resume.
+        Slash::Pause if crate::running::pausable(thread) => {
+            Ok(Command::PauseRun { thread: thread.id })
+        }
+        Slash::Pause if thread.paused => Err(refused("This response is already paused")),
+        Slash::Pause => Err(refused(
+            "Only a running native response can be paused, and not while it is being summarized",
+        )),
+        Slash::Resume if crate::running::resumable(thread) => {
+            Ok(Command::ResumeRun { thread: thread.id })
+        }
+        Slash::Resume => Err(refused("Nothing is paused in this conversation")),
         Slash::Mode(name) => {
             settled()?;
             let mode = Mode::ALL
@@ -486,11 +512,13 @@ mod tests {
         assert_eq!(
             names("/"),
             [
-                "new", "rename", "compact", "stop", "mode", "model", "effort", "in", "every"
+                "new", "rename", "compact", "stop", "pause", "resume", "mode", "model", "effort",
+                "in", "every"
             ]
         );
         assert_eq!(names("/mod"), ["mode", "model"]);
         assert_eq!(names("/s"), ["stop"]);
+        assert_eq!(names("/re"), ["rename", "resume"]);
         assert!(names("/x").is_empty());
         // Once the name is finished, or for ordinary text, there is nothing to complete.
         assert!(names("/rename ").is_empty());
@@ -537,6 +565,35 @@ mod tests {
         thread.state = RunState::Idle;
         thread.backend = CodingBackend::Codex;
         assert!(resolve(Slash::Compact, &thread, &snapshot, true).is_err());
+    }
+
+    #[test]
+    fn pause_and_resume_follow_the_running_response() {
+        let snapshot = crate::empty_snapshot();
+        let mut thread = Thread::new(text(), Mode::Chat);
+        assert_eq!(parse("/pause"), Ok(Typed::Run(Slash::Pause)));
+        assert_eq!(parse("/resume"), Ok(Typed::Run(Slash::Resume)));
+        assert!(parse(&format!("/pause {}", text())).is_err());
+        // Idle: nothing to pause or resume.
+        assert!(resolve(Slash::Pause, &thread, &snapshot, true).is_err());
+        assert!(resolve(Slash::Resume, &thread, &snapshot, true).is_err());
+        thread.state = RunState::Running;
+        assert_eq!(
+            resolve(Slash::Pause, &thread, &snapshot, true),
+            Ok(Command::PauseRun { thread: thread.id })
+        );
+        assert!(resolve(Slash::Resume, &thread, &snapshot, true).is_err());
+        thread.paused = true;
+        let twice = resolve(Slash::Pause, &thread, &snapshot, true).expect_err("paused");
+        assert_eq!(twice.kind, ErrorKind::InvalidRequest);
+        assert_eq!(
+            resolve(Slash::Resume, &thread, &snapshot, true),
+            Ok(Command::ResumeRun { thread: thread.id })
+        );
+        // Only native runs pause.
+        thread.paused = false;
+        thread.backend = CodingBackend::Codex;
+        assert!(resolve(Slash::Pause, &thread, &snapshot, true).is_err());
     }
 
     fn model(efforts: Vec<String>) -> ModelInfo {
