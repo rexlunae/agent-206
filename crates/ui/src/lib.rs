@@ -10,6 +10,7 @@ mod messengers;
 mod pages;
 mod route;
 mod settings;
+mod skills;
 mod tools;
 #[cfg(target_arch = "wasm32")]
 use a206_core::Ignore;
