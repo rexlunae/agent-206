@@ -216,15 +216,23 @@ async fn serve_network(
     static_dir: PathBuf,
     options: NetworkOptions,
 ) -> Result<(), WebError> {
-    let (names, hosts) = host_names(&options.names, options.listen.port())?;
-    access::ready(&root).await.map_err(WebError::SignIn)?;
-    let tls = tls::load(&root, &names, &options.certificate).map_err(WebError::Tls)?;
     let addr = options.listen;
     let listener =
         std::net::TcpListener::bind(addr).map_err(|source| WebError::Bind { addr, source })?;
-    listener
+    let bound = listener
         .set_nonblocking(true)
+        .and_then(|()| listener.local_addr())
         .map_err(|source| WebError::Bind { addr, source })?;
+    // Port 0 asks the system for one; browsers send the one it assigned.
+    let (names, hosts) = host_names(&options.names, bound.port())?;
+    access::ready(&root).await.map_err(WebError::SignIn)?;
+    let tls = tls::load(
+        &root,
+        &names,
+        &options.certificate,
+        std::time::SystemTime::now(),
+    )
+    .map_err(WebError::Tls)?;
     let gateway = Gateway::resolve(&root, remote)?;
     let urls: Vec<_> = hosts
         .iter()
@@ -332,8 +340,17 @@ async fn canonical_host(
     request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
-    let Some(loopback) = state.access.loopback() else {
-        return next.run(request).await;
+    let loopback = match state.access.as_ref() {
+        Access::Loopback(loopback) => loopback,
+        // Opened to other devices, nothing (not even the sign-in page) is
+        // served for a name that was not listed.
+        Access::Network(network) => {
+            return if network.serves(request.headers()) {
+                next.run(request).await
+            } else {
+                StatusCode::MISDIRECTED_REQUEST.into_response()
+            };
+        }
     };
     let host = request
         .headers()
@@ -1224,5 +1241,10 @@ mod tests {
         // There is no one-time link to claim.
         let link = get_with_host(&app, "/connect/anything", HOST).await;
         assert_eq!(link.status(), StatusCode::NOT_FOUND);
+        // An unlisted name gets nothing, not even the page that asks for codes.
+        for path in ["/", "/connect/anything"] {
+            let other = get_with_host(&app, path, "rebound.test:8443").await;
+            assert_eq!(other.status(), StatusCode::MISDIRECTED_REQUEST, "{path}");
+        }
     }
 }

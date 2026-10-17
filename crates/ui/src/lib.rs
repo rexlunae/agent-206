@@ -565,8 +565,6 @@ fn Shell() -> Element {
     };
     use_context_provider(|| state);
     use_future(move || async move {
-        #[cfg(target_arch = "wasm32")]
-        sign_in::detect().await;
         // The web bridge may not have a gateway yet; it is asked once this
         // browser may use it, before any gateway is polled.
         #[cfg(target_arch = "wasm32")]
@@ -575,6 +573,7 @@ fn Shell() -> Element {
         loop {
             #[cfg(target_arch = "wasm32")]
             let signing_in = {
+                sign_in::detect().await;
                 let mut sign_in = state.sign_in;
                 if sign_in::required() && !*sign_in.peek() {
                     sign_in.set(true);

@@ -5,23 +5,29 @@
 use crate::{PageFrame, State, error::ErrorNotice};
 use a206_core::{ErrorKind, ErrorReport, SignInReply, SignInRequest};
 use fc_dioxus::prelude::*;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 
-/// Whether this server signs browsers in with authenticator codes.
-static NETWORK: AtomicBool = AtomicBool::new(false);
+const UNKNOWN: u8 = 0;
+const LOOPBACK: u8 = 1;
+const NETWORK: u8 = 2;
+/// How this server signs browsers in, once it has said.
+static METHOD: AtomicU8 = AtomicU8::new(UNKNOWN);
 
 pub(crate) fn network() -> bool {
-    NETWORK.load(Ordering::Relaxed)
+    METHOD.load(Ordering::Relaxed) == NETWORK
 }
 
-/// Ask the server how browsers sign in. A server that cannot say (an older
-/// build, or one not reachable yet) is treated as loopback; the next request
-/// to it reports the actual problem.
+/// Ask the server how browsers sign in, until it answers. A failed request
+/// (the connection dropped, or an older server) says nothing, so the shell asks
+/// again on its next round; until then the browser is treated as loopback.
 pub(crate) async fn detect() {
+    if METHOD.load(Ordering::Relaxed) != UNKNOWN {
+        return;
+    }
     if let Ok(SignInReply::Methods { totp }) =
         crate::web_post::<_, SignInReply>("/api/sign-in", SignInRequest::Methods, None).await
     {
-        NETWORK.store(totp, Ordering::Relaxed);
+        METHOD.store(if totp { NETWORK } else { LOOPBACK }, Ordering::Relaxed);
     }
 }
 

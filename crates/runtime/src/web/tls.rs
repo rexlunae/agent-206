@@ -79,10 +79,11 @@ pub(super) fn load(
     root: &Path,
     names: &[String],
     certificate: &Certificate,
+    now: SystemTime,
 ) -> Result<Loaded, TlsError> {
     let (cert, key) = match certificate {
         Certificate::Files { cert, key } => (cert.clone(), key.clone()),
-        Certificate::Generated => generated(root, names, SystemTime::now())?,
+        Certificate::Generated => generated(root, names, now)?,
     };
     let chain = CertificateDer::pem_file_iter(&cert)
         .and_then(Iterator::collect::<Result<Vec<_>, _>>)
@@ -201,6 +202,10 @@ fn private_file(path: &Path, bytes: &[u8]) -> Result<(), TlsError> {
 mod tests {
     use super::*;
 
+    /// A fixed moment, so certificate renewal never depends on the test's clock.
+    fn moment() -> SystemTime {
+        UNIX_EPOCH + Duration::from_secs(1_800_000_000)
+    }
     fn names() -> Vec<String> {
         vec![
             format!("h{}.test", uuid::Uuid::new_v4().simple()),
@@ -212,7 +217,7 @@ mod tests {
     fn a_generated_certificate_is_reused_for_the_same_names_and_renewed_near_expiry() {
         let root = tempfile::tempdir().unwrap();
         let names = names();
-        let now = SystemTime::now();
+        let now = moment();
         let first = generated(root.path(), &names, now).unwrap();
         let pem = std::fs::read(&first.0).unwrap();
         let mut reversed = names.clone();
@@ -234,7 +239,7 @@ mod tests {
             let mode = std::fs::metadata(&renewed.1).unwrap().permissions().mode();
             assert_eq!(mode & 0o077, 0, "key is readable by others: {mode:o}");
         }
-        let loaded = load(root.path(), &names, &Certificate::Generated).unwrap();
+        let loaded = load(root.path(), &names, &Certificate::Generated, late).unwrap();
         assert_eq!(loaded.fingerprint.len(), 32 * 3 - 1);
     }
 
@@ -249,7 +254,7 @@ mod tests {
             cert: cert.clone(),
             key: key.clone(),
         };
-        let Err(error) = load(root.path(), &names(), &files) else {
+        let Err(error) = load(root.path(), &names(), &files, moment()) else {
             panic!("loaded an empty certificate file");
         };
         assert!(matches!(&error, TlsError::NoCertificate { path } if *path == cert));
@@ -258,12 +263,12 @@ mod tests {
             a206_core::ErrorKind::InvalidRequest
         );
         // A real certificate with a missing key names the key.
-        let (generated_cert, _) = generated(root.path(), &names(), SystemTime::now()).unwrap();
+        let (generated_cert, _) = generated(root.path(), &names(), moment()).unwrap();
         let files = Certificate::Files {
             cert: generated_cert,
             key: root.path().join("missing.pem"),
         };
-        let Err(error) = load(root.path(), &names(), &files) else {
+        let Err(error) = load(root.path(), &names(), &files, moment()) else {
             panic!("loaded without a key");
         };
         assert!(matches!(&error, TlsError::Pem { path, .. } if path.ends_with("missing.pem")));

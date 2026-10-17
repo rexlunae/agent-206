@@ -128,10 +128,10 @@ impl Access {
             Self::Loopback(loopback) => {
                 host == Some(loopback.host.as_str()) && origin == Some(loopback.origin.as_str())
             }
-            Self::Network(network) => host.is_some_and(|host| {
-                network.hosts.iter().any(|allowed| allowed == host)
-                    && origin.and_then(|origin| origin.strip_prefix("https://")) == Some(host)
-            }),
+            Self::Network(network) => {
+                network.serves(headers)
+                    && origin.and_then(|origin| origin.strip_prefix("https://")) == host
+            }
         };
         placed && text(headers, header::CONTENT_TYPE) == Some("application/msgpack")
     }
@@ -162,6 +162,10 @@ impl Loopback {
     }
 }
 impl Network {
+    /// Whether the request names one of this server's hosts.
+    pub fn serves(&self, headers: &HeaderMap) -> bool {
+        text(headers, header::HOST).is_some_and(|host| self.hosts.iter().any(|h| h == host))
+    }
     /// Check `code` against the vault's authenticator and start a session.
     /// A code is accepted only while the vault is unlocked with an enrolled
     /// authenticator; the broker's throttle and replay protection apply.
