@@ -1,5 +1,6 @@
 //! Native command execution for the run engine: one [`ToolHost`] tool that
-//! runs a shell command inside the OS sandbox (`a206_sandbox` on Linux).
+//! runs a shell command inside the OS sandbox (`a206_sandbox`: bubblewrap and
+//! Landlock on Linux, Seatbelt on macOS).
 //!
 //! The tool declares only [`Capability::Execute`], and its host policy is
 //! `Ask`, so every call waits for the user's approval of that exact command
@@ -10,6 +11,10 @@
 //! credential stores under `$HOME` stay hidden even inside the project. The
 //! environment is empty apart from a private home, temporary directory and a
 //! fixed `PATH`.
+//!
+//! macOS has no PID namespace, so the shell's process group is killed when it
+//! exits; a process that leaves that group (with `setsid`) can outlive the
+//! call there, though it stays inside the same Seatbelt policy.
 //!
 //! Platforms without that isolation do not offer the tool: they report it
 //! unavailable rather than run commands unconfined.
@@ -23,6 +28,13 @@ use std::path::{Path, PathBuf};
 pub const NAME: &str = "execute_command";
 /// The source named when the tool is unavailable.
 pub const SOURCE: &str = "native exec";
+/// The command's locale; macOS has no `C.UTF-8`.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const LOCALE: &str = if cfg!(target_os = "macos") {
+    "en_US.UTF-8"
+} else {
+    "C.UTF-8"
+};
 /// Seconds a command may run when the call names no timeout.
 pub const DEFAULT_TIMEOUT: u64 = 30;
 /// Longest timeout a call may ask for.
@@ -158,7 +170,7 @@ fn parse(arguments: &Map<String, Value>) -> Result<Call, ExecError> {
 /// Runs commands for native runs. `state_root` is the gateway's private
 /// state, which commands never see.
 pub struct ExecHost {
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    #[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
     state_root: PathBuf,
 }
 impl ExecHost {
@@ -207,7 +219,7 @@ impl ExecHost {
 impl ToolHost for ExecHost {
     fn list<'a>(&'a self, _scope: &'a ToolScope) -> BoxFuture<'a, ToolListing> {
         Box::pin(async move {
-            if cfg!(target_os = "linux") {
+            if cfg!(any(target_os = "linux", target_os = "macos")) {
                 ToolListing {
                     tools: vec![Self::spec()],
                     unavailable: vec![],
@@ -244,14 +256,14 @@ impl ToolHost for ExecHost {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 impl ExecHost {
     async fn run(&self, _scope: &ToolScope, _call: Call) -> Result<ToolOutput, ExecError> {
         Err(ExecError::Unsupported)
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 impl ExecHost {
     /// Cancel-safe: dropping the future kills the sandbox and everything in it.
     async fn run(&self, scope: &ToolScope, call: Call) -> Result<ToolOutput, ExecError> {
@@ -343,7 +355,7 @@ impl ExecHost {
             .env("HOME", &home)
             .env("TMPDIR", &tmp)
             .env("PATH", "/usr/bin:/bin")
-            .env("LANG", "C.UTF-8")
+            .env("LANG", LOCALE)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             // Bubblewrap reports setup failures here before the command starts.
@@ -351,20 +363,26 @@ impl ExecHost {
             .process_group(0)
             .kill_on_drop(true);
         let mut child = command.spawn().map_err(ExecError::Spawn)?;
-        let group = Group(
+        let group = Group(std::sync::Mutex::new(
             child
                 .id()
                 .and_then(|id| i32::try_from(id).ok())
                 .map(nix::unistd::Pid::from_raw),
-        );
+        ));
         let finished = tokio::time::timeout_at(deadline, async {
             control.ready(&mut child).await.map_err(ExecError::Start)?;
             let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
                 unreachable!("stdout and stderr are piped")
             };
-            // The sandbox's PID namespace ends with the shell, so no
-            // descendant can hold the pipes open past its exit.
-            let (status, out, err) = tokio::join!(child.wait(), bounded(stdout), bounded(stderr));
+            // On Linux the sandbox's PID namespace ends with the shell. macOS
+            // has none, so the shell's group is killed once it exits: a
+            // leftover background process cannot hold the pipes open.
+            let exited = async {
+                let status = child.wait().await;
+                group.kill();
+                status
+            };
+            let (status, out, err) = tokio::join!(exited, bounded(stdout), bounded(stderr));
             Ok::<_, ExecError>((status.map_err(ExecError::Output)?, out?, err?))
         })
         .await;
@@ -392,7 +410,7 @@ impl ExecHost {
 }
 
 /// The sandbox's process group, killed when dropped.
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 fn reject_protected_workspace(workspace: &Path, hidden: &[PathBuf]) -> Result<(), ExecError> {
     for path in hidden {
         // Missing credential stores cannot contain a canonical workspace.
@@ -414,7 +432,7 @@ fn reject_protected_workspace(workspace: &Path, hidden: &[PathBuf]) -> Result<()
     Ok(())
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 fn stream_text(name: &str, bytes: &[u8], cut: bool) -> String {
     let decoded = String::from_utf8_lossy(bytes);
     let mut end = decoded.len().min(MAX_STREAM);
@@ -428,21 +446,29 @@ fn stream_text(name: &str, bytes: &[u8], cut: bool) -> String {
     text
 }
 
-#[cfg(target_os = "linux")]
-struct Group(Option<nix::unistd::Pid>);
-#[cfg(target_os = "linux")]
-impl Drop for Group {
-    fn drop(&mut self) {
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+struct Group(std::sync::Mutex<Option<nix::unistd::Pid>>);
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl Group {
+    /// Kill the group once; later calls do nothing.
+    fn kill(&self) {
         use a206_core::Ignore;
-        if let Some(group) = self.0.take() {
+        let group = self.0.lock().ok().and_then(|mut group| group.take());
+        if let Some(group) = group {
             // The group may already have exited, and there is no caller to report to.
             nix::sys::signal::killpg(group, nix::sys::signal::Signal::SIGKILL).ignore();
         }
     }
 }
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl Drop for Group {
+    fn drop(&mut self) {
+        self.kill();
+    }
+}
 
 /// Read a stream to its end, keeping at most [`MAX_STREAM`] bytes.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 async fn bounded(
     mut stream: impl tokio::io::AsyncRead + Unpin,
 ) -> Result<(Vec<u8>, bool), ExecError> {
@@ -586,7 +612,7 @@ mod tests {
             capabilities: Default::default(),
         };
         let listing = host.list(&scope).await;
-        if cfg!(target_os = "linux") {
+        if cfg!(any(target_os = "linux", target_os = "macos")) {
             let [spec] = listing.tools.as_slice() else {
                 panic!("{listing:?}")
             };

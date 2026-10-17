@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Linux OS isolation for external agent runtimes: bubblewrap namespaces with Landlock inside"
+description = "OS isolation for external agent runtimes and commands: bubblewrap with Landlock on Linux, Seatbelt on macOS"
 [dependencies]
 a206-core.workspace = true
 serde.workspace = true

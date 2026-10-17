@@ -211,9 +211,9 @@ impl Rig {
             panic!("tool listing failed");
         };
         // Native exec is registered alongside extensions, but deliberately
-        // unavailable until equivalent isolation exists on this platform.
+        // unavailable where no equivalent isolation exists (Windows).
         // Still reject any unavailable extension or unexpected host failure.
-        if cfg!(target_os = "linux") {
+        if cfg!(any(target_os = "linux", target_os = "macos")) {
             assert!(list.unavailable.is_empty(), "{:?}", list.unavailable);
         } else {
             assert_eq!(list.unavailable.len(), 1, "{:?}", list.unavailable);
