@@ -11,7 +11,11 @@ format, frontmatter and gating rules, the Linux bubblewrap/Landlock sandbox
 design (crates/sandbox), tool-call argument repair and in-response
 de-duplication (`tool_healing.rs`), the project instruction file list
 (`workspace_context.rs`) and the 75% compaction threshold with
-summarize-older-turns compaction (`gateway/providers/mod.rs`) are adapted from
+summarize-older-turns compaction (`gateway/providers/mod.rs`), and the memory
+extension's BM25 search with heading/20-line section chunking, its word
+tokenization and the `MEMORY.md` + `memory/` file scope of `memory_search`,
+`memory_get` and note saving (`memory.rs`, `tools/memory_tools.rs`;
+plugins/memory) are adapted from
 RustyClaw,
 https://github.com/rexlunae/RustyClaw,
 Copyright (c) 2026 Erica Stith, MIT License (included in LICENSE).

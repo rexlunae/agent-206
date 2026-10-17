@@ -656,3 +656,196 @@ fn bundled_skill_guest_only_uses_the_scoped_skill_imports() {
         }]
     );
 }
+
+fn memory() -> Builtin {
+    builtin("agent206.memory").unwrap().unwrap()
+}
+/// A workspace of far more memory notes than one search may read, so the
+/// guest's own bounds stop it; each `ReadFile` returns `text(index)`.
+fn memory_corpus(
+    text: impl Fn(usize) -> String + 'static,
+) -> impl FnMut(&HostRequest) -> HostReply + 'static {
+    const NOTES: usize = 400;
+    move |request| match request {
+        HostRequest::ListDirectory { path } if path == "." => HostReply::Directory(vec![
+            entry("MEMORY.md", EntryKind::File),
+            entry("memory", EntryKind::Directory),
+        ]),
+        HostRequest::ListDirectory { .. } => HostReply::Directory(
+            (0..NOTES)
+                .map(|index| DirEntry {
+                    name: format!("{index:04}.md"),
+                    kind: EntryKind::File,
+                    // Unknown sizes: the guest must bound what it reads itself.
+                    size: None,
+                })
+                .collect(),
+        ),
+        HostRequest::ReadFile { path } => {
+            let index = path
+                .trim_start_matches("memory/")
+                .trim_end_matches(".md")
+                .parse()
+                .unwrap_or(NOTES);
+            HostReply::File(text(index).into_bytes().into())
+        }
+        other => panic!("memory_search sent {other:?}"),
+    }
+}
+
+/// The costliest inputs for the guest's loading and ranking still finish
+/// inside the default fuel, host-call and output limits: the guest's own
+/// work meter stops it first and says how much it searched.
+#[test]
+fn memory_search_at_its_bounds_fits_the_invocation_limits() {
+    // Non-ASCII terms of every length from 1 to 24 characters, so no word
+    // is ruled out by its length and odd-length ASCII words are compared.
+    let query = (1..=24)
+        .map(|n| format!("{}q", "ж".repeat(n - 1)))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let note = |unit: &str, index: usize| unit.repeat(8 * 1024 / unit.len() + index % 3);
+    // Each note about 8 KiB.
+    type Generate = Box<dyn Fn(usize) -> String>;
+    let corpora: Vec<(&str, Generate)> = vec![
+        // The most words per byte.
+        (
+            "short words",
+            Box::new(move |i| note("ab Cd e ij kl mn op q\n", i)),
+        ),
+        // The most lines per byte.
+        ("blank lines", Box::new(move |i| note("\n", i))),
+        // A separator character that is not ASCII between every letter.
+        ("wide separators", Box::new(move |i| note("a—", i))),
+        // Single non-ASCII characters, each its own word.
+        (
+            "distinct characters",
+            Box::new(|i| {
+                (0..2700)
+                    .filter_map(|k| char::from_u32(0xc0 + ((i * 2700 + k) % 0x1f00) as u32))
+                    .flat_map(|c| [c, ' '])
+                    .collect()
+            }),
+        ),
+        // Cyrillic words of the query's lengths, lowercased to compare.
+        (
+            "cased words",
+            Box::new(|i| {
+                (0..900)
+                    .map(|k| "Жжэ".chars().cycle().skip(i + k).take(1 + (i * 7 + k) % 24))
+                    .map(String::from_iter)
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            }),
+        ),
+        (
+            "mixed scripts",
+            Box::new(move |i| note("ÄÖÜ ÆØÅ Ωμέγα Жук 日本 語 ", i)),
+        ),
+    ];
+    for (label, text) in corpora {
+        let (bridge, seen) = mock(memory_corpus(text));
+        let (outcome, _) = engine::run(
+            memory().wasm,
+            &tool(
+                "memory_search",
+                &[
+                    ("query", Value::Str(query.clone())),
+                    ("max_results", Value::Int(20)),
+                ],
+            ),
+            Limits::default(),
+            bridge,
+        );
+        let Ok(Outcome::Tool(output)) = outcome else {
+            panic!("{label}: expected tool output, got {outcome:?}");
+        };
+        assert!(
+            output.text.contains("[stopped at a bound after "),
+            "{label}: {}",
+            output.text
+        );
+        assert!(
+            seen.borrow().iter().all(|r| matches!(
+                r,
+                HostRequest::ListDirectory { .. } | HostRequest::ReadFile { .. }
+            )),
+            "{label}: searching only lists and reads"
+        );
+    }
+}
+
+#[test]
+fn memory_tools_refuse_paths_before_any_host_call() {
+    let note = || ("text", Value::Str(unique("note")));
+    for (name, args) in [
+        (
+            "memory_get",
+            vec![("path", Value::Str(format!("src/{}.md", unique("s"))))],
+        ),
+        (
+            "memory_save",
+            vec![("path", Value::Str("MEMORY.md".into())), note()],
+        ),
+        (
+            "memory_save",
+            vec![
+                ("path", Value::Str(format!("memory/../{}.md", unique("s")))),
+                note(),
+            ],
+        ),
+    ] {
+        let (bridge, seen) = mock(|request| panic!("host call {request:?}"));
+        let (outcome, _) =
+            engine::run(memory().wasm, &tool(name, &args), Limits::default(), bridge);
+        let Ok(Outcome::Failed(error)) = outcome else {
+            panic!("expected a refusal, got {outcome:?}");
+        };
+        assert_eq!(error.code, "not_memory_path");
+        assert!(seen.borrow().is_empty());
+    }
+}
+
+#[test]
+fn memory_save_creates_a_note_through_write_calls() {
+    let path = format!("memory/{}/{}.md", unique("d"), unique("n"));
+    let text = unique("note ");
+    let (bridge, seen) = mock(|request| match request {
+        HostRequest::ReadFile { .. } => HostReply::Failed(HostFailure {
+            code: HostErrorCode::NotFound,
+            message: "no such file or directory".into(),
+        }),
+        _ => HostReply::Done,
+    });
+    let (outcome, _) = engine::run(
+        memory().wasm,
+        &tool(
+            "memory_save",
+            &[
+                ("path", Value::Str(path.clone())),
+                ("text", Value::Str(text.clone())),
+            ],
+        ),
+        Limits::default(),
+        bridge,
+    );
+    assert_eq!(
+        outcome.unwrap(),
+        Outcome::Tool(ToolOutput {
+            text: format!("created {path}, lines 1-1")
+        })
+    );
+    let parent = path.rsplit_once('/').unwrap().0.to_string();
+    assert_eq!(
+        *seen.borrow(),
+        vec![
+            HostRequest::ReadFile { path: path.clone() },
+            HostRequest::CreateDirectory { path: parent },
+            HostRequest::WriteFile {
+                path,
+                contents: format!("{text}\n").into_bytes().into(),
+                overwrite: false,
+            },
+        ]
+    );
+}
