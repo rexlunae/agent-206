@@ -11,6 +11,7 @@ a206-extensions.workspace = true
 a206-mcp.workspace = true
 a206-skills.workspace = true
 a206-vault.workspace = true
+http = "1"
 a206-broker.workspace = true
 a206-sandbox.workspace = true
 serde.workspace = true
@@ -54,6 +55,7 @@ tracing-subscriber.workspace = true
 tempfile.workspace = true
 a206-broker.workspace = true
 a206-vault.workspace = true
+http = "1"
 [[test]]
 name = "native_exec"
 harness = false

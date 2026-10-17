@@ -187,6 +187,10 @@ pub enum HostRequest {
     /// A unified diff of one file: `HEAD` against the index when `staged`,
     /// otherwise the index against the working tree.
     GitDiff { path: String, staged: bool },
+    /// `GET` a credential-free HTTPS URL on the standard port. The host, and
+    /// every redirect's, must be one the manifest declares, and every
+    /// resolved address must be public. No cookies, credentials or proxies.
+    Fetch { url: String },
     /// Read this extension's own persisted state.
     StateGet { key: String },
     /// Replace (`Some`) or delete (`None`) this extension's state entry.
@@ -210,6 +214,7 @@ pub enum HostReply {
     GitStatus(GitStatus),
     Commits(Vec<GitCommit>),
     Diff(GitDiff),
+    Fetched(FetchResponse),
     State(Option<ByteBuf>),
     Done,
     Failed(HostFailure),
@@ -220,6 +225,17 @@ pub struct DirEntry {
     pub kind: EntryKind,
     /// File size in bytes; absent for directories and unknown sizes.
     pub size: Option<u64>,
+}
+/// The final response of a fetch, after redirects. Any status is returned;
+/// a non-2xx status is not a host failure.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FetchResponse {
+    pub status: u16,
+    /// The `Content-Type` header, when present and valid text.
+    pub content_type: Option<String>,
+    pub body: ByteBuf,
+    /// The body was cut at the host's bound.
+    pub truncated: bool,
 }
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SearchResult {
@@ -330,6 +346,9 @@ pub enum HostErrorCode {
     /// This host does not implement the request.
     Unsupported,
     Io,
+    /// The destination could not be reached: DNS, connection, TLS, timeout
+    /// or too many redirects.
+    Network,
     /// A code from a newer host.
     #[serde(other)]
     Other,
@@ -347,6 +366,7 @@ impl HostErrorCode {
             Self::Budget => "budget",
             Self::Unsupported => "unsupported",
             Self::Io => "io",
+            Self::Network => "network",
             Self::Other => "other",
         }
     }

@@ -343,6 +343,37 @@ fn long_diffs_fit_the_outcome_limit() {
 }
 
 #[test]
+fn web_tool_reports_status_type_and_text() {
+    let builtin = builtin("agent206.web").unwrap().unwrap();
+    let (page, url) = (
+        unique("page"),
+        format!("https://{}.example/a", unique("site")),
+    );
+    let body = page.clone().into_bytes();
+    let (bridge, seen) = mock(move |_| {
+        HostReply::Fetched(FetchResponse {
+            status: 404,
+            content_type: Some("text/plain".into()),
+            body: body.clone().into(),
+            truncated: true,
+        })
+    });
+    let invocation = tool("fetch_url", &[("url", Value::Str(format!("{url}#part")))]);
+    let (outcome, _) = engine::run(builtin.wasm, &invocation, Limits::default(), bridge);
+    let Ok(Outcome::Tool(output)) = outcome else {
+        panic!("expected tool output, got {outcome:?}");
+    };
+    assert_eq!(
+        output.text,
+        format!(
+            "HTTP 404\nContent-Type: text/plain\n\n{page}\n[the response continues; it was cut at a limit]"
+        )
+    );
+    // The fragment never reaches the host call.
+    assert_eq!(*seen.borrow(), vec![HostRequest::Fetch { url }]);
+}
+
+#[test]
 fn budgets_stop_the_guest() {
     let reply = |_: &HostRequest| HostReply::Directory(vec![]);
     let (fuel, _) = engine::run(

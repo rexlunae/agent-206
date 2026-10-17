@@ -2,7 +2,9 @@
 //! RustyClaw's SSRF policy is preserved without its DNS re-check race.
 use a206_core::ErrorKind;
 use std::{
+    future::Future,
     net::{IpAddr, Ipv4Addr, SocketAddr},
+    pin::Pin,
     time::Duration,
 };
 use url::Url;
@@ -55,6 +57,8 @@ pub enum DownloadError {
     ResolveTimeout(#[source] tokio::time::error::Elapsed),
     #[error("download destination resolves to a private, reserved or local address")]
     PrivateAddress,
+    #[error("the destination host is not one the request may reach")]
+    Destination,
     #[error("download redirected too many times")]
     TooManyRedirects,
     #[error("download redirect has no valid destination")]
@@ -74,7 +78,7 @@ impl crate::error::Classified for DownloadError {
             | Self::NonstandardPort
             | Self::Fragment
             | Self::MissingHost => ErrorKind::InvalidRequest,
-            Self::PrivateAddress => ErrorKind::PermissionDenied,
+            Self::PrivateAddress | Self::Destination => ErrorKind::PermissionDenied,
             Self::Resolve(_) => ErrorKind::Unavailable,
             Self::ResolveTimeout(_) => ErrorKind::Timeout,
             Self::Transport(error) if error.is_timeout() => ErrorKind::Timeout,
@@ -103,54 +107,104 @@ fn validate_url(url: &Url) -> Result<(), DownloadError> {
 pub(crate) fn transport(error: reqwest::Error) -> DownloadError {
     DownloadError::Transport(error.without_url())
 }
+/// A future a [`Net`] returns.
+pub(crate) type Pending<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+/// DNS and HTTPS as public requests use them. The policy in
+/// [`public_request`] applies to every implementation; tests substitute
+/// one that never touches the network.
+pub(crate) trait Net: Send + Sync {
+    fn resolve<'a>(&'a self, host: &'a str) -> Pending<'a, std::io::Result<Vec<SocketAddr>>>;
+    /// One `GET` to `url`, connecting only to the checked `answers`.
+    fn get<'a>(
+        &'a self,
+        url: &'a Url,
+        host: &'a str,
+        answers: &'a [SocketAddr],
+    ) -> Pending<'a, Result<reqwest::Response, reqwest::Error>>;
+}
+/// The real network.
+pub(crate) struct Internet;
+impl Net for Internet {
+    fn resolve<'a>(&'a self, host: &'a str) -> Pending<'a, std::io::Result<Vec<SocketAddr>>> {
+        Box::pin(async move { Ok(tokio::net::lookup_host((host, 443)).await?.collect()) })
+    }
+    fn get<'a>(
+        &'a self,
+        url: &'a Url,
+        host: &'a str,
+        answers: &'a [SocketAddr],
+    ) -> Pending<'a, Result<reqwest::Response, reqwest::Error>> {
+        Box::pin(async move {
+            reqwest::Client::builder()
+                .no_proxy()
+                .https_only(true)
+                .connect_timeout(Duration::from_secs(10))
+                .read_timeout(Duration::from_secs(30))
+                .redirect(reqwest::redirect::Policy::none())
+                .resolve_to_addrs(host, answers)
+                .build()?
+                .get(url.clone())
+                .send()
+                .await
+        })
+    }
+}
+
+/// A successful public download.
 pub async fn public_get(source: &str) -> Result<reqwest::Response, DownloadError> {
+    let response = public_request(source, |_| true, &Internet).await?;
+    if response.status().is_success() {
+        Ok(response)
+    } else {
+        Err(DownloadError::Status {
+            status: response.status(),
+        })
+    }
+}
+
+/// The final non-redirect response of a public `GET`, whatever its status.
+/// Every hop must be a credential-free HTTPS URL on port 443 whose host
+/// `allowed` accepts and whose every resolved address is public; the
+/// connection is pinned to those checked addresses.
+pub(crate) async fn public_request(
+    source: &str,
+    allowed: impl Fn(&str) -> bool,
+    net: &dyn Net,
+) -> Result<reqwest::Response, DownloadError> {
     let mut url = Url::parse(source).map_err(DownloadError::InvalidUrl)?;
     for hop in 0..=5 {
         validate_url(&url)?;
         let host = url.host_str().ok_or(DownloadError::MissingHost)?;
+        if !allowed(host) {
+            return Err(DownloadError::Destination);
+        }
         let answers: Vec<SocketAddr> = match url.host() {
             Some(url::Host::Ipv4(address)) => vec![SocketAddr::new(address.into(), 443)],
             Some(url::Host::Ipv6(address)) => vec![SocketAddr::new(address.into(), 443)],
-            Some(url::Host::Domain(_)) => tokio::time::timeout(
-                Duration::from_secs(10),
-                tokio::net::lookup_host((host, 443)),
-            )
-            .await
-            .map_err(DownloadError::ResolveTimeout)?
-            .map_err(DownloadError::Resolve)?
-            .collect(),
+            Some(url::Host::Domain(_)) => {
+                tokio::time::timeout(Duration::from_secs(10), net.resolve(host))
+                    .await
+                    .map_err(DownloadError::ResolveTimeout)?
+                    .map_err(DownloadError::Resolve)?
+            }
             None => return Err(DownloadError::MissingHost),
         };
         if answers.is_empty() || !answers.iter().all(|a| public_address(a.ip())) {
             return Err(DownloadError::PrivateAddress);
         }
-        let client = reqwest::Client::builder()
-            .no_proxy()
-            .https_only(true)
-            .connect_timeout(Duration::from_secs(10))
-            .read_timeout(Duration::from_secs(30))
-            .redirect(reqwest::redirect::Policy::none())
-            .resolve_to_addrs(host, &answers)
-            .build()
-            .map_err(transport)?;
-        let response = client.get(url.clone()).send().await.map_err(transport)?;
-        if response.status().is_redirection() {
-            if hop >= 5 {
-                return Err(DownloadError::TooManyRedirects);
-            }
-            let location = response
-                .headers()
-                .get(reqwest::header::LOCATION)
-                .and_then(|location| location.to_str().ok())
-                .ok_or(DownloadError::InvalidRedirect)?;
-            url = url.join(location).map_err(DownloadError::RedirectTarget)?;
-        } else if !response.status().is_success() {
-            return Err(DownloadError::Status {
-                status: response.status(),
-            });
-        } else {
+        let response = net.get(&url, host, &answers).await.map_err(transport)?;
+        if !response.status().is_redirection() {
             return Ok(response);
         }
+        if hop >= 5 {
+            return Err(DownloadError::TooManyRedirects);
+        }
+        let location = response
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|location| location.to_str().ok())
+            .ok_or(DownloadError::InvalidRedirect)?;
+        url = url.join(location).map_err(DownloadError::RedirectTarget)?;
     }
     Err(DownloadError::TooManyRedirects)
 }

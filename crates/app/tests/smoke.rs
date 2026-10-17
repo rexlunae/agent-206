@@ -246,6 +246,39 @@ async fn extension_smoke(app: &App) -> Result<()> {
         "git status outside a repository: {}",
         String::from_utf8_lossy(&status.stderr)
     );
+    // The web extension's fetch goes through the gateway's SSRF guard: a
+    // loopback address is refused before any connection, with or without
+    // the grant, and the client hears the reason.
+    let fetch = [
+        "extension",
+        "tool",
+        "agent206.web",
+        "fetch_url",
+        "--args",
+        "url = \"https://127.0.0.1/\"",
+    ];
+    let ungranted = capture(app.command(&fetch)).await?;
+    ensure!(
+        !ungranted.status.success()
+            && String::from_utf8_lossy(&ungranted.stderr).contains("Use the network"),
+        "fetch without the network grant: {}",
+        String::from_utf8_lossy(&ungranted.stderr)
+    );
+    app.cli(&[
+        "extension",
+        "grant",
+        "agent206.web",
+        "--capability",
+        "network",
+    ])
+    .await?;
+    let private = capture(app.command(&fetch)).await?;
+    ensure!(
+        !private.status.success()
+            && String::from_utf8_lossy(&private.stderr).contains("private, reserved or local"),
+        "fetch of a loopback address: {}",
+        String::from_utf8_lossy(&private.stderr)
+    );
     app.cli(&["extension", "grant", id]).await?;
     ensure!(
         !capture(app.command(&panel)).await?.status.success(),
