@@ -234,13 +234,9 @@ fn extension(context: &Context<'_>, plugin: &PluginSummary, detailed: bool) -> V
                                 .into(),
                         );
                     }
-                } else if !offered {
-                    // The skill host checks approvals only once nothing else
-                    // blocks its tools, so state the requirement, not a verdict.
-                    blocked.push(
-                        "It also needs a skill the user approved and has not changed since.".into(),
-                    );
                 }
+                // Otherwise the skill host has not looked at approvals, so
+                // the listing makes no claim about them.
                 offered.then(|| tool.name.clone())
             } else {
                 context
