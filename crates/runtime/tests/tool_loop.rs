@@ -91,11 +91,16 @@ impl ToolHost for TestHost {
     ) -> BoxFuture<'a, Result<ToolOutput, ErrorReport>> {
         Box::pin(async move {
             let blocking = self.blocking.as_deref() == Some(request.name.as_str());
-            let text = format!(
-                "{}:{}",
-                self.marker,
-                Value::Object(request.arguments.clone())
-            );
+            // Tools named `…lines_…` return their `value` argument as is.
+            let text = if request.name.contains("lines_") {
+                request.arguments["value"].as_str().unwrap().to_owned()
+            } else {
+                format!(
+                    "{}:{}",
+                    self.marker,
+                    Value::Object(request.arguments.clone())
+                )
+            };
             // Tools named `fail_…` report their own failure.
             let is_error = request.name.starts_with("fail_");
             let held = request.name.starts_with("held_");
@@ -1549,6 +1554,146 @@ async fn output_that_must_be_whole_fails_rather_than_being_cut() {
     let kept = record(&calls[0].id).output.as_deref().unwrap_or_default();
     assert!(!kept.contains("oooo"), "{kept}");
     assert_eq!(record(&calls[1].id).state, ToolCallState::Succeeded);
+}
+
+// ── Output rules ────────────────────────────────────────────────────────────
+
+impl Rig {
+    /// Add a user output rules file to the gateway's state directory.
+    fn write_rules(&self, text: &str) -> std::path::PathBuf {
+        let directory = self._state.path().join(a206_runtime::gateway::OUTPUT_RULES);
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join(format!("{}.toml", nonce()));
+        std::fs::write(&path, text).unwrap();
+        path
+    }
+}
+
+#[tokio::test]
+async fn output_rules_shorten_what_the_model_sees_and_the_call_records_it() {
+    let api = ProviderApi::Anthropic;
+    let (tool_name, failing) = (
+        format!("lines_{}", nonce()),
+        format!("fail_lines_{}", nonce()),
+    );
+    let mut rig = rig(
+        api,
+        vec![
+            tool(&tool_name, ToolPermission::Allow, &[]),
+            tool(&failing, ToolPermission::Allow, &[]),
+        ],
+        None,
+    )
+    .await;
+    for name in [&tool_name, &failing] {
+        rig.permit(name, ToolPermission::Allow).await;
+    }
+    let (rule, program, noise) = (nonce(), nonce(), nonce());
+    rig.write_rules(&format!(
+        "[[rule]]\nid = \"{rule}\"\n[rule.match]\ntools = [\"{tool_name}\", \"{failing}\"]\nargv0 = [\"{program}\"]\n[rule.filters]\nskip = ['^{noise}']\n[[rule.counters]]\nname = \"kept\"\npattern = '^keep'\n"
+    ));
+    let value = format!("keep {}\n{noise} {}\nkeep {}\n", nonce(), nonce(), nonce());
+    let lines: Vec<&str> = value.lines().collect();
+    let reduced = format!(
+        "{}\n{}\n[output rule `{rule}` kept 2 of 3 lines; kept: 2]",
+        lines[0], lines[2]
+    );
+    let calls = [
+        // The rule's program, after a `cd`, with its output piped on.
+        Call::new(
+            &tool_name,
+            json!({"command": format!("cd x && {program} run | tee log"), "value": value}),
+        ),
+        // Another program: no rule applies.
+        Call::new(&tool_name, json!({"command": nonce(), "value": value})),
+        // A reported failure is reduced too.
+        Call::new(&failing, json!({"command": program, "value": value})),
+    ];
+    let task = rig.send();
+    let first = rig.next_request().await;
+    first.respond(calls_response(api, &calls, "")).await;
+    let second = rig.next_request().await;
+    assert_eq!(
+        result_for(api, &second.body, &calls[0].id),
+        Some(reduced.clone())
+    );
+    assert_eq!(
+        result_for(api, &second.body, &calls[1].id),
+        Some(value.clone())
+    );
+    assert_eq!(
+        result_for(api, &second.body, &calls[2].id),
+        Some(reduced.clone())
+    );
+    second.respond(text_response(api, &nonce())).await;
+    let thread = finished(task).await;
+    assert_eq!(thread.state, RunState::Complete, "{:?}", thread.error);
+    let recorded = calls_of(&thread);
+    let record = |id: &str| recorded.iter().find(|c| c.id == id).unwrap();
+    let expected = OutputReduction {
+        rule: rule.clone(),
+        user_rule: true,
+        original_bytes: value.len() as u64,
+        counts: vec![OutputCount {
+            name: "kept".into(),
+            count: 2,
+        }],
+    };
+    assert_eq!(record(&calls[0].id).reduction.as_ref(), Some(&expected));
+    assert_eq!(
+        record(&calls[0].id).output.as_deref(),
+        Some(reduced.as_str())
+    );
+    assert_eq!(record(&calls[1].id).reduction, None);
+    let failed = record(&calls[2].id);
+    assert_eq!(failed.state, ToolCallState::Failed);
+    assert_eq!(failed.reduction.as_ref(), Some(&expected));
+    assert_eq!(failed.output.as_deref(), Some(reduced.as_str()));
+}
+
+#[tokio::test]
+async fn output_that_must_be_whole_is_never_reduced() {
+    let api = ProviderApi::OpenAi;
+    let name = format!("lines_{}", nonce());
+    let mut tools = vec![tool(&name, ToolPermission::Allow, &[])];
+    tools[0].whole_output = true;
+    let mut rig = rig(api, tools, None).await;
+    rig.permit(&name, ToolPermission::Allow).await;
+    let noise = nonce();
+    rig.write_rules(&format!(
+        "[[rule]]\nid = \"{}\"\n[rule.filters]\nskip = ['^{noise}']\n",
+        nonce()
+    ));
+    let value = format!("{}\n{noise}\n", nonce());
+    let call = Call::new(&name, json!({"value": value}));
+    let task = rig.send();
+    let first = rig.next_request().await;
+    first
+        .respond(calls_response(api, std::slice::from_ref(&call), ""))
+        .await;
+    let second = rig.next_request().await;
+    assert_eq!(result_for(api, &second.body, &call.id), Some(value.clone()));
+    second.respond(text_response(api, &nonce())).await;
+    let thread = finished(task).await;
+    assert_eq!(calls_of(&thread)[0].reduction, None);
+}
+
+#[tokio::test]
+async fn an_invalid_output_rule_file_fails_the_run_before_the_model_is_asked() {
+    let api = ProviderApi::Gemini;
+    let mut rig = rig(api, vec![], None).await;
+    let path = rig.write_rules(&format!("[[rule]]\nid = \"{}\"\nunknown = 1\n", nonce()));
+    let thread = finished(rig.send()).await;
+    assert_eq!(thread.state, RunState::Failed);
+    let report = thread.error.expect("the run's failure");
+    assert_eq!(report.kind, ErrorKind::InvalidRequest, "{report:?}");
+    assert!(
+        report.message.contains(&path.display().to_string()),
+        "{report:?}"
+    );
+    // The parser's own explanation travels as the cause.
+    assert!(report.source.is_some(), "{report:?}");
+    assert!(rig.requests.try_recv().is_err(), "the model was asked");
 }
 
 // ── Subagents ───────────────────────────────────────────────────────────────

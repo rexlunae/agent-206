@@ -496,6 +496,29 @@ a "Current plan" section with the steps and statuses, for as long as the tool is
 offered. Clients: a plan card above the composer in the shared conversation view
 (`ui/src/conversation.rs`, desktop/web/TUI) and `agent206 plan THREAD`.
 
+## Output rules
+
+Before a tool result reaches the model, the run engine passes it through the
+output rules (`crates/output-rules`, after RustyClaw's `tokenjuice`; format in
+[output-rules.md](output-rules.md)). The first matching rule may drop noise
+lines, strip terminal escapes, fold blank runs and keep only the start and end
+of very long output; the reduced text ends with a line naming the rule and how
+many lines it kept. Rules match on the tool name and, for a call with a string
+`command` argument, the program and arguments of the command whose output the
+line produces. Both successful and tool-reported failed results are reduced;
+results only useful whole (`ToolSpec::whole_output`) never are.
+
+The reduced text is the call's `output`: it is what the model and the user see,
+and the original is not kept. `ToolCall::reduction` records the rule, whether
+it is the user's, the original size and the rule's counts, and the tool trace
+says "Shortened for the model by …". Rules ship with the application for
+`execute_command` (git status and diff, cargo, npm/pnpm/yarn installs, ls); the
+user adds, replaces or turns them off with TOML files in the gateway state
+directory's `output-rules/`. Workspace files cannot change what a model sees.
+The rules are read when a run starts; a file that cannot be read or parsed
+fails the run before the model is asked, with the file and the parser's cause
+in the error.
+
 ## Context
 
 ### Project instruction files
@@ -623,4 +646,6 @@ and unit tests in `retry.rs`.
 
 Leaked tool-markup filtering, schema type coercion and repeat-call warnings from
 RustyClaw's healing; Anthropic thinking-block replay alongside tool results;
-parallel tool execution.
+parallel tool execution; RustyClaw's project-layer output rules
+(`<workspace>/.tokenjuice/rules/`) and a way to list or edit output rules from
+the GUI or CLI.
