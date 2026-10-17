@@ -1,8 +1,8 @@
 # Messengers
 
 A messenger connects a chat service account to Agent 206 so that people can
-talk to a thread from that service. Telegram, Matrix, Discord, Slack and IRC
-are implemented;
+talk to a thread from that service. Telegram, Matrix, Discord, Slack, IRC
+and Signal are implemented;
 RustyClaw's other channels are listed in
 [parity.md](parity.md#messengers--channels).
 
@@ -15,14 +15,17 @@ of the desktop, web and terminal apps):
 ```toml
 [[messengers]]
 name = "team"                 # lowercase letters, digits, single hyphens
-kind = "telegram"             # or "matrix", "discord", "slack" or "irc"
+kind = "telegram"             # or "matrix", "discord", "slack", "irc" or "signal"
 enabled = false               # off until the user turns it on
 credential = "team-token"     # vault credential name, never the token
+                              # (Signal has none)
 # app_credential = "team-app"  # Slack only: the app-level token's credential
-# login = "teambot"           # IRC only: the services account (and nickname)
+# login = "teambot"           # IRC: the services account (and nickname);
+                              # Signal: the account's +number or ACI
 # endpoint = "https://..."    # an origin; defaults to the official API,
                               # required for Matrix (the homeserver) and
-                              # IRC (the server, ircs://host[:port])
+                              # IRC (the server, ircs://host[:port]) and
+                              # Signal (the signal-cli daemon)
 allowed_chats = ["-1001234"]  # chats whose messages reach a thread
 allowed_users = ["5551234"]   # senders accepted; groups need it
 model = { provider = "<provider id>", model = "<id from the provider's API>" }
@@ -322,6 +325,51 @@ agent206 messenger enable libera
   the bot's own earlier connection, until the server notices it is gone) is
   retried with the usual backoff, with the failure shown meanwhile.
 
+## Signal
+
+A Signal messenger talks through a [signal-cli](https://github.com/AsamK/signal-cli)
+daemon that the user installs, registers or links and runs. signal-cli holds
+the account's keys and does all of Signal's encryption, so the account has
+no vault credential: Agent 206 never sees or stores those keys, and the
+gateway never starts, stops or updates the daemon. Run it in multi-account
+mode with manual receiving, so that messages wait with Signal until the
+gateway subscribes:
+
+```sh
+signal-cli daemon --socket "$XDG_RUNTIME_DIR/signal-cli/socket" --receive-mode=manual
+agent206 messenger add phone --kind signal --endpoint "unix://$XDG_RUNTIME_DIR/signal-cli/socket" --login +15551234567
+agent206 messenger allow phone <ACI of the person>
+agent206 messenger allow-sender phone <ACI of the person>
+agent206 messenger enable phone
+```
+
+- **Daemon.** The endpoint is `unix:///absolute/path` (the daemon's
+  `--socket`) or `tcp://127.0.0.1:port` / `tcp://[::1]:port` (its `--tcp`);
+  any other host is refused, since the JSON-RPC interface has no
+  authentication and anyone who can reach it can use the account. Prefer
+  the Unix socket, whose file permissions decide who else can. A TCP
+  connection whose peer turns out not to be loopback is closed.
+- **Account.** `login` is the account's number in `+E.164` form or its ACI.
+  On connecting the gateway asks the daemon to list its accounts and stops,
+  waiting for the user, when the login is not one of them; otherwise it
+  subscribes to that account's messages.
+- **Identity.** Senders are ACIs (the account UUID signal-cli reports once it
+  has decrypted and authenticated a message), not phone numbers, which can
+  be hidden or change hands. A direct chat is the sender's ACI; a group chat
+  is its base64 group id. UUIDs are saved lowercase. `agent206 messenger
+  list` and the Messengers page show refused chats and senders by these ids,
+  so the first message from someone can be allowed from there.
+- **What is read and sent.** Only text messages are answered; reactions,
+  edits, deletions, receipts, typing, stories and messages synced from the
+  account's other devices are ignored, and each message is handled once.
+  Replies go to the same ACI or group in parts of at most 2000 characters,
+  at most eight, each sent after signal-cli accepted the previous one. A
+  request the daemon does not answer within a minute fails.
+- **Delivery.** With `--receive-mode=manual` messages that arrive while the
+  gateway is stopped wait with Signal and are answered once it reconnects;
+  a daemon receiving on its own may have taken them already. As with every
+  messenger, the gateway runs it only while paired with an unlocked vault.
+
 ## Interface for the run engine
 
 `a206_runtime::messengers::Host` is the boundary between a messenger and the
@@ -346,7 +394,8 @@ participant cannot approve their own request.
 
 ## Not yet
 
-- Signal, WhatsApp, Google Chat, Teams, iMessage and webhooks.
+- WhatsApp, Google Chat, Teams, iMessage and webhooks.
+- Signal attachments, mentions and quoted replies.
 - IRC certificate fingerprints or custom roots, SASL EXTERNAL, networks
   without `account-tag`, and channel keys.
 - Slack thread replies, the Events API over HTTP (Socket Mode only) and

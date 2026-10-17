@@ -54,14 +54,18 @@ pub enum MessengerKind {
     Slack,
     /// IRC over TLS, signed in to the network's services with SASL.
     Irc,
+    /// Signal through a signal-cli daemon the user runs, which holds the
+    /// account's keys; Agent 206 talks to its local JSON-RPC socket.
+    Signal,
 }
 impl MessengerKind {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::Telegram,
         Self::Matrix,
         Self::Discord,
         Self::Slack,
         Self::Irc,
+        Self::Signal,
     ];
     pub fn label(self) -> &'static str {
         match self {
@@ -70,6 +74,7 @@ impl MessengerKind {
             Self::Discord => "Discord",
             Self::Slack => "Slack",
             Self::Irc => "IRC",
+            Self::Signal => "Signal",
         }
     }
     /// The service's official API endpoint, used unless an entry names
@@ -80,7 +85,7 @@ impl MessengerKind {
             Self::Matrix => None,
             Self::Discord => Some("https://discord.com"),
             Self::Slack => Some("https://slack.com"),
-            Self::Irc => None,
+            Self::Irc | Self::Signal => None,
         }
     }
     /// How the user obtains the token the vault stores for this kind.
@@ -101,6 +106,9 @@ impl MessengerKind {
             Self::Irc => {
                 "Register the bot's nickname as an account with the network's services, and store its password in the vault, bound to the server (ircs://host:port)"
             }
+            Self::Signal => {
+                "Register or link the account with signal-cli and run its daemon yourself (signal-cli daemon --socket PATH --receive-mode=manual); signal-cli keeps the account's keys, so no vault credential is used"
+            }
         }
     }
     /// Whether the kind receives events with a second, app-level token
@@ -109,9 +117,34 @@ impl MessengerKind {
         matches!(self, Self::Slack)
     }
     /// Whether the kind signs in with an account name of its own
-    /// ([`MessengerConfig::login`]).
+    /// ([`MessengerConfig::login`]): IRC's services account, or the Signal
+    /// account signal-cli serves.
     pub fn needs_login(self) -> bool {
-        matches!(self, Self::Irc)
+        matches!(self, Self::Irc | Self::Signal)
+    }
+    /// Whether the kind spends a vault credential. Signal does not: the
+    /// user's signal-cli holds the account's keys, and Agent 206 never sees
+    /// or stores them.
+    pub fn needs_credential(self) -> bool {
+        !matches!(self, Self::Signal)
+    }
+    /// Whether the kind's endpoint is a signal-cli daemon ([`SignalDaemon`]).
+    pub fn is_signal(self) -> bool {
+        matches!(self, Self::Signal)
+    }
+    /// A typed chat or sender id as this kind's messenger compares it: IRC
+    /// names fold the way the network compares them, and Signal ACIs are
+    /// written in signal-cli's lowercase form. Other ids, and Signal group
+    /// ids (case-sensitive base64), are kept as typed.
+    pub fn fold(self, id: &str) -> String {
+        match self {
+            Self::Irc => irc_lowercase(id),
+            Self::Signal => match uuid::Uuid::try_parse(id) {
+                Ok(aci) if id.len() == 36 => aci.hyphenated().to_string(),
+                _ => id.to_owned(),
+            },
+            _ => id.to_owned(),
+        }
     }
     /// Whether the kind's endpoint is an IRC server ([`IrcServer`]) rather
     /// than an HTTPS origin.
@@ -188,6 +221,115 @@ impl IrcServer {
         let scheme = if self.tls { "ircs" } else { "irc" };
         format!("{scheme}://{}:{}", self.host, self.port)
     }
+}
+
+/// Why an endpoint is not a signal-cli daemon Agent 206 connects to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
+pub enum SignalDaemonError {
+    #[error("write a signal-cli daemon as unix:///absolute/path/to/socket or tcp://127.0.0.1:port")]
+    Shape,
+    #[error(
+        "signal-cli's JSON-RPC socket has no authentication; connect to it on loopback or through a Unix socket only"
+    )]
+    NotLoopback,
+}
+
+/// A signal-cli JSON-RPC daemon as a messenger endpoint: a Unix socket
+/// (`signal-cli daemon --socket PATH`) or a loopback TCP port
+/// (`--tcp 127.0.0.1:PORT`). The socket is unauthenticated, so anything that
+/// can reach it can use the account; nothing farther than loopback is
+/// accepted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SignalDaemon {
+    /// An absolute socket path.
+    Socket(String),
+    Tcp(std::net::SocketAddr),
+}
+impl SignalDaemon {
+    pub fn parse(endpoint: &str) -> Result<Self, SignalDaemonError> {
+        let url = url::Url::parse(endpoint).map_err(|_| SignalDaemonError::Shape)?;
+        if !url.username().is_empty()
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+        {
+            return Err(SignalDaemonError::Shape);
+        }
+        match url.scheme() {
+            "unix" => {
+                let path = url.path();
+                let valid = url.host_str().is_none_or(str::is_empty)
+                    && path.starts_with('/')
+                    && path.len() > 1
+                    && path.len() <= 255
+                    && !path.contains('%');
+                if valid {
+                    Ok(Self::Socket(path.to_owned()))
+                } else {
+                    Err(SignalDaemonError::Shape)
+                }
+            }
+            "tcp" => {
+                if !matches!(url.path(), "" | "/") {
+                    return Err(SignalDaemonError::Shape);
+                }
+                let port = url
+                    .port()
+                    .filter(|&p| p != 0)
+                    .ok_or(SignalDaemonError::Shape)?;
+                let ip = match url.host().ok_or(SignalDaemonError::Shape)? {
+                    url::Host::Ipv4(ip) => std::net::IpAddr::V4(ip),
+                    url::Host::Ipv6(ip) => std::net::IpAddr::V6(ip),
+                    // A `tcp:` URL's host is opaque to the URL parser, so an
+                    // IPv4 address arrives as a name.
+                    url::Host::Domain(name) if name.eq_ignore_ascii_case("localhost") => {
+                        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+                    }
+                    url::Host::Domain(name) => name
+                        .parse::<std::net::Ipv4Addr>()
+                        .map(std::net::IpAddr::V4)
+                        .map_err(|_| SignalDaemonError::NotLoopback)?,
+                };
+                if !ip.is_loopback() {
+                    return Err(SignalDaemonError::NotLoopback);
+                }
+                Ok(Self::Tcp(std::net::SocketAddr::new(ip, port)))
+            }
+            _ => Err(SignalDaemonError::Shape),
+        }
+    }
+}
+
+/// Whether `account` names a Signal account signal-cli serves: a phone
+/// number in E.164 form (`+` and 7 to 15 digits), or the account's ACI for
+/// an account without one.
+pub fn valid_signal_account(account: &str) -> bool {
+    valid_signal_number(account) || valid_signal_aci(account)
+}
+
+fn valid_signal_number(number: &str) -> bool {
+    number.strip_prefix('+').is_some_and(|digits| {
+        (7..=15).contains(&digits.len())
+            && !digits.starts_with('0')
+            && digits.bytes().all(|b| b.is_ascii_digit())
+    })
+}
+
+/// Whether `id` is a Signal account's ACI (a service id), in the lowercase
+/// hyphenated form signal-cli reports, which senders and direct chats use.
+pub fn valid_signal_aci(id: &str) -> bool {
+    id.len() == 36
+        && uuid::Uuid::try_parse(id).is_ok_and(|parsed| parsed.hyphenated().to_string() == id)
+}
+
+/// Whether `id` is a Signal group id as signal-cli writes it: standard
+/// base64 of a 32-byte group identifier.
+pub fn valid_signal_group(id: &str) -> bool {
+    id.len() == 44
+        && id.ends_with('=')
+        && id[..43]
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/')
 }
 
 /// Whether `nick` can be an IRC nickname and account name: a letter or one
@@ -452,6 +594,89 @@ mod tests {
             Some(&sender)
         );
         assert_eq!(status.refused.len(), MAX_REFUSED_CHATS);
+    }
+
+    #[test]
+    fn signal_daemons_are_local_sockets_or_loopback_ports() {
+        let port = 1024 + (uuid::Uuid::new_v4().as_u128() % 60000) as u16;
+        let dir = uuid::Uuid::new_v4().simple().to_string();
+        assert_eq!(
+            SignalDaemon::parse(&format!("unix:///run/{dir}/signal.sock")),
+            Ok(SignalDaemon::Socket(format!("/run/{dir}/signal.sock")))
+        );
+        for (endpoint, ip) in [
+            (format!("tcp://127.0.0.1:{port}"), "127.0.0.1"),
+            (format!("tcp://localhost:{port}"), "127.0.0.1"),
+            (format!("tcp://[::1]:{port}"), "::1"),
+        ] {
+            assert_eq!(
+                SignalDaemon::parse(&endpoint),
+                Ok(SignalDaemon::Tcp(std::net::SocketAddr::new(
+                    ip.parse().unwrap(),
+                    port
+                ))),
+                "{endpoint}"
+            );
+        }
+        for remote in [
+            format!("tcp://192.0.2.1:{port}"),
+            format!("tcp://{dir}.example:{port}"),
+            format!("tcp://0.0.0.0:{port}"),
+        ] {
+            assert_eq!(
+                SignalDaemon::parse(&remote),
+                Err(SignalDaemonError::NotLoopback),
+                "{remote}"
+            );
+        }
+        for bad in [
+            "tcp://127.0.0.1".to_owned(),
+            format!("tcp://127.0.0.1:{port}/rpc"),
+            format!("http://127.0.0.1:{port}"),
+            "unix://relative".to_owned(),
+            format!("unix:///run/{dir}%2f"),
+            format!("unix:///run/{dir}?x"),
+        ] {
+            assert_eq!(
+                SignalDaemon::parse(&bad),
+                Err(SignalDaemonError::Shape),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn typed_ids_fold_as_each_service_compares_them() {
+        let name = format!("#{}", uuid::Uuid::new_v4().simple()).to_uppercase();
+        assert_eq!(MessengerKind::Irc.fold(&name), name.to_lowercase());
+        let aci = uuid::Uuid::new_v4().hyphenated().to_string();
+        assert_eq!(MessengerKind::Signal.fold(&aci.to_uppercase()), aci);
+        // Group ids are case-sensitive base64.
+        let group = format!("{}A=", "Ab".repeat(21));
+        assert_eq!(MessengerKind::Signal.fold(&group), group);
+        for kind in MessengerKind::ALL
+            .into_iter()
+            .filter(|k| !k.is_irc() && !k.is_signal())
+        {
+            assert_eq!(kind.fold(&name), name);
+        }
+    }
+
+    #[test]
+    fn signal_ids_are_numbers_acis_and_group_ids() {
+        let aci = uuid::Uuid::new_v4().hyphenated().to_string();
+        assert!(valid_signal_account(&aci) && valid_signal_aci(&aci));
+        assert!(valid_signal_account("+15551234567"));
+        for bad in ["15551234567", "+0555", "+1555 123", "+1234567890123456"] {
+            assert!(!valid_signal_account(bad), "{bad}");
+        }
+        assert!(!valid_signal_aci(&aci.to_uppercase()));
+        assert!(!valid_signal_aci(&aci.replace('-', "")));
+        let group = format!("{}=", "A".repeat(43));
+        assert!(valid_signal_group(&group));
+        for bad in [group.replace('=', "A"), format!("{}=", "-".repeat(43)), aci] {
+            assert!(!valid_signal_group(&bad), "{bad}");
+        }
     }
 
     #[test]
