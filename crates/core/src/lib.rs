@@ -691,6 +691,20 @@ pub enum EventKind {
     ThreadChanged {
         id: Id,
     },
+    /// A conversation was created by the user, a messenger or a delegating
+    /// agent.
+    ThreadCreated {
+        id: Id,
+    },
+    /// A conversation's title changed; the thread has the new one.
+    ThreadRenamed {
+        id: Id,
+    },
+    /// A reply ended; `state` is `Complete`, `Failed` or `Cancelled`.
+    RunEnded {
+        thread: Id,
+        state: RunState,
+    },
     CatalogChanged {
         provider: Id,
     },

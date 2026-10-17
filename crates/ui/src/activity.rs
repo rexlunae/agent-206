@@ -5,7 +5,7 @@
 use crate::{PageFrame, State, error::ErrorNotice, route::Route};
 use a206_core::{
     ActivityPage, ApprovalOutcome, Command, DownloadState, ErrorKind, ErrorReport, Event,
-    EventKind, Id, MAX_ACTIVITY, PromptOutcome, Reply, Snapshot,
+    EventKind, Id, MAX_ACTIVITY, PromptOutcome, Reply, RunState, Snapshot,
 };
 use fc_dioxus::prelude::*;
 
@@ -217,6 +217,28 @@ fn describe(kind: &EventKind, snapshot: &Snapshot) -> Entry {
             IconName::Sparkles,
             conversation(id, &|c| format!("Conversation {c} changed")),
         ),
+        EventKind::ThreadCreated { id } => (
+            IconName::Plus,
+            conversation(id, &|c| format!("Conversation {c} started")),
+        ),
+        // The journal keeps no earlier title, so only the current one is named.
+        EventKind::ThreadRenamed { id } => (
+            IconName::Edit,
+            conversation(id, &|c| format!("Conversation renamed; now called {c}")),
+        ),
+        EventKind::RunEnded { thread, state } => {
+            let (icon, ended) = match state {
+                RunState::Failed => (IconName::Error, "failed"),
+                RunState::Cancelled => (IconName::Close, "was stopped"),
+                RunState::Complete => (IconName::Check, "finished"),
+                // Not sent by the gateway; said without claiming success.
+                RunState::Idle | RunState::Running => (IconName::Info, "ended"),
+            };
+            (
+                icon,
+                conversation(thread, &|c| format!("Reply {ended} in {c}")),
+            )
+        }
         EventKind::BackendActivity { thread, title } => (
             IconName::Terminal,
             conversation(thread, &|c| format!("{title} (in {c})")),
@@ -457,6 +479,36 @@ mod tests {
         );
         assert!(html.contains("Question declined in a conversation that no longer exists"));
         assert!(html.contains("2 hours ago"));
+    }
+
+    #[test]
+    fn conversation_lifecycle_entries_say_how_a_reply_ended() {
+        let mut snapshot = crate::empty_snapshot();
+        let thread = Thread::new(Id::new_v4().simple().to_string(), Mode::Chat);
+        snapshot.threads.push(thread.clone());
+        let id = thread.id;
+        let text = |kind| describe(&kind, &snapshot).text;
+        let title = &thread.title;
+        assert_eq!(
+            text(EventKind::ThreadCreated { id }),
+            format!("Conversation “{title}” started")
+        );
+        assert_eq!(
+            text(EventKind::ThreadRenamed { id }),
+            format!("Conversation renamed; now called “{title}”")
+        );
+        for (state, ended) in [
+            (RunState::Complete, "finished"),
+            (RunState::Failed, "failed"),
+            (RunState::Cancelled, "was stopped"),
+        ] {
+            assert_eq!(
+                text(EventKind::RunEnded { thread: id, state }),
+                format!("Reply {ended} in “{title}”")
+            );
+        }
+        let entry = describe(&EventKind::ThreadCreated { id }, &snapshot);
+        assert_eq!(entry.link, Some(Route::Chat { id, split: None }));
     }
 
     #[test]
