@@ -387,6 +387,8 @@ fn Conversation(thread: Thread, target: Option<Uuid>) -> Element {
                     ThreadFacts { thread: thread.clone() }
                     ContextControls { thread: thread.clone() }
                     BackendControls { thread: thread.clone() }
+                    // Here too, so split view, which has no inspector, keeps it.
+                    crate::subagents::Subagents { thread: id }
                 }
             }
         }

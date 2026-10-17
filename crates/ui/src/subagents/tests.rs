@@ -80,3 +80,17 @@ fn a_cycle_in_parent_links_ends_instead_of_recursing() {
     let html = render(vec![first.clone(), second.clone()], first.id);
     assert_eq!(html.matches(&second.title).count(), 2, "{html}");
 }
+
+#[test]
+fn a_long_chain_of_delegations_is_shown_to_its_end() {
+    let root = thread(None, RunState::Idle);
+    let mut chain = vec![root.clone()];
+    for _ in 0..12 {
+        let parent = chain.last().map(|t| t.id);
+        chain.push(thread(parent, RunState::Idle));
+    }
+    let html = render(chain.clone(), root.id);
+    for t in &chain[1..] {
+        assert!(html.contains(&format!("/conversations/{}", t.id)), "{html}");
+    }
+}
