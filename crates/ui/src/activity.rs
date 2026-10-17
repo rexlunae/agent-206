@@ -336,7 +336,7 @@ fn describe(kind: &EventKind, snapshot: &Snapshot) -> Entry {
             IconName::Clock,
             match snapshot.jobs.iter().find(|job| job.id == *id) {
                 Some(job) => conversation(&job.thread, &|c| {
-                    format!("Scheduled message “{}” for {c} changed", job.name)
+                    format!("Scheduled message {} changed in {c}", job.name)
                 }),
                 None => ("A removed scheduled message changed".to_owned(), None),
             },
@@ -481,7 +481,7 @@ mod tests {
         assert_eq!(
             entry.text,
             format!(
-                "Scheduled message “{}” for “{}” changed",
+                "Scheduled message {} changed in “{}”",
                 job.name, thread.title
             )
         );
