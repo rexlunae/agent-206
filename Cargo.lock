@@ -192,10 +192,12 @@ dependencies = [
  "fs2",
  "futures-util",
  "gix",
+ "globset",
  "http",
  "jiff",
  "nix 0.31.3",
  "rcgen",
+ "regex",
  "reqwest",
  "rmcp",
  "rmp-serde",
@@ -4684,6 +4686,18 @@ dependencies = [
  "windows-sys 0.59.0",
  "x11rb",
  "xkeysym",
+]
+
+[[package]]
+name = "globset"
+version = "0.4.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "07c34a9410465b45bd9787443bc7370f37735bad04b0f0cd57ff1a3186c98988"
+dependencies = [
+ "aho-corasick",
+ "bstr",
+ "regex-automata",
+ "regex-syntax",
 ]
 
 [[package]]

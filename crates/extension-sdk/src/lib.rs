@@ -167,6 +167,16 @@ pub mod __private {
 }
 
 /// Host calls. Each one is authorized by the gateway for this invocation.
+/// How [`host::search_pattern`] matches. The default is a literal,
+/// case-sensitive text in every file.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SearchOptions<'a> {
+    pub regex: bool,
+    pub ignore_case: bool,
+    /// Search only files whose path matches this glob.
+    pub include: Option<&'a str>,
+}
+
 pub mod host {
     use super::*;
     use serde_bytes::ByteBuf;
@@ -261,6 +271,37 @@ pub mod host {
             max_matches,
         })? {
             HostReply::Matches(result) => Ok(result),
+            _ => Err(unexpected()),
+        }
+    }
+    /// Lines matching `pattern` in UTF-8 files under `path`; see
+    /// [`HostRequest::SearchPattern`].
+    pub fn search_pattern(
+        path: &str,
+        pattern: &str,
+        options: SearchOptions<'_>,
+        max_matches: u32,
+    ) -> Result<SearchResult, HostFailure> {
+        match call(&HostRequest::SearchPattern {
+            path: path.into(),
+            pattern: pattern.into(),
+            regex: options.regex,
+            ignore_case: options.ignore_case,
+            include: options.include.map(Into::into),
+            max_matches,
+        })? {
+            HostReply::Matches(result) => Ok(result),
+            _ => Err(unexpected()),
+        }
+    }
+    /// Entries under `path` matching `glob`; see [`HostRequest::Find`].
+    pub fn find(path: &str, glob: &str, max_results: u32) -> Result<FindResult, HostFailure> {
+        match call(&HostRequest::Find {
+            path: path.into(),
+            glob: glob.into(),
+            max_results,
+        })? {
+            HostReply::Found(result) => Ok(result),
             _ => Err(unexpected()),
         }
     }

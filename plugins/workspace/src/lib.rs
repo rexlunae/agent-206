@@ -1,8 +1,8 @@
 //! Bundled workspace extension. Every file access is a host call that the
 //! gateway authorizes against the caller's `read_workspace` grant.
 use a206_extension_sdk::{
-    Args, DirEntry, EntryKind, Extension, Field, GuestError, Node, Tone, ToolOutput, UiEvent, View,
-    bool_arg, excerpt, host, int_arg, string_arg,
+    Args, DirEntry, EntryKind, Extension, Field, GuestError, Node, SearchOptions, Tone, ToolOutput,
+    UiEvent, View, bool_arg, excerpt, host, int_arg, string_arg,
 };
 
 struct Workspace;
@@ -13,6 +13,7 @@ const SHOW_HIDDEN: &str = "show_hidden";
 const TOGGLE_HIDDEN: &str = "toggle-hidden";
 const README_LINES: usize = 40;
 const DEFAULT_MATCHES: i64 = 100;
+const DEFAULT_FOUND: i64 = 200;
 
 impl Extension for Workspace {
     fn tool(name: &str, args: &Args) -> Result<ToolOutput, GuestError> {
@@ -36,7 +37,12 @@ impl Extension for Workspace {
                 let path = string_arg(args, "path")?.unwrap_or(".");
                 let max = int_arg(args, "max_matches")?.unwrap_or(DEFAULT_MATCHES);
                 let max = u32::try_from(max.clamp(1, 500)).unwrap_or(1);
-                let found = host::search(path, query, max)?;
+                let options = SearchOptions {
+                    regex: bool_arg(args, "regex")?.unwrap_or(false),
+                    ignore_case: bool_arg(args, "ignore_case")?.unwrap_or(false),
+                    include: string_arg(args, "include")?,
+                };
+                let found = host::search_pattern(path, query, options, max)?;
                 let mut lines: Vec<String> = found
                     .matches
                     .iter()
@@ -47,6 +53,31 @@ impl Extension for Workspace {
                 }
                 if found.truncated {
                     lines.push("[more matches may exist; the search stopped at a limit]".into());
+                }
+                Ok(ToolOutput {
+                    text: excerpt(lines.join("\n")),
+                })
+            }
+            "find_files" => {
+                let pattern = required(args, "pattern")?;
+                let path = string_arg(args, "path")?.unwrap_or(".");
+                let max = int_arg(args, "max_results")?.unwrap_or(DEFAULT_FOUND);
+                let max = u32::try_from(max.clamp(1, 1000)).unwrap_or(1);
+                let found = host::find(path, pattern, max)?;
+                let mut lines: Vec<String> = found
+                    .entries
+                    .iter()
+                    .map(|entry| match entry.kind {
+                        EntryKind::Directory => format!("{}/", entry.path),
+                        EntryKind::Symlink => format!("{} (link)", entry.path),
+                        _ => entry.path.clone(),
+                    })
+                    .collect();
+                if lines.is_empty() {
+                    lines.push("nothing matches".into());
+                }
+                if found.truncated {
+                    lines.push("[more entries may match; the walk stopped at a limit]".into());
                 }
                 Ok(ToolOutput {
                     text: excerpt(lines.join("\n")),

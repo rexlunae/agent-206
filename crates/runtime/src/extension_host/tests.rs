@@ -424,6 +424,183 @@ async fn search_is_bounded_and_does_not_follow_links() {
 }
 
 #[tokio::test]
+async fn a_pattern_search_matches_by_regex_or_case_and_chosen_files() {
+    let (dir, store) = store();
+    let root = dir.path().join("project");
+    let word = uuid::Uuid::new_v4().simple().to_string();
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(
+        root.join("src/a.rs"),
+        format!("{word}_1\n{}\nplain\n", word.to_uppercase()),
+    )
+    .unwrap();
+    std::fs::write(root.join("src/b.txt"), format!("{word}_2\n")).unwrap();
+    let search =
+        |pattern: &str, regex, ignore_case, include: Option<&str>| HostRequest::SearchPattern {
+            path: ".".into(),
+            pattern: pattern.into(),
+            regex,
+            ignore_case,
+            include: include.map(Into::into),
+            max_matches: 10,
+        };
+    let found = |reply| match reply {
+        HostReply::Matches(found) => found
+            .matches
+            .into_iter()
+            .map(|m| (m.path, m.line))
+            .collect::<Vec<_>>(),
+        other => panic!("search failed: {other:?}"),
+    };
+    let mut denied = workspace_calls(&store, Some(root.clone()), &[]);
+    assert_eq!(
+        code(denied.handle(search(&word, false, false, None)).await),
+        Some(HostErrorCode::Denied)
+    );
+    let mut host = workspace_calls(&store, Some(root.clone()), &[Capability::ReadWorkspace]);
+    let a = || ("src/a.rs".to_string(), 1);
+    let b = || ("src/b.txt".to_string(), 1);
+    let upper = || ("src/a.rs".to_string(), 2);
+    let regex = format!("^{word}_[0-9]$");
+    assert_eq!(
+        found(host.handle(search(&regex, true, false, None)).await),
+        [a(), b()]
+    );
+    // Without `regex` the same text is literal and matches nothing.
+    assert_eq!(
+        found(host.handle(search(&regex, false, false, None)).await),
+        []
+    );
+    assert_eq!(
+        found(host.handle(search(&word, false, true, None)).await),
+        [a(), upper(), b()]
+    );
+    assert_eq!(
+        found(host.handle(search(&word, false, false, None)).await),
+        [a(), b()]
+    );
+    assert_eq!(
+        found(host.handle(search(&word, false, false, Some("*.rs"))).await),
+        [a()]
+    );
+    assert_eq!(
+        found(
+            host.handle(search(&word, false, false, Some("src/*.txt")))
+                .await
+        ),
+        [b()]
+    );
+    assert_eq!(
+        code(host.handle(search("(", true, false, None)).await),
+        Some(HostErrorCode::Invalid)
+    );
+    assert_eq!(
+        code(host.handle(search(&word, false, false, Some("["))).await),
+        Some(HostErrorCode::Invalid)
+    );
+    // A repetition that compiles far past the size bound is refused.
+    assert_eq!(
+        code(
+            host.handle(search(r"\w{1000}{1000}", true, false, None))
+                .await
+        ),
+        Some(HostErrorCode::TooLarge)
+    );
+}
+
+#[tokio::test]
+async fn find_matches_names_or_paths_without_following_links() {
+    let (dir, store) = store();
+    let root = dir.path().join("project");
+    // `z` sorts after `deep`, so the name order below is fixed.
+    let name = format!("z{}", uuid::Uuid::new_v4().simple());
+    std::fs::create_dir_all(root.join("src/deep")).unwrap();
+    std::fs::create_dir_all(root.join(".git")).unwrap();
+    std::fs::create_dir_all(dir.path().join("outside")).unwrap();
+    for path in [
+        format!("src/{name}.rs"),
+        format!("src/deep/{name}.rs"),
+        format!(".git/{name}.rs"),
+        format!("{name}.txt"),
+        format!("outside/{name}.rs"),
+    ] {
+        let at = if path.starts_with("outside/") {
+            dir.path().join(&path)
+        } else {
+            root.join(&path)
+        };
+        std::fs::write(at, "").unwrap();
+    }
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(dir.path().join("outside"), root.join("src/link")).unwrap();
+    let find = |path: &str, glob: &str, max_results| HostRequest::Find {
+        path: path.into(),
+        glob: glob.into(),
+        max_results,
+    };
+    let found = |reply| match reply {
+        HostReply::Found(found) => (
+            found
+                .entries
+                .into_iter()
+                .map(|e| (e.path, e.kind))
+                .collect::<Vec<_>>(),
+            found.truncated,
+        ),
+        other => panic!("find failed: {other:?}"),
+    };
+    let file = |path: String| (path, EntryKind::File);
+    let mut denied = workspace_calls(&store, Some(root.clone()), &[]);
+    assert_eq!(
+        code(denied.handle(find(".", "*.rs", 10)).await),
+        Some(HostErrorCode::Denied)
+    );
+    let mut host = workspace_calls(&store, Some(root.clone()), &[Capability::ReadWorkspace]);
+    let all_rs = [
+        file(format!("src/deep/{name}.rs")),
+        file(format!("src/{name}.rs")),
+    ];
+    assert_eq!(
+        found(host.handle(find(".", "*.rs", 10)).await),
+        (all_rs.to_vec(), false)
+    );
+    assert_eq!(
+        found(host.handle(find(".", "src/*.rs", 10)).await),
+        (vec![file(format!("src/{name}.rs"))], false)
+    );
+    assert_eq!(
+        found(host.handle(find(".", "src/**/*.rs", 10)).await),
+        (all_rs.to_vec(), false)
+    );
+    // Below `src`, results stay workspace-relative.
+    assert_eq!(
+        found(host.handle(find("src", "deep/*", 10)).await),
+        (vec![file(format!("src/deep/{name}.rs"))], false)
+    );
+    assert_eq!(
+        found(host.handle(find(".", "deep", 10)).await),
+        (vec![("src/deep".to_string(), EntryKind::Directory)], false)
+    );
+    #[cfg(unix)]
+    assert_eq!(
+        found(host.handle(find(".", "link", 10)).await),
+        (vec![("src/link".to_string(), EntryKind::Symlink)], false)
+    );
+    assert_eq!(
+        found(host.handle(find(".", "*.rs", 1)).await),
+        (vec![all_rs[0].clone()], true)
+    );
+    assert_eq!(
+        code(host.handle(find("..", "*", 10)).await),
+        Some(HostErrorCode::Invalid)
+    );
+    assert_eq!(
+        code(host.handle(find(".", "", 10)).await),
+        Some(HostErrorCode::Invalid)
+    );
+}
+
+#[tokio::test]
 async fn revoking_stops_calls_already_running() {
     let (dir, store) = store();
     std::fs::write(dir.path().join("note.txt"), "text").unwrap();
