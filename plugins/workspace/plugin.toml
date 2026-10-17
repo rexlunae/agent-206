@@ -1,7 +1,7 @@
 id = "agent206.workspace"
 name = "Workspace files"
 description = "Lists, finds, searches, reads and edits files in a project workspace, and shows an overview panel."
-version = "0.4.0"
+version = "0.5.0"
 abi = 2
 capabilities = ["read_workspace", "write_workspace"]
 
@@ -127,6 +127,22 @@ name = "new_text"
 type = "string"
 description = "Its replacement."
 required = true
+
+[[tools]]
+name = "apply_patch"
+description = "Apply a unified diff (as git diff or diff -u writes it) to files of the project workspace. It may change, create and delete several files, with several hunks each. Every hunk's context and removed lines must match the file exactly; a hunk that has moved applies where it matches nearest to its @@ line number. Nothing is written unless every file applies. Renames, mode changes and binary changes are not supported."
+capabilities = ["write_workspace"]
+
+[[tools.params]]
+name = "patch"
+type = "string"
+description = "The unified diff: --- and +++ lines for each file (/dev/null for a created or deleted one), then @@ -start,count +start,count @@ hunks."
+required = true
+
+[[tools.params]]
+name = "check_only"
+type = "boolean"
+description = "Check that the patch applies without writing anything. Defaults to false."
 
 [[panels]]
 id = "overview"
