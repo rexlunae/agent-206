@@ -168,6 +168,27 @@ pub enum HostRequest {
         query: String,
         max_matches: u32,
     },
+    /// Find lines matching `pattern` in UTF-8 files under `path`, without
+    /// following symlinks: a literal text unless `regex`, compared without
+    /// letter case when `ignore_case`. With `include`, only files whose path
+    /// matches that glob are searched (see [`HostRequest::Find`]).
+    SearchPattern {
+        path: String,
+        pattern: String,
+        regex: bool,
+        ignore_case: bool,
+        include: Option<String>,
+        max_matches: u32,
+    },
+    /// Entries under `path` matching a glob, without following symlinks. A
+    /// glob without `/` matches entry names at any depth; one with `/`
+    /// matches the whole path below `path`. `*` stays within one name and
+    /// `**` crosses directories.
+    Find {
+        path: String,
+        glob: String,
+        max_results: u32,
+    },
     /// Write a whole file atomically. Without `overwrite`, an existing file
     /// is refused with [`HostErrorCode::Exists`].
     WriteFile {
@@ -220,6 +241,7 @@ pub enum HostReply {
     File(ByteBuf),
     Directory(Vec<DirEntry>),
     Matches(SearchResult),
+    Found(FindResult),
     GitStatus(GitStatus),
     Commits(Vec<GitCommit>),
     Diff(GitDiff),
@@ -253,6 +275,19 @@ pub struct SearchResult {
     pub matches: Vec<SearchMatch>,
     /// The search stopped early at a bound; more matches may exist.
     pub truncated: bool,
+}
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FindResult {
+    /// In path order.
+    pub entries: Vec<FoundEntry>,
+    /// The walk stopped early at a bound; more entries may match.
+    pub truncated: bool,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FoundEntry {
+    /// Workspace-relative, `/`-separated.
+    pub path: String,
+    pub kind: EntryKind,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SearchMatch {

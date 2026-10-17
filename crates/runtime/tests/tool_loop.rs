@@ -1382,7 +1382,9 @@ async fn calls_that_do_not_fit_in_storage_are_settled_and_the_run_goes_on() {
     let large = |n: usize| -> Vec<Call> {
         (0..n)
             .map(|_| {
-                let filler = "a".repeat(a206_runtime::tool_calls::MAX_ARGUMENTS - 8 * 1024);
+                // The margin leaves the first batch room for the rest of the
+                // stored state, such as bundled extension manifests.
+                let filler = "a".repeat(a206_runtime::tool_calls::MAX_ARGUMENTS - 9 * 1024);
                 Call::new(&nonce(), json!({"value": format!("{}{filler}", nonce())}))
             })
             .collect()

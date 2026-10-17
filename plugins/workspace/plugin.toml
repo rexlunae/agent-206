@@ -1,7 +1,7 @@
 id = "agent206.workspace"
 name = "Workspace files"
-description = "Lists, searches, reads and edits files in a project workspace, and shows an overview panel."
-version = "0.3.0"
+description = "Lists, finds, searches, reads and edits files in a project workspace, and shows an overview panel."
+version = "0.4.0"
 abi = 2
 capabilities = ["read_workspace", "write_workspace"]
 
@@ -27,15 +27,51 @@ description = "File path relative to the workspace root."
 required = true
 
 [[tools]]
+name = "find_files"
+description = "Find files and directories in the project workspace whose path matches a glob, such as `*.rs` or `src/**/test_*.py`. Skips .git and does not follow symlinks."
+capabilities = ["read_workspace"]
+
+[[tools.params]]
+name = "pattern"
+type = "string"
+description = "Glob. Without `/` it matches names at any depth; with `/` it matches the path below `path`. `*` stays within one name, `**` crosses directories."
+required = true
+
+[[tools.params]]
+name = "path"
+type = "string"
+description = "Directory to look in, relative to the workspace root. Defaults to the root."
+
+[[tools.params]]
+name = "max_results"
+type = "integer"
+description = "Most entries to return, from 1 to 1000. Defaults to 200."
+
+[[tools]]
 name = "search_text"
-description = "Find lines containing a literal, case-sensitive text in UTF-8 files of the project workspace. Skips .git and does not follow symlinks."
+description = "Find lines containing a text, or matching a regular expression, in UTF-8 files of the project workspace. Case-sensitive unless ignore_case is true. Skips .git and does not follow symlinks."
 capabilities = ["read_workspace"]
 
 [[tools.params]]
 name = "query"
 type = "string"
-description = "Text to find."
+description = "Text to find, or a regular expression when regex is true (Rust regex syntax, matched within one line)."
 required = true
+
+[[tools.params]]
+name = "regex"
+type = "boolean"
+description = "Treat query as a regular expression. Defaults to false."
+
+[[tools.params]]
+name = "ignore_case"
+type = "boolean"
+description = "Ignore letter case. Defaults to false."
+
+[[tools.params]]
+name = "include"
+type = "string"
+description = "Search only files matching this glob, read like find_files' pattern, relative to path."
 
 [[tools.params]]
 name = "path"
