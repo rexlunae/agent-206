@@ -59,8 +59,10 @@ conversation until the user permits them:
   `added_by: user` or `you`. Results show the first 512 bytes of each message
   with its full `message_bytes`. Jobs are listed oldest first; a listing stops at 48
   KiB with `next_after`, a cursor over that order which `schedule_list { after }`
-  continues from even when jobs are added or removed between pages, so every listing is complete
-  JSON below the output cap and every job is reachable. Only the listing is
+  continues from, so every listing is complete JSON below the output cap and
+  every job is reachable. Removing jobs between pages never hides one; a job
+  added while paging may sort before the cursor (creation times are whole
+  seconds), so a new listing from the start is the one to trust after adding. Only the listing is
   marked whole output: adding and removing commit before they return, so their
   small results are never turned into a failure for lack of room.
 - `schedule_remove { id }` removes a job a model of this conversation added; the

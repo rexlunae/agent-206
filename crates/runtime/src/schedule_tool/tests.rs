@@ -281,8 +281,15 @@ async fn listings_stay_whole_json_below_the_output_cap() {
     }
     assert!(pages > 1, "the listing needed more than one page");
     assert_eq!(seen.len(), count);
-    for bad in [json!(7), json!("later"), json!("1:not-an-id")] {
+    for (bad, caused) in [
+        (json!(7), false),
+        (json!("later"), false),
+        (json!(format!("soon:{}", Id::new_v4())), true),
+        (json!("1:not-an-id"), true),
+    ] {
         let error = call(&host, mine, LIST, json!({ "after": bad })).unwrap_err();
         assert_eq!(error.kind, ErrorKind::InvalidRequest, "{bad}");
+        // A cursor that fails to parse keeps the parser's reason.
+        assert_eq!(error.source.is_some(), caused, "{bad}");
     }
 }

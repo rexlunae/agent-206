@@ -39,6 +39,10 @@ pub enum ScheduleToolError {
     Type(&'static str),
     #[error("`after` is not a `next_after` from schedule_list")]
     Cursor,
+    #[error("`after` does not start with a creation time")]
+    CursorTime(#[source] std::num::ParseIntError),
+    #[error("`after` does not end with a job ID")]
+    CursorId(#[source] uuid::Error),
     #[error("unknown argument `{0}`")]
     Unknown(String),
     #[error("unknown schedule tool `{0}`")]
@@ -207,9 +211,16 @@ impl ScheduleHost {
 
 /// The position a `next_after` names.
 fn cursor(text: &str) -> Result<(u64, Id), ErrorReport> {
-    text.split_once(':')
-        .and_then(|(created, id)| Some((created.parse().ok()?, id.parse().ok()?)))
-        .ok_or_else(|| fail(ScheduleToolError::Cursor))
+    let (created, id) = text
+        .split_once(':')
+        .ok_or_else(|| fail(ScheduleToolError::Cursor))?;
+    Ok((
+        created
+            .parse()
+            .map_err(|e| fail(ScheduleToolError::CursorTime(e)))?,
+        id.parse()
+            .map_err(|e| fail(ScheduleToolError::CursorId(e)))?,
+    ))
 }
 fn allow(args: &Map<String, Value>, known: &[&str]) -> Result<(), ErrorReport> {
     match args.keys().find(|key| !known.contains(&key.as_str())) {
