@@ -813,17 +813,18 @@ pub enum SetupRequest {
 /// What a client needs to show gateway setup.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SetupStatus {
-    /// The saved gateway, if any.
-    pub configured: Option<GatewayTarget>,
-    /// An endpoint given with `--remote` that overrides the saved gateway for this run.
-    pub pinned: Option<String>,
-    /// Why the saved or pinned gateway could not be used.
+    /// The gateway this client is using now: the saved one, or `--remote`.
+    /// Setup saved by another client takes effect when this one restarts.
+    pub active: Option<GatewayTarget>,
+    /// True when `active` came from `--remote` rather than the saved setup.
+    pub pinned: bool,
+    /// Why no gateway is active, such as a damaged saved setup.
     pub problem: Option<ErrorReport>,
 }
 impl SetupStatus {
-    /// True until a gateway is saved or pinned and usable.
+    /// True until this client has a gateway to use.
     pub fn required(&self) -> bool {
-        self.problem.is_some() || (self.configured.is_none() && self.pinned.is_none())
+        self.active.is_none()
     }
 }
 

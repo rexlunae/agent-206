@@ -11,7 +11,7 @@ pub(crate) use backend::status;
 
 #[cfg(not(target_arch = "wasm32"))]
 mod backend {
-    use crate::{PROFILE, SETUP_ERROR};
+    use crate::{PROFILE, SETUP_ERROR, TARGET};
     use a206_core::{
         ErrorKind, ErrorReport, GatewayConnection, GatewayProbe, GatewayTarget, SetupStatus,
     };
@@ -59,15 +59,13 @@ mod backend {
         }
     }
     pub(crate) async fn status() -> Result<SetupStatus, ErrorReport> {
-        let (root, pinned) = profile()?;
+        let (_, pinned) = profile()?;
+        // Report the gateway in use, not a file another client may have rewritten.
+        let active = TARGET.lock().ok().and_then(|target| target.clone());
         let problem = SETUP_ERROR.lock().ok().and_then(|problem| problem.clone());
-        let (configured, problem) = match connection::load(&root) {
-            Ok(saved) => (saved.map(|saved| saved.target), problem),
-            Err(error) => (None, Some(report(&error))),
-        };
         Ok(SetupStatus {
-            configured,
-            pinned,
+            pinned: pinned.is_some() && active.is_some(),
+            active,
             problem,
         })
     }
@@ -189,6 +187,7 @@ async fn finish(mut state: State, target: GatewayTarget) -> Result<(), ErrorRepo
     state.connected.set(false);
     state.outage.set(None);
     state.status.set(String::new());
+    state.error.set(None);
     state.setup.set(false);
     Ok(())
 }
@@ -212,7 +211,7 @@ pub(crate) fn GatewaySetup() -> Element {
 #[component]
 fn SetupForm(current: SetupStatus) -> Element {
     let state = use_context::<State>();
-    let saved_ssh = match &current.configured {
+    let saved_ssh = match &current.active {
         Some(GatewayTarget::Ssh { endpoint }) => Some(endpoint.clone()),
         _ => None,
     };
@@ -241,8 +240,8 @@ fn SetupForm(current: SetupStatus) -> Element {
         });
     };
     rsx! { PageFrame { kicker: "First-time setup", title: "Choose your gateway.", description: "The gateway runs your agents and holds their policy. Pick where it lives before this client connects to anything.",
-        if let Some(pinned) = current.pinned.clone() {
-            Alert { title: rsx! { "Started with --remote" }, "This session uses {pinned}. Saving here replaces it and sets the default for later sessions." }
+        if let (true, Some(GatewayTarget::Ssh { endpoint })) = (current.pinned, current.active.clone()) {
+            Alert { title: rsx! { "Started with --remote" }, "This session uses {endpoint}. Saving here replaces it and sets the default for later sessions." }
         }
         if cfg!(target_arch = "wasm32") {
             Alert { title: rsx! { "Set up through the web server" }, "The Agent 206 web server makes the SSH connection, with its own OpenSSH keys and known hosts. This browser never receives a key." }

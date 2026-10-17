@@ -53,24 +53,29 @@ pub enum WebError {
 /// repaired) the browser is offered setup and nothing connects or launches.
 struct Gateway {
     client: Option<GatewayController>,
-    pinned: Option<String>,
+    /// The target `client` talks to; status reports this, never a file that
+    /// another client may have rewritten since.
+    target: Option<GatewayTarget>,
+    pinned: bool,
     problem: Option<ErrorReport>,
 }
 impl Gateway {
     fn resolve(root: &std::path::Path, remote: Option<String>) -> Result<Self, WebError> {
         Ok(match connection::resolve(root, remote.clone()) {
             Ok(target) => Gateway {
-                client: target.map(|target| {
+                client: target.as_ref().map(|target| {
                     GatewayController::new(root.into(), target.remote().map(str::to_owned))
                 }),
-                pinned: remote,
+                target,
+                pinned: remote.is_some(),
                 problem: None,
             },
             Err(error) if remote.is_some() => return Err(WebError::Remote(error)),
             // A damaged saved setup is shown to the browser, which can replace it.
             Err(error) => Gateway {
                 client: None,
-                pinned: None,
+                target: None,
+                pinned: false,
                 problem: Some(crate::error::handle("load gateway setup", &error)),
             },
         })
@@ -86,20 +91,12 @@ impl Web {
             .client
             .clone()
     }
-    /// A saved setup that cannot be read is reported as the problem to fix.
     fn status(&self) -> SetupStatus {
         let gateway = self.gateway.read().unwrap_or_else(PoisonError::into_inner);
-        let (configured, problem) = match connection::load(&self.root) {
-            Ok(saved) => (saved.map(|saved| saved.target), gateway.problem.clone()),
-            Err(error) => (
-                None,
-                Some(crate::error::handle("load gateway setup", &error)),
-            ),
-        };
         SetupStatus {
-            configured,
-            pinned: gateway.pinned.clone(),
-            problem,
+            active: gateway.target.clone(),
+            pinned: gateway.pinned,
+            problem: gateway.problem.clone(),
         }
     }
     /// Save a verified target and switch to it in one step, so the file and the
@@ -117,7 +114,8 @@ impl Web {
                 self.root.to_path_buf(),
                 target.remote().map(str::to_owned),
             )),
-            pinned: None,
+            target: Some(target),
+            pinned: false,
             problem: None,
         };
         Ok(())
@@ -536,7 +534,8 @@ mod tests {
         Web {
             gateway: Arc::new(RwLock::new(Gateway {
                 client: Some(GatewayController::attach(root.clone(), None)),
-                pinned: None,
+                target: Some(GatewayTarget::Local),
+                pinned: false,
                 problem: None,
             })),
             root: Arc::new(root),
@@ -671,7 +670,7 @@ mod tests {
             panic!("unexpected {status:?}");
         };
         assert!(status.required());
-        assert_eq!(status.configured, None);
+        assert_eq!(status.active, None);
         let (_, reply) = post::<_, Reply>(&app, &state, "/api/command", Command::Snapshot).await;
         let Reply::Error(report) = reply else {
             panic!("unexpected {reply:?}");
@@ -770,5 +769,44 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
         assert!(!root.path().join("connection.toml").exists());
+    }
+    #[tokio::test]
+    async fn status_reports_the_gateway_in_use_not_a_rewritten_file() {
+        let root = tempfile::tempdir().unwrap();
+        let (state, app) = unconfigured(root.path());
+        let pinned = GatewayTarget::Ssh {
+            endpoint: format!("ssh://u{}@gateway.test", uuid::Uuid::new_v4().simple()),
+        };
+        // A pinned gateway is in use; the damaged default file is not consulted.
+        *state.gateway.write().unwrap() = Gateway {
+            client: None,
+            target: Some(pinned.clone()),
+            pinned: true,
+            problem: None,
+        };
+        std::fs::write(root.path().join("connection.toml"), "target = 7").unwrap();
+        let (_, reply) =
+            post::<_, SetupReply>(&app, &state, "/api/setup", SetupRequest::Status).await;
+        let SetupReply::Status(status) = reply else {
+            panic!("unexpected {reply:?}");
+        };
+        assert!(!status.required());
+        assert_eq!(status.active, Some(pinned.clone()));
+        assert!(status.pinned && status.problem.is_none());
+        // Another client saving a different gateway does not change what this
+        // bridge reports, because it does not change what this bridge uses.
+        connection::save(
+            root.path(),
+            &GatewayConnection {
+                target: GatewayTarget::Local,
+            },
+        )
+        .unwrap();
+        let (_, reply) =
+            post::<_, SetupReply>(&app, &state, "/api/setup", SetupRequest::Status).await;
+        let SetupReply::Status(status) = reply else {
+            panic!("unexpected {reply:?}");
+        };
+        assert_eq!(status.active, Some(pinned));
     }
 }

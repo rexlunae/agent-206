@@ -315,6 +315,8 @@ structured not-configured error and serves gateway setup (`/api/setup`). SSH
 probes, key scans and known_hosts writes happen in the bridge process; the
 browser sends an endpoint and the fingerprint the user verified, never a key
 entry, and a target is saved only after a strict-host-key check succeeds.
+Like the desktop client, the bridge keeps the gateway it started with (or last
+switched to) until it restarts; setup saved by another client applies then.
 
 Public downloads validate all resolved addresses, pin them for the TLS request,
 follow only validated HTTPS redirects, and bypass ambient proxy settings. Transfer

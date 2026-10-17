@@ -51,6 +51,9 @@ pub fn configure(root: std::path::PathBuf, remote: Option<String>) {
         }
     }
 }
+/// The target `CLIENT` talks to, for the setup screen.
+#[cfg(not(target_arch = "wasm32"))]
+static TARGET: std::sync::Mutex<Option<a206_core::GatewayTarget>> = std::sync::Mutex::new(None);
 #[cfg(not(target_arch = "wasm32"))]
 fn connect(root: std::path::PathBuf, target: &a206_core::GatewayTarget) {
     if let Ok(mut client) = CLIENT.lock() {
@@ -58,6 +61,9 @@ fn connect(root: std::path::PathBuf, target: &a206_core::GatewayTarget) {
             root,
             target.remote().map(str::to_owned),
         ));
+    }
+    if let Ok(mut active) = TARGET.lock() {
+        *active = Some(target.clone());
     }
 }
 /// True until this client has a gateway to talk to.
