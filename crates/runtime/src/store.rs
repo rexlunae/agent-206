@@ -521,6 +521,7 @@ mod tests {
             error: None,
             signature: None,
             reduction: None,
+            redactions: Vec::new(),
         };
         message.tool_calls = vec![
             call(ToolCallState::AwaitingApproval),

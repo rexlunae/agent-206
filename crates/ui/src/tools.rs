@@ -1,8 +1,8 @@
 //! Tool traces, pending approvals and per-tool permissions in a conversation.
 use crate::{State, dispatch, error::ErrorNotice};
 use a206_core::{
-    ApprovalDecision, ApprovalRequest, Command, ErrorKind, ErrorReport, OutputReduction, Reply,
-    ToolCall, ToolCallState, ToolPermission,
+    ApprovalDecision, ApprovalRequest, Command, ErrorKind, ErrorReport, OutputCount,
+    OutputReduction, Reply, ToolCall, ToolCallState, ToolPermission,
 };
 use fc_dioxus::prelude::*;
 use uuid::Uuid;
@@ -43,10 +43,25 @@ pub(crate) fn ToolTrace(call: ToolCall) -> Element {
                 pre { class: "a206-tool-output", "{output}" }
             }
         }
+        if !call.redactions.is_empty() {
+            p { class: "a206-muted", {redaction_note(&call.redactions)} }
+        }
         if let Some(reduction) = call.reduction.as_ref() {
             p { class: "a206-muted", {reduction_note(reduction)} }
         }
     }
+}
+
+/// Which kinds of credential were removed before the model saw a result.
+fn redaction_note(redactions: &[OutputCount]) -> String {
+    let kinds: Vec<String> = redactions
+        .iter()
+        .map(|found| format!("{} × {}", found.name, found.count))
+        .collect();
+    format!(
+        "Credentials removed before the model saw this result: {}",
+        kinds.join(", ")
+    )
 }
 
 /// What an output rule did to a result, which is all the model saw of it.
@@ -222,6 +237,7 @@ mod tests {
             error: None,
             signature: None,
             reduction: None,
+            redactions: Vec::new(),
         }
     }
     #[test]
@@ -285,8 +301,7 @@ mod tests {
         assert!(html.contains(Lifecycle::Complete.as_str()), "{html}");
     }
     #[test]
-    fn a_reduced_result_says_which_rule_shortened_it() {
-        use a206_core::OutputCount;
+    fn a_result_says_how_it_was_changed_for_the_model() {
         let mut done = call(ToolCallState::Succeeded);
         done.output = Some(Uuid::new_v4().to_string());
         let plain = render(done.clone());
@@ -302,10 +317,23 @@ mod tests {
                 count: 3,
             }],
         });
-        let html = render(done);
+        let html = render(done.clone());
         assert!(
             html.contains(&format!(
                 "Shortened for the model by your output rule `{rule}` from {bytes} bytes; {name}: 3"
+            )),
+            "{html}"
+        );
+        assert!(!html.contains("Credentials removed"), "{html}");
+        let kind = Uuid::new_v4().simple().to_string();
+        done.redactions = vec![OutputCount {
+            name: kind.clone(),
+            count: 2,
+        }];
+        let html = render(done);
+        assert!(
+            html.contains(&format!(
+                "Credentials removed before the model saw this result: {kind} × 2"
             )),
             "{html}"
         );

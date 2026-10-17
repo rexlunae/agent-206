@@ -1,0 +1,13 @@
+[package]
+name = "a206-leak-scan"
+description = "Removal of credential-shaped text from tool results before a model reads them"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+[dependencies]
+regex = "1"
+[dev-dependencies]
+uuid.workspace = true
+[lints]
+workspace = true

@@ -116,6 +116,7 @@ impl ToolHost for TestHost {
             // Tools named `fail_…` report their own failure.
             let is_error = request.name.starts_with("fail_");
             let held = request.name.starts_with("held_");
+            let broken = request.name.starts_with("broken_");
             self.calls.send((scope.clone(), request)).unwrap();
             if blocking {
                 let _flag = DropFlag(self.dropped.clone());
@@ -123,6 +124,10 @@ impl ToolHost for TestHost {
             }
             if held {
                 self.release.notified().await;
+            }
+            // Tools named `broken_…` fail in the host, quoting the text.
+            if broken {
+                return Err(ErrorReport::new(ErrorKind::Other, text));
             }
             Ok(ToolOutput { text, is_error })
         })
@@ -1692,6 +1697,122 @@ async fn output_that_must_be_whole_is_never_reduced() {
     second.respond(text_response(api, &nonce())).await;
     let thread = finished(task).await;
     assert_eq!(calls_of(&thread)[0].reduction, None);
+}
+
+// ── Credential removal ──────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn credentials_in_tool_results_never_reach_the_model_or_the_record() {
+    let api = ProviderApi::OpenAi;
+    let names = [
+        format!("lines_{}", nonce()),
+        format!("fail_lines_{}", nonce()),
+        format!("broken_lines_{}", nonce()),
+        format!("whole_lines_{}", nonce()),
+    ];
+    let mut tools: Vec<_> = names
+        .iter()
+        .map(|name| tool(name, ToolPermission::Allow, &[]))
+        .collect();
+    tools[3].whole_output = true;
+    let mut rig = rig(api, tools, None).await;
+    for name in &names {
+        rig.permit(name, ToolPermission::Allow).await;
+    }
+    // A rule that would count the token's line, were it still there.
+    let (program, noise) = (nonce(), nonce());
+    rig.write_rules(&format!(
+        "[[rule]]\nid = \"{}\"\n[rule.match]\nargv0 = [\"{program}\"]\n[rule.filters]\nskip = ['^{noise}']\n[[rule.counters]]\nname = \"tokens\"\npattern = 'ghp_'\n",
+        nonce()
+    ));
+    // The model passes the text in, so the token appears in its own
+    // arguments; only what the tools return is checked.
+    let token = format!("ghp_{}{}", nonce(), nonce());
+    let (before, after) = (nonce(), nonce());
+    let value = format!("{before} {token}\n{noise}\n{after}\n");
+    let clean = format!("{before} [redacted github_token]\n{noise}\n{after}\n");
+    let calls: Vec<_> = names
+        .iter()
+        .map(|name| Call::new(name, json!({"command": program, "value": value})))
+        .collect();
+    let task = rig.send();
+    let first = rig.next_request().await;
+    first.respond(calls_response(api, &calls, "")).await;
+    let second = rig.next_request().await;
+    for call in &calls {
+        let seen = result_for(api, &second.body, &call.id).unwrap();
+        assert!(!seen.contains(&token), "{seen}");
+        assert!(seen.contains("[redacted github_token]"), "{seen}");
+    }
+    second.respond(text_response(api, &nonce())).await;
+    let thread = finished(task).await;
+    assert_eq!(thread.state, RunState::Complete, "{:?}", thread.error);
+    let recorded = calls_of(&thread);
+    let record = |id: &str| recorded.iter().find(|c| c.id == id).unwrap();
+    let found = vec![OutputCount {
+        name: "github_token".into(),
+        count: 1,
+    }];
+    for call in &calls {
+        let call = record(&call.id);
+        assert_eq!(call.redactions, found, "{}", call.tool);
+        assert!(!call.output.as_deref().unwrap().contains(&token));
+        let report = call.error.as_ref().map(ErrorReport::detail);
+        assert!(!report.unwrap_or_default().contains(&token));
+    }
+    // The rule ran on the cleaned text: nothing left for it to count.
+    let reduction = record(&calls[0].id).reduction.clone().unwrap();
+    assert_eq!(reduction.counts[0].count, 0);
+    assert!(
+        record(&calls[0].id)
+            .output
+            .as_deref()
+            .unwrap()
+            .starts_with(&format!(
+                "{before} [redacted github_token]\n{after}\n[output rule"
+            ))
+    );
+    assert_eq!(record(&calls[3].id).output.as_deref(), Some(clean.as_str()));
+    let broken = record(&calls[2].id);
+    assert_eq!(broken.state, ToolCallState::Failed);
+    assert!(broken.error.is_some());
+}
+
+#[tokio::test]
+async fn a_credential_an_output_rule_joins_is_removed_too() {
+    let api = ProviderApi::Anthropic;
+    let name = format!("lines_{}", nonce());
+    let mut rig = rig(api, vec![tool(&name, ToolPermission::Allow, &[])], None).await;
+    rig.permit(&name, ToolPermission::Allow).await;
+    rig.write_rules(&format!(
+        "[[rule]]\nid = \"{}\"\n[rule.match]\ntools = [\"{name}\"]\n[rule.transforms]\nstrip_ansi = true\n",
+        nonce()
+    ));
+    // A colour change inside the token hides its shape until the rule
+    // strips the escape.
+    let (head, tail) = (nonce(), nonce());
+    let value = format!("ghp_{head}\u{1b}[0m{tail}\n");
+    let call = Call::new(&name, json!({"value": value}));
+    let task = rig.send();
+    let first = rig.next_request().await;
+    first
+        .respond(calls_response(api, std::slice::from_ref(&call), ""))
+        .await;
+    let second = rig.next_request().await;
+    let seen = result_for(api, &second.body, &call.id).unwrap();
+    assert!(!seen.contains(&tail), "{seen}");
+    assert!(seen.contains("[redacted github_token]"), "{seen}");
+    second.respond(text_response(api, &nonce())).await;
+    let thread = finished(task).await;
+    let call = &calls_of(&thread)[0];
+    assert!(call.reduction.is_some());
+    assert_eq!(
+        call.redactions,
+        [OutputCount {
+            name: "github_token".into(),
+            count: 1
+        }]
+    );
 }
 
 #[tokio::test]
