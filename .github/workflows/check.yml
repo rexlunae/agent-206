@@ -36,6 +36,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+          # The runtime embeds the bundled WASM extensions.
+          targets: wasm32-unknown-unknown
       - run: sudo apt-get update && sudo apt-get install -y bubblewrap
       # Ubuntu's AppArmor default blocks the unprivileged user namespaces
       # bubblewrap creates; the sandbox itself still requires both layers.
