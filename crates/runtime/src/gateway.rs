@@ -2058,6 +2058,21 @@ mod tests {
             before = current.events.last().map(|event| event.sequence);
         }
         assert_eq!(seen, names.iter().rev().cloned().collect::<Vec<_>>());
+        // A zero limit still returns the cursor its `more` promises.
+        let Reply::Activity(zero) = gateway
+            .request(Request {
+                id: Id::new_v4(),
+                body: Command::Activity {
+                    before: None,
+                    limit: 0,
+                },
+            })
+            .await
+            .body
+        else {
+            panic!("activity failed");
+        };
+        assert!(zero.more && zero.events.len() == 1);
     }
 
     #[tokio::test]

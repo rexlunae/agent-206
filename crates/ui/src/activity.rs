@@ -10,21 +10,30 @@ use a206_core::{
 use fc_dioxus::prelude::*;
 
 /// Journal events shown so far, newest first, and whether older ones remain.
+/// Sequences number one gateway's journal, so `gateway` (the shell's gateway
+/// generation) says which journal they came from.
 #[derive(Clone, Debug, Default, PartialEq)]
 struct Shown {
+    gateway: u64,
     events: Vec<Event>,
     more: bool,
 }
 impl Shown {
-    /// Put a fresh newest page on top. Older pages already loaded stay when
-    /// the new page reaches them; otherwise events in between were never
-    /// fetched, so the list restarts from the new page.
-    fn refresh(&mut self, page: ActivityPage) {
-        let Some(top) = self.events.first().map(|event| event.sequence) else {
-            *self = Self {
-                events: page.events,
-                more: page.more,
-            };
+    fn start(gateway: u64, page: ActivityPage) -> Self {
+        Self {
+            gateway,
+            events: page.events,
+            more: page.more,
+        }
+    }
+    /// Put a fresh newest page from `gateway` on top. Older pages already
+    /// loaded stay when the new page reaches them; otherwise events in between
+    /// were never fetched (or came from another gateway), so the list restarts
+    /// from the new page.
+    fn refresh(&mut self, gateway: u64, page: ActivityPage) {
+        let top = self.events.first().map(|event| event.sequence);
+        let Some(top) = top.filter(|_| self.gateway == gateway) else {
+            *self = Self::start(gateway, page);
             return;
         };
         let reaches = !page.more || page.events.last().is_some_and(|e| e.sequence <= top);
@@ -37,16 +46,20 @@ impl Shown {
             events.append(&mut self.events);
             self.events = events;
         } else {
-            *self = Self {
-                events: page.events,
-                more: page.more,
-            };
+            *self = Self::start(gateway, page);
         }
     }
-    /// Append the page that came before the oldest event shown.
-    fn extend(&mut self, page: ActivityPage) {
-        self.events.extend(page.events);
-        self.more = page.more;
+    /// The cursor for the page before the oldest event shown.
+    fn bottom(&self) -> Option<u64> {
+        self.events.last().map(|event| event.sequence)
+    }
+    /// Append the page `gateway` returned for events before `before`, unless
+    /// the list restarted while it was being fetched.
+    fn extend(&mut self, gateway: u64, before: u64, page: ActivityPage) {
+        if self.gateway == gateway && self.bottom() == Some(before) {
+            self.events.extend(page.events);
+            self.more = page.more;
+        }
     }
 }
 
@@ -72,14 +85,37 @@ pub fn Activity() -> Element {
     let mut loaded = use_signal(|| false);
     let mut loading_older = use_signal(|| false);
     let mut failure = use_signal(|| None::<ErrorReport>);
-    // Each new journal event the snapshot reports refreshes the newest page.
+    // Ages are relative, so the page keeps its own clock.
+    let mut clock = use_signal(crate::messengers::now);
+    use_future(move || async move {
+        loop {
+            futures_timer::Delay::new(std::time::Duration::from_secs(30)).await;
+            clock.set(crate::messengers::now());
+        }
+    });
+    // Each new journal event the snapshot reports refreshes the newest page,
+    // and another gateway starts the list over.
     let last_event = use_memo(move || state.data.read().last_event);
+    let gateway = state.gateway_generation;
     use_effect(move || {
         let _ = last_event();
+        let generation = gateway();
+        if shown.peek().gateway != generation {
+            shown.set(Shown {
+                gateway: generation,
+                ..Shown::default()
+            });
+            loaded.set(false);
+        }
         spawn(async move {
-            match fetch(None).await {
+            let result = fetch(None).await;
+            // A reply from a gateway the shell has since left is dropped.
+            if *gateway.peek() != generation {
+                return;
+            }
+            match result {
                 Ok(page) => {
-                    shown.write().refresh(page);
+                    shown.write().refresh(generation, page);
                     failure.set(None);
                 }
                 Err(report) => failure.set(Some(report)),
@@ -91,22 +127,29 @@ pub fn Activity() -> Element {
         if *loading_older.peek() {
             return;
         }
-        let Some(before) = shown.peek().events.last().map(|event| event.sequence) else {
+        let (generation, bottom) = {
+            let shown = shown.peek();
+            (shown.gateway, shown.bottom())
+        };
+        let Some(before) = bottom else {
             return;
         };
         loading_older.set(true);
         spawn(async move {
-            match fetch(Some(before)).await {
-                Ok(page) => {
-                    shown.write().extend(page);
-                    failure.set(None);
+            let result = fetch(Some(before)).await;
+            if *gateway.peek() == generation {
+                match result {
+                    Ok(page) => {
+                        shown.write().extend(generation, before, page);
+                        failure.set(None);
+                    }
+                    Err(report) => failure.set(Some(report)),
                 }
-                Err(report) => failure.set(Some(report)),
             }
             loading_older.set(false);
         });
     };
-    let now = crate::messengers::now();
+    let now = clock();
     let snapshot = state.data.read();
     let current = shown();
     rsx! { PageFrame { kicker: "Activity", title: "What happened, newest first.", description: "Approvals, questions, downloads and changes to extensions, connections and settings, from the gateway's event log.",
@@ -333,18 +376,29 @@ mod tests {
     #[test]
     fn a_new_page_joins_loaded_history_only_when_nothing_is_skipped() {
         let mut shown = Shown::default();
-        shown.refresh(page(vec![extension(5), extension(3)], true));
-        shown.extend(page(vec![extension(2)], false));
+        shown.refresh(0, page(vec![extension(5), extension(3)], true));
+        shown.extend(0, 3, page(vec![extension(2)], false));
         assert!(!shown.more);
         // Overlaps the top: only the new events go on top, history stays.
-        shown.refresh(page(vec![extension(8), extension(6), extension(5)], true));
+        shown.refresh(
+            0,
+            page(vec![extension(8), extension(6), extension(5)], true),
+        );
         let sequences = |shown: &Shown| shown.events.iter().map(|e| e.sequence).collect::<Vec<_>>();
         assert_eq!(sequences(&shown), [8, 6, 5, 3, 2]);
         assert!(!shown.more);
         // A full page that stops above the top skipped events: start over.
-        shown.refresh(page(vec![extension(20), extension(19)], true));
+        shown.refresh(0, page(vec![extension(20), extension(19)], true));
         assert_eq!(sequences(&shown), [20, 19]);
         assert!(shown.more);
+        // An older page fetched before that restart no longer fits.
+        shown.extend(0, 2, page(vec![], false));
+        assert!(shown.more);
+        // Another gateway's journal never merges with this one.
+        shown.refresh(1, page(vec![extension(21), extension(19)], false));
+        assert_eq!((shown.gateway, sequences(&shown)), (1, vec![21, 19]));
+        shown.extend(0, 19, page(vec![extension(18)], false));
+        assert_eq!(sequences(&shown), [21, 19]);
     }
 
     #[test]

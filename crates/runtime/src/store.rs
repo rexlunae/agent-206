@@ -241,7 +241,9 @@ impl Store {
     /// See [`Command::Activity`](a206_core::Command::Activity). Only the
     /// retained journal is read, so the oldest page ends where the journal does.
     pub fn activity(&self, before: Option<u64>, limit: u32) -> Result<ActivityPage> {
-        let limit = usize::try_from(limit.min(MAX_ACTIVITY)).unwrap_or(0);
+        // A page always holds at least one event, so a page that says older
+        // activity remains also carries the cursor to reach it.
+        let limit = usize::try_from(limit.clamp(1, MAX_ACTIVITY)).unwrap_or(1);
         let before = before.unwrap_or(self.state.last_event.saturating_add(1));
         let mut stmt = self
             .db

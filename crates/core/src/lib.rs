@@ -737,7 +737,7 @@ pub enum Command {
         thread: Id,
     },
     /// The newest [`ActivityPage`] of the event journal, or the page before
-    /// sequence `before`; at most `limit` (capped at [`MAX_ACTIVITY`]) events.
+    /// sequence `before`; `limit` events, between one and [`MAX_ACTIVITY`].
     Activity {
         before: Option<u64>,
         limit: u32,
