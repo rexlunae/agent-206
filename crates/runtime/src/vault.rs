@@ -221,6 +221,12 @@ mod imp {
     }
 
     enum Job {
+        /// Read the status without starting a broker; `None` when none runs.
+        Peek(oneshot::Sender<Result<Option<BrokerStatus>>>),
+        /// Work that starts a broker when none is running.
+        Act(Action),
+    }
+    enum Action {
         Call(Box<Request>, oneshot::Sender<Result<Reply>>),
         Pair {
             if_running: bool,
@@ -256,7 +262,7 @@ mod imp {
         pub async fn call(&self, request: Request) -> Result<Reply> {
             let (reply, receiver) = oneshot::channel();
             self.sender
-                .send(Job::Call(Box::new(request), reply))
+                .send(Job::Act(Action::Call(Box::new(request), reply)))
                 .map_err(|_| VaultError::Worker(None))?;
             receiver.await.map_err(|_| VaultError::Worker(None))?
         }
@@ -265,6 +271,15 @@ mod imp {
                 Reply::Status(status) => Ok(status),
                 _ => Err(VaultError::UnexpectedReply),
             }
+        }
+        /// The broker's status if one is running, without starting one, for
+        /// background reads that must not undo a deliberate `vault stop`.
+        pub async fn status_if_running(&self) -> Result<Option<BrokerStatus>> {
+            let (reply, receiver) = oneshot::channel();
+            self.sender
+                .send(Job::Peek(reply))
+                .map_err(|_| VaultError::Worker(None))?;
+            receiver.await.map_err(|_| VaultError::Worker(None))?
         }
         /// Pair the running gateway with this connection's unlock.
         pub async fn pair_gateway(&self) -> Result<()> {
@@ -277,7 +292,7 @@ mod imp {
         async fn pair(&self, if_running: bool) -> Result<bool> {
             let (reply, receiver) = oneshot::channel();
             self.sender
-                .send(Job::Pair { if_running, reply })
+                .send(Job::Act(Action::Pair { if_running, reply }))
                 .map_err(|_| VaultError::Worker(None))?;
             receiver.await.map_err(|_| VaultError::Worker(None))?
         }
@@ -289,15 +304,45 @@ mod imp {
         while let Some(job) = receiver.blocking_recv() {
             // A caller that stopped waiting needs no reply.
             match job {
-                Job::Call(_, reply) => reply.send(Err(lost())).ignore(),
-                Job::Pair { reply, .. } => reply.send(Err(lost())).ignore(),
+                Job::Act(Action::Call(_, reply)) => reply.send(Err(lost())).ignore(),
+                Job::Act(Action::Pair { reply, .. }) => reply.send(Err(lost())).ignore(),
+                Job::Peek(reply) => reply.send(Err(lost())).ignore(),
             }
         }
+    }
+
+    /// Status through the held connection, or a running broker's; never
+    /// starts one. A held connection that fails in transport may belong to a
+    /// broker that was stopped, so look again before reporting it.
+    async fn peek(root: &Path, client: &mut Option<Client>) -> Result<Option<BrokerStatus>> {
+        if let Some(mut connected) = client.take() {
+            let result = status(&mut connected).await;
+            if keeps_connection(&result) {
+                *client = Some(connected);
+                return result.map(Some);
+            }
+        }
+        let Some(mut connected) = connect_running(root).await? else {
+            return Ok(None);
+        };
+        let result = status(&mut connected).await;
+        if keeps_connection(&result) {
+            *client = Some(connected);
+        }
+        result.map(Some)
     }
 
     async fn work(root: PathBuf, mut receiver: mpsc::UnboundedReceiver<Job>) {
         let mut client = None;
         while let Some(job) = receiver.recv().await {
+            let job = match job {
+                Job::Peek(reply) => {
+                    // A caller that stopped waiting needs no reply.
+                    reply.send(peek(&root, &mut client).await).ignore();
+                    continue;
+                }
+                Job::Act(action) => action,
+            };
             let connected = match client.take() {
                 Some(connected) => Ok(connected),
                 None => connect(&root).await,
@@ -307,20 +352,20 @@ mod imp {
                 Err(error) => {
                     // A caller that stopped waiting needs no reply.
                     match job {
-                        Job::Call(_, reply) => reply.send(Err(error)).ignore(),
-                        Job::Pair { reply, .. } => reply.send(Err(error)).ignore(),
+                        Action::Call(_, reply) => reply.send(Err(error)).ignore(),
+                        Action::Pair { reply, .. } => reply.send(Err(error)).ignore(),
                     }
                     continue;
                 }
             };
             let healthy = match job {
-                Job::Call(request, reply) => {
+                Action::Call(request, reply) => {
                     let result = connected.call(*request).await.map_err(VaultError::from);
                     let healthy = keeps_connection(&result);
                     reply.send(result).ignore();
                     healthy
                 }
-                Job::Pair { if_running, reply } => {
+                Action::Pair { if_running, reply } => {
                     let result = if if_running && !gateway_running(&root).await {
                         Ok(false)
                     } else {
@@ -368,6 +413,9 @@ mod fallback {
         pub async fn status(&self) -> Result<a206_broker::BrokerStatus> {
             Err(VaultError::Unsupported)
         }
+        pub async fn status_if_running(&self) -> Result<Option<a206_broker::BrokerStatus>> {
+            Err(VaultError::Unsupported)
+        }
         pub async fn pair_gateway(&self) -> Result<()> {
             Err(VaultError::Unsupported)
         }
@@ -405,5 +453,16 @@ mod tests {
         let report = crate::error::report(&locked);
         assert_eq!(report.kind, ErrorKind::Unavailable);
         assert_eq!(report.message, a206_broker::BrokerError::Locked.to_string());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_background_status_read_never_starts_a_broker() {
+        let root = tempfile::tempdir().unwrap();
+        let session = Session::open(root.path().to_path_buf());
+        assert!(matches!(session.status_if_running().await, Ok(None)));
+        // Nothing was spawned or prepared for one.
+        assert!(!a206_broker::socket_path(root.path()).exists());
+        assert!(!root.path().join("vault").exists());
     }
 }
