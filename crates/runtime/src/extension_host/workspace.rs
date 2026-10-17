@@ -822,12 +822,25 @@ struct Planned<'a> {
 /// Apply `files` together: every file is read and patched in memory before
 /// anything is written, then every new text is staged in a temporary file,
 /// and only then are they put in place in request order. Directories a new
-/// file needs are made while staging and stay if a later file fails.
+/// file needs are made while staging and stay if a later file fails. Raising
+/// `interrupt` stops the patch, with nothing written, until the first file is
+/// put in place; from then on it finishes and reports what it did.
 pub(super) fn patch_files(
     root: PathBuf,
     files: &[FilePatch],
     check_only: bool,
+    interrupt: &std::sync::atomic::AtomicBool,
 ) -> Result<HostReply, HostFailure> {
+    let interrupted = || {
+        if interrupt.load(std::sync::atomic::Ordering::Relaxed) {
+            Err(failure(
+                HostErrorCode::Budget,
+                "the patch took too long, and no file was changed",
+            ))
+        } else {
+            Ok(())
+        }
+    };
     if files.is_empty() {
         return Err(failure(
             HostErrorCode::Invalid,
@@ -863,6 +876,7 @@ pub(super) fn patch_files(
     };
     let mut planned = Vec::with_capacity(files.len());
     for file in files {
+        interrupted()?;
         match plan(&workspace, file) {
             Ok(plan) => planned.push(plan),
             Err(failure) => return failed(file, failure),
@@ -873,6 +887,7 @@ pub(super) fn patch_files(
     }
     let mut ready = Vec::with_capacity(planned.len());
     for mut plan in planned {
+        interrupted()?;
         let directory = match plan.directory.take() {
             Some(directory) => directory,
             None => match workspace
@@ -888,6 +903,7 @@ pub(super) fn patch_files(
     }
     let mut staged = Vec::with_capacity(ready.len());
     for (plan, directory) in &ready {
+        interrupted()?;
         let staging = match &plan.text {
             Some(text) => stage(
                 directory,
@@ -904,6 +920,8 @@ pub(super) fn patch_files(
             Err(failure) => return failed(plan.file, failure),
         }
     }
+    // The point of no return: past this check every file is attempted.
+    interrupted()?;
     let mut changed = Vec::with_capacity(staged.len());
     for (plan, directory, staging) in staged.drain(..) {
         let expected = plan.original.as_deref();

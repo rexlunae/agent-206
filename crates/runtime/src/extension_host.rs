@@ -17,7 +17,7 @@ use a206_extensions::{
     ArgError, Limits, Manifest, ManifestError,
     abi::{
         ABI, Call, HostErrorCode, HostFailure, HostReply, HostRequest, Invocation, LogLevel,
-        Outcome,
+        Outcome, PatchFailure, PatchResult,
     },
     worker::{Frame, Start},
 };
@@ -777,9 +777,36 @@ fn failure(code: HostErrorCode, message: &str) -> HostFailure {
     }
 }
 impl HostCalls {
+    /// How long a call with a point of no return may run before it must
+    /// stop, leaving room for its outcome to reach the guest.
+    fn write_budget(&self) -> Result<Duration, HostFailure> {
+        let budget = self
+            .deadline
+            .saturating_duration_since(tokio::time::Instant::now())
+            .saturating_sub(GIT_WRITE_RESERVE)
+            .min(GIT_TIMEOUT);
+        if budget.is_zero() {
+            return Err(failure(
+                HostErrorCode::Budget,
+                "too little time is left in this call to change files",
+            ));
+        }
+        Ok(budget)
+    }
     async fn handle(&mut self, request: HostRequest) -> HostReply {
         match self.execute(request).await {
-            Ok(reply) => reply,
+            Ok(reply) => {
+                // A patch reports a file's failure inside its reply, which
+                // the guest turns into its own failure: keep the cause.
+                if let HostReply::Patched(PatchResult {
+                    failed: Some(PatchFailure { failure, .. }),
+                    ..
+                }) = &reply
+                {
+                    self.last_failure = Some(failure.clone());
+                }
+                reply
+            }
             Err(failure) => {
                 self.last_failure = Some(failure.clone());
                 HostReply::Failed(failure)
@@ -928,7 +955,15 @@ impl HostCalls {
             }
             HostRequest::PatchFiles { files, check_only } => {
                 let root = self.workspace()?;
-                blocking(move || workspace::patch_files(root, &files, check_only)).await
+                // As for a commit: a patch that has started putting files in
+                // place finishes and is reported, so it must start early
+                // enough to reach the guest before the invocation ends.
+                let budget = self.write_budget()?;
+                git_write_call_with_timeout(
+                    move |interrupt| workspace::patch_files(root, &files, check_only, &interrupt),
+                    budget,
+                )
+                .await
             }
             HostRequest::CreateDirectory { path } => {
                 let root = self.workspace()?;
@@ -951,17 +986,7 @@ impl HostCalls {
                 let user = self.user_git;
                 // Stop early enough that a commit made at the last moment
                 // still reaches the guest before the invocation is dropped.
-                let budget = self
-                    .deadline
-                    .saturating_duration_since(tokio::time::Instant::now())
-                    .saturating_sub(GIT_WRITE_RESERVE)
-                    .min(GIT_TIMEOUT);
-                if budget.is_zero() {
-                    return Err(failure(
-                        HostErrorCode::Budget,
-                        "too little time is left in this call to commit",
-                    ));
-                }
+                let budget = self.write_budget()?;
                 git_write_call_with_timeout(
                     move |interrupt| {
                         git_commit::commit(root, &message, &paths, &user()?, &interrupt)
@@ -1083,7 +1108,8 @@ async fn git_call_with_timeout(
 ) -> Result<HostReply, HostFailure> {
     run_git(work, timeout, Late::Refuse).await
 }
-/// Like [`git_call`], for a call that changes the repository, stopping at
+/// Like [`git_call`], for a call that changes the workspace or repository
+/// (a commit or a patch), stopping at
 /// `timeout`. Once past its point of no return it finishes, and its outcome
 /// is reported as it is: a commit made after the deadline is still a commit.
 /// If this future is dropped, a call that has not reached that point stops

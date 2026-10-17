@@ -28,6 +28,8 @@ pub enum ParseError {
         "line {0}: the hunk has no line numbers and only adds lines, so where it goes is unknown"
     )]
     Unplaced(usize),
+    #[error("line {0}: the hunk has fewer lines than the counts in its @@ header")]
+    ShortHunk(usize),
     #[error("{0} has a file header but no hunks")]
     NoHunks(String),
 }
@@ -69,7 +71,7 @@ pub fn parse(patch: &str) -> Result<Vec<FilePatch>, ParseError> {
                 .last_mut()
                 .ok_or(ParseError::HunkWithoutFile(number))?;
             let header = range(line).ok_or(ParseError::BadHeader(number))?;
-            let hunk = hunk(&mut lines, header);
+            let hunk = hunk(&mut lines, header).ok_or(ParseError::ShortHunk(number))?;
             let adds_only = hunk
                 .lines
                 .iter()
@@ -180,13 +182,14 @@ fn range(line: &str) -> Option<Header> {
     })
 }
 
-/// The lines of one hunk. With counts, exactly that many old and new lines
-/// (or fewer, if the patch ends or another header starts first); without,
+/// The lines of one hunk. With counts, exactly that many old and new lines,
+/// or `None` if the patch ends or another header starts first: applying the
+/// lines that are there would make only part of the change. Without counts,
 /// every line until something that is not a hunk line.
 fn hunk<'a>(
     lines: &mut std::iter::Peekable<impl Iterator<Item = (usize, &'a str)>>,
     header: Header,
-) -> Hunk {
+) -> Option<Hunk> {
     let (mut old, mut new) = header.counts.unwrap_or((u32::MAX, u32::MAX));
     let mut out: Vec<PatchLine> = Vec::new();
     while let Some(&(_, line)) = lines.peek() {
@@ -236,10 +239,13 @@ fn hunk<'a>(
         out.push(line);
         lines.next();
     }
-    Hunk {
+    if header.counts.is_some() && (old, new) != (0, 0) {
+        return None;
+    }
+    Some(Hunk {
         old_start: header.old_start,
         lines: out,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -336,6 +342,11 @@ new file mode 100644
         // One line more than the header counts is reported, not dropped.
         let over = "--- a/f\n+++ b/f\n@@ -1 +1 @@\n-a\n+b\n+c\n";
         assert_eq!(parse(over), Err(ParseError::OutsideHunk(6)));
+        // So is one line less: the hunk would make only part of its change.
+        let short = "--- a/f\n+++ b/f\n@@ -1,2 +1,2 @@\n-a\n+b\n";
+        assert_eq!(parse(short), Err(ParseError::ShortHunk(3)));
+        let cut = "--- a/f\n+++ b/f\n@@ -1,2 +1,2 @@\n-a\n+b\n@@ -5 +5 @@\n-e\n+E\n";
+        assert_eq!(parse(cut), Err(ParseError::ShortHunk(3)));
     }
 
     #[test]

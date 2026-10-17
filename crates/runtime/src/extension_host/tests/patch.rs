@@ -42,7 +42,7 @@ fn read(root: &Path, path: &str) -> Option<String> {
     std::fs::read_to_string(root.join(path)).ok()
 }
 /// Every regular file under `root`, so a test sees stray temporary files.
-fn files(root: &Path) -> Vec<String> {
+fn files_under(root: &Path) -> Vec<String> {
     let mut found = Vec::new();
     let mut pending = vec![root.to_path_buf()];
     while let Some(directory) = pending.pop() {
@@ -109,7 +109,7 @@ async fn a_patch_changes_creates_and_deletes_files_together() {
         Some(format!("one\n{new}\nthree\n"))
     );
     assert_eq!(read(&root, "new/dir/b.txt"), Some(format!("{new}\n")));
-    assert_eq!(files(&root), vec!["new/dir/b.txt", "src/a.txt"]);
+    assert_eq!(files_under(&root), vec!["new/dir/b.txt", "src/a.txt"]);
 
     // Applied again, the first file no longer matches, so nothing changes:
     // not even the files after it, which would apply on their own.
@@ -118,6 +118,11 @@ async fn a_patch_changes_creates_and_deletes_files_together() {
     assert_eq!(
         failed("src/a.txt", host.handle(patch(files_patch, false)).await),
         HostErrorCode::Conflict
+    );
+    assert_eq!(
+        host.last_failure.as_ref().map(|failure| failure.code),
+        Some(HostErrorCode::Conflict),
+        "the guest's failure keeps the host's cause"
     );
     assert_eq!(read(&root, "gone.txt").as_deref(), Some("bye\n"));
     assert!(!root.join("new/dir/b.txt").exists());
@@ -229,4 +234,24 @@ async fn patches_need_the_write_grant_and_stay_inside_the_workspace() {
     );
     assert_eq!(read(dir.path(), "outside.txt").as_deref(), Some("a\n"));
     assert!(!root.join("f.txt").exists());
+}
+
+#[test]
+fn an_interrupted_patch_writes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    std::fs::write(root.join("f.txt"), "a\n").unwrap();
+    let files = vec![
+        file("f.txt", FileChange::Modify, 1, &[('-', "a"), ('+', "b")]),
+        file("new/g.txt", FileChange::Create, 0, &[('+', "x")]),
+    ];
+    let interrupt = std::sync::atomic::AtomicBool::new(true);
+    let refused =
+        crate::extension_host::workspace::patch_files(root.clone(), &files, false, &interrupt);
+    assert_eq!(
+        refused.map_err(|failure| failure.code),
+        Err(HostErrorCode::Budget)
+    );
+    assert_eq!(read(&root, "f.txt").as_deref(), Some("a\n"));
+    assert_eq!(files_under(&root), vec!["f.txt"]);
 }
