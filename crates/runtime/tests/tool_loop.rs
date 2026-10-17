@@ -572,6 +572,7 @@ async fn budgets_stop_a_run_that_keeps_calling_tools() {
 
     // Rounds: the second response's call does not run.
     let budget = ToolBudget {
+        tokens: None,
         rounds: 2,
         tool_calls: 8,
     };
@@ -609,6 +610,7 @@ async fn budgets_stop_a_run_that_keeps_calling_tools() {
 
     // Tool calls: of two calls in one response only the first runs.
     let budget = ToolBudget {
+        tokens: None,
         rounds: 8,
         tool_calls: 1,
     };
@@ -652,6 +654,7 @@ async fn budgets_stop_a_run_that_keeps_calling_tools() {
         .run(Command::SetToolBudget {
             thread: rig.thread,
             budget: ToolBudget {
+                tokens: None,
                 rounds: 0,
                 tool_calls: 1,
             },
@@ -1234,6 +1237,7 @@ async fn a_parent_lowering_its_budget_limits_its_child() {
     };
     // Calls: the child's own budget allows both, the parent's only one.
     let parent_budget = ToolBudget {
+        tokens: None,
         rounds: ToolBudget::default().rounds,
         tool_calls: 1,
     };
@@ -1262,6 +1266,7 @@ async fn a_parent_lowering_its_budget_limits_its_child() {
 
     // Rounds, independently of calls.
     let parent_budget = ToolBudget {
+        tokens: None,
         rounds: 1,
         tool_calls: ToolBudget::default().tool_calls,
     };
@@ -1372,6 +1377,7 @@ async fn calls_that_do_not_fit_in_storage_are_settled_and_the_run_goes_on() {
         rig.run(Command::SetToolBudget {
             thread: rig.thread,
             budget: ToolBudget {
+                tokens: None,
                 rounds: 8,
                 tool_calls: ToolBudget::MAX,
             },
@@ -1860,6 +1866,7 @@ async fn a_steered_message_left_by_a_failed_run_follows_its_failure() {
     let budget = ToolBudget {
         rounds: 1,
         tool_calls: 1,
+        tokens: None,
     };
     let reply = rig
         .run(Command::SetToolBudget {
@@ -1967,4 +1974,173 @@ async fn subagent_send_steers_a_running_subagent() {
     .await
     .unwrap_or_else(wait("the subagent to finish"));
     assert!(thread_of(&rig, id).steering.is_empty());
+}
+
+// ── Token budgets ───────────────────────────────────────────────────────────
+
+impl Rig {
+    async fn token_budget(&self, thread: Id, tokens: Option<u64>) -> Reply {
+        self.run(Command::SetToolBudget {
+            thread,
+            budget: ToolBudget {
+                tokens,
+                ..ToolBudget::default()
+            },
+        })
+        .await
+    }
+}
+
+#[tokio::test]
+async fn a_token_budget_stops_a_run_before_a_request_it_cannot_afford() {
+    let api = ProviderApi::Anthropic;
+    let name = nonce();
+    let mut rig = rig(api, vec![tool(&name, ToolPermission::Allow, &[])], None).await;
+    rig.permit(&name, ToolPermission::Allow).await;
+    let (input, output) = (count(), count());
+    // Room for the first request's usage, and nothing after the second's.
+    let limit = input + output + 1;
+    assert_eq!(rig.token_budget(rig.thread, Some(limit)).await, Reply::Ok);
+    let task = rig.send();
+    let first = rig.next_request().await;
+    let call = Call::new(&name, json!({}));
+    first
+        .respond(with_usage(
+            calls_response(api, std::slice::from_ref(&call), ""),
+            input,
+            output,
+        ))
+        .await;
+    let second = rig.next_request().await;
+    let late = Call::new(&name, json!({"value": nonce()}));
+    second
+        .respond(with_usage(
+            calls_response(api, std::slice::from_ref(&late), ""),
+            input,
+            output,
+        ))
+        .await;
+    let thread = finished(task).await;
+    assert_eq!(thread.state, RunState::Failed);
+    let error = thread.error.clone().unwrap();
+    assert_eq!(error.kind, ErrorKind::PermissionDenied);
+    assert!(error.message.contains(&limit.to_string()), "{error:?}");
+    // The first call ran; the one no request could follow was stopped.
+    let calls = calls_of(&thread);
+    assert_eq!(calls[0].state, ToolCallState::Succeeded);
+    assert_ne!(calls[1].state, ToolCallState::Succeeded);
+    assert_eq!(rig.executed().len(), 1);
+}
+
+#[tokio::test]
+async fn a_token_budget_stops_a_run_whose_usage_is_unknown() {
+    // These scripted OpenAI responses report no usage.
+    let api = ProviderApi::OpenAi;
+    let name = nonce();
+    let mut rig = rig(api, vec![tool(&name, ToolPermission::Allow, &[])], None).await;
+    rig.permit(&name, ToolPermission::Allow).await;
+    // Without a limit the same run goes on.
+    let task = rig.send();
+    let first = rig.next_request().await;
+    first
+        .respond(calls_response(api, &[Call::new(&name, json!({}))], ""))
+        .await;
+    rig.next_request()
+        .await
+        .respond(text_response(api, &nonce()))
+        .await;
+    assert_eq!(finished(task).await.state, RunState::Complete);
+
+    let limit = count() + 1_000_000;
+    assert_eq!(rig.token_budget(rig.thread, Some(limit)).await, Reply::Ok);
+    let task = rig.send();
+    let first = rig.next_request().await;
+    first
+        .respond(calls_response(api, &[Call::new(&name, json!({}))], ""))
+        .await;
+    let thread = finished(task).await;
+    assert_eq!(thread.state, RunState::Failed);
+    let error = thread.error.unwrap();
+    assert_eq!(error.kind, ErrorKind::PermissionDenied);
+    assert!(error.message.contains("did not report"), "{error:?}");
+
+    // A final reply cannot be shown to have kept the limit either; the
+    // reply itself is kept.
+    let task = rig.send();
+    let answer = nonce();
+    rig.next_request()
+        .await
+        .respond(text_response(api, &answer))
+        .await;
+    let thread = finished(task).await;
+    assert_eq!(thread.state, RunState::Failed);
+    assert!(thread.messages.iter().any(|m| m.text == answer));
+    let error = thread.error.unwrap();
+    assert!(error.message.contains("did not report"), "{error:?}");
+}
+
+#[tokio::test]
+async fn a_token_budget_lowered_while_a_call_waits_stops_the_next_request() {
+    let api = ProviderApi::Anthropic;
+    let name = nonce();
+    let mut rig = rig(api, vec![tool(&name, ToolPermission::Ask, &[])], None).await;
+    rig.permit(&name, ToolPermission::Ask).await;
+    let (input, output) = (count(), count());
+    let limit = input + output + 1_000_000;
+    assert_eq!(rig.token_budget(rig.thread, Some(limit)).await, Reply::Ok);
+    let task = rig.send();
+    let first = rig.next_request().await;
+    first
+        .respond(with_usage(
+            calls_response(api, &[Call::new(&name, json!({}))], ""),
+            input,
+            output,
+        ))
+        .await;
+    let approval = rig.pending_approval().await;
+    // Lowered below what the run has already used while it waits.
+    assert_eq!(rig.token_budget(rig.thread, Some(input)).await, Reply::Ok);
+    assert_eq!(
+        rig.resolve(&approval, &approval.digest, ApprovalDecision::Approve)
+            .await,
+        Reply::Ok
+    );
+    let thread = finished(task).await;
+    assert_eq!(thread.state, RunState::Failed);
+    let error = thread.error.unwrap();
+    assert_eq!(error.kind, ErrorKind::PermissionDenied);
+    assert!(error.message.contains("token budget"), "{error:?}");
+    assert!(rig.requests.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn a_subagents_token_budget_stays_within_its_parents() {
+    let api = ProviderApi::OpenAi;
+    let rig = rig(api, vec![], None).await;
+    let parent = rig.thread;
+    let Reply::Thread(child) = rig
+        .run(Command::CreateSubagent {
+            parent,
+            title: nonce(),
+            mode: Mode::Chat,
+            model: rig.model.clone(),
+            requested: Default::default(),
+        })
+        .await
+    else {
+        panic!("subagent created");
+    };
+    let limit = count();
+    assert_eq!(rig.token_budget(parent, Some(limit)).await, Reply::Ok);
+    for denied in [None, Some(limit + 1)] {
+        refused(
+            rig.token_budget(child.id, denied).await,
+            ErrorKind::PermissionDenied,
+        );
+    }
+    assert_eq!(rig.token_budget(child.id, Some(limit)).await, Reply::Ok);
+    refused(
+        rig.token_budget(parent, Some(0)).await,
+        ErrorKind::InvalidRequest,
+    );
 }
