@@ -21,8 +21,8 @@ pub enum StoreError {
     ReadSettings(#[source] std::io::Error),
     #[error("settings.toml is invalid")]
     Settings(#[source] toml::de::Error),
-    #[error("the bundled extension is invalid")]
-    Builtin(#[source] a206_extensions::ExtensionError),
+    #[error("the bundled extensions are invalid")]
+    Builtin(#[source] a206_extensions::ManifestError),
     #[error("stored provider presets are invalid")]
     Presets(#[source] crate::provider::PresetError),
     #[error("snapshot capacity reached; paged history is not implemented yet")]
@@ -84,7 +84,8 @@ impl Store {
         db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
             CREATE TABLE IF NOT EXISTS snapshot(id INTEGER PRIMARY KEY CHECK(id=1), payload BLOB NOT NULL);
             CREATE TABLE IF NOT EXISTS events(seq INTEGER PRIMARY KEY AUTOINCREMENT, payload BLOB NOT NULL);
-            CREATE TABLE IF NOT EXISTS requests(id TEXT PRIMARY KEY, request BLOB NOT NULL, reply BLOB);")?;
+            CREATE TABLE IF NOT EXISTS requests(id TEXT PRIMARY KEY, request BLOB NOT NULL, reply BLOB);
+            CREATE TABLE IF NOT EXISTS extension_state(extension TEXT NOT NULL, key TEXT NOT NULL, value BLOB NOT NULL, PRIMARY KEY(extension, key));")?;
         let data: Option<Vec<u8>> = db
             .query_row("SELECT payload FROM snapshot WHERE id=1", [], |row| {
                 row.get(0)
@@ -108,12 +109,7 @@ impl Store {
                 projects: vec![],
                 catalogs: vec![],
                 downloads: vec![],
-                plugins: vec![
-                    a206_extensions::builtin()
-                        .map_err(StoreError::Builtin)?
-                        .0
-                        .summary(),
-                ],
+                plugins: vec![],
                 last_event: 0,
                 managed_joshua_provider: None,
                 messengers: vec![],
@@ -127,6 +123,7 @@ impl Store {
         };
         crate::provider::validate_presets(&store.state.settings.provider_presets)
             .map_err(StoreError::Presets)?;
+        store.state.plugins = bundled_plugins(&store.state.plugins)?;
         // A fresh gateway has no owned child. Retire its persisted connection, not
         // arbitrary user-configured endpoints that happen to have the same URL.
         store.state.clear_managed_joshua();
@@ -246,6 +243,48 @@ impl Store {
         )?;
         Ok(())
     }
+    /// This extension's persisted value for `key`.
+    pub fn extension_state(&self, extension: &str, key: &str) -> Result<Option<Vec<u8>>> {
+        Ok(self
+            .db
+            .query_row(
+                "SELECT value FROM extension_state WHERE extension=?1 AND key=?2",
+                params![extension, key],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+    /// Replace or delete one entry, refusing writes past `quota`.
+    pub fn put_extension_state(
+        &mut self,
+        extension: &str,
+        key: &str,
+        value: Option<&[u8]>,
+        quota: StateQuota,
+    ) -> Result<StatePut> {
+        let tx = self.db.transaction()?;
+        tx.execute(
+            "DELETE FROM extension_state WHERE extension=?1 AND key=?2",
+            params![extension, key],
+        )?;
+        if let Some(value) = value {
+            let (entries, bytes): (u64, u64) = tx.query_row(
+                "SELECT COUNT(*), COALESCE(SUM(LENGTH(key) + LENGTH(value)), 0) FROM extension_state WHERE extension=?1",
+                [extension],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            if entries >= quota.entries || bytes + (key.len() + value.len()) as u64 > quota.bytes {
+                // Dropping the transaction keeps the previous value.
+                return Ok(StatePut::Quota);
+            }
+            tx.execute(
+                "INSERT INTO extension_state(extension,key,value) VALUES(?1,?2,?3)",
+                params![extension, key, value],
+            )?;
+        }
+        tx.commit()?;
+        Ok(StatePut::Stored)
+    }
     pub fn thread(&self, id: Id) -> Result<&Thread> {
         self.state
             .threads
@@ -261,6 +300,35 @@ impl Store {
             .ok_or(StoreError::ThreadNotFound)
     }
 }
+/// Bounds on one extension's persisted state.
+#[derive(Debug, Clone, Copy)]
+pub struct StateQuota {
+    pub entries: u64,
+    pub bytes: u64,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatePut {
+    Stored,
+    Quota,
+}
+
+/// Summaries of the bundled extensions, keeping the user's enable choice and
+/// only those grants the current manifest still requests: an update never
+/// inherits a newly requested capability.
+fn bundled_plugins(previous: &[PluginSummary]) -> Result<Vec<PluginSummary>> {
+    Ok(a206_extensions::builtins()
+        .map_err(StoreError::Builtin)?
+        .iter()
+        .map(|builtin| {
+            let earlier = previous.iter().find(|p| p.id == builtin.manifest.id);
+            builtin.manifest.summary(
+                earlier.is_none_or(|p| p.enabled),
+                &earlier.map(|p| p.granted.clone()).unwrap_or_default(),
+            )
+        })
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -297,6 +365,65 @@ mod tests {
         };
         assert_eq!(report.kind, a206_core::ErrorKind::Conflict);
         assert_eq!(report.correlation, Some(id));
+    }
+    #[test]
+    fn extension_grants_survive_restart_within_the_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let builtin = a206_extensions::builtins().unwrap().remove(0);
+        let requested = builtin.manifest.capabilities.clone();
+        let outside = [
+            Capability::Execute,
+            Capability::Network,
+            Capability::UseSecret,
+        ]
+        .into_iter()
+        .find(|c| !requested.contains(c))
+        .unwrap();
+        {
+            let mut store = Store::open(dir.path()).unwrap();
+            let plugin = store
+                .state
+                .plugins
+                .iter_mut()
+                .find(|p| p.id == builtin.manifest.id)
+                .unwrap();
+            assert!(plugin.granted.is_empty(), "nothing is granted by default");
+            plugin.enabled = false;
+            plugin.granted = requested.iter().copied().chain([outside]).collect();
+            store.persist(None).unwrap();
+        }
+        let store = Store::open(dir.path()).unwrap();
+        let plugin = store
+            .state
+            .plugins
+            .iter()
+            .find(|p| p.id == builtin.manifest.id)
+            .unwrap();
+        assert!(!plugin.enabled);
+        assert_eq!(plugin.granted, requested);
+    }
+    #[test]
+    fn extension_state_is_scoped_and_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::open(dir.path()).unwrap();
+        let quota = StateQuota {
+            entries: 2,
+            bytes: 64,
+        };
+        let (a, b) = (Id::new_v4().to_string(), Id::new_v4().to_string());
+        let put = |store: &mut Store, ext: &str, key: &str, value: Option<&[u8]>| {
+            store.put_extension_state(ext, key, value, quota).unwrap()
+        };
+        assert_eq!(put(&mut store, &a, "k", Some(b"1")), StatePut::Stored);
+        assert_eq!(store.extension_state(&b, "k").unwrap(), None);
+        assert_eq!(put(&mut store, &a, "k", Some(b"2")), StatePut::Stored);
+        assert_eq!(put(&mut store, &a, "j", Some(b"3")), StatePut::Stored);
+        assert_eq!(put(&mut store, &a, "i", Some(b"4")), StatePut::Quota);
+        assert_eq!(put(&mut store, &a, "k", Some(&[0; 64])), StatePut::Quota);
+        // A refused write keeps the earlier value.
+        assert_eq!(store.extension_state(&a, "k").unwrap(), Some(b"2".to_vec()));
+        assert_eq!(put(&mut store, &a, "k", None), StatePut::Stored);
+        assert_eq!(store.extension_state(&a, "k").unwrap(), None);
     }
     #[test]
     fn journal_and_dedup_survive_restart() {

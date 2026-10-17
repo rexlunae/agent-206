@@ -135,7 +135,7 @@ pub enum GatewayError {
     #[error(transparent)]
     Download(#[from] crate::network::DownloadError),
     #[error(transparent)]
-    Extension(#[from] a206_extensions::ExtensionError),
+    Extension(#[from] crate::extension_host::ExtensionError),
     #[error(transparent)]
     Frame(#[from] transport::FrameError),
     #[error("state could not be encoded")]
@@ -154,16 +154,6 @@ pub enum GatewayError {
     Document(#[source] std::io::Error),
     #[error("this viewer supports UTF-8 text and Markdown")]
     NotText(#[source] std::io::Error),
-    #[error("could not locate the agent206 executable")]
-    CurrentExe(#[source] std::io::Error),
-    #[error("could not run the extension worker")]
-    Worker(#[source] std::io::Error),
-    #[error("extension worker timed out")]
-    WorkerTimeout(#[source] tokio::time::error::Elapsed),
-    #[error("extension worker failed with {status}")]
-    WorkerFailed { status: std::process::ExitStatus },
-    #[error("extension worker output is invalid")]
-    WorkerOutput(#[source] a206_protocol::Error),
     #[error("invalid download URL")]
     DownloadUrl(#[source] url::ParseError),
     #[error("could not prepare the download directory")]
@@ -193,7 +183,7 @@ impl crate::error::Classified for GatewayError {
             Self::NotFound(_) => ErrorKind::NotFound,
             Self::Conflict(_) => ErrorKind::Conflict,
             Self::Denied(_) => ErrorKind::PermissionDenied,
-            Self::Draining | Self::Worker(_) | Self::ReplyChannel => ErrorKind::Unavailable,
+            Self::Draining | Self::ReplyChannel => ErrorKind::Unavailable,
             Self::HistoryFull
             | Self::WriteSettings(_)
             | Self::MarkStopped(_)
@@ -202,12 +192,9 @@ impl crate::error::Classified for GatewayError {
             Self::Poisoned { .. }
             | Self::Encode(_)
             | Self::EncodeSettings(_)
-            | Self::CurrentExe(_)
-            | Self::WorkerFailed { .. }
             | Self::Task(_)
             | Self::Limiter(_) => ErrorKind::Internal,
-            Self::ShutdownTimeout(_) | Self::WorkerTimeout(_) => ErrorKind::Timeout,
-            Self::WorkerOutput(_) => ErrorKind::Protocol,
+            Self::ShutdownTimeout(_) => ErrorKind::Timeout,
             Self::DownloadCancelled => ErrorKind::Cancelled,
             Self::Integrity | Self::Length { .. } => ErrorKind::Provider,
             // `transparent` hides these from the chain, so classify them here.
@@ -292,6 +279,7 @@ pub struct Gateway {
     stop: tokio_util::sync::CancellationToken,
     joshua: Arc<tokio::sync::Mutex<crate::joshua::Manager>>,
     store: Arc<Mutex<Store>>,
+    extensions: crate::extension_host::ExtensionHost,
     downloads: Arc<Mutex<BTreeMap<Id, tokio_util::sync::CancellationToken>>>,
     running: Arc<Mutex<BTreeMap<Id, tokio_util::sync::CancellationToken>>>,
     /// Held only in memory: a restart needs a fresh pairing from the user.
@@ -342,13 +330,15 @@ impl Gateway {
                 config: config.clone(),
             })
             .collect();
+        let store = Arc::new(Mutex::new(store));
         Ok(Self {
             admission: Arc::new(Mutex::new(Admission::default())),
             shutdown_committed: Arc::new(tokio::sync::Mutex::new(false)),
             started: std::time::Instant::now(),
             stop: tokio_util::sync::CancellationToken::new(),
             joshua: Arc::new(tokio::sync::Mutex::new(crate::joshua::Manager::default())),
-            store: Arc::new(Mutex::new(store)),
+            extensions: crate::extension_host::ExtensionHost::new(store.clone(), root.to_owned()),
+            store,
             downloads: Arc::new(Mutex::new(BTreeMap::new())),
             running: Arc::new(Mutex::new(BTreeMap::new())),
             pairing: Arc::new(Mutex::new(None)),
@@ -490,7 +480,10 @@ impl Gateway {
                 | Command::Events { .. }
                 | Command::GitStatus { .. }
                 | Command::ReadDocument { .. }
-                | Command::RunExtension { .. }
+                // Extension output can carry workspace content, so it is
+                // never persisted in the request journal.
+                | Command::OpenPanel { .. }
+                | Command::CallTool { .. }
                 // Never journal a pairing: request bodies are persisted.
                 | Command::PairBroker { .. }
         );
@@ -1290,52 +1283,64 @@ impl Gateway {
                 .await??;
                 Ok(Reply::Text(text))
             }
-            Command::RunExtension { id, input } => {
+            Command::OpenPanel {
+                extension,
+                panel,
+                project,
+                event,
+            } => {
+                let scope = self.user_scope(project)?;
+                let view = self
+                    .extensions
+                    .open_panel(&extension, &panel, event, scope)
+                    .await?;
+                Ok(Reply::Panel(view))
+            }
+            Command::CallTool {
+                extension,
+                tool,
+                args,
+                project,
+            } => {
+                let scope = self.user_scope(project)?;
+                let output = self
+                    .extensions
+                    .call_tool(&extension, &tool, args, scope)
+                    .await?;
+                Ok(Reply::Text(output.text))
+            }
+            Command::GrantExtension {
+                extension,
+                capabilities,
+            } => {
+                let mut store = self.lock()?;
+                let plugin = store
+                    .state
+                    .plugins
+                    .iter_mut()
+                    .find(|p| p.id == extension)
+                    .ok_or(GatewayError::NotFound("extension not found"))?;
                 check(
-                    input.is_empty(),
-                    GatewayError::Invalid("ABI v1 does not accept input yet"),
+                    capabilities.is_subset(&plugin.capabilities),
+                    GatewayError::Invalid(
+                        "an extension can only be granted what its manifest requests",
+                    ),
                 )?;
-                let (manifest, wasm) = a206_extensions::builtin()?;
-                check(
-                    manifest.id == id && manifest.capabilities.is_empty(),
-                    GatewayError::Denied("extension is not enabled"),
-                )?;
-                let _validated_wasm = wasm;
-                let child = tokio::process::Command::new(
-                    std::env::current_exe().map_err(GatewayError::CurrentExe)?,
-                )
-                .arg("--data-dir")
-                .arg(self.lock()?.root.clone())
-                .arg("extension-worker")
-                .env_clear()
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::null())
-                .kill_on_drop(true)
-                .spawn()
-                .map_err(GatewayError::Worker)?;
-                let result = tokio::time::timeout(
-                    std::time::Duration::from_secs(5),
-                    child.wait_with_output(),
-                )
-                .await
-                .map_err(GatewayError::WorkerTimeout)?
-                .map_err(GatewayError::Worker)?;
-                check(
-                    result.status.success(),
-                    GatewayError::WorkerFailed {
-                        status: result.status,
-                    },
-                )?;
-                let output: Vec<(String, String)> = a206_protocol::decode_payload(&result.stdout)
-                    .map_err(GatewayError::WorkerOutput)?;
-                Ok(Reply::Text(
-                    output
-                        .into_iter()
-                        .map(|(_, value)| value)
-                        .collect::<Vec<_>>()
-                        .join("\n\n"),
-                ))
+                plugin.granted = capabilities;
+                store.persist(Some(EventKind::ExtensionChanged { id: extension }))?;
+                Ok(Reply::Ok)
+            }
+            Command::EnableExtension { extension, enabled } => {
+                let mut store = self.lock()?;
+                store
+                    .state
+                    .plugins
+                    .iter_mut()
+                    .find(|p| p.id == extension)
+                    .ok_or(GatewayError::NotFound("extension not found"))?
+                    .enabled = enabled;
+                store.persist(Some(EventKind::ExtensionChanged { id: extension }))?;
+                Ok(Reply::Ok)
             }
             Command::Shutdown => {
                 // Serialize independent shutdown attempts so a failed one's
@@ -1387,6 +1392,18 @@ impl Gateway {
                 Ok(Reply::Ok)
             }
         }
+    }
+    /// The scope of a user acting directly: their grant to the extension,
+    /// on the project they chose.
+    fn user_scope(&self, project: Option<Id>) -> Result<crate::extension_host::Scope> {
+        Ok(crate::extension_host::Scope {
+            workspace: project.map(|id| self.project_root(id)).transpose()?,
+            ceiling: None,
+        })
+    }
+    /// The extension host the run engine calls tools through.
+    pub fn extensions(&self) -> &crate::extension_host::ExtensionHost {
+        &self.extensions
     }
     fn project_root(&self, id: Id) -> Result<PathBuf> {
         Ok(self

@@ -6,6 +6,7 @@ pub mod connection;
 pub mod control;
 pub mod doctor;
 pub mod error;
+pub mod extension_host;
 pub mod gateway;
 pub mod joshua;
 pub mod mcp;

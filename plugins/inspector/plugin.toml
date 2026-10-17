@@ -1,7 +1,0 @@
-id = "agent206.inspector"
-name = "Workspace inspector"
-description = "A sandboxed extension that contributes a workspace information panel."
-version = "0.1.0"
-abi = 1
-entry = "run"
-capabilities = []
