@@ -86,6 +86,23 @@ mod imp {
     use std::path::{Path, PathBuf};
     use tokio::sync::{mpsc, oneshot};
 
+    /// Connect to this profile's broker only if one is running; `None` when
+    /// none answers. Never starts a broker.
+    pub async fn connect_running(root: &Path) -> std::result::Result<Option<Client>, ClientError> {
+        match Client::connect(root, Role::User).await {
+            Ok(client) => Ok(Some(client)),
+            Err(ClientError::Io(error))
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                ) =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     /// Connect to this profile's broker, starting `agent206 vault broker` when
     /// none is running. The broker outlives the caller, like the gateway.
     pub async fn connect(root: &Path) -> Result<Client> {
