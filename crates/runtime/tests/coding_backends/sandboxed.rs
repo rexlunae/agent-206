@@ -274,7 +274,7 @@ pub async fn drives_both_agent_protocols_in_the_real_os_sandbox() {
         });
     }
     assert_eq!(
-        command(&gateway, Command::SaveSettings(settings.clone())).await,
+        command(&gateway, Command::SaveSettings(Box::new(settings.clone()))).await,
         Reply::Ok
     );
     for (kind, provider) in [CodingBackend::Codex, CodingBackend::ClaudeAgent]
@@ -463,7 +463,7 @@ pub async fn drives_both_agent_protocols_in_the_real_os_sandbox() {
                     .to_string_lossy()
                     .into();
                 assert_eq!(
-                    command(&gateway, Command::SaveSettings(settings)).await,
+                    command(&gateway, Command::SaveSettings(Box::new(settings))).await,
                     Reply::Ok
                 );
             } else {
@@ -485,7 +485,7 @@ pub async fn drives_both_agent_protocols_in_the_real_os_sandbox() {
                 let mut settings = gateway.snapshot().unwrap().settings;
                 settings.backends = old_backends;
                 assert_eq!(
-                    command(&gateway, Command::SaveSettings(settings)).await,
+                    command(&gateway, Command::SaveSettings(Box::new(settings))).await,
                     Reply::Ok
                 );
             }

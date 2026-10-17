@@ -176,6 +176,21 @@ pub enum SandboxError {
         path.display()
     )]
     Exposed { path: PathBuf },
+    #[error(
+        "program directory {} lies inside {}, which must stay hidden; choose another directory",
+        directory.display(),
+        hidden.display()
+    )]
+    HiddenProgramDirectory { directory: PathBuf, hidden: PathBuf },
+    #[error(
+        "program directory {} overlaps the writable directory {}; programs there could be written by the command",
+        directory.display(),
+        writable.display()
+    )]
+    WritableProgramDirectory {
+        directory: PathBuf,
+        writable: PathBuf,
+    },
     #[error("could not encode the sandbox specification")]
     Encode(#[source] rmp_serde::encode::Error),
     #[error("sandbox specification is not valid base64")]
@@ -229,7 +244,10 @@ impl SandboxError {
             Self::Bubblewrap(_) | Self::SandboxExec(_) | Self::NotEnforced | Self::Unsupported => {
                 ErrorKind::Unavailable
             }
-            Self::Exposed { .. } => ErrorKind::PermissionDenied,
+            Self::Exposed { .. } | Self::HiddenProgramDirectory { .. } => {
+                ErrorKind::PermissionDenied
+            }
+            Self::WritableProgramDirectory { .. } => ErrorKind::Conflict,
             Self::Path { .. } => ErrorKind::InvalidRequest,
             Self::Inspect { .. } => return None,
             Self::Encode(_)

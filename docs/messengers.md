@@ -1,7 +1,8 @@
 # Messengers
 
 A messenger connects a chat service account to Agent 206 so that people can
-talk to a thread from that service. Telegram, Matrix and Discord are implemented;
+talk to a thread from that service. Telegram, Matrix, Discord and Slack are
+implemented;
 RustyClaw's other channels are listed in
 [parity.md](parity.md#messengers--channels).
 
@@ -14,9 +15,10 @@ of the desktop, web and terminal apps):
 ```toml
 [[messengers]]
 name = "team"                 # lowercase letters, digits, single hyphens
-kind = "telegram"             # or "matrix" or "discord"
+kind = "telegram"             # or "matrix", "discord" or "slack"
 enabled = false               # off until the user turns it on
 credential = "team-token"     # vault credential name, never the token
+# app_credential = "team-app"  # Slack only: the app-level token's credential
 # endpoint = "https://..."    # an origin; defaults to the official API,
                               # required for Matrix (the homeserver)
 allowed_chats = ["-1001234"]  # chats whose messages reach a thread
@@ -211,6 +213,53 @@ agent206 messenger enable guild
   the developer portal ends Discord's session (close code 4004), so the
   next session identifies with the token the vault holds then.
 
+## Slack
+
+A Slack messenger is a Slack app with
+[Socket Mode](https://api.slack.com/apis/socket-mode) turned on. It uses two
+tokens, each its own vault credential bound to `https://slack.com`: the bot
+token (`xoxb-`, scopes `chat:write` plus the `*:history` scopes for the
+conversations it reads) answers through the Web API, and the app-level token
+(`xapp-`, scope `connections:write`) receives events. Subscribe the app to
+the `message.channels`, `message.groups`, `message.im` and `message.mpim` bot
+events it should hear, and invite the bot to those channels.
+
+```sh
+agent206 vault add slack-bot --kind token --destination https://slack.com
+agent206 vault add slack-app --kind token --destination https://slack.com
+agent206 messenger add workspace --kind slack --credential slack-bot --app-credential slack-app
+agent206 messenger allow workspace <channel id>
+agent206 messenger allow-sender workspace <member id>
+agent206 messenger enable workspace
+```
+
+- **Ids.** Chats are conversation ids (`C…`, `G…`, or `D…` for a direct
+  message) and senders are member ids (`U…`). Only direct messages are
+  private; channels and group conversations need listed senders.
+- **Brokered socket.** The broker asks `apps.connections.open` with the
+  app-level token where to connect and connects there itself
+  (`SocketScheme::SlackSocketMode`, broker protocol v8), so the ticketed
+  socket URL stays in the broker, as both tokens do. The broker's limits for
+  socket sessions apply (see [Discord](#discord)).
+- **Acknowledgements.** Every envelope is acknowledged as it arrives, before
+  any turn runs, so Slack does not deliver it again. A message delivered
+  again anyway (the same channel and timestamp), including on the next
+  socket after a reconnect, is answered once: the last 1024 message keys are
+  kept for as long as the bot user and vault pairing stay the same.
+- **What is read and sent.** Only people's plain messages are read: the
+  app's own, other bots', edits, joins and every other subtype are ignored,
+  as are slash commands and interactions. Slack's `&amp;`, `&lt;` and
+  `&gt;` escapes are undone for the model; mentions stay in Slack's
+  `<@U…>` form. Replies go through `chat.postMessage`, split at 4000
+  characters, with `&`, `<` and `>` escaped so a reply cannot write a
+  mention (such as `<!channel>`) or a link, and with unfurling off. Replies
+  go to the conversation, not to a message's thread.
+- **Delivery.** A `disconnect` request starts a new socket. Messages sent
+  while the app was disconnected are not answered. A rejected token
+  (`invalid_auth` and similar, from `auth.test` or `apps.connections.open`)
+  or a missing app credential stops the messenger until the user acts. The
+  bot user is checked (`auth.test`) before each batch.
+
 ## Interface for the run engine
 
 `a206_runtime::messengers::Host` is the boundary between a messenger and the
@@ -235,9 +284,9 @@ participant cannot approve their own request.
 
 ## Not yet
 
-- Slack, IRC, Signal, WhatsApp, Google Chat, Teams, iMessage and webhooks.
-  The broker's socket sessions already support Slack's Socket Mode
-  (`SocketScheme::SlackSocketMode`); the Slack adapter is next.
+- IRC, Signal, WhatsApp, Google Chat, Teams, iMessage and webhooks.
+- Slack thread replies, the Events API over HTTP (Socket Mode only) and
+  conversation names in the refused list.
 - Discord session resume, slash commands, threads' own channel ids beyond
   allowing them, and channel names in the refused list (only direct messages
   carry a title).
