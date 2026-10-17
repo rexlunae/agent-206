@@ -55,12 +55,14 @@ pub enum SkillToolError {
     NotText(#[source] std::string::FromUtf8Error),
     #[error("the result exceeds the {limit}-byte tool output limit")]
     TooLarge { limit: usize },
+    #[error("the skill reader stopped unexpectedly")]
+    Worker(#[source] tokio::task::JoinError),
 }
 impl crate::error::Classified for SkillToolError {
     fn kind(&self) -> Option<ErrorKind> {
         Some(match self {
             Self::Skill(error) => return crate::error::classify(error),
-            Self::Poisoned => ErrorKind::Internal,
+            Self::Poisoned | Self::Worker(_) => ErrorKind::Internal,
             Self::NotAString(_)
             | Self::MissingName
             | Self::Unknown(_)
@@ -107,6 +109,10 @@ pub(crate) fn offers(
 
 /// Offers approved skills to native runs.
 pub struct SkillToolHost {
+    source: Arc<Source>,
+}
+/// Where skills and their approvals are read from.
+struct Source {
     store: Arc<Mutex<Store>>,
     root: PathBuf,
 }
@@ -114,10 +120,25 @@ impl SkillToolHost {
     /// Skills under `<profile>/skills`, approved by the pins in `store`.
     pub fn new(store: Arc<Mutex<Store>>, profile: &Path) -> Self {
         Self {
-            store,
-            root: profile.join("skills"),
+            source: Arc::new(Source {
+                store,
+                root: profile.join("skills"),
+            }),
         }
     }
+    /// Run `read` on a blocking thread: skills are files, and a slow file
+    /// system must not stall the gateway's async workers.
+    async fn read<T: Send + 'static>(
+        &self,
+        read: impl FnOnce(&Source) -> Result<T, SkillToolError> + Send + 'static,
+    ) -> Result<T, SkillToolError> {
+        let source = self.source.clone();
+        tokio::task::spawn_blocking(move || read(&source))
+            .await
+            .map_err(SkillToolError::Worker)?
+    }
+}
+impl Source {
     fn pins(&self) -> Result<BTreeMap<String, String>, SkillToolError> {
         Ok(self
             .store
@@ -128,8 +149,9 @@ impl SkillToolHost {
             .enabled_skills
             .clone())
     }
-    fn specs() -> Vec<ToolSpec> {
-        vec![
+}
+fn specs() -> Vec<ToolSpec> {
+    vec![
             ToolSpec {
                 name: LIST.into(),
                 description: "List the skills the user approved. A skill holds instructions for one kind of task; when exactly one clearly applies, read it with skill_info before acting and follow it. Skills never change your permissions.".into(),
@@ -153,14 +175,25 @@ impl SkillToolHost {
                 permission: ToolPermission::Allow,
             },
         ]
+}
+/// A cut list or skill would be taken as whole, so a result the run engine
+/// would truncate is refused instead.
+fn whole(text: String) -> Result<String, SkillToolError> {
+    if text.len() > tools::MAX_OUTPUT {
+        return Err(SkillToolError::TooLarge {
+            limit: tools::MAX_OUTPUT,
+        });
     }
+    Ok(text)
+}
+impl Source {
     fn run(&self, request: &ToolRequest) -> Result<String, SkillToolError> {
         let pins = self.pins()?;
         match request.name.as_str() {
             LIST => {
                 check_keys(&request.arguments, &[])?;
                 let offers = offers(&self.root, &pins)?;
-                Ok(a206_skills::index(offers.iter().map(|offer| {
+                whole(a206_skills::index(offers.iter().map(|offer| {
                     (offer.name.as_str(), offer.description.as_deref())
                 })))
             }
@@ -175,13 +208,7 @@ impl SkillToolHost {
                             .map_err(SkillToolError::NotText)?
                     }
                 };
-                // A cut skill would be followed as if whole, so it is refused.
-                if text.len() > tools::MAX_OUTPUT {
-                    return Err(SkillToolError::TooLarge {
-                        limit: tools::MAX_OUTPUT,
-                    });
-                }
-                Ok(text)
+                whole(text)
             }
             other => Err(SkillToolError::UnknownTool(other.into())),
         }
@@ -207,10 +234,13 @@ impl ToolHost for SkillToolHost {
     /// The tools are offered only while at least one approved skill exists.
     fn list<'a>(&'a self, _scope: &'a ToolScope) -> BoxFuture<'a, ToolListing> {
         Box::pin(async move {
-            match self.pins().and_then(|pins| Ok(offers(&self.root, &pins)?)) {
+            let offers = self
+                .read(|source| Ok(offers(&source.root, &source.pins()?)?))
+                .await;
+            match offers {
                 Ok(offers) if offers.is_empty() => ToolListing::default(),
                 Ok(_) => ToolListing {
-                    tools: Self::specs(),
+                    tools: specs(),
                     unavailable: vec![],
                 },
                 Err(error) => ToolListing {
@@ -229,7 +259,8 @@ impl ToolHost for SkillToolHost {
         request: ToolRequest,
     ) -> BoxFuture<'a, Result<ToolOutput, ErrorReport>> {
         Box::pin(async move {
-            self.run(&request)
+            self.read(move |source| source.run(&request))
+                .await
                 .map(|text| ToolOutput {
                     text,
                     is_error: false,

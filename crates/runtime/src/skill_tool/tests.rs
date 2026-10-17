@@ -135,3 +135,35 @@ async fn supporting_files_and_arguments_are_checked() {
         ErrorKind::InvalidRequest
     );
 }
+
+#[tokio::test]
+async fn a_list_too_large_for_one_result_is_refused_rather_than_cut() {
+    let profile = tempfile::tempdir().unwrap();
+    let store = Arc::new(Mutex::new(Store::open(profile.path()).unwrap()));
+    let host = SkillToolHost::new(store.clone(), profile.path());
+    let dir = profile.path().join("skills/long");
+    std::fs::create_dir_all(&dir).unwrap();
+    let description = Id::new_v4()
+        .simple()
+        .to_string()
+        .repeat(tools::MAX_OUTPUT / 32 + 1);
+    let text = format!("---\nname: long\ndescription: {description}\n---\nBody");
+    std::fs::write(dir.join("SKILL.md"), &text).unwrap();
+    let digest = a206_skills::parse(&text, "long").unwrap().digest;
+    store
+        .lock()
+        .unwrap()
+        .state
+        .settings
+        .enabled_skills
+        .insert("long".into(), digest);
+    let refused = call(&host, LIST, json!({})).await.unwrap_err();
+    assert_eq!(refused.kind, ErrorKind::InvalidRequest);
+    assert_eq!(
+        call(&host, INFO, json!({"name": "long"}))
+            .await
+            .unwrap()
+            .text,
+        "Body"
+    );
+}
