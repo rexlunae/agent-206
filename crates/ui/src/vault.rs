@@ -189,7 +189,9 @@ impl Panel {
         match self.session().status_if_running().await {
             Ok(found) => self.show(found.unwrap_or_else(|| stopped(root))),
             Err(error) => {
+                // Offer no action on a state that could not be confirmed.
                 self.report(VaultSeen::Unreadable);
+                self.status.set(None);
                 self.poll_failure.set(Some(failure(
                     "vault_status",
                     "Could not re-read the vault state",
@@ -513,7 +515,7 @@ fn VaultPanel(root: PathBuf) -> Element {
                     DescriptionItem { term: rsx! { "Two-factor authentication" }, "{known(status.totp_enrolled)}" }
                     DescriptionItem { term: rsx! { "Agent credential access" }, "{known(status.agent_access)}" }
                 }
-            } else if (panel.failure)().is_none() {
+            } else if (panel.failure)().is_none() && (panel.poll_failure)().is_none() {
                 p { class: "a206-muted", role: "status", "Checking the vault…" }
             }
             if let Some(message) = (panel.notice)() {
