@@ -223,8 +223,11 @@ must live in a separate, user-selected installation directory; no project/state/
 ancestor can serve as that installation root. Native executables, required libraries
 and the Claude adapter must be inside it. See [coding-backends.md](coding-backends.md).
 
-The current macOS supervisor uses deny-by-default Seatbelt filesystem and network
-rules. Other platforms fail closed until equivalent isolation exists. The backend
+The macOS supervisor uses deny-by-default Seatbelt filesystem and network rules.
+On Linux, `a206-sandbox` runs the backend under bubblewrap namespaces (no network
+but loopback, a minimal mount view) and a Landlock allowlist applied inside by a
+helper, which is this executable re-run before it starts threads. Both layers are
+required. Other platforms fail closed until equivalent isolation exists. The backend
 can connect only to the supervisor's ephemeral loopback proxy port. The proxy accepts
 an opaque, per-run capability and only the selected API-discovered model; it strips
 that capability before forwarding, rejects other paths/models, bounds response

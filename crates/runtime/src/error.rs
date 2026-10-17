@@ -104,6 +104,7 @@ pub(crate) fn classify(error: &(dyn Error + 'static)) -> Option<ErrorKind> {
         crate::extension_host::ExtensionError,
         a206_extensions::abi::HostFailure,
         a206_protocol::Error,
+        a206_sandbox::SandboxError,
         reqwest::Error,
     );
     if let Some(kind) = a206_extensions::classify(error) {
@@ -119,6 +120,12 @@ pub(crate) fn classify(error: &(dyn Error + 'static)) -> Option<ErrorKind> {
         return Some(ErrorKind::Protocol);
     }
     None
+}
+
+impl Classified for a206_sandbox::SandboxError {
+    fn kind(&self) -> Option<ErrorKind> {
+        a206_sandbox::SandboxError::kind(self)
+    }
 }
 
 impl Classified for a206_broker::BrokerError {

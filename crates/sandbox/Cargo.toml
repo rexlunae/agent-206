@@ -1,0 +1,21 @@
+[package]
+name = "a206-sandbox"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Linux OS isolation for external agent runtimes: bubblewrap namespaces with Landlock inside"
+[dependencies]
+a206-core.workspace = true
+serde.workspace = true
+rmp-serde.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+base64 = "0.22"
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock = "0.4.4"
+[dev-dependencies]
+tempfile.workspace = true
+uuid.workspace = true
+[lints]
+workspace = true

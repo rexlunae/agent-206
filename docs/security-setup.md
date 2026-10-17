@@ -116,7 +116,7 @@ protection on a renderer or platform that cannot enforce it.
 | Scoped use | Skill/trigger and destination restrictions, explicit approvals | Existing narrowed tool/model grants; credential-use binding pending |
 | Reveal authentication | Per-connection short step-up window (120 seconds upstream) | 120-second window gates owner reveal, separate from agent use, expiry/revoke tested; lock/reconnect revocation wiring in the broker pending |
 | Prompt and leak defenses | Prompt-injection validation and outbound secret leak detection | Full boundary scanning/attack corpus pending |
-| OS sandbox | Strongest supported OS boundary, vault path excluded | macOS external backend isolation tested; other platforms and full RustyClaw tool parity pending |
+| OS sandbox | Strongest supported OS boundary, vault path excluded | macOS (Seatbelt) and Linux (bubblewrap + Landlock) external backend isolation tested; Windows, native exec and full RustyClaw tool parity pending |
 | Audit and redaction | Log decisions without secret material | Redacted secret type exists; broker audit and adversarial no-secret leakage tests pending |
 
 Retain security semantics, not unsafe helpers or vulnerabilities. Unsupported
