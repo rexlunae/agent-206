@@ -205,17 +205,10 @@ invocations and relays gateway-authorized host calls (`a206/docs/plugin-api.md`)
    Without it no tool, memory, cron or channel feature is reachable by a model.
 3. **Extension ABI v2** (MessagePack input, scoped host calls for workspace/exec/network/git, typed
    UI contributions, reviewed install). Partial: the ABI, SDK, workspace read/search/write, git read, network fetch and state host
-<<<<<<< HEAD
    calls, typed panels, user grants, user package install and agent-prepared packages with review are in; exec/git-write host calls remain. Every RustyClaw tool family is meant to ship as a WASM builtin.
-4. **OS sandbox for the macOS worker.** External backends, MCP servers and native `execute_command`
-   are isolated on macOS and Linux by one `a206-sandbox` profile; the WASM worker on Linux. The
-   macOS worker still runs unconfined (`runtime/src/sandbox.rs`).
-=======
-   calls, typed panels, user grants and user package install are in; exec/git-write host calls and agent-prepared packages remain. Every RustyClaw tool family is meant to ship as a WASM builtin.
 4. **OS sandbox on macOS and Linux.** Done: external backends, MCP servers, native
    `execute_command` and the WASM worker are isolated on both by one `a206-sandbox` profile.
    Windows isolation remains.
->>>>>>> origin/main
 5. **Context management**: compaction keyed to API-reported limits, workspace instruction files,
    memory extension. Needed for long-running and scheduled agents.
 6. **Delegation/task lifecycle** (agent-requested spawn, steering, hierarchical cancel, budgets) →

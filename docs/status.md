@@ -155,8 +155,8 @@ vault migration or production security certification.
    dispatch only after those boundary tests pass.
 2. Connect MCP tools to the native run engine (WASM extension tools are connected), then add the project
    scheduler and the background task lifecycle.
-3. Grow the extension SDK's host domains and builtins, and add reviewed
-   agent-generated extension packages.
+3. Grow the extension SDK's host domains and builtins, and add a pre-install
+   audit for user- and agent-supplied extension packages.
 4. Add verified local/SSH installers, remote supervision, browser/vault integration,
    document format plugins and forge-neutral PR/CI workflows.
 5. Complete context/accounting controls and API integrations without introducing a
