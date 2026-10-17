@@ -71,6 +71,9 @@ const TESTS: &[(&str, Test)] = &[
     ("agents_cannot_leave_unbounded_proposals", || {
         Box::pin(agents_cannot_leave_unbounded_proposals())
     }),
+    ("git_tools_run_once_the_conversation_is_granted_git", || {
+        Box::pin(git_tools_run_once_the_conversation_is_granted_git())
+    }),
     (
         "the_agent_learns_what_it_can_call_and_what_to_ask_for",
         || Box::pin(the_agent_learns_what_it_can_call_and_what_to_ask_for()),
@@ -1058,6 +1061,118 @@ async fn agents_cannot_leave_unbounded_proposals() {
     assert_eq!(proposals.len(), MAX_EXTENSION_PROPOSALS);
     assert!(!proposals.iter().any(|p| p.digest == first.digest));
     assert!(!rig.stored(&first.digest));
+}
+
+async fn git_tools_run_once_the_conversation_is_granted_git() {
+    let mut rig = rig().await;
+    gix::init(rig.workspace.path()).unwrap();
+    const GIT: &str = "agent206.git";
+    rig.ok(Command::GrantExtension {
+        extension: GIT.into(),
+        capabilities: [Capability::GitRead].into(),
+    })
+    .await;
+    rig.tool = tool_name(GIT, "git_status");
+    rig.permit(ToolPermission::Allow).await;
+    let name = rig.tool.clone();
+    let status = || Call::new(&name, json!({}));
+
+    // Granted to the extension and permitted, but not to this conversation.
+    let (thread, _) = rig.round_trip(&[status()]).await;
+    let record = calls_of(&thread).last().unwrap().clone();
+    assert_eq!(record.state, ToolCallState::Denied);
+    assert_eq!(error_kind(&record), ErrorKind::PermissionDenied);
+
+    // An external runtime is never offered a git grant it could not be held to.
+    let id = rig.thread;
+    let refused = move |backend, capabilities: &[Capability]| Command::SetBackend {
+        thread: id,
+        backend,
+        capabilities: capabilities.iter().copied().collect(),
+    };
+    let reply = rig
+        .run(refused(CodingBackend::Codex, &[Capability::GitRead]))
+        .await;
+    assert_eq!(failure(reply).kind, ErrorKind::PermissionDenied);
+    // Plan mode's ceiling holds git reading, not committing or the network.
+    for capability in [Capability::GitWrite, Capability::Network] {
+        let reply = rig.run(refused(CodingBackend::Native, &[capability])).await;
+        assert_eq!(failure(reply).kind, ErrorKind::PermissionDenied);
+    }
+
+    rig.grant_thread(&[Capability::ReadWorkspace, Capability::GitRead])
+        .await;
+    let (thread, results) = rig.round_trip(&[status()]).await;
+    let record = calls_of(&thread).last().unwrap().clone();
+    assert_eq!(record.state, ToolCallState::Succeeded, "{:?}", record.error);
+    let text = results[0].as_deref().unwrap();
+    assert!(text.contains(&rig.file.0), "{text}");
+
+    // In Code mode committing is grantable, but only with reading.
+    let model = rig.thread().model.unwrap();
+    let configured = rig
+        .run(Command::ConfigureThread {
+            id: rig.thread,
+            mode: Mode::Code,
+            model: Some(model.clone()),
+            subagent_models: [model].into(),
+        })
+        .await;
+    assert!(matches!(configured, Reply::Thread(_)), "{configured:?}");
+    let reply = rig
+        .run(refused(CodingBackend::Native, &[Capability::GitWrite]))
+        .await;
+    assert_eq!(failure(reply).kind, ErrorKind::InvalidRequest);
+    rig.grant_thread(&[Capability::GitRead, Capability::GitWrite])
+        .await;
+
+    // With both grants, the agent commits the file it was asked to.
+    let config = rig.workspace.path().join(".git/config");
+    let mut text = std::fs::read_to_string(&config).unwrap();
+    text.push_str(
+        "[user]\n\tname = Agent Test\n\temail = test@example.invalid\n[commit]\n\tgpgSign = false\n",
+    );
+    std::fs::write(&config, text).unwrap();
+    rig.ok(Command::GrantExtension {
+        extension: GIT.into(),
+        capabilities: [Capability::GitRead, Capability::GitWrite].into(),
+    })
+    .await;
+    rig.tool = tool_name(GIT, "git_commit");
+    rig.permit(ToolPermission::Allow).await;
+    let message = nonce();
+    let commit = Call::new(
+        &rig.tool,
+        json!({ "message": message, "paths": rig.file.0 }),
+    );
+    let (thread, _) = rig.round_trip(&[commit]).await;
+    let record = calls_of(&thread).last().unwrap().clone();
+    assert_eq!(record.state, ToolCallState::Succeeded, "{:?}", record.error);
+    let committed = {
+        let repo = gix::open(rig.workspace.path()).unwrap();
+        let head = repo.head_commit().unwrap();
+        head.message_raw().unwrap().to_string()
+    };
+    assert_eq!(committed.trim(), message);
+
+    // The network alone needs no project, unlike everything else.
+    let Reply::Thread(research) = rig
+        .run(Command::CreateThread {
+            title: nonce(),
+            mode: Mode::Research,
+        })
+        .await
+    else {
+        panic!("research thread created");
+    };
+    let grant = |capabilities: &[Capability]| Command::SetBackend {
+        thread: research.id,
+        backend: CodingBackend::Native,
+        capabilities: capabilities.iter().copied().collect(),
+    };
+    rig.ok(grant(&[Capability::Network])).await;
+    let reply = rig.run(grant(&[Capability::ReadWorkspace])).await;
+    assert_eq!(failure(reply).kind, ErrorKind::InvalidRequest);
 }
 
 async fn the_agent_learns_what_it_can_call_and_what_to_ask_for() {

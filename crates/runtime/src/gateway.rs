@@ -27,7 +27,9 @@ pub(crate) use mcp_servers::McpClient;
 pub use mcp_servers::{McpOffer, McpOffers};
 pub use run::{RunError, ToolError};
 mod delegation;
+mod plans;
 mod schedules;
+pub use plans::Plans;
 mod skills;
 pub use crate::skill_tool::SkillOffer;
 pub use delegation::{Caller, Child, Delegator, DelegatorError, Reservation};
@@ -471,6 +473,9 @@ impl Gateway {
         // permits them, and each new job waits for the user's approval.
         let schedule_tools = Arc::new(crate::schedule_tool::ScheduleHost::new(gateway.jobs()));
         Arc::make_mut(&mut gateway.tool_hosts).push(schedule_tools);
+        // The plan tool, denied in each conversation until the user permits it.
+        let plan_tools = Arc::new(crate::plan_tool::PlanHost::new(gateway.plans()));
+        Arc::make_mut(&mut gateway.tool_hosts).push(plan_tools);
         // Subagent tools; each conversation still denies them until the user
         // permits them, and they are offered only with subagent models.
         gateway.bind_delegation();
@@ -1029,14 +1034,8 @@ impl Gateway {
                     thread.parent.is_none(),
                     GatewayError::Denied("delegated threads cannot change backend grants"),
                 )?;
-                let supported: BTreeSet<_> = [
-                    Capability::ReadWorkspace,
-                    Capability::WriteWorkspace,
-                    Capability::Execute,
-                ]
-                .into();
                 check(
-                    capabilities.is_subset(&supported)
+                    capabilities.iter().all(|c| backend.grantable().contains(c))
                         && capabilities.is_subset(&thread.mode.ceiling()),
                     GatewayError::Denied("backend capability is unavailable in this mode"),
                 )?;
@@ -1046,7 +1045,14 @@ impl Gateway {
                     GatewayError::Invalid("write access also requires read access"),
                 )?;
                 check(
-                    capabilities.is_empty() || thread.project.is_some(),
+                    !capabilities.contains(&Capability::GitWrite)
+                        || capabilities.contains(&Capability::GitRead),
+                    GatewayError::Invalid("changing git history also requires reading it"),
+                )?;
+                // Only the network reaches beyond the project.
+                check(
+                    capabilities.iter().all(|c| *c == Capability::Network)
+                        || thread.project.is_some(),
                     GatewayError::Invalid("associate a project before granting workspace tools"),
                 )?;
                 if backend != CodingBackend::Native {
