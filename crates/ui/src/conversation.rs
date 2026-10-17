@@ -151,7 +151,7 @@ fn SideBySide(first: Thread, target: Option<Uuid>, rest: Vec<Thread>) -> Element
     }
 }
 /// The activity line under a running conversation.
-fn run_status(thread: &Thread) -> (Lifecycle, String) {
+pub(crate) fn run_status(thread: &Thread) -> (Lifecycle, String) {
     match (thread.held, thread.paused) {
         (true, true) => (Lifecycle::Queued, "Paused before its next step".into()),
         (true, false) => (
@@ -593,19 +593,16 @@ fn Conversation(thread: Thread, target: Option<Uuid>) -> Element {
                                 onclick: move |_| submit(),
                             }
                         }
-                        // A conversation being compacted has no run to pause.
-                        if thread.state == RunState::Running && thread.backend == CodingBackend::Native
-                            && (thread.paused || thread.compacting.is_none()) {
-                            if thread.paused {
-                                IconButton { icon: IconName::Play, label: name!("Resume response"), title: "Resume response",
-                                    size: ButtonSize::Sm, variant: ButtonVariant::Ghost,
-                                    onclick: move |_| dispatch(state, Command::ResumeRun { thread: id }),
-                                }
-                            } else {
-                                IconButton { icon: IconName::Pause, label: name!("Pause response"), title: "Pause before its next step",
-                                    size: ButtonSize::Sm, variant: ButtonVariant::Ghost,
-                                    onclick: move |_| dispatch(state, Command::PauseRun { thread: id }),
-                                }
+                        if crate::running::resumable(&thread) {
+                            IconButton { icon: IconName::Play, label: name!("Resume response"), title: "Resume response",
+                                size: ButtonSize::Sm, variant: ButtonVariant::Ghost,
+                                onclick: move |_| dispatch(state, Command::ResumeRun { thread: id }),
+                            }
+                        }
+                        if crate::running::pausable(&thread) {
+                            IconButton { icon: IconName::Pause, label: name!("Pause response"), title: "Pause before its next step",
+                                size: ButtonSize::Sm, variant: ButtonVariant::Ghost,
+                                onclick: move |_| dispatch(state, Command::PauseRun { thread: id }),
                             }
                         }
                         IconButton { icon: if running { IconName::Stop } else { IconName::ArrowUp }, label: if running { name!("Stop response") } else { name!("Send message") },
