@@ -10,6 +10,7 @@ pub mod extension_host;
 pub mod gateway;
 pub mod joshua;
 pub mod mcp;
+pub mod messengers;
 pub mod network;
 pub mod process;
 pub mod provider;

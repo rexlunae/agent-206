@@ -16,6 +16,7 @@ use std::{
 };
 use tokio::io::AsyncWriteExt;
 mod mcp_servers;
+mod messengers;
 pub use mcp_servers::{McpOffer, McpOffers};
 
 /// Streamed reply text that is not final yet. It is published as the
@@ -295,6 +296,12 @@ pub struct Gateway {
     /// Last automatic catalog attempt per provider, reset by a new pairing.
     refreshed: Arc<Mutex<BTreeMap<Id, u64>>>,
     paired: Arc<tokio::sync::Notify>,
+    /// Counts pairings, so messengers waiting for the vault wake on a new one.
+    pairings: tokio::sync::watch::Sender<u64>,
+    /// What the messenger supervisor should run.
+    messengers: tokio::sync::watch::Sender<Vec<crate::messengers::Desired>>,
+    /// Messengers the user disconnected; they connect again only on request.
+    messengers_stopped: Arc<Mutex<BTreeSet<String>>>,
     mcp: Arc<mcp_servers::McpServers>,
 }
 /// The broker pairing this gateway holds, with the connection that anchors it.
@@ -307,7 +314,30 @@ struct Paired {
 const REFRESH_RETRY: u64 = 300;
 impl Gateway {
     pub fn open(root: &Path) -> Result<Self, StoreError> {
-        let store = Arc::new(Mutex::new(Store::open(root)?));
+        let mut store = Store::open(root)?;
+        // Messenger state is runtime state: nothing is connected yet.
+        store.state.messengers =
+            Self::messenger_statuses(&store.state.messengers, &store.state.settings.messengers)
+                .into_iter()
+                .map(|status| MessengerStatus {
+                    state: MessengerState::Stopped,
+                    account: None,
+                    failure: None,
+                    ..status
+                })
+                .collect();
+        // Nobody has disconnected anything yet, so enabled entries run.
+        let desired = store
+            .state
+            .settings
+            .messengers
+            .iter()
+            .map(|config| crate::messengers::Desired {
+                run: config.enabled,
+                config: config.clone(),
+            })
+            .collect();
+        let store = Arc::new(Mutex::new(store));
         Ok(Self {
             admission: Arc::new(Mutex::new(Admission::default())),
             shutdown_committed: Arc::new(tokio::sync::Mutex::new(false)),
@@ -322,6 +352,9 @@ impl Gateway {
             pair_requests: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             refreshed: Arc::new(Mutex::new(BTreeMap::new())),
             paired: Arc::new(tokio::sync::Notify::new()),
+            pairings: tokio::sync::watch::Sender::new(0),
+            messengers: tokio::sync::watch::Sender::new(desired),
+            messengers_stopped: Arc::new(Mutex::new(BTreeSet::new())),
             mcp: Arc::default(),
         })
     }
@@ -555,6 +588,8 @@ impl Gateway {
                     .map_err(poisoned("catalog refresh"))?
                     .clear();
                 self.paired.notify_one();
+                self.pairings
+                    .send_modify(|count| *count = count.wrapping_add(1));
                 Ok(Reply::Ok)
             }
             Command::JoshuaStatus => {
@@ -610,6 +645,7 @@ impl Gateway {
             Command::Events { after } => Ok(Reply::Events(self.lock()?.events(after)?)),
             Command::SaveSettings(mut settings) => {
                 provider::validate_presets(&settings.provider_presets)?;
+                messengers::validate(&settings.messengers)?;
                 let mut backend_kinds = BTreeSet::new();
                 for backend in &settings.backends {
                     crate::backends::validate_config(backend)?;
@@ -705,12 +741,18 @@ impl Gateway {
                         .iter()
                         .any(|p| p.id == c.provider && old.contains(p))
                 });
+                store.state.messengers =
+                    Self::messenger_statuses(&store.state.messengers, &settings.messengers);
                 let previous = std::mem::replace(&mut store.state.settings, settings);
                 store.state.mcp_servers = mcp_servers;
                 store.persist(Some(EventKind::SettingsChanged))?;
                 self.stop_changed_mcp(&previous.mcp_servers, &store.state.settings.mcp_servers)?;
+                drop(store);
+                self.publish_messengers()?;
                 Ok(Reply::Ok)
             }
+            Command::ConnectMessenger { name } => self.connect_messenger(&name, true),
+            Command::DisconnectMessenger { name } => self.connect_messenger(&name, false),
             Command::RefreshCatalog { provider } => {
                 let config = self
                     .lock()?

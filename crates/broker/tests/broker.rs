@@ -1281,3 +1281,64 @@ async fn brokers_accept_the_previous_protocol_version() {
         assert_eq!(matches!(reply, Reply::Ok), accepted, "version {version}");
     }
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn telegram_tokens_go_in_the_path_and_odd_tokens_are_refused() {
+    use axum::{Router, extract::Path as UrlPath, http::HeaderMap, routing::get};
+    let seen = Arc::new(Mutex::new(Vec::<(String, bool)>::new()));
+    let app = {
+        let seen = seen.clone();
+        Router::new().route(
+            "/{bot}/getMe",
+            get(move |UrlPath(bot): UrlPath<String>, headers: HeaderMap| {
+                let seen = seen.clone();
+                async move {
+                    let header = headers.contains_key("authorization");
+                    seen.lock().unwrap().push((bot, header));
+                    "{}"
+                }
+            }),
+        )
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let (_dir, root, _task) = start().await;
+    let mut a = user(&root).await;
+    a.call(unlock(&random(), None, true)).await.unwrap();
+    // Shaped like a real bot token: digits, a colon, then URL-safe text.
+    let token = format!("{}:{}", std::process::id(), random().replace('-', "_"));
+    let (good, odd) = (random(), random());
+    for (name, value) in [(&good, token.clone()), (&odd, format!("{token}/../x"))] {
+        a.call(Request::PutCredential {
+            name: name.clone(),
+            meta: meta(vec![origin.clone()]),
+            value: WireValue::Single(WireSecret::new(value)),
+            replace: false,
+        })
+        .await
+        .unwrap();
+    }
+    let mut gateway = paired_gateway(&mut a, &root).await;
+    let call = |credential: &str| {
+        Request::Provider(ProviderCall {
+            credential: credential.to_owned(),
+            method: HttpMethod::Get,
+            url: format!("{origin}/getMe"),
+            auth: AuthScheme::TelegramBot,
+            anthropic_version: None,
+            body: None,
+        })
+    };
+    assert!(matches!(
+        gateway.call(call(&good)).await.unwrap(),
+        Reply::Provider { status: 200, .. }
+    ));
+    assert_eq!(*seen.lock().unwrap(), [(format!("bot{token}"), false)]);
+    assert_eq!(
+        denied(gateway.call(call(&odd)).await),
+        BrokerError::Upstream(UpstreamFailure::InvalidBotToken)
+    );
+    assert_eq!(seen.lock().unwrap().len(), 1);
+}
