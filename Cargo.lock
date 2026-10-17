@@ -117,6 +117,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "a206-plugin-web"
+version = "0.1.0"
+dependencies = [
+ "a206-extension-sdk",
+]
+
+[[package]]
 name = "a206-plugin-workspace"
 version = "0.1.0"
 dependencies = [
@@ -156,6 +163,7 @@ dependencies = [
  "fs2",
  "futures-util",
  "gix",
+ "http",
  "nix 0.31.3",
  "rcgen",
  "reqwest",
