@@ -85,7 +85,7 @@ pub fn first(schedule: &Schedule, now: u64) -> Result<u64, ScheduleError> {
 
 /// Settle the job runs a restart interrupted. Call it on the stored state before
 /// interrupted conversation runs are marked failed. A run whose message the
-/// conversation received ends as that conversation's run did; a run that
+/// conversation received ends as that conversation shows it did; a run that
 /// never sent it is due again at once, so the message is sent exactly once.
 pub fn recover(jobs: &mut [Job], threads: &[Thread]) {
     for job in jobs {
@@ -97,16 +97,32 @@ pub fn recover(jobs: &mut [Job], threads: &[Thread]) {
             continue;
         };
         let thread = threads.iter().find(|thread| thread.id == job.thread);
-        let sent = thread.is_some_and(|thread| {
-            thread
-                .messages
+        let messages = thread.map_or(&[][..], |thread| &thread.messages[..]);
+        let sent = messages
+            .iter()
+            .position(|m| m.role == Role::User && m.at >= run.at && m.text == job.text);
+        // The run's own outcome is the conversation's only while its message
+        // is the latest; a later message started another run, so this one
+        // ended earlier, with a reply or without one.
+        let later = |sent: usize| {
+            messages[sent + 1..]
                 .iter()
-                .any(|m| m.role == Role::User && m.at >= run.at && m.text == job.text)
-        });
-        run.outcome = match thread.map(|thread| &thread.state) {
-            Some(RunState::Complete) if sent => JobOutcome::Complete,
-            Some(RunState::Cancelled) if sent => JobOutcome::Cancelled,
-            _ if sent => JobOutcome::Failed,
+                .position(|m| m.role == Role::User)
+        };
+        run.outcome = match (sent, thread.map(|thread| &thread.state)) {
+            (Some(sent), state) => match (later(sent), state) {
+                (None, Some(RunState::Complete)) => JobOutcome::Complete,
+                (None, Some(RunState::Cancelled)) => JobOutcome::Cancelled,
+                (None, _) => JobOutcome::Failed,
+                (Some(next), _) => {
+                    let replies = &messages[sent + 1..sent + 1 + next];
+                    if replies.iter().any(|m| m.role == Role::Assistant) {
+                        JobOutcome::Complete
+                    } else {
+                        JobOutcome::Failed
+                    }
+                }
+            },
             _ => {
                 // Due again at the interrupted time; the scheduler runs it
                 // once and then continues on its schedule.

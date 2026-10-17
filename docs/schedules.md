@@ -15,8 +15,9 @@ of those applies to the next run; a job never carries authority of its own.
 | `Cron { expression, zone }` | A cron expression (five fields, or six with seconds first; [croner](https://docs.rs/croner) syntax) in an IANA time zone, or the gateway's own zone when unset. |
 
 If the gateway stops while a job's run is starting, the next start settles it:
-when the conversation received the message, the run ends as that conversation's
-run did; when it did not, the job is due again at once, so the message is sent
+when the conversation received the message, the run ends as the conversation
+shows (its current run's state while that message is the latest, otherwise
+complete if a reply followed it); when it did not, the job is due again at once, so the message is sent
 exactly once.
 
 When the gateway was stopped through one or more due times, the job runs once

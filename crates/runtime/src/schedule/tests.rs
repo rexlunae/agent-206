@@ -106,6 +106,26 @@ fn a_restart_sends_an_interrupted_message_once() {
     unsent.messages.push(message(&text, started - 1));
     unsent.state = RunState::Complete;
 
+    // Sent, then another message started a later run that is still going:
+    // the job's run ended before it, with a reply or without one.
+    let mut answered = interrupted.clone();
+    answered.id = Id::new_v4();
+    answered.messages.push(Message::new(
+        Role::Assistant,
+        Id::new_v4().to_string(),
+        started,
+        CodingBackend::default(),
+    ));
+    answered
+        .messages
+        .push(message(&Id::new_v4().to_string(), started + 1));
+    let mut unanswered = interrupted.clone();
+    unanswered.id = Id::new_v4();
+    unanswered.state = RunState::Complete;
+    unanswered
+        .messages
+        .push(message(&Id::new_v4().to_string(), started + 1));
+
     let later = started + seconds;
     let mut jobs = vec![
         job(complete.id, &text, every.clone(), Some(later)),
@@ -120,7 +140,17 @@ fn a_restart_sends_an_interrupted_message_once() {
         ..JobRun::start(started)
     });
     jobs.push(settled.clone());
-    recover(&mut jobs, &[complete, interrupted, unsent]);
+    jobs.push(job(answered.id, &text, Schedule::At { at: started }, None));
+    jobs.push(job(
+        unanswered.id,
+        &text,
+        Schedule::At { at: started },
+        None,
+    ));
+    recover(
+        &mut jobs,
+        &[complete, interrupted, unsent, answered, unanswered],
+    );
 
     let outcome = |job: &Job| job.last.as_ref().unwrap().outcome.clone();
     assert_eq!(outcome(&jobs[0]), JobOutcome::Complete);
@@ -135,4 +165,11 @@ fn a_restart_sends_an_interrupted_message_once() {
         assert_eq!(unsent.next, Some(started));
     }
     assert_eq!(jobs[5], settled, "a finished run is left alone");
+    assert_eq!(outcome(&jobs[6]), JobOutcome::Complete);
+    assert_eq!(outcome(&jobs[7]), JobOutcome::Failed);
+    assert!(
+        jobs[6..]
+            .iter()
+            .all(|job| !job.enabled && job.next.is_none())
+    );
 }
