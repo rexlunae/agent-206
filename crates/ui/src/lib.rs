@@ -15,6 +15,7 @@ mod schedules;
 mod search;
 mod settings;
 mod skills;
+mod subagents;
 mod tools;
 #[cfg(target_arch = "wasm32")]
 use a206_core::Ignore;

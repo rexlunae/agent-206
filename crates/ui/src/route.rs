@@ -336,6 +336,24 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn split_view_keeps_each_conversations_subagents_in_its_details() {
+        let parent = a206_core::Thread::new(Uuid::new_v4().to_string(), a206_core::Mode::Chat);
+        let mut child = a206_core::Thread::new(Uuid::new_v4().to_string(), a206_core::Mode::Chat);
+        child.parent = Some(parent.id);
+        let mut snapshot = crate::empty_snapshot();
+        snapshot.threads = vec![parent.clone(), child.clone()];
+        let html = render_thread(ThreadFixture {
+            snapshot,
+            id: parent.id,
+            split: Some(child.id),
+            message: None,
+        });
+        assert_eq!(html.matches(">Subagents<").count(), 2, "{html}");
+        assert!(html.contains("Delegated from"), "{html}");
+        assert!(html.contains("No subagents yet"), "{html}");
+    }
+
+    #[test]
     fn loaded_deep_links_select_exact_threads_and_restore_split_selector() {
         let first = a206_core::Thread::new(Uuid::new_v4().to_string(), a206_core::Mode::Chat);
         let second = a206_core::Thread::new(Uuid::new_v4().to_string(), a206_core::Mode::Chat);
