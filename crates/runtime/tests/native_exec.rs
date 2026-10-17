@@ -590,7 +590,7 @@ async fn background_sessions_end_with_their_host() {
         let mut rest = Vec::new();
         held.read_to_end(&mut rest).unwrap();
         // The test may have given up already.
-        let _ = ended.send(rest);
+        a206_core::Ignore::ignore(ended.send(rest));
     });
     let patience = std::time::Duration::from_secs(60);
     let first = tokio::time::timeout(patience, started)
