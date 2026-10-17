@@ -1,6 +1,6 @@
 //! Fail closed outside supported OS isolation. Clearing environment is not a sandbox.
-//! macOS uses a generated Seatbelt profile; Linux uses `a206_sandbox`
-//! (bubblewrap namespaces with Landlock inside). Other platforms refuse.
+//! `a206_sandbox` confines the runtime: bubblewrap namespaces with Landlock
+//! inside on Linux, a Seatbelt profile on macOS. Other platforms refuse.
 use super::{BackendError, Result, check};
 use a206_core::*;
 use std::{
@@ -240,102 +240,8 @@ impl Process {
         }
     }
 }
-#[cfg(target_os = "macos")]
-fn sandbox_command(
-    executable: &Path,
-    root: &Path,
-    scratch: &Path,
-    cwd: &Path,
-    state: &Path,
-    thread: &Thread,
-    port: u16,
-) -> Result<Command> {
-    // A JSON string literal is also a valid SBPL string literal.
-    let quote = |path: &Path| -> Result<String> {
-        path.to_str()
-            .map(|path| serde_json::Value::from(path).to_string())
-            .ok_or(BackendError::NonUtf8Path)
-    };
-    let mut policy = format!(
-        r#"(version 1)
-(deny default)
-(allow process-fork)
-(allow process-exec (subpath {}))
-(allow signal (target self))
-(allow sysctl-read)
-(allow system-mac-syscall (mac-policy-name "vnguard"))
-(allow system-mac-syscall (require-all (mac-policy-name "Sandbox") (mac-syscall-number 67)))
-(allow file-read* (literal "/"))
-(allow file-read-metadata (literal "/var") (literal "/tmp"))
-(allow mach-lookup (global-name "com.apple.system.logger") (global-name "com.apple.system.opendirectoryd"))
-(allow file-map-executable file-read* (subpath "/System/Library") (subpath "/System/iOSSupport/System/Library") (subpath "/usr/lib") (subpath "/usr/share") (subpath "/Library/Apple") (subpath "/private/var/db/dyld") (literal "/dev/null") (literal "/dev/urandom") (literal "/dev/random") (subpath {}) (subpath {}))
-(allow file-write* (subpath {}) (literal "/dev/null"))
-(allow network-outbound (remote ip "localhost:{}"))
-"#,
-        quote(root)?,
-        quote(root)?,
-        quote(scratch)?,
-        quote(scratch)?,
-        port
-    );
-    // Runtime traversal needs metadata for exact ancestors, never arbitrary files
-    // elsewhere in the user's filesystem. Descendants stay within the read grants.
-    let mut ancestors = std::collections::BTreeSet::new();
-    for path in [
-        root,
-        scratch,
-        cwd,
-        Path::new("/System/Library"),
-        Path::new("/System/iOSSupport/System/Library"),
-        Path::new("/usr/lib"),
-        Path::new("/usr/share"),
-        Path::new("/Library/Apple"),
-        Path::new("/private/var/db/dyld"),
-    ] {
-        ancestors.extend(path.ancestors().skip(1));
-    }
-    for ancestor in ancestors {
-        policy.push_str(&format!(
-            "(allow file-read-metadata (literal {}))\n",
-            quote(ancestor)?
-        ));
-    }
-    if thread
-        .grant
-        .capabilities
-        .contains(&Capability::ReadWorkspace)
-    {
-        policy.push_str(&format!("(allow file-read* (subpath {}))\n", quote(cwd)?));
-    }
-    if thread
-        .grant
-        .capabilities
-        .contains(&Capability::WriteWorkspace)
-    {
-        policy.push_str(&format!("(allow file-write* (subpath {}))\n", quote(cwd)?));
-    }
-    if thread.grant.capabilities.contains(&Capability::Execute) {
-        policy.push_str(
-            "(allow process-exec file-read* (subpath \"/bin\") (subpath \"/usr/bin\"))\n",
-        );
-    }
-    // Seatbelt rules are ordered: exclusions must follow broad workspace grants.
-    policy.push_str(&format!(
-        "(deny file-read* file-write* (subpath {}))\n",
-        quote(state)?
-    ));
-    // Deny ambient agent configuration and common credential stores even inside a broad workspace.
-    for hidden in a206_sandbox::hidden_home_paths() {
-        policy.push_str(&format!(
-            "(deny file-read* file-write* (subpath {}))\n",
-            quote(&hidden)?
-        ));
-    }
-    let mut command = Command::new("/usr/bin/sandbox-exec");
-    command.args(["-p", &policy]).arg(executable);
-    Ok(command)
-}
-#[cfg(target_os = "linux")]
+/// `a206_sandbox`: bubblewrap and Landlock on Linux, Seatbelt on macOS.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn sandbox_command(
     executable: &Path,
     root: &Path,

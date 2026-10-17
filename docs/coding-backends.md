@@ -102,7 +102,8 @@ agent206 backend select "$THREAD_ID" native
 
 ## Current boundaries and limits
 
-The macOS implementation uses Seatbelt. On Linux (`crates/sandbox`), bubblewrap
+On macOS `crates/sandbox` generates a Seatbelt policy from the same profile
+(`seatbelt.rs`) and starts the runtime with `sandbox-exec`. On Linux, bubblewrap
 places the runtime in new user, PID, IPC, UTS, cgroup and network namespaces with a
 mount namespace holding only system libraries, the installation, scratch space and
 the granted project; Landlock then confines reads, writes and execution to the same
