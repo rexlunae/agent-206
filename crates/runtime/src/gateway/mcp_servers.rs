@@ -325,10 +325,19 @@ impl Gateway {
             }
             match self.mcp.claim(name)? {
                 Claim::Wait(mut done) => {
+                    let entry = self.mcp_config(name).ok();
                     // A failure is sent; a success just closes the channel.
                     if done.changed().await.is_ok()
                         && let Some(report) = done.borrow_and_update().clone()
                     {
+                        // A start the user cut short by disconnecting or
+                        // changing the server is not this server's failure.
+                        if self.mcp.is_stopped(name)? {
+                            return Ok(Discovered::Stopped);
+                        }
+                        if self.mcp_config(name).ok() != entry {
+                            continue;
+                        }
                         return Ok(Discovered::Failed(report));
                     }
                     attempted = true;
@@ -944,5 +953,18 @@ mod tests {
             g.snapshot().unwrap().mcp_servers[0].state,
             McpServerState::Disconnected
         );
+
+        // A start cut short by a disconnect leaves the server out, not failed.
+        let Claim::Start(claim) = g.mcp.claim("tools").unwrap() else {
+            panic!("nothing else is starting");
+        };
+        let disconnect = async {
+            tokio::task::yield_now().await;
+            g.disconnect_mcp("tools").unwrap();
+            claim.outcome.send_replace(Some(failure.clone()));
+            drop(claim);
+        };
+        let (offers, ()) = tokio::join!(g.mcp_offers(thread.id), disconnect);
+        assert_eq!(offers.unwrap(), McpOffers::default());
     }
 }
