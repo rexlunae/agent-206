@@ -373,6 +373,35 @@ fn web_tool_reports_status_type_and_text() {
     assert_eq!(*seen.borrow(), vec![HostRequest::Fetch { url }]);
 }
 
+/// A body the host cut inside a multibyte character is still shown as text.
+#[test]
+fn web_tool_keeps_text_cut_mid_character() {
+    let builtin = builtin("agent206.web").unwrap().unwrap();
+    let page = unique("page");
+    let mut body = format!("{page}€").into_bytes();
+    body.pop();
+    let (bridge, _) = mock(move |_| {
+        HostReply::Fetched(FetchResponse {
+            status: 200,
+            content_type: None,
+            body: body.clone().into(),
+            truncated: true,
+        })
+    });
+    let invocation = tool(
+        "fetch_url",
+        &[("url", Value::Str("https://a.example/".into()))],
+    );
+    let (outcome, _) = engine::run(builtin.wasm, &invocation, Limits::default(), bridge);
+    let Ok(Outcome::Tool(output)) = outcome else {
+        panic!("expected tool output, got {outcome:?}");
+    };
+    assert_eq!(
+        output.text,
+        format!("HTTP 200\n\n{page}\n[the response continues; it was cut at a limit]")
+    );
+}
+
 #[test]
 fn budgets_stop_the_guest() {
     let reply = |_: &HostRequest| HostReply::Directory(vec![]);

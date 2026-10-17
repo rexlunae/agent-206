@@ -186,6 +186,9 @@ async fn fetch_returns_any_status_and_bounds_the_body() {
     );
     net.routes
         .insert(format!("https://{site}/big"), (200, vec![], big.clone()));
+    // Not a redirect, despite the 3xx code: there is nothing to follow.
+    net.routes
+        .insert(format!("https://{site}/same"), (304, vec![], vec![]));
     let (mut calls, _) = fetch_calls(
         &store,
         net,
@@ -207,4 +210,9 @@ async fn fetch_returns_any_status_and_bounds_the_body() {
     assert!(cut.truncated);
     assert_eq!(cut.body.len(), crate::extension_host::fetch::MAX_FETCH);
     assert_eq!(cut.content_type, None);
+    let HostReply::Fetched(unchanged) = calls.handle(fetch(&format!("https://{site}/same"))).await
+    else {
+        panic!("fetch failed");
+    };
+    assert_eq!(unchanged.status, 304);
 }

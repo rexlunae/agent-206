@@ -23,20 +23,33 @@ impl Extension for Web {
         if let Some(content_type) = &response.content_type {
             text.push_str(&format!("\nContent-Type: {content_type}"));
         }
-        match std::str::from_utf8(&response.body) {
-            Ok(body) => {
+        match readable(&response.body, response.truncated) {
+            Some(body) => {
                 text.push_str("\n\n");
                 text.push_str(prefix(body, MAX_TEXT));
                 if body.len() > MAX_TEXT || response.truncated {
                     text.push_str("\n[the response continues; it was cut at a limit]");
                 }
             }
-            Err(_) => text.push_str(&format!(
+            None => text.push_str(&format!(
                 "\n\n[{} bytes of non-text content not shown]",
                 response.body.len()
             )),
         }
         Ok(ToolOutput { text })
+    }
+}
+
+/// The body as UTF-8 text. When the host cut the body, a character split by
+/// the cut is dropped rather than making the whole page unreadable.
+fn readable(body: &[u8], truncated: bool) -> Option<&str> {
+    match std::str::from_utf8(body) {
+        Ok(text) => Some(text),
+        // `error_len() == None`: the bytes end mid-character, nothing invalid.
+        Err(error) if truncated && error.error_len().is_none() => {
+            std::str::from_utf8(&body[..error.valid_up_to()]).ok()
+        }
+        Err(_) => None,
     }
 }
 

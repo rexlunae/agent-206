@@ -193,7 +193,18 @@ pub(crate) async fn public_request(
             return Err(DownloadError::PrivateAddress);
         }
         let response = net.get(&url, host, &answers).await.map_err(transport)?;
-        if !response.status().is_redirection() {
+        // Only statuses that mean "go there" are followed; 300, 304 and the
+        // like are final answers.
+        use reqwest::StatusCode as S;
+        let redirect = matches!(
+            response.status(),
+            S::MOVED_PERMANENTLY
+                | S::FOUND
+                | S::SEE_OTHER
+                | S::TEMPORARY_REDIRECT
+                | S::PERMANENT_REDIRECT
+        );
+        if !redirect {
             return Ok(response);
         }
         if hop >= 5 {
