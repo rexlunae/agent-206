@@ -186,6 +186,9 @@ fn print_preview(preview: &Preview) {
                 UnsupportedMessenger::InvalidChats => {
                     "skipped: its allowed chats are not ones Agent 206 accepts"
                 }
+                UnsupportedMessenger::InvalidEndpoint => {
+                    "skipped: it names no server, or one that is not an HTTPS origin"
+                }
             },
         };
         println!(
@@ -409,7 +412,11 @@ pub async fn import(root: &Path, remote: Option<String>, source: ImportSource) -
     {
         let (name, origin) = (
             &messenger.name,
-            messenger.kind.map_or("", |kind| kind.default_endpoint()),
+            messenger
+                .endpoint
+                .as_deref()
+                .or_else(|| messenger.kind.and_then(|kind| kind.default_endpoint()))
+                .unwrap_or_default(),
         );
         println!(
             "To use messenger {name}: agent206 vault add {name}-token --kind token --destination {origin}, then agent206 messenger set {name} --credential {name}-token, agent206 messenger allow {name} <chat> and agent206 messenger enable {name}"

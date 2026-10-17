@@ -2,14 +2,16 @@
 //!
 //! A messenger entry is user configuration: nothing here enables it, connects
 //! it or lets a chat reach a thread. Entries start disabled, accept no chat
-//! until the user allows it, and spend their bot token only through the vault
-//! broker for the messenger's API origin. Imported entries stay disabled.
+//! until the user allows it, and spend their bot or access token only through
+//! the vault broker for the messenger's API origin. Imported entries stay
+//! disabled.
 use crate::{ErrorReport, Mode, ModelKey};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
 /// Longest messenger name, chat id or credential name accepted in settings.
-pub const MAX_MESSENGER_FIELD: usize = 128;
+/// Matrix room and user ids may be up to 255 bytes.
+pub const MAX_MESSENGER_FIELD: usize = 255;
 /// Most chats, and most senders, one messenger may allow.
 pub const MAX_ALLOWED_CHATS: usize = 256;
 /// Most refused chats a status remembers, so the user can allow one.
@@ -44,25 +46,33 @@ pub enum MessengerKind {
     /// Telegram Bot API, polled with `getUpdates`.
     #[default]
     Telegram,
+    /// Matrix client-server API on the user's homeserver, polled with `/sync`.
+    Matrix,
 }
 impl MessengerKind {
-    pub const ALL: [Self; 1] = [Self::Telegram];
+    pub const ALL: [Self; 2] = [Self::Telegram, Self::Matrix];
     pub fn label(self) -> &'static str {
         match self {
             Self::Telegram => "Telegram",
+            Self::Matrix => "Matrix",
         }
     }
-    /// The service's official API endpoint, used unless an entry names another.
-    pub fn default_endpoint(self) -> &'static str {
+    /// The service's official API endpoint, used unless an entry names
+    /// another. Federated services have none: the user names their server.
+    pub fn default_endpoint(self) -> Option<&'static str> {
         match self {
-            Self::Telegram => "https://api.telegram.org",
+            Self::Telegram => Some("https://api.telegram.org"),
+            Self::Matrix => None,
         }
     }
-    /// How the user obtains the bot token the vault stores for this kind.
+    /// How the user obtains the token the vault stores for this kind.
     pub fn credential_help(self) -> &'static str {
         match self {
             Self::Telegram => {
                 "Create a bot with @BotFather and store its token in the vault, bound to the API origin"
+            }
+            Self::Matrix => {
+                "Sign the bot account in to your homeserver and store its access token in the vault, bound to the homeserver origin"
             }
         }
     }
@@ -77,11 +87,12 @@ pub struct MessengerConfig {
     /// Disabled messengers never connect. Off unless the user turns it on.
     #[serde(default)]
     pub enabled: bool,
-    /// Vault credential holding the bot token. The broker spends it only for
+    /// Vault credential holding the bot or access token. The broker spends it only for
     /// the origin it is bound to; the gateway never sees its value.
     #[serde(default)]
     pub credential: Option<String>,
-    /// API base URL; the kind's official endpoint when absent.
+    /// API base URL; the kind's official endpoint when absent. Required for
+    /// kinds without one, such as Matrix (the homeserver).
     #[serde(default)]
     pub endpoint: Option<String>,
     /// Chats whose messages reach a thread. Everything else is refused and
@@ -115,10 +126,12 @@ impl MessengerConfig {
             mode: Mode::Chat,
         }
     }
-    pub fn endpoint(&self) -> &str {
+    /// The configured endpoint, else the kind's official one; `None` when
+    /// the kind has none and the user has not named one.
+    pub fn endpoint(&self) -> Option<&str> {
         self.endpoint
             .as_deref()
-            .unwrap_or_else(|| self.kind.default_endpoint())
+            .or_else(|| self.kind.default_endpoint())
     }
     /// Whether a message from `sender` in `chat` may reach a thread: the chat
     /// is allowed, and the sender is listed, or the list is empty and the
@@ -243,6 +256,15 @@ mod tests {
             MessengerKind::Telegram.default_endpoint()
         );
         assert_eq!(config, MessengerConfig::new(name, MessengerKind::Telegram));
+        // A homeserver is the user's choice, never assumed.
+        let matrix = MessengerConfig::new(uuid::Uuid::new_v4().to_string(), MessengerKind::Matrix);
+        assert_eq!(matrix.endpoint(), None);
+        let origin = format!("https://{}.test", uuid::Uuid::new_v4().simple());
+        let matrix = MessengerConfig {
+            endpoint: Some(origin.clone()),
+            ..matrix
+        };
+        assert_eq!(matrix.endpoint(), Some(origin.as_str()));
     }
 
     #[test]

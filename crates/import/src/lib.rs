@@ -172,6 +172,10 @@ pub struct MessengerImport {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<MessengerKind>,
+    /// The server the source connected to, when the service is federated
+    /// (a Matrix homeserver). An origin, carried over as the endpoint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
     /// Chats the source allowed; carried over as this entry's allow-list.
     #[serde(default)]
     pub allowed_chats: BTreeSet<String>,
@@ -179,8 +183,8 @@ pub struct MessengerImport {
     /// users still holds.
     #[serde(default)]
     pub allowed_users: BTreeSet<String>,
-    /// The source kept a token in its configuration in plain text. It is
-    /// not read; the user stores it in the vault.
+    /// The source kept a token or password in its configuration in plain
+    /// text. It is not read; the user stores a token in the vault.
     #[serde(default)]
     pub token_left_behind: bool,
     pub action: MessengerAction,
@@ -207,6 +211,9 @@ pub enum UnsupportedMessenger {
     /// More allowed chats or users than Agent 206 accepts, or ids it would
     /// refuse.
     InvalidChats,
+    /// The service needs a server URL and the source names none, or one
+    /// that is not an HTTPS (or local HTTP) origin.
+    InvalidEndpoint,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -298,6 +305,7 @@ impl Preview {
                 continue;
             }
             let mut config = MessengerConfig::new(import.name.clone(), kind);
+            config.endpoint = import.endpoint.clone();
             config.allowed_chats = import.allowed_chats.clone();
             config.allowed_users = import.allowed_users.clone();
             added.push(config.name.clone());

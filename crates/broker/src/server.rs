@@ -804,6 +804,7 @@ async fn request(http: &reqwest::Client, out: Outbound) -> Result<reqwest::Respo
     let method = match out.method {
         HttpMethod::Get => reqwest::Method::GET,
         HttpMethod::Post => reqwest::Method::POST,
+        HttpMethod::Put => reqwest::Method::PUT,
     };
     let mut request = http.request(method, out.url);
     if let Some((name, value)) = &out.header {

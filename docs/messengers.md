@@ -1,8 +1,9 @@
 # Messengers
 
 A messenger connects a chat service account to Agent 206 so that people can
-talk to a thread from that service. Telegram is implemented; RustyClaw's other
-channels are listed in [parity.md](parity.md#messengers--channels).
+talk to a thread from that service. Telegram and Matrix are implemented;
+RustyClaw's other channels are listed in
+[parity.md](parity.md#messengers--channels).
 
 ## Configuration
 
@@ -13,27 +14,30 @@ of the desktop, web and terminal apps):
 ```toml
 [[messengers]]
 name = "team"                 # lowercase letters, digits, single hyphens
-kind = "telegram"
+kind = "telegram"             # or "matrix"
 enabled = false               # off until the user turns it on
 credential = "team-token"     # vault credential name, never the token
-# endpoint = "https://..."    # an origin; defaults to the official API
+# endpoint = "https://..."    # an origin; defaults to the official API,
+                              # required for Matrix (the homeserver)
 allowed_chats = ["-1001234"]  # chats whose messages reach a thread
 allowed_users = ["5551234"]   # senders accepted; groups need it
 model = { provider = "<provider id>", model = "<id from the provider's API>" }
 mode = "chat"                 # mode of new chat threads
 ```
 
-The gateway validates every save: unique names, an HTTPS (or loopback HTTP)
-origin without a path, credentials, query or fragment, bounded chat and
-sender lists and printable ids. Entries start disabled, allow no chat and have no model, so
+The gateway validates every save: unique names, an endpoint for kinds without
+an official one, an HTTPS (or loopback HTTP) origin without a path,
+credentials, query or fragment, bounded chat and sender lists and printable
+ids of at most 255 bytes. Entries start disabled, allow no chat and have no model, so
 adding one, including through import, connects nothing and answers nobody.
 
 ## Security
 
 - **Tokens stay in the vault.** The gateway asks the vault broker to make
-  each Bot API call (`AuthScheme::TelegramBot`, broker protocol v6). The broker
-  checks that the credential is bound to the endpoint's exact origin and
-  places the token in the request path itself. Plain HTTP (loopback only)
+  each API call (Telegram: `AuthScheme::TelegramBot`, broker protocol v6;
+  Matrix: a bearer token, with `PUT` from protocol v7). The broker checks
+  that the credential is bound to the endpoint's exact origin and attaches
+  the token itself (Telegram's goes in the request path). Plain HTTP (loopback only)
   never goes through a configured proxy, which would see the token. The token never reaches the
   gateway, events, the model or logs, and the broker refuses a token whose
   characters could change the path. Error bodies from the service are not
@@ -83,6 +87,72 @@ A turn runs as its own task. A messenger stopped mid-turn (disabled,
 reconfigured or shut down) lets the turn finish or be cancelled by gateway
 shutdown like any other run, and does not send its reply.
 
+## Matrix
+
+A Matrix messenger is a bot account on the user's homeserver. The endpoint is
+the homeserver's client API origin (as `.well-known/matrix/client` names it;
+discovery is not automatic), and the credential is the account's access
+token, bound to that origin:
+
+```sh
+agent206 vault add bot-token --kind token --destination https://matrix.example.org
+agent206 messenger add home --kind matrix --endpoint https://matrix.example.org --credential bot-token
+agent206 messenger allow home '!roomid:example.org'
+agent206 messenger allow-sender home '@me:example.org'
+agent206 messenger enable home
+```
+
+- **Every room is a group.** Matrix does not say reliably whether a room is a
+  direct chat, so a message is accepted only from a sender in
+  `allowed_users`, in a room in `allowed_chats`. Room and user ids are the
+  canonical `!room:server` and `@user:server` forms.
+- **Joining.** The bot joins a room only when invited to one in
+  `allowed_chats`; other invitations are left pending and listed as refused.
+  Allowing one restarts the messenger, whose first sync sees the pending
+  invitation and joins it.
+- **No end-to-end encryption.** Encrypted messages cannot be read. Before
+  each turn and before each reply the gateway checks the room's encryption
+  state through a successful full-room state read (a 404 is not proof of
+  missing encryption), and never sends anything, not even a failure notice, to an encrypted
+  room, since a plain-text message there would downgrade it. The refusal is
+  reported in the status only.
+- **What is read and sent.** Only `m.text` messages from other accounts are
+  read; notices (which bots send), edits, reactions and attachments are
+  ignored. Replies are `m.notice` messages, so other bots do not answer them,
+  split at 8000 UTF-16 units.
+- **Delivery.** `/sync` is long-polled (25 s) with a filter that drops
+  presence, receipts and room state. Each time the messenger starts (a
+  gateway start, enabling it or changing its settings), its first sync
+  starts from now and answers nothing, so history is never answered. The
+  sync token is held in memory and survives reconnects, but messages sent
+  while the messenger was stopped are not answered. A 401 (expired or
+  revoked token) stops the messenger until the user acts. The account is
+  checked (`whoami`) before each sync, and another account behind the
+  credential starts from a fresh sync token.
+  Limited timelines are backfilled using `/rooms/{roomId}/messages` before
+  accepting the next sync token, with event-ID deduplication across pages
+  and the timeline. Each batch is capped at 64 allowed rooms, 1,000 total events
+  (including invitations and backfill), and 32 pagination requests across
+  all rooms. Overflow or cyclic pagination fails the batch and preserves
+  the previous cursor; it never silently skips messages.
+  Unrelated rooms contribute discovery only, outside the allowed-room work
+  budget. Up to 4,096 unapproved room IDs are retained and surfaced for
+  the recent-refusal feed in chunks of 64 across polls. **The review list
+  retains only the latest 16 refused chats or senders**, not a full room
+  directory; older entries are replaced. Other room IDs can be added
+  manually under Allowed chats or through the CLI. The old cursor is held until
+  every discovery reaches that feed; authorized turns and joins are delivered
+  only in the final chunk, so reconnecting during discovery cannot repeat
+  them. Deduplication keys survive intermediate chunks and reconnects until
+  the actual sync token advances. Larger discovery sets produce a budget error without confirming
+  the sync. Full
+  room state is scanned with constant additional memory under the broker's
+  byte limit, separately from sync-event budgets, so large membership lists
+  do not prevent checking encryption.
+
+The adapter follows the [Matrix Client-Server API](https://spec.matrix.org/latest/client-server-api/)
+for `/join/{roomIdOrAlias}`, full room state, sync and forward message pagination.
+
 ## Interface for the run engine
 
 `a206_runtime::messengers::Host` is the boundary between a messenger and the
@@ -107,9 +177,13 @@ participant cannot approve their own request.
 
 ## Not yet
 
-- Discord, Slack, Matrix, IRC, Signal, WhatsApp, Google Chat, Teams, iMessage
-  and webhooks. Discord's gateway and Slack's Socket Mode need a brokered
+- Discord, Slack, IRC, Signal, WhatsApp, Google Chat, Teams, iMessage and
+  webhooks. Discord's gateway and Slack's Socket Mode need a brokered
   WebSocket connection, which the broker does not offer yet.
 - Attachments, edits, reactions and group mention handling; only text
   messages are read.
-- A persisted poll offset for exactly-once delivery across restarts.
+- A persisted poll offset or sync token for exactly-once delivery across
+  restarts.
+- Matrix end-to-end encryption, homeserver discovery through
+  `.well-known/matrix/client`, and password sign-in (the user supplies an
+  access token).
