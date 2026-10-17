@@ -284,6 +284,70 @@ async fn extension_smoke(app: &App) -> Result<()> {
         !capture(app.command(&panel)).await?.status.success(),
         "revoking a grant had no effect"
     );
+    installed_extension_smoke(app, &project, &body).await
+}
+
+/// A third-party package over the wire: it arrives disabled, runs once the
+/// user enables and grants it, and is gone after uninstalling.
+async fn installed_extension_smoke(app: &App, project: &str, body: &str) -> Result<()> {
+    let bundled = "agent206.workspace";
+    let id = format!("test.{}", uuid::Uuid::new_v4().simple());
+    let package = tempfile::tempdir()?;
+    let (manifest, module) = (
+        package.path().join("plugin.toml"),
+        package.path().join("module.wasm"),
+    );
+    std::fs::write(
+        &manifest,
+        include_str!("../../../plugins/workspace/plugin.toml").replacen(
+            &format!("id = \"{bundled}\""),
+            &format!("id = \"{id}\""),
+            1,
+        ),
+    )?;
+    let builtin = a206_extensions::builtin(bundled)?.context("bundled workspace extension")?;
+    std::fs::write(&module, builtin.wasm)?;
+    let install = [
+        "extension",
+        "install",
+        manifest.to_str().context("manifest path")?,
+        module.to_str().context("module path")?,
+    ];
+    let Reply::Extension(summary) = toml::from_str(&app.cli(&install).await?)? else {
+        anyhow::bail!("expected the installed extension");
+    };
+    ensure!(
+        summary.id == id && !summary.enabled && summary.granted.is_empty(),
+        "an installed extension arrived usable: {summary:?}"
+    );
+    let read = [
+        "extension",
+        "tool",
+        &id,
+        "read_text_file",
+        "--project",
+        project,
+        "--args",
+        "path = \"notes.txt\"",
+    ];
+    ensure!(
+        !capture(app.command(&read)).await?.status.success(),
+        "a disabled installed extension ran"
+    );
+    app.cli(&["extension", "enable", &id]).await?;
+    app.cli(&["extension", "grant", &id, "--capability", "read_workspace"])
+        .await?;
+    ensure!(
+        app.cli(&read).await?.trim() == body,
+        "the installed extension's output did not round-trip"
+    );
+    app.cli(&["extension", "uninstall", &id]).await?;
+    let gone = capture(app.command(&read)).await?;
+    ensure!(
+        !gone.status.success() && String::from_utf8_lossy(&gone.stderr).contains("not installed"),
+        "an uninstalled extension still ran: {}",
+        String::from_utf8_lossy(&gone.stderr)
+    );
     Ok(())
 }
 

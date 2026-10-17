@@ -10,7 +10,7 @@
 //! what the tool or panel declares.
 use crate::store::{StatePut, StateQuota, Store, StoreError};
 use a206_core::{
-    Capability, ErrorKind, ErrorReport, PluginSummary,
+    Capability, ErrorKind, ErrorReport, PluginSource, PluginSummary,
     extension::{Args, ToolOutput, ToolSpec, UiEvent, View},
 };
 use a206_extensions::{
@@ -55,6 +55,16 @@ pub enum ExtensionError {
     Disabled(String),
     #[error("the bundled extensions are invalid")]
     Builtins(#[source] ManifestError),
+    #[error(transparent)]
+    Package(#[from] packages::PackageError),
+    #[error("\"{0}\" is bundled with Agent 206; disable it instead")]
+    Bundled(String),
+    #[error("\"{0}\" was updated as it started; try again")]
+    Updated(String),
+    #[error("could not record the extension")]
+    Store(#[from] StoreError),
+    #[error("the extension install task failed")]
+    Join(#[source] tokio::task::JoinError),
     #[error(transparent)]
     Call(#[from] ArgError),
     #[error("\"{extension}\" needs the \"{}\" permission", capability.label())]
@@ -105,7 +115,11 @@ impl crate::error::Classified for ExtensionError {
             Self::Disabled(_) | Self::NotGranted { .. } | Self::OutOfScope { .. } => {
                 ErrorKind::PermissionDenied
             }
-            Self::NoProject => ErrorKind::InvalidRequest,
+            Self::NoProject | Self::Bundled(_) => ErrorKind::InvalidRequest,
+            Self::Package(error) => return classify(error),
+            Self::Store(error) => return classify(error),
+            Self::Join(_) => ErrorKind::Internal,
+            Self::Updated(_) => ErrorKind::Conflict,
             Self::Builtins(_) | Self::Poisoned | Self::CurrentExe(_) => ErrorKind::Internal,
             Self::Confine(error) => return classify(error),
             Self::Spawn(_) | Self::Channel(_) | Self::Exited => ErrorKind::Unavailable,
@@ -164,17 +178,52 @@ pub struct ExtensionTools {
 pub struct ExtensionHost {
     store: Arc<Mutex<Store>>,
     net: Arc<dyn crate::network::Net>,
-    /// Passed to unconfined workers; a Linux worker gets an empty one instead.
-    #[cfg_attr(target_os = "linux", allow(dead_code))]
+    /// Holds installed packages. Passed to unconfined workers; a Linux worker
+    /// gets an empty one instead.
     data_dir: PathBuf,
+    /// Serializes changes to the package store.
+    packages: Arc<Mutex<()>>,
+}
+/// An extension's validated manifest, with its module when it is installed
+/// rather than bundled.
+struct Loaded {
+    manifest: Manifest,
+    module: Option<Vec<u8>>,
+    /// The recorded source this was loaded from.
+    source: PluginSource,
 }
 impl ExtensionHost {
     pub fn new(store: Arc<Mutex<Store>>, data_dir: PathBuf) -> Self {
-        Self {
+        let host = Self {
             store,
             net: Arc::new(crate::network::Internet),
             data_dir,
+            packages: Arc::default(),
+        };
+        if let Err(error) = host.prune() {
+            // Leftover files only take space; the next start tries again.
+            tracing::warn!(
+                error = &error as &dyn std::error::Error,
+                "could not prune extension packages"
+            );
         }
+        host
+    }
+    /// Remove package files that no installed extension records.
+    fn prune(&self) -> Result<(), ExtensionError> {
+        let _serial = self.packages.lock().map_err(|_| ExtensionError::Poisoned)?;
+        let keep = self
+            .plugins()?
+            .into_iter()
+            .filter_map(|plugin| match plugin.source {
+                PluginSource::Installed { digest } => Some(digest),
+                PluginSource::Bundled => None,
+            })
+            .collect();
+        Ok(packages::prune(
+            &packages::directory(&self.data_dir),
+            &keep,
+        )?)
     }
 
     /// Tools of enabled extensions whose declared capabilities the user has
@@ -210,8 +259,9 @@ impl ExtensionHost {
             .into_iter()
             .filter(|plugin| plugin.enabled && plugin.id != crate::skill_tool::EXTENSION)
             .map(|plugin| {
-                let tools = self.manifest(&plugin.id).map(|manifest| {
-                    manifest
+                let tools = self.load(&plugin.id).map(|loaded| {
+                    loaded
+                        .manifest
                         .tools
                         .into_iter()
                         .filter(|tool| tool.capabilities.is_subset(&plugin.granted))
@@ -238,17 +288,15 @@ impl ExtensionHost {
         args: Args,
         scope: Scope,
     ) -> Result<ToolOutput, ExtensionError> {
-        let manifest = self.manifest(extension)?;
-        let spec = manifest.tool(tool)?;
+        let loaded = self.load(extension)?;
+        let spec = loaded.manifest.tool(tool)?;
         a206_extensions::check_args(spec, &args)?;
         let call = Call::Tool {
             name: tool.into(),
             args,
         };
-        match self
-            .invoke(&manifest, &spec.capabilities, call, scope)
-            .await?
-        {
+        let declared = spec.capabilities.clone();
+        match self.invoke(loaded, &declared, call, scope).await? {
             Outcome::Tool(output) => Ok(output),
             _ => Err(ExtensionError::Unexpected),
         }
@@ -262,16 +310,14 @@ impl ExtensionHost {
         event: Option<UiEvent>,
         scope: Scope,
     ) -> Result<View, ExtensionError> {
-        let manifest = self.manifest(extension)?;
-        let spec = manifest.panel(panel)?;
+        let loaded = self.load(extension)?;
+        let spec = loaded.manifest.panel(panel)?;
         let call = Call::Panel {
             id: panel.into(),
             event,
         };
-        match self
-            .invoke(&manifest, &spec.capabilities, call, scope)
-            .await?
-        {
+        let declared = spec.capabilities.clone();
+        match self.invoke(loaded, &declared, call, scope).await? {
             Outcome::Panel(view) => Ok(view),
             _ => Err(ExtensionError::Unexpected),
         }
@@ -286,25 +332,165 @@ impl ExtensionHost {
             .plugins
             .clone())
     }
-    fn manifest(&self, extension: &str) -> Result<Manifest, ExtensionError> {
-        a206_extensions::builtin(extension)
-            .map_err(ExtensionError::Builtins)?
-            .map(|builtin| builtin.manifest)
-            .ok_or_else(|| ExtensionError::NotInstalled(extension.into()))
+    /// The manifest and module recorded for `extension`. An installed
+    /// package is verified against its digest on every load.
+    fn load(&self, extension: &str) -> Result<Loaded, ExtensionError> {
+        let not_installed = || ExtensionError::NotInstalled(extension.into());
+        let plugin = self
+            .plugins()?
+            .into_iter()
+            .find(|p| p.id == extension)
+            .ok_or_else(not_installed)?;
+        match plugin.source {
+            PluginSource::Bundled => a206_extensions::builtin(extension)
+                .map_err(ExtensionError::Builtins)?
+                .map(|builtin| Loaded {
+                    manifest: builtin.manifest,
+                    module: None,
+                    source: PluginSource::Bundled,
+                })
+                .ok_or_else(not_installed),
+            PluginSource::Installed { digest } => {
+                let package =
+                    packages::load(&packages::directory(&self.data_dir), extension, &digest)?;
+                Ok(Loaded {
+                    manifest: package.manifest,
+                    module: Some(package.module),
+                    source: PluginSource::Installed { digest },
+                })
+            }
+        }
+    }
+
+    /// Install or update a third-party package (user operation). It arrives
+    /// disabled; an update keeps only the grants its new manifest requests.
+    /// Installing the package already installed changes nothing, apart from
+    /// restoring its stored copy if that was altered.
+    pub async fn install(
+        &self,
+        manifest: String,
+        module: Vec<u8>,
+    ) -> Result<PluginSummary, ExtensionError> {
+        let package = packages::prepare(manifest, module)?;
+        let host = self.clone();
+        tokio::task::spawn_blocking(move || host.install_blocking(package))
+            .await
+            .map_err(ExtensionError::Join)?
+    }
+    fn install_blocking(
+        &self,
+        package: packages::Package,
+    ) -> Result<PluginSummary, ExtensionError> {
+        let _serial = self.packages.lock().map_err(|_| ExtensionError::Poisoned)?;
+        let dir = packages::directory(&self.data_dir);
+        let created = packages::store(&dir, &package)?;
+        // A package directory this install created is removed again if the
+        // install is not recorded; nothing else refers to it.
+        let discard = |error: ExtensionError| {
+            if created && let Err(cleanup) = packages::remove(&dir, &package.digest) {
+                tracing::warn!(error = &cleanup as &dyn std::error::Error, extension = %package.manifest.id, "could not remove an unrecorded extension package");
+            }
+            error
+        };
+        let id = package.manifest.id.clone();
+        let mut store = self
+            .store
+            .lock()
+            .map_err(|_| discard(ExtensionError::Poisoned))?;
+        let plugins = &mut store.state.plugins;
+        let previous = plugins.iter().position(|p| p.id == id);
+        let installed = PluginSource::Installed {
+            digest: package.digest.clone(),
+        };
+        let granted = match previous.map(|index| &plugins[index]) {
+            // Unreachable while bundled ids keep the reserved prefix.
+            Some(plugin) if plugin.source == PluginSource::Bundled => {
+                return Err(discard(ExtensionError::Bundled(id)));
+            }
+            // The same package again: nothing the user reviewed changed.
+            Some(plugin) if plugin.source == installed => return Ok(plugin.clone()),
+            Some(plugin) => plugin.granted.clone(),
+            None => BTreeSet::new(),
+        };
+        let mut summary = package.manifest.summary(false, &granted);
+        summary.source = installed;
+        let replaced = match previous {
+            Some(index) => Some(std::mem::replace(&mut plugins[index], summary.clone())),
+            None => {
+                plugins.push(summary.clone());
+                None
+            }
+        };
+        // A refused persist restores the earlier state.
+        store
+            .persist(Some(a206_core::EventKind::ExtensionChanged {
+                id: id.clone(),
+            }))
+            .map_err(|error| discard(error.into()))?;
+        drop(store);
+        if let Some(PluginSource::Installed { digest }) = replaced.map(|p| p.source)
+            && let Err(error) = packages::remove(&dir, &digest)
+        {
+            // The new package is recorded; the leftover copy is pruned at the
+            // next start.
+            tracing::warn!(error = &error as &dyn std::error::Error, extension = %id, "could not remove the replaced extension package");
+        }
+        Ok(summary)
+    }
+
+    /// Remove an installed extension, its stored state and its package.
+    pub async fn uninstall(&self, extension: String) -> Result<(), ExtensionError> {
+        let host = self.clone();
+        tokio::task::spawn_blocking(move || host.uninstall_blocking(&extension))
+            .await
+            .map_err(ExtensionError::Join)?
+    }
+    fn uninstall_blocking(&self, extension: &str) -> Result<(), ExtensionError> {
+        let _serial = self.packages.lock().map_err(|_| ExtensionError::Poisoned)?;
+        let mut store = self.store.lock().map_err(|_| ExtensionError::Poisoned)?;
+        let index = store
+            .state
+            .plugins
+            .iter()
+            .position(|p| p.id == extension)
+            .ok_or_else(|| ExtensionError::NotInstalled(extension.into()))?;
+        let PluginSource::Installed { digest } = store.state.plugins[index].source.clone() else {
+            return Err(ExtensionError::Bundled(extension.into()));
+        };
+        // State first: if recording the removal then fails, the extension is
+        // still listed and uninstalling again finishes the job.
+        store.clear_extension_state(extension)?;
+        store.state.plugins.remove(index);
+        store.persist(Some(a206_core::EventKind::ExtensionChanged {
+            id: extension.into(),
+        }))?;
+        drop(store);
+        // On failure the files are no longer recorded and are pruned at the
+        // next start; the error says so.
+        packages::remove(&packages::directory(&self.data_dir), &digest)?;
+        Ok(())
     }
 
     async fn invoke(
         &self,
-        manifest: &Manifest,
+        loaded: Loaded,
         declared: &BTreeSet<Capability>,
         call: Call,
         scope: Scope,
     ) -> Result<Outcome, ExtensionError> {
+        let Loaded {
+            manifest,
+            module,
+            source,
+        } = loaded;
         let plugin = self
             .plugins()?
             .into_iter()
             .find(|p| p.id == manifest.id)
             .ok_or_else(|| ExtensionError::NotInstalled(manifest.id.clone()))?;
+        if plugin.source != source {
+            return Err(ExtensionError::Updated(manifest.name.clone()));
+        }
         if !plugin.enabled {
             return Err(ExtensionError::Disabled(manifest.id.clone()));
         }
@@ -342,11 +528,13 @@ impl ExtensionHost {
             store: Arc::clone(&self.store),
             hosts: manifest.hosts.clone(),
             net: Arc::clone(&self.net),
+            source,
             logs: 0,
             last_failure: None,
         };
         let start = Start {
             extension: manifest.id.clone(),
+            module: module.map(serde_bytes::ByteBuf::from),
             invocation: Invocation { abi: ABI, call },
             limits: Limits::default(),
         };
@@ -486,6 +674,8 @@ struct HostCalls {
     /// The manifest's network destinations.
     hosts: Vec<String>,
     net: Arc<dyn crate::network::Net>,
+    /// The package this invocation runs; calls stop once it is replaced.
+    source: PluginSource,
     logs: u32,
     last_failure: Option<HostFailure>,
 }
@@ -510,7 +700,8 @@ impl HostCalls {
         name: &str,
         arguments: serde_json::Map<String, serde_json::Value>,
     ) -> Result<HostReply, HostFailure> {
-        if self.extension != crate::skill_tool::EXTENSION {
+        // Only the bundled module itself, never a package installed under any id.
+        if self.extension != crate::skill_tool::EXTENSION || self.source != PluginSource::Bundled {
             return Err(failure(
                 HostErrorCode::Denied,
                 "skill reads are restricted to the skills builtin",
@@ -565,6 +756,7 @@ impl HostCalls {
         let required = a206_extensions::required_capability(&request);
         let allowed = self.lock()?.state.plugins.iter().any(|p| {
             p.id == self.extension
+                && p.source == self.source
                 && p.enabled
                 && required.is_none_or(|c| p.granted.contains(&c) && self.effective.contains(&c))
         });
@@ -771,6 +963,7 @@ impl Drop for Interrupt {
 }
 mod fetch;
 mod git;
+pub mod packages;
 mod workspace;
 
 #[cfg(test)]

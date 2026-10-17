@@ -182,6 +182,7 @@ impl Manifest {
             tools: self.tools.clone(),
             panels: self.panels.clone(),
             hosts: self.hosts.clone(),
+            source: Default::default(),
         }
     }
 }

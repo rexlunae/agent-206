@@ -15,8 +15,11 @@ use std::io::{Read, Write};
 /// What the parent asks the worker to run.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Start {
-    /// A bundled extension id. Installed packages will add a digest-pinned source.
+    /// The extension id: a bundled one when `module` is `None`.
     pub extension: String,
+    /// An installed extension's module, verified against its pinned digest by
+    /// the gateway. The worker has no access to the gateway's files.
+    pub module: Option<serde_bytes::ByteBuf>,
     pub invocation: Invocation,
     pub limits: Limits,
 }
@@ -86,13 +89,17 @@ pub fn serve<R: Read + 'static, W: Write + 'static>(
     output: W,
 ) -> Result<W, WorkerError> {
     let start: Start = read_frame(&mut input).map_err(WorkerError::Start)?;
-    let builtin = crate::builtin(&start.extension)
-        .map_err(RunError::Builtins)
-        .and_then(|builtin| builtin.ok_or_else(|| RunError::Unknown(start.extension.clone())));
-    let (result, mut pipe) = match builtin {
-        Ok(builtin) => {
+    let module = match &start.module {
+        Some(module) => Ok(module.as_slice()),
+        None => crate::builtin(&start.extension)
+            .map_err(RunError::Builtins)
+            .and_then(|builtin| builtin.ok_or_else(|| RunError::Unknown(start.extension.clone())))
+            .map(|builtin| builtin.wasm),
+    };
+    let (result, mut pipe) = match module {
+        Ok(wasm) => {
             let (result, pipe) = engine::run(
-                builtin.wasm,
+                wasm,
                 &start.invocation,
                 start.limits,
                 Pipe { input, output },
