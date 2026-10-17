@@ -113,8 +113,12 @@ impl Profile<'_> {
             NetworkAccess::Proxy(port) => rule(format!(
                 "(allow network-outbound (remote ip \"localhost:{port}\"))\n"
             )),
+            // IP networks and the system resolver only: a blanket
+            // network-outbound would also reach every filesystem socket on
+            // the host, which the Linux mount view keeps out of sight.
             NetworkAccess::Host => rule(
-                r#"(allow network-outbound)
+                r#"(allow network-outbound (remote ip "*:*"))
+(allow network-outbound (remote unix-socket (path-literal "/private/var/run/mDNSResponder")))
 (allow system-socket)
 (allow mach-lookup (global-name "com.apple.dnssd.service") (global-name "com.apple.SystemConfiguration.configd") (global-name "com.apple.trustd.agent"))
 (allow file-read* (subpath "/private/etc/ssl") (literal "/private/etc/resolv.conf") (literal "/private/etc/hosts") (literal "/private/etc/services") (literal "/private/etc/protocols"))
@@ -283,7 +287,11 @@ mod tests {
         assert!(proxy.contains("(allow network-outbound (remote ip \"localhost:4242\"))"));
         assert!(!proxy.contains("(allow network-outbound)\n"));
         let host = with(NetworkAccess::Host);
-        assert!(host.contains("(allow network-outbound)\n"));
+        assert!(host.contains("(allow network-outbound (remote ip \"*:*\"))"));
+        assert!(
+            !host.contains("(allow network-outbound)"),
+            "the host network grant must not cover filesystem sockets"
+        );
         assert!(host.contains("com.apple.dnssd.service"));
     }
 

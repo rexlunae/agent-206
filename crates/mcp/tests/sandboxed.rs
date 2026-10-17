@@ -187,6 +187,18 @@ async fn network_and_programs_follow_their_grants() {
         call(&session, "connect", "address", &address).await,
         Ok("connected".into())
     );
+    // Network means IP networks: local services listening on filesystem
+    // sockets (container engines, agents, databases) stay out of reach.
+    let sockets = tempfile::tempdir().unwrap();
+    let socket = sockets.path().join("s");
+    let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    std::os::unix::net::UnixStream::connect(&socket).unwrap();
+    assert!(
+        call(&session, "connect_socket", "path", path(&socket))
+            .await
+            .is_err(),
+        "a server with Network must not reach host Unix sockets"
+    );
     // `sh` with no input exits successfully.
     assert_eq!(
         call(&session, "run", "program", program).await,

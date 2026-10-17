@@ -401,6 +401,9 @@ impl Gateway {
         let extension_tools: Arc<dyn crate::tools::ToolHost> = Arc::new(
             crate::extension_tools::ExtensionToolHost::new(extensions.clone()),
         );
+        // Proposing grants nothing; installing a proposal is a user operation.
+        let propose_tools: Arc<dyn crate::tools::ToolHost> =
+            Arc::new(crate::propose_tool::ProposeHost::new(extensions.clone()));
         // So are tools of enabled MCP servers the conversation may use. The
         // host holds only the MCP client, not this gateway.
         let mcp = McpClient::new(store.clone());
@@ -431,6 +434,7 @@ impl Gateway {
                 Arc::new(crate::exec_tool::ExecHost::new(root)),
                 Arc::new(crate::prompt_tool::PromptHost::new(prompts.clone())),
                 skill_tools,
+                propose_tools,
             ]),
             approvals: Arc::new(Mutex::new(BTreeMap::new())),
             prompts,
@@ -1508,6 +1512,15 @@ impl Gateway {
             Command::SetJobEnabled { id, enabled } => self.set_job_enabled(id, enabled),
             Command::RemoveJob { id } => self.remove_job(id),
             Command::RunJob { id } => self.run_job(id),
+            Command::InstallProposal { digest } => {
+                let summary = self.extensions.install_proposal(digest).await?;
+                self.policy_changed();
+                Ok(Reply::Extension(Box::new(summary)))
+            }
+            Command::DismissProposal { digest } => {
+                self.extensions.dismiss_proposal(digest).await?;
+                Ok(Reply::Ok)
+            }
             Command::Skills => Ok(Reply::Skills(self.skills()?)),
             Command::ReadSkill { name } => Ok(Reply::Skill(self.read_skill(&name)?)),
             Command::SetSkillEnabled {

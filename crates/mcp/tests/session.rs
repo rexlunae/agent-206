@@ -26,6 +26,7 @@ async fn lists_and_calls_tools() {
         names,
         [
             "connect",
+            "connect_socket",
             "echo",
             "exit",
             "flood",

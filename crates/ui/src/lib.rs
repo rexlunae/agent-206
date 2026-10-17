@@ -129,6 +129,7 @@ fn empty_snapshot() -> Snapshot {
         managed_joshua_provider: None,
         mcp_servers: vec![],
         jobs: vec![],
+        extension_proposals: vec![],
     }
 }
 /// Send a command; a gateway-reported failure arrives as `Err` with its causes.

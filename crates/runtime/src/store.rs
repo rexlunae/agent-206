@@ -117,6 +117,7 @@ impl Store {
                 messengers: vec![],
                 mcp_servers: vec![],
                 jobs: vec![],
+                extension_proposals: vec![],
             }
         };
         let mut store = Self {

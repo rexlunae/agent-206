@@ -502,6 +502,7 @@ mod tests {
             messengers: vec![],
             mcp_servers: vec![],
             jobs: vec![],
+            extension_proposals: vec![],
             last_event: 0,
             managed_joshua_provider: None,
         }
