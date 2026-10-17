@@ -411,11 +411,12 @@ pub async fn drives_both_agent_protocols_in_the_real_os_sandbox() {
         )
         .await;
         let actor = gateway.clone();
+        let id = thread.id;
         let job = tokio::spawn(async move {
             command(
                 &actor,
                 Command::Send {
-                    thread: thread.id,
+                    thread: id,
                     text: behavior.into(),
                     attachments: vec![],
                 },

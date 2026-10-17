@@ -216,6 +216,76 @@ fn long_files_are_cut_to_fit_the_outcome_limit() {
 }
 
 #[test]
+fn write_tool_creates_parents_then_writes() {
+    let (dir, file, text) = (unique("dir"), unique("file"), unique("text"));
+    let path = format!("{dir}/{file}");
+    let (bridge, seen) = mock(|_| HostReply::Done);
+    let (outcome, _) = engine::run(
+        workspace().wasm,
+        &tool(
+            "write_text_file",
+            &[
+                ("path", Value::Str(path.clone())),
+                ("text", Value::Str(text.clone())),
+            ],
+        ),
+        Limits::default(),
+        bridge,
+    );
+    assert!(matches!(outcome, Ok(Outcome::Tool(_))), "{outcome:?}");
+    assert_eq!(
+        *seen.borrow(),
+        vec![
+            HostRequest::CreateDirectory { path: dir },
+            HostRequest::WriteFile {
+                path,
+                contents: text.into_bytes().into(),
+                overwrite: false,
+            },
+        ]
+    );
+}
+
+#[test]
+fn search_tool_reports_matches_and_truncation() {
+    let (path, text, query) = (unique("src/f"), unique("line"), unique("q"));
+    let reply = SearchResult {
+        matches: vec![SearchMatch {
+            path: path.clone(),
+            line: 7,
+            text: text.clone(),
+        }],
+        truncated: true,
+    };
+    let (bridge, seen) = mock(move |_| HostReply::Matches(reply.clone()));
+    let (outcome, _) = engine::run(
+        workspace().wasm,
+        &tool(
+            "search_text",
+            &[
+                ("query", Value::Str(query.clone())),
+                ("max_matches", Value::Int(9000)),
+            ],
+        ),
+        Limits::default(),
+        bridge,
+    );
+    let Ok(Outcome::Tool(output)) = outcome else {
+        panic!("expected tool output, got {outcome:?}");
+    };
+    assert!(output.text.starts_with(&format!("{path}:7: {text}\n")));
+    assert!(output.text.contains("limit"));
+    assert_eq!(
+        *seen.borrow(),
+        vec![HostRequest::Search {
+            path: ".".into(),
+            query,
+            max_matches: 500,
+        }]
+    );
+}
+
+#[test]
 fn budgets_stop_the_guest() {
     let reply = |_: &HostRequest| HostReply::Directory(vec![]);
     let (fuel, _) = engine::run(

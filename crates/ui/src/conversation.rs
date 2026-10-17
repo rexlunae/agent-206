@@ -191,8 +191,9 @@ fn Conversation(thread: Thread) -> Element {
             })
         })
         .unwrap_or_else(|| "Balance —".into());
+    // Cost is the whole run's: every model request it made.
     let cost_label = thread
-        .usage
+        .run_usage
         .as_ref()
         .and_then(|u| u.cost)
         .map(|v| format!("Cost {v:.4}"))
@@ -243,10 +244,12 @@ fn Conversation(thread: Thread) -> Element {
                         author: rsx! { match message.role { Role::User => "You", Role::Assistant => message.backend.label(), Role::System => "System", Role::Tool => "Tool" } },
                         p { class: "a206-message-text", "{message.text}" }
                         for file in &message.attachments { Badge { Icon { name: IconName::File, size: IconSize::Sm } "{file.name} · {file.text.len()} B" } }
+                        for call in &message.tool_calls { crate::tools::ToolTrace { key: "{call.id}", call: call.clone() } }
                     }
                 }
             } }
             }
+            for request in &thread.approvals { crate::tools::PendingApproval { key: "{request.id}", thread: id, request: request.clone() } }
             if running { AgentStatus { state: Lifecycle::Running, label: rsx! { {thread.backend_activity.clone().unwrap_or_else(|| format!("{} is working…", thread.backend.label()))} } } }
             if let Some(report) = thread.error.clone().filter(|_| !running && thread.state == RunState::Failed) {
                 crate::error::ErrorNotice { report, title: "Run failed".to_string() }
@@ -367,6 +370,10 @@ fn Inspector(thread: Thread) -> Element {
         h3 { "Conversation details" }
         ThreadFacts { thread: thread.clone() }
         BackendControls { thread: thread.clone() }
+        if thread.backend == CodingBackend::Native {
+            Divider {}
+            crate::tools::ToolPermissions { thread: id }
+        }
         Divider {}
         h3 { "Subagent models" }
         p { class: "a206-muted", "Choose which models this conversation may delegate to." }
@@ -518,7 +525,12 @@ fn ThreadFacts(thread: Thread) -> Element {
     let limit = model.and_then(|m| m.context_limit);
     let input = thread.usage.as_ref().and_then(|u| u.input_tokens);
     let output = thread.usage.as_ref().and_then(|u| u.output_tokens);
-    let cost = thread.usage.as_ref().and_then(|u| u.cost);
+    let run = thread.run_usage.as_ref();
+    let (run_input, run_output) = (
+        run.and_then(|u| u.input_tokens),
+        run.and_then(|u| u.output_tokens),
+    );
+    let cost = run.and_then(|u| u.cost);
     let pct = limit
         .zip(input)
         .and_then(|(limit, used)| (limit > 0).then_some(used as f64 / limit as f64 * 100.0));
@@ -543,8 +555,9 @@ fn ThreadFacts(thread: Thread) -> Element {
             dt { "Context used" } dd { {pct.map(|p| format!("{p:.1}%")).unwrap_or_else(|| "Not reported".into())} }
             dt { "Context limit" } dd { "{number(limit)}" }
             dt { "Output limit" } dd { "{number(model.and_then(|m| m.output_limit))}" }
-            dt { "Input / output" } dd { "{number(input)} / {number(output)}" }
-            dt { "Response cost" } dd { {cost.map(|c| format!("{c:.6}")).unwrap_or_else(|| "Not reported".into())} }
+            dt { "Last request input / output" } dd { "{number(input)} / {number(output)}" }
+            dt { "Run input / output" } dd { "{number(run_input)} / {number(run_output)}" }
+            dt { "Run cost" } dd { {cost.map(|c| format!("{c:.6}")).unwrap_or_else(|| "Not reported".into())} }
             dt { "Input / output rate" } dd { "{price(model.and_then(|m| m.input_cost_per_token))} / {price(model.and_then(|m| m.output_cost_per_token))}" }
             dt { "Account balance" } dd { {catalog.and_then(|c| c.balance.map(|v| format!("{v:.4} {}", c.balance_currency.as_deref().unwrap_or("provider units")))).unwrap_or_else(|| "Not reported".into())} }
             dt { "Token balance" } dd { "{number(catalog.and_then(|c| c.token_balance))}" }

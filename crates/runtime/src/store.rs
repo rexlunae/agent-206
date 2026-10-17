@@ -50,6 +50,8 @@ impl crate::error::Classified for StoreError {
     }
 }
 type Result<T, E = StoreError> = std::result::Result<T, E>;
+/// Largest snapshot kept: one frame, less room for the envelope it travels in.
+const LIMIT: usize = a206_protocol::MAX_FRAME - 65_536;
 
 /// Open the single profile lock used by both startup and offline stop intent.
 pub(crate) fn profile_lock(root: &Path) -> std::io::Result<std::fs::File> {
@@ -112,6 +114,7 @@ impl Store {
                 plugins: vec![],
                 last_event: 0,
                 managed_joshua_provider: None,
+                messengers: vec![],
                 mcp_servers: vec![],
             }
         };
@@ -140,6 +143,19 @@ impl Store {
             })
             .collect();
         for thread in &mut store.state.threads {
+            // No run survives a restart, so neither do its approvals or calls.
+            thread.approvals.clear();
+            for call in thread.messages.iter_mut().flat_map(|m| &mut m.tool_calls) {
+                if !call.state.is_final() {
+                    let report = a206_core::ErrorReport::new(
+                        a206_core::ErrorKind::Unavailable,
+                        "The gateway restarted before this tool call finished.",
+                    );
+                    call.state = a206_core::ToolCallState::Cancelled;
+                    call.output = Some(report.detail());
+                    call.error = Some(report);
+                }
+            }
             if thread.state == RunState::Running {
                 thread.state = RunState::Failed;
                 thread.error = Some(a206_core::ErrorReport::new(
@@ -179,8 +195,13 @@ impl Store {
         }
         result
     }
+    /// Bytes the snapshot can still grow by before a persist is refused as
+    /// [`StoreError::Full`].
+    pub fn remaining(&self) -> Result<usize> {
+        Ok(LIMIT.saturating_sub(rmp_serde::to_vec_named(&self.state)?.len() + 1))
+    }
     fn persist_inner(&mut self, kind: Option<EventKind>) -> Result<()> {
-        if rmp_serde::to_vec_named(&self.state)?.len() >= a206_protocol::MAX_FRAME - 65_536 {
+        if rmp_serde::to_vec_named(&self.state)?.len() >= LIMIT {
             return Err(StoreError::Full);
         }
         let tx = self.db.transaction()?;
@@ -365,6 +386,60 @@ mod tests {
         assert_eq!(restored.state.settings.providers, vec![user]);
         assert!(restored.state.managed_joshua_provider.is_none());
         assert_eq!(restored.state.settings.revision, 1);
+    }
+    #[test]
+    fn restart_expires_approvals_and_cancels_unfinished_tool_calls() {
+        use a206_core::{ApprovalRequest, Message, Mode, Role, Thread, ToolCall, ToolCallState};
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = Store::open(directory.path()).unwrap();
+        let mut thread = Thread::new(Id::new_v4().to_string(), Mode::Chat);
+        let mut message = Message::new(Role::Assistant, String::new(), 0, thread.backend);
+        let call = |state| ToolCall {
+            id: Id::new_v4().to_string(),
+            generated_id: false,
+            tool: Id::new_v4().simple().to_string(),
+            arguments: "{}".into(),
+            digest: Id::new_v4().to_string(),
+            healed: false,
+            state,
+            output: None,
+            error: None,
+            signature: None,
+        };
+        message.tool_calls = vec![
+            call(ToolCallState::AwaitingApproval),
+            call(ToolCallState::Succeeded),
+        ];
+        let pending = &message.tool_calls[0];
+        thread.approvals.push(ApprovalRequest {
+            id: Id::new_v4(),
+            message: message.id,
+            call: pending.id.clone(),
+            tool: pending.tool.clone(),
+            arguments: pending.arguments.clone(),
+            digest: pending.digest.clone(),
+            capabilities: Default::default(),
+            requested_at: 0,
+        });
+        thread.messages.push(message);
+        thread.state = RunState::Running;
+        let id = thread.id;
+        store.state.threads.push(thread);
+        store.persist(None).unwrap();
+        drop(store);
+        let restored = Store::open(directory.path()).unwrap();
+        let thread = restored.thread(id).unwrap();
+        assert!(thread.approvals.is_empty());
+        let states: Vec<_> = thread.messages[0]
+            .tool_calls
+            .iter()
+            .map(|c| c.state)
+            .collect();
+        assert_eq!(
+            states,
+            vec![ToolCallState::Cancelled, ToolCallState::Succeeded]
+        );
+        assert!(thread.messages[0].tool_calls[0].error.is_some());
     }
     #[test]
     fn pending_replays_reference_their_request() {

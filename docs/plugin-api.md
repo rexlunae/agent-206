@@ -13,9 +13,9 @@ only reach. Without bubblewrap or Landlock, calls fail rather than run unconfine
 
 Agent 206 bundles `agent206.workspace` (`plugins/workspace`), written in Rust
 against the guest SDK and compiled to WASM by `crates/extensions/build.rs`. It
-offers the `list_directory` and `read_text_file` tools (text past 192 KiB is
-cut with a notice) and an `overview`
-panel. User-installed and agent-prepared packages are not implemented yet: the
+offers the `list_directory`, `read_text_file` (text past 192 KiB is cut with a
+notice), `search_text`, `write_text_file` and `edit_text_file` tools and an
+`overview` panel. The write tools need a separate `write_workspace` grant. User-installed and agent-prepared packages are not implemented yet: the
 worker only loads bundled modules.
 
 The wire types live in `a206-extension-abi`; the guest SDK is
@@ -113,14 +113,21 @@ unsafe operation.
 | --- | --- | --- | --- |
 | `read_file { path }` | `read_workspace` + a project | file bytes | 512 KiB, regular files only (opened without blocking) |
 | `list_directory { path }` | `read_workspace` + a project | entries (name, kind, size if known) | 1,024 entries |
+| `search { path, query, max_matches }` | `read_workspace` + a project | matches (path, line, text) and whether it stopped early | literal, case-sensitive query of 1 KiB; 500 matches, 5,000 files, 32 MiB read; 10,000 directories, 64 levels; skips `.git`, symlinks, files over 512 KiB and non-UTF-8 files; results in path order |
+| `write_file { path, contents, overwrite }` | `write_workspace` + a project | done | 512 KiB; written to a temporary file first, so readers never see a partial file; a new file is published with a hard link that refuses one created meanwhile, an existing regular file is replaced by rename keeping its permissions; without `overwrite` an existing file is `exists` |
+| `edit_file { path, old, new }` | `write_workspace` + a project | done | UTF-8, 512 KiB; `old` must occur exactly once, else `conflict`; also `conflict` when the file changed or was removed after it was read |
+| `create_directory { path }` | `write_workspace` + a project | done, also when it exists | missing parents are created |
 | `state_get { key }` | nothing | the extension's own value | — |
 | `state_put { key, value }` | nothing | done (`value = None` deletes) | 64 keys, 256 KiB per extension |
 | `log { level, message }` | nothing | done; recorded through tracing | 32 per call, 1 KiB each |
 
 Workspace paths are relative and resolved with cap-std: absolute paths, `..`
-escapes and symlinks that leave the root are refused. A refusal is a typed
+escapes and symlinks that leave the root are refused. Writes also refuse any
+path through `.git` (in any letter case) or through a symlink, and the
+gateway serializes extension writes so an edit cannot interleave with another. A refusal is a typed
 `failed { code, message }` reply (`denied`, `no_workspace`, `not_found`,
-`invalid`, `too_large`, `budget`, `unsupported`, `io`); messages never contain
+`invalid`, `too_large`, `exists`, `conflict`, `budget`, `unsupported`, `io`;
+a host that predates a code sends it as `other`); messages never contain
 host paths. Extension state is stored in the gateway's SQLite database,
 private to each extension id. Extension output is never written to the request
 journal, because it can carry workspace content.
@@ -147,7 +154,7 @@ in app chrome outside the panel, and no panel event can change them.
 | Wall time | 10 seconds per invocation, host calls included |
 | Invocation input | 1 MiB |
 | Outcome | 256 KiB |
-| Host calls | 256 per invocation; requests 128 KiB, replies 1 MiB |
+| Host calls | 256 per invocation; requests and replies 1 MiB |
 
 Exhausted fuel, a trap, a missing export, an ABI violation (out-of-bounds
 pointers, `host_take` without a pending reply, an undecodable request), an
@@ -182,7 +189,7 @@ exists yet. Tool text is extension output, never instructions.
 
 | Domain | Operations | Authority |
 | --- | --- | --- |
-| workspace | Scoped patch, search | `write_workspace`, `read_workspace` |
+| workspace | Multi-hunk patch | `write_workspace` |
 | git | Status, diff, stage, commit | separate read/write capabilities |
 | forge | PRs, reviews, checks, logs | adapter-specific scoped credential handle |
 | network | Fetch through the SSRF guard | `network` + destination |
