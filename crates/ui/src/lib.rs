@@ -1,6 +1,7 @@
 //! Shared desktop/web/terminal application tree, composed with fc-dioxus.
 #![forbid(unsafe_code)]
 mod activity;
+mod audit;
 mod conversation;
 mod error;
 mod extensions;

@@ -46,7 +46,7 @@ invocations and relays gateway-authorized host calls (`a206/docs/plugin-api.md`)
 | LeakDetector on outputs/requests (`security/leak_detector.rs`) | missing | Boundary scanner at gateway egress + extension output |
 | SSRF validator (`security/ssrf.rs`) | partial: public-only, pinned-address fetch for downloads and the extension `fetch` host call, with per-manifest destination lists (`a206/crates/runtime/src/network.rs`) | Reuse `network.rs` for every other network-capable host call |
 | Credential-guard override tool (`tools/guard_override.rs`) | missing (intentionally) | Only a user-approved, scoped exception in the approval surface |
-| Skill security audit (`skill_audit.rs`) | missing | Run on extension/skill packages pre-install |
+| Skill security audit (`skill_audit.rs`) | partial: pattern audit of each `SKILL.md` and of extension and proposal manifest text, shown by line or field before approval on the Extensions page and in the CLI (`a206/crates/audit`); advisory, never blocking. RustyClaw's `oxidized-agentic-audit` was not reused: as a library it prints to stderr, runs `shellcheck`/`semgrep`/`gitleaks` from `PATH` on the untrusted folder, and honours suppressions the package itself ships | Audit skills' supporting files |
 | SSH client pairing, Ed25519 keys, QR (`pairing/*`, `rustyclaw-gateway/src/ssh/server.rs`) | partial: OpenSSH stdio with strict host checks (`a206/crates/runtime/src/transport.rs`); no in-app pairing | Keep RustyClaw's SSH-based gateway protocol (decided 2026-10-16); in-app host-key pairing |
 
 ## Agent loop, tool calling and streaming

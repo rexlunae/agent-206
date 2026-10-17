@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use uuid::Uuid;
 
+pub mod audit;
 pub mod doctor;
 pub mod error;
 pub mod extension;
@@ -11,6 +12,7 @@ pub mod ignore;
 pub mod prompts;
 pub mod search;
 pub mod tools;
+pub use audit::{AuditBuilder, AuditField, AuditFinding, AuditLocation, AuditReport, AuditRule};
 pub use error::{ErrorKind, ErrorReport};
 pub use ignore::Ignore;
 pub use prompts::{AnswerError, PromptAnswer, PromptOutcome, UserPrompt};
@@ -691,6 +693,9 @@ pub struct SkillSummary {
     pub expects_env: Vec<String>,
     /// Why the skill could not be read.
     pub failure: Option<ErrorReport>,
+    /// What the pre-install audit found in `SKILL.md`, for the user's review.
+    #[serde(default)]
+    pub audit: AuditReport,
 }
 /// The exact `SKILL.md` a user reviews, with the digest that approves it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
