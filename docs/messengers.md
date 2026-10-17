@@ -7,7 +7,8 @@ channels are listed in [parity.md](parity.md#messengers--channels).
 ## Configuration
 
 Messengers are `[[messengers]]` entries in the profile settings (TOML through
-`agent206 settings`, or the `agent206 messenger` commands):
+`agent206 settings`, the `agent206 messenger` commands, or the Messengers page
+of the desktop, web and terminal apps):
 
 ```toml
 [[messengers]]
@@ -106,7 +107,6 @@ participant cannot approve their own request.
 
 ## Not yet
 
-- Desktop/TUI settings screens (CLI and TOML only for now).
 - Discord, Slack, Matrix, IRC, Signal, WhatsApp, Google Chat, Teams, iMessage
   and webhooks. Discord's gateway and Slack's Socket Mode need a brokered
   WebSocket connection, which the broker does not offer yet.

@@ -390,31 +390,25 @@ mod native {
         ssh: Option<String>,
         trust: &[String],
     ) -> anyhow::Result<()> {
-        use a206_core::{GatewayConnection, GatewayTarget};
-        use a206_runtime::connection::{self, ConnectionError};
+        use a206_core::{GatewayConnection, GatewayProbe, GatewayTarget};
+        use a206_runtime::connection;
         let target = match ssh {
             Some(endpoint) if !local => {
-                let version = match connection::check_ssh(root, &endpoint).await {
-                    Err(ConnectionError::UnknownHost { .. }) => {
-                        let offered = connection::scan_host_keys(&endpoint).await?;
-                        let accepted: Vec<_> = offered
-                            .iter()
-                            .filter(|key| trust.contains(&key.fingerprint))
-                            .cloned()
-                            .collect();
-                        if accepted.is_empty() {
-                            println!("The host offers these keys:");
-                            for key in &offered {
-                                println!("  {} {}", key.algorithm, key.fingerprint);
-                            }
-                            anyhow::bail!(
-                                "verify a fingerprint with the server's administrator, then rerun with --trust <fingerprint>"
-                            );
+                let mut probe = connection::probe(root, &endpoint).await?;
+                if let GatewayProbe::Unverified { keys } = &probe {
+                    if !keys.iter().any(|key| trust.contains(&key.fingerprint)) {
+                        println!("The host offers these keys:");
+                        for key in keys {
+                            println!("  {} {}", key.algorithm, key.fingerprint);
                         }
-                        connection::trust_host_keys(root, &accepted)?;
-                        connection::check_ssh(root, &endpoint).await?
+                        anyhow::bail!(
+                            "verify a fingerprint with the server's administrator, then rerun with --trust <fingerprint>"
+                        );
                     }
-                    other => other?,
+                    probe = connection::trust_fingerprints(root, &endpoint, trust).await?;
+                }
+                let GatewayProbe::Reachable { version } = probe else {
+                    anyhow::bail!("the host key is still not trusted after recording it");
                 };
                 println!("Remote gateway: {version}");
                 GatewayTarget::Ssh { endpoint }
@@ -606,9 +600,14 @@ mod native {
                     };
                 }
                 if let Action::Web { static_dir, port } = action {
-                    return Ok(
-                        a206_runtime::web::serve(root.clone(), remote()?, static_dir, port).await?,
-                    );
+                    // The bridge offers first-time setup to the browser itself.
+                    return Ok(a206_runtime::web::serve(
+                        root.clone(),
+                        args.remote.clone(),
+                        static_dir,
+                        port,
+                    )
+                    .await?);
                 }
                 let client = a206_runtime::client::Client::start(root.clone(), remote()?);
                 if let Action::Acp { thread } = action {

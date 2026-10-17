@@ -3,6 +3,7 @@ use crate::pages::Gateway;
 use crate::{
     PageFrame, Shell,
     conversation::Workspace as Chat,
+    messengers::Messengers,
     pages::{
         Browser, Conversations, Documents, Downloads, Extensions, Joshua, Overview as Workspace,
         Projects, Security,
@@ -25,6 +26,8 @@ pub(crate) enum Route {
     Projects {},
     #[route("/connections")]
     Providers {},
+    #[route("/messengers")]
+    Messengers {},
     #[route("/downloads")]
     Downloads {},
     #[route("/extensions")]
@@ -54,6 +57,7 @@ impl Route {
             Self::Chat { .. } | Self::Conversations {} => IconName::Sparkles,
             Self::Projects {} => IconName::Folder,
             Self::Providers {} => IconName::Link,
+            Self::Messengers {} => IconName::Send,
             Self::Downloads {} => IconName::Download,
             Self::Extensions {} => IconName::Plus,
             Self::Browser {} => IconName::Globe,
@@ -71,6 +75,7 @@ impl Route {
             Self::Conversations {} => "Conversations",
             Self::Projects {} => "Projects",
             Self::Providers {} => "Connections",
+            Self::Messengers {} => "Messengers",
             Self::Downloads {} => "Downloads",
             Self::Extensions {} => "Extensions",
             Self::Browser {} => "Browser",
@@ -240,6 +245,13 @@ mod tests {
         let mut dom = VirtualDom::new(setup_app);
         dom.provide_root_context(Rc::new(MemoryHistory::default()) as Rc<dyn History>);
         dom.rebuild_in_place();
+        // Let the setup status resource resolve, then render what it shows.
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(dom.wait_for_work());
+        dom.render_immediate(&mut dioxus::dioxus_core::NoOpMutations);
         let html = dioxus_ssr::render(&dom);
         assert!(html.contains("Choose your gateway."));
         assert!(html.contains("This computer"));
@@ -250,11 +262,10 @@ mod tests {
         assert!(html.contains("Keep current gateway"));
     }
 
-    #[component]
-    fn ThreadView() -> Element {
-        let fixture = use_context::<ThreadFixture>();
-        let state = crate::State {
-            data: use_signal(|| fixture.snapshot.clone()),
+    /// Loaded, connected client state showing `snapshot`.
+    fn loaded_state(snapshot: a206_core::Snapshot) -> crate::State {
+        crate::State {
+            data: use_signal(|| snapshot),
             loaded: use_signal(|| true),
             connected: use_signal(|| true),
             gateway: use_signal(|| None),
@@ -266,7 +277,13 @@ mod tests {
             theme: use_signal(|| ThemeChoice::from_design(Design::Helix)),
             setup: use_signal(|| false),
             navigator: navigator(),
-        };
+        }
+    }
+
+    #[component]
+    fn ThreadView() -> Element {
+        let fixture = use_context::<ThreadFixture>();
+        let state = loaded_state(fixture.snapshot.clone());
         use_context_provider(|| state);
         rsx! { Chat { id: fixture.id, split: fixture.split } }
     }
@@ -316,5 +333,67 @@ mod tests {
             ..fixture
         });
         assert_eq!(html.matches("aria-label=\"Message your agent\"").count(), 1);
+    }
+
+    #[derive(Clone, Debug, PartialEq, Routable)]
+    enum MessengerRoute {
+        #[route("/")]
+        MessengerView {},
+    }
+
+    #[component]
+    fn MessengerView() -> Element {
+        let snapshot = use_context::<a206_core::Snapshot>();
+        let state = loaded_state(snapshot);
+        use_context_provider(|| state);
+        rsx! { crate::messengers::Messengers {} }
+    }
+
+    #[test]
+    fn messenger_page_offers_to_allow_only_what_was_refused() {
+        use a206_core::{
+            MessengerConfig, MessengerKind, MessengerState, MessengerStatus, RefusedChat,
+        };
+        let id = || Uuid::new_v4().simple().to_string();
+        let (allowed, other, sender, stranger, credential) = (id(), id(), id(), id(), id());
+        let mut config = MessengerConfig::new(format!("m-{}", id()), MessengerKind::Telegram);
+        config.enabled = true;
+        config.credential = Some(credential.clone());
+        config.allowed_chats.insert(allowed.clone());
+        let refused = |chat: &str, sender: Option<&str>| RefusedChat {
+            chat: chat.to_owned(),
+            sender: sender.map(str::to_owned),
+            title: None,
+            count: 1,
+            last_at: 0,
+        };
+        let mut snapshot = crate::empty_snapshot();
+        snapshot.messengers = vec![MessengerStatus {
+            name: config.name.clone(),
+            state: MessengerState::Failed,
+            refused: vec![
+                refused(&allowed, Some(&sender)),
+                refused(&other, None),
+                // A sender in a chat that is not allowed is not offered.
+                refused(&other, Some(&stranger)),
+            ],
+            ..MessengerStatus::default()
+        }];
+        snapshot.settings.messengers = vec![config.clone()];
+        fn app() -> Element {
+            rsx! { Router::<MessengerRoute> {} }
+        }
+        let mut dom = VirtualDom::new(app);
+        dom.provide_root_context(snapshot);
+        dom.provide_root_context(Rc::new(MemoryHistory::default()) as Rc<dyn History>);
+        dom.rebuild_in_place();
+        let html = dioxus_ssr::render(&dom);
+        assert!(html.contains(&config.name) && html.contains(&credential));
+        assert!(html.contains("Failed"));
+        // One button each in the allow-list editors, plus one per refusal
+        // that allowing would admit.
+        assert_eq!(html.matches(">Allow chat<").count(), 2, "{html}");
+        assert_eq!(html.matches(">Allow sender<").count(), 2, "{html}");
+        assert!(html.contains(&stranger));
     }
 }

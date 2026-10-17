@@ -916,6 +916,61 @@ pub struct HostKey {
     pub entry: String,
 }
 
+/// The outcome of checking an SSH gateway during setup.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GatewayProbe {
+    /// The host key is trusted and the remote reports this `agent206 --version`.
+    Reachable { version: String },
+    /// The host is not in known_hosts; it offers these keys for the user to verify.
+    Unverified { keys: Vec<HostKey> },
+}
+
+/// A client's gateway setup request to the web bridge, which runs SSH and owns
+/// known_hosts on the browser's behalf.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SetupRequest {
+    Status,
+    /// Check an SSH endpoint with strict host key checking.
+    Probe {
+        endpoint: String,
+    },
+    /// Trust the key with this fingerprint, if the host still offers it, then check again.
+    Trust {
+        endpoint: String,
+        fingerprint: String,
+    },
+    /// Verify, save and switch to a gateway.
+    Save {
+        target: GatewayTarget,
+    },
+}
+
+/// What a client needs to show gateway setup.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetupStatus {
+    /// The gateway this client is using now: the saved one, or `--remote`.
+    /// Setup saved by another client takes effect when this one restarts.
+    pub active: Option<GatewayTarget>,
+    /// True when `active` came from `--remote` rather than the saved setup.
+    pub pinned: bool,
+    /// Why no gateway is active, such as a damaged saved setup.
+    pub problem: Option<ErrorReport>,
+}
+impl SetupStatus {
+    /// True until this client has a gateway to use.
+    pub fn required(&self) -> bool {
+        self.active.is_none()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SetupReply {
+    Status(SetupStatus),
+    Probe(GatewayProbe),
+    Saved,
+    Error(ErrorReport),
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

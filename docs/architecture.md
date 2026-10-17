@@ -55,7 +55,8 @@ The GUI, CLI, ACP and MCP do not open independent mutable state snapshots.
 A remote connection runs `agent206 gateway --stdio` using ordinary OpenSSH;
 that entry point bridges to the same remote per-user socket. Strict host key
 checking is mandatory. SSH's configured identities and agents are respected;
-unknown hosts require explicit SSH pairing outside the application today.
+an unknown host's keys are scanned during gateway setup and recorded in the
+profile's own known_hosts only after the user confirms a fingerprint.
 Keepalives detect dead peers. TCP/SSH retransmits lost packets; the application
 handles fragmented frames and records durable request IDs and event cursors.
 
@@ -312,6 +313,15 @@ content type. The application issues no session cookie: cookies ignore ports and
 could otherwise be sent to a local development server inside the preview browser.
 App chrome cannot be framed. This is a single-user loopback bridge, not a public
 hosting/authentication system.
+
+The bridge is also the browser's gateway client. It connects to the profile's
+saved gateway, local or SSH, and until one is saved it answers commands with a
+structured not-configured error and serves gateway setup (`/api/setup`). SSH
+probes, key scans and known_hosts writes happen in the bridge process; the
+browser sends an endpoint and the fingerprint the user verified, never a key
+entry, and a target is saved only after a strict-host-key check succeeds.
+Like the desktop client, the bridge keeps the gateway it started with (or last
+switched to) until it restarts; setup saved by another client applies then.
 
 Public downloads validate all resolved addresses, pin them for the TLS request,
 follow only validated HTTPS redirects, and bypass ambient proxy settings. Transfer

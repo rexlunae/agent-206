@@ -381,7 +381,7 @@ fn sandbox_command(
         execute: capabilities.contains(&Capability::Execute),
         hidden: &hidden,
         cwd: &start,
-        port: Some(port),
+        network: a206_sandbox::NetworkAccess::Proxy(port),
     };
     Ok(Command::from(profile.command()?))
 }

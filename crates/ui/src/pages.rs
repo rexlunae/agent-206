@@ -275,10 +275,7 @@ pub fn Gateway() -> Element {
                     ErrorNotice { report: error, title: "Connection needs attention".to_string() }
                 }
             }
-            // The web bridge's gateway is chosen on its server with `agent206 gateway setup`.
-            if !cfg!(target_arch = "wasm32") {
-                CardFooter { Button { variant: ButtonVariant::Secondary, onclick: move |_| { let mut setup = state.setup; setup.set(true); }, "Change gateway" } }
-            }
+            CardFooter { Button { variant: ButtonVariant::Secondary, onclick: move |_| { let mut setup = state.setup; setup.set(true); }, "Change gateway" } }
         }
         HealthChecks {}
         Card { variant: CardVariant::Subtle, CardHeader { CardTitle { "Security setup" } }
