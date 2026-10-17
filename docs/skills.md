@@ -7,8 +7,8 @@ no code Agent 206 runs and they never add permissions. A model following a skill
 still works within its thread's grants.
 
 Status: **experimental**. Listing, review and approval work in the CLI and the
-desktop/TUI Extensions page. The run engine that shows skills to models is not
-merged yet.
+desktop/TUI Extensions page. Native runs reach approved skills through the
+`skill_list` and `skill_info` tools.
 
 ## Installing
 
@@ -57,19 +57,26 @@ A program requirement is met only by an executable file on `PATH`.
 
 CLI: `agent206 skills list | show NAME | enable NAME --digest HEX | disable NAME`.
 
-## Run engine interface
+## Model access
 
-Gateway methods (`crates/runtime/src/gateway/skills.rs`):
+Native runs get two tools, named as in RustyClaw, from
+`crates/runtime/src/skill_tool.rs`:
 
-- `skill_index(thread)` returns the model-facing `<available_skills>` block for
-  the system prompt (names and descriptions escaped); `skill_offers(thread)`
-  returns the same list as data.
-- `skill_instructions(thread, name)` returns the Markdown body, re-checking at
-  read time that this exact version is approved.
-- `skill_file(thread, name, path)` returns a bounded supporting file.
+- `skill_list` returns the `<available_skills>` block: names and descriptions of
+  approved, unchanged skills, escaped as author text.
+- `skill_info` takes `name` and an optional `path`, and returns the skill's
+  Markdown body or one UTF-8 supporting file.
 
-Failures are `GatewayError::Skill(SkillError)`: `Disabled` and `Changed` are
-permission denials, malformed skills are invalid requests.
+Both are offered only while at least one approved skill exists. They declare no
+capability, since a skill adds instructions and never authority, and like every
+tool they stay denied in a conversation until the user permits them there. Each
+call re-reads the file and checks it against its approval, so an edit withdraws
+it at once. A result longer than the tool output limit (64 KiB) is refused
+rather than cut, because a cut skill would be followed as if it were whole.
+
+The gateway methods `skill_index`, `skill_offers`, `skill_instructions` and
+`skill_file` share the same checks. Failures are typed: `Disabled` and `Changed`
+are permission denials; malformed skills and arguments are invalid requests.
 
 ## Not yet implemented
 

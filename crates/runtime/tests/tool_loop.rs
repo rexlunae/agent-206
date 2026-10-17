@@ -1337,3 +1337,57 @@ async fn a_message_is_admitted_only_with_room_for_its_reply() {
     }
     assert!(accepted > 0);
 }
+
+#[tokio::test]
+async fn approved_skills_reach_the_model_through_the_skill_tools() {
+    let api = ProviderApi::OpenAi;
+    let mut rig = rig(api, vec![], None).await;
+    let body = nonce();
+    let dir = rig._state.path().join("skills/notes");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("SKILL.md"),
+        format!("---\nname: notes\ndescription: Take notes.\n---\n{body}"),
+    )
+    .unwrap();
+    let Reply::Skill(reviewed) = rig
+        .run(Command::ReadSkill {
+            name: "notes".into(),
+        })
+        .await
+    else {
+        panic!("skill read for review");
+    };
+    let approved = rig
+        .run(Command::SetSkillEnabled {
+            name: "notes".into(),
+            enabled: true,
+            digest: Some(reviewed.digest),
+        })
+        .await;
+    assert_eq!(approved, Reply::Ok);
+    // The skill tools stay denied until this conversation permits them.
+    let task = rig.send();
+    let first = rig.next_request().await;
+    assert!(offered(api, &first.body).is_empty());
+    first.respond(text_response(api, &nonce())).await;
+    finished(task).await;
+
+    rig.permit(a206_runtime::skill_tool::INFO, ToolPermission::Allow)
+        .await;
+    let task = rig.send();
+    let first = rig.next_request().await;
+    assert_eq!(
+        offered(api, &first.body),
+        vec![a206_runtime::skill_tool::INFO.to_string()]
+    );
+    let call = Call::new(a206_runtime::skill_tool::INFO, json!({"name": "notes"}));
+    first
+        .respond(calls_response(api, std::slice::from_ref(&call), &nonce()))
+        .await;
+    let second = rig.next_request().await;
+    assert_eq!(result_for(api, &second.body, &call.id), Some(body));
+    second.respond(text_response(api, &nonce())).await;
+    let thread = finished(task).await;
+    assert_eq!(thread.state, RunState::Complete, "{:?}", thread.error);
+}
