@@ -147,7 +147,7 @@ impl Profile<'_> {
         add(PathBuf::from("/dev/null"), Access::Device);
         if self.terminal.is_some() {
             // Its own controlling terminal; bubblewrap's `/dev` has no other.
-            add(PathBuf::from("/dev/tty"), Access::Device);
+            add(PathBuf::from("/dev/tty"), Access::Terminal);
         }
         for device in READ_DEVICES {
             add(PathBuf::from(device), Access::Read);
@@ -491,7 +491,7 @@ mod tests {
             terminal: Some(&device),
             ..piped
         };
-        assert_eq!(access(&terminal.rules().unwrap(), tty), [Access::Device]);
+        assert_eq!(access(&terminal.rules().unwrap(), tty), [Access::Terminal]);
         // The device itself is not mounted on Linux; the inherited copy is used.
         assert!(access(&terminal.rules().unwrap(), &device).is_empty());
         assert!(terminal.spec().unwrap().terminal);

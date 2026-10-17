@@ -5,10 +5,7 @@
 use a206_core::{Capability, ErrorKind, Id};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use a206_runtime::{
-    exec_tool::{
-        ExecHost, MAX_INPUT, MAX_PER_THREAD, MAX_STREAM, NAME, PROCESS, PROCESS_WRITE,
-        TERMINAL_COLUMNS, TERMINAL_ROWS,
-    },
+    exec_tool::{ExecHost, MAX_INPUT, MAX_PER_THREAD, MAX_STREAM, NAME, PROCESS, PROCESS_WRITE},
     tools::{ToolHost, ToolOutput, ToolRequest, ToolScope},
 };
 
@@ -351,18 +348,20 @@ async fn terminal_sessions_take_keys_and_interrupts() {
         &scope,
         serde_json::json!({
             "command": "test -t 0 && test -t 1 && test -t 2 && echo is-a-$TERM-tty; \
-                        echo via-dev-tty > /dev/tty; echo size-$(stty size); \
+                        echo via-dev-tty > /dev/tty; echo size-$(stty size < /dev/tty); \
                         read line; echo got-$line; exec sleep 600",
             "terminal": true,
         }),
     )
     .await;
-    let size = format!("size-{TERMINAL_ROWS} {TERMINAL_COLUMNS}");
+    // The documented 80x24, as rows then columns; `stty` reads it through a
+    // `/dev/tty` opened inside the sandbox.
+    let size = "size-24 80";
     let text = shown(
         &host,
         &scope,
         &session,
-        &["is-a-dumb-tty", "via-dev-tty", &size],
+        &["is-a-dumb-tty", "via-dev-tty", size],
     )
     .await;
     assert!(text.starts_with("running\n--- terminal ---"), "{text}");

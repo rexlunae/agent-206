@@ -221,7 +221,9 @@ background sessions.
   poll as `sandbox` output only when there is any. On macOS a launcher in
   this executable starts the session and takes the terminal before it
   becomes `sandbox-exec` (`terminal.rs`); the Seatbelt policy adds only that
-  terminal device and `/dev/tty`, and Landlock on Linux adds only `/dev/tty`.
+  terminal device and `/dev/tty`, and Landlock on Linux adds only `/dev/tty`,
+  with the device-control right so a program can configure the terminal it
+  opens there.
   `poll` returns the terminal's output, echoed input included, as one
   `terminal` stream with the same bounds. `process_write` then also takes
   `keys`, a list of at most 256 key names sent after `data` (Enter as a
@@ -241,7 +243,8 @@ sandbox on Linux and macOS CI (grants, hidden state, symlinked working
 directories, network, exit status, output and time bounds, leftover
 background processes; background sessions' input, output, ownership, kill,
 timeout, limits, input deadlines, stopping on a withdrawn grant and end
-with their host; terminal sessions' terminal streams, size, `/dev/tty`,
+with their host; terminal sessions' terminal streams, size read through a `/dev/tty`
+opened in the sandbox,
 text and keys, refused close and Ctrl-C interrupting the command, checked
 to fail when the command's group is not given the foreground; on Linux the
 test binary doubles as

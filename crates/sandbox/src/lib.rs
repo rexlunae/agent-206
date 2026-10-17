@@ -78,6 +78,9 @@ pub enum Access {
     Write,
     /// Read and write an existing device such as `/dev/null`.
     Device,
+    /// Read, write and control a terminal device: `Device` plus its ioctls,
+    /// which programs use to configure a terminal they open.
+    Terminal,
 }
 
 /// One Landlock allowlist entry, as a path inside the sandbox.

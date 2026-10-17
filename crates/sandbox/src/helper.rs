@@ -167,6 +167,7 @@ fn restrict(spec: &Spec) -> Result<(), SandboxError> {
             Access::Execute => read | AccessFs::Execute,
             Access::Write => all & !AccessFs::Execute,
             Access::Device => AccessFs::ReadFile | AccessFs::WriteFile,
+            Access::Terminal => AccessFs::ReadFile | AccessFs::WriteFile | AccessFs::IoctlDev,
         };
         let fd = PathFd::new(&rule.path).map_err(|source| SandboxError::LandlockPath {
             path: rule.path.clone(),
