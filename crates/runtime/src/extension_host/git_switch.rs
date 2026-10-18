@@ -152,7 +152,16 @@ pub(super) fn switch(
 
     // Opened now, so a reflog that cannot be written refuses the switch
     // before anything changes.
-    let mut head_log = open_head_log(&repo).map_err(|e| git_failure("switch", &e))?;
+    let mut head_log = open_head_log(&repo).map_err(|error| {
+        tracing::warn!(
+            error = &error as &dyn std::error::Error,
+            "could not open HEAD's reflog for a branch switch"
+        );
+        failure(
+            HostErrorCode::Io,
+            "HEAD's reflog (.git/logs/HEAD) could not be opened for writing; nothing was switched",
+        )
+    })?;
     // The last point at which the switch can stop with nothing changed.
     check(&interrupt)?;
     let removals = steps
