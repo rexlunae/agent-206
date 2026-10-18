@@ -575,7 +575,7 @@ listing, the result or the conversation. See
 
 ## Pushing git branches (`git_push`)
 
-`runtime/src/git_push.rs` offers `git_push` in conversations with a project
+`runtime/src/git_remote.rs` offers `git_push` in conversations with a project
 once the user has set at least one git credential (Settings, Git credentials,
 or `git_credentials` in `settings --apply`). Each entry names a forge origin
 (`https://host[:port]`), the username the forge expects with a token
@@ -625,8 +625,53 @@ the same name on the remote, like `git push <remote> <branch>`:
 
 The token never reaches the gateway, the model, the conversation or a log.
 Cancelling a call after the pack was sent may leave the server updated. Not
-yet: ssh remotes, force pushes, deleting remote branches, tags, pushing to a
-differently named branch, and fetching.
+yet: ssh remotes, force pushes, deleting remote branches, tags and pushing to a
+differently named branch.
+
+## Fetching git branches (`git_fetch`)
+
+`runtime/src/git_remote.rs` offers `git_fetch` beside `git_push`, under the
+same conditions: a git credential for the forge, the conversation's GitWrite
+grant, and Ask, so the user approves each call. It brings one branch of the
+remote up to date in its remote-tracking branch, like
+`git fetch <remote> <branch>`. Local branches, the index and the working tree
+are left alone; merging or switching is up to the model's other tools.
+
+Arguments are `branch` (default: the branch the current branch merges from,
+when `branch.<name>.remote` is that remote, else the current branch's own
+name) and `remote` (default: the current branch's remote, else `origin`).
+
+- The remote's `url` follows the push rules (HTTPS only, `insteadOf`
+  rewrites refused, included configuration refused). The remote's
+  `remote.<name>.fetch` must be the mapping `git clone` sets up,
+  `refs/heads/*:refs/remotes/<remote>/*`, with or without `+`, and be the
+  remote's only mapping (git would also update what others map to); any
+  other configuration is refused before the forge is asked for anything.
+  Submodule entries in fetched trees are kept as commit ids; the submodules'
+  own commits are not fetched, as git does not fetch them here either.
+- Shallow repositories, partial clones (`extensions.partialClone` or
+  `remote.<name>.promisor`) and a `reference-transaction` hook are refused;
+  `user.name` and `user.email` must be set for the reflog.
+- The gateway asks the vault broker for the server's references and then for
+  a pack (`GitUploadPack`, broker protocol v14), with the token sent as for a
+  push. It tells the server about up to 256 commits it has, newest first,
+  from the remote-tracking branch, the local branch of the same name and
+  HEAD. When the server's commit and everything it reaches are already here,
+  no pack is asked for; when the remote-tracking branch already points at it,
+  the result says `up_to_date`.
+- The pack (side-band or plain) must fit one broker message, the same limits
+  as a push, and is written and indexed by gitoxide into `objects/pack` with
+  a `.keep` file. The gateway then checks the fetched commit's whole history
+  is present; a pack missing anything is removed and the call fails.
+- The remote-tracking branch moves only from the value it had when the fetch
+  began. A new commit that does not contain the old one is a forced update,
+  allowed only with `+` in the refspec and reported as `forced_update`;
+  without it the call fails and the pack is removed. The reflog says
+  `fetch: fast-forward` or `fetch: forced-update`.
+
+The result names the branch, remote, `tracking_branch`, the old and new
+commits and how many objects arrived. Not yet: ssh remotes, several branches
+or tags at once, pruning, and packs over about 4 MiB.
 
 ## Output rules
 

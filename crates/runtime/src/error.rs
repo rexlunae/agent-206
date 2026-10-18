@@ -93,7 +93,7 @@ pub(crate) fn classify(error: &(dyn Error + 'static)) -> Option<ErrorKind> {
         crate::extension_list_tool::ListError,
         crate::propose_tool::ProposeError,
         crate::gateway::GatewayError,
-        crate::git_push::PushError,
+        crate::git_remote::RemoteError,
         crate::joshua::JoshuaError,
         crate::messengers::MessengerError,
         crate::network::DownloadError,
