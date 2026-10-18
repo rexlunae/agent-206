@@ -71,6 +71,7 @@ pub async fn serve(client: Client, thread: Uuid) -> Result<(), AcpError> {
                         thread,
                         text,
                         attachments: vec![],
+                        images: vec![],
                     })
                     .await
                     .map_err(|_| Error::internal_error())?;
