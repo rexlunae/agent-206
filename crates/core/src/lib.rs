@@ -371,6 +371,14 @@ pub struct Message {
     /// in the thread for the user.
     #[serde(default)]
     pub compaction: Option<Compaction>,
+    /// The reasoning text a model streamed before or between its reply,
+    /// for display only: it is never sent back to a model.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub reasoning: String,
+    /// The model streamed more reasoning than a message keeps; the rest was
+    /// not recorded.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub reasoning_shortened: bool,
 }
 impl Message {
     pub fn new(role: Role, text: String, at: u64, backend: CodingBackend) -> Self {
@@ -383,6 +391,8 @@ impl Message {
             backend,
             tool_calls: vec![],
             compaction: None,
+            reasoning: String::new(),
+            reasoning_shortened: false,
         }
     }
 }
