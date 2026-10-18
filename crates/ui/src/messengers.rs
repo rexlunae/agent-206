@@ -318,7 +318,7 @@ fn AllowList(
                 code { "{entry}" }
                 div { class: "a206-row",
                     if !senders {
-                        Button { size: ButtonSize::Sm, variant: ButtonVariant::Ghost, availability: if testable { Availability::Enabled } else { Availability::Disabled }, onclick: { let destination = chat_destination(&messenger, &entry); move |_| dispatch(state, Command::SendTestMessage { destination: destination.clone() }) }, "Send test" }
+                        Button { size: ButtonSize::Sm, variant: ButtonVariant::Ghost, aria_label: format!("Send test message to {entry} using {messenger}"), availability: if testable { Availability::Enabled } else { Availability::Disabled }, onclick: { let destination = chat_destination(&messenger, &entry); move |_| dispatch(state, Command::SendTestMessage { destination: destination.clone() }) }, "Send test" }
                     }
                     Button { size: ButtonSize::Sm, variant: ButtonVariant::Ghost, onclick: { let messenger = messenger.clone(); let entry = entry.clone(); move |_| edit_list(state, &messenger, senders, |list, _| { list.remove(&entry); }) }, "Remove" }
                 }
@@ -634,6 +634,43 @@ mod tests {
         snapshot.messengers[0].state = MessengerState::Stopped;
         let stopped = button(&render_page(snapshot));
         assert!(stopped.contains("disabled"), "{stopped}");
+    }
+
+    #[test]
+    fn chat_test_buttons_name_each_destination_and_messenger() {
+        let id = || Uuid::new_v4().simple().to_string();
+        let mut config = MessengerConfig::new(format!("m-{}", id()), MessengerKind::Telegram);
+        config.enabled = true;
+        let chats = [id(), id()];
+        config.allowed_chats.extend(chats.iter().cloned());
+        let mut snapshot = crate::empty_snapshot();
+        snapshot.settings.messengers.push(config.clone());
+        snapshot.messengers.push(MessengerStatus {
+            name: config.name.clone(),
+            state: MessengerState::Connected,
+            ..MessengerStatus::default()
+        });
+        let html = render_page(snapshot.clone());
+        assert_eq!(html.matches(">Send test<").count(), 2);
+        for chat in &chats {
+            let label = format!(
+                "aria-label=\"Send test message to {chat} using {}\"",
+                config.name
+            );
+            assert_eq!(html.matches(&label).count(), 1, "{html}");
+        }
+        // Disabled buttons keep the same destination names.
+        snapshot.messengers[0].state = MessengerState::Stopped;
+        let html = render_page(snapshot);
+        for chat in &chats {
+            assert!(
+                html.contains(&format!(
+                    "aria-label=\"Send test message to {chat} using {}\"",
+                    config.name
+                )),
+                "{html}"
+            );
+        }
     }
 
     #[test]
