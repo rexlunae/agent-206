@@ -173,6 +173,7 @@ name = "a206-plugin-web"
 version = "0.1.0"
 dependencies = [
  "a206-extension-sdk",
+ "url",
 ]
 
 [[package]]

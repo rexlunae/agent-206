@@ -21,7 +21,7 @@ pub(super) async fn fetch(
 ) -> Result<HostReply, HostFailure> {
     let allowed = |host: &str| a206_extensions::allows_host(hosts, host);
     let response = tokio::time::timeout(FETCH_TIMEOUT, async {
-        let mut response = public_request(url, allowed, net).await?;
+        let (mut response, redirected) = public_request(url, allowed, net).await?;
         let status = response.status().as_u16();
         let content_type = response
             .headers()
@@ -45,6 +45,7 @@ pub(super) async fn fetch(
             content_type,
             body: body.into(),
             truncated,
+            redirected,
         })
     })
     .await;

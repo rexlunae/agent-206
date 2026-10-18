@@ -202,6 +202,7 @@ async fn fetch_returns_any_status_and_bounds_the_body() {
             content_type: Some(text[0].1.clone()),
             body: body.into(),
             truncated: false,
+            redirected: true,
         })
     );
     let HostReply::Fetched(cut) = calls.handle(fetch(&format!("https://{site}/big"))).await else {
@@ -210,6 +211,7 @@ async fn fetch_returns_any_status_and_bounds_the_body() {
     assert!(cut.truncated);
     assert_eq!(cut.body.len(), crate::extension_host::fetch::MAX_FETCH);
     assert_eq!(cut.content_type, None);
+    assert!(!cut.redirected);
     let HostReply::Fetched(unchanged) = calls.handle(fetch(&format!("https://{site}/same"))).await
     else {
         panic!("fetch failed");
