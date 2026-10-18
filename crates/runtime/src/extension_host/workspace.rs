@@ -379,6 +379,9 @@ struct Ignores {
     rules: gix::ignore::Search,
     /// Where the walk started, relative to the workspace: `""` or `dir/`.
     start: String,
+    /// The start, or a directory above it, is ignored: git excludes
+    /// everything below an ignored directory, so the walk finds nothing.
+    start_ignored: bool,
 }
 impl Ignores {
     /// The rules in force at `path` (workspace-relative), from the
@@ -387,6 +390,7 @@ impl Ignores {
         let mut ignores = Self {
             rules: gix::ignore::Search::default(),
             start: String::new(),
+            start_ignored: false,
         };
         if workspace
             .symlink_metadata(".git")
@@ -401,6 +405,10 @@ impl Ignores {
         let mut directory = workspace.try_clone().map_err(|e| io_failure(&e))?;
         for name in path.split('/').filter(|name| !name.is_empty()) {
             ignores.add(&directory, ".gitignore", &ignores.start.clone())?;
+            if ignores.ignores(name, true) {
+                ignores.start_ignored = true;
+                break;
+            }
             directory = directory.open_dir(name).map_err(|e| io_failure(&e))?;
             ignores.start.push_str(name);
             ignores.start.push('/');
@@ -503,6 +511,7 @@ impl Walk {
         let ignores = respect_ignores
             .then(|| Ignores::above(&workspace, &path))
             .transpose()?;
+
         let walk = Self {
             ignores,
             ..Self::default()
@@ -519,6 +528,10 @@ impl Walk {
     ) -> Result<std::ops::ControlFlow<()>, HostFailure> {
         // The directory's own rules apply below it, and only there.
         let rules = match &mut self.ignores {
+            // Git excludes everything below an ignored directory.
+            Some(ignores) if ignores.start_ignored => {
+                return Ok(std::ops::ControlFlow::Continue(()));
+            }
             Some(ignores) => {
                 let at = [ignores.start.as_str(), prefix].concat();
                 let before = ignores.rules.patterns.len();

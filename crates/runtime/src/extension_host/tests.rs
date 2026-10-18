@@ -608,7 +608,7 @@ async fn walks_skip_what_git_ignores_unless_asked() {
     let (dir, store) = store();
     let root = dir.path().join("project");
     let n = uuid::Uuid::new_v4().simple().to_string();
-    for directory in [".git/info", "build", "src/gen", "src/deep"] {
+    for directory in [".git/info", "build/sub", "src/gen", "src/deep"] {
         std::fs::create_dir_all(root.join(directory)).unwrap();
     }
     let rules = [
@@ -667,6 +667,14 @@ async fn walks_skip_what_git_ignores_unless_asked() {
     assert_eq!(
         files_found(host.handle(find("src/deep", false)).await),
         ["src/deep/gen"]
+    );
+    // Started in an ignored directory, or below one, it finds nothing.
+    for path in ["build", "build/sub", "src/gen"] {
+        assert!(files_found(host.handle(find(path, false)).await).is_empty());
+    }
+    assert_eq!(
+        files_found(host.handle(find("src/gen", true)).await),
+        ["src/gen/code"]
     );
     let mut all = files.to_vec();
     all.sort();
