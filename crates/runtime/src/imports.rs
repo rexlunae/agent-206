@@ -295,6 +295,9 @@ async fn serve_io(
             a206_import::Tool::ClaudeCode => {
                 a206_import::claude_code::preview(&request.body.source, &request.body.settings)
             }
+            a206_import::Tool::Codex => {
+                a206_import::codex::preview(&request.body.source, &request.body.settings)
+            }
         }
         .map_err(|error| crate::error::correlated("import.preview", request.id, &error))
         .and_then(|preview| {

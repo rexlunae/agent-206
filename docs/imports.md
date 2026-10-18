@@ -2,8 +2,9 @@
 
 Import is a required setup feature. This contract separates source discovery,
 review and application so migration cannot silently grant authority or activate
-foreign code. RustyClaw settings/vault migration and the scoped Claude Code
-connection adapter below are implemented; other source adapters remain planned.
+foreign code. RustyClaw settings/vault migration and the scoped Claude Code and
+Codex connection adapters below are implemented; other source adapters remain
+planned.
 
 ## Claude Code settings adapter
 
@@ -100,8 +101,8 @@ from previews because they can contain inline passwords or signed tokens.
 Providers still need live API discovery; messengers are saved disabled and
 without credentials. Vault migration is a separate action on Security or through
 `agent206 vault import FILE --apply`; settings selection never copies or unlocks
-a vault. Claude Code supports the limited connection adapter above; other tool
-adapters remain planned.
+a vault. Claude Code and Codex support the limited connection adapters above;
+other tool adapters remain planned.
 
 Before any reader reply (including the legacy terminal flow), the remaining
 preview strings are checked for known credential shapes. A match refuses the
@@ -210,6 +211,46 @@ unrelated-file, executable and network denials. Unit tests cover protocol versio
 truncated/oversized frames, oversized results and target-data minimization.
 This is the prerequisite for the shared GUI preview/apply flow, not that UI.
 
+## Codex configuration adapter
+
+Select **Codex** on Import and choose an absolute directory containing
+`config.toml` on the gateway host, such as `~/.codex` or a project's `.codex`.
+The CLI uses `agent206 import review-codex /absolute/config-directory`, then
+`import apply-review ID --provider INDEX`. It shares the isolated reader, held
+review, selected apply, source/target checks and receipt with the other adapters.
+
+Each `[model_providers.ID]` table becomes one reviewed OpenAI-compatible
+connection with its `base_url` unchanged. Codex sends the Responses API under
+that base; Agent 206 calls the chat completions and models routes under the same
+prefix, so test the connection after import: an endpoint that serves only the
+Responses API will not work yet. A base URL matching an OpenAI-compatible preset
+takes the preset's name. These tables are unavailable, with their endpoint
+omitted:
+
+- ids Codex reserves for built-in providers (`openai`, `ollama`, `lmstudio`,
+  `ollama-chat`), the Bedrock overrides and any table with `aws` signing;
+- a `wire_api` other than `responses`, which Codex itself refuses;
+- `requires_openai_auth` or `gateway_oauth` sign-in;
+- `query_params`, which may hold keys and change the endpoint;
+- a missing, non-HTTPS, credential-bearing or query-bearing `base_url`.
+
+Only this one file is read. Profiles, project trust entries, `CODEX_HOME` and
+other layers are not merged. `env_key`, `experimental_bearer_token`, `auth`
+commands and HTTP headers stay behind and are counted as credentials; their
+values are never deserialized. Model and provider choices, profiles, approval
+and sandbox settings, permissions, shell environment policy, `notify`, hooks,
+MCP servers, plugins, marketplaces and skills remain inactive, and instructions
+are listed as not imported. No connection gets a credential reference; models
+come from live API discovery.
+
+Schema inspected at openai/codex `8c076942cb70fba8e5c4732c23f1faabc4aed484`
+(Apache-2.0): `ConfigToml` in `codex-rs/config/src/config_toml.rs` and
+`ModelProviderInfo`, `WireApi` and the reserved ids in
+`codex-rs/model-provider-info/src/lib.rs`. Unit tests cover generated private
+strings staying behind, each refusal, preset naming, malformed TOML diagnostics,
+source bounds and symlinks; a CLI test runs the real isolated reader and gateway.
+Session history, `AGENTS.md` instructions and `auth.json` are not read.
+
 ## Sources and evidence
 
 | Source | Intended data | Primary source / format gate |
@@ -217,7 +258,7 @@ This is the prerequisite for the shared GUI preview/apply flow, not that UI.
 | RustyClaw | Settings, conversations/projects, prompts, encrypted vault and all policy metadata | Pinned source baseline in security-setup.md; configuration, sessions and credentials readers must be versioned |
 | Cline | Task history, connection settings, instructions | [Task documentation](https://docs.cline.bot/core-workflows/task-management); inspect source-version storage schemas before implementing native task readers |
 | Claude Code | Explicit settings.json Anthropic endpoint (implemented); instruction files and session transcripts (planned) | [Settings](https://code.claude.com/docs/en/settings), [environment](https://code.claude.com/docs/en/env-vars); no implicit scope merging or imported authority |
-| Codex | TOML configuration, instructions, session history | Local upstream source under ignored .reference/codex; pin the inspected revision and rollout schemas when implementing |
+| Codex | `[model_providers]` endpoints in one config.toml (implemented); instructions and session history (planned) | openai/codex at `8c076942cb70fba8e5c4732c23f1faabc4aed484`; pin rollout schemas before reading sessions |
 | DeepSeek Harness | Supported configuration/history/export format | [Official harness](https://deepseek.com/en/harness/), [deepseek-ai/deepseek-harness](https://github.com/deepseek-ai/deepseek-harness); pin source/storage schemas before implementing, independently of the DeepSeek provider |
 | Other common tools | Exported conversations, connection settings and instructions | Add versioned adapters for documented formats; evaluate OpenClaw, Aider, Continue, Cursor and Windsurf individually |
 
