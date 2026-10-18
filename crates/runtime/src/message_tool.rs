@@ -57,7 +57,7 @@ impl MessageHost {
     fn spec(destinations: Vec<String>) -> ToolSpec {
         ToolSpec {
             name: SEND.into(),
-            description: "Send a message to one of the user's webhooks, such as a team chat channel. It is posted as it is, outside this conversation, and the user approves each call. Long messages are sent in a few parts, without the whitespace where they split; a message too long for the webhook is refused whole.".into(),
+            description: "Send a message to one of the user's webhooks, such as a team chat channel. It is posted as it is, outside this conversation, and the user approves each call. Long messages are sent in a few parts, leaving out any part that would hold only whitespace; a message too long for the webhook is refused whole.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
