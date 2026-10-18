@@ -65,6 +65,9 @@ pub(crate) struct Signal {
     /// redelivery is answered at least once rather than never.
     returned: Vec<String>,
     failed: std::sync::atomic::AtomicBool,
+    /// The listener of a session that ended, still holding messages it
+    /// queued before its connection closed.
+    ended: Option<Listener>,
 }
 
 struct Session {
@@ -92,22 +95,24 @@ impl Signal {
             recent: Arc::default(),
             returned: Vec::new(),
             failed: std::sync::atomic::AtomicBool::new(false),
+            ended: None,
         }
     }
 
     /// Connect to the daemon, check that it serves the account and subscribe
     /// to its messages, unless the current session is still running.
     pub(crate) async fn connect(&mut self) -> Result<Account> {
-        // A session whose task ended can deliver nothing more; what it still
-        // queued was never handled, so it is dropped for signal-cli's
-        // redelivery to a new subscription rather than answered through a
-        // connection that is gone.
+        // A session whose task ended can send nothing more, but what it
+        // queued was delivered by signal-cli and may not come again: its
+        // listener is drained first, with replies going through the new
+        // session.
         if self
             .session
             .as_ref()
             .is_some_and(|session| session.outgoing.is_closed())
+            && let Some(ended) = self.session.take()
         {
-            self.session = None;
+            self.ended = Some(ended.listener);
         }
         if let Some(session) = &self.session {
             return Ok(session.account.clone());
@@ -167,14 +172,34 @@ impl Signal {
                 recent.insert(&key);
             }
         }
+        if let Some(ended) = self.ended.as_mut() {
+            match ended.receive().await {
+                Ok(batch) => return Ok(self.unhandled(batch)),
+                // Drained; its failure was the reason for reconnecting.
+                Err(_) => self.ended = None,
+            }
+        }
         let Some(session) = self.session.as_mut() else {
             return Err(MessengerError::SocketEnded { service: SERVICE });
         };
-        let batch = session.listener.receive().await;
-        match &batch {
-            Ok(batch) => self.returned = batch.events.iter().map(|(key, _)| key.clone()).collect(),
-            Err(_) => self.session = None,
+        match session.listener.receive().await {
+            Ok(batch) => Ok(self.unhandled(batch)),
+            Err(error) => {
+                self.session = None;
+                Err(error)
+            }
         }
+    }
+
+    /// `batch` without what was handled since it was queued (a message the
+    /// ended session and the new subscription both delivered), remembering
+    /// the rest as returned.
+    fn unhandled(&mut self, mut batch: Batch) -> Batch {
+        {
+            let recent = lock(&self.recent);
+            batch.events.retain(|(key, _)| !recent.contains(key));
+        }
+        self.returned = batch.events.iter().map(|(key, _)| key.clone()).collect();
         batch
     }
 
