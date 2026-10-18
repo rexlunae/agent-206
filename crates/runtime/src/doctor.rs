@@ -451,7 +451,7 @@ fn pinned_chmod(
     path: &Path,
     directory: bool,
     opened: impl FnOnce(rustix::io::Errno) -> RepairError,
-    decide: impl FnOnce(u32) -> Result<Option<rustix::fs::Mode>, RepairError>,
+    decide: impl FnOnce(rustix::fs::RawMode) -> Result<Option<rustix::fs::Mode>, RepairError>,
 ) -> Result<(), Pinned> {
     use rustix::fs::{Mode, OFlags};
     // NONBLOCK keeps a FIFO put in its place from stalling the open.
@@ -481,7 +481,7 @@ fn unreadable(
     path: &Path,
     directory: bool,
     opened: impl FnOnce(rustix::io::Errno) -> RepairError,
-    decide: impl FnOnce(u32) -> Result<Option<rustix::fs::Mode>, RepairError>,
+    decide: impl FnOnce(rustix::fs::RawMode) -> Result<Option<rustix::fs::Mode>, RepairError>,
 ) -> Result<(), Pinned> {
     use rustix::fs::{Mode, OFlags};
     use std::os::fd::AsRawFd;
@@ -510,7 +510,7 @@ fn unreadable(
     path: &Path,
     _directory: bool,
     opened: impl FnOnce(rustix::io::Errno) -> RepairError,
-    decide: impl FnOnce(u32) -> Result<Option<rustix::fs::Mode>, RepairError>,
+    decide: impl FnOnce(rustix::fs::RawMode) -> Result<Option<rustix::fs::Mode>, RepairError>,
 ) -> Result<(), Pinned> {
     use rustix::fs::{AtFlags, CWD, FileType};
     let stat = rustix::fs::lstat(path).map_err(Pinned::Change)?;
