@@ -59,6 +59,14 @@ fn a_team_starts_with_its_coordinators_mode_and_a_permitted_model_only() {
     assert_eq!((mode, chosen), (Mode::Research, model.clone()));
     assert_eq!(requested, parent.grant.capabilities);
 
+    // Members are left to the gateway, which reads each one by ID: one
+    // missing from the bounded listing does not stop the request.
+    let coordinator_only = AgentProfiles {
+        profiles: vec![profile("lead", Some(&model))],
+        problems: vec![],
+    };
+    assert!(start(&team, &parent, &coordinator_only, &[]).is_some());
+
     // A coordinator naming a model the conversation does not permit, or a
     // missing coordinator profile, starts nothing.
     let elsewhere = AgentProfiles {
