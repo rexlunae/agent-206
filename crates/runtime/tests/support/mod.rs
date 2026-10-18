@@ -408,6 +408,7 @@ pub fn send(gateway: &Gateway, thread: Id) -> tokio::task::JoinHandle<Reply> {
                 thread,
                 text: nonce(),
                 attachments: vec![],
+                images: vec![],
             },
         )
         .await

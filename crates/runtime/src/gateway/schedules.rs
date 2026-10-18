@@ -236,6 +236,7 @@ impl Gateway {
                     thread,
                     text,
                     attachments: vec![],
+                    images: vec![],
                 },
             })
             .await;

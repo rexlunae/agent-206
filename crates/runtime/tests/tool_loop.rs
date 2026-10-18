@@ -1507,6 +1507,7 @@ async fn a_message_is_admitted_only_with_room_for_its_reply() {
                         thread,
                         text,
                         attachments: vec![],
+                        images: vec![],
                     },
                 })
                 .await
