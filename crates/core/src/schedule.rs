@@ -96,6 +96,10 @@ pub enum JobOutcome {
     /// The gateway did not run the message, for example because the
     /// conversation was busy or had no model.
     Refused(ErrorReport),
+    /// The gateway stopped before it saw how this run ended. Only an earlier
+    /// run in a job's history ends this way; restart recovery settles the
+    /// latest run from its conversation.
+    Unrecorded,
 }
 
 /// One run of a job.

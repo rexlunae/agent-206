@@ -66,16 +66,8 @@ fn outcome(outcome: &JobOutcome, kind: JobKind) -> (BadgeTone, &'static str) {
         JobOutcome::Failed => (BadgeTone::Danger, "Failed"),
         JobOutcome::Cancelled => (BadgeTone::Neutral, "Cancelled"),
         JobOutcome::Refused(_) => (BadgeTone::Warning, "Not sent"),
+        JobOutcome::Unrecorded => (BadgeTone::Neutral, "Ended; result not recorded"),
     }
-}
-
-/// How one run in a job's history went. A run shown as running that is not
-/// the job's current run ended while the gateway was stopped, unrecorded.
-fn run_outcome(run: &JobRun, kind: JobKind, current: Option<Uuid>) -> (BadgeTone, &'static str) {
-    if run.outcome == JobOutcome::Running && current != Some(run.id) {
-        return (BadgeTone::Neutral, "Ended; result not recorded");
-    }
-    outcome(&run.outcome, kind)
 }
 
 fn title(snapshot: &Snapshot, thread: Uuid) -> Option<String> {
@@ -167,9 +159,18 @@ fn JobHistory(job: Job) -> Element {
     let id = job.id;
     let mut runs = use_signal(|| None::<Vec<JobRun>>);
     let mut failure = use_signal(|| None::<ErrorReport>);
-    let reload = move || {
+    // Only the newest request's reply is shown, so a slow earlier one never
+    // replaces it.
+    let mut latest = use_signal(|| 0_u64);
+    let mut reload = move || {
+        let request = latest() + 1;
+        latest.set(request);
         spawn(async move {
-            match load_runs(id).await {
+            let loaded = load_runs(id).await;
+            if latest() != request {
+                return;
+            }
+            match loaded {
                 Ok(list) => {
                     failure.set(None);
                     runs.set(Some(list));
@@ -178,20 +179,26 @@ fn JobHistory(job: Job) -> Element {
             }
         });
     };
-    use_hook(reload);
+    // Each change to the latest run (a new run, or how one ended) is in the
+    // history too.
+    let last = job.last.clone();
+    use_effect(use_reactive!(|last| {
+        let _ = last;
+        reload();
+    }));
     rsx! { div { class: "a206-stack",
         if let Some(report) = failure() { ErrorNotice { report, title: "Run history unavailable".to_string(), dismiss: move |_| failure.set(None) } }
         match runs() {
             None if failure().is_none() => rsx! { p { class: "a206-muted", "Loading run history…" } },
             None => rsx! {},
-            Some(list) => rsx! { RunList { runs: list, kind: job.kind, current: job.last.as_ref().map(|run| run.id) } },
+            Some(list) => rsx! { RunList { runs: list, kind: job.kind } },
         }
         div { Button { size: ButtonSize::Sm, variant: ButtonVariant::Ghost, onclick: move |_| reload(), "Refresh run history" } }
     } }
 }
 
 #[component]
-fn RunList(runs: Vec<JobRun>, kind: JobKind, current: Option<Uuid>) -> Element {
+fn RunList(runs: Vec<JobRun>, kind: JobKind) -> Element {
     let zone = TimeZone::system();
     if runs.is_empty() {
         return rsx! { p { class: "a206-muted", "It has not run yet." } };
@@ -201,7 +208,7 @@ fn RunList(runs: Vec<JobRun>, kind: JobKind, current: Option<Uuid>) -> Element {
         ul { class: "a206-stack",
             for run in runs {
                 li { key: "{run.id}",
-                    { let (tone, label) = run_outcome(&run, kind, current); rsx! {
+                    { let (tone, label) = outcome(&run.outcome, kind); rsx! {
                         div { class: "a206-row",
                             span { "{show_time(run.at, &zone)}" }
                             Badge { tone, "{label}" }

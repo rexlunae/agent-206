@@ -413,3 +413,39 @@ async fn the_history_keeps_a_bounded_number_of_runs_and_settles_earlier_ones() {
         .collect();
     assert_eq!(kept, newest);
 }
+
+#[tokio::test]
+async fn runs_still_going_at_a_restart_end_unrecorded_in_the_history() {
+    let state = tempfile::tempdir().unwrap();
+    let (id, first, second) = {
+        let g = Gateway::open(state.path()).unwrap();
+        let thread = thread(&g).await;
+        let Reply::Job(created) = schedule(&g, thread, every(schedule::MIN_INTERVAL)).await else {
+            panic!("job scheduled");
+        };
+        let at = arbitrary();
+        let (first, second) = (JobRun::start(at), JobRun::start(at));
+        for run in [&first, &second] {
+            let mut store = g.lock().unwrap();
+            job_mut(&mut store.state, created.id).unwrap().last = Some(run.clone());
+            store
+                .persist(Some(EventKind::JobChanged { id: created.id }))
+                .unwrap();
+        }
+        // Both are still going: the earlier one only in the history.
+        let history = g.lock().unwrap().job_runs(created.id).unwrap();
+        assert!(history.iter().all(|r| r.outcome == JobOutcome::Running));
+        (created.id, first.id, second.id)
+    };
+    let g = Gateway::open(state.path()).unwrap();
+    let history = runs(send(&g, Command::JobRuns { id }).await);
+    assert_eq!(history[1].id, first);
+    assert_eq!(history[1].outcome, JobOutcome::Unrecorded);
+    // The latest is settled from its conversation, as `Job::last` is.
+    assert_eq!(history[0].id, second);
+    assert_eq!(Some(&history[0]), job(&g, id).last.as_ref());
+    assert!(!matches!(
+        history[0].outcome,
+        JobOutcome::Running | JobOutcome::Unrecorded
+    ));
+}

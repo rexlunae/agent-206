@@ -75,7 +75,7 @@ the system) pauses the job and records why.
 Jobs are in `Snapshot::jobs`, and each change publishes `JobChanged { id }`.
 `Job::last` records the latest run, with its own ID so a late result of an
 earlier run never replaces a newer one: `Running`, `Complete`, `Failed` (the
-conversation shows the failure), `Cancelled`, `Quiet` (a heartbeat check that
+conversation shows the failure), `Cancelled`, `Unrecorded` (only in the history, below), `Quiet` (a heartbeat check that
 found nothing needing attention) or `Refused` with the gateway's
 report when the message was not run, for example because the conversation was
 busy or had no model. `JobRun::ended` is when the run ended (`None` while it
@@ -87,10 +87,12 @@ The gateway keeps each job's latest 50 runs (`schedule::MAX_JOB_RUNS`) in a
 `job_runs` table of its state database, beside the snapshot. Every change to a
 job's latest run is written in the same transaction as the snapshot that shows
 it, so the history and `Job::last` never disagree. A run that a newer one
-replaced as the latest still records how it ended. Older runs are dropped as
-new ones start, and removing the job removes its history. A run the history
-shows as running that is not the job's latest ended while the gateway was
-stopped, and the page labels it as such rather than guessing an outcome.
+replaced as the latest stays running in the history until it ends, and then
+records how. Older runs are dropped as
+new ones start, and removing the job removes its history. When the gateway starts,
+restart recovery settles each job's latest run from its conversation, and any
+earlier run still shown as running becomes `Unrecorded` (the page says "Ended;
+result not recorded") rather than given an outcome the gateway never saw.
 `JobRuns` is read-only and not journaled. RustyClaw keeps an unbounded
 per-job JSON Lines file (`cron.rs` `record_run`/`get_runs`); here the history
 is bounded and lives in the same database as the jobs.
@@ -150,9 +152,9 @@ approval round trip in `crates/runtime/tests/schedules.rs`.
 gateway daemon's scheduler calls when the next job is due, when a job changes and
 at least hourly. Tests: `schedule/tests.rs` (at, interval grid, cron with seconds
 and zones), `gateway/schedules/tests.rs` (validation, one run per wake, pause,
-run now) and `crates/runtime/tests/schedules.rs` (a due job's native run against a
+run now, run history) and `crates/runtime/tests/schedules.rs` (a due job's native run against a
 scripted provider).
 
 Not yet: delivery of results to a
-messenger chat, run history beyond the latest run, and jitter for many jobs due
+messenger chat, and jitter for many jobs due
 at once.

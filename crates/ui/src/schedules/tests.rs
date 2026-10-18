@@ -191,34 +191,36 @@ fn heartbeat_checks_show_their_checklist_and_whether_anything_needed_attention()
     );
 }
 
-fn render_runs(runs: Vec<JobRun>, current: Option<Uuid>) -> String {
+fn render_runs(runs: Vec<JobRun>) -> String {
     #[derive(Props, Clone, PartialEq)]
     struct Fixture {
         runs: Vec<JobRun>,
-        current: Option<Uuid>,
     }
     fn app(props: Fixture) -> Element {
-        rsx! { RunList { runs: props.runs, kind: JobKind::Message, current: props.current } }
+        rsx! { RunList { runs: props.runs, kind: JobKind::Message } }
     }
-    let mut dom = VirtualDom::new_with_props(app, Fixture { runs, current });
+    let mut dom = VirtualDom::new_with_props(app, Fixture { runs });
     dom.rebuild_in_place();
     dioxus_ssr::render(&dom)
 }
 
 #[test]
 fn run_history_shows_each_run_and_marks_unrecorded_ends() {
-    assert!(render_runs(vec![], None).contains("It has not run yet."));
+    assert!(render_runs(vec![]).contains("It has not run yet."));
     let at = 86_400 + arbitrary(4_000_000_000);
     let took = 1 + arbitrary(3_000);
     let refusal = format!("busy-{}", Uuid::new_v4().simple());
     let current = JobRun::start(at + took + 1);
-    let unrecorded = JobRun::start(at);
+    let unrecorded = JobRun {
+        outcome: JobOutcome::Unrecorded,
+        ..JobRun::start(at)
+    };
     let refused = JobRun {
         outcome: JobOutcome::Refused(ErrorReport::new(ErrorKind::Conflict, refusal.clone())),
         ended: Some(at + took),
         ..JobRun::start(at)
     };
-    let html = render_runs(vec![current.clone(), refused, unrecorded], Some(current.id));
+    let html = render_runs(vec![current, refused, unrecorded]);
     assert_eq!(
         html.matches("Ended; result not recorded").count(),
         1,

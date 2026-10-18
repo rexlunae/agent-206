@@ -200,6 +200,7 @@ impl Store {
         for job in &store.state.jobs {
             record_run(&tx, &store.state, job.id)?;
         }
+        unrecorded(&tx)?;
         tx.commit()?;
         store.persist(None)?;
         Ok(store)
@@ -473,6 +474,28 @@ fn bundled_plugins(previous: &[PluginSummary]) -> Result<Vec<PluginSummary>> {
         .collect();
     plugins.extend(installed);
     Ok(plugins)
+}
+
+/// Mark every run the history still shows as running ended unrecorded: no
+/// run survives a restart, and recovery has settled each job's latest.
+fn unrecorded(tx: &rusqlite::Transaction<'_>) -> Result<()> {
+    let mut stmt = tx.prepare("SELECT run, payload FROM job_runs")?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for (key, payload) in rows {
+        let mut run: JobRun = rmp_serde::from_slice(&payload)?;
+        if run.outcome == JobOutcome::Running {
+            run.outcome = JobOutcome::Unrecorded;
+            tx.execute(
+                "UPDATE job_runs SET payload=?1 WHERE run=?2",
+                params![rmp_serde::to_vec_named(&run)?, key],
+            )?;
+        }
+    }
+    Ok(())
 }
 
 /// Keep `job`'s latest run in its history, which holds its newest
