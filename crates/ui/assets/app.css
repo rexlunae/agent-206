@@ -94,6 +94,10 @@ body { max-inline-size: none; inline-size: 100%; padding: 0; background: var(--f
 .a206-attach:focus-within { outline: 2px solid var(--fc-color-focus-ring); outline-offset: 2px; }
 .a206-attachment-chips { display: flex; gap: var(--fc-space-1); flex-wrap: wrap; padding: var(--fc-space-1) var(--fc-space-2); }
 .a206-attachment-chips .fc-btn { font-size: .7rem; min-block-size: 1.5rem; max-inline-size: 100%; overflow-wrap: anywhere; }
+.a206-message-images { display: flex; flex-wrap: wrap; gap: var(--fc-space-2); margin-block: var(--fc-space-1); }
+.a206-message-image { margin: 0; display: flex; flex-direction: column; gap: var(--fc-space-1); max-inline-size: 16rem; }
+.a206-message-image img, .a206-message-image [role="img"] { display: block; inline-size: 100%; max-block-size: 12rem; object-fit: contain; border-radius: var(--fc-radius-md); border: 1px solid var(--fc-color-border-subtle); background: var(--fc-color-bg-muted); min-block-size: 4rem; }
+.a206-message-image figcaption { font-size: .7rem; color: var(--fc-color-text-muted); overflow-wrap: anywhere; }
 .a206-attachment-error { margin: var(--fc-space-1); font-size: .75rem; color: var(--fc-color-text-default); }
 .a206-account-widget { white-space: nowrap; color: var(--fc-color-text-muted); font-variant-numeric: tabular-nums; }
 

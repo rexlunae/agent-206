@@ -8,6 +8,7 @@ license.workspace = true
 default = []
 web = ["dioxus/web", "fc-dioxus/web"]
 [dependencies]
+base64 = "0.22"
 a206-vault-channel.workspace = true
 zeroize.workspace = true
 qrcode = { version = "0.14", default-features = false }

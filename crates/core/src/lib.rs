@@ -257,6 +257,10 @@ pub struct ModelInfo {
     pub reasoning: Option<bool>,
     #[serde(default)]
     pub reasoning_efforts: Vec<String>,
+    /// Whether the models API reports that the model accepts images;
+    /// `None` when it does not say.
+    #[serde(default)]
+    pub image_input: Option<bool>,
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Catalog {
@@ -354,6 +358,55 @@ pub struct TextAttachment {
     pub name: String,
     pub text: String,
 }
+/// The largest image the gateway stores, in bytes: base64-encoded, one image
+/// and its message still fit in a provider request the vault broker carries.
+pub const MAX_IMAGE_BYTES: usize = 2 * 1024 * 1024;
+/// The most images one message carries.
+pub const MAX_IMAGES: usize = 4;
+/// An image format the gateway accepts, recognised from the file's own
+/// bytes rather than its name or a client's claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ImageType {
+    Png,
+    Jpeg,
+    Gif,
+    Webp,
+}
+impl ImageType {
+    /// The format whose signature `bytes` starts with.
+    pub fn sniff(bytes: &[u8]) -> Option<Self> {
+        if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+            Some(Self::Png)
+        } else if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+            Some(Self::Jpeg)
+        } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+            Some(Self::Gif)
+        } else if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+            Some(Self::Webp)
+        } else {
+            None
+        }
+    }
+    pub fn mime(self) -> &'static str {
+        match self {
+            Self::Png => "image/png",
+            Self::Jpeg => "image/jpeg",
+            Self::Gif => "image/gif",
+            Self::Webp => "image/webp",
+        }
+    }
+}
+/// An image attached to a user message. The gateway keeps its bytes outside
+/// the conversation, named by their SHA-256 digest; `Command::StageImage`
+/// stores them and returns this description.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageAttachment {
+    pub name: String,
+    pub media_type: ImageType,
+    /// Lowercase hexadecimal SHA-256 of the bytes.
+    pub digest: String,
+    pub size: u64,
+}
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Message {
     pub id: Id,
@@ -361,6 +414,9 @@ pub struct Message {
     pub text: String,
     #[serde(default)]
     pub attachments: Vec<TextAttachment>,
+    /// Images attached to a user message.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<ImageAttachment>,
     pub at: u64,
     #[serde(default)]
     pub backend: CodingBackend,
@@ -389,6 +445,7 @@ impl Message {
             role,
             text,
             attachments: vec![],
+            images: vec![],
             at,
             backend,
             tool_calls: vec![],
@@ -990,6 +1047,20 @@ pub enum Command {
         text: String,
         #[serde(default)]
         attachments: Vec<TextAttachment>,
+        /// Images staged with [`Command::StageImage`].
+        #[serde(default)]
+        images: Vec<ImageAttachment>,
+    },
+    /// Store an image for a later `Send`. Replies with
+    /// [`Reply::Image`] describing it.
+    StageImage {
+        name: String,
+        #[serde(with = "serde_bytes")]
+        data: Vec<u8>,
+    },
+    /// The bytes of a stored image, for display.
+    ReadImage {
+        digest: String,
     },
     CancelRun {
         thread: Id,
@@ -1254,6 +1325,8 @@ impl Command {
             Self::ConfigureThread { .. } => "configure_thread",
             Self::SetEffort { .. } => "set_effort",
             Self::Send { .. } => "send",
+            Self::StageImage { .. } => "stage_image",
+            Self::ReadImage { .. } => "read_image",
             Self::CancelRun { .. } => "cancel_run",
             Self::SearchMessages { .. } => "search_messages",
             Self::Activity { .. } => "activity",
@@ -1329,6 +1402,8 @@ pub enum Reply {
     Activity(ActivityPage),
     Extension(Box<PluginSummary>),
     Job(Box<Job>),
+    Image(ImageAttachment),
+    ImageData(#[serde(with = "serde_bytes")] Vec<u8>),
 }
 impl Reply {
     /// Separate a gateway-reported failure from a successful reply.

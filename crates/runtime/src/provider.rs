@@ -2,7 +2,10 @@
 use a206_core::*;
 use futures_util::StreamExt;
 use serde_json::{Value, json};
-use std::{collections::BTreeSet, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    time::Duration,
+};
 use url::Url;
 const MAX_MODELS: usize = 4096;
 const MAX_PAGES: usize = 64;
@@ -224,6 +227,95 @@ pub struct Ask<'a> {
     pub prompt: &'a str,
     pub info: &'a ModelInfo,
     pub tools: &'a [crate::tools::ToolSpec],
+    /// The bytes of the images the history sends, from [`ImageData::load`].
+    pub images: &'a ImageData,
+}
+/// The bytes of the images one request sends, by digest. An image whose
+/// bytes are absent is described in text instead, which is how a model whose
+/// API reports that it does not accept images learns one was attached.
+#[derive(Debug, Default)]
+pub struct ImageData(BTreeMap<String, Vec<u8>>, Absent);
+/// Why an image's bytes are not sent.
+#[derive(Debug, Default, Clone, Copy)]
+enum Absent {
+    /// The request would grow past what the broker carries.
+    #[default]
+    Size,
+    /// The model's API reports that it does not accept images.
+    Refused,
+}
+/// The most request bytes images may bring a request to: the broker's bound,
+/// so a request fits whether or not its credential is brokered.
+const IMAGE_BUDGET: usize = a206_broker::MAX_PROVIDER_BODY;
+/// JSON around one image's base64 bytes, at most.
+const IMAGE_OVERHEAD: usize = 128;
+impl ImageData {
+    /// Read every image the history of `thread` sends to the model `info`
+    /// describes: none when its API reports that it does not accept images.
+    /// Blocks on file reads.
+    pub fn load(
+        images: &crate::images::Images,
+        thread: &Thread,
+        info: &ModelInfo,
+    ) -> Result<Self, crate::images::ImageError> {
+        let mut data = BTreeMap::new();
+        if info.image_input == Some(false) {
+            return Ok(Self(data, Absent::Refused));
+        }
+        for message in history(thread).iter() {
+            for image in &message.images {
+                if !data.contains_key(&image.digest) {
+                    data.insert(image.digest.clone(), images.read(image)?);
+                }
+            }
+        }
+        Ok(Self(data, Absent::Size))
+    }
+    /// No bytes, each image described as left out for size.
+    fn without_bytes(&self) -> Self {
+        Self(BTreeMap::new(), Absent::Size)
+    }
+    /// The images of `thread`'s history, newest first, that fit in a request
+    /// of `bare` bytes without any. An image repeated in the history is kept
+    /// or left out everywhere it appears, and counted once per appearance.
+    fn fit(&self, thread: &Thread, bare: usize) -> Self {
+        let history = history(thread);
+        let newest_first: Vec<&ImageAttachment> = history
+            .iter()
+            .rev()
+            .flat_map(|m| m.images.iter().rev())
+            .collect();
+        let mut appearances = BTreeMap::<&str, usize>::new();
+        for image in &newest_first {
+            *appearances.entry(image.digest.as_str()).or_default() += 1;
+        }
+        let mut size = bare;
+        let mut kept = BTreeMap::new();
+        let mut considered = BTreeSet::new();
+        for image in newest_first {
+            let Some(bytes) = self.0.get(&image.digest) else {
+                continue;
+            };
+            if !considered.insert(image.digest.as_str()) {
+                continue;
+            }
+            let each = bytes.len().div_ceil(3) * 4 + IMAGE_OVERHEAD;
+            let added = each.saturating_mul(appearances[image.digest.as_str()]);
+            if size.saturating_add(added) > IMAGE_BUDGET {
+                // A smaller, older image may still fit.
+                continue;
+            }
+            size += added;
+            kept.insert(image.digest.clone(), bytes.clone());
+        }
+        Self(kept, Absent::Size)
+    }
+    fn base64(&self, image: &ImageAttachment) -> Option<String> {
+        use base64::Engine;
+        self.0
+            .get(&image.digest)
+            .map(|bytes| base64::engine::general_purpose::STANDARD.encode(bytes))
+    }
 }
 /// Where credentialed requests go: the profile whose vault broker holds the
 /// key, and the pairing a trusted client gave the gateway for this unlock.
@@ -598,7 +690,27 @@ fn parse_model(config: &ProviderConfig, item: &Value) -> Result<ModelInfo> {
         output_cost_per_token: price(item.pointer("/pricing/completion")),
         reasoning,
         reasoning_efforts: efforts,
+        image_input: image_input(config.api, item),
     })
+}
+/// Whether a models API item says the model accepts images. Anthropic
+/// reports a capability; OpenAI-compatible catalogs that list input
+/// modalities (OpenRouter and others) say so by omission too. Gemini's
+/// models API does not report it.
+fn image_input(api: ProviderApi, item: &Value) -> Option<bool> {
+    match api {
+        ProviderApi::Anthropic => item
+            .pointer("/capabilities/image_input/supported")
+            .and_then(Value::as_bool),
+        ProviderApi::OpenAi => {
+            let modalities = item
+                .pointer("/architecture/input_modalities")
+                .or_else(|| item.get("input_modalities"))?
+                .as_array()?;
+            Some(modalities.iter().any(|m| m.as_str() == Some("image")))
+        }
+        ProviderApi::Gemini => None,
+    }
 }
 fn valid_effort(value: &str) -> bool {
     !value.is_empty() && value.len() <= 64 && !value.chars().any(char::is_control)
@@ -647,90 +759,107 @@ pub async fn complete(
         prompt,
         info,
         tools,
+        images,
     } = ask;
     let model = thread.model.as_ref().ok_or(ProviderError::NoModel)?;
     check(model == &info.key, ProviderError::ModelMismatch)?;
-    let (url, body) = match config.api {
-        ProviderApi::OpenAi => {
-            let mut messages = vec![json!({"role": "system", "content": prompt})];
-            for message in &history(thread) {
-                openai_message(message, &mut messages);
-            }
-            // Usage arrives in a final chunk only when asked for.
-            let mut body = json!({"model": model.model, "messages": messages, "stream": true,
+    let build = |images: &ImageData| -> Result<(Url, Value)> {
+        Ok(match config.api {
+            ProviderApi::OpenAi => {
+                let mut messages = vec![json!({"role": "system", "content": prompt})];
+                for message in &history(thread) {
+                    openai_message(message, images, &mut messages);
+                }
+                // Usage arrives in a final chunk only when asked for.
+                let mut body = json!({"model": model.model, "messages": messages, "stream": true,
                 "stream_options": {"include_usage": true}});
-            if let Some(effort) = &thread.effort {
-                body["reasoning_effort"] = json!(effort);
-            }
-            if !tools.is_empty() {
-                body["tools"] = tools
+                if let Some(effort) = &thread.effort {
+                    body["reasoning_effort"] = json!(effort);
+                }
+                if !tools.is_empty() {
+                    body["tools"] = tools
                     .iter()
                     .map(|tool| json!({"type": "function", "function": {"name": tool.name, "description": tool.description, "parameters": tool.parameters}}))
                     .collect();
+                }
+                (endpoint(config, "chat/completions")?, body)
             }
-            (endpoint(config, "chat/completions")?, body)
-        }
-        ProviderApi::Anthropic => {
-            // This is a request budget, not a claim about a model's context or output capacity.
-            let budget = info.output_limit.unwrap_or(8192).min(8192);
-            let mut messages = vec![];
-            for message in &history(thread) {
-                anthropic_message(message, &mut messages);
-            }
-            let mut body = json!({"model": model.model, "system": prompt, "max_tokens": budget, "stream": true,
+            ProviderApi::Anthropic => {
+                // This is a request budget, not a claim about a model's context or output capacity.
+                let budget = info.output_limit.unwrap_or(8192).min(8192);
+                let mut messages = vec![];
+                for message in &history(thread) {
+                    anthropic_message(message, images, &mut messages);
+                }
+                let mut body = json!({"model": model.model, "system": prompt, "max_tokens": budget, "stream": true,
                 "messages": messages });
-            if let Some(effort) = &thread.effort {
-                body["output_config"] = json!({"effort": effort});
-            }
-            if !tools.is_empty() {
-                body["tools"] = tools
+                if let Some(effort) = &thread.effort {
+                    body["output_config"] = json!({"effort": effort});
+                }
+                if !tools.is_empty() {
+                    body["tools"] = tools
                     .iter()
                     .map(|tool| json!({"name": tool.name, "description": tool.description, "input_schema": tool.parameters}))
                     .collect();
+                }
+                (endpoint(config, "messages")?, body)
             }
-            (endpoint(config, "messages")?, body)
-        }
-        ProviderApi::Gemini => {
-            check(thread.effort.is_none(), ProviderError::GeminiEffort)?;
-            let resource = model
-                .model
-                .strip_prefix("models/")
-                .ok_or(ProviderError::GeminiResource)?;
-            check(
-                !resource.is_empty()
-                    && resource != "."
-                    && resource != ".."
-                    && !resource.contains('/'),
-                ProviderError::GeminiResource,
-            )?;
-            let mut url = endpoint(config, "models/")?;
-            // An http(s) endpoint always has path segments.
-            url.path_segments_mut()
-                .map_err(|()| ProviderError::Endpoint(EndpointError::Shape))?
-                .pop_if_empty()
-                .push(&format!("{resource}:streamGenerateContent"));
-            url.query_pairs_mut().append_pair("alt", "sse");
-            let mut contents = vec![];
-            for message in &history(thread) {
-                gemini_content(message, &mut contents);
-            }
-            let mut body = json!({"systemInstruction": {"parts": [{"text": prompt}]},
+            ProviderApi::Gemini => {
+                check(thread.effort.is_none(), ProviderError::GeminiEffort)?;
+                let resource = model
+                    .model
+                    .strip_prefix("models/")
+                    .ok_or(ProviderError::GeminiResource)?;
+                check(
+                    !resource.is_empty()
+                        && resource != "."
+                        && resource != ".."
+                        && !resource.contains('/'),
+                    ProviderError::GeminiResource,
+                )?;
+                let mut url = endpoint(config, "models/")?;
+                // An http(s) endpoint always has path segments.
+                url.path_segments_mut()
+                    .map_err(|()| ProviderError::Endpoint(EndpointError::Shape))?
+                    .pop_if_empty()
+                    .push(&format!("{resource}:streamGenerateContent"));
+                url.query_pairs_mut().append_pair("alt", "sse");
+                let mut contents = vec![];
+                for message in &history(thread) {
+                    gemini_content(message, images, &mut contents);
+                }
+                let mut body = json!({"systemInstruction": {"parts": [{"text": prompt}]},
                 "contents": contents });
-            // Thought summaries are returned only when asked for, and only
-            // models the API reports as thinking accept the request.
-            if info.reasoning == Some(true) {
-                body["generationConfig"] = json!({"thinkingConfig": {"includeThoughts": true}});
-            }
-            if !tools.is_empty() {
-                let declarations: Vec<_> = tools
+                // Thought summaries are returned only when asked for, and only
+                // models the API reports as thinking accept the request.
+                if info.reasoning == Some(true) {
+                    body["generationConfig"] = json!({"thinkingConfig": {"includeThoughts": true}});
+                }
+                if !tools.is_empty() {
+                    let declarations: Vec<_> = tools
                     .iter()
                     .map(|tool| json!({"name": tool.name, "description": tool.description, "parametersJsonSchema": tool.parameters}))
                     .collect();
-                body["tools"] = json!([{"functionDeclarations": declarations}]);
+                    body["tools"] = json!([{"functionDeclarations": declarations}]);
+                }
+                (url, body)
             }
-            (url, body)
-        }
+        })
     };
+    // Images are sent newest first while the request stays within what the
+    // broker carries; older ones are named in text instead.
+    let fitted;
+    let images = if images.0.is_empty() {
+        images
+    } else {
+        let (_, bare) = build(&images.without_bytes())?;
+        fitted = images.fit(
+            thread,
+            serde_json::to_vec(&bare).map_or(usize::MAX, |b| b.len()),
+        );
+        &fitted
+    };
+    let (url, body) = build(images)?;
     let mut attempt = 1;
     loop {
         let mut sink = Sink {
@@ -871,7 +1000,45 @@ fn tool_input(call: &ToolCall) -> Value {
         _ => json!({UNPARSED_ARGUMENTS: call.arguments}),
     }
 }
-fn openai_message(message: &Message, out: &mut Vec<Value>) {
+/// The text of a user message with its images, for one protocol: `encode`
+/// turns an image's media type and base64 bytes into a content part.
+fn user_parts(
+    message: &Message,
+    images: &ImageData,
+    encode: impl Fn(&str, String) -> Value,
+    text: impl Fn(String) -> Value,
+) -> Vec<Value> {
+    let mut content = text_content(message);
+    let mut parts = vec![];
+    for image in &message.images {
+        match (images.base64(image), images.1) {
+            (Some(data), _) => parts.push(encode(image.media_type.mime(), data)),
+            (None, Absent::Refused) => content.push_str(&format!(
+                "\n\n[Image {:?} was attached but is not sent: the current model's API reports that it does not accept images.]",
+                image.name
+            )),
+            (None, Absent::Size) => content.push_str(&format!(
+                "\n\n[Image {:?} was attached here but is not sent again: with the newer images, the request would be too large.]",
+                image.name
+            )),
+        }
+    }
+    if !content.is_empty() {
+        parts.push(text(content));
+    }
+    parts
+}
+fn openai_message(message: &Message, images: &ImageData, out: &mut Vec<Value>) {
+    if message.role == Role::User && !message.images.is_empty() {
+        let parts = user_parts(
+            message,
+            images,
+            |mime, data| json!({"type": "image_url", "image_url": {"url": format!("data:{mime};base64,{data}")}}),
+            |text| json!({"type": "text", "text": text}),
+        );
+        out.push(json!({"role": "user", "content": parts}));
+        return;
+    }
     let role = match message.role {
         Role::User => "user",
         Role::Assistant => "assistant",
@@ -893,8 +1060,17 @@ fn openai_message(message: &Message, out: &mut Vec<Value>) {
         out.push(json!({"role": "tool", "tool_call_id": call.id, "content": tool_result(call)}));
     }
 }
-fn anthropic_message(message: &Message, out: &mut Vec<Value>) {
+fn anthropic_message(message: &Message, images: &ImageData, out: &mut Vec<Value>) {
     match message.role {
+        Role::User if !message.images.is_empty() => {
+            let parts = user_parts(
+                message,
+                images,
+                |mime, data| json!({"type": "image", "source": {"type": "base64", "media_type": mime, "data": data}}),
+                |text| json!({"type": "text", "text": text}),
+            );
+            out.push(json!({"role": "user", "content": parts}));
+        }
         Role::User => out.push(json!({"role": "user", "content": message_content(message)})),
         Role::Assistant if message.tool_calls.is_empty() => {
             out.push(json!({"role": "assistant", "content": message_content(message)}))
@@ -919,8 +1095,17 @@ fn anthropic_message(message: &Message, out: &mut Vec<Value>) {
         Role::System | Role::Tool => {}
     }
 }
-fn gemini_content(message: &Message, out: &mut Vec<Value>) {
+fn gemini_content(message: &Message, images: &ImageData, out: &mut Vec<Value>) {
     match message.role {
+        Role::User if !message.images.is_empty() => {
+            let parts = user_parts(
+                message,
+                images,
+                |mime, data| json!({"inlineData": {"mimeType": mime, "data": data}}),
+                |text| json!({"text": text}),
+            );
+            out.push(json!({"role": "user", "parts": parts}));
+        }
         Role::User => {
             out.push(json!({"role": "user", "parts": [{"text": message_content(message)}]}))
         }
@@ -1467,13 +1652,23 @@ fn text_parts(parts: Option<&Value>, key: &str, skip_thought: bool) -> Option<St
         .collect();
     (!texts.is_empty()).then(|| texts.join(""))
 }
-pub(crate) fn message_content(message: &Message) -> String {
+/// A message's text with its text documents.
+fn text_content(message: &Message) -> String {
     let mut content = message.text.clone();
     for attachment in &message.attachments {
         content.push_str(&format!(
             "\n\nAttached text document ({:?}):\n{}",
             attachment.name, attachment.text
         ));
+    }
+    content
+}
+/// A message as text alone, for readers that receive no images: its images
+/// are named where they were attached.
+pub(crate) fn message_content(message: &Message) -> String {
+    let mut content = text_content(message);
+    for image in &message.images {
+        content.push_str(&format!("\n\n[Attached image {:?}]", image.name));
     }
     content
 }

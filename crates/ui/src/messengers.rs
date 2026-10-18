@@ -522,6 +522,7 @@ mod tests {
                 output_cost_per_token: None,
                 reasoning: None,
                 reasoning_efforts: vec![],
+                image_input: None,
             }],
             balance: None,
             balance_currency: None,

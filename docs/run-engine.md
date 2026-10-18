@@ -744,6 +744,37 @@ previous summary first.
 Tests: `crates/runtime/tests/context.rs` (scripted OpenAI, Anthropic and Gemini
 streams) and unit tests in `compaction.rs`, `memory_flush.rs` and `instructions.rs`.
 
+## Images
+
+A user message carries up to four images (PNG, JPEG, GIF or WebP, recognised
+from their bytes, at most 2 MiB each). `StageImage` stores an image's bytes in
+the state directory's `images/` folder, named by their SHA-256 digest, and
+returns the name, format, digest and size; `Send` lists those, and the message
+records only them, so images never enter the conversation snapshot. `ReadImage`
+returns the bytes for display. While the gateway runs it keeps at most 32
+staged images no message refers to, removing the oldest first; the rest, and
+partial writes, are removed when it starts. `StageImage` is not kept in the
+request journal: a retried request stores the bytes again rather than receiving
+a reply for an image that may since have been removed.
+
+`Send` checks every image is still stored exactly as staged, and refuses images
+for a coding backend or for a model whose models API reports that it does not
+accept them (Anthropic's `capabilities.image_input`, or `input_modalities` in
+OpenAI-compatible catalogs such as OpenRouter). Gemini's models API does not
+report it; unreported support is left to the provider, whose refusal reaches the
+client as a provider error. Each round reads the images again, so one changed or
+removed on disk fails the run with a typed error rather than being sent.
+
+Images go in each protocol's own form: an `image_url` data URL part (OpenAI
+compatible), a base64 `image` block (Anthropic) or an `inlineData` part
+(Gemini), before the message text. They are sent newest first while the request
+stays within what the vault broker carries (a little under 4 MiB, so the same
+request fits whether or not its credential is brokered); an older image left
+out is named in its message's text as not resent. An image attached to several
+messages is sent with each of them or with none, and counted once per message. After the conversation's
+model changes to one whose API reports no image input, earlier images are named
+as not sent. Compaction summaries and coding backends see image names only.
+
 ## Retrying model requests
 
 `crates/runtime/src/retry.rs`. A model request (a round or a compaction summary) is

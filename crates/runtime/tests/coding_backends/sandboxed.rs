@@ -332,6 +332,7 @@ pub async fn drives_both_agent_protocols_in_the_real_os_sandbox() {
                     thread: thread.id,
                     text: Id::new_v4().to_string(),
                     attachments: vec![],
+                    images: vec![],
                 },
             ),
         )
@@ -419,6 +420,7 @@ pub async fn drives_both_agent_protocols_in_the_real_os_sandbox() {
                     thread: id,
                     text: behavior.into(),
                     attachments: vec![],
+                    images: vec![],
                 },
             )
             .await
@@ -579,6 +581,7 @@ pub async fn drives_both_agent_protocols_in_the_real_os_sandbox() {
                 thread: project.manager,
                 text: behavior.into(),
                 attachments: vec![],
+                images: vec![],
             },
         )
         .await

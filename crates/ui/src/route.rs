@@ -594,6 +594,7 @@ pub(crate) mod tests {
                     let unsent = crate::conversation::Unsent {
                         text: text.clone(),
                         attachments: vec![],
+                        images: vec![],
                     };
                     (*id, unsent)
                 })
