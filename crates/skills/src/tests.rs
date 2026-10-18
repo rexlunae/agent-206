@@ -351,3 +351,49 @@ fn package_scan_refuses_symlinked_supporting_files_and_directories() {
     let _socket = std::os::unix::net::UnixListener::bind(root.path().join("one/socket")).unwrap();
     assert!(matches!(load(root.path(), "one"), Err(SkillError::Path)));
 }
+
+#[test]
+fn approved_snapshot_paths_use_validated_normalized_components() {
+    let root = tempfile::tempdir().unwrap();
+    let main = skill_text("one", "");
+    write(root.path(), "one", &main);
+    std::fs::create_dir(root.path().join("one/refs")).unwrap();
+    std::fs::write(root.path().join("one/refs/guide.md"), "Reviewed guide").unwrap();
+    let digest = load(root.path(), "one").unwrap().0.digest;
+    for path in [
+        "refs/guide.md",
+        "refs/./guide.md",
+        "refs//guide.md",
+        "refs///./guide.md",
+    ] {
+        assert_eq!(
+            read_approved_file(root.path(), "one", path, &digest).unwrap(),
+            b"Reviewed guide",
+            "{path}"
+        );
+    }
+    assert_eq!(
+        read_approved_file(root.path(), "one", "SKILL.md/.", &digest).unwrap(),
+        main.as_bytes()
+    );
+    for path in [
+        "",
+        "/refs/guide.md",
+        "refs/../refs/guide.md",
+        "./refs/guide.md",
+        "refs\\guide.md",
+    ] {
+        assert!(
+            matches!(
+                read_approved_file(root.path(), "one", path, &digest),
+                Err(SkillError::Path)
+            ),
+            "{path}"
+        );
+    }
+    std::fs::write(root.path().join("one/refs/guide.md"), "Changed").unwrap();
+    assert!(matches!(
+        read_approved_file(root.path(), "one", "refs/./guide.md", &digest),
+        Err(SkillError::Changed)
+    ));
+}

@@ -130,12 +130,12 @@ impl Gateway {
 
     /// A supporting file inside an approved skill, by relative path.
     pub fn skill_file(&self, thread: Id, name: &str, path: &str) -> Result<Vec<u8>> {
-        let skill = self.approved_skill(thread, name)?;
+        let pins = self.skill_pins(thread)?;
         Ok(a206_skills::read_approved_file(
             &self.skills_root()?,
             name,
             path,
-            &skill.digest,
+            pins.get(name).ok_or(SkillError::Disabled)?,
         )?)
     }
 }

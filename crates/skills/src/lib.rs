@@ -366,14 +366,21 @@ pub fn read_approved_file(
     {
         return Err(SkillError::Path);
     }
+    // std::path accepts internal `.` and redundant separators. Use those
+    // validated components for the snapshot key, not the original spelling.
+    let key = Path::new(relative)
+        .components()
+        .map(|component| component.as_os_str().to_str().ok_or(SkillError::Path))
+        .collect::<Result<Vec<_>, _>>()?
+        .join("/");
     let (mut skill, text) = load(root, name)?;
     if skill.digest != digest {
         return Err(SkillError::Changed);
     }
-    if relative == "SKILL.md" {
+    if key == "SKILL.md" {
         return Ok(text.into_bytes());
     }
-    skill.files.remove(relative).ok_or(SkillError::NotFound)
+    skill.files.remove(&key).ok_or(SkillError::NotFound)
 }
 
 /// Refuse a symlink at the skill directory or any component of `relative`
