@@ -838,6 +838,60 @@ async fn deltas_are_published_in_order_while_the_stream_is_open() {
     }
 }
 #[tokio::test]
+async fn tool_call_markup_written_as_text_is_removed_from_the_reply() {
+    for api in PROTOCOLS {
+        let mut rig = Rig::new(api, false).await;
+        let info = model_info(api, rig.config.id);
+        let (intro, outro) = (Id::new_v4().to_string(), Id::new_v4().to_string());
+        let call = format!("{{\"name\": \"{}\"}}", Id::new_v4());
+        // The open tag is split across deltas, and the reply ends in text that
+        // could have begun one.
+        let chunks = [
+            format!("{intro}<tool_"),
+            format!("call>{call}</tool_call> `<tool_call>` {outro} <"),
+        ];
+        let (task, mut deltas) = spawn_complete(&rig, &info);
+        let opened = rig.requests.recv().await.unwrap();
+        let identity = Id::new_v4().as_u128();
+        let (input, output) = (
+            (identity % 1000) as u64 + 1,
+            (identity >> 64) as u64 % 1000 + 1,
+        );
+        send_split(&opened.feed, &opening_events(api, input)).await;
+        for chunk in &chunks {
+            send_split(&opened.feed, &text_event(api, chunk)).await;
+        }
+        send_split(&opened.feed, &closing_events(api, input, output)).await;
+        drop(opened.feed);
+        let (text, _) = task.await.unwrap().unwrap();
+        assert_eq!(text, format!("{intro} `<tool_call>` {outro} <"), "{api:?}");
+        let mut streamed = String::new();
+        while let Ok(Progress::Delta(delta)) = deltas.try_recv() {
+            streamed.push_str(&delta);
+        }
+        assert!(!streamed.contains(&call), "{api:?}: {streamed}");
+        // The held `<` is the last delta.
+        assert_eq!(streamed, text, "{api:?}");
+
+        // A reply that was nothing but a leaked call is a failed reply.
+        let (task, _deltas) = spawn_complete(&rig, &info);
+        let opened = rig.requests.recv().await.unwrap();
+        send_split(&opened.feed, &opening_events(api, input)).await;
+        send_split(
+            &opened.feed,
+            &text_event(api, &format!("<tool_call>{call}</tool_call>\n")),
+        )
+        .await;
+        send_split(&opened.feed, &closing_events(api, input, output)).await;
+        drop(opened.feed);
+        let error = task.await.unwrap().unwrap_err();
+        assert!(
+            matches!(error, provider::ProviderError::Malformed(why) if why.contains("tool call as text")),
+            "{api:?}: {error:?}"
+        );
+    }
+}
+#[tokio::test]
 async fn malformed_failed_and_truncated_streams_are_typed_errors() {
     use provider::ProviderError as P;
     for brokered in [false, true] {

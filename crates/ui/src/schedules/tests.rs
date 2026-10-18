@@ -1,5 +1,5 @@
 use super::*;
-use a206_core::{ErrorKind, ErrorReport, JobRun, Mode, Thread};
+use a206_core::{ErrorKind, ErrorReport, JobKind, JobRun, Mode, Thread};
 use dioxus::history::{History, MemoryHistory};
 use std::rc::Rc;
 
@@ -11,6 +11,7 @@ fn arbitrary(range: u64) -> u64 {
 fn job(thread: Uuid) -> Job {
     let at = 86_400 + arbitrary(4_000_000_000);
     Job {
+        kind: a206_core::JobKind::Message,
         id: Uuid::new_v4(),
         name: format!("job-{}", Uuid::new_v4().simple()),
         thread,
@@ -148,4 +149,42 @@ fn the_form_builds_exactly_the_schedule_it_shows() {
             }
         );
     }
+}
+
+#[test]
+fn heartbeat_checks_show_their_checklist_and_whether_anything_needed_attention() {
+    let thread = Thread::new(format!("t-{}", Uuid::new_v4().simple()), Mode::Chat);
+    let heartbeat = |outcome: JobOutcome| {
+        let mut job = job(thread.id);
+        job.kind = JobKind::Heartbeat;
+        job.text = String::new();
+        job.last = Some(JobRun {
+            id: Uuid::new_v4(),
+            at: job.created,
+            outcome,
+        });
+        job
+    };
+    let mut snapshot = crate::empty_snapshot();
+    snapshot.threads = vec![thread.clone()];
+    snapshot.jobs = vec![heartbeat(JobOutcome::Quiet)];
+    let quiet = render(snapshot.clone());
+    assert!(
+        quiet.contains("Heartbeat check") && quiet.contains("HEARTBEAT.md"),
+        "{quiet}"
+    );
+    assert!(quiet.contains("Nothing needed attention"), "{quiet}");
+    assert!(!quiet.contains("Needs attention"), "{quiet}");
+    snapshot.jobs = vec![heartbeat(JobOutcome::Complete)];
+    let alert = render(snapshot.clone());
+    assert!(alert.contains("Needs attention"), "{alert}");
+    // A message job that completes is simply complete.
+    let mut message = job(thread.id);
+    message.last = heartbeat(JobOutcome::Complete).last;
+    snapshot.jobs = vec![message];
+    let plain = render(snapshot);
+    assert!(
+        plain.contains(">Complete<") && !plain.contains("Needs attention"),
+        "{plain}"
+    );
 }

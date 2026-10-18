@@ -179,6 +179,8 @@ pub enum GatewayError {
     Programs(#[from] crate::exec_tool::programs::ProgramsError),
     #[error(transparent)]
     Schedule(#[from] crate::schedule::ScheduleError),
+    #[error("HEARTBEAT.md could not be read")]
+    Heartbeat(#[source] crate::instructions::InstructionError),
     #[error(transparent)]
     Search(#[from] a206_core::SearchError),
     #[error(transparent)]
@@ -266,6 +268,7 @@ impl crate::error::Classified for GatewayError {
             Self::Prompt(error) => return classify(error),
             Self::Programs(error) => return classify(error),
             Self::Schedule(error) => return classify(error),
+            Self::Heartbeat(error) => return classify(error),
             Self::Frame(error) => return classify(error),
             Self::Run(error) => return classify(error),
             Self::Compaction(error) => return classify(error),
@@ -1577,8 +1580,9 @@ impl Gateway {
                 thread,
                 text,
                 schedule,
+                kind,
             } => self
-                .schedule_job(name, thread, text, schedule, JobAuthor::User)
+                .schedule_job(name, thread, text, kind, schedule, JobAuthor::User)
                 .map(|job| Reply::Job(Box::new(job))),
             Command::SetJobEnabled { id, enabled } => self.set_job_enabled(id, enabled),
             Command::RemoveJob { id } => self.remove_job(id),

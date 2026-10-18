@@ -6,6 +6,34 @@ journaled and run like a message the user typed, under the conversation's grants
 mode, models, tool permissions and budget as they are when it fires. Narrowing any
 of those applies to the next run; a job never carries authority of its own.
 
+## Heartbeat checks
+
+A job with `kind: Heartbeat` is RustyClaw's heartbeat, run by the same
+scheduler. When it runs, the gateway reads `HEARTBEAT.md` at the conversation's
+project root (at most 32 KiB, through the same confined reader as the project
+instruction files, and only if the conversation's grants include reading the
+project at that moment) and sends it as one message asking the model to work
+through the checklist and reply with exactly `HEARTBEAT_OK` when nothing needs
+attention. The message names the run's ID, so a restart can tell which run sent
+it. The grant is checked again after the file is read. The checklist is read
+only there: instruction files never include it.
+
+- No project, no read grant, or no `HEARTBEAT.md`: the run is `Refused` with
+  the reason (`NotFound` or `PermissionDenied`) and nothing is sent.
+- A larger `HEARTBEAT.md` whose first 32 KiB are blank: `Refused`, since the
+  rest was not read.
+- An empty or blank `HEARTBEAT.md`: the run is `Quiet` and nothing is sent, so a
+  checklist can be paused by emptying it.
+- A reply of exactly `HEARTBEAT_OK` (surrounding whitespace aside): `Quiet`.
+  Any other reply is `Complete` and shown as needing attention; the reply is in
+  the conversation. Messages steered in after the run's last round do not
+  count as its reply.
+
+Heartbeat jobs take no text (`text` must be empty). The conversation keeps the
+check and its reply like any other turn; compaction keeps long-running ones
+small. RustyClaw's unwired `subconscious.rs` decider loop is not ported: a
+heartbeat is an ordinary run with the conversation's model, grants and budget.
+
 ## Schedules
 
 | Schedule | Meaning |
@@ -22,7 +50,8 @@ are 24 and 168 hours, and months and years, which have no fixed length, are
 refused.
 
 If the gateway stops while a job's run is starting, the next start settles it:
-when the conversation received the message, the run ends as the conversation
+when the conversation received the message (for a heartbeat, the check message
+naming that run's ID), the run ends as the conversation
 shows (its current run's state while that message is the latest, otherwise
 complete if a reply followed it); when it did not, the job is due again at once, so the message is sent
 exactly once.
@@ -35,8 +64,9 @@ the system) pauses the job and records why.
 
 ## Commands
 
-- `ScheduleJob { name, thread, text, schedule }` adds an enabled job
-  (`Reply::Job`). Names are 1–200 bytes, texts 1–128 KiB, at most 256 jobs.
+- `ScheduleJob { name, thread, text, schedule, kind }` adds an enabled job
+  (`Reply::Job`). Names are 1–200 bytes, message texts 1–128 KiB, at most 256
+  jobs; `kind` is `Message` (the default) or `Heartbeat`, which takes no text.
 - `SetJobEnabled { id, enabled }` pauses or resumes it.
 - `RunJob { id }` runs it now and leaves its schedule as it is.
 - `RemoveJob { id }` deletes it; its conversation keeps what it sent.
@@ -44,11 +74,13 @@ the system) pauses the job and records why.
 Jobs are in `Snapshot::jobs`, and each change publishes `JobChanged { id }`.
 `Job::last` records the latest run, with its own ID so a late result of an
 earlier run never replaces a newer one: `Running`, `Complete`, `Failed` (the
-conversation shows the failure), `Cancelled` or `Refused` with the gateway's
+conversation shows the failure), `Cancelled`, `Quiet` (a heartbeat check that
+found nothing needing attention) or `Refused` with the gateway's
 report when the message was not run, for example because the conversation was
 busy or had no model.
 
-CLI: `agent206 schedule list`, `schedule add THREAD --name N --text T` with one
+CLI: `agent206 schedule list`, `schedule add THREAD --name N --text T` (or
+`--heartbeat` instead of `--text`) with one
 of `--at RFC3339`, `--in 90m`, `--every 90m [--anchor RFC3339]` or `--cron EXPR [--zone Z]`,
 and `schedule pause|resume|run|remove ID`. Times and intervals are parsed by
 `a206_core::schedule::{parse_instant, parse_interval}`, shared with the page below.
@@ -58,7 +90,8 @@ and `schedule pause|resume|run|remove ID`. Times and intervals are parsed by
 Desktop, TUI and web share the Schedules page (`/schedules`, `crates/ui/src/schedules.rs`).
 It lists every job, soonest first, with its conversation, what its schedule means,
 who added it, its next time and its latest run (a refusal shows the gateway's
-report), and offers Pause/Resume, Run now and Remove. Its form sends `ScheduleJob`:
+report; a heartbeat check shows whether anything needed attention), and offers Pause/Resume, Run now and Remove. Its form sends `ScheduleJob`
+with a message or a heartbeat check:
 once at a date and time in an IANA zone (prefilled with the client's own zone;
 `parse_local` moves a time a clock change skips forward by the gap and takes the
 later of a repeated one), on an interval counted from now, or on a cron

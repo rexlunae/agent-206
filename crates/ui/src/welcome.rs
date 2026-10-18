@@ -6,8 +6,8 @@
 //! conversation; projects, messengers and skills follow as extras.
 use crate::{PageFrame, State, call, dispatch, error::ErrorNotice, route::Route};
 use a206_core::{
-    Command, ErrorKind, ErrorReport, GatewayPhase, GatewayReport, MessengerKind, Mode, Reply,
-    SkillSummary, Snapshot,
+    Command, ErrorKind, ErrorReport, GatewayPhase, GatewayReport, MessengerKind, MessengerState,
+    Mode, Reply, SkillSummary, Snapshot,
 };
 use fc_dioxus::prelude::*;
 
@@ -271,8 +271,11 @@ fn steps(
 /// Steps that widen what Agent 206 can reach. None is needed to start, so they
 /// stay out of the checklist count.
 /// `skills` is the gateway's last skill listing: `None` until it answers.
+/// `running` is whether the gateway reports itself running now; otherwise the
+/// snapshot's messenger states are from before it stopped.
 fn extras(
     snapshot: &Snapshot,
+    running: bool,
     skills: Option<&Result<Vec<SkillSummary>, ErrorReport>>,
 ) -> [Step; 3] {
     let done_or = |done: bool, title, detail: String, hint: String| {
@@ -284,20 +287,32 @@ fn extras(
     };
     let projects = snapshot.projects.len();
     let messengers = &snapshot.settings.messengers;
-    let enabled = messengers.iter().filter(|m| m.enabled).count();
-    [
-        done_or(
-            projects > 0,
-            "Add a project",
-            format!("Projects: {projects}."),
-            "Point a project at a folder so its conversations share a root and a coordinator."
-                .into(),
+    let enabled: Vec<_> = messengers.iter().filter(|m| m.enabled).collect();
+    // What the gateway reports for a turned-on messenger; one it has not
+    // reported yet has not started.
+    let state = |name: &str| {
+        snapshot
+            .messengers
+            .iter()
+            .find(|status| status.name == name)
+            .map_or(MessengerState::Stopped, |status| status.state)
+    };
+    let connected = enabled
+        .iter()
+        .filter(|m| state(&m.name) == MessengerState::Connected)
+        .count();
+    const MESSENGER: &str = "Connect a messenger";
+    let messenger = if !running && !enabled.is_empty() {
+        Step::new(
+            MESSENGER,
+            Progress::Unknown,
+            "The gateway is not running, so whether a messenger is connected is unknown.",
         )
-        .on(Route::Projects {}),
+    } else {
         done_or(
-            enabled > 0,
-            "Connect a messenger",
-            format!("Turned on: {enabled} of {}.", messengers.len()),
+            connected > 0,
+            MESSENGER,
+            format!("Connected: {connected} of {}.", messengers.len()),
             if messengers.is_empty() {
                 let kinds: Vec<_> = MessengerKind::ALL.iter().map(|kind| kind.label()).collect();
                 let kinds = match kinds.split_last() {
@@ -309,11 +324,30 @@ fn extras(
                 format!(
                     "Reach your agent from {kinds}. Any token it signs in with stays in the vault."
                 )
-            } else {
+            } else if enabled.is_empty() {
                 "Configured but turned off; a messenger connects only once you turn it on.".into()
+            } else {
+                let states: Vec<_> = enabled
+                    .iter()
+                    .map(|m| format!("{}: {}", m.name, state(&m.name).label()))
+                    .collect();
+                format!(
+                    "Turned on but not connected ({}). The Messengers page shows why.",
+                    states.join(", ")
+                )
             },
         )
-        .on(Route::Messengers {}),
+    };
+    [
+        done_or(
+            projects > 0,
+            "Add a project",
+            format!("Projects: {projects}."),
+            "Point a project at a folder so its conversations share a root and a coordinator."
+                .into(),
+        )
+        .on(Route::Projects {}),
+        messenger.on(Route::Messengers {}),
         skill_step(skills, done_or).on(Route::Extensions {}),
     ]
 }
@@ -404,7 +438,10 @@ pub(crate) fn Welcome() -> Element {
         .filter(|step| step.progress == Progress::Done)
         .count();
     let total = steps.len();
-    let extras = extras(&snapshot, skills.read().as_ref());
+    let gateway_running = gateway
+        .as_ref()
+        .is_some_and(|report| report.phase == GatewayPhase::Running);
+    let extras = extras(&snapshot, gateway_running, skills.read().as_ref());
     let skills_failed = skills
         .read()
         .as_ref()
@@ -651,7 +688,10 @@ mod tests {
     fn extras_are_recommended_until_the_snapshot_shows_them() {
         let none = Some(&Ok(vec![]));
         let mut snapshot = crate::empty_snapshot();
-        assert_eq!(progress(&extras(&snapshot, none)), [Progress::Optional; 3]);
+        assert_eq!(
+            progress(&extras(&snapshot, true, none)),
+            [Progress::Optional; 3]
+        );
         snapshot.projects.push(a206_core::Project {
             id: Uuid::new_v4(),
             name: text(),
@@ -660,20 +700,62 @@ mod tests {
         });
         let mut messenger = a206_core::MessengerConfig::new(text(), MessengerKind::ALL[0]);
         snapshot.settings.messengers.push(messenger.clone());
-        let [project, off, _] = extras(&snapshot, none);
+        let [project, off, _] = extras(&snapshot, true, none);
         assert_eq!(project.progress, Progress::Done);
         // Configured but off is not connected.
         assert_eq!(off.progress, Progress::Optional);
         assert!(off.detail.contains("turned off"), "{}", off.detail);
         messenger.enabled = true;
-        snapshot.settings.messengers = vec![messenger];
+        snapshot.settings.messengers = vec![messenger.clone()];
+        // Turned on is not connected: not started, failed or still connecting.
+        for state in [
+            None,
+            Some(MessengerState::Failed),
+            Some(MessengerState::Connecting),
+            Some(MessengerState::WaitingForVault),
+        ] {
+            snapshot.messengers = state
+                .map(|state| a206_core::MessengerStatus {
+                    name: messenger.name.clone(),
+                    state,
+                    account: None,
+                    failure: None,
+                    refused: vec![],
+                })
+                .into_iter()
+                .collect();
+            let [_, on, _] = extras(&snapshot, true, none);
+            assert_eq!(on.progress, Progress::Optional, "{state:?}");
+            assert!(on.detail.contains(&messenger.name), "{}", on.detail);
+        }
+        // Another messenger's connection does not count for this one.
+        snapshot.messengers[0].name = text();
+        snapshot.messengers[0].state = MessengerState::Connected;
+        assert_eq!(
+            extras(&snapshot, true, none)[1].progress,
+            Progress::Optional
+        );
+        snapshot.messengers[0].name = messenger.name.clone();
+        // A stopped gateway's last report says nothing about now.
+        snapshot.messengers[0].state = MessengerState::Connected;
+        assert_eq!(
+            extras(&snapshot, false, none)[1].progress,
+            Progress::Unknown
+        );
+        // With nothing turned on there is nothing to be unsure about.
+        snapshot.settings.messengers[0].enabled = false;
+        assert_eq!(
+            extras(&snapshot, false, none)[1].progress,
+            Progress::Optional
+        );
+        snapshot.settings.messengers[0].enabled = true;
         let enabled = Ok(vec![SkillSummary {
             name: text(),
             enabled: true,
             ..Default::default()
         }]);
         assert_eq!(
-            progress(&extras(&snapshot, Some(&enabled))),
+            progress(&extras(&snapshot, true, Some(&enabled))),
             [Progress::Done; 3]
         );
     }
@@ -681,7 +763,7 @@ mod tests {
     #[test]
     fn a_skill_counts_only_while_the_gateway_offers_it() {
         let snapshot = crate::empty_snapshot();
-        let skill = |read| extras(&snapshot, read).into_iter().last().unwrap();
+        let skill = |read| extras(&snapshot, true, read).into_iter().last().unwrap();
         assert_eq!(skill(None).progress, Progress::Checking);
         let failed = Err(ErrorReport::new(ErrorKind::Protocol, text()));
         assert_eq!(skill(Some(&failed)).progress, Progress::Unknown);
