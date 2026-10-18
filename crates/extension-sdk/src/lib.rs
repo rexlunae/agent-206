@@ -383,6 +383,15 @@ pub mod host {
             _ => Err(unexpected()),
         }
     }
+    /// Commit everything the index holds on top of `HEAD`.
+    pub fn git_commit_staged(message: &str) -> Result<GitCommit, HostFailure> {
+        match call(&HostRequest::GitCommitStaged {
+            message: message.into(),
+        })? {
+            HostReply::Committed(commit) => Ok(commit),
+            _ => Err(unexpected()),
+        }
+    }
     /// Stage the working-tree content of exactly `paths`, or with
     /// `unstage`, set them back to `HEAD`. Only the index changes.
     pub fn git_stage(paths: &[&str], unstage: bool) -> Result<(), HostFailure> {

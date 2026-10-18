@@ -1176,6 +1176,25 @@ async fn git_tools_run_once_the_conversation_is_granted_git() {
         assert_eq!(head.message_raw().unwrap().to_string().trim(), message);
     }
 
+    // And commits what is staged.
+    rig.tool = tool_name(GIT, "git_commit");
+    let message = nonce();
+    let commit = Call::new(&rig.tool, json!({ "message": message, "staged": true }));
+    let (thread, _) = rig.round_trip(&[commit]).await;
+    let record = calls_of(&thread).last().unwrap().clone();
+    assert_eq!(record.state, ToolCallState::Succeeded, "{:?}", record.error);
+    {
+        let repo = gix::open(rig.workspace.path()).unwrap();
+        let head = repo.head_commit().unwrap();
+        assert_eq!(head.message_raw().unwrap().to_string().trim(), message);
+        let tree = head.tree().unwrap();
+        let entry = tree.lookup_entry_by_path(&rig.file.0).unwrap().unwrap();
+        assert_eq!(
+            repo.find_object(entry.object_id()).unwrap().data,
+            changed.as_bytes()
+        );
+    }
+
     // The network alone needs no project, unlike everything else.
     let Reply::Thread(research) = rig
         .run(Command::CreateThread {
