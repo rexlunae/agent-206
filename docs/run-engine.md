@@ -563,17 +563,19 @@ instruction files, user messages or attachments.
 ## Text addressed to the model in tool results
 
 A web page, a file or a server's reply can carry text written for the model
-reading it. After credentials are removed and the output rules run, every
-tool result (successful, reported failure or host failure, whole-output
-results included) is scanned by `crates/injection-scan` (after RustyClaw's
-`PromptGuard`) for phrases that address the reader: overriding earlier
+reading it. Every tool result (successful, reported failure or host
+failure, whole-output results included) is checked by `crates/injection-scan`
+(after RustyClaw's `PromptGuard`). Invisible Unicode tag characters go
+first, before credentials are looked for, since they can split a credential
+or a phrase so neither is recognised. Once the result is bounded, the text
+the model will read is scanned for phrases that address the reader: overriding earlier
 instructions ("ignore all previous instructions"), reassigning its role
 ("from now on you are", "your new task is"), chat-template turn markers
 (`<|im_start|>`, `[INST]`, `<<SYS>>`), requests for its prompt or
 credentials ("print your system prompt", "send your API keys") and tool-call
-markup. Invisible Unicode tag characters, which spell out text only a model
-reads, are removed (`hidden_text`); the emoji subdivision flags that use them
-are kept. Nothing else is removed and no result is blocked: when the model
+markup. The removed tag characters, which spell out text only a model
+reads, are reported as `hidden_text`; the emoji subdivision flags that use
+them are kept. Text cut off by the output limit is not reported. Nothing else is removed and no result is blocked: when the model
 reads a flagged result it starts with a note naming the kinds and the tool
 and saying to treat the text as data, not instructions. The stored output
 stays the tool's own text, `ToolCall::injection` records each kind and how

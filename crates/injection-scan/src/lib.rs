@@ -4,11 +4,12 @@
 //! A web page, a file or a server's reply can carry text written for the
 //! model that reads it ("ignore your previous instructions"), turn markers
 //! of a chat template, tool-call markup, or characters the user cannot see.
-//! [`scan`] reports which of these kinds a result contains and how often,
-//! and removes the invisible Unicode tag characters, which carry text only a
-//! model reads. Everything else is kept: the gateway marks the result for
-//! the model and shows the kinds beside it, so the user can tell what the
-//! tool returned. A result is never blocked for what it says.
+//! [`find`] reports which of these kinds a result contains and how often,
+//! and [`remove_hidden`] removes the invisible Unicode tag characters, which
+//! carry text only a model reads. Everything else is kept: the gateway
+//! marks the result for the model and shows the kinds beside it, so the
+//! user can tell what the tool returned. A result is never blocked for what
+//! it says.
 //!
 //! Matching is by phrase and is advisory: wording that avoids the phrases
 //! is not found, and quoted examples are found too. The phrases address the
@@ -37,7 +38,7 @@ pub const HIDDEN_TEXT: &str = "hidden_text";
 /// Tool-call markup, as a model would write it.
 pub const TOOL_CALL_MARKUP: &str = "tool_call_markup";
 
-/// The phrases [`scan`] reports, by kind. Several patterns may share one.
+/// The phrases [`find`] reports, by kind. Several patterns may share one.
 const PATTERNS: [(&str, &str); 6] = [
     (
         "instruction_override",
@@ -85,15 +86,7 @@ pub struct Found {
     pub count: u64,
 }
 
-/// A result without its hidden text, and the kinds found in it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Scanned {
-    pub text: String,
-    /// The kinds found, in name order, each once.
-    pub found: Vec<Found>,
-}
-
-/// The names of the kinds [`scan`] can report, in name order.
+/// The names of the kinds that can be reported, in name order.
 pub fn kinds() -> Vec<&'static str> {
     let mut names: Vec<_> = PATTERNS.iter().map(|(name, _)| *name).collect();
     names.push(HIDDEN_TEXT);
@@ -102,32 +95,23 @@ pub fn kinds() -> Vec<&'static str> {
     names
 }
 
-/// `text` without its hidden text and with the kinds it contains, or
-/// `None` when it contains none.
-pub fn scan(text: &str) -> Option<Scanned> {
-    let (text, hidden) = match without_hidden(text) {
-        Some((text, runs)) => (text, runs),
-        None => (text.to_owned(), 0),
-    };
+/// The phrases in `text` that address the model, by kind in name order.
+/// Run it on the text the model will read, after [`remove_hidden`]: hidden
+/// characters can split a phrase.
+pub fn find(text: &str) -> Vec<Found> {
     let mut found: Vec<Found> = Vec::new();
-    let mut add = |kind: &'static str, count: u64| {
+    for (kind, pattern) in KINDS.iter() {
+        let count = pattern.find_iter(text).count() as u64;
         if count == 0 {
-            return;
+            continue;
         }
-        match found.iter_mut().find(|found| found.kind == kind) {
+        match found.iter_mut().find(|found| found.kind == *kind) {
             Some(found) => found.count += count,
             None => found.push(Found { kind, count }),
         }
-    };
-    add(HIDDEN_TEXT, hidden);
-    for (kind, pattern) in KINDS.iter() {
-        add(kind, pattern.find_iter(&text).count() as u64);
-    }
-    if found.is_empty() {
-        return None;
     }
     found.sort_by_key(|found| found.kind);
-    Some(Scanned { text, found })
+    found
 }
 
 /// The waving black flag that begins an emoji tag sequence.
@@ -139,13 +123,15 @@ fn is_tag(c: char) -> bool {
     ('\u{E0000}'..='\u{E007F}').contains(&c)
 }
 
-/// `text` without runs of Unicode tag characters, and how many runs went,
-/// or `None` when it has none. Tag characters are invisible and spell out
-/// ASCII a model reads; their one visible use, the subdivision flags (a
-/// black flag, tag letters, a cancel tag), is kept.
-fn without_hidden(text: &str) -> Option<(String, u64)> {
+/// `text` without runs of Unicode tag characters, and how many runs went.
+/// Tag characters are invisible and spell out ASCII a model reads; they
+/// can also split a credential or a phrase so neither is recognised, so
+/// they go before anything else looks at a result. Their one visible use,
+/// the subdivision flags (a black flag, tag letters, a cancel tag), is
+/// kept, and tags right after a flag's cancel tag are a run of their own.
+pub fn remove_hidden(text: String) -> (String, u64) {
     if !text.chars().any(is_tag) {
-        return None;
+        return (text, 0);
     }
     let mut out = String::with_capacity(text.len());
     let mut runs = 0;
@@ -161,20 +147,23 @@ fn without_hidden(text: &str) -> Option<(String, u64)> {
         while let Some(next) = chars.next_if(|next| is_tag(*next)) {
             run.push(next);
         }
-        let flag = previous == Some(BLACK_FLAG)
-            && run.len() > 1
-            && run.last() == Some(&CANCEL_TAG)
-            && run[..run.len() - 1]
+        let mut rest = &run[..];
+        if previous == Some(BLACK_FLAG)
+            && let Some(cancel) = run.iter().position(|c| *c == CANCEL_TAG)
+            && cancel > 0
+            && run[..cancel]
                 .iter()
-                .all(|c| ('\u{E0020}'..='\u{E007E}').contains(c));
-        if flag {
-            out.extend(run);
-        } else {
+                .all(|c| ('\u{E0020}'..='\u{E007E}').contains(c))
+        {
+            out.extend(&run[..=cancel]);
+            rest = &run[cancel + 1..];
+        }
+        if !rest.is_empty() {
             runs += 1;
         }
         previous = None;
     }
-    Some((out, runs))
+    (out, runs)
 }
 
 #[cfg(test)]
