@@ -117,7 +117,7 @@ pub fn preview(root: &Path, settings: &Settings) -> Result<Preview> {
         // Agent 206 appends messages/models, so preserve that exact prefix.
         let valid = a206_core::providers::base_url(&endpoint).is_ok();
         let base_url = if valid && !config.env.routing {
-            format!("{}/v1", endpoint.trim_end_matches('/'))
+            format!("{}/v1", endpoint.strip_suffix('/').unwrap_or(&endpoint))
         } else {
             String::new()
         };
@@ -201,6 +201,28 @@ mod tests {
         )
         .unwrap();
         root
+    }
+    #[test]
+    fn sdk_request_prefix_keeps_custom_paths_and_repeated_trailing_slashes() {
+        for (base, expected) in [
+            ("https://example.test", "https://example.test/v1"),
+            (
+                "https://example.test/proxy/",
+                "https://example.test/proxy/v1",
+            ),
+            (
+                "https://example.test/proxy//",
+                "https://example.test/proxy//v1",
+            ),
+            ("https://example.test/v1", "https://example.test/v1/v1"),
+        ] {
+            let result = preview(
+                source(serde_json::json!({"env":{"ANTHROPIC_BASE_URL":base}})).path(),
+                &Settings::default(),
+            )
+            .unwrap();
+            assert_eq!(result.providers[0].base_url, expected);
+        }
     }
     #[test]
     fn only_explicit_endpoint_is_carried_over_without_authority_or_model_facts() {
