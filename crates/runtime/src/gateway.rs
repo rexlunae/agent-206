@@ -28,8 +28,10 @@ pub use mcp_servers::{McpOffer, McpOffers};
 pub use run::{OUTPUT_RULES, RunError, ToolError};
 mod delegation;
 mod plans;
+mod pushes;
 mod schedules;
 pub use plans::Plans;
+pub use pushes::Pushes;
 mod imports;
 mod pause;
 mod profiles;
@@ -617,6 +619,10 @@ impl Gateway {
         // permits it, and then still approved by the user call by call.
         let message_tools = Arc::new(crate::message_tool::MessageHost::new(gateway.outbox()));
         Arc::make_mut(&mut gateway.tool_hosts).push(message_tools);
+        // Pushing git branches, denied in each conversation until the user
+        // permits it, and then still approved by the user call by call.
+        let push_tools = Arc::new(crate::git_push::PushHost::new(gateway.pushes()));
+        Arc::make_mut(&mut gateway.tool_hosts).push(push_tools);
         // The plan tool, denied in each conversation until the user permits it.
         let plan_tools = Arc::new(crate::plan_tool::PlanHost::new(gateway.plans()));
         Arc::make_mut(&mut gateway.tool_hosts).push(plan_tools);
@@ -811,6 +817,7 @@ impl Gateway {
     fn save_settings(&self, mut settings: Box<Settings>) -> Result<Reply> {
         provider::validate_presets(&settings.provider_presets)?;
         messengers::validate(&settings.messengers)?;
+        pushes::validate(&mut settings.git_credentials)?;
         let mut backend_kinds = BTreeSet::new();
         for backend in &settings.backends {
             crate::backends::validate_config(backend)?;

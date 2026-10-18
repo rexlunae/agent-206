@@ -168,6 +168,24 @@ impl Settings {
             .string(key)
             .or_else(|| self.user.string(key))
     }
+    /// Whether a `url.<base>.insteadOf` or `pushInsteadOf` rule, which git
+    /// applies to remote URLs, matches `url`.
+    pub(super) fn rewrites(&self, url: &str) -> bool {
+        [&self.repository, &self.user].into_iter().any(|config| {
+            config
+                .sections_by_name("url")
+                .into_iter()
+                .flatten()
+                .any(|section| {
+                    ["insteadOf", "pushInsteadOf"].iter().any(|key| {
+                        section
+                            .values(key)
+                            .iter()
+                            .any(|prefix| !prefix.is_empty() && url.as_bytes().starts_with(prefix))
+                    })
+                })
+        })
+    }
     /// An unreadable value counts as `true`, so it never weakens a check.
     fn flag(&self, key: &str) -> Option<bool> {
         let read = |config: &gix::config::File| config.boolean(key).unwrap_or(Some(true));
