@@ -162,22 +162,18 @@ async fn refused_branches_create_nothing() {
 
 #[tokio::test]
 async fn long_nested_names_are_accepted_to_a_depth() {
-    use crate::extension_host::git_branch::MAX_BRANCH_FOLDERS;
     let (dir, store) = store();
     let root = &project(dir.path());
     branchable(root);
     let mut host = writer(&store, root);
-    // Longer than 255 bytes in all, as git allows.
+    // The documented limit is 20 folders. Longer than 255 bytes in all,
+    // as git allows.
     let folder = unique("f");
-    let deepest = format!(
-        "{}{}",
-        format!("{folder}/").repeat(MAX_BRANCH_FOLDERS),
-        unique("b")
-    );
+    let deepest = format!("{}{}", format!("{folder}/").repeat(20), unique("b"));
     assert!(deepest.len() > 255);
     let reply = host.handle(create(&deepest, None)).await;
     assert!(matches!(reply, HostReply::Branch(_)), "{reply:?}");
-    let deeper = format!("{}{}", "a/".repeat(MAX_BRANCH_FOLDERS + 1), unique("b"));
+    let deeper = format!("{}{}", "a/".repeat(21), unique("b"));
     assert_eq!(
         code(host.handle(create(&deeper, None)).await),
         Some(HostErrorCode::Invalid)

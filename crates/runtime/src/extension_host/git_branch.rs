@@ -187,7 +187,11 @@ fn nests(repo: &gix::Repository, name: &str) -> Result<bool, HostFailure> {
     let mut inside = references
         .prefixed(below.as_str())
         .map_err(|e| git_failure("branches", &e))?;
-    Ok(inside.next().is_some())
+    inside
+        .next()
+        .transpose()
+        .map(|reference| reference.is_some())
+        .map_err(|e| git_failure("branches", &e))
 }
 
 /// `refs/heads/<name>`, for a name `git branch` accepts.
