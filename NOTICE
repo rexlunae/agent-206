@@ -19,7 +19,9 @@ plugins/memory), and the key names and escape sequences of background
 process keystrokes (`process_manager.rs` `translate_keys`), and the tool-output
 rule model and shipped rules (`crates/tokenjuice`; crates/output-rules), and
 the credential kinds removed from tool results
-(`security/leak_detector.rs`; crates/leak-scan) are adapted from
+(`security/leak_detector.rs`; crates/leak-scan), and the leaked tool-call
+tags removed from streamed reply text and their streaming hold-back
+(`tool_healing.rs` `StreamSanitizer`; runtime/src/markup.rs) are adapted from
 RustyClaw,
 https://github.com/rexlunae/RustyClaw,
 Copyright (c) 2026 Erica Stith, MIT License (included in LICENSE).
