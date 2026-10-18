@@ -82,6 +82,8 @@ pub enum AuditField {
     ToolDescription,
     ParameterDescription,
     PanelTitle,
+    TriggerName,
+    TriggerDescription,
 }
 impl AuditField {
     pub fn label(self) -> &'static str {
@@ -92,6 +94,8 @@ impl AuditField {
             Self::ToolDescription => "tool description",
             Self::ParameterDescription => "parameter description",
             Self::PanelTitle => "panel title",
+            Self::TriggerName => "trigger name",
+            Self::TriggerDescription => "trigger description",
         }
     }
 }

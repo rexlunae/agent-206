@@ -6,7 +6,7 @@
 //! authorizes them.
 use a206_extension_abi::{
     Call, EXPORT_BUFFER, EXPORT_INVOKE, EXPORT_MEMORY, HostReply, HostRequest, IMPORT_HOST_CALL,
-    IMPORT_HOST_TAKE, IMPORT_MODULE, Invocation, Outcome, ViewError,
+    IMPORT_HOST_TAKE, IMPORT_MODULE, Invocation, MAX_TRIGGER_CURSOR, Outcome, ViewError,
 };
 use serde::{Deserialize, Serialize};
 use wasmi::{
@@ -120,6 +120,8 @@ pub enum EngineError {
     WrongOutcome { expected: &'static str },
     #[error("extension panel is invalid")]
     View(#[source] ViewError),
+    #[error("extension trigger kept more than {MAX_TRIGGER_CURSOR} bytes for its next check")]
+    Cursor,
 }
 
 /// Why a host function trapped. The interpreter only carries an opaque
@@ -341,9 +343,23 @@ fn execute<B: HostBridge + 'static>(
     let outcome: Outcome = a206_protocol::decode_payload(&output).map_err(EngineError::Output)?;
     match (&invocation.call, &outcome) {
         (_, Outcome::Failed(_)) | (Call::Tool { .. }, Outcome::Tool(_)) => {}
+        (Call::Trigger { .. }, Outcome::Trigger(output)) => {
+            if output
+                .cursor
+                .as_ref()
+                .is_some_and(|c| c.len() > MAX_TRIGGER_CURSOR)
+            {
+                return Err(EngineError::Cursor);
+            }
+        }
         (Call::Panel { .. }, Outcome::Panel(view)) => view.validate().map_err(EngineError::View)?,
         (Call::Tool { .. }, _) => return Err(EngineError::WrongOutcome { expected: "tool" }),
         (Call::Panel { .. }, _) => return Err(EngineError::WrongOutcome { expected: "panel" }),
+        (Call::Trigger { .. }, _) => {
+            return Err(EngineError::WrongOutcome {
+                expected: "trigger",
+            });
+        }
     }
     Ok(outcome)
 }

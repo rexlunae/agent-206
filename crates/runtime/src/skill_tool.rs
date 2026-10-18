@@ -272,6 +272,7 @@ impl ToolHost for SkillToolHost {
                     Scope {
                         workspace: None,
                         ceiling: Some(scope.capabilities.clone()),
+                        current: None,
                     },
                 )
                 .await

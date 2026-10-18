@@ -2,7 +2,7 @@
 //! so the scheduler's decisions are tested without a clock.
 use a206_core::{
     Delivery, ErrorKind, ErrorReport, Job, JobKind, JobOutcome, Role, RunState, Schedule, Thread,
-    schedule::{heartbeat_run, is_heartbeat_ok},
+    schedule::{check_run, is_heartbeat_ok},
 };
 use jiff::{Timestamp, tz::TimeZone};
 use std::str::FromStr;
@@ -151,9 +151,11 @@ pub fn recover(jobs: &mut [Job], threads: &[Thread]) {
                 && m.at >= run.at
                 && match job.kind {
                     JobKind::Message => m.text == job.text,
-                    // Its text is built from HEARTBEAT.md when it runs,
-                    // and names the run that sent it.
-                    JobKind::Heartbeat => heartbeat_run(&m.text) == Some(run.id),
+                    // Its text is built from HEARTBEAT.md or the trigger's
+                    // report when it runs, and names the run that sent it.
+                    JobKind::Heartbeat | JobKind::Trigger { .. } => {
+                        check_run(&m.text) == Some(run.id)
+                    }
                 }
         });
         // The run's own outcome is the conversation's only while its message
@@ -209,7 +211,7 @@ pub fn recover(jobs: &mut [Job], threads: &[Thread]) {
                 job.next = Some(job.next.map_or(run.at, |next| next.min(run.at)));
                 JobOutcome::Refused(ErrorReport::new(
                     ErrorKind::Unavailable,
-                    "The gateway restarted before sending this message; it is sent again.",
+                    "The gateway restarted before this run sent its message; it runs again.",
                 ))
             }
         };

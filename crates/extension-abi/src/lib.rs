@@ -10,7 +10,7 @@
 //! `docs/plugin-api.md` documents the calling sequence.
 #![forbid(unsafe_code)]
 use serde::{Deserialize, Serialize};
-use serde_bytes::ByteBuf;
+pub use serde_bytes::ByteBuf;
 use std::collections::BTreeMap;
 
 /// The ABI version this crate describes. Manifests and invocations carry it.
@@ -49,6 +49,15 @@ pub enum Call {
     /// Render a panel the manifest declares, optionally after a user event
     /// on an element of an earlier rendering.
     Panel { id: String, event: Option<UiEvent> },
+    /// Check a trigger the manifest declares, for the scheduled job `job`,
+    /// with arguments the host has already checked against its parameters.
+    /// `cursor` is what the previous check of this job returned, if any.
+    Trigger {
+        name: String,
+        job: String,
+        args: Args,
+        cursor: Option<ByteBuf>,
+    },
 }
 pub type Args = BTreeMap<String, Value>;
 
@@ -119,6 +128,7 @@ impl ParamKind {
 pub enum Outcome {
     Tool(ToolOutput),
     Panel(View),
+    Trigger(TriggerOutput),
     /// The guest handled the call and reports a failure of its own.
     Failed(GuestError),
 }
@@ -126,6 +136,19 @@ pub enum Outcome {
 pub struct ToolOutput {
     /// Model-facing text. It is extension output, never instructions.
     pub text: String,
+}
+
+/// Most bytes of [`TriggerOutput::cursor`].
+pub const MAX_TRIGGER_CURSOR: usize = 4096;
+/// What one check of a trigger found.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TriggerOutput {
+    /// What happened, when the trigger fired; `None` when it did not. It is
+    /// extension output, never instructions.
+    pub fired: Option<String>,
+    /// What the next check of the same job receives as its cursor, at most
+    /// [`MAX_TRIGGER_CURSOR`] bytes; `None` clears it.
+    pub cursor: Option<ByteBuf>,
 }
 
 /// A failure the guest reports. `code` is a stable guest-defined identifier.
