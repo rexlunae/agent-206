@@ -47,6 +47,13 @@ pub enum MessengerAction {
     Connect { name: String },
     /// Disconnect a messenger until the next connect or gateway restart.
     Disconnect { name: String },
+    /// Post a short test message to an enabled webhook, or with --chat to
+    /// an allowed chat of a connected messenger.
+    Test {
+        name: String,
+        #[arg(long)]
+        chat: Option<String>,
+    },
 }
 
 #[derive(clap::Args)]
@@ -195,7 +202,8 @@ fn edit(mut settings: Settings, action: MessengerAction) -> Result<Option<Settin
         }
         MessengerAction::List
         | MessengerAction::Connect { .. }
-        | MessengerAction::Disconnect { .. } => return Ok(None),
+        | MessengerAction::Disconnect { .. }
+        | MessengerAction::Test { .. } => return Ok(None),
     }
     Ok(Some(settings))
 }
@@ -204,6 +212,12 @@ pub async fn run(client: &Client, action: MessengerAction) -> Result<()> {
     let command = match action {
         MessengerAction::Connect { name } => Command::ConnectMessenger { name },
         MessengerAction::Disconnect { name } => Command::DisconnectMessenger { name },
+        MessengerAction::Test { name, chat } => Command::SendTestMessage {
+            destination: match chat {
+                Some(chat) => format!("{name}/{chat}"),
+                None => name,
+            },
+        },
         action => {
             let snapshot = match client.call(Command::Snapshot).await? {
                 Reply::Snapshot(snapshot) => snapshot,
