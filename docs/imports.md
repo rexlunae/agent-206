@@ -91,6 +91,27 @@ inactive authority, disabled messenger restrictions, replay and receipt failures
 are tested against the actual isolated reader and gateway; the CLI is tested
 through the real binary. Rollback and GUI vault migration remain planned.
 
+### Vault source identity (library foundation)
+
+`a206_vault::Vault::review_import` reads a regular, bounded source file without
+decrypting it or creating a target, returning only its byte count and SHA-256.
+Source opening on Unix uses no-follow/nonblocking flags and validates the opened
+handle, so a final symlink or FIFO cannot bypass the regular-file check. Source
+imports fail explicitly on platforms without this safe opening implementation.
+`import_reviewed` rereads the source once and checks that identity before any
+staging or authentication. It stages the same checked buffer, so an edit after
+the check cannot change the imported vault. Each TOTP retry checks the source
+again. A changed source leaves the target absent and locked; existing targets
+remain protected. Password, enrolled TOTP, replay protection and policy checks
+still run on the private copy. The identity is not evidence of a valid vault.
+
+This is a tested library primitive, not a broker command or GUI migration flow.
+The existing CLI and broker still use the legacy import operation. The next
+integration must hold the reviewed identity in the broker, use versioned native
+and encrypted setup requests, refuse older peers rather than falling back to an
+unguarded import, and expose an explicit review/apply flow before claiming GUI
+vault migration. Vault rollback and key-file migration remain pending.
+
 ### Isolated source reader
 
 The CLI launches `a206_runtime::imports::preview`: a fresh copy of the current

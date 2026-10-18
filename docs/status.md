@@ -237,3 +237,16 @@ Reload restores current values, gateway endpoint rejection retains the draft
 and error, and successful edits appear immediately and reload correctly. No
 vault, real credentials, model calls or grants were created. Native desktop/TUI
 interaction remains unverified.
+
+## Vault source identity (2026-10-18)
+
+The vault library now offers bounded, read-only source identity capture and
+reviewed import of exactly those bytes. A changed source is refused before
+staging; TOTP retries recheck it. The existing private-copy authentication,
+policy preservation and target no-replace behavior are shared with legacy
+import. Tests cover equal-length source changes, size identity mismatches,
+nonfiles/symlinks/oversized sources, wrong passwords, enrolled TOTP/replay,
+unchanged source bytes and refusal to replace existing targets. This primitive
+is not connected to the broker, CLI or GUI yet. Broker-held review tokens,
+versioned encrypted setup integration, UI review/apply and vault rollback
+remain pending; no new migration control is advertised.

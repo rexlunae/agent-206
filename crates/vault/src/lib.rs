@@ -11,7 +11,7 @@ mod totp;
 
 pub use auth::{AuthThrottle, Lockout, StepUpWindow};
 pub use credential::CredentialValue;
-pub use import::{ImportCheck, MAX_IMPORT_BYTES};
+pub use import::{ImportCheck, ImportIdentity, MAX_IMPORT_BYTES, ReviewedImportError};
 pub use policy::{AccessContext, AccessPolicy, CredentialKind, CredentialMeta, Denial};
 pub use totp::{PendingTotp, TotpOutcome, unix_now};
 

@@ -5,10 +5,36 @@
 //! flag and two-factor enrollment travels inside the encrypted file unchanged.
 use crate::{Error, Secret, TotpOutcome, Vault};
 use securestore::{KeySource, SecretsManager};
+use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
 /// Larger than any credential vault; a bigger "vault" is refused unread.
 pub const MAX_IMPORT_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Identity of bounded source bytes, without decrypting or exposing entries.
+/// This is not a claim that the file is a valid vault: password, format and
+/// enrolled TOTP verification still happen on the private staging copy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImportIdentity {
+    pub bytes: u64,
+    pub sha256: [u8; 32],
+}
+impl ImportIdentity {
+    fn of(bytes: &[u8]) -> Self {
+        Self {
+            bytes: bytes.len() as u64,
+            sha256: Sha256::digest(bytes).into(),
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ReviewedImportError {
+    #[error("the source vault changed; review it again before importing")]
+    SourceChanged,
+    #[error(transparent)]
+    Vault(#[from] Error),
+}
 
 /// Why an import did not complete without being an error: the source vault
 /// has two-factor enrolled and needs a current code from its authenticator.
@@ -30,6 +56,37 @@ impl Drop for Staging {
 }
 
 impl Vault {
+    /// Read only the bounded encrypted source and capture its identity for a
+    /// later explicit import. No target directories or files are created.
+    pub fn review_import(&self, source: &Path) -> Result<ImportIdentity, Error> {
+        if self.path.exists() {
+            return Err(Error::Exists);
+        }
+        Ok(ImportIdentity::of(&read_source(source)?))
+    }
+
+    /// Import only the bytes identified by `review`. Read the source once,
+    /// check those bytes before any staging or authentication, and stage that
+    /// same buffer; a later source edit cannot change what is imported.
+    /// A TOTP retry must use the same identity and rereads/checks the source.
+    pub fn import_reviewed(
+        &mut self,
+        source: &Path,
+        review: ImportIdentity,
+        password: &Secret,
+        totp: Option<&str>,
+        now: u64,
+    ) -> Result<ImportCheck, ReviewedImportError> {
+        if self.path.exists() {
+            return Err(Error::Exists.into());
+        }
+        let bytes = read_source(source)?;
+        if ImportIdentity::of(&bytes) != review {
+            return Err(ReviewedImportError::SourceChanged);
+        }
+        Ok(self.import_bytes(&bytes, password, totp, now)?)
+    }
+
     /// Copy `source` in as this vault, verifying its password and, when it
     /// has two-factor enrolled, a current code. Refuses when this vault
     /// already exists: merging two vaults is not an import. On success the
@@ -45,6 +102,19 @@ impl Vault {
             return Err(Error::Exists);
         }
         let bytes = read_source(source)?;
+        self.import_bytes(&bytes, password, totp, now)
+    }
+
+    fn import_bytes(
+        &mut self,
+        bytes: &[u8],
+        password: &Secret,
+        totp: Option<&str>,
+        now: u64,
+    ) -> Result<ImportCheck, Error> {
+        if self.path.exists() {
+            return Err(Error::Exists);
+        }
         let parent = self
             .path
             .parent()
@@ -58,7 +128,7 @@ impl Vault {
         let staged = tempfile::Builder::new()
             .prefix(".import-")
             .tempfile_in(parent)?;
-        std::io::Write::write_all(&mut staged.as_file(), &bytes)?;
+        std::io::Write::write_all(&mut staged.as_file(), bytes)?;
         staged.as_file().sync_all()?;
         // Hand cleanup to `Staging`, which also covers the replacement that a
         // two-factor check writes over the staged path.
@@ -110,7 +180,11 @@ impl Vault {
 /// than followed somewhere unexpected.
 fn read_source(source: &Path) -> Result<Vec<u8>, Error> {
     use std::io::Read;
-    let metadata = std::fs::symlink_metadata(source).map_err(Error::ImportSource)?;
+    let file = open_source(source).map_err(Error::ImportSource)?;
+    // Inspect the opened handle, not a prior path lookup. NOFOLLOW rejects a
+    // final symlink atomically and NONBLOCK prevents a swapped FIFO from
+    // hanging before we can reject its file type.
+    let metadata = file.metadata().map_err(Error::ImportSource)?;
     if !metadata.is_file() {
         return Err(Error::ImportSource(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -124,8 +198,8 @@ fn read_source(source: &Path) -> Result<Vec<u8>, Error> {
         )));
     }
     let mut bytes = Vec::new();
-    std::fs::File::open(source)
-        .and_then(|file| file.take(MAX_IMPORT_BYTES + 1).read_to_end(&mut bytes))
+    file.take(MAX_IMPORT_BYTES + 1)
+        .read_to_end(&mut bytes)
         .map_err(Error::ImportSource)?;
     if bytes.len() as u64 > MAX_IMPORT_BYTES {
         return Err(Error::ImportSource(std::io::Error::new(
@@ -134,6 +208,27 @@ fn read_source(source: &Path) -> Result<Vec<u8>, Error> {
         )));
     }
     Ok(bytes)
+}
+
+#[cfg(unix)]
+fn open_source(source: &Path) -> std::io::Result<std::fs::File> {
+    use nix::{
+        fcntl::{OFlag, open},
+        sys::stat::Mode,
+    };
+    Ok(open(
+        source,
+        OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    )?
+    .into())
+}
+#[cfg(not(unix))]
+fn open_source(_source: &Path) -> std::io::Result<std::fs::File> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "safe vault source opening is unavailable on this platform",
+    ))
 }
 
 #[cfg(test)]
@@ -174,6 +269,118 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let vault = Vault::locked(dir.path().join("vault").join("secrets.json"));
         (dir, vault)
+    }
+
+    #[test]
+    fn review_and_source_change_refusal_do_not_create_a_target() {
+        let password = Secret::new(random());
+        let (_src, path, _) = source(&password);
+        let before = std::fs::read(&path).unwrap();
+        let (_dir, mut vault) = target();
+        let review = vault.review_import(&path).unwrap();
+        assert_eq!(review.bytes, before.len() as u64);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(!vault.path.parent().unwrap().exists());
+        let mut changed = before.clone();
+        // Equal-length edits must be detected, not just file-size changes.
+        changed[0] ^= 1;
+        std::fs::write(&path, &changed).unwrap();
+        assert!(matches!(
+            vault.import_reviewed(&path, review, &password, None, 1_800_000_015),
+            Err(ReviewedImportError::SourceChanged)
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), changed);
+        assert!(vault.is_locked());
+        assert!(!vault.path.parent().unwrap().exists());
+        std::fs::write(&path, &before).unwrap();
+        let mismatched_size = ImportIdentity {
+            bytes: review.bytes + 1,
+            ..review
+        };
+        assert!(matches!(
+            vault.import_reviewed(&path, mismatched_size, &password, None, 1_800_000_015),
+            Err(ReviewedImportError::SourceChanged)
+        ));
+        assert!(!vault.path.parent().unwrap().exists());
+    }
+
+    #[test]
+    fn reviewed_import_keeps_authentication_policies_and_source_bytes() {
+        let password = Secret::new(random());
+        let (_src, path, name) = source(&password);
+        let before = std::fs::read(&path).unwrap();
+        let (_dir, mut vault) = target();
+        let review = vault.review_import(&path).unwrap();
+        assert!(matches!(
+            vault.import_reviewed(&path, review, &Secret::new(random()), None, 1_800_000_015),
+            Err(ReviewedImportError::Vault(Error::Crypto))
+        ));
+        assert!(!vault.exists());
+        assert!(vault.is_locked());
+        assert_eq!(
+            vault
+                .import_reviewed(&path, review, &password, None, 1_800_000_015)
+                .unwrap(),
+            ImportCheck::Imported
+        );
+        let (_, meta) = vault
+            .credentials()
+            .unwrap()
+            .into_iter()
+            .find(|(n, _)| n == &name)
+            .unwrap();
+        assert!(meta.disabled);
+        assert!(matches!(meta.policy, AccessPolicy::SkillOnly(_)));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        vault.lock();
+        // Existing targets win even over an unreadable source; never replace.
+        assert!(matches!(
+            vault.review_import(&path.with_extension("missing")),
+            Err(Error::Exists)
+        ));
+        assert!(matches!(
+            vault.import_reviewed(&path, review, &password, None, 1_800_000_015),
+            Err(ReviewedImportError::Vault(Error::Exists))
+        ));
+    }
+
+    #[test]
+    fn review_refuses_nonfiles_symlinks_and_oversized_sources() {
+        let directory = tempfile::tempdir().unwrap();
+        let (_target, vault) = target();
+        assert!(matches!(
+            vault.review_import(directory.path()),
+            Err(Error::ImportSource(_))
+        ));
+        let path = directory.path().join("oversized");
+        std::fs::File::create(&path)
+            .unwrap()
+            .set_len(MAX_IMPORT_BYTES + 1)
+            .unwrap();
+        assert!(matches!(
+            vault.review_import(&path),
+            Err(Error::ImportSource(_))
+        ));
+        #[cfg(unix)]
+        {
+            let link = directory.path().join("link");
+            std::os::unix::fs::symlink(&path, &link).unwrap();
+            assert!(matches!(
+                vault.review_import(&link),
+                Err(Error::ImportSource(_))
+            ));
+            let fifo = directory.path().join("fifo");
+            nix::unistd::mkfifo(
+                &fifo,
+                nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+            )
+            .unwrap();
+            assert!(matches!(
+                vault.review_import(&fifo),
+                Err(Error::ImportSource(_))
+            ));
+        }
+        assert!(!vault.path.parent().unwrap().exists());
     }
 
     #[test]
@@ -257,21 +464,37 @@ mod tests {
         original.lock();
         let before = std::fs::read(&path).unwrap();
         let (_dir, mut vault) = target();
+        let review = vault.review_import(&path).unwrap();
         assert_eq!(
-            vault.import(&path, &password, None, now).unwrap(),
+            vault
+                .import_reviewed(&path, review, &password, None, now)
+                .unwrap(),
             ImportCheck::TotpRequired
         );
         assert!(!vault.exists());
+        std::fs::write(&path, [before.as_slice(), b" "].concat()).unwrap();
+        assert!(matches!(
+            vault.import_reviewed(&path, review, &password, Some(&code_at(&pending, now)), now),
+            Err(ReviewedImportError::SourceChanged)
+        ));
+        assert!(!vault.exists());
+        std::fs::write(&path, &before).unwrap();
         assert_eq!(
             vault
-                .import(&path, &password, Some(&code_at(&pending, earlier)), now)
+                .import_reviewed(
+                    &path,
+                    review,
+                    &password,
+                    Some(&code_at(&pending, earlier)),
+                    now
+                )
                 .unwrap(),
             ImportCheck::Totp(TotpOutcome::Replayed)
         );
         assert!(!vault.exists());
         assert_eq!(
             vault
-                .import(&path, &password, Some(&code_at(&pending, now)), now)
+                .import_reviewed(&path, review, &password, Some(&code_at(&pending, now)), now)
                 .unwrap(),
             ImportCheck::Imported
         );
