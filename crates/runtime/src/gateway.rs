@@ -37,6 +37,7 @@ mod skills;
 mod steering;
 pub use crate::skill_tool::SkillOffer;
 pub use delegation::{Caller, Child, Delegator, DelegatorError, Reservation, Spawn};
+pub use messengers::Outbox;
 pub use schedules::{Jobs, MAX_AGENT_JOBS};
 
 /// Streamed reply text that is not final yet. It is published as the
@@ -517,6 +518,10 @@ impl Gateway {
         // permits them, and each new job waits for the user's approval.
         let schedule_tools = Arc::new(crate::schedule_tool::ScheduleHost::new(gateway.jobs()));
         Arc::make_mut(&mut gateway.tool_hosts).push(schedule_tools);
+        // Sending to webhooks, denied in each conversation until the user
+        // permits it, and then still approved by the user call by call.
+        let message_tools = Arc::new(crate::message_tool::MessageHost::new(gateway.outbox()));
+        Arc::make_mut(&mut gateway.tool_hosts).push(message_tools);
         // The plan tool, denied in each conversation until the user permits it.
         let plan_tools = Arc::new(crate::plan_tool::PlanHost::new(gateway.plans()));
         Arc::make_mut(&mut gateway.tool_hosts).push(plan_tools);

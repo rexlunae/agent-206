@@ -19,6 +19,7 @@ pub mod joshua;
 pub mod markup;
 pub mod mcp;
 pub mod mcp_tools;
+pub mod message_tool;
 pub mod messengers;
 pub mod network;
 pub mod plan_tool;

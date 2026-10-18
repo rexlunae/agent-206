@@ -3,7 +3,9 @@
 A messenger connects a chat service account to Agent 206 so that people can
 talk to a thread from that service. Telegram, Matrix, Discord, Slack, IRC,
 Signal and Beeper (which reaches WhatsApp, iMessage, Google Chat and the
-other networks Beeper Desktop connects to) are implemented;
+other networks Beeper Desktop connects to) are implemented, and webhook
+messengers let a model post to Slack, Discord, Google Chat, Teams and other
+incoming webhooks with the user's approval;
 RustyClaw's other channels are listed in
 [parity.md](parity.md#messengers--channels).
 
@@ -16,7 +18,8 @@ of the desktop, web and terminal apps):
 ```toml
 [[messengers]]
 name = "team"                 # lowercase letters, digits, single hyphens
-kind = "telegram"             # or "matrix", "discord", "slack", "irc", "signal" or "beeper"
+kind = "telegram"             # or "matrix", "discord", "slack", "irc", "signal",
+                              # "beeper" or "webhook"
 enabled = false               # off until the user turns it on
 credential = "team-token"     # vault credential name, never the token
                               # (Signal has none)
@@ -31,6 +34,7 @@ allowed_chats = ["-1001234"]  # chats whose messages reach a thread
 allowed_users = ["5551234"]   # senders accepted; groups need it
 model = { provider = "<provider id>", model = "<id from the provider's API>" }
 mode = "chat"                 # mode of new chat threads
+# format = "text"             # webhooks only: "text", "discord" or "teams"
 ```
 
 The gateway validates every save: unique names, an endpoint for kinds without
@@ -431,6 +435,41 @@ agent206 messenger enable beeper
   retries until one is. Adding or removing an account starts afresh, without
   answering what arrived in between.
 
+## Webhooks
+
+A webhook messenger posts to an incoming webhook: a Slack app's, a Discord
+channel's, a Google Chat space's, a Teams channel's Workflows webhook, or any
+endpoint that takes JSON. It only sends. It never connects or receives, has
+no chats, senders or model (the gateway refuses an entry with any), and shows
+"Ready to send" while enabled.
+
+```sh
+agent206 vault add team-hook --kind token --destination https://hooks.slack.com
+agent206 messenger add team-hook --kind webhook --credential team-hook \
+  --endpoint https://hooks.slack.com --format text
+agent206 messenger enable team-hook
+```
+
+- **The URL is the secret.** A webhook's path and query carry its key, so the
+  whole URL is the vault credential, bound to the URL's origin, which is also
+  the entry's endpoint. The gateway names only that origin; the broker sends
+  to the stored URL (`AuthScheme::WebhookUrl`, broker protocol v12) and
+  refuses a stored URL on any other origin, and a call that adds a path or
+  query of its own, so the URL never reaches the gateway, a model or a log.
+- **Sending.** Models post with the native `send_message` tool, which names a
+  webhook by its entry name and is offered only while an enabled webhook the
+  user has not disconnected exists. Like every tool it is denied in a
+  conversation until the user permits it, and it always asks: the user
+  approves each call, seeing the destination and the exact text, and a model
+  cannot approve its own call. A refused call sends nothing.
+- **Formats.** `text` posts `{"text": …}` (Slack, Google Chat, Mattermost and
+  other Slack-compatible hooks), `discord` posts `{"content": …}` with
+  mentions turned off, and `teams` posts one Adaptive Card. A message is sent
+  in at most eight parts of 4,000 characters (Discord: 2,000), in order; a
+  longer one is refused whole rather than cut. A part that fails stops the
+  rest, and the error says how many were delivered. The last failure is shown
+  on the Messengers page until a send succeeds.
+
 ## Interface for the run engine
 
 `a206_runtime::messengers::Host` is the boundary between a messenger and the
@@ -456,7 +495,11 @@ participant cannot approve their own request.
 ## Not yet
 
 - WhatsApp, Google Chat and iMessage on their own (they are reached through
-  Beeper), Teams and webhooks.
+  Beeper), and Teams conversations (webhooks only post to a channel).
+- Sending to the chats of receiving messengers with `send_message`, a test
+  send from the Messengers page or CLI, webhook delivery of scheduled
+  messages' replies, and importing RustyClaw webhook entries (reported as an
+  unknown kind, since their URL is the secret).
 - Beeper attachments, reactions and replies to a specific message, the
   experimental WebSocket event stream, and remembering cursors across
   restarts.
