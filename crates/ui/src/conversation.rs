@@ -3,8 +3,9 @@ use crate::{
     route::{Columns, Route},
 };
 use a206_core::{
-    Capability, CodingBackend, Command, CompactionTrigger, ErrorKind, ErrorReport,
-    InstructionStatus, Mode, ModelKey, PlanStatus, Reply, Role, RunState, TextAttachment, Thread,
+    Capability, CodingBackend, Command, CompactionTrigger, ErrorKind, ErrorReport, ImageAttachment,
+    ImageType, InstructionStatus, MAX_IMAGE_BYTES, MAX_IMAGES, Mode, ModelKey, PlanStatus, Reply,
+    Role, RunState, TextAttachment, Thread,
 };
 use fc_dioxus::prelude::*;
 use std::collections::HashMap;
@@ -29,6 +30,8 @@ async fn reveal(mounted: MountedEvent) {
 pub(crate) struct Unsent {
     pub(crate) text: String,
     pub(crate) attachments: Vec<TextAttachment>,
+    /// Images the gateway has stored for this message.
+    pub(crate) images: Vec<ImageAttachment>,
 }
 /// Unsent drafts by conversation for the life of the client, so adding or
 /// closing a column, which remounts the conversations, or leaving the page
@@ -205,10 +208,18 @@ fn Conversation(thread: Thread, target: Option<Uuid>) -> Element {
             .map(|u| u.attachments.clone())
             .unwrap_or_default()
     });
+    let mut images = use_signal(|| {
+        drafts
+            .peek()
+            .get(&id)
+            .map(|u| u.images.clone())
+            .unwrap_or_default()
+    });
     use_effect(move || {
         let unsent = Unsent {
             text: draft(),
             attachments: attachments(),
+            images: images(),
         };
         let mut all = drafts.write();
         if unsent == Unsent::default() {
@@ -313,9 +324,10 @@ fn Conversation(thread: Thread, target: Option<Uuid>) -> Element {
         if !running
             && has_model
             && !reading_files()
-            && (!text.is_empty() || !attachments.read().is_empty())
+            && (!text.is_empty() || !attachments.read().is_empty() || !images.read().is_empty())
         {
             let files = attachments();
+            let pictures = images();
             if text.len() + files.iter().map(|a| a.text.len()).sum::<usize>() > 128 * 1024 {
                 attachment_error.set(Some(rejected("Message and attachments exceed 128 KiB")));
                 return;
@@ -323,11 +335,13 @@ fn Conversation(thread: Thread, target: Option<Uuid>) -> Element {
             submitting.set(true);
             draft.set(String::new());
             attachments.set(vec![]);
+            images.set(vec![]);
             spawn(async move {
                 let result = crate::call(Command::Send {
                     thread: id,
                     text: text.clone(),
                     attachments: files.clone(),
+                    images: pictures.clone(),
                 })
                 .await;
                 match result {
@@ -338,6 +352,7 @@ fn Conversation(thread: Thread, target: Option<Uuid>) -> Element {
                     other => {
                         draft.set(typed);
                         attachments.set(files);
+                        images.set(pictures);
                         state.error.set(Some(match other {
                             Err(error) => error,
                             _ => ErrorReport::new(ErrorKind::Protocol, "Unexpected send response"),
@@ -374,6 +389,7 @@ fn Conversation(thread: Thread, target: Option<Uuid>) -> Element {
         .as_ref()
         .and_then(|key| models.iter().find(|m| &m.key == key));
     let limit = model.and_then(|m| m.context_limit);
+    let image_input = model.and_then(|m| m.image_input);
     let used = thread.usage.as_ref().and_then(|u| u.input_tokens);
     let context = limit
         .zip(used)
@@ -481,6 +497,11 @@ fn Conversation(thread: Thread, target: Option<Uuid>) -> Element {
                         if !message.text.is_empty() || message.reasoning.is_empty() {
                             p { class: "a206-message-text", "{message.text}" }
                         }
+                        if !message.images.is_empty() {
+                            div { class: "a206-message-images",
+                                for image in &message.images { MessageImage { key: "{image.digest}", image: image.clone() } }
+                            }
+                        }
                         for file in &message.attachments { Badge { Icon { name: IconName::File, size: IconSize::Sm } "{file.name} · {file.text.len()} B" } }
                         for call in &message.tool_calls { crate::tools::ToolTrace { key: "{call.id}", call: call.clone() } }
                     }
@@ -528,6 +549,18 @@ fn Conversation(thread: Thread, target: Option<Uuid>) -> Element {
                         }
                     }
                 }
+                if !images.read().is_empty() {
+                    div { class: "a206-attachment-chips", aria_label: "Attached images",
+                        for (index, image) in images.read().iter().enumerate() {
+                            Button { size: ButtonSize::Sm, variant: ButtonVariant::Subtle, availability: if running { Availability::Disabled } else { Availability::Enabled },
+                                aria_label: format!("Remove image {}", image.name),
+                                title: if image_input.is_none() { "Remove image · this model's API does not report whether it accepts images" } else { "Remove image" },
+                                onclick: move |_| { images.write().remove(index); },
+                                Icon { name: IconName::Image, size: IconSize::Sm } "{image.name} · {size_label(image.size)}" Icon { name: IconName::Close, size: IconSize::Sm }
+                            }
+                        }
+                    }
+                }
                 if !attachments.read().is_empty() {
                     div { class: "a206-attachment-chips", aria_label: "Attached text documents",
                         for (index, file) in attachments.read().iter().enumerate() {
@@ -543,12 +576,12 @@ fn Conversation(thread: Thread, target: Option<Uuid>) -> Element {
 
                 div { class: "a206-compose-toolbar",
                     div { class: "a206-compose-selectors",
-                        label { class: "a206-attach fc-btn fc-btn--ghost fc-btn--sm fc-btn--icon", title: "Attach UTF-8 text documents · up to 128 KiB total",
+                        label { class: "a206-attach fc-btn fc-btn--ghost fc-btn--sm fc-btn--icon", title: "Attach UTF-8 text documents (128 KiB in all) or up to four PNG, JPEG, GIF or WebP images (2 MiB each)",
                             Icon { name: IconName::Attach }
                             // A keyed fragment replaces the native input after reading it,
                             // so choosing the same file again emits a fresh change event.
                             for version in [file_input_version()] {
-                            input { key: "{version}", r#type: "file", multiple: true, aria_label: "Attach text documents", disabled: running || reading_files(),
+                            input { key: "{version}", r#type: "file", multiple: true, aria_label: "Attach text documents or images", disabled: running || reading_files(),
                                 onchange: move |event: FormEvent| {
                                     let files = event.files();
                                     if files.is_empty() { return; }
@@ -556,17 +589,32 @@ fn Conversation(thread: Thread, target: Option<Uuid>) -> Element {
                                     attachment_error.set(None);
                                     spawn(async move {
                                         let mut pending = attachments();
+                                        let mut pictures = images();
                                         let result = async {
-                                            if pending.len() + files.len() > 8 { return Err(rejected("Attach at most eight text documents")); }
                                             let mut total = pending.iter().map(|f| f.text.len()).sum::<usize>();
                                             for file in files {
-                                                let text = read_attachment(&file, 128 * 1024 - total).await?;
-                                                total += text.len();
-                                                pending.push(TextAttachment { name: file.name(), text });
+                                                match read_attachment(&file, 128 * 1024 - total).await? {
+                                                    Read::Text(text) => {
+                                                        if pending.len() == 8 { return Err(rejected("Attach at most eight text documents")); }
+                                                        total += text.len();
+                                                        pending.push(TextAttachment { name: file.name(), text });
+                                                    }
+                                                    Read::Image(data) => {
+                                                        if pictures.len() == MAX_IMAGES { return Err(rejected("Attach at most four images")); }
+                                                        if image_input == Some(false) { return Err(rejected("The selected model's API reports that it does not accept images")); }
+                                                        match crate::call(Command::StageImage { name: file.name(), data }).await? {
+                                                            Reply::Image(image) => pictures.push(image),
+                                                            _ => return Err(ErrorReport::new(ErrorKind::Protocol, "Unexpected response to an image attachment")),
+                                                        }
+                                                    }
+                                                }
                                             }
                                             Ok(())
                                         }.await;
-                                        match result { Ok(()) => attachments.set(pending), Err(report) => { crate::error::record("attach", &report); attachment_error.set(Some(report)) } }
+                                        // What was read before a failure stays attached.
+                                        attachments.set(pending);
+                                        images.set(pictures);
+                                        if let Err(report) = result { crate::error::record("attach", &report); attachment_error.set(Some(report)) }
                                         reading_files.set(false);
                                         file_input_version.set(file_input_version().wrapping_add(1));
                                     });
@@ -970,16 +1018,29 @@ fn RenameTitle(id: Uuid, initial: String) -> Element {
     }
 }
 
+/// An attachment as read: an image when its bytes say so, otherwise text.
+enum Read {
+    Text(String),
+    Image(Vec<u8>),
+}
+/// Read one attachment: an image of at most [`MAX_IMAGE_BYTES`], or text of
+/// at most `remaining` bytes.
 async fn read_attachment(
     file: &dioxus::html::FileData,
     remaining: usize,
-) -> Result<String, ErrorReport> {
-    let bytes = crate::files::read_bounded(file, remaining)
+) -> Result<Read, ErrorReport> {
+    let bytes = crate::files::read_bounded(file, remaining.max(MAX_IMAGE_BYTES))
         .await
         .map_err(unreadable)?
-        .ok_or_else(|| rejected("Attachments exceed 128 KiB"))?;
+        .ok_or_else(|| rejected("Images are limited to 2 MiB each"))?;
+    if ImageType::sniff(&bytes).is_some() {
+        return Ok(Read::Image(bytes));
+    }
+    if bytes.len() > remaining {
+        return Err(rejected("Text attachments exceed 128 KiB"));
+    }
     let text = String::from_utf8(bytes).map_err(|error| {
-        rejected("Use UTF-8 text documents; image, PDF and audio attachments are not supported yet")
+        rejected("Use UTF-8 text documents or PNG, JPEG, GIF or WebP images; PDF and audio attachments are not supported yet")
             .caused_by(ErrorReport::capture(&error, |_| None))
     })?;
     if text.contains('\0') {
@@ -987,7 +1048,51 @@ async fn read_attachment(
             "Use UTF-8 text documents totaling at most 128 KiB",
         ));
     }
-    Ok(text)
+    Ok(Read::Text(text))
+}
+fn size_label(bytes: u64) -> String {
+    match bytes {
+        0..1024 => format!("{bytes} B"),
+        1024..1_048_576 => format!("{:.0} KiB", bytes as f64 / 1024.0),
+        _ => format!("{:.1} MiB", bytes as f64 / 1_048_576.0),
+    }
+}
+/// An attached image, read from the gateway when shown.
+#[component]
+fn MessageImage(image: ImageAttachment) -> Element {
+    let digest = image.digest.clone();
+    let data = use_resource(move || {
+        let digest = digest.clone();
+        async move { crate::call(Command::ReadImage { digest }).await }
+    });
+    let alt = AccessibleName::try_from(image.name.as_str())
+        .unwrap_or_else(|_| AccessibleName::from_checked_literal("Attached image"));
+    let src = match &*data.read() {
+        Some(Ok(Reply::ImageData(bytes))) => {
+            use base64::Engine;
+            Some(Ok(format!(
+                "data:{};base64,{}",
+                image.media_type.mime(),
+                base64::engine::general_purpose::STANDARD.encode(bytes)
+            )))
+        }
+        Some(Ok(_)) => Some(Err(ErrorReport::new(
+            ErrorKind::Protocol,
+            "Unexpected response to an image request",
+        ))),
+        Some(Err(report)) => Some(Err(report.clone())),
+        None => None,
+    };
+    rsx! {
+        figure { class: "a206-message-image",
+            match src {
+                Some(Ok(src)) => rsx! { CardMedia { alt: Alt::Text(alt), src } },
+                Some(Err(report)) => rsx! { crate::error::ErrorNotice { report, title: format!("Image {} not shown", image.name) } },
+                None => rsx! { CardMedia { alt: Alt::Text(alt) } },
+            }
+            figcaption { "{image.name} · {size_label(image.size)}" }
+        }
+    }
 }
 fn rejected(message: &str) -> ErrorReport {
     ErrorReport::new(ErrorKind::InvalidRequest, message)
@@ -998,8 +1103,6 @@ fn unreadable(error: dioxus::CapturedError) -> ErrorReport {
         .caused_by(ErrorReport::capture(&**error, |_| None))
 }
 
-/// The reasoning a model streamed with a reply, collapsed above its text.
-/// `live` while the reply is still streaming.
 /// Reasoning is still being written only while it is the newest part of the
 /// running reply: once text or a tool call follows, that round has thought.
 fn reasoning_live(thread: &a206_core::Thread, message: &a206_core::Message, running: bool) -> bool {
@@ -1011,6 +1114,8 @@ fn reasoning_live(thread: &a206_core::Thread, message: &a206_core::Message, runn
             .last()
             .is_some_and(|last| last.id == message.id)
 }
+/// The reasoning a model streamed with a reply, collapsed above its text.
+/// `live` while the reply is still streaming.
 #[component]
 fn MessageReasoning(message: a206_core::Message, live: bool) -> Element {
     rsx! {

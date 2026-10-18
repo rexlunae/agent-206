@@ -226,6 +226,7 @@ async fn paginates_native_catalogs_and_dispatches_protocol_specific_text() {
             role: Role::User,
             text: api.text.clone(),
             attachments: vec![],
+            images: vec![],
             at: provider::now(),
             backend: CodingBackend::Native,
             tool_calls: vec![],
@@ -247,6 +248,7 @@ async fn paginates_native_catalogs_and_dispatches_protocol_specific_text() {
                 prompt: &prompt,
                 info: model,
                 tools: &[],
+                images: &provider::ImageData::default(),
             },
             &progress,
             &RetryPolicy::NONE,
@@ -523,12 +525,14 @@ async fn scripted(catalog: Value) -> (String, tokio::sync::mpsc::Receiver<Opened
         method: axum::http::Method,
         uri: axum::http::Uri,
         headers: HeaderMap,
-        body: axum::body::Bytes,
+        body: axum::body::Body,
     ) -> axum::response::Response {
         use axum::response::IntoResponse;
         if method == axum::http::Method::GET {
             return Json(api.catalog).into_response();
         }
+        // Requests carrying images exceed axum's default body limit.
+        let body = axum::body::to_bytes(body, usize::MAX).await.unwrap();
         let (feed, pieces) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
         let opened = Opened {
             target: uri.to_string(),
@@ -657,6 +661,7 @@ fn model_info(api: ProviderApi, provider: Id) -> ModelInfo {
         output_cost_per_token: None,
         reasoning: None,
         reasoning_efforts: vec![],
+        image_input: None,
     }
 }
 fn conversation(info: &ModelInfo) -> Thread {
@@ -667,6 +672,7 @@ fn conversation(info: &ModelInfo) -> Thread {
         role: Role::User,
         text: Id::new_v4().to_string(),
         attachments: vec![],
+        images: vec![],
         at: provider::now(),
         backend: CodingBackend::Native,
         tool_calls: vec![],
@@ -765,9 +771,13 @@ fn spawn_complete(
     rig: &Rig,
     info: &ModelInfo,
 ) -> (Completion, tokio::sync::mpsc::Receiver<Progress>) {
-    spawn_with(rig, info, conversation(info), |turn| {
-        (turn.text, turn.usage)
-    })
+    spawn_with(
+        rig,
+        info,
+        conversation(info),
+        provider::ImageData::default(),
+        |turn| (turn.text, turn.usage),
+    )
 }
 /// Run `complete` for `thread` in the background and return the whole turn.
 fn spawn_turn(
@@ -775,13 +785,16 @@ fn spawn_turn(
     info: &ModelInfo,
     thread: Thread,
 ) -> (TurnTask, tokio::sync::mpsc::Receiver<Progress>) {
-    spawn_with(rig, info, thread, |turn| turn)
+    spawn_with(rig, info, thread, provider::ImageData::default(), |turn| {
+        turn
+    })
 }
 /// Aborting the returned task drops the request, as the gateway does.
 fn spawn_with<T: Send + 'static>(
     rig: &Rig,
     info: &ModelInfo,
     thread: Thread,
+    images: provider::ImageData,
     map: fn(provider::Turn) -> T,
 ) -> (
     tokio::task::JoinHandle<Result<T, provider::ProviderError>>,
@@ -808,6 +821,7 @@ fn spawn_with<T: Send + 'static>(
                 prompt: &prompt,
                 info: &info,
                 tools: &[],
+                images: &images,
             },
             &progress,
             &RetryPolicy::NONE,
@@ -1289,6 +1303,7 @@ async fn the_gateway_journals_streamed_text_and_reports_partial_failures() {
                         thread: id,
                         text: Id::new_v4().to_string(),
                         attachments: vec![],
+                        images: vec![],
                     },
                 })
                 .await
@@ -1508,6 +1523,7 @@ async fn an_older_broker_is_used_without_streaming() {
             prompt: "",
             info: &info,
             tools: &[],
+            images: &provider::ImageData::default(),
         },
         &progress,
         &RetryPolicy::NONE,
@@ -1567,6 +1583,7 @@ async fn brokered_connection_failures_are_retried() {
             prompt: "",
             info: &info,
             tools: &[],
+            images: &provider::ImageData::default(),
         },
         &progress,
         &retry,
@@ -1591,4 +1608,195 @@ async fn brokered_connection_failures_are_retried() {
     }
     assert_eq!(retries.len(), 1, "{retries:?}");
     assert!(retries[0].contains("2 of 2"), "{retries:?}");
+}
+/// A PNG signature followed by `len` bytes unique to this run.
+fn png(len: usize) -> Vec<u8> {
+    let mut data = b"\x89PNG\r\n\x1a\n".to_vec();
+    while data.len() < len {
+        data.extend_from_slice(Id::new_v4().as_bytes());
+    }
+    data.truncate(len.max(8));
+    data
+}
+/// The parts of the request's first user message.
+fn first_user_parts(api: ProviderApi, body: &Value) -> Vec<Value> {
+    let parts = match api {
+        // The system prompt comes first.
+        ProviderApi::OpenAi => &body["messages"][1]["content"],
+        ProviderApi::Anthropic => &body["messages"][0]["content"],
+        ProviderApi::Gemini => &body["contents"][0]["parts"],
+    };
+    parts.as_array().cloned().unwrap_or_default()
+}
+#[tokio::test]
+async fn attached_images_are_sent_in_each_protocols_form_unless_the_api_says_no() {
+    use base64::Engine;
+    for api in PROTOCOLS {
+        let mut rig = Rig::new(api, false).await;
+        let mut info = model_info(api, rig.config.id);
+        let dir = tempfile::tempdir().unwrap();
+        let store = a206_runtime::images::Images::new(dir.path());
+        let data = png(64);
+        let image = store.stage(&Id::new_v4().to_string(), &data).unwrap();
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&data);
+        let mut thread = conversation(&info);
+        thread.messages[0].images.push(image.clone());
+        let text = thread.messages[0].text.clone();
+        // Unreported is left to the provider; reported support sends too.
+        for accepts in [None, Some(true), Some(false)] {
+            info.image_input = accepts;
+            let images = provider::ImageData::load(&store, &thread, &info).unwrap();
+            let (task, _deltas) = spawn_with(&rig, &info, thread.clone(), images, |t| t.text);
+            let opened = rig.requests.recv().await.unwrap();
+            let parts = first_user_parts(api, &opened.body);
+            if accepts == Some(false) {
+                assert!(!opened.body.to_string().contains(&encoded), "{api:?}");
+                assert_eq!(parts.len(), 1, "{api:?}: {parts:?}");
+                let note = parts[0]["text"].as_str().unwrap();
+                assert!(
+                    note.starts_with(&text) && note.contains(&image.name),
+                    "{api:?}: {note}"
+                );
+                assert!(note.contains("does not accept images"), "{api:?}: {note}");
+            } else {
+                let expected_image = match api {
+                    ProviderApi::OpenAi => json!({"type": "image_url",
+                        "image_url": {"url": format!("data:image/png;base64,{encoded}")}}),
+                    ProviderApi::Anthropic => json!({"type": "image",
+                        "source": {"type": "base64", "media_type": "image/png", "data": encoded}}),
+                    ProviderApi::Gemini => {
+                        json!({"inlineData": {"mimeType": "image/png", "data": encoded}})
+                    }
+                };
+                let expected_text = match api {
+                    ProviderApi::Gemini => json!({"text": text}),
+                    _ => json!({"type": "text", "text": text}),
+                };
+                assert_eq!(parts, vec![expected_image, expected_text], "{api:?}");
+            }
+            drop(opened.feed);
+            task.await.unwrap().unwrap_err();
+        }
+        // An image alone sends no empty text part.
+        info.image_input = None;
+        thread.messages[0].text.clear();
+        let images = provider::ImageData::load(&store, &thread, &info).unwrap();
+        let (task, _deltas) = spawn_with(&rig, &info, thread.clone(), images, |t| t.text);
+        let opened = rig.requests.recv().await.unwrap();
+        assert_eq!(first_user_parts(api, &opened.body).len(), 1, "{api:?}");
+        drop(opened.feed);
+        task.await.unwrap().unwrap_err();
+    }
+}
+#[tokio::test]
+async fn older_images_are_named_not_resent_when_the_request_would_be_too_large() {
+    let api = ProviderApi::Anthropic;
+    let mut rig = Rig::new(api, false).await;
+    let info = model_info(api, rig.config.id);
+    let dir = tempfile::tempdir().unwrap();
+    let store = a206_runtime::images::Images::new(dir.path());
+    let mut thread = conversation(&info);
+    // Three images of the largest size: their base64 forms cannot all fit.
+    let mut staged = vec![];
+    for _ in 0..3 {
+        let image = store
+            .stage(&Id::new_v4().to_string(), &png(a206_core::MAX_IMAGE_BYTES))
+            .unwrap();
+        let mut message = Message::new(
+            Role::User,
+            Id::new_v4().to_string(),
+            provider::now(),
+            CodingBackend::Native,
+        );
+        message.images.push(image.clone());
+        thread.messages.push(Message::new(
+            Role::Assistant,
+            Id::new_v4().to_string(),
+            provider::now(),
+            CodingBackend::Native,
+        ));
+        thread.messages.push(message);
+        staged.push(image);
+    }
+    let images = provider::ImageData::load(&store, &thread, &info).unwrap();
+    let (mut task, _deltas) = spawn_with(&rig, &info, thread, images, |t| t.text);
+    let opened = tokio::select! {
+        opened = rig.requests.recv() => opened.unwrap(),
+        failed = &mut task => panic!("no request was made: {failed:?}"),
+    };
+    let body = opened.body.to_string();
+    assert!(
+        body.len() <= a206_broker::MAX_PROVIDER_BODY,
+        "{}",
+        body.len()
+    );
+    let messages = opened.body["messages"].as_array().unwrap();
+    let sent = |index: usize| {
+        messages[index]["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|part| part["type"] == "image")
+    };
+    // The newest image is sent; the older ones are named in their messages.
+    let newest = messages.len() - 1;
+    assert!(sent(newest));
+    for older in [newest - 2, newest - 4] {
+        assert!(!sent(older));
+        let note = messages[older]["content"][0]["text"].as_str().unwrap();
+        assert!(note.contains("too large"), "{note}");
+    }
+    assert!(body.contains(&staged[0].name) && body.contains(&staged[1].name));
+    drop(opened.feed);
+    task.await.unwrap().unwrap_err();
+}
+#[tokio::test]
+async fn image_support_is_read_from_the_models_api_and_unknown_when_unreported() {
+    let reported = |api: ProviderApi, accepts: Option<bool>| -> Value {
+        let id = Id::new_v4().to_string();
+        match (api, accepts) {
+            (ProviderApi::Anthropic, Some(accepts)) => {
+                json!({"id": id, "capabilities": {"image_input": {"supported": accepts}}})
+            }
+            (ProviderApi::OpenAi, Some(accepts)) => {
+                let modalities = if accepts {
+                    json!(["text", "image"])
+                } else {
+                    json!(["text"])
+                };
+                json!({"id": id, "architecture": {"input_modalities": modalities}})
+            }
+            (ProviderApi::Gemini, _) => json!({"name": format!("models/{id}"),
+                "supportedGenerationMethods": ["generateContent"]}),
+            (_, None) => json!({"id": id}),
+        }
+    };
+    for api in PROTOCOLS {
+        let cases: &[Option<bool>] = if api == ProviderApi::Gemini {
+            &[None]
+        } else {
+            &[Some(true), Some(false), None]
+        };
+        let items: Vec<Value> = cases.iter().map(|c| reported(api, *c)).collect();
+        let catalog = match api {
+            ProviderApi::Gemini => json!({"models": items}),
+            _ => json!({"data": items}),
+        };
+        let (origin, _requests) = scripted(catalog).await;
+        let config = ProviderConfig {
+            id: Id::new_v4(),
+            label: Id::new_v4().to_string(),
+            base_url: format!("{origin}/v1"),
+            credential: None,
+            api,
+        };
+        let none = tempfile::tempdir().unwrap();
+        let broker = provider::Broker {
+            root: none.path(),
+            pairing: None,
+        };
+        let catalog = provider::catalog(&config, broker).await.unwrap();
+        let found: Vec<Option<bool>> = catalog.models.iter().map(|m| m.image_input).collect();
+        assert_eq!(found, cases, "{api:?}");
+    }
 }

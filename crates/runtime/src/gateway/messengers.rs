@@ -304,6 +304,7 @@ impl Host for Gateway {
                         thread,
                         text,
                         attachments: vec![],
+                        images: vec![],
                     },
                 })
                 .await

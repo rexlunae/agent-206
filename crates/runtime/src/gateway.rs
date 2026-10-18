@@ -97,6 +97,7 @@ impl PartialReply {
                 role: Role::Assistant,
                 text: self.text.clone(),
                 attachments: vec![],
+                images: vec![],
                 at: now(),
                 backend: thread.backend,
                 tool_calls: vec![],
@@ -206,6 +207,8 @@ pub enum GatewayError {
     #[error(transparent)]
     Search(#[from] a206_core::SearchError),
     #[error(transparent)]
+    Image(#[from] crate::images::ImageError),
+    #[error(transparent)]
     Frame(#[from] transport::FrameError),
     #[error(transparent)]
     Run(#[from] run::RunError),
@@ -296,6 +299,7 @@ impl crate::error::Classified for GatewayError {
             Self::Frame(error) => return classify(error),
             Self::Run(error) => return classify(error),
             Self::Compaction(error) => return classify(error),
+            Self::Image(error) => return classify(error),
             // The cause's own kind (missing, denied, invalid data) is the useful one.
             Self::Receipt(_)
             | Self::Workspace(_)
@@ -378,6 +382,8 @@ pub struct Gateway {
     stop: tokio_util::sync::CancellationToken,
     joshua: Arc<tokio::sync::Mutex<crate::joshua::Manager>>,
     store: Arc<Mutex<Store>>,
+    /// Image bytes of messages, kept outside the snapshot.
+    images: crate::images::Images,
     extensions: crate::extension_host::ExtensionHost,
     downloads: Arc<Mutex<BTreeMap<Id, tokio_util::sync::CancellationToken>>>,
     running: Arc<Mutex<BTreeMap<Id, tokio_util::sync::CancellationToken>>>,
@@ -438,6 +444,11 @@ fn journal_form(command: &Command) -> std::borrow::Cow<'_, Command> {
                 module: Sha256::digest(module).to_vec(),
             })
         }
+        // The image is stored by its digest, which identifies it here too.
+        Command::StageImage { name, data } => std::borrow::Cow::Owned(Command::StageImage {
+            name: name.clone(),
+            data: Sha256::digest(data).to_vec(),
+        }),
         command => std::borrow::Cow::Borrowed(command),
     }
 }
@@ -445,6 +456,23 @@ fn journal_form(command: &Command) -> std::borrow::Cow<'_, Command> {
 impl Gateway {
     pub fn open(root: &Path) -> Result<Self, StoreError> {
         let mut store = Store::open(root)?;
+        let images = crate::images::Images::new(root);
+        // Images staged but never sent, and partial writes, are not kept
+        // across a restart. A failure leaves unused files only.
+        let referenced: BTreeSet<&str> = store
+            .state
+            .threads
+            .iter()
+            .flat_map(|t| &t.messages)
+            .flat_map(|m| &m.images)
+            .map(|i| i.digest.as_str())
+            .collect();
+        if let Err(error) = images.sweep(&referenced) {
+            tracing::warn!(
+                error = &error as &dyn std::error::Error,
+                "unused images were not removed"
+            );
+        }
         // Messenger state is runtime state: nothing is connected yet.
         store.state.messengers =
             Self::messenger_statuses(&store.state.messengers, &store.state.settings.messengers)
@@ -499,6 +527,7 @@ impl Gateway {
             joshua: Arc::new(tokio::sync::Mutex::new(crate::joshua::Manager::default())),
             extensions,
             store,
+            images,
             downloads: Arc::new(Mutex::new(BTreeMap::new())),
             running: Arc::new(Mutex::new(BTreeMap::new())),
             accepting: Arc::new(Mutex::new(BTreeSet::new())),
@@ -675,6 +704,7 @@ impl Gateway {
                 | Command::Events { .. }
                 | Command::GitStatus { .. }
                 | Command::ReadDocument { .. }
+                | Command::ReadImage { .. }
                 // Extension output can carry workspace content, so it is
                 // never persisted in the request journal.
                 | Command::OpenPanel { .. }
@@ -1166,7 +1196,23 @@ impl Gateway {
                 thread: id,
                 text,
                 attachments,
+                images,
             } => {
+                check(
+                    images.len() <= MAX_IMAGES,
+                    GatewayError::Invalid("attach at most four images"),
+                )?;
+                // Every image must still be stored exactly as staged.
+                if !images.is_empty() {
+                    let (store, staged) = (self.images.clone(), images.clone());
+                    tokio::task::spawn_blocking(move || {
+                        staged
+                            .iter()
+                            .try_for_each(|image| store.read(image).map(drop))
+                    })
+                    .await??;
+                }
+                let image_size: usize = images.iter().map(|i| i.name.len() + 256).sum();
                 check(
                     attachments.len() <= 8,
                     GatewayError::Invalid("attach at most eight text documents"),
@@ -1189,7 +1235,7 @@ impl Gateway {
                     )?;
                 }
                 check(
-                    (!text.trim().is_empty() || !attachments.is_empty())
+                    (!text.trim().is_empty() || !attachments.is_empty() || !images.is_empty())
                         && text.len() <= 128 * 1024,
                     GatewayError::Invalid("message must be 1–131072 bytes"),
                 )?;
@@ -1201,7 +1247,11 @@ impl Gateway {
                     // of storage.
                     check(
                         store.remaining()?
-                            >= text.len() + attachment_size + MESSAGE_OVERHEAD + run::NEXT_ROUND,
+                            >= text.len()
+                                + attachment_size
+                                + image_size
+                                + MESSAGE_OVERHEAD
+                                + run::NEXT_ROUND,
                         GatewayError::HistoryFull,
                     )?;
                     let current = store.thread(id)?;
@@ -1210,6 +1260,22 @@ impl Gateway {
                         GatewayError::Conflict("thread is already running"),
                     )?;
                     let (config, info) = native_model(&store.state, current)?;
+                    if !images.is_empty() {
+                        check(
+                            current.backend == CodingBackend::Native,
+                            GatewayError::Invalid(
+                                "images are sent only to model providers, not coding backends",
+                            ),
+                        )?;
+                        // An unreported capability is left to the provider,
+                        // whose refusal reaches the client.
+                        check(
+                            info.image_input != Some(false),
+                            GatewayError::Invalid(
+                                "the selected model's API reports that it does not accept images",
+                            ),
+                        )?;
+                    }
                     let prompt = store
                         .state
                         .settings
@@ -1244,6 +1310,7 @@ impl Gateway {
                         role: Role::User,
                         text,
                         attachments,
+                        images,
                         at: now(),
                         backend: thread.backend,
                         tool_calls: vec![],
@@ -1554,6 +1621,18 @@ impl Gateway {
                 )
                 .await?;
                 Ok(Reply::Text(String::from_utf8_lossy(&output).into_owned()))
+            }
+            Command::StageImage { name, data } => {
+                let images = self.images.clone();
+                let image =
+                    tokio::task::spawn_blocking(move || images.stage(&name, &data)).await??;
+                Ok(Reply::Image(image))
+            }
+            Command::ReadImage { digest } => {
+                let images = self.images.clone();
+                let data =
+                    tokio::task::spawn_blocking(move || images.read_digest(&digest)).await??;
+                Ok(Reply::ImageData(data))
             }
             Command::ReadDocument { project, path } => {
                 let root = self.project_root(project)?;

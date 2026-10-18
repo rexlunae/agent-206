@@ -151,6 +151,10 @@ mod native {
         Chat {
             thread: uuid::Uuid,
             text: String,
+            /// Attach a PNG, JPEG, GIF or WebP image of at most 2 MiB;
+            /// repeat for up to four.
+            #[arg(long = "image")]
+            images: Vec<PathBuf>,
         },
         /// Add a message to a conversation's running native run; it is read
         /// before the run's next model request.
@@ -482,6 +486,45 @@ mod native {
             })?
             .enabled = enabled;
         Ok(Command::SaveSettings(Box::new(settings)))
+    }
+    /// Store each image with the gateway, which checks its format and size.
+    async fn stage_images(
+        client: &a206_runtime::client::Client,
+        paths: &[PathBuf],
+    ) -> anyhow::Result<Vec<a206_core::ImageAttachment>> {
+        anyhow::ensure!(
+            paths.len() <= a206_core::MAX_IMAGES,
+            "attach at most {} images",
+            a206_core::MAX_IMAGES
+        );
+        use anyhow::Context;
+        let mut staged = vec![];
+        for path in paths {
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| anyhow::anyhow!("{} has no usable file name", path.display()))?
+                .to_owned();
+            let size = std::fs::metadata(path)
+                .with_context(|| format!("could not read {}", path.display()))?
+                .len();
+            anyhow::ensure!(
+                size <= a206_core::MAX_IMAGE_BYTES as u64,
+                "{} is larger than 2 MiB",
+                path.display()
+            );
+            let data = std::fs::read(path)
+                .with_context(|| format!("could not read {}", path.display()))?;
+            match client
+                .call(Command::StageImage { name, data })
+                .await?
+                .into_result()?
+            {
+                Reply::Image(image) => staged.push(image),
+                _ => anyhow::bail!("unexpected reply while attaching {}", path.display()),
+            }
+        }
+        Ok(staged)
     }
     fn default_root() -> anyhow::Result<PathBuf> {
         Ok(PathBuf::from(
@@ -1003,10 +1046,15 @@ mod native {
                             .find(|m| m.label().eq_ignore_ascii_case(&mode))
                             .ok_or_else(|| anyhow::anyhow!("unknown mode"))?,
                     },
-                    Action::Chat { thread, text } => Command::Send {
+                    Action::Chat {
+                        thread,
+                        text,
+                        images,
+                    } => Command::Send {
                         thread,
                         text,
                         attachments: vec![],
+                        images: stage_images(&client, &images).await?,
                     },
                     Action::Steer { thread, text } => Command::Steer { thread, text },
                     Action::Pause { thread } => Command::PauseRun { thread },

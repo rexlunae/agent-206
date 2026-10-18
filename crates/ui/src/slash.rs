@@ -610,6 +610,7 @@ mod tests {
             output_cost_per_token: None,
             reasoning: None,
             reasoning_efforts: efforts,
+            image_input: None,
         }
     }
 

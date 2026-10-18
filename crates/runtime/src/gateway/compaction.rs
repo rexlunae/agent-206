@@ -264,6 +264,8 @@ impl Gateway {
         // deltas and retry notices are dropped instead of waiting for room.
         let (sender, receiver) = tokio::sync::mpsc::channel(1);
         drop(receiver);
+        // The transcript names images; their bytes are not summarized.
+        let no_images = provider::ImageData::default();
         let operation = provider::complete(
             request.config,
             broker,
@@ -272,6 +274,7 @@ impl Gateway {
                 prompt: SUMMARY_PROMPT,
                 info: request.info,
                 tools: &[],
+                images: &no_images,
             },
             &sender,
             &self.retry,

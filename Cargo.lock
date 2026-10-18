@@ -311,6 +311,7 @@ dependencies = [
  "a206-protocol",
  "a206-runtime",
  "a206-vault-channel",
+ "base64 0.22.1",
  "dioxus",
  "dioxus-ssr",
  "fc-dioxus",

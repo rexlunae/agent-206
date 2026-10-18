@@ -79,7 +79,7 @@ invocations and relays gateway-authorized host calls (`a206/docs/plugin-api.md`)
 | `http_request` with scanning (`tools/http.rs`) | missing | Destination-bound brokered HTTP |
 | `browser` CDP automation (`tools/browser/real.rs`) | partial: sandboxed preview, no automation (`ui/src/pages.rs` Browser) | Isolated profile/driver process; exact-origin vault injection |
 | `pdf`, `document` DOCX/XLSX/PPTX (`tools/pdf.rs`, `document.rs`) | partial: UTF-8 text/Markdown only | Format-viewer WASM extensions |
-| `image` vision, `image_generate`, `tts` (`tools/image_gen.rs`, `gateway_tools`) | missing; attachments text-only (8 × 128 KiB) | Image/audio attachments; capability from API metadata only |
+| `image` vision, `image_generate`, `tts` (`tools/image_gen.rs`, `gateway_tools`) | partial: image input for native providers (up to 4 PNG/JPEG/GIF/WebP images of 2 MiB per user message, `runtime/src/images.rs`; sent per protocol in `runtime/src/provider.rs`; refused when the models API reports no image input, unknown left to the provider; docs/run-engine.md "Images"); `image_generate` and `tts` missing | Audio attachments; image generation and speech as extensions; capability from API metadata only |
 | `chart` SVG (`tools/chart.rs`) | missing | Typed UI contribution rendered by fc-dioxus (no raw SVG/HTML injection) |
 | `canvas` / A2UI (`canvas/*`, `tools/devices/canvas.rs`) | missing | Plugin typed UI descriptions (`docs/plugin-api.md` target) |
 | `nodes` SSH/ADB/VNC devices (`tools/devices/nodes.rs`) | missing | Extension over ordinary SSH; host verification |

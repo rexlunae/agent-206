@@ -717,6 +717,15 @@ impl Gateway {
         broker: provider::Broker<'_>,
         offered: &[ToolSpec],
     ) -> Result<Option<Result<(provider::Turn, Id), provider::ProviderError>>> {
+        // Images are read for each round, so one changed or removed since it
+        // was attached is reported rather than sent.
+        let images = if thread.messages.iter().any(|m| !m.images.is_empty()) {
+            let (images, thread, info) = (self.images.clone(), thread.clone(), run.info.clone());
+            tokio::task::spawn_blocking(move || provider::ImageData::load(&images, &thread, &info))
+                .await??
+        } else {
+            provider::ImageData::default()
+        };
         let (sender, mut progress) = tokio::sync::mpsc::channel(32);
         let operation = provider::complete(
             &run.config,
@@ -726,6 +735,7 @@ impl Gateway {
                 prompt,
                 info: &run.info,
                 tools: offered,
+                images: &images,
             },
             &sender,
             &self.retry,

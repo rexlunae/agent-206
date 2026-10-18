@@ -162,6 +162,7 @@ impl Rig {
                     thread: id,
                     text,
                     attachments: vec![],
+                    images: vec![],
                 },
             )
             .await
