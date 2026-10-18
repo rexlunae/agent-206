@@ -2136,8 +2136,9 @@ async fn irc_without_a_login_waits_for_the_user() {
 /// A stand-in signal-cli daemon on a Unix socket: it serves `accounts`,
 /// sends `early` before answering `subscribeReceive` and `script` after,
 /// and records every request it receives. With `hang_up_after`, the first
-/// connection closes after answering that many `send`s, and the next
-/// subscription sends `replay`.
+/// connection closes after answering that many `send`s (or, with
+/// `unanswered`, on receiving the last of them), and the next subscription
+/// sends `replay`.
 #[derive(Clone, Default)]
 struct SignalDaemon {
     accounts: Vec<String>,
@@ -2145,6 +2146,7 @@ struct SignalDaemon {
     script: Arc<Mutex<Vec<Value>>>,
     replay: Arc<Mutex<Vec<Value>>>,
     hang_up_after: usize,
+    unanswered: bool,
     sent: Arc<std::sync::atomic::AtomicUsize>,
     hung_up: Arc<std::sync::atomic::AtomicBool>,
     received: Arc<Mutex<Vec<Value>>>,
@@ -2182,6 +2184,16 @@ async fn serve_signal(dir: &std::path::Path, daemon: SignalDaemon) -> String {
                             if daemon.hung_up.load(Ordering::SeqCst) {
                                 send.append(&mut daemon.replay.lock().unwrap());
                             }
+                        }
+                        Some("send")
+                            if daemon.unanswered
+                                && !daemon.hung_up.load(Ordering::SeqCst)
+                                && daemon.sent.load(Ordering::SeqCst) + 1
+                                    == daemon.hang_up_after =>
+                        {
+                            daemon.sent.fetch_add(1, Ordering::SeqCst);
+                            daemon.hung_up.store(true, Ordering::SeqCst);
+                            return;
                         }
                         Some("send") => {
                             send.push(
@@ -2415,6 +2427,83 @@ async fn signal_keeps_early_messages_and_answers_none_twice_across_a_reconnect()
     assert_eq!(
         sends(),
         [q1, q2, q3].map(|q| json!(format!("reply to {q}")))
+    );
+    stop.cancel();
+    supervisor.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn signal_answers_messages_a_failed_session_left_unhandled_when_redelivered() {
+    let number = format!("+1555{}", 1_000_000 + std::process::id() % 1_000_000);
+    let friend = Id::new_v4().hyphenated().to_string();
+    let (q1, q2) = (random(), random());
+    let (dir, _credential, pairing, _anchor) = broker("https://unused.invalid", &random()).await;
+    // The first reply never gets an answer: the connection closes, and q2,
+    // already queued, goes with that session.
+    let daemon = SignalDaemon {
+        accounts: vec![number.clone()],
+        hang_up_after: 1,
+        unanswered: true,
+        ..SignalDaemon::default()
+    };
+    let message = |timestamp, text: &String| {
+        signal_message(&number, &friend, timestamp, json!({ "message": text }))
+    };
+    daemon
+        .script
+        .lock()
+        .unwrap()
+        .extend([message(1, &q1), message(2, &q2)]);
+    daemon
+        .replay
+        .lock()
+        .unwrap()
+        .extend([message(1, &q1), message(2, &q2)]);
+    let endpoint = serve_signal(dir.path(), daemon.clone()).await;
+    let host = signal_host(&dir, pairing);
+    let entry = MessengerConfig {
+        enabled: true,
+        endpoint: Some(endpoint),
+        login: Some(number.clone()),
+        allowed_chats: BTreeSet::from([friend.clone()]),
+        allowed_users: BTreeSet::from([friend.clone()]),
+        model: Some(ModelKey {
+            provider: Id::new_v4(),
+            model: random(),
+        }),
+        ..MessengerConfig::new("signal".to_owned(), MessengerKind::Signal)
+    };
+    let (_desired, receiver) = watch::channel(vec![Desired {
+        config: entry,
+        run: true,
+    }]);
+    let stop = CancellationToken::new();
+    let supervisor = tokio::spawn(supervise(host.clone(), receiver, FAST, stop.clone()));
+    let sends = || -> Vec<Value> {
+        daemon
+            .received
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r["method"] == "send")
+            .map(|r| r["params"]["message"].clone())
+            .collect()
+    };
+    host.until(|_| sends().len() == 2).await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    // q1's reply was tried once (the gateway answers a message at most
+    // once), and q2, which the failed session never handled, is answered
+    // when signal-cli delivers it again.
+    assert_eq!(sends(), [&q1, &q2].map(|q| json!(format!("reply to {q}"))));
+    assert_eq!(
+        daemon
+            .received
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r["method"] == "subscribeReceive")
+            .count(),
+        2
     );
     stop.cancel();
     supervisor.await.unwrap();

@@ -54,10 +54,17 @@ pub(crate) struct Signal {
     daemon: std::result::Result<SignalDaemon, a206_core::messengers::SignalDaemonError>,
     login: Option<String>,
     session: Option<Session>,
-    /// Messages seen lately, kept across subscriptions so one signal-cli
+    /// Messages handled lately, kept across subscriptions so one signal-cli
     /// delivers again after a reconnect is not answered twice. The login
     /// cannot change without a new adapter, so these are all its account's.
     recent: Arc<Mutex<Recent>>,
+    /// Keys of the batch last returned. The gateway asks for the next batch
+    /// once it handled every event of this one, so they count as handled
+    /// then, unless a reply failed meanwhile (`failed`): a failed reply ends
+    /// the gateway's session with the rest of the batch unhandled, and a
+    /// redelivery is answered at least once rather than never.
+    returned: Vec<String>,
+    failed: std::sync::atomic::AtomicBool,
 }
 
 struct Session {
@@ -83,12 +90,25 @@ impl Signal {
             login,
             session: None,
             recent: Arc::default(),
+            returned: Vec::new(),
+            failed: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
     /// Connect to the daemon, check that it serves the account and subscribe
     /// to its messages, unless the current session is still running.
     pub(crate) async fn connect(&mut self) -> Result<Account> {
+        // A session whose task ended can deliver nothing more; what it still
+        // queued was never handled, so it is dropped for signal-cli's
+        // redelivery to a new subscription rather than answered through a
+        // connection that is gone.
+        if self
+            .session
+            .as_ref()
+            .is_some_and(|session| session.outgoing.is_closed())
+        {
+            self.session = None;
+        }
         if let Some(session) = &self.session {
             return Ok(session.account.clone());
         }
@@ -138,18 +158,36 @@ impl Signal {
     /// The messages the session queued, waiting for at least one. A session
     /// failure ends it; the next connect subscribes again.
     pub(crate) async fn receive(&mut self, _cursor: Option<&str>) -> Result<Batch> {
+        let failed = self.failed.swap(false, std::sync::atomic::Ordering::SeqCst);
+        if failed {
+            self.returned.clear();
+        } else {
+            let mut recent = lock(&self.recent);
+            for key in self.returned.drain(..) {
+                recent.insert(&key);
+            }
+        }
         let Some(session) = self.session.as_mut() else {
             return Err(MessengerError::SocketEnded { service: SERVICE });
         };
         let batch = session.listener.receive().await;
-        if batch.is_err() {
-            self.session = None;
+        match &batch {
+            Ok(batch) => self.returned = batch.events.iter().map(|(key, _)| key.clone()).collect(),
+            Err(_) => self.session = None,
         }
         batch
     }
 
     /// Send `text` to a group or, for a direct chat, to the ACI it names.
     pub(crate) async fn send(&self, chat: &str, text: &str) -> Result<()> {
+        let sent = self.reply(chat, text).await;
+        if sent.is_err() {
+            self.failed.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        sent
+    }
+
+    async fn reply(&self, chat: &str, text: &str) -> Result<()> {
         let ended = || MessengerError::SocketEnded { service: SERVICE };
         let session = self.session.as_ref().ok_or_else(ended)?;
         let (done, answer) = oneshot::channel();
@@ -289,12 +327,14 @@ fn refusal_text(message: &str) -> String {
     let line: String = message
         .chars()
         .map(|c| if c.is_control() { ' ' } else { c })
-        .take(MAX_REFUSAL)
         .collect();
-    match a206_leak_scan::redact(&line) {
+    // Redacted whole, before cutting, so no credential is cut to a prefix
+    // the scanner no longer recognizes.
+    let line = match a206_leak_scan::redact(&line) {
         Some(redacted) => redacted.text,
         None => line,
-    }
+    };
+    line.chars().take(MAX_REFUSAL).collect()
 }
 
 /// Queue messages and send replies until something fails.
@@ -325,8 +365,12 @@ async fn session(
         writer: mut rpc,
         early,
     } = rpc;
+    // Queued in this subscription; the shared `recent` holds only what the
+    // gateway handled, so a message queued but lost with a failed session
+    // can still be answered when signal-cli delivers it again.
+    let mut queued = Recent::default();
     for message in early {
-        notified(&message, &login, &recent, &queue)?;
+        notified(&message, &login, &recent, &mut queued, &queue)?;
     }
     let (lines, mut incoming) = mpsc::channel::<Result<Incoming>>(64);
     // Aborted when the session ends (`_reading`), so it never outlives the
@@ -366,7 +410,7 @@ async fn session(
                     }
                     continue;
                 }
-                notified(&message, &login, &recent, &queue)?;
+                notified(&message, &login, &recent, &mut queued, &queue)?;
             }
             reply = requests.recv() => {
                 // The adapter went away with its listener.
@@ -395,22 +439,36 @@ async fn session(
 
 /// Queue a `receive` notification's message unless it was seen lately,
 /// in this subscription or an earlier one.
-fn notified(message: &Incoming, login: &str, recent: &Mutex<Recent>, queue: &Queue) -> Result<()> {
+fn notified(
+    message: &Incoming,
+    login: &str,
+    recent: &Mutex<Recent>,
+    queued: &mut Recent,
+    queue: &Queue,
+) -> Result<()> {
     if message.method.as_deref() != Some("receive") {
         return Ok(());
     }
     let Some((key, event)) = message.params.as_ref().and_then(|p| received(p, login)) else {
         return Ok(());
     };
-    // Held only for the check; nothing is awaited under it.
-    let new = recent
+    if lock(recent).contains(&key) || queued.contains(&key) {
+        return Ok(());
+    }
+    queue.push(key.clone(), event)?;
+    // Only once it is queued: a message refused for a full queue is not
+    // remembered, so its redelivery is not mistaken for a duplicate.
+    queued.insert(&key);
+    Ok(())
+}
+
+/// The shared cache, held only for a check or an insert and never across
+/// an await. A poisoned lock only means a session panicked mid-insert; the
+/// keys it holds are still sound.
+fn lock(recent: &Mutex<Recent>) -> std::sync::MutexGuard<'_, Recent> {
+    recent
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(&key);
-    if new {
-        queue.push(key, event)?;
-    }
-    Ok(())
 }
 
 /// Aborts the reading task when the session ends.
@@ -456,6 +514,10 @@ struct Recent {
     order: VecDeque<String>,
 }
 impl Recent {
+    fn contains(&self, key: &str) -> bool {
+        self.keys.contains(key)
+    }
+
     /// Whether `key` is new, remembering it.
     fn insert(&mut self, key: &str) -> bool {
         if !self.keys.insert(key.to_owned()) {
@@ -718,5 +780,8 @@ mod tests {
         assert!(text.starts_with("bad request "));
         let long = refusal_text(&"x".repeat(MAX_REFUSAL * 2));
         assert_eq!(long.chars().count(), MAX_REFUSAL);
+        // A credential across the cut is removed whole, not cut to a prefix.
+        let straddling = refusal_text(&format!("{} {token}", "x".repeat(MAX_REFUSAL - 10)));
+        assert!(!straddling.contains("ghp_"), "{straddling}");
     }
 }
