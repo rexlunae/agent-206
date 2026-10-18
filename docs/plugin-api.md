@@ -24,8 +24,19 @@ quoted paths are refused, as is a hunk with more or fewer lines than the
 counts in its `@@` header. The write tools need a separate `write_workspace` grant. It also bundles
 `agent206.git` (`plugins/git`) with `git_status`, `git_log` and `git_diff`
 tools under the `git_read` grant and a `git_commit` tool under its own
-`git_write` grant, and `agent206.web` (`plugins/web`) with a
-`fetch_url` tool under the `network` grant.
+`git_write` grant, and `agent206.web` (`plugins/web`) with `fetch_url` (the
+raw response) and `read_web_page` tools under the `network` grant.
+`read_web_page` reads HTML in one pass in the guest, without a DOM: it drops
+scripts, styles, navigation, headers, footers, asides, forms and similar
+chrome; keeps only `<main>`/`<article>` content when that content has text;
+and writes Markdown (headings, lists, `http(s)` links resolved against the
+page, code, rules) or plain text, with the page title and description on
+request. After a redirect the page's address is unknown, so relative links
+keep only their text. Other text types
+are returned as they are. Like memory search it meters its own work and stops
+with a notice before the invocation's fuel runs out; under the default fuel
+that is roughly 100 KB of ordinary HTML, and less for pages that are nearly all
+tags. CSS selectors (RustyClaw's `selector`) are not supported.
 `agent206.memory` (`plugins/memory`) has project memory tools that see only
 `MEMORY.md` and `memory/**/*.md`: `memory_search` (BM25 over heading/20-line
 sections, through the ordinary list and read host calls) and `memory_get` (a
@@ -264,7 +275,7 @@ unsafe operation.
 | `git_log { max }` | `git_read` + a project | commits from `HEAD`: id, summary, author name (no email), author time | 200 commits |
 | `git_diff { path, staged }` | `git_read` + a project | unified diff of one file (`HEAD`→index when `staged`, else index→working tree; a symbolic link compares its target text), or `binary` | 512 KiB per side (checked before a blob is read), 192 KiB of text, 3 context lines; at most 8,192 input lines combined and 1,000,000 line pairs, otherwise a budget failure |
 | `git_commit { message, paths }` | `git_write` + a project | the new commit: id, summary, author name, time | 1 to 100 paths, 16 KiB message, 512 KiB per file and 8 MiB together; 5 s and 3 s before the invocation's deadline, but once the commit is written it is reported, even past that; see [Commits](#commits) |
-| `fetch { url }` | `network` + a declared host | final status (any, not only 2xx), `Content-Type`, body, whether it was cut | 512 KiB body; 8 s including redirects; 5 redirects |
+| `fetch { url }` | `network` + a declared host | final status (any, not only 2xx), `Content-Type`, body, whether it was cut, whether a redirect was followed | 512 KiB body; 8 s including redirects; 5 redirects |
 | `state_get { key }` | nothing | the extension's own value | — |
 | `state_put { key, value }` | nothing | done (`value = None` deletes) | 64 keys, 256 KiB per extension |
 | `log { level, message }` | nothing | done; recorded through tracing | 32 per call, 1 KiB each |
@@ -323,7 +334,8 @@ credential-free HTTPS on port 443 without a fragment, on a host the manifest
 declares, and every address the host resolves to must be public. The
 connection is pinned to those checked addresses, so a second DNS answer cannot
 redirect it. It sends no cookies, credentials or proxy settings. A refusal
-never echoes the URL, because links can carry tokens.
+never echoes the URL, because links can carry tokens, and a reply never
+names the address a redirect led to; it only says one was followed.
 
 Workspace paths are relative and resolved with cap-std: absolute paths, `..`
 escapes and symlinks that leave the root are refused. Writes also refuse any
