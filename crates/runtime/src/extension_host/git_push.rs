@@ -191,7 +191,7 @@ pub(crate) fn pack(
         return Ok(None);
     }
     if !old.is_null() {
-        match ancestor(&repo, old, target.tip, interrupt).map_err(host)? {
+        match ancestor(&repo, old, target.tip, MAX_ANCESTRY, interrupt).map_err(host)? {
             Some(true) => {}
             Some(false) => return Err(PushError::NotFastForward(target.branch.clone())),
             None => return Err(PushError::History),
@@ -217,12 +217,13 @@ fn peeled(repo: &gix::Repository, reference: &str) -> Result<Option<ObjectId>, H
 }
 
 /// Whether `old` is `tip` or one of its ancestors, or `None` when that
-/// takes more than [`MAX_ANCESTRY`] commits to tell. A commit the
-/// repository lacks is not.
+/// takes more than `limit` commits to tell. A commit the repository lacks
+/// is not.
 fn ancestor(
     repo: &gix::Repository,
     old: ObjectId,
     tip: ObjectId,
+    limit: usize,
     interrupt: &AtomicBool,
 ) -> Result<Option<bool>, HostFailure> {
     if !repo.has_object(old) {
@@ -233,7 +234,7 @@ fn ancestor(
         .all()
         .map_err(|e| git_failure("log", &e))?;
     for (seen, info) in walk.enumerate() {
-        if seen == MAX_ANCESTRY {
+        if seen == limit {
             return Ok(None);
         }
         if seen % 1024 == 0 {
@@ -252,7 +253,8 @@ pub(crate) enum Tracked {
     /// It now points at the pushed commit.
     Updated,
     /// It already pointed at a commit the pushed one does not descend from,
-    /// such as one a later push or fetch recorded, and was left there.
+    /// such as one a later push or fetch recorded, and was left there. A
+    /// commit too far back to tell is reported as a failure instead.
     Kept,
 }
 
@@ -261,6 +263,11 @@ pub(crate) enum Tracked {
 /// changed after it was read, so two pushes finishing out of order cannot
 /// rewind it.
 pub(crate) fn record(root: PathBuf, target: &PushTarget) -> Result<Tracked, HostFailure> {
+    record_within(root, target, MAX_ANCESTRY)
+}
+
+/// [`record`], walking at most `limit` commits to compare the two.
+fn record_within(root: PathBuf, target: &PushTarget, limit: usize) -> Result<Tracked, HostFailure> {
     let never = AtomicBool::new(false);
     let repo = open(root, &never)?;
     let settings = settings(&repo)?;
@@ -281,9 +288,15 @@ pub(crate) fn record(root: PathBuf, target: &PushTarget) -> Result<Tracked, Host
         let expected = match current {
             None => PreviousValue::MustNotExist,
             Some(current) if current == target.tip => return Ok(Tracked::Updated),
-            Some(current) => match ancestor(&repo, current, target.tip, &never)? {
+            Some(current) => match ancestor(&repo, current, target.tip, limit, &never)? {
                 Some(true) => PreviousValue::MustExistAndMatch(Target::Object(current)),
-                Some(false) | None => return Ok(Tracked::Kept),
+                Some(false) => return Ok(Tracked::Kept),
+                None => {
+                    return Err(unsupported(
+                        "the remote-tracking branch is too far behind the pushed commit to tell \
+                         whether it is older; fetch the remote to update it",
+                    ));
+                }
             },
         };
         let edit = RefEdit {
@@ -547,6 +560,22 @@ mod tests {
         // The earlier push finishing last does not rewind it.
         assert_eq!(record(dir.path().into(), &first).unwrap(), Tracked::Kept);
         assert_eq!(at(), Some(second.tip));
+        // Too far behind to tell is a failure, not a claim that it is newer.
+        advance(&dir);
+        let third = target_of(&dir, None, None).unwrap();
+        assert!(matches!(
+            record_within(dir.path().into(), &third, 1),
+            Err(HostFailure {
+                code: HostErrorCode::Unsupported,
+                ..
+            })
+        ));
+        assert_eq!(at(), Some(second.tip));
+        assert_eq!(
+            record_within(dir.path().into(), &third, 2).unwrap(),
+            Tracked::Updated
+        );
+        assert_eq!(at(), Some(third.tip));
     }
 
     #[test]
