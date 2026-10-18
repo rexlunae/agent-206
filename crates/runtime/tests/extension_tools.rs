@@ -1214,6 +1214,37 @@ async fn git_tools_run_once_the_conversation_is_granted_git() {
         assert_ne!(on.as_bstr(), format!("refs/heads/{branch}").as_str());
     }
 
+    // Switching to it also edits project files, so it needs that grant too.
+    rig.grant_thread(&[
+        Capability::ReadWorkspace,
+        Capability::WriteWorkspace,
+        Capability::GitRead,
+        Capability::GitWrite,
+    ])
+    .await;
+    rig.ok(Command::GrantExtension {
+        extension: GIT.into(),
+        capabilities: [
+            Capability::GitRead,
+            Capability::GitWrite,
+            Capability::WriteWorkspace,
+        ]
+        .into(),
+    })
+    .await;
+    rig.tool = tool_name(GIT, "git_switch");
+    rig.permit(ToolPermission::Allow).await;
+    let switch = Call::new(&rig.tool, json!({ "name": branch }));
+    let (thread, _) = rig.round_trip(&[switch]).await;
+    let record = calls_of(&thread).last().unwrap().clone();
+    assert_eq!(record.state, ToolCallState::Succeeded, "{:?}", record.error);
+    let on = gix::open(rig.workspace.path())
+        .unwrap()
+        .head_name()
+        .unwrap()
+        .unwrap();
+    assert_eq!(on.as_bstr(), format!("refs/heads/{branch}").as_str());
+
     // The network alone needs no project, unlike everything else.
     let Reply::Thread(research) = rig
         .run(Command::CreateThread {

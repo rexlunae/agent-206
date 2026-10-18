@@ -33,7 +33,7 @@ const COMMIT_HOOKS: [&str; 4] = [
     "post-commit",
 ];
 /// Attributes that make git change content on the way into a commit.
-const CONVERSIONS: [&str; 6] = [
+pub(super) const CONVERSIONS: [&str; 6] = [
     "filter",
     "ident",
     "working-tree-encoding",
@@ -163,7 +163,7 @@ impl Settings {
             )),
         }
     }
-    fn string(&self, key: &str) -> Option<BString> {
+    pub(super) fn string(&self, key: &str) -> Option<BString> {
         self.repository
             .string(key)
             .or_else(|| self.user.string(key))

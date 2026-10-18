@@ -13,34 +13,36 @@ pub use manifest::{ArgError, Manifest, ManifestError, allows_host, check_args};
 use a206_core::{Capability, ErrorKind};
 use std::error::Error;
 
-/// The capability a host request needs. Extension-scoped state and logs need
-/// none. Approved skill imports are separately restricted to the bundled
-/// skills identity and current approval pins by the gateway.
-pub fn required_capability(request: &abi::HostRequest) -> Option<Capability> {
+/// The capabilities a host request needs, all of them. Extension-scoped
+/// state and logs need none. Approved skill imports are separately
+/// restricted to the bundled skills identity and current approval pins by
+/// the gateway.
+pub fn required_capabilities(request: &abi::HostRequest) -> &'static [Capability] {
+    use Capability::*;
     use abi::HostRequest as R;
     match request {
         R::ReadFile { .. }
         | R::ListDirectory { .. }
         | R::Search { .. }
         | R::SearchPattern { .. }
-        | R::Find { .. } => Some(Capability::ReadWorkspace),
+        | R::Find { .. } => &[ReadWorkspace],
         R::WriteFile { .. }
         | R::EditFile { .. }
         | R::CreateDirectory { .. }
-        | R::PatchFiles { .. } => Some(Capability::WriteWorkspace),
-        R::GitStatus | R::GitLog { .. } | R::GitDiff { .. } | R::GitBranches => {
-            Some(Capability::GitRead)
-        }
+        | R::PatchFiles { .. } => &[WriteWorkspace],
+        R::GitStatus | R::GitLog { .. } | R::GitDiff { .. } | R::GitBranches => &[GitRead],
         R::GitCommit { .. }
         | R::GitCommitStaged { .. }
         | R::GitStage { .. }
-        | R::GitCreateBranch { .. } => Some(Capability::GitWrite),
-        R::Fetch { .. } => Some(Capability::Network),
+        | R::GitCreateBranch { .. } => &[GitWrite],
+        // A switch rewrites project files as well as git state.
+        R::GitSwitchBranch { .. } => &[GitWrite, WriteWorkspace],
+        R::Fetch { .. } => &[Network],
         R::StateGet { .. }
         | R::StatePut { .. }
         | R::Log { .. }
         | R::SkillList
-        | R::SkillRead { .. } => None,
+        | R::SkillRead { .. } => &[],
     }
 }
 

@@ -249,6 +249,11 @@ pub enum HostRequest {
         #[serde(default)]
         start: Option<String>,
     },
+    /// Switch to the local branch `name`, like `git switch <name>`: the
+    /// working tree and index change to its commit and `HEAD` names it.
+    /// Refused unless the working tree and index match `HEAD`, and when a
+    /// file would replace an untracked or ignored one.
+    GitSwitchBranch { name: String },
     /// Put the working-tree content of exactly `paths` in the index, like
     /// `git add` (a path missing from the working tree is removed from the
     /// index), or with `unstage`, set them back to `HEAD`, like
@@ -289,7 +294,8 @@ pub enum HostReply {
     /// The commit a [`HostRequest::GitCommit`] made.
     Committed(GitCommit),
     Branches(GitBranches),
-    /// The branch a [`HostRequest::GitCreateBranch`] made.
+    /// The branch a [`HostRequest::GitCreateBranch`] made, or the one a
+    /// [`HostRequest::GitSwitchBranch`] made current.
     Branch(GitBranch),
     Patched(PatchResult),
     Fetched(FetchResponse),
