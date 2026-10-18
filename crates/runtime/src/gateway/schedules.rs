@@ -221,7 +221,6 @@ impl Gateway {
     fn fire(&self, job: &Job) {
         let Some(JobRun {
             id: run,
-            at,
             outcome: JobOutcome::Running,
             ..
         }) = job.last
@@ -246,7 +245,7 @@ impl Gateway {
                 ),
                 // An empty checklist has nothing to check.
                 Ok(None) => (JobOutcome::Quiet, None),
-                Ok(Some(text)) => gateway.send_job(thread, kind, text, at).await,
+                Ok(Some(text)) => gateway.send_job(thread, kind, text).await,
             };
             // Nobody waits on this task, so a failure to record the outcome
             // is logged; the conversation still shows the run itself.
@@ -268,15 +267,28 @@ impl Gateway {
             }
         }));
     }
-    /// Send a job's message to `thread` for the run started `at`, and report
-    /// how the run ended, with its reply.
+    /// Send a job's message to `thread` and report how its run ended, with
+    /// its reply.
     async fn send_job(
         &self,
         thread: Id,
         kind: JobKind,
         text: String,
-        at: u64,
     ) -> (JobOutcome, Option<String>) {
+        // A conversation's messages are only ever added to, so the job's
+        // message is the first with its text from here on.
+        let from = match self
+            .lock()
+            .and_then(|store| Ok(store.thread(thread)?.messages.len()))
+        {
+            Ok(from) => from,
+            Err(error) => {
+                return (
+                    JobOutcome::Refused(crate::error::handle("schedule_job", &error)),
+                    None,
+                );
+            }
+        };
         let reply = self
             .request(Request {
                 id: Id::new_v4(),
@@ -289,7 +301,7 @@ impl Gateway {
             })
             .await;
         match reply.body {
-            Reply::Thread(thread) => (ended(kind, &thread), run_reply(&thread, &text, at)),
+            Reply::Thread(thread) => (ended(kind, &thread), run_reply(&thread, &text, from)),
             Reply::Error(report) => (JobOutcome::Refused(report), None),
             _ => (JobOutcome::Failed, None),
         }
@@ -377,14 +389,27 @@ impl Gateway {
         posts: bool,
     ) -> Result<Option<String>> {
         let ended = Some(now());
-        let to = self.update_run(id, run, |to, last| {
-            let to = to.filter(|_| posts && outcome == JobOutcome::Complete);
+        let posts = posts && outcome == JobOutcome::Complete;
+        let recorded = self.update_run(id, run, |to, last| {
+            let to = to.filter(|_| posts);
             last.outcome = outcome;
             last.ended = ended;
             last.delivery = to.as_ref().map(|_| Delivery::Posting);
             to
         })?;
-        Ok(to.flatten())
+        match recorded {
+            Some(to) => Ok(to),
+            // Newer runs pushed this one out of the history; its reply is
+            // still posted while the job keeps a destination.
+            None if posts => Ok(self
+                .lock()?
+                .state
+                .jobs
+                .iter()
+                .find(|job| job.id == id)
+                .and_then(|job| job.deliver_to.clone())),
+            None => Ok(None),
+        }
     }
 
     /// Run jobs as they come due until the gateway stops.
@@ -495,15 +520,17 @@ fn ended(kind: JobKind, thread: &Thread) -> JobOutcome {
 }
 
 /// A run's reply: the last assistant text after the message `sent` that
-/// started it, the first such message since the run started `at` (as
-/// restart recovery finds it). Messages steered into the run, even with the
-/// same text, follow it; the reply to those it took in comes after them, and
-/// those steered too late come after the reply and are skipped.
-fn run_reply(thread: &Thread, sent: &str, at: u64) -> Option<String> {
-    let start = thread
-        .messages
-        .iter()
-        .position(|m| m.role == Role::User && m.at >= at && m.text == sent)?;
+/// started it, the first such message from index `from`, where the
+/// conversation ended before it was sent. Messages steered into the run, even
+/// with the same text, follow it; the reply to those it took in comes after
+/// them, and those steered too late come after the reply and are skipped.
+fn run_reply(thread: &Thread, sent: &str, from: usize) -> Option<String> {
+    let start = from
+        + thread
+            .messages
+            .get(from..)?
+            .iter()
+            .position(|m| m.role == Role::User && m.text == sent)?;
     thread.messages[start + 1..]
         .iter()
         .rev()

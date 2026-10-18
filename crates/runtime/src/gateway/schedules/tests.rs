@@ -443,6 +443,31 @@ async fn the_history_keeps_a_bounded_number_of_runs_and_settles_earlier_ones() {
         .map(|r| r.id)
         .collect();
     assert_eq!(kept, newest);
+
+    // A run pushed out of the history still posts its reply, while the job
+    // keeps a destination; a removed job's does not.
+    let pruned = Id::new_v4();
+    let to = job(&g, created.id).deliver_to;
+    assert!(to.is_some());
+    assert_eq!(
+        g.finish_job(created.id, pruned, JobOutcome::Complete, true)
+            .unwrap(),
+        to
+    );
+    assert_eq!(
+        g.finish_job(created.id, pruned, JobOutcome::Failed, true)
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        send(&g, Command::RemoveJob { id: created.id }).await,
+        Reply::Ok
+    );
+    assert_eq!(
+        g.finish_job(created.id, pruned, JobOutcome::Complete, true)
+            .unwrap(),
+        None
+    );
 }
 
 #[tokio::test]
@@ -489,29 +514,30 @@ async fn runs_still_going_at_a_restart_end_unrecorded_in_the_history() {
 
 #[test]
 fn a_runs_reply_is_the_last_answer_after_its_own_message() {
-    let at = arbitrary();
-    let say =
-        |role, text: &str, when| Message::new(role, text.into(), when, CodingBackend::default());
+    let say = |role, text: &str| Message::new(role, text.into(), 0, CodingBackend::default());
     let (sent, earlier, reply) = (nonce(), nonce(), nonce());
     let mut thread = Thread::new(nonce(), Mode::Chat);
     thread.messages = vec![
-        // The same text, sent before the run started.
-        say(Role::User, &sent, at - 1),
-        say(Role::Assistant, &earlier, at - 1),
-        say(Role::User, &sent, at),
-        say(Role::Assistant, &nonce(), at),
+        // The same text, answered before this run's message was sent (in
+        // the same second, which a time cannot tell apart).
+        say(Role::User, &sent),
+        say(Role::Assistant, &earlier),
+        say(Role::User, &sent),
+        say(Role::Assistant, &nonce()),
         // Steered into the run, which answered it.
-        say(Role::User, &nonce(), at),
-        say(Role::Assistant, &reply, at),
-        say(Role::Assistant, " \n", at),
+        say(Role::User, &nonce()),
+        say(Role::Assistant, &reply),
+        say(Role::Assistant, " \n"),
         // Steered too late for the run, with the job's own text.
-        say(Role::User, &sent, at),
+        say(Role::User, &sent),
     ];
-    assert_eq!(super::run_reply(&thread, &sent, at), Some(reply));
+    assert_eq!(super::run_reply(&thread, &sent, 2), Some(reply));
     // A run that answered with no text has no reply, not an earlier one.
     thread.messages.truncate(3);
-    assert_eq!(super::run_reply(&thread, &sent, at), None);
-    assert_eq!(super::run_reply(&thread, &nonce(), at), None);
+    thread.messages.push(say(Role::Assistant, ""));
+    assert_eq!(super::run_reply(&thread, &sent, 2), None);
+    assert_eq!(super::run_reply(&thread, &nonce(), 0), None);
+    assert_eq!(super::run_reply(&thread, &sent, 99), None);
 }
 
 #[test]

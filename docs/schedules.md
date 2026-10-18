@@ -100,8 +100,11 @@ allowed; the vault broker spends the credential. A heartbeat check posts only a
 reply that needs attention, never a quiet one. Failed, cancelled and refused
 runs post nothing, and the destination is read when the run ends, so clearing
 it stops a run in progress from posting. The reply is the last assistant text
-after the first message with the job's text since the run started, so a steered
-message with the same text does not hide it. The run's end is recorded first,
+after the first message with the job's text added after the job sent it
+(conversations are only ever added to), so neither an identical earlier message
+nor a steered message with the same text is taken for it. A run pushed out of
+the history by newer ones still posts its reply while the job keeps a
+destination. The run's end is recorded first,
 with `JobRun::delivery` set to `Posting`, and the post's result replaces it:
 `Sent { parts }` or `Failed` with the report (for example a disconnected
 webhook). A post still going out when the gateway stops becomes `Unrecorded` on
