@@ -23,8 +23,9 @@ and an `overview` panel. `apply_patch` reads a unified diff (`git diff` or
 quoted paths are refused, as is a hunk with more or fewer lines than the
 counts in its `@@` header. The write tools need a separate `write_workspace` grant. It also bundles
 `agent206.git` (`plugins/git`) with `git_status`, `git_log`, `git_branches` and
-`git_diff` tools under the `git_read` grant and `git_stage`, `git_commit` and
-`git_branch_create` tools under their own `git_write` grant, and `agent206.web` (`plugins/web`) with `fetch_url` (the
+`git_diff` tools under the `git_read` grant, `git_stage`, `git_commit` and
+`git_branch_create` tools under their own `git_write` grant, and `git_switch`,
+which needs `git_write` and `write_workspace` together, and `agent206.web` (`plugins/web`) with `fetch_url` (the
 raw response) and `read_web_page` tools under the `network` grant.
 `read_web_page` reads HTML in one pass in the guest, without a DOM: it drops
 scripts, styles, navigation, headers, footers, asides, forms and similar
@@ -276,6 +277,7 @@ unsafe operation.
 | `git_diff { path, staged }` | `git_read` + a project | unified diff of one file (`HEAD`→index when `staged`, else index→working tree; a symbolic link compares its target text), or `binary` | 512 KiB per side (checked before a blob is read), 192 KiB of text, 3 context lines; at most 8,192 input lines combined and 1,000,000 line pairs, otherwise a budget failure |
 | `git_branches` | `git_read` + a project | local branches sorted by name: short name, commit id, whether `HEAD` is on it | 500 branches, then `truncated`; 5 s per git call |
 | `git_create_branch { name, start }` | `git_write` + a project | the new branch | see [Branches](#branches); the same deadline as `git_commit` |
+| `git_switch_branch { name }` | `git_write` and `write_workspace` + a project | the branch, now current | 1,000 changed files, 512 KiB per file and 32 MiB together; see [Branches](#branches); the same deadline as `git_commit`, and a switch that has started changing files finishes and is reported |
 | `git_stage { paths, unstage }` | `git_write` + a project | done | 1 to 100 paths, 512 KiB per file and 8 MiB together; the same deadline as `git_commit`; see [Staging](#staging) |
 | `git_commit { message, paths }` | `git_write` + a project | the new commit: id, summary, author name, time | 1 to 100 paths, 16 KiB message, 512 KiB per file and 8 MiB together; 5 s and 3 s before the invocation's deadline, but once the commit is written it is reported, even past that; see [Commits](#commits) |
 | `git_commit_staged { message }` | `git_write` + a project | the new commit, as `git_commit` | 16 KiB message; the same deadline as `git_commit`; see [Commits](#commits) |
@@ -352,6 +354,25 @@ ids are not evaluated (`not_found`), and an unborn `HEAD` with no `start` is
 `invalid`. The reflog records `user.name` and `user.email`, which are required
 as for commits and read the same way. A `reference-transaction` hook, which
 git would run, refuses the call as `unsupported`.
+
+`git_switch_branch` works like `git switch <name>` for an existing local
+branch: the working tree and the index change to the branch's commit, then
+`HEAD` names the branch and HEAD's reflog records the move as git does (so
+`git switch -` works). Switching to the current branch changes nothing. It
+needs both `git_write` and `write_workspace`, since it rewrites project files.
+Nothing is carried over: any staged or unstaged change to a tracked file
+refuses the switch as `conflict`, as does an untracked or ignored file (or a
+folder holding one, or an empty folder) where the branch has a file. Untracked files elsewhere
+stay. Files the branch does not change keep their index data, so git does
+not read them again. These are `unsupported`: a `post-checkout` or
+`reference-transaction` hook; `core.autocrlf` or `core.eol=crlf`; a changed
+file that the branch's attributes give a `filter`, `ident`,
+`working-tree-encoding` or `eol=crlf`; submodules; a symbolic link the
+branch would create; a sparse checkout; a bare repository; and a merge,
+rebase or similar in progress. `user.name` and `user.email` are required for
+the reflog, and a reflog that cannot be opened refuses the switch as `io`. Every check is made before the first file changes. If writing a
+file then fails, the call fails naming that file and saying that the index
+and `HEAD` still name the previous branch.
 
 ### Staging
 
@@ -452,7 +473,7 @@ Tool text is extension output, never instructions.
 | Domain | Operations | Authority |
 | --- | --- | --- |
 | workspace | Multi-hunk patch | `write_workspace` |
-| git | Switching branches, push | `git_write` (push also needs a forge credential handle) |
+| git | Push, switching with changes carried over, creating symbolic links | `git_write` (push also needs a forge credential handle) |
 | forge | PRs, reviews, checks, logs | adapter-specific scoped credential handle |
 | network | Requests other than `GET`, headers, brokered credentials | `network` + destination + secret handle |
 | downloads | Enqueue, cancel, subscribe | destination and origin grants |
