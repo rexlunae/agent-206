@@ -5,22 +5,13 @@
 //! about tool calls quotes their markup there.
 //!
 //! Adapted from RustyClaw's `StreamSanitizer` (`tool_healing.rs`, MIT).
+use a206_injection_scan::TOOL_CALL_TAGS as TAGS;
 
 /// How far past a tag the filter looks for the backtick run that would make
 /// it inline code, so a long line is not copied again for every chunk. The
 /// limit is on the text, not on the chunks, so every chunking of a reply is
 /// filtered the same way.
 const MAX_HOLD: usize = 4096;
-
-/// Open and close tags of leaked tool-call blocks.
-const TAGS: [(&str, &str); 6] = [
-    ("<tool_call>", "</tool_call>"),
-    ("<tool_calls>", "</tool_calls>"),
-    ("<function_call>", "</function_call>"),
-    ("<function_calls>", "</function_calls>"),
-    ("<tool_use>", "</tool_use>"),
-    ("<|tool_call|>", "<|/tool_call|>"),
-];
 
 /// Removes leaked tool-call blocks from streamed text.
 ///
