@@ -255,9 +255,13 @@ fn run_history_shows_whether_each_reply_was_posted() {
             ErrorKind::NotFound,
             refusal.clone(),
         ))),
+        run(Delivery::Posting),
+        run(Delivery::Unrecorded),
         JobRun::start(at),
     ]);
     assert_eq!(html.matches("Reply posted<").count(), 1, "{html}");
+    assert_eq!(html.matches("Posting reply").count(), 1, "{html}");
+    assert_eq!(html.matches("it may not have arrived").count(), 1, "{html}");
     assert!(
         html.contains(&format!("Reply posted in {parts} parts")),
         "{html}"

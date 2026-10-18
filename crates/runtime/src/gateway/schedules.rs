@@ -221,6 +221,7 @@ impl Gateway {
     fn fire(&self, job: &Job) {
         let Some(JobRun {
             id: run,
+            at,
             outcome: JobOutcome::Running,
             ..
         }) = job.last
@@ -231,6 +232,8 @@ impl Gateway {
         let (id, thread, kind, text) = (job.id, job.thread, job.kind, job.text.clone());
         // Detached: the run belongs to the conversation, where the user sees
         // and can cancel it; shutdown cancels every run, which ends this task.
+        // A post still going out when the gateway stops is recorded as
+        // posting, which restart recovery reports as unrecorded.
         drop(tokio::spawn(async move {
             let text = match kind {
                 JobKind::Message => Ok(Some(text)),
@@ -243,26 +246,36 @@ impl Gateway {
                 ),
                 // An empty checklist has nothing to check.
                 Ok(None) => (JobOutcome::Quiet, None),
-                Ok(Some(text)) => gateway.send_job(thread, kind, text).await,
-            };
-            let delivery = match reply {
-                Some(reply) if outcome == JobOutcome::Complete => gateway.deliver(id, &reply).await,
-                _ => None,
+                Ok(Some(text)) => gateway.send_job(thread, kind, text, at).await,
             };
             // Nobody waits on this task, so a failure to record the outcome
             // is logged; the conversation still shows the run itself.
-            if let Err(error) = gateway.finish_job(id, run, outcome, delivery) {
-                crate::error::handle("schedule_job", &error);
+            let to = match gateway.finish_job(id, run, outcome, reply.is_some()) {
+                Ok(to) => to,
+                Err(error) => {
+                    crate::error::handle("schedule_job", &error);
+                    return;
+                }
+            };
+            let (Some(to), Some(reply)) = (to, reply) else {
+                return;
+            };
+            let delivery = gateway.deliver(&to, &reply).await;
+            if let Err(error) =
+                gateway.update_run(id, run, |_, last| last.delivery = Some(delivery))
+            {
+                crate::error::handle("schedule_delivery", &error);
             }
         }));
     }
-    /// Send a job's message to `thread` and report how its run ended, with
-    /// its reply.
+    /// Send a job's message to `thread` for the run started `at`, and report
+    /// how the run ended, with its reply.
     async fn send_job(
         &self,
         thread: Id,
         kind: JobKind,
         text: String,
+        at: u64,
     ) -> (JobOutcome, Option<String>) {
         let reply = self
             .request(Request {
@@ -276,34 +289,19 @@ impl Gateway {
             })
             .await;
         match reply.body {
-            Reply::Thread(thread) => (ended(kind, &thread), run_reply(&thread, &text)),
+            Reply::Thread(thread) => (ended(kind, &thread), run_reply(&thread, &text, at)),
             Reply::Error(report) => (JobOutcome::Refused(report), None),
             _ => (JobOutcome::Failed, None),
         }
     }
-    /// Post a run's `reply` to the job's messenger destination, read now so
-    /// one the user cleared meanwhile is not used; `None` without one.
-    async fn deliver(&self, id: Id, reply: &str) -> Option<Delivery> {
-        let to = match self.lock() {
-            Ok(store) => store
-                .state
-                .jobs
-                .iter()
-                .find(|job| job.id == id)
-                .and_then(|job| job.deliver_to.clone())?,
-            Err(error) => {
-                return Some(Delivery::Failed(crate::error::handle(
-                    "schedule_delivery",
-                    &error,
-                )));
-            }
-        };
-        Some(match self.outbox().send(&to, reply).await {
+    /// Post a run's `reply` to the messenger destination `to`.
+    async fn deliver(&self, to: &str, reply: &str) -> Delivery {
+        match self.outbox().send(to, reply).await {
             Ok(parts) => Delivery::Sent {
                 parts: u64::try_from(parts).unwrap_or(u64::MAX),
             },
             Err(error) => Delivery::Failed(crate::error::handle("schedule_delivery", &error)),
-        })
+        }
     }
     /// The heartbeat check message for `thread`, from `HEARTBEAT.md` at its
     /// project root as the conversation's grants allow reading it now, or
@@ -332,27 +330,24 @@ impl Gateway {
             Some(checklist) => Ok(Some(heartbeat_message(&checklist, run))),
         }
     }
-    fn finish_job(
+    /// Apply `change` to run `run` of job `id`, given the job's current
+    /// messenger destination: to `Job::last` while it is that run, else to
+    /// its row in the history. `None` when the job, or the run, is gone.
+    fn update_run<T>(
         &self,
         id: Id,
         run: Id,
-        outcome: JobOutcome,
-        delivery: Option<Delivery>,
-    ) -> Result<()> {
+        change: impl FnOnce(Option<String>, &mut JobRun) -> T,
+    ) -> Result<Option<T>> {
         let mut store = self.lock()?;
         // The job may have been removed, or run again, meanwhile.
         let Some(job) = store.state.jobs.iter_mut().find(|job| job.id == id) else {
-            return Ok(());
+            return Ok(None);
         };
-        let ended = Some(now());
-        let settled = match &mut job.last {
-            Some(last) if last.id == run => {
-                last.outcome = outcome;
-                last.ended = ended;
-                last.delivery = delivery;
-                None
-            }
-            // A newer run is the latest; this one ends in the history only.
+        let to = job.deliver_to.clone();
+        let (result, settled) = match &mut job.last {
+            Some(last) if last.id == run => (change(to, last), None),
+            // A newer run is the latest; this one changes in the history only.
             _ => {
                 let Some(mut earlier) = store
                     .job_runs(id)?
@@ -360,17 +355,36 @@ impl Gateway {
                     .find(|earlier| earlier.id == run)
                 else {
                     // Already pruned from the history.
-                    return Ok(());
+                    return Ok(None);
                 };
-                earlier.outcome = outcome;
-                earlier.ended = ended;
-                earlier.delivery = delivery;
+                let result = change(to, &mut earlier);
                 job_mut(&mut store.state, id)?.history += 1;
-                Some(earlier)
+                (result, Some(earlier))
             }
         };
         store.persist_settling(Some(EventKind::JobChanged { id }), settled.as_ref())?;
-        Ok(())
+        Ok(Some(result))
+    }
+
+    /// Record how a run ended. When it has a reply to post and the job a
+    /// destination, the run is recorded as posting and the destination
+    /// returned, so a gateway stopped while posting leaves a record of it.
+    fn finish_job(
+        &self,
+        id: Id,
+        run: Id,
+        outcome: JobOutcome,
+        posts: bool,
+    ) -> Result<Option<String>> {
+        let ended = Some(now());
+        let to = self.update_run(id, run, |to, last| {
+            let to = to.filter(|_| posts && outcome == JobOutcome::Complete);
+            last.outcome = outcome;
+            last.ended = ended;
+            last.delivery = to.as_ref().map(|_| Delivery::Posting);
+            to
+        })?;
+        Ok(to.flatten())
     }
 
     /// Run jobs as they come due until the gateway stops.
@@ -481,13 +495,15 @@ fn ended(kind: JobKind, thread: &Thread) -> JobOutcome {
 }
 
 /// A run's reply: the last assistant text after the message `sent` that
-/// started it. Messages steered into the run come before it; those steered
-/// too late follow it and are skipped.
-fn run_reply(thread: &Thread, sent: &str) -> Option<String> {
+/// started it, the first such message since the run started `at` (as
+/// restart recovery finds it). Messages steered into the run, even with the
+/// same text, follow it; the reply to those it took in comes after them, and
+/// those steered too late come after the reply and are skipped.
+fn run_reply(thread: &Thread, sent: &str, at: u64) -> Option<String> {
     let start = thread
         .messages
         .iter()
-        .rposition(|m| m.role == Role::User && m.text == sent)?;
+        .position(|m| m.role == Role::User && m.at >= at && m.text == sent)?;
     thread.messages[start + 1..]
         .iter()
         .rev()

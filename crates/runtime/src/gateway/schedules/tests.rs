@@ -232,10 +232,10 @@ async fn an_earlier_run_ending_late_leaves_the_latest_result() {
     job_mut(&mut g.lock().unwrap().state, created.id)
         .unwrap()
         .last = Some(second.clone());
-    g.finish_job(created.id, first.id, JobOutcome::Failed, None)
+    g.finish_job(created.id, first.id, JobOutcome::Failed, false)
         .unwrap();
     assert_eq!(job(&g, created.id).last, Some(second.clone()));
-    g.finish_job(created.id, second.id, JobOutcome::Complete, None)
+    g.finish_job(created.id, second.id, JobOutcome::Complete, false)
         .unwrap();
     assert_eq!(
         job(&g, created.id).last.map(|run| run.outcome),
@@ -391,24 +391,43 @@ async fn the_history_keeps_a_bounded_number_of_runs_and_settles_earlier_ones() {
     let second = JobRun::start(at);
     start(&second);
     let revision = job(&g, created.id).history;
-    let posted = Delivery::Sent {
-        parts: 1 + arbitrary() % 8,
-    };
-    g.finish_job(
-        created.id,
-        first.id,
-        JobOutcome::Complete,
-        Some(posted.clone()),
-    )
-    .unwrap();
+    let to = nonce();
+    job_mut(&mut g.lock().unwrap().state, created.id)
+        .unwrap()
+        .deliver_to = Some(to.clone());
+    // A run with a reply to post records its end first, as posting.
+    assert_eq!(
+        g.finish_job(created.id, first.id, JobOutcome::Complete, true)
+            .unwrap(),
+        Some(to)
+    );
     // Clients showing the history learn that it changed.
     assert_ne!(job(&g, created.id).history, revision);
     let history = g.lock().unwrap().job_runs(created.id).unwrap();
     assert_eq!(history[0], second, "the latest run is still running");
     assert_eq!(history[1].id, first.id);
     assert_eq!(history[1].outcome, JobOutcome::Complete);
-    assert_eq!(history[1].delivery, Some(posted));
+    assert_eq!(history[1].delivery, Some(Delivery::Posting));
     assert!(history[1].ended.is_some());
+    let posted = Delivery::Sent {
+        parts: 1 + arbitrary() % 8,
+    };
+    g.update_run(created.id, first.id, |_, run| {
+        run.delivery = Some(posted.clone())
+    })
+    .unwrap();
+    let history = g.lock().unwrap().job_runs(created.id).unwrap();
+    assert_eq!(history[1].delivery, Some(posted));
+    // A run that failed, or has no reply, has nothing to post.
+    for (outcome, posts) in [(JobOutcome::Failed, true), (JobOutcome::Complete, false)] {
+        let run = JobRun::start(at);
+        start(&run);
+        assert_eq!(
+            g.finish_job(created.id, run.id, outcome, posts).unwrap(),
+            None
+        );
+        assert_eq!(job(&g, created.id).last.unwrap().delivery, None);
+    }
 
     let extra = 1 + arbitrary() as usize % 8;
     let mut newest = vec![];
@@ -436,7 +455,12 @@ async fn runs_still_going_at_a_restart_end_unrecorded_in_the_history() {
             panic!("job scheduled");
         };
         let at = arbitrary();
-        let (first, second) = (JobRun::start(at), JobRun::start(at));
+        // The earlier one was posting its reply.
+        let first = JobRun {
+            delivery: Some(Delivery::Posting),
+            ..JobRun::start(at)
+        };
+        let second = JobRun::start(at);
         for run in [&first, &second] {
             let mut store = g.lock().unwrap();
             job_mut(&mut store.state, created.id).unwrap().last = Some(run.clone());
@@ -453,6 +477,7 @@ async fn runs_still_going_at_a_restart_end_unrecorded_in_the_history() {
     let history = runs(send(&g, Command::JobRuns { id }).await);
     assert_eq!(history[1].id, first);
     assert_eq!(history[1].outcome, JobOutcome::Unrecorded);
+    assert_eq!(history[1].delivery, Some(Delivery::Unrecorded));
     // The latest is settled from its conversation, as `Job::last` is.
     assert_eq!(history[0].id, second);
     assert_eq!(Some(&history[0]), job(&g, id).last.as_ref());
@@ -464,26 +489,29 @@ async fn runs_still_going_at_a_restart_end_unrecorded_in_the_history() {
 
 #[test]
 fn a_runs_reply_is_the_last_answer_after_its_own_message() {
-    let say = |role, text: &str| Message::new(role, text.into(), 0, CodingBackend::default());
+    let at = arbitrary();
+    let say =
+        |role, text: &str, when| Message::new(role, text.into(), when, CodingBackend::default());
     let (sent, earlier, reply) = (nonce(), nonce(), nonce());
     let mut thread = Thread::new(nonce(), Mode::Chat);
     thread.messages = vec![
-        say(Role::User, &nonce()),
-        say(Role::Assistant, &earlier),
-        say(Role::User, &sent),
-        say(Role::Assistant, &nonce()),
+        // The same text, sent before the run started.
+        say(Role::User, &sent, at - 1),
+        say(Role::Assistant, &earlier, at - 1),
+        say(Role::User, &sent, at),
+        say(Role::Assistant, &nonce(), at),
         // Steered into the run, which answered it.
-        say(Role::User, &nonce()),
-        say(Role::Assistant, &reply),
-        say(Role::Assistant, " \n"),
-        // Steered too late for the run.
-        say(Role::User, &nonce()),
+        say(Role::User, &nonce(), at),
+        say(Role::Assistant, &reply, at),
+        say(Role::Assistant, " \n", at),
+        // Steered too late for the run, with the job's own text.
+        say(Role::User, &sent, at),
     ];
-    assert_eq!(super::run_reply(&thread, &sent), Some(reply));
+    assert_eq!(super::run_reply(&thread, &sent, at), Some(reply));
     // A run that answered with no text has no reply, not an earlier one.
     thread.messages.truncate(3);
-    assert_eq!(super::run_reply(&thread, &sent), None);
-    assert_eq!(super::run_reply(&thread, &nonce()), None);
+    assert_eq!(super::run_reply(&thread, &sent, at), None);
+    assert_eq!(super::run_reply(&thread, &nonce(), at), None);
 }
 
 #[test]

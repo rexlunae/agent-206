@@ -740,7 +740,7 @@ async fn a_webhook_disconnected_while_a_message_goes_out_stays_stopped() {
 }
 
 /// Run `job` now, answer its model request with `answer`, and return the run
-/// once it has ended.
+/// once it has ended and posted its reply.
 async fn run_and_answer(setup: &mut Setup, api: ProviderApi, job: Id, answer: &str) -> JobRun {
     let Reply::Job(started) = request(&setup.gateway, Command::RunJob { id: job }).await else {
         panic!("job started");
@@ -753,7 +753,12 @@ async fn run_and_answer(setup: &mut Setup, api: ProviderApi, job: Id, answer: &s
             let state = setup.gateway.snapshot().unwrap();
             let job = state.jobs.iter().find(|j| j.id == job).unwrap();
             match &job.last {
-                Some(last) if last.id == run && last.outcome != JobOutcome::Running => {
+                // A completed run's reply is posted after its end is recorded.
+                Some(last)
+                    if last.id == run
+                        && last.outcome != JobOutcome::Running
+                        && last.delivery != Some(Delivery::Posting) =>
+                {
                     return last.clone();
                 }
                 _ => tokio::time::sleep(Duration::from_millis(5)).await,

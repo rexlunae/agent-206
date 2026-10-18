@@ -99,9 +99,16 @@ checks then that the messenger is enabled and, for a chat, connected and still
 allowed; the vault broker spends the credential. A heartbeat check posts only a
 reply that needs attention, never a quiet one. Failed, cancelled and refused
 runs post nothing, and the destination is read when the run ends, so clearing
-it stops a run in progress from posting. `JobRun::delivery` records `Sent {
-parts }` or `Failed` with the report (for example a disconnected webhook); a
-failed post never changes the run's outcome, and a webhook's failure also shows
+it stops a run in progress from posting. The reply is the last assistant text
+after the first message with the job's text since the run started, so a steered
+message with the same text does not hide it. The run's end is recorded first,
+with `JobRun::delivery` set to `Posting`, and the post's result replaces it:
+`Sent { parts }` or `Failed` with the report (for example a disconnected
+webhook). A post still going out when the gateway stops becomes `Unrecorded` on
+restart (it may or may not have arrived; it is not resent, since resending
+could post it twice), and a run that completed but whose end was never recorded
+gets `Failed`, since posting had not started. A failed post never changes the
+run's outcome or its recorded end, and a webhook's failure also shows
 on the Messengers page. RustyClaw's cron jobs store an announce `delivery`
 (channel and target, `cron.rs`) that its gateway's cron runtime never posts;
 here the destination must be one the user already set up and allowed.

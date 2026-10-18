@@ -77,6 +77,11 @@ fn delivery(delivery: &Delivery) -> (BadgeTone, String) {
         Delivery::Sent { parts: 1 } => (BadgeTone::Success, "Reply posted".to_owned()),
         Delivery::Sent { parts } => (BadgeTone::Success, format!("Reply posted in {parts} parts")),
         Delivery::Failed(_) => (BadgeTone::Warning, "Reply not posted".to_owned()),
+        Delivery::Posting => (BadgeTone::Info, "Posting reply".to_owned()),
+        Delivery::Unrecorded => (
+            BadgeTone::Neutral,
+            "Stopped while posting reply; it may not have arrived".to_owned(),
+        ),
     }
 }
 

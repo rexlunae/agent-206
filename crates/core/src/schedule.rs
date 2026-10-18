@@ -139,11 +139,16 @@ impl JobRun {
 /// attention.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Delivery {
+    /// The run's reply is being posted.
+    Posting,
     /// Posted, in this many parts.
     Sent { parts: u64 },
     /// Not posted, or only partly: the destination was withdrawn or
     /// disconnected, or the service refused it.
     Failed(ErrorReport),
+    /// The gateway stopped while the reply was being posted, so whether it
+    /// was posted, or only partly, is not known.
+    Unrecorded,
 }
 
 /// Most runs of one job the gateway keeps in its history.

@@ -470,8 +470,9 @@ fn bundled_plugins(previous: &[PluginSummary]) -> Result<Vec<PluginSummary>> {
     Ok(plugins)
 }
 
-/// Mark every run the history still shows as running ended unrecorded: no
-/// run survives a restart, and recovery has settled each job's latest.
+/// Mark every run the history still shows as running ended unrecorded, and
+/// every reply it shows as posting unrecorded: neither survives a restart,
+/// and recovery has settled each job's latest.
 fn unrecorded(tx: &rusqlite::Transaction<'_>) -> Result<()> {
     let mut stmt = tx.prepare("SELECT run, payload FROM job_runs")?;
     let rows = stmt
@@ -481,8 +482,14 @@ fn unrecorded(tx: &rusqlite::Transaction<'_>) -> Result<()> {
         .collect::<rusqlite::Result<Vec<_>>>()?;
     for (key, payload) in rows {
         let mut run: JobRun = rmp_serde::from_slice(&payload)?;
-        if run.outcome == JobOutcome::Running {
-            run.outcome = JobOutcome::Unrecorded;
+        let posting = run.delivery == Some(Delivery::Posting);
+        if posting {
+            run.delivery = Some(Delivery::Unrecorded);
+        }
+        if run.outcome == JobOutcome::Running || posting {
+            if run.outcome == JobOutcome::Running {
+                run.outcome = JobOutcome::Unrecorded;
+            }
             tx.execute(
                 "UPDATE job_runs SET payload=?1 WHERE run=?2",
                 params![rmp_serde::to_vec_named(&run)?, key],
