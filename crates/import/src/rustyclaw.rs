@@ -126,7 +126,9 @@ fn webhook_origin<'de, D: serde::Deserializer<'de>>(
     let url = String::deserialize(deserializer)?;
     let origin = url::Url::parse(&url)
         .ok()
-        .filter(|url| url.username().is_empty() && url.password().is_none())
+        .filter(|url| {
+            url.username().is_empty() && url.password().is_none() && url.fragment().is_none()
+        })
         .map(|url| url.origin().ascii_serialization())
         .filter(|origin| a206_core::providers::base_url(origin).is_ok());
     Ok(Some(
@@ -1074,6 +1076,11 @@ messenger_type = "webhook"
 webhook_url = "https://{key}:{secret}@{host}/hooks"
 
 [[messengers]]
+name = "marked"
+messenger_type = "webhook"
+webhook_url = "https://{host}/hooks/{secret}#{key}"
+
+[[messengers]]
 name = "missing"
 messenger_type = "webhook"
 "#
@@ -1155,6 +1162,13 @@ messenger_type = "webhook"
                     unsupported(UnsupportedMessenger::InvalidEndpoint)
                 ),
                 (
+                    "marked",
+                    webhook,
+                    None,
+                    None,
+                    unsupported(UnsupportedMessenger::InvalidEndpoint)
+                ),
+                (
                     "missing",
                     webhook,
                     None,
@@ -1163,8 +1177,8 @@ messenger_type = "webhook"
                 ),
             ]
         );
-        assert!(preview.messengers[..7].iter().all(|m| m.token_left_behind));
-        assert!(!preview.messengers[7].token_left_behind);
+        assert!(preview.messengers[..8].iter().all(|m| m.token_left_behind));
+        assert!(!preview.messengers[8].token_left_behind);
         assert!(
             preview
                 .messengers

@@ -476,7 +476,7 @@ agent206 messenger enable team-hook
   the `text` format (Teams: `teams`). Only the URL's origin is read and kept,
   as the endpoint; the URL itself stays behind, and you store it in the vault
   bound to that origin. A URL that is not HTTPS (or loopback HTTP), or that
-  carries a user name or password, is reported and skipped. RustyClaw's
+  carries a user name, password or fragment, is reported and skipped. RustyClaw's
   Teams webhooks may be the retired Office 365 connectors; a Teams entry
   needs a Workflows webhook URL.
 
