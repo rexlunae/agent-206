@@ -388,6 +388,8 @@ fn AddMessenger() -> Element {
         "Required: your signal-cli daemon's socket, as unix:///path/to/socket or tcp://127.0.0.1:port. Agent 206 never starts or stops it."
     } else if needs_endpoint {
         "Required: your homeserver's client API origin, with no path."
+    } else if selected == Some(MessengerKind::Beeper) {
+        "Leave empty for Beeper Desktop on the gateway's computer. Beeper elsewhere needs an https:// origin."
     } else {
         "Leave empty for the service's official API. An origin only, with no path."
     };

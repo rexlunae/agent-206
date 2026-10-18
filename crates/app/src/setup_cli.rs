@@ -198,6 +198,9 @@ fn print_preview(preview: &Preview) {
                 UnsupportedMessenger::NoSignalDaemon => {
                     "skipped: start a signal-cli daemon, then add it with `agent206 messenger add`"
                 }
+                UnsupportedMessenger::ThroughBeeper => {
+                    "skipped: connect this network to Beeper Desktop, then add Beeper with `agent206 messenger add`"
+                }
             },
         };
         println!(
