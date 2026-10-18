@@ -395,6 +395,8 @@ pub struct Gateway {
     store: Arc<Mutex<Store>>,
     /// Image bytes of messages, kept outside the snapshot.
     images: crate::images::Images,
+    /// Digests of images staged and not yet sent, oldest first.
+    staged: Arc<Mutex<std::collections::VecDeque<String>>>,
     extensions: crate::extension_host::ExtensionHost,
     downloads: Arc<Mutex<BTreeMap<Id, tokio_util::sync::CancellationToken>>>,
     running: Arc<Mutex<BTreeMap<Id, tokio_util::sync::CancellationToken>>>,
@@ -447,6 +449,40 @@ const REFRESH_RETRY: u64 = 300;
 /// What the request journal keeps of a command: an installed module is
 /// recorded by its SHA-256 rather than copied, which still tells a retry
 /// apart from a different request reusing its id.
+impl Gateway {
+    /// Record a newly staged image, removing the oldest staged images no
+    /// message refers to beyond [`crate::images::MAX_UNSENT`]. Removal holds
+    /// the store lock, as admitting a message does.
+    fn keep_unsent(&self, digest: &str) -> Result<()> {
+        let store = self.lock()?;
+        let referenced: BTreeSet<&str> = store
+            .state
+            .threads
+            .iter()
+            .flat_map(|t| &t.messages)
+            .flat_map(|m| &m.images)
+            .map(|i| i.digest.as_str())
+            .collect();
+        let mut staged = self.staged.lock().map_err(poisoned("staged images"))?;
+        staged.retain(|d| d != digest && !referenced.contains(d.as_str()));
+        if !referenced.contains(digest) {
+            staged.push_back(digest.to_owned());
+        }
+        while staged.len() > crate::images::MAX_UNSENT {
+            let Some(oldest) = staged.pop_front() else {
+                break;
+            };
+            // A file left behind is removed at the next start.
+            if let Err(error) = self.images.remove(&oldest) {
+                tracing::warn!(
+                    error = &error as &dyn std::error::Error,
+                    "an unsent image was not removed"
+                );
+            }
+        }
+        Ok(())
+    }
+}
 fn journal_form(command: &Command) -> std::borrow::Cow<'_, Command> {
     match command {
         Command::InstallExtension { manifest, module } => {
@@ -455,11 +491,6 @@ fn journal_form(command: &Command) -> std::borrow::Cow<'_, Command> {
                 module: Sha256::digest(module).to_vec(),
             })
         }
-        // The image is stored by its digest, which identifies it here too.
-        Command::StageImage { name, data } => std::borrow::Cow::Owned(Command::StageImage {
-            name: name.clone(),
-            data: Sha256::digest(data).to_vec(),
-        }),
         command => std::borrow::Cow::Borrowed(command),
     }
 }
@@ -539,6 +570,7 @@ impl Gateway {
             extensions,
             store,
             images,
+            staged: Arc::default(),
             downloads: Arc::new(Mutex::new(BTreeMap::new())),
             running: Arc::new(Mutex::new(BTreeMap::new())),
             accepting: Arc::new(Mutex::new(BTreeSet::new())),
@@ -716,6 +748,10 @@ impl Gateway {
                 | Command::GitStatus { .. }
                 | Command::ReadDocument { .. }
                 | Command::ReadImage { .. }
+                // Storing the same bytes again is harmless, and a receipt
+                // could outlive the image it describes: images never sent
+                // are removed.
+                | Command::StageImage { .. }
                 // Extension output can carry workspace content, so it is
                 // never persisted in the request journal.
                 | Command::OpenPanel { .. }
@@ -1266,6 +1302,14 @@ impl Gateway {
                                 + run::NEXT_ROUND,
                         GatewayError::HistoryFull,
                     )?;
+                    // Images never sent are removed under this lock, so one
+                    // still present now stays once the message refers to it.
+                    if let Some(gone) = images.iter().find(|i| !self.images.exists(&i.digest)) {
+                        return Err(crate::images::ImageError::Missing {
+                            digest: gone.digest.clone(),
+                        }
+                        .into());
+                    }
                     let current = store.thread(id)?;
                     check(
                         current.state != RunState::Running,
@@ -1659,6 +1703,7 @@ impl Gateway {
                 let images = self.images.clone();
                 let image =
                     tokio::task::spawn_blocking(move || images.stage(&name, &data)).await??;
+                self.keep_unsent(&image.digest)?;
                 Ok(Reply::Image(image))
             }
             Command::ReadImage { digest } => {

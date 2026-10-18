@@ -1751,6 +1751,51 @@ async fn older_images_are_named_not_resent_when_the_request_would_be_too_large()
     task.await.unwrap().unwrap_err();
 }
 #[tokio::test]
+async fn an_image_repeated_in_the_history_is_counted_each_time_it_would_be_sent() {
+    let api = ProviderApi::Anthropic;
+    let mut rig = Rig::new(api, false).await;
+    let info = model_info(api, rig.config.id);
+    let dir = tempfile::tempdir().unwrap();
+    let store = a206_runtime::images::Images::new(dir.path());
+    let mut thread = conversation(&info);
+    // One image of the largest size fits once, but not twice.
+    let image = store
+        .stage(&Id::new_v4().to_string(), &png(a206_core::MAX_IMAGE_BYTES))
+        .unwrap();
+    for _ in 0..2 {
+        let mut message = Message::new(
+            Role::User,
+            Id::new_v4().to_string(),
+            provider::now(),
+            CodingBackend::Native,
+        );
+        message.images.push(image.clone());
+        thread.messages.push(Message::new(
+            Role::Assistant,
+            Id::new_v4().to_string(),
+            provider::now(),
+            CodingBackend::Native,
+        ));
+        thread.messages.push(message);
+    }
+    let images = provider::ImageData::load(&store, &thread, &info).unwrap();
+    let (mut task, _deltas) = spawn_with(&rig, &info, thread, images, |t| t.text);
+    let opened = tokio::select! {
+        opened = rig.requests.recv() => opened.unwrap(),
+        failed = &mut task => panic!("no request was made: {failed:?}"),
+    };
+    let body = opened.body.to_string();
+    assert!(
+        body.len() <= a206_broker::MAX_PROVIDER_BODY,
+        "{}",
+        body.len()
+    );
+    assert!(!body.contains("\"type\":\"image\""));
+    assert_eq!(body.matches(&image.name).count(), 2);
+    drop(opened.feed);
+    task.await.unwrap().unwrap_err();
+}
+#[tokio::test]
 async fn image_support_is_read_from_the_models_api_and_unknown_when_unreported() {
     let reported = |api: ProviderApi, accepts: Option<bool>| -> Value {
         let id = Id::new_v4().to_string();

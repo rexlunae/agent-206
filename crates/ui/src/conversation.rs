@@ -680,7 +680,7 @@ fn Conversation(thread: Thread, target: Option<Uuid>) -> Element {
                             label: match primary { Primary::Stop => name!("Stop response"), Primary::Run => name!("Run command"), Primary::Send => name!("Send message") },
                             title: match primary { Primary::Stop => "Stop response", Primary::Run => "Run command · Enter", Primary::Send => "Send · Enter (Shift+Enter for a new line)" },
                             class: "a206-compose-send", size: ButtonSize::Sm, variant: ButtonVariant::Primary,
-                            availability: if running || typed_command || (has_model && !reading_files() && (!draft().trim().is_empty() || !attachments.read().is_empty())) { Availability::Enabled } else { Availability::Disabled },
+                            availability: if running || typed_command || (has_model && !reading_files() && (!draft().trim().is_empty() || !attachments.read().is_empty() || !images.read().is_empty())) { Availability::Enabled } else { Availability::Disabled },
                             onclick: move |_| { if primary == Primary::Stop { dispatch(state, Command::CancelRun { thread: id }); } else { submit(); } }
                         }
                     }

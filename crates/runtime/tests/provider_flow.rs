@@ -680,6 +680,28 @@ async fn images_are_staged_checked_against_the_models_api_and_kept_only_when_sen
     assert!(!request.contains(&encoded));
     assert!(request.contains(&image.name) && request.contains("does not accept images"));
 
+    // Staged images no message refers to are bounded: the oldest goes first,
+    // and a sent image is never counted among them.
+    let mut newest = None;
+    for _ in 0..a206_runtime::images::MAX_UNSENT {
+        let Reply::Image(staged) = run(&gateway, stage(png())).await else {
+            panic!("expected a staged image");
+        };
+        newest = Some(staged);
+    }
+    assert_eq!(
+        error_kind(run(&gateway, read(&unsent.digest)).await),
+        ErrorKind::NotFound
+    );
+    assert!(matches!(
+        run(&gateway, read(&newest.unwrap().digest)).await,
+        Reply::ImageData(_)
+    ));
+    assert_eq!(
+        run(&gateway, read(&image.digest)).await,
+        Reply::ImageData(data.clone())
+    );
+
     // A restart keeps what a message refers to and drops what was never sent.
     drop(gateway);
     let gateway = Gateway::open(dir.path()).unwrap();

@@ -751,8 +751,11 @@ from their bytes, at most 2 MiB each). `StageImage` stores an image's bytes in
 the state directory's `images/` folder, named by their SHA-256 digest, and
 returns the name, format, digest and size; `Send` lists those, and the message
 records only them, so images never enter the conversation snapshot. `ReadImage`
-returns the bytes for display. Images staged but never sent, and partial
-writes, are removed when the gateway starts.
+returns the bytes for display. While the gateway runs it keeps at most 32
+staged images no message refers to, removing the oldest first; the rest, and
+partial writes, are removed when it starts. `StageImage` is not kept in the
+request journal: a retried request stores the bytes again rather than receiving
+a reply for an image that may since have been removed.
 
 `Send` checks every image is still stored exactly as staged, and refuses images
 for a coding backend or for a model whose models API reports that it does not
@@ -767,7 +770,8 @@ compatible), a base64 `image` block (Anthropic) or an `inlineData` part
 (Gemini), before the message text. They are sent newest first while the request
 stays within what the vault broker carries (a little under 4 MiB, so the same
 request fits whether or not its credential is brokered); an older image left
-out is named in its message's text as not resent. After the conversation's
+out is named in its message's text as not resent. An image attached to several
+messages is sent with each of them or with none, and counted once per message. After the conversation's
 model changes to one whose API reports no image input, earlier images are named
 as not sent. Compaction summaries and coding backends see image names only.
 

@@ -51,6 +51,9 @@ impl Classified for ImageError {
 }
 type Result<T, E = ImageError> = std::result::Result<T, E>;
 
+/// The most staged images kept that no message refers to; staging another
+/// removes the oldest. Room for a few drafts' worth of images.
+pub const MAX_UNSENT: usize = 32;
 /// Check an attachment name as text attachment names are checked.
 pub fn valid_name(name: &str) -> bool {
     !name.is_empty() && name.len() <= 255 && !name.chars().any(char::is_control)
@@ -147,6 +150,20 @@ impl Images {
             },
         )?;
         Ok(data)
+    }
+    /// Whether bytes are stored under `digest`.
+    pub fn exists(&self, digest: &str) -> bool {
+        valid_digest(digest) && self.path(digest).is_file()
+    }
+    /// Remove the bytes stored under `digest`; already absent is fine.
+    pub fn remove(&self, digest: &str) -> io::Result<()> {
+        if !valid_digest(digest) {
+            return Ok(());
+        }
+        match std::fs::remove_file(self.path(digest)) {
+            Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error),
+            _ => Ok(()),
+        }
     }
     /// Remove every stored file whose digest is not in `keep`, including
     /// partial files a failed write left. Returns how many were removed.

@@ -277,23 +277,30 @@ impl ImageData {
     }
     /// The images of `thread`'s history, newest first, that fit in a request
     /// of `bare` bytes without any. An image repeated in the history is kept
-    /// or left out everywhere it appears.
+    /// or left out everywhere it appears, and counted once per appearance.
     fn fit(&self, thread: &Thread, bare: usize) -> Self {
-        let mut size = bare;
-        let mut kept = BTreeMap::new();
-        let newest_first = history(thread);
-        for image in newest_first
+        let history = history(thread);
+        let newest_first: Vec<&ImageAttachment> = history
             .iter()
             .rev()
             .flat_map(|m| m.images.iter().rev())
-        {
+            .collect();
+        let mut appearances = BTreeMap::<&str, usize>::new();
+        for image in &newest_first {
+            *appearances.entry(image.digest.as_str()).or_default() += 1;
+        }
+        let mut size = bare;
+        let mut kept = BTreeMap::new();
+        let mut considered = BTreeSet::new();
+        for image in newest_first {
             let Some(bytes) = self.0.get(&image.digest) else {
                 continue;
             };
-            if kept.contains_key(&image.digest) {
+            if !considered.insert(image.digest.as_str()) {
                 continue;
             }
-            let added = bytes.len().div_ceil(3) * 4 + IMAGE_OVERHEAD;
+            let each = bytes.len().div_ceil(3) * 4 + IMAGE_OVERHEAD;
+            let added = each.saturating_mul(appearances[image.digest.as_str()]);
             if size.saturating_add(added) > IMAGE_BUDGET {
                 // A smaller, older image may still fit.
                 continue;
