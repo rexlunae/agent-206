@@ -16,6 +16,7 @@ mod matrix;
 mod signal;
 mod slack;
 mod telegram;
+pub(crate) mod webhook;
 
 use a206_broker::{AuthScheme, HttpMethod, ProviderCall, Reply as BrokerReply, Request, Role};
 use a206_broker::{SocketCall, SocketOpen, SocketScheme};
@@ -112,6 +113,27 @@ pub enum MessengerError {
     NoAccountId { service: &'static str },
     #[error("Beeper Desktop has no chat accounts connected yet; add one in Beeper")]
     BeeperNoAccounts,
+    #[error("{service} messengers only send; there is nothing to connect")]
+    SendOnly { service: &'static str },
+    #[error("the gateway is not paired with an unlocked vault; unlock the vault and try again")]
+    NoPairing,
+    #[error("there is no enabled webhook named {name}")]
+    NoWebhook { name: String },
+    #[error("webhook {name} was disabled, disconnected or changed, so nothing more was sent")]
+    Withdrawn { name: String },
+    #[error("the message is empty")]
+    EmptyMessage,
+    #[error(
+        "the message is longer than this webhook takes ({most} characters); send a shorter one"
+    )]
+    MessageTooLong { most: usize },
+    #[error("{sent} of {total} parts were sent before one failed")]
+    PartlySent {
+        sent: usize,
+        total: usize,
+        #[source]
+        source: Box<MessengerError>,
+    },
     #[error(
         "room {chat} is end-to-end encrypted, which Agent 206 does not support yet; it neither reads nor answers there"
     )]
@@ -157,7 +179,14 @@ impl crate::error::Classified for MessengerError {
             | Self::NoLogin
             | Self::NoModel
             | Self::Endpoint(_)
-            | Self::EndpointPath => ErrorKind::InvalidRequest,
+            | Self::EndpointPath
+            | Self::SendOnly { .. }
+            | Self::EmptyMessage
+            | Self::MessageTooLong { .. } => ErrorKind::InvalidRequest,
+            Self::NoWebhook { .. } => ErrorKind::NotFound,
+            Self::NoPairing => ErrorKind::Unavailable,
+            Self::Withdrawn { .. } => ErrorKind::Cancelled,
+            Self::PartlySent { source, .. } => return crate::error::classify(source.as_ref()),
             Self::TurnAborted(_) => ErrorKind::Internal,
             Self::BrokerTooOld | Self::VaultUnavailable(_) => ErrorKind::Unavailable,
             Self::Broker(error) => return crate::error::classify(error),
@@ -303,10 +332,13 @@ impl Adapter {
                 config.login.clone(),
             )));
         }
-        Ok(Self::new(config, Api::new(root, pairing, config)?))
-    }
-    fn new(config: &MessengerConfig, api: Api) -> Self {
-        match config.kind {
+        if config.kind.is_send_only() {
+            return Err(MessengerError::SendOnly {
+                service: config.kind.label(),
+            });
+        }
+        let api = Api::new(root, pairing, config)?;
+        Ok(match config.kind {
             MessengerKind::Telegram => Self::Telegram(telegram::Telegram::new(api)),
             MessengerKind::Matrix => {
                 Self::Matrix(matrix::Matrix::new(api, config.allowed_chats.clone()))
@@ -326,7 +358,12 @@ impl Adapter {
             MessengerKind::Beeper => {
                 Self::Beeper(beeper::Beeper::new(api, config.allowed_chats.clone()))
             }
-        }
+            MessengerKind::Webhook => {
+                return Err(MessengerError::SendOnly {
+                    service: config.kind.label(),
+                });
+            }
+        })
     }
     /// Check the credential and name the account.
     async fn connect(&mut self) -> Result<Account> {
@@ -473,7 +510,14 @@ pub async fn supervise<H: Host>(
                     if let Some(previous) = previous {
                         finish(previous).await;
                     }
-                    if entry.run {
+                    if entry.run && entry.config.kind.is_send_only() {
+                        // Nothing to connect: it sends when a model's
+                        // approved call asks it to.
+                        host.update(&name, |status| {
+                            status.state = MessengerState::Ready;
+                            status.failure = None;
+                        });
+                    } else if entry.run {
                         let cancel = stop.child_token();
                         let task = tokio::spawn(run(
                             host.clone(),
@@ -930,6 +974,7 @@ impl Api {
         };
         let needed = match auth {
             AuthScheme::DiscordBot => needed.max(a206_broker::SOCKET_VERSION),
+            AuthScheme::WebhookUrl => needed.max(a206_broker::WEBHOOK_VERSION),
             _ => needed,
         };
         let mut client = self.client(needed).await?;

@@ -15,7 +15,15 @@ tool calls, a budget is used up, or the user cancels:
    assembled from OpenAI-compatible `tool_calls` deltas, Anthropic `tool_use`
    blocks with `input_json_delta`, or Gemini `functionCall` parts (whose
    `thoughtSignature` is stored and sent back). An OpenAI stream is complete only
-   with both a finish reason (including `tool_calls`) and `[DONE]`.
+   with both a finish reason (including `tool_calls`) and `[DONE]`. Reasoning
+   the provider streams (OpenAI-compatible `reasoning_content` or `reasoning`,
+   whichever comes first in a delta; Anthropic `thinking_delta`; Gemini
+   `thought` parts, requested with `thinkingConfig.includeThoughts` only for
+   models the Models API reports as thinking) is journaled the same way into the
+   reply's `reasoning`, up to 128 KiB (`MAX_REASONING_TEXT`; beyond it the rest
+   is dropped and `reasoning_shortened` is set, without failing the reply). It
+   is shown collapsed above the reply and is never sent back to a model, nor
+   given to compaction or message search.
 3. Record the calls on the assistant message. Argument text is parsed; a code fence
    or surrounding prose and trailing commas are repaired (`healed`), truncated or
    non-object arguments fail that call, and an identical call later in the same
@@ -33,8 +41,8 @@ tool calls, a budget is used up, or the user cancels:
    repeated provider call IDs are replaced.
    Calls are recorded in order while their arguments fit in the conversation's
    remaining storage, keeping a reserve for settling this response's calls and
-   for the next round (the longest reply the provider path accepts, its metadata
-   and its own settlement); the rest fail with a `Storage` report and no stored
+   for the next round (the longest reply the provider path accepts, the most
+   reasoning a reply keeps, its metadata and its own settlement); the rest fail with a `Storage` report and no stored
    arguments, and the run goes on. Tool outputs are likewise cut to the space
    above that reserve. A round never starts without room for its reply; if that
    room is gone the run fails with `HistoryFull` instead of streaming a reply it
@@ -532,6 +540,17 @@ a "Current plan" section with the steps and statuses, for as long as the tool is
 offered. Clients: a plan card above the composer in the shared conversation view
 (`ui/src/conversation.rs`, desktop/web/TUI) and `agent206 plan THREAD`.
 
+## Messages out (`send_message`)
+
+`runtime/src/message_tool.rs` offers `send_message`, after RustyClaw's
+`message` tool, while the user has an enabled webhook messenger they have not
+disconnected. Its arguments are `destination`, the webhook's entry name (an
+enum of the current names), and `text`. The host's policy is Ask, so even a
+conversation that permits the tool approves each call, and the host refuses
+any call the user did not approve. The result names the destination and the
+number of parts sent; the webhook URL never appears in the listing, the
+result or the conversation. See [messengers.md](messengers.md#webhooks).
+
 ## Output rules
 
 Before a tool result reaches the model, the run engine passes it through the
@@ -748,7 +767,11 @@ and unit tests in `retry.rs`.
 
 ## Not implemented
 
-Converting nested argument values or union types; running a tool call that was written as text; Anthropic thinking-block replay alongside tool results;
+Converting nested argument values or union types; running a tool call that was written as text; Anthropic thinking-block replay alongside tool results, and
+asking Anthropic models for summarized thinking (`display: "summarized"`), so
+current Anthropic models, which omit thinking text by default, show none: replayed
+blocks are checked against an unchanged system prompt and tool list, and a run's
+system prompt changes between rounds (plan reminder, memory flush);
 parallel tool execution; RustyClaw's project-layer output rules
 (`<workspace>/.tokenjuice/rules/`) and a way to list or edit output rules from
 the GUI or CLI; credential scanning of instruction files, attachments and

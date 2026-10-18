@@ -61,9 +61,13 @@ pub enum MessengerKind {
     /// connected to Beeper (WhatsApp, iMessage, Google Chat and others) and
     /// answers as the user's own accounts there.
     Beeper,
+    /// An incoming webhook of a chat service (Slack, Discord, Google Chat,
+    /// Teams) or any JSON endpoint. It only sends: models post to it with
+    /// the `send_message` tool, and the user approves each message.
+    Webhook,
 }
 impl MessengerKind {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Telegram,
         Self::Matrix,
         Self::Discord,
@@ -71,6 +75,7 @@ impl MessengerKind {
         Self::Irc,
         Self::Signal,
         Self::Beeper,
+        Self::Webhook,
     ];
     pub fn label(self) -> &'static str {
         match self {
@@ -81,6 +86,7 @@ impl MessengerKind {
             Self::Irc => "IRC",
             Self::Signal => "Signal",
             Self::Beeper => "Beeper",
+            Self::Webhook => "Webhook",
         }
     }
     /// The service's official API endpoint, used unless an entry names
@@ -91,7 +97,8 @@ impl MessengerKind {
             Self::Matrix => None,
             Self::Discord => Some("https://discord.com"),
             Self::Slack => Some("https://slack.com"),
-            Self::Irc | Self::Signal => None,
+            // A webhook's origin is the service the user created it on.
+            Self::Irc | Self::Signal | Self::Webhook => None,
             // Beeper Desktop serves its API on this loopback port.
             Self::Beeper => Some("http://localhost:23373"),
         }
@@ -120,6 +127,9 @@ impl MessengerKind {
             Self::Beeper => {
                 "In Beeper Desktop, turn on the Desktop API, create a token under Settings, Integrations, Approved connections, and store it in the vault, bound to the API origin. Replies are sent as you, from your own accounts"
             }
+            Self::Webhook => {
+                "Create an incoming webhook in the chat service (a Slack app, a Discord channel's Integrations, a Google Chat space's Apps & integrations, or a Teams channel's Workflows) and store its whole URL in the vault, bound to the URL's origin, which is also the endpoint. A webhook only sends: you approve each message a model posts to it"
+            }
         }
     }
     /// Whether the kind receives events with a second, app-level token
@@ -138,6 +148,11 @@ impl MessengerKind {
     /// or stores them.
     pub fn needs_credential(self) -> bool {
         !matches!(self, Self::Signal)
+    }
+    /// Whether the kind only sends ([`MessengerKind::Webhook`]): it never
+    /// connects or receives, and its allow-lists, model and mode are unused.
+    pub fn is_send_only(self) -> bool {
+        matches!(self, Self::Webhook)
     }
     /// Whether the kind's endpoint is a signal-cli daemon ([`SignalDaemon`]).
     pub fn is_signal(self) -> bool {
@@ -161,6 +176,38 @@ impl MessengerKind {
     /// than an HTTPS origin.
     pub fn is_irc(self) -> bool {
         matches!(self, Self::Irc)
+    }
+}
+
+/// The body a webhook messenger posts, by the service the webhook belongs to.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WebhookFormat {
+    /// `{"text": …}`: the shape Slack, Google Chat and many other services
+    /// (Mattermost, Rocket.Chat, Zulip's Slack-compatible hooks) accept.
+    #[default]
+    Text,
+    /// Discord: `{"content": …}`.
+    Discord,
+    /// A Teams Workflows webhook: one Adaptive Card with the text.
+    Teams,
+}
+impl WebhookFormat {
+    pub const ALL: [Self; 3] = [Self::Text, Self::Discord, Self::Teams];
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Text => "Slack, Google Chat or JSON text",
+            Self::Discord => "Discord",
+            Self::Teams => "Microsoft Teams",
+        }
+    }
+    /// The name `--format` and TOML use.
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::Discord => "discord",
+            Self::Teams => "teams",
+        }
     }
 }
 
@@ -422,6 +469,9 @@ pub struct MessengerConfig {
     /// Mode, and so system prompt and grants, of new chat threads.
     #[serde(default)]
     pub mode: Mode,
+    /// The body a webhook posts. Unused by other kinds.
+    #[serde(default)]
+    pub format: WebhookFormat,
 }
 impl MessengerConfig {
     pub fn new(name: String, kind: MessengerKind) -> Self {
@@ -437,6 +487,7 @@ impl MessengerConfig {
             allowed_users: BTreeSet::new(),
             model: None,
             mode: Mode::Chat,
+            format: WebhookFormat::Text,
         }
     }
     /// The configured endpoint, else the kind's official one; `None` when
@@ -470,6 +521,9 @@ pub enum MessengerState {
     WaitingForVault,
     Connecting,
     Connected,
+    /// A send-only messenger (a webhook) is enabled; it has nothing to
+    /// connect, and a failed send is reported to the call that made it.
+    Ready,
     /// The last attempt failed; the gateway retries with backoff unless the
     /// failure needs the user (for example a rejected token).
     Failed,
@@ -481,6 +535,7 @@ impl MessengerState {
             Self::WaitingForVault => "Waiting for vault",
             Self::Connecting => "Connecting",
             Self::Connected => "Connected",
+            Self::Ready => "Ready to send",
             Self::Failed => "Failed",
         }
     }

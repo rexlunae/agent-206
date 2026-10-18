@@ -1415,8 +1415,12 @@ async fn calls_that_do_not_fit_in_storage_are_settled_and_the_run_goes_on() {
         (0..n)
             .map(|_| {
                 // The margin leaves the first batch room for the rest of the
-                // stored state, such as bundled extension manifests.
-                let filler = "a".repeat(a206_runtime::tool_calls::MAX_ARGUMENTS - 9 * 1024);
+                // stored state, such as bundled extension manifests, and for
+                // the reasoning the next round may stream.
+                let margin = 9 * 1024
+                    + a206_runtime::provider::MAX_REASONING_TEXT
+                        / a206_runtime::tool_calls::MAX_CALLS;
+                let filler = "a".repeat(a206_runtime::tool_calls::MAX_ARGUMENTS - margin);
                 Call::new(&nonce(), json!({"value": format!("{}{filler}", nonce())}))
             })
             .collect()
@@ -1447,13 +1451,25 @@ async fn calls_that_do_not_fit_in_storage_are_settled_and_the_run_goes_on() {
         .collect();
     third.respond(calls_response(api, &small, "")).await;
     let fourth = rig.next_request().await;
-    // The longest reply the provider accepts still fits after the calls.
+    // The longest reply the provider accepts, with the most reasoning a reply
+    // keeps, still fits after the calls.
     let mut reply = nonce();
     reply.push_str(&"b".repeat(a206_runtime::provider::MAX_REPLY_TEXT - reply.len()));
-    fourth.respond(text_response(api, &reply)).await;
+    let mut reasoning = nonce();
+    reasoning.push_str(&"r".repeat(a206_runtime::provider::MAX_REASONING_TEXT - reasoning.len()));
+    let thought = sse(
+        None,
+        json!({"choices": [{"index": 0, "delta": {"reasoning_content": reasoning}}]}),
+    );
+    fourth
+        .respond(format!("{thought}{}", text_response(api, &reply)))
+        .await;
     let thread = finished(task).await;
     assert_eq!(thread.state, RunState::Complete, "{:?}", thread.error);
-    assert_eq!(thread.messages.last().unwrap().text, reply);
+    let last = thread.messages.last().unwrap();
+    assert_eq!(last.text, reply);
+    assert_eq!(last.reasoning, reasoning);
+    assert!(!last.reasoning_shortened);
     let recorded = calls_of(&thread);
     let settled: Vec<_> = recorded
         .iter()

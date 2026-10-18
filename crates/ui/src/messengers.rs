@@ -4,7 +4,7 @@
 use crate::{PageFrame, State, dispatch, error::ErrorNotice};
 use a206_core::{
     Command, MessengerConfig, MessengerKind, MessengerState, MessengerStatus, Mode, ModelKey,
-    RefusedChat, Snapshot,
+    RefusedChat, Snapshot, WebhookFormat,
 };
 use fc_dioxus::prelude::*;
 use uuid::Uuid;
@@ -33,7 +33,7 @@ fn save_messenger(state: State, name: &str, edit: impl FnOnce(&mut MessengerConf
 
 fn tone(state: MessengerState) -> BadgeTone {
     match state {
-        MessengerState::Connected => BadgeTone::Success,
+        MessengerState::Connected | MessengerState::Ready => BadgeTone::Success,
         MessengerState::Connecting | MessengerState::WaitingForVault => BadgeTone::Info,
         MessengerState::Failed => BadgeTone::Danger,
         MessengerState::Stopped => BadgeTone::Neutral,
@@ -139,6 +139,9 @@ fn MessengerCard(now: u64, config: MessengerConfig, status: MessengerStatus) -> 
         MessengerState::Connected | MessengerState::Connecting | MessengerState::WaitingForVault
     );
     let endpoint = config.endpoint().unwrap_or("no server chosen").to_owned();
+    let send_only = config.kind.is_send_only();
+    let format = config.format;
+    let format_selected = use_memo(use_reactive!(|format| Some(format.label().to_owned())));
     rsx! { Card {
         CardHeader { CardTitle { "{config.name}" } CardSubtitle { "{config.kind.label()} · {endpoint}" } }
         CardBody {
@@ -156,7 +159,16 @@ fn MessengerCard(now: u64, config: MessengerConfig, status: MessengerStatus) -> 
                 CredentialRow { messenger: config.name.clone(), app: true, current: config.app_credential.clone() }
             }
             Checkbox { label: rsx! { "Enabled" }, checked: ReadSignal::from(enabled), onchange: { let name = name.clone(); move |on: bool| save_messenger(state, &name, |m| m.enabled = on) } }
-            if let Some(report) = status.failure.clone() { ErrorNotice { report, title: "Messenger failed".to_string() } }
+            if let Some(report) = status.failure.clone() { ErrorNotice { report, title: if send_only { "Last message failed".to_string() } else { "Messenger failed".to_string() } } }
+            if send_only {
+                p { class: "a206-muted", "Models post here with send_message once you permit that tool in a conversation, and you approve each message. Nothing is received." }
+                Field { label: rsx! { "Message format" },
+                    Select { label: name!("Message format"), value: ReadSignal::from(format_selected),
+                        options: WebhookFormat::ALL.into_iter().map(|f| SelectChoice::new(f.label(), f.label())).collect(),
+                        onchange: { let name = name.clone(); move |value: String| { if let Some(format) = WebhookFormat::ALL.into_iter().find(|f| f.label() == value) { save_messenger(state, &name, |m| m.format = format) } } }
+                    }
+                }
+            } else {
             div { class: "a206-grid",
                 Field { label: rsx! { "Model for new chats" }, hint: rsx! { "The only model a chat's conversation may use. Without one, chats are told no model is chosen." },
                     if models.is_empty() {
@@ -184,9 +196,11 @@ fn MessengerCard(now: u64, config: MessengerConfig, status: MessengerStatus) -> 
                     RefusedRow { key: "{refused.chat}-{refused.sender:?}", messenger: config.name.clone(), refused: refused.clone(), offer: Offer::for_refused(&config, refused) }
                 }
             }
+            }
         }
         CardFooter {
-            if running {
+            if send_only {
+            } else if running {
                 Button { variant: ButtonVariant::Secondary, onclick: { let name = name.clone(); move |_| dispatch(state, Command::DisconnectMessenger { name: name.clone() }) }, "Disconnect" }
             } else {
                 Button { variant: ButtonVariant::Secondary, availability: if config.enabled { Availability::Enabled } else { Availability::Disabled }, onclick: { let name = name.clone(); move |_| dispatch(state, Command::ConnectMessenger { name: name.clone() }) }, "Connect" }
@@ -366,6 +380,7 @@ fn AddMessenger() -> Element {
     let mut app_credential = use_signal(String::new);
     let mut endpoint = use_signal(String::new);
     let mut login = use_signal(String::new);
+    let mut format = use_signal(|| Some(WebhookFormat::Text.label().to_owned()));
     let selected = MessengerKind::ALL
         .into_iter()
         .find(|k| Some(k.label()) == kind().as_deref());
@@ -376,6 +391,11 @@ fn AddMessenger() -> Element {
     let needs_credential = selected.is_some_and(MessengerKind::needs_credential);
     let irc = selected.is_some_and(MessengerKind::is_irc);
     let signal = selected.is_some_and(MessengerKind::is_signal);
+    let webhook = selected.is_some_and(MessengerKind::is_send_only);
+    let chosen_format = WebhookFormat::ALL
+        .into_iter()
+        .find(|f| Some(f.label()) == format().as_deref())
+        .unwrap_or_default();
     let ready = selected.is_some()
         && (!needs_login || !login().trim().is_empty())
         && !name().trim().is_empty()
@@ -386,6 +406,8 @@ fn AddMessenger() -> Element {
         "Required: the IRC server, as ircs://host or ircs://host:port. Only TLS is used."
     } else if signal {
         "Required: your signal-cli daemon's socket, as unix:///path/to/socket or tcp://127.0.0.1:port. Agent 206 never starts or stops it."
+    } else if webhook {
+        "Required: the webhook URL's origin, such as https://hooks.slack.com, with no path. The vault credential holds the whole URL."
     } else if needs_endpoint {
         "Required: your homeserver's client API origin, with no path."
     } else if selected == Some(MessengerKind::Beeper) {
@@ -403,8 +425,14 @@ fn AddMessenger() -> Element {
                     options: MessengerKind::ALL.into_iter().map(|k| SelectChoice::new(k.label(), k.label())).collect(),
                     onchange: move |value: String| kind.set(Some(value))
                 } }
+                if webhook {
+                    Field { label: rsx! { "Message format" }, Select { label: name!("Message format"), value: ReadSignal::from(format),
+                        options: WebhookFormat::ALL.into_iter().map(|f| SelectChoice::new(f.label(), f.label())).collect(),
+                        onchange: move |value: String| format.set(Some(value))
+                    } }
+                }
                 if needs_credential {
-                    Field { label: rsx! { "Vault credential" }, hint: rsx! { "The name of the vault entry holding the token, never the token itself." }, Input { value: ReadSignal::from(credential), oninput: move |v| credential.set(v), placeholder: "Credential name" } }
+                    Field { label: rsx! { "Vault credential" }, hint: rsx! { if webhook { "The name of the vault entry holding the webhook URL, never the URL itself." } else { "The name of the vault entry holding the token, never the token itself." } }, Input { value: ReadSignal::from(credential), oninput: move |v| credential.set(v), placeholder: "Credential name" } }
                 }
                 if needs_login {
                     Field { label: rsx! { "Login" }, hint: rsx! { if signal { "The account's phone number (+ and digits), as signal-cli serves it." } else { "The bot's nickname, registered as an account with the network's services." } }, Input { value: ReadSignal::from(login), oninput: move |v| login.set(v), placeholder: if signal { "+15551234567" } else { "Nickname" } } }
@@ -412,7 +440,7 @@ fn AddMessenger() -> Element {
                 if needs_app {
                     Field { label: rsx! { "App-level token credential" }, hint: rsx! { "The vault entry holding the app-level token the service sends events with." }, Input { value: ReadSignal::from(app_credential), oninput: move |v| app_credential.set(v), placeholder: "Credential name" } }
                 }
-                Field { label: rsx! { if irc { "Server" } else if signal { "signal-cli daemon" } else { "API endpoint" } }, hint: rsx! { "{endpoint_hint}" }, Input { value: ReadSignal::from(endpoint), oninput: move |v| endpoint.set(v), placeholder: selected.and_then(|k| k.default_endpoint()).unwrap_or(if irc { "ircs://irc.example" } else if signal { "unix:///run/user/1000/signal-cli/socket" } else { "https://homeserver.example" }) } }
+                Field { label: rsx! { if irc { "Server" } else if signal { "signal-cli daemon" } else { "API endpoint" } }, hint: rsx! { "{endpoint_hint}" }, Input { value: ReadSignal::from(endpoint), oninput: move |v| endpoint.set(v), placeholder: selected.and_then(|k| k.default_endpoint()).unwrap_or(if irc { "ircs://irc.example" } else if signal { "unix:///run/user/1000/signal-cli/socket" } else if webhook { "https://hooks.slack.com" } else { "https://homeserver.example" }) } }
             }
         }
         CardFooter { Button { variant: ButtonVariant::Primary, availability: if ready { Availability::Enabled } else { Availability::Disabled }, onclick: move |_| {
@@ -422,6 +450,7 @@ fn AddMessenger() -> Element {
             entry.app_credential = Some(app_credential().trim().to_owned()).filter(|c| service.needs_app_credential() && !c.is_empty());
             entry.endpoint = Some(endpoint().trim().to_owned()).filter(|e| !e.is_empty());
             entry.login = Some(login().trim().to_owned()).filter(|l| service.needs_login() && !l.is_empty());
+            entry.format = chosen_format;
             let mut settings = state.data.read().settings.clone();
             settings.messengers.push(entry);
             dispatch(state, Command::SaveSettings(Box::new(settings)));
