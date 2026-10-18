@@ -999,6 +999,18 @@ impl HostCalls {
                 )
                 .await
             }
+            HostRequest::GitStage { paths, unstage } => {
+                let root = self.workspace()?;
+                let user = self.user_git;
+                // As for a commit: an index written at the last moment
+                // still reaches the guest before the invocation is dropped.
+                let budget = self.write_budget()?;
+                git_write_call_with_timeout(
+                    move |interrupt| git_stage::stage(root, &paths, unstage, user, &interrupt),
+                    budget,
+                )
+                .await
+            }
             HostRequest::Fetch { url } => fetch::fetch(self.net.as_ref(), &self.hosts, &url).await,
             HostRequest::StateGet { key } => {
                 check_key(&key)?;
@@ -1173,6 +1185,7 @@ impl Drop for Interrupt {
 mod fetch;
 mod git;
 mod git_commit;
+mod git_stage;
 pub mod packages;
 mod patch;
 mod proposals;

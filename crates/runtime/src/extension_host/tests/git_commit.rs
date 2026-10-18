@@ -17,12 +17,12 @@ fn committable(root: &Path, files: &[(&str, &str)]) -> (String, String) {
     (name, email)
 }
 /// The repository lives beside the gateway's own data, never around it.
-fn project(dir: &Path) -> std::path::PathBuf {
+pub(super) fn project(dir: &Path) -> std::path::PathBuf {
     let root = dir.join("repo");
     std::fs::create_dir(&root).unwrap();
     root
 }
-fn configure(root: &Path, text: &str) {
+pub(super) fn configure(root: &Path, text: &str) {
     use std::io::Write;
     std::fs::OpenOptions::new()
         .append(true)
@@ -37,14 +37,14 @@ fn commit(message: &str, paths: &[&str]) -> HostRequest {
         paths: paths.iter().map(|path| (*path).into()).collect(),
     }
 }
-fn writer(store: &Arc<Mutex<Store>>, root: &Path) -> HostCalls {
+pub(super) fn writer(store: &Arc<Mutex<Store>>, root: &Path) -> HostCalls {
     workspace_calls(
         store,
         Some(root.into()),
         &[Capability::GitRead, Capability::GitWrite],
     )
 }
-fn head(root: &Path) -> Option<gix::ObjectId> {
+pub(super) fn head(root: &Path) -> Option<gix::ObjectId> {
     gix::open(root).unwrap().head_id().ok().map(gix::Id::detach)
 }
 /// The blob text at `path` in `HEAD`, if any.
@@ -55,7 +55,7 @@ fn committed(root: &Path, path: &str) -> Option<String> {
     let blob = repo.find_object(entry.object_id()).unwrap();
     Some(String::from_utf8(blob.detach().data).unwrap())
 }
-async fn changes(host: &mut HostCalls) -> Vec<(String, GitArea, GitChange)> {
+pub(super) async fn changes(host: &mut HostCalls) -> Vec<(String, GitArea, GitChange)> {
     let HostReply::GitStatus(status) = host.handle(HostRequest::GitStatus).await else {
         panic!("status failed");
     };
@@ -275,6 +275,24 @@ async fn a_write_finishing_after_the_deadline_reports_its_outcome() {
 }
 
 #[cfg(unix)]
+#[tokio::test]
+async fn a_file_replaced_by_a_directory_is_not_committed_as_a_removal() {
+    let (dir, store) = store();
+    let root = &project(dir.path());
+    committable(root, &[("a", "one\n")]);
+    std::fs::remove_file(root.join("a")).unwrap();
+    std::fs::create_dir(root.join("a")).unwrap();
+    std::fs::write(root.join("a/x"), unique("x")).unwrap();
+    let before = head(root);
+    let mut host = writer(&store, root);
+    assert_eq!(
+        code(host.handle(commit("m", &["a"])).await),
+        Some(HostErrorCode::Unsupported)
+    );
+    assert_eq!(head(root), before);
+    assert_eq!(committed(root, "a").as_deref(), Some("one\n"));
+}
+
 #[tokio::test]
 async fn modes_and_links_are_recorded_without_following_links() {
     use std::os::unix::fs::PermissionsExt;

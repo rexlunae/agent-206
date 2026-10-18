@@ -29,7 +29,7 @@ pub fn required_capability(request: &abi::HostRequest) -> Option<Capability> {
         | R::CreateDirectory { .. }
         | R::PatchFiles { .. } => Some(Capability::WriteWorkspace),
         R::GitStatus | R::GitLog { .. } | R::GitDiff { .. } => Some(Capability::GitRead),
-        R::GitCommit { .. } => Some(Capability::GitWrite),
+        R::GitCommit { .. } | R::GitStage { .. } => Some(Capability::GitWrite),
         R::Fetch { .. } => Some(Capability::Network),
         R::StateGet { .. }
         | R::StatePut { .. }

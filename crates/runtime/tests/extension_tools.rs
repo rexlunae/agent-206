@@ -1157,6 +1157,25 @@ async fn git_tools_run_once_the_conversation_is_granted_git() {
     };
     assert_eq!(committed.trim(), message);
 
+    // The same grant stages a change without committing it.
+    let changed = nonce();
+    std::fs::write(rig.workspace.path().join(&rig.file.0), &changed).unwrap();
+    rig.tool = tool_name(GIT, "git_stage");
+    rig.permit(ToolPermission::Allow).await;
+    let stage = Call::new(&rig.tool, json!({ "paths": rig.file.0 }));
+    let (thread, _) = rig.round_trip(&[stage]).await;
+    let record = calls_of(&thread).last().unwrap().clone();
+    assert_eq!(record.state, ToolCallState::Succeeded, "{:?}", record.error);
+    {
+        let repo = gix::open(rig.workspace.path()).unwrap();
+        let index = repo.open_index().unwrap();
+        let entry = index.entry_by_path(rig.file.0.as_str().into()).unwrap();
+        assert_eq!(repo.find_object(entry.id).unwrap().data, changed.as_bytes());
+        // Staging committed nothing.
+        let head = repo.head_commit().unwrap();
+        assert_eq!(head.message_raw().unwrap().to_string().trim(), message);
+    }
+
     // The network alone needs no project, unlike everything else.
     let Reply::Thread(research) = rig
         .run(Command::CreateThread {

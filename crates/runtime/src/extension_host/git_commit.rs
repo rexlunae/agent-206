@@ -96,13 +96,13 @@ fn read_user_file(path: &std::path::Path) -> Result<Option<Vec<u8>>, HostFailure
 
 /// A setting from the repository, else from the user, with every include
 /// git would follow resolved, conditional ones too.
-struct Settings {
+pub(super) struct Settings {
     repository: gix::config::File,
     user: gix::config::File,
     home: Option<PathBuf>,
 }
 impl Settings {
-    fn resolve(repo: &gix::Repository, user: &UserGit) -> Result<Self, HostFailure> {
+    pub(super) fn resolve(repo: &gix::Repository, user: &UserGit) -> Result<Self, HostFailure> {
         let failed = |e: &(dyn std::error::Error + 'static)| git_failure("config", e);
         let git_dir = repo.git_dir();
         let read = |name: &str, source| {
@@ -177,7 +177,7 @@ impl Settings {
     }
 }
 
-enum Change {
+pub(super) enum Change {
     Write { id: ObjectId, mode: Mode, size: u32 },
     Remove,
 }
@@ -238,44 +238,9 @@ pub(super) fn commit(
             "set user.name and user.email in git configuration first",
         ));
     };
-    let file_mode = settings.flag("core.fileMode").unwrap_or(cfg!(unix));
-    let autocrlf = settings
-        .string("core.autocrlf")
-        .is_some_and(|value| !value.eq_ignore_ascii_case(b"false"));
-
     // Hold the index lock from here on, as `git commit` does, so no other
     // git process changes the index or commits in between.
-    let index_path = repo.index_path();
-    let lock = gix::lock::File::acquire_to_update_resource(
-        &index_path,
-        gix::lock::acquire::Fail::Immediately,
-        None,
-        0,
-    )
-    .map_err(|e| {
-        tracing::warn!(error = &e as &dyn std::error::Error, "git index is locked");
-        failure(
-            HostErrorCode::Conflict,
-            "another git operation is using the repository; try again",
-        )
-    })?;
-    let mut index = if index_path.is_file() {
-        repo.open_index().map_err(|e| git_failure("index", &e))?
-    } else {
-        gix::index::File::from_state(gix::index::State::new(repo.object_hash()), index_path)
-    };
-    if index.link().is_some() || index.is_sparse() {
-        return Err(unsupported(
-            "split and sparse indexes are not supported for commits",
-        ));
-    }
-    if index
-        .entries()
-        .iter()
-        .any(|e| e.stage() != Stage::Unconflicted)
-    {
-        return Err(unsupported("resolve the merge conflicts first"));
-    }
+    let (lock, mut index) = lock_index(&repo)?;
 
     let head = repo.head().map_err(|e| git_failure("head", &e))?;
     let parent = head.id().map(gix::Id::detach);
@@ -288,19 +253,9 @@ pub(super) fn commit(
         None => ObjectId::empty_tree(repo.object_hash()),
     };
     let mut tree = repo.edit_tree(base).map_err(|e| git_failure("tree", &e))?;
-    let overrides = user_excludes(&settings, user, &repo)?;
-    let mut rules = repo
-        .attributes(
-            &index,
-            gix::worktree::stack::state::attributes::Source::WorktreeThenIdMapping,
-            gix::worktree::stack::state::ignore::Source::WorktreeThenIdMappingIfNotSkipped,
-            overrides,
-        )
-        .map_err(|e| git_failure("attributes", &e))?;
-    let mut conversions = rules.selected_attribute_matches(CONVERSIONS);
+    let mut files = WorkingFiles::new(&repo, &index, &settings, user)?;
 
     let mut changes = Vec::new();
-    let mut written = 0u64;
     for path in &named {
         check(interrupt)?;
         let path = path.as_bstr();
@@ -323,7 +278,9 @@ pub(super) fn commit(
                 "a parent of the path is a file in git",
             ));
         }
-        let Some(file) = workspace::tracked(root.clone(), &path.to_str_lossy())? else {
+        let recorded_executable = previous == Some(EntryKind::BlobExecutable)
+            || indexed.is_some_and(|e| e.mode == Mode::FILE_EXECUTABLE);
+        let Some(change) = files.read(&root, path, &named, known, recorded_executable)? else {
             if !known {
                 return Err(failure(
                     HostErrorCode::NotFound,
@@ -334,81 +291,11 @@ pub(super) fn commit(
             changes.push((path.to_owned(), Change::Remove));
             continue;
         };
-        let (bytes, kind) = match file {
-            Tracked::Link(target) => (target, EntryKind::Link),
-            Tracked::File { bytes, executable } => {
-                // Without `core.fileMode` the recorded bit is kept.
-                let executable = if file_mode {
-                    executable
-                } else {
-                    previous == Some(EntryKind::BlobExecutable)
-                        || indexed.is_some_and(|e| e.mode == Mode::FILE_EXECUTABLE)
-                };
-                let kind = if executable {
-                    EntryKind::BlobExecutable
-                } else {
-                    EntryKind::Blob
-                };
-                (bytes, kind)
-            }
-        };
-        let platform = rules
-            .at_entry(path, Some(index_mode(kind)))
-            .map_err(|e| git_failure("attributes", &e))?;
-        if !known && platform.is_excluded() {
-            return Err(failure(
-                HostErrorCode::Invalid,
-                "a named path is ignored by git and not tracked",
-            ));
+        if let Change::Write { id, mode, .. } = &change {
+            tree.upsert(path, entry_kind(*mode), *id)
+                .map_err(|e| git_failure("tree", &e))?;
         }
-        platform.matching_attributes(&mut conversions);
-        let mut converts_line_endings = autocrlf;
-        for matched in conversions.iter_selected() {
-            use gix::attrs::StateRef;
-            if matches!(
-                matched.assignment.state,
-                StateRef::Unspecified | StateRef::Unset
-            ) {
-                continue;
-            }
-            match matched.assignment.name.as_str() {
-                "text" | "eol" | "crlf" => converts_line_endings = true,
-                _ => {
-                    return Err(unsupported(
-                        "a named file has a git filter, ident or encoding attribute, \
-                         which extensions do not apply",
-                    ));
-                }
-            }
-        }
-        if converts_line_endings && bytes.contains(&b'\r') {
-            return Err(unsupported(
-                "a named file has carriage returns that git would convert; \
-                 extensions do not convert line endings",
-            ));
-        }
-        written += bytes.len() as u64;
-        if written > MAX_COMMIT_BYTES {
-            return Err(failure(
-                HostErrorCode::TooLarge,
-                "the named files exceed 8 MiB together",
-            ));
-        }
-        let size = u32::try_from(bytes.len()).unwrap_or(u32::MAX);
-        let id = repo
-            .write_blob(&bytes)
-            .map_err(|e| git_failure("blob", &e))?
-            .detach();
-        tree.upsert(path, kind, id)
-            .map_err(|e| git_failure("tree", &e))?;
-        changes.push((
-            path.to_owned(),
-            Change::Write {
-                id,
-                mode: index_mode(kind),
-                size,
-            },
-        ));
+        changes.push((path.to_owned(), change));
     }
     let new_tree = tree.write().map_err(|e| git_failure("tree", &e))?.detach();
     if new_tree == base {
@@ -457,7 +344,8 @@ pub(super) fn commit(
     // Committed: from here on a failure must say so.
     tracing::info!(commit = %id, "extension made a git commit");
     update_index(&mut index, changes);
-    if !write_index(&index, lock, id) {
+    if !write_index(&index, lock) {
+        tracing::warn!(commit = %id, "committed, but the git index is not updated");
         return Err(failure(
             HostErrorCode::Io,
             &format!(
@@ -475,14 +363,30 @@ pub(super) fn commit(
 }
 
 /// `a/b` for any spelling `check_relative` accepts, such as `a//b/`.
-fn normalized(path: &str) -> BString {
+pub(super) fn normalized(path: &str) -> BString {
     let parts: Vec<_> = std::path::Path::new(path)
         .components()
         .map(|part| part.as_os_str().to_string_lossy().into_owned())
         .collect();
     parts.join("/").into()
 }
-fn index_mode(kind: EntryKind) -> Mode {
+fn entry_kind(mode: Mode) -> EntryKind {
+    match mode {
+        Mode::FILE_EXECUTABLE => EntryKind::BlobExecutable,
+        Mode::SYMLINK => EntryKind::Link,
+        _ => EntryKind::Blob,
+    }
+}
+/// Whether `named` holds a path below `path`.
+pub(super) fn names_below(named: &BTreeSet<BString>, path: &BStr) -> bool {
+    let mut prefix = path.to_owned();
+    prefix.push(b'/');
+    named
+        .range(prefix.clone()..)
+        .next()
+        .is_some_and(|below| below.starts_with(prefix.as_slice()))
+}
+pub(super) fn index_mode(kind: EntryKind) -> Mode {
     match kind {
         EntryKind::BlobExecutable => Mode::FILE_EXECUTABLE,
         EntryKind::Link => Mode::SYMLINK,
@@ -549,7 +453,7 @@ fn user_excludes(
     Ok(Some(search))
 }
 
-fn update_index(index: &mut gix::index::File, changes: Vec<(BString, Change)>) {
+pub(super) fn update_index(index: &mut gix::index::File, changes: Vec<(BString, Change)>) {
     // Lookups need sorted entries, so new ones are added only at the end.
     let mut added = Vec::new();
     for (path, change) in changes {
@@ -585,24 +489,204 @@ fn update_index(index: &mut gix::index::File, changes: Vec<(BString, Change)>) {
     // The cached trees no longer match the entries.
     index.remove_tree();
 }
-/// Write the updated index through the lock taken before committing,
+/// Write the updated index through the lock taken before changing it,
 /// recording any failure here, where it is handled.
-fn write_index(index: &gix::index::File, lock: gix::lock::File, commit: ObjectId) -> bool {
+pub(super) fn write_index(index: &gix::index::File, lock: gix::lock::File) -> bool {
     let mut out = std::io::BufWriter::new(lock);
     if let Err(error) = index.write_to(&mut out, gix::index::write::Options::default()) {
-        tracing::warn!(error = &error as &dyn std::error::Error, %commit, "committed but could not write the git index");
+        tracing::warn!(
+            error = &error as &dyn std::error::Error,
+            "could not write the git index"
+        );
         return false;
     }
     let lock = match out.into_inner() {
         Ok(lock) => lock,
         Err(error) => {
-            tracing::warn!(error = error.error() as &dyn std::error::Error, %commit, "committed but could not write the git index");
+            tracing::warn!(
+                error = error.error() as &dyn std::error::Error,
+                "could not write the git index"
+            );
             return false;
         }
     };
     if let Err(error) = lock.commit() {
-        tracing::warn!(error = &error.error as &dyn std::error::Error, %commit, "committed but could not replace the git index");
+        tracing::warn!(
+            error = &error.error as &dyn std::error::Error,
+            "could not replace the git index"
+        );
         return false;
     }
     true
+}
+
+/// The index, locked against every other git process until the lock is
+/// committed or dropped. Split, sparse and conflicted indexes are refused.
+pub(super) fn lock_index(
+    repo: &gix::Repository,
+) -> Result<(gix::lock::File, gix::index::File), HostFailure> {
+    let index_path = repo.index_path();
+    let lock = gix::lock::File::acquire_to_update_resource(
+        &index_path,
+        gix::lock::acquire::Fail::Immediately,
+        None,
+        0,
+    )
+    .map_err(|e| {
+        tracing::warn!(error = &e as &dyn std::error::Error, "git index is locked");
+        failure(
+            HostErrorCode::Conflict,
+            "another git operation is using the repository; try again",
+        )
+    })?;
+    let index = if index_path.is_file() {
+        repo.open_index().map_err(|e| git_failure("index", &e))?
+    } else {
+        gix::index::File::from_state(gix::index::State::new(repo.object_hash()), index_path)
+    };
+    if index.link().is_some() || index.is_sparse() {
+        return Err(unsupported("split and sparse indexes are not supported"));
+    }
+    if index
+        .entries()
+        .iter()
+        .any(|e| e.stage() != Stage::Unconflicted)
+    {
+        return Err(unsupported("resolve the merge conflicts first"));
+    }
+    Ok((lock, index))
+}
+
+/// Working-tree files read as git would store them. Where git would change
+/// content on the way in (filters, ident, encodings, line-ending
+/// conversion), the file is refused rather than stored unconverted.
+pub(super) struct WorkingFiles<'repo> {
+    rules: gix::AttributeStack<'repo>,
+    conversions: gix::attrs::search::Outcome,
+    file_mode: bool,
+    autocrlf: bool,
+    /// File bytes read so far, bounded by [`MAX_COMMIT_BYTES`].
+    written: u64,
+}
+impl<'repo> WorkingFiles<'repo> {
+    pub(super) fn new(
+        repo: &'repo gix::Repository,
+        index: &gix::index::State,
+        settings: &Settings,
+        user: &UserGit,
+    ) -> Result<Self, HostFailure> {
+        let overrides = user_excludes(settings, user, repo)?;
+        let rules = repo
+            .attributes(
+                index,
+                gix::worktree::stack::state::attributes::Source::WorktreeThenIdMapping,
+                gix::worktree::stack::state::ignore::Source::WorktreeThenIdMappingIfNotSkipped,
+                overrides,
+            )
+            .map_err(|e| git_failure("attributes", &e))?;
+        let conversions = rules.selected_attribute_matches(CONVERSIONS);
+        Ok(Self {
+            rules,
+            conversions,
+            file_mode: settings.flag("core.fileMode").unwrap_or(cfg!(unix)),
+            autocrlf: settings
+                .string("core.autocrlf")
+                .is_some_and(|value| !value.eq_ignore_ascii_case(b"false")),
+            written: 0,
+        })
+    }
+
+    /// Store `path`'s working-tree content as a blob; `None` when nothing is
+    /// there. `known` paths are tracked, so ignore rules do not refuse them;
+    /// `recorded_executable` is kept when `core.fileMode` is off. A
+    /// directory is refused, unless it replaces a tracked file and `named`
+    /// also holds paths below it: then the file is gone, as with `None`.
+    pub(super) fn read(
+        &mut self,
+        root: &std::path::Path,
+        path: &BStr,
+        named: &BTreeSet<BString>,
+        known: bool,
+        recorded_executable: bool,
+    ) -> Result<Option<Change>, HostFailure> {
+        let repo = self.rules.repo;
+        let Some(file) = workspace::tracked(root.into(), &path.to_str_lossy())? else {
+            return Ok(None);
+        };
+        let (bytes, kind) = match file {
+            Tracked::Directory if known && names_below(named, path) => return Ok(None),
+            Tracked::Directory => {
+                return Err(unsupported(
+                    "a named path is a directory; name the files in it",
+                ));
+            }
+            Tracked::Link(target) => (target, EntryKind::Link),
+            Tracked::File { bytes, executable } => {
+                let executable = if self.file_mode {
+                    executable
+                } else {
+                    recorded_executable
+                };
+                let kind = if executable {
+                    EntryKind::BlobExecutable
+                } else {
+                    EntryKind::Blob
+                };
+                (bytes, kind)
+            }
+        };
+        let platform = self
+            .rules
+            .at_entry(path, Some(index_mode(kind)))
+            .map_err(|e| git_failure("attributes", &e))?;
+        if !known && platform.is_excluded() {
+            return Err(failure(
+                HostErrorCode::Invalid,
+                "a named path is ignored by git and not tracked",
+            ));
+        }
+        platform.matching_attributes(&mut self.conversions);
+        let mut converts_line_endings = self.autocrlf;
+        for matched in self.conversions.iter_selected() {
+            use gix::attrs::StateRef;
+            if matches!(
+                matched.assignment.state,
+                StateRef::Unspecified | StateRef::Unset
+            ) {
+                continue;
+            }
+            match matched.assignment.name.as_str() {
+                "text" | "eol" | "crlf" => converts_line_endings = true,
+                _ => {
+                    return Err(unsupported(
+                        "a named file has a git filter, ident or encoding attribute, \
+                         which extensions do not apply",
+                    ));
+                }
+            }
+        }
+        if converts_line_endings && bytes.contains(&b'\r') {
+            return Err(unsupported(
+                "a named file has carriage returns that git would convert; \
+                 extensions do not convert line endings",
+            ));
+        }
+        self.written += bytes.len() as u64;
+        if self.written > MAX_COMMIT_BYTES {
+            return Err(failure(
+                HostErrorCode::TooLarge,
+                "the named files exceed 8 MiB together",
+            ));
+        }
+        let size = u32::try_from(bytes.len()).unwrap_or(u32::MAX);
+        let id = repo
+            .write_blob(&bytes)
+            .map_err(|e| git_failure("blob", &e))?
+            .detach();
+        Ok(Some(Change::Write {
+            id,
+            mode: index_mode(kind),
+            size,
+        }))
+    }
 }

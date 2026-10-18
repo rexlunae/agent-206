@@ -236,6 +236,15 @@ pub enum HostRequest {
     /// removed, the index is updated to match for those paths, and other
     /// staged changes stay staged.
     GitCommit { message: String, paths: Vec<String> },
+    /// Put the working-tree content of exactly `paths` in the index, like
+    /// `git add` (a path missing from the working tree is removed from the
+    /// index), or with `unstage`, set them back to `HEAD`, like
+    /// `git reset --`. Only the index changes.
+    GitStage {
+        paths: Vec<String>,
+        #[serde(default)]
+        unstage: bool,
+    },
     /// `GET` a credential-free HTTPS URL on the standard port. The host, and
     /// every redirect's, must be one the manifest declares, and every
     /// resolved address must be public. No cookies, credentials or proxies.
