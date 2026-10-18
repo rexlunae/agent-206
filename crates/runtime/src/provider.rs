@@ -732,7 +732,7 @@ pub async fn complete(
             }
         };
         let error = match streamed {
-            Ok(()) => return sink.reply.finish(),
+            Ok(()) => return sink.finish().await,
             Err(error) => error,
         };
         // Once anything arrived the failure is final: a retry would stream
@@ -939,6 +939,18 @@ impl Sink<'_> {
         }
         decoded.map_err(ProviderError::Sse)
     }
+    /// The stream ended: text the markup filter held back is the last delta.
+    async fn finish(mut self) -> Result<Turn> {
+        let held = self.reply.markup.finish();
+        if !held.is_empty() {
+            self.reply.append(&held)?;
+            self.progress
+                .send(crate::backends::Progress::Delta(held))
+                .await
+                .ignore();
+        }
+        self.reply.finish()
+    }
 }
 /// A provider without a credential (a local or SSH-forwarded endpoint).
 async fn stream_direct(
@@ -1042,6 +1054,8 @@ struct StreamedReply {
     /// alone it completes a Gemini one). A tool-call finish counts the same.
     finished: bool,
     calls: crate::tool_calls::Assembler,
+    /// Removes tool-call markup the model wrote as text.
+    markup: crate::markup::Filter,
 }
 impl StreamedReply {
     fn new(api: ProviderApi) -> Self {
@@ -1056,6 +1070,7 @@ impl StreamedReply {
             ended: false,
             finished: false,
             calls: crate::tool_calls::Assembler::default(),
+            markup: crate::markup::Filter::default(),
         }
     }
     /// Apply one event and return the text it appends, if any.
@@ -1240,16 +1255,24 @@ impl StreamedReply {
                 text_parts(parts, "text", true)
             }
         };
-        let Some(delta) = delta.filter(|d| !d.is_empty()) else {
+        let Some(delta) = delta
+            .map(|d| self.markup.feed(&d))
+            .filter(|d| !d.is_empty())
+        else {
             return Ok(None);
         };
-        check(
-            self.text.len() + delta.len() <= MAX_REPLY_TEXT,
-            ProviderError::Malformed("provider message exceeds the conversation limit"),
-        )?;
-        self.text.push_str(&delta);
+        self.append(&delta)?;
         Ok(Some(delta))
     }
+    fn append(&mut self, text: &str) -> Result<()> {
+        check(
+            self.text.len() + text.len() <= MAX_REPLY_TEXT,
+            ProviderError::Malformed("provider message exceeds the conversation limit"),
+        )?;
+        self.text.push_str(text);
+        Ok(())
+    }
+    /// The reply once its stream ended.
     fn finish(self) -> Result<Turn> {
         let complete = match self.api {
             ProviderApi::Anthropic => self.ended,
@@ -1259,6 +1282,20 @@ impl StreamedReply {
             ProviderApi::Gemini => self.finished,
         };
         check(complete, ProviderError::Incomplete)?;
+        let removed = self.markup.removed();
+        if removed > 0 {
+            tracing::warn!(
+                blocks = removed,
+                "removed tool-call markup the model wrote as reply text"
+            );
+        }
+        // What is left around removed markup is usually only whitespace.
+        check(
+            removed == 0 || !self.text.trim().is_empty() || !self.calls.is_empty(),
+            ProviderError::Malformed(
+                "the model wrote its tool call as text instead of calling the tool",
+            ),
+        )?;
         check(
             !self.text.is_empty() || !self.calls.is_empty(),
             ProviderError::Malformed("provider returned no text response"),
