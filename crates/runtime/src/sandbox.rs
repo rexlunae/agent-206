@@ -64,6 +64,14 @@ mod confined {
         pub async fn spawn_self(
             args: impl FnOnce(&Path) -> Vec<std::ffi::OsString>,
         ) -> std::result::Result<Self, ConfineError> {
+            Self::spawn_self_reading(None, args).await
+        }
+        /// Like `spawn_self`, with one explicit read-only source directory.
+        /// No programs, network or other user directories are granted.
+        pub async fn spawn_self_reading(
+            source: Option<&Path>,
+            args: impl FnOnce(&Path) -> Vec<std::ffi::OsString>,
+        ) -> std::result::Result<Self, ConfineError> {
             let scratch = tempfile::Builder::new()
                 .prefix("a206-confined-")
                 .tempdir()
@@ -85,7 +93,7 @@ mod confined {
                 root: &executable,
                 scratch: &root,
                 control: &control,
-                workspace: None,
+                workspace: source.map(|path| (path, false)),
                 execute: false,
                 programs: &[],
                 hidden: &[],

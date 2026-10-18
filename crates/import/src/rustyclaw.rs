@@ -389,7 +389,7 @@ fn count_dir(path: &Path) -> usize {
 /// `vault_exists` is whether this profile already has a vault (`None` when
 /// it could not be checked). Nothing is written.
 pub fn preview(root: &Path, settings: &Settings, vault_exists: Option<bool>) -> Result<Preview> {
-    match std::fs::metadata(root) {
+    match std::fs::symlink_metadata(root) {
         Ok(metadata) if metadata.is_dir() => {}
         Ok(_) => {
             return Err(ImportError::NotDirectory {
@@ -415,7 +415,7 @@ pub fn preview(root: &Path, settings: &Settings, vault_exists: Option<bool>) -> 
             let text = String::from_utf8_lossy(bytes);
             toml::from_str(&text).map_err(|source| ImportError::Config {
                 path: config_path.clone(),
-                source,
+                source: source.into(),
             })?
         }
         None => Config::default(),

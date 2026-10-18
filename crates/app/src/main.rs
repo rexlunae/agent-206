@@ -1268,6 +1268,15 @@ fn main() -> std::process::ExitCode {
             return std::process::ExitCode::FAILURE;
         }
     }
+    if let Some(result) = a206_runtime::imports::dispatch() {
+        return match result {
+            Ok(code) => code,
+            Err(error) => {
+                eprintln!("Agent 206 import reader: {error:#}");
+                std::process::ExitCode::FAILURE
+            }
+        };
+    }
     if let Err(error) = native::run() {
         eprintln!("Agent 206: {error:#}");
         return std::process::ExitCode::FAILURE;

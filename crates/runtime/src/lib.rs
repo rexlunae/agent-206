@@ -13,6 +13,7 @@ pub mod extension_host;
 pub mod extension_list_tool;
 pub mod extension_tools;
 pub mod gateway;
+pub mod imports;
 pub mod instructions;
 pub mod joshua;
 pub mod markup;

@@ -210,6 +210,7 @@ dependencies = [
  "a206-broker",
  "a206-core",
  "a206-extensions",
+ "a206-import",
  "a206-injection-scan",
  "a206-leak-scan",
  "a206-mcp",
