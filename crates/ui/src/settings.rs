@@ -67,6 +67,7 @@ pub fn Providers() -> Element {
             }
         }
         PresetLibrary {}
+        crate::search_services::SearchServices {}
         h2 { "Coding-agent backends" }
         p { class: "a206-muted", "Configure optional Codex or Claude Agent runtimes separately from model providers." }
         for kind in [CodingBackend::Codex, CodingBackend::ClaudeAgent] {

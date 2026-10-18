@@ -573,6 +573,33 @@ listing, the result or the conversation. See
 [messengers.md](messengers.md#webhooks) and
 [posting to chats](messengers.md#posting-to-chats).
 
+## Web search (`web_search`)
+
+`runtime/src/search_tool.rs` offers `web_search`, after RustyClaw's tool of
+the same name, while the user has a search service in
+`Settings::search_services` (`a206_core::web_search`): Brave Search or Exa, a
+name, an endpoint (the service's official one unless the user changes it) and
+the vault credential holding its key. The tool declares
+`Capability::Network`, so a conversation needs the network grant (Research
+mode, or `backend select … native --network`) and, like every tool, must
+permit it; calls are not approved one by one. Arguments are `query` (at most
+400 characters), `count` (1 to 10, default 5), `service` (by name; the first
+service otherwise), and per service `freshness` and `country` (Brave) or
+`type` and `category` (Exa). An option the chosen service does not support is
+refused rather than dropped, unlike RustyClaw's silent per-provider clamping.
+The gateway builds the request and the broker attaches the key for the bound
+origin: `X-Subscription-Token` with `Accept: application/json` for Brave
+(`AuthScheme::SubscriptionToken`, broker v13) and `x-api-key` for Exa. The
+result is JSON with the service, the query and up to `count` results: title,
+URL, a snippet (Brave, tags removed) or up to 4,000 characters of page text
+(Exa), and the date and author when the service reports them. A refused key
+(HTTP 401 or 403) fails the call as permission denied, 429 as rate limited.
+Results pass through the same credential redaction and injection scan as every
+tool result. The gateway never holds the key, so it cannot reach the
+listing, the result or the conversation. RustyClaw read the keys from `BRAVE_API_KEY` and
+`EXA_API_KEY`; they are not imported, since environment variables are not
+part of its stored configuration.
+
 ## Output rules
 
 Before a tool result reaches the model, the run engine passes it through the

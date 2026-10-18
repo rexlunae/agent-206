@@ -15,6 +15,7 @@ pub mod prompts;
 pub mod search;
 pub mod teams;
 pub mod tools;
+pub mod web_search;
 pub use audit::{AuditBuilder, AuditField, AuditFinding, AuditLocation, AuditReport, AuditRule};
 pub use error::{ErrorKind, ErrorReport};
 pub use ignore::Ignore;
@@ -298,6 +299,9 @@ pub struct Settings {
     pub messengers: Vec<MessengerConfig>,
     #[serde(default)]
     pub mcp_servers: Vec<McpServerConfig>,
+    /// Web search services the native `web_search` tool may query.
+    #[serde(default)]
+    pub search_services: Vec<web_search::SearchConfig>,
     /// Enabled skills by name, each pinned to the SHA-256 of the `SKILL.md`
     /// the user approved. Any edit to a skill disables it until re-approved.
     #[serde(default)]
@@ -322,6 +326,7 @@ impl Default for Settings {
             backends: vec![],
             messengers: vec![],
             mcp_servers: vec![],
+            search_services: vec![],
             enabled_skills: Default::default(),
             program_directories: vec![],
             prompts: Mode::ALL
