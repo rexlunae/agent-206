@@ -345,6 +345,15 @@ pub enum RepairError {
         #[source]
         source: std::io::Error,
     },
+    #[error(
+        "{} cannot be read by its owner and /proc is not mounted, so its permissions could not be changed safely; remove group and other access by hand",
+        path.display()
+    )]
+    NeedsProcfs {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("could not reach the gateway")]
     Gateway(#[source] crate::control::ControlError),
     #[error("the gateway refused the request")]
@@ -435,10 +444,40 @@ enum Pinned {
 /// Change the mode of `path` itself, never a final link's target, so a link
 /// swapped in after the check cannot redirect the change. `decide` sees the
 /// mode of the entry that will change and returns its new mode, if any.
-/// Neither variant needs read access: an owner may change the mode of a file
-/// it cannot read.
-#[cfg(target_os = "linux")]
+/// A readable entry is changed through its own descriptor; one its owner
+/// cannot read (the owner may still change its mode) takes [`unreadable`].
+#[cfg(unix)]
 fn pinned_chmod(
+    path: &Path,
+    directory: bool,
+    opened: impl FnOnce(rustix::io::Errno) -> RepairError,
+    decide: impl FnOnce(u32) -> Result<Option<rustix::fs::Mode>, RepairError>,
+) -> Result<(), Pinned> {
+    use rustix::fs::{Mode, OFlags};
+    // NONBLOCK keeps a FIFO put in its place from stalling the open.
+    let mut flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+    if directory {
+        flags |= OFlags::DIRECTORY;
+    }
+    match rustix::fs::open(path, flags, Mode::empty()) {
+        Ok(fd) => {
+            let stat = rustix::fs::fstat(&fd).map_err(Pinned::Change)?;
+            match decide(stat.st_mode).map_err(Pinned::Open)? {
+                Some(mode) => rustix::fs::fchmod(&fd, mode).map_err(Pinned::Change),
+                None => Ok(()),
+            }
+        }
+        Err(rustix::io::Errno::ACCESS) => unreadable(path, directory, opened, decide),
+        Err(error) => Err(Pinned::Open(opened(error))),
+    }
+}
+
+/// Pin the entry with O_PATH, which needs no read access, and change it
+/// through its /proc descriptor link (fchmod refuses an O_PATH descriptor).
+/// That link names the same inode and no other process can replace it.
+/// Without procfs the repair fails with [`RepairError::NeedsProcfs`].
+#[cfg(target_os = "linux")]
+fn unreadable(
     path: &Path,
     directory: bool,
     opened: impl FnOnce(rustix::io::Errno) -> RepairError,
@@ -455,47 +494,34 @@ fn pinned_chmod(
     let Some(mode) = decide(stat.st_mode).map_err(Pinned::Open)? else {
         return Ok(());
     };
-    // fchmod refuses an O_PATH descriptor; its /proc link names the same
-    // inode, and no other process can replace it.
-    rustix::fs::chmod(format!("/proc/self/fd/{}", fd.as_raw_fd()), mode).map_err(Pinned::Change)
+    match rustix::fs::chmod(format!("/proc/self/fd/{}", fd.as_raw_fd()), mode) {
+        Err(rustix::io::Errno::NOENT) => Err(Pinned::Open(RepairError::NeedsProcfs {
+            path: path.to_owned(),
+            source: rustix::io::Errno::NOENT.into(),
+        })),
+        result => result.map_err(Pinned::Change),
+    }
 }
 
+/// Check the entry, then change it by name without following a final link
+/// (a link swapped in changes only the link's own mode).
 #[cfg(all(unix, not(target_os = "linux")))]
-fn pinned_chmod(
+fn unreadable(
     path: &Path,
-    directory: bool,
+    _directory: bool,
     opened: impl FnOnce(rustix::io::Errno) -> RepairError,
     decide: impl FnOnce(u32) -> Result<Option<rustix::fs::Mode>, RepairError>,
 ) -> Result<(), Pinned> {
-    use rustix::fs::{AtFlags, CWD, FileType, Mode, OFlags};
-    // NONBLOCK keeps a FIFO put in its place from stalling the open.
-    let mut flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
-    if directory {
-        flags |= OFlags::DIRECTORY;
+    use rustix::fs::{AtFlags, CWD, FileType};
+    let stat = rustix::fs::lstat(path).map_err(Pinned::Change)?;
+    if FileType::from_raw_mode(stat.st_mode) == FileType::Symlink {
+        return Err(Pinned::Open(opened(rustix::io::Errno::LOOP)));
     }
-    match rustix::fs::open(path, flags, Mode::empty()) {
-        Ok(fd) => {
-            let stat = rustix::fs::fstat(&fd).map_err(Pinned::Change)?;
-            match decide(stat.st_mode).map_err(Pinned::Open)? {
-                Some(mode) => rustix::fs::fchmod(&fd, mode).map_err(Pinned::Change),
-                None => Ok(()),
-            }
+    match decide(stat.st_mode).map_err(Pinned::Open)? {
+        Some(mode) => {
+            rustix::fs::chmodat(CWD, path, mode, AtFlags::SYMLINK_NOFOLLOW).map_err(Pinned::Change)
         }
-        // Unreadable to its owner: check the entry, then change it by name
-        // without following a final link (a link swapped in changes only
-        // the link's own mode).
-        Err(rustix::io::Errno::ACCESS) => {
-            let stat = rustix::fs::lstat(path).map_err(Pinned::Change)?;
-            if FileType::from_raw_mode(stat.st_mode) == FileType::Symlink {
-                return Err(Pinned::Open(opened(rustix::io::Errno::LOOP)));
-            }
-            match decide(stat.st_mode).map_err(Pinned::Open)? {
-                Some(mode) => rustix::fs::chmodat(CWD, path, mode, AtFlags::SYMLINK_NOFOLLOW)
-                    .map_err(Pinned::Change),
-                None => Ok(()),
-            }
-        }
-        Err(error) => Err(Pinned::Open(opened(error))),
+        None => Ok(()),
     }
 }
 
