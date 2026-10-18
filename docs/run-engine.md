@@ -19,7 +19,18 @@ tool calls, a budget is used up, or the user cancels:
 3. Record the calls on the assistant message. Argument text is parsed; a code fence
    or surrounding prose and trailing commas are repaired (`healed`), truncated or
    non-object arguments fail that call, and an identical call later in the same
-   response is `Skipped`. Missing or repeated provider call IDs are replaced.
+   response is `Skipped`. A top-level value whose tool schema declares another
+   scalar type is converted when the conversion is exact (a number or boolean
+   to a string, `"7"` to an integer, `"0.5"` to a number, `"true"`/`"false"`
+   to a boolean); that also marks the call `healed`, and the converted text is
+   what approvals bind to. Anything else is left for the tool to report. When
+   the model requests the same call (tool and argument text) five or more
+   times in a row, across rounds and whatever became of the earlier requests
+   (denied, invalid or run), the call records the run length (`repeated`), the
+   trace shows it, and the result the model reads starts with a note that
+   requesting it again will not change an unchanging result; the call still runs,
+   since polling a process or rerunning tests repeats legitimately. Missing or
+   repeated provider call IDs are replaced.
    Calls are recorded in order while their arguments fit in the conversation's
    remaining storage, keeping a reserve for settling this response's calls and
    for the next round (the longest reply the provider path accepts, its metadata
@@ -729,8 +740,7 @@ and unit tests in `retry.rs`.
 
 ## Not implemented
 
-Schema type coercion and repeat-call warnings from RustyClaw's healing;
-running a tool call that was written as text; Anthropic thinking-block replay alongside tool results;
+Converting nested argument values or union types; running a tool call that was written as text; Anthropic thinking-block replay alongside tool results;
 parallel tool execution; RustyClaw's project-layer output rules
 (`<workspace>/.tokenjuice/rules/`) and a way to list or edit output rules from
 the GUI or CLI; credential scanning of instruction files, attachments and

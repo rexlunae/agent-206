@@ -357,13 +357,15 @@ async fn argument_errors_return_to_the_model_as_typed_failures() {
     rig.permit(ToolPermission::Allow).await;
     let unknown = nonce();
     let calls = [
-        Call::new(&rig.tool, json!({"path": 7})),
+        // A number where a string is declared would be converted.
+        Call::new(&rig.tool, json!({"path": [7]})),
         Call::new(
             &rig.tool,
             json!({"path": rig.file.0, unknown.clone(): true}),
         ),
         Call::new(&rig.tool, json!({})),
-        Call::new(&rig.tool, json!({"path": u64::MAX})),
+        // Nested, so it is not converted to the declared string first.
+        Call::new(&rig.tool, json!({"path": [u64::MAX]})),
     ];
     let (thread, results) = rig.round_trip(&calls).await;
     assert_eq!(thread.state, RunState::Complete, "{:?}", thread.error);
