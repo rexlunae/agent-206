@@ -185,8 +185,10 @@ fn add_usage(total: Usage, round: &Usage) -> Usage {
 /// call stores a short report) and for a failure report.
 const SETTLEMENT: usize = 128 * 1024;
 /// Snapshot bytes that must be free to start a round: the longest reply the
-/// provider accepts, its metadata and the settlement of its calls.
-pub(super) const NEXT_ROUND: usize = provider::MAX_REPLY_TEXT + SETTLEMENT;
+/// provider accepts, the reasoning streamed beside it, its metadata and the
+/// settlement of its calls.
+pub(super) const NEXT_ROUND: usize =
+    provider::MAX_REPLY_TEXT + provider::MAX_REASONING_TEXT + SETTLEMENT;
 /// Snapshot bytes a response's call arguments and outputs never use: the
 /// settlement of those calls, then the next round. Recording calls therefore
 /// never stops the run from storing the model's next reply.
@@ -765,7 +767,11 @@ impl Gateway {
         }
         let result = match result {
             Some(Ok(turn)) => {
-                let message = partial.finish(thread, turn.text.clone());
+                let message = partial.finish(
+                    thread,
+                    turn.text.clone(),
+                    Some((turn.reasoning.clone(), turn.reasoning_shortened)),
+                );
                 Some(Ok((turn, message)))
             }
             Some(Err(error)) => {
