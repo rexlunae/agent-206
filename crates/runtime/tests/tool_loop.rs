@@ -1832,7 +1832,7 @@ async fn arguments_take_their_declared_types_and_repeats_are_reported() {
     let mut ids = vec![];
     // The model sends a string for the integer and a number for the string,
     // the same way each round.
-    let threshold = a206_runtime::tool_calls::REPEAT_THRESHOLD as usize;
+    let threshold = 5; // docs/run-engine.md: reported from the fifth request in a row
     let mut request = rig.next_request().await;
     for round in 0..threshold {
         let call = Call::new(&name, json!({"count": count.to_string(), "label": count}));
@@ -1852,7 +1852,10 @@ async fn arguments_take_their_declared_types_and_repeats_are_reported() {
         let noted = seen.contains("times in a row");
         assert_eq!(noted, round + 1 == threshold, "round {round}: {seen}");
         if noted {
-            assert!(seen.contains(&format!("made {threshold} times")), "{seen}");
+            assert!(
+                seen.contains(&format!("requested {threshold} times")),
+                "{seen}"
+            );
         }
     }
     request.respond(text_response(api, &nonce())).await;

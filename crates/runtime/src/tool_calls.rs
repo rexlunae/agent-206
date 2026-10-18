@@ -321,12 +321,7 @@ fn convert(declared: &str, value: &Value) -> Option<Value> {
             .parse::<i64>()
             .ok()
             .map(|n| Value::Number(n.into())),
-        ("number", Value::String(text)) => text
-            .trim()
-            .parse::<f64>()
-            .ok()
-            .and_then(serde_json::Number::from_f64)
-            .map(Value::Number),
+        ("number", Value::String(text)) => exact_number(text.trim()).map(Value::Number),
         ("boolean", Value::String(text)) => match text.trim() {
             "true" => Some(Value::Bool(true)),
             "false" => Some(Value::Bool(false)),
@@ -336,14 +331,50 @@ fn convert(declared: &str, value: &Value) -> Option<Value> {
     }
 }
 
+/// A plain decimal (`-12`, `0.5`) as the JSON number with exactly its value:
+/// an integer that fits, or a float whose shortest form is the same decimal.
+/// Exponents, and values a float would round or lose, are left alone.
+fn exact_number(text: &str) -> Option<serde_json::Number> {
+    let digits = text.strip_prefix('-').unwrap_or(text);
+    let (whole, fraction) = digits.split_once('.').unwrap_or((digits, ""));
+    let plain = !whole.is_empty()
+        && whole.bytes().all(|b| b.is_ascii_digit())
+        && fraction.bytes().all(|b| b.is_ascii_digit())
+        && (digits.len() == whole.len() || !fraction.is_empty());
+    if !plain {
+        return None;
+    }
+    if fraction.is_empty()
+        && let Ok(integer) = text.parse::<i64>()
+    {
+        return Some(integer.into());
+    }
+    let float = text.parse::<f64>().ok()?;
+    // The decimal without leading zeros of the whole part or trailing zeros
+    // of the fraction, as Rust writes a float's shortest form.
+    let whole = whole.trim_start_matches('0');
+    let whole = if whole.is_empty() { "0" } else { whole };
+    let fraction = fraction.trim_end_matches('0');
+    let sign = if text.starts_with('-') { "-" } else { "" };
+    let normal = if fraction.is_empty() {
+        format!("{sign}{whole}")
+    } else {
+        format!("{sign}{whole}.{fraction}")
+    };
+    (float.to_string() == normal)
+        .then(|| serde_json::Number::from_f64(float))
+        .flatten()
+}
+
 /// Consecutive identical calls at which [`Repeats::observe`] starts
 /// reporting them.
 pub const REPEAT_THRESHOLD: u32 = 5;
 
-/// Counts consecutive identical calls (same tool, same argument text)
-/// across the rounds of one run. A call that keeps repeating with the same
-/// result is reported to the model, never blocked: polling a process or
-/// rerunning tests repeats legitimately.
+/// Counts consecutive identical call requests (same tool, same argument
+/// text) across the rounds of one run, whether or not they ran: any other
+/// request in between ends the streak. A request that keeps repeating is
+/// reported to the model, never blocked: polling a process or rerunning
+/// tests repeats legitimately.
 #[derive(Debug, Default)]
 pub struct Repeats {
     last: Option<String>,
@@ -406,6 +437,14 @@ mod tests {
         // are and are not marked healed.
         for raw in [
             json!({"line": "several", "ratio": "NaN", "deep": "yes"}),
+            // A float would round these: past i64 and 2^53, and below the
+            // smallest subnormal.
+            json!({"ratio": "99999999999999999999"}),
+            json!({"ratio": "9007199254740993.5"}),
+            json!({"ratio": format!("0.{}1", "0".repeat(400))}),
+            json!({"ratio": "1e3"}),
+            json!({"ratio": ".5"}),
+            json!({"ratio": "5."}),
             json!({"line": "1.5"}),
             json!({"path": "a", "line": 3, "deep": false}),
         ] {
@@ -417,6 +456,18 @@ mod tests {
         let healed = parse_arguments(r#"{"line": 1,}"#).unwrap();
         assert!(coerce(healed.clone(), &schema).healed);
         assert_eq!(coerce(healed.clone(), &json!({})), healed);
+    }
+    #[test]
+    fn plain_decimals_convert_to_numbers_with_the_same_value() {
+        for (text, value) in [
+            ("-12", json!(-12)),
+            ("0.5", json!(0.5)),
+            ("007.250", json!(7.25)),
+            ("9007199254740993", json!(9007199254740993_i64)),
+            ("-0.0", json!(-0.0)),
+        ] {
+            assert_eq!(exact_number(text).map(Value::Number), Some(value), "{text}");
+        }
     }
     #[test]
     fn repeats_are_reported_from_the_threshold_and_reset_by_another_call() {

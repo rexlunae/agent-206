@@ -24,10 +24,11 @@ tool calls, a budget is used up, or the user cancels:
    to a string, `"7"` to an integer, `"0.5"` to a number, `"true"`/`"false"`
    to a boolean); that also marks the call `healed`, and the converted text is
    what approvals bind to. Anything else is left for the tool to report. When
-   the run makes the same call (tool and argument text) five or more times in
-   a row, across rounds, the call records the run length (`repeated`), the
-   trace shows it, and the result the model reads ends with a note that
-   calling again will not change an unchanging result; the call still runs,
+   the model requests the same call (tool and argument text) five or more
+   times in a row, across rounds and whatever became of the earlier requests
+   (denied, invalid or run), the call records the run length (`repeated`), the
+   trace shows it, and the result the model reads starts with a note that
+   requesting it again will not change an unchanging result; the call still runs,
    since polling a process or rerunning tests repeats legitimately. Missing or
    repeated provider call IDs are replaced.
    Calls are recorded in order while their arguments fit in the conversation's

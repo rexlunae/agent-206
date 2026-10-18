@@ -804,8 +804,8 @@ pub(crate) fn history(thread: &Thread) -> Vec<std::borrow::Cow<'_, Message>> {
     out
 }
 /// The text a model receives as one call's result. A result holding text
-/// that reads as instructions to the model starts with a note saying so,
-/// and a call the run keeps repeating ends with one.
+/// that reads as instructions to the model, or from a call the run keeps
+/// requesting, starts with a note saying so.
 pub(crate) fn tool_result(call: &ToolCall) -> std::borrow::Cow<'_, str> {
     let output = call
         .output
@@ -814,7 +814,17 @@ pub(crate) fn tool_result(call: &ToolCall) -> std::borrow::Cow<'_, str> {
     if call.injection.is_empty() && call.repeated.is_none() {
         return std::borrow::Cow::Borrowed(output);
     }
+    // Notes go first, so a summary that keeps only a result's start keeps
+    // them.
     let mut text = String::new();
+    if let Some(count) = call.repeated {
+        text.push_str(&format!(
+            "[Agent 206 note: this exact `{}` call has now been requested {count} times in a row \
+             with identical arguments. If its result is not changing, requesting it again will \
+             not change it: change the arguments or do something else.]\n\n",
+            call.tool,
+        ));
+    }
     if !call.injection.is_empty() {
         let kinds: Vec<&str> = call
             .injection
@@ -829,14 +839,6 @@ pub(crate) fn tool_result(call: &ToolCall) -> std::borrow::Cow<'_, str> {
         ));
     }
     text.push_str(output);
-    if let Some(count) = call.repeated {
-        text.push_str(&format!(
-            "\n\n[Agent 206 note: this exact `{}` call has now been made {count} times in a row \
-             with identical arguments. If its result is not changing, calling it again will not \
-             change it: change the arguments or do something else.]",
-            call.tool,
-        ));
-    }
     std::borrow::Cow::Owned(text)
 }
 /// The field that carries a call's argument text when the model sent

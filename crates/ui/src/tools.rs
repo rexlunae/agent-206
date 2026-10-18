@@ -50,7 +50,7 @@ pub(crate) fn ToolTrace(call: ToolCall) -> Element {
             p { class: "a206-muted", {injection_note(&call.injection)} }
         }
         if let Some(count) = call.repeated {
-            p { class: "a206-muted", "The same call, with the same arguments, {count} times in a row; the model was told." }
+            p { class: "a206-muted", "Requested the same way {count} times in a row; the model was told." }
         }
         if let Some(reduction) = call.reduction.as_ref() {
             p { class: "a206-muted", {reduction_note(reduction)} }
@@ -366,7 +366,7 @@ mod tests {
         let html = render(repeated);
         assert!(
             html.contains(&format!(
-                "The same call, with the same arguments, {count} times in a row; the model was told."
+                "Requested the same way {count} times in a row; the model was told."
             )),
             "{html}"
         );

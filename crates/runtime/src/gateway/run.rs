@@ -801,7 +801,8 @@ impl Gateway {
     /// unusable or that repeat an earlier call are settled here; the rest are
     /// returned with their arguments, in order, for a decision.
     /// Arguments are converted to the scalar types the tool declares, and
-    /// a call repeating the run's previous calls is counted.
+    /// every call requested is counted against the run's streak of identical
+    /// requests.
     fn record_calls(
         &self,
         id: Id,
@@ -846,6 +847,12 @@ impl Gateway {
                 injection: Vec::new(),
                 repeated: None,
             };
+            let duplicate = !seen_calls.insert(record.digest.clone());
+            // The streak counts requests, whatever becomes of them; a
+            // duplicate in the same response is the same request.
+            if !duplicate {
+                record.repeated = repeats.observe(&record.digest);
+            }
             let usable = match parsed {
                 Err(error) => {
                     settle(
@@ -855,14 +862,11 @@ impl Gateway {
                     );
                     None
                 }
-                Ok(_) if !seen_calls.insert(record.digest.clone()) => {
+                Ok(_) if duplicate => {
                     settle(&mut record, ToolCallState::Skipped, &ToolError::Duplicate);
                     None
                 }
-                Ok(arguments) => {
-                    record.repeated = repeats.observe(&record.digest);
-                    Some(arguments)
-                }
+                Ok(arguments) => Some(arguments),
             };
             decisions.push((id, usable));
             records.push(record);
