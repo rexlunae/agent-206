@@ -395,42 +395,108 @@ pub async fn repair(
 
 #[cfg(unix)]
 fn restrict(path: &Path, directory: bool) -> Result<(), RepairError> {
-    use rustix::fs::{FileType, Mode, OFlags};
     let failed = |source: rustix::io::Errno| RepairError::Permissions {
         path: path.to_owned(),
         source: source.into(),
     };
-    let not_plain = || RepairError::NotPlain {
-        path: path.to_owned(),
+    let opened = |error| match error {
+        rustix::io::Errno::LOOP | rustix::io::Errno::NOTDIR => RepairError::NotPlain {
+            path: path.to_owned(),
+        },
+        error => failed(error),
     };
-    // Change the mode through a descriptor opened without following a final
-    // link, so a link swapped in after the check cannot redirect the change.
+    pinned_chmod(path, directory, opened, |st_mode| {
+        use rustix::fs::{FileType, Mode};
+        let expected = if directory {
+            FileType::Directory
+        } else {
+            FileType::RegularFile
+        };
+        if FileType::from_raw_mode(st_mode) != expected {
+            return Err(RepairError::NotPlain {
+                path: path.to_owned(),
+            });
+        }
+        let mode = Mode::from_raw_mode(st_mode).bits() & 0o7777;
+        Ok((mode & 0o077 != 0).then(|| Mode::from_raw_mode(mode & !0o077)))
+    })
+    .map_err(|error| match error {
+        Pinned::Open(error) => error,
+        Pinned::Change(error) => failed(error),
+    })
+}
+
+#[cfg(unix)]
+enum Pinned {
+    Open(RepairError),
+    Change(rustix::io::Errno),
+}
+
+/// Change the mode of `path` itself, never a final link's target, so a link
+/// swapped in after the check cannot redirect the change. `decide` sees the
+/// mode of the entry that will change and returns its new mode, if any.
+/// Neither variant needs read access: an owner may change the mode of a file
+/// it cannot read.
+#[cfg(target_os = "linux")]
+fn pinned_chmod(
+    path: &Path,
+    directory: bool,
+    opened: impl FnOnce(rustix::io::Errno) -> RepairError,
+    decide: impl FnOnce(u32) -> Result<Option<rustix::fs::Mode>, RepairError>,
+) -> Result<(), Pinned> {
+    use rustix::fs::{Mode, OFlags};
+    use std::os::fd::AsRawFd;
+    let mut flags = OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    if directory {
+        flags |= OFlags::DIRECTORY;
+    }
+    let fd = rustix::fs::open(path, flags, Mode::empty()).map_err(|e| Pinned::Open(opened(e)))?;
+    let stat = rustix::fs::fstat(&fd).map_err(Pinned::Change)?;
+    let Some(mode) = decide(stat.st_mode).map_err(Pinned::Open)? else {
+        return Ok(());
+    };
+    // fchmod refuses an O_PATH descriptor; its /proc link names the same
+    // inode, and no other process can replace it.
+    rustix::fs::chmod(format!("/proc/self/fd/{}", fd.as_raw_fd()), mode).map_err(Pinned::Change)
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn pinned_chmod(
+    path: &Path,
+    directory: bool,
+    opened: impl FnOnce(rustix::io::Errno) -> RepairError,
+    decide: impl FnOnce(u32) -> Result<Option<rustix::fs::Mode>, RepairError>,
+) -> Result<(), Pinned> {
+    use rustix::fs::{AtFlags, CWD, FileType, Mode, OFlags};
     // NONBLOCK keeps a FIFO put in its place from stalling the open.
     let mut flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
     if directory {
         flags |= OFlags::DIRECTORY;
     }
-    let fd = match rustix::fs::open(path, flags, Mode::empty()) {
-        Ok(fd) => fd,
-        Err(rustix::io::Errno::LOOP | rustix::io::Errno::NOTDIR) => return Err(not_plain()),
-        Err(error) => return Err(failed(error)),
-    };
-    let stat = rustix::fs::fstat(&fd).map_err(failed)?;
-    let kind = FileType::from_raw_mode(stat.st_mode);
-    if kind
-        != if directory {
-            FileType::Directory
-        } else {
-            FileType::RegularFile
+    match rustix::fs::open(path, flags, Mode::empty()) {
+        Ok(fd) => {
+            let stat = rustix::fs::fstat(&fd).map_err(Pinned::Change)?;
+            match decide(stat.st_mode).map_err(Pinned::Open)? {
+                Some(mode) => rustix::fs::fchmod(&fd, mode).map_err(Pinned::Change),
+                None => Ok(()),
+            }
         }
-    {
-        return Err(not_plain());
+        // Unreadable to its owner: check the entry, then change it by name
+        // without following a final link (a link swapped in changes only
+        // the link's own mode).
+        Err(rustix::io::Errno::ACCESS) => {
+            let stat = rustix::fs::lstat(path).map_err(Pinned::Change)?;
+            if FileType::from_raw_mode(stat.st_mode) == FileType::Symlink {
+                return Err(Pinned::Open(opened(rustix::io::Errno::LOOP)));
+            }
+            match decide(stat.st_mode).map_err(Pinned::Open)? {
+                Some(mode) => rustix::fs::chmodat(CWD, path, mode, AtFlags::SYMLINK_NOFOLLOW)
+                    .map_err(Pinned::Change),
+                None => Ok(()),
+            }
+        }
+        Err(error) => Err(Pinned::Open(opened(error))),
     }
-    let mode = Mode::from_raw_mode(stat.st_mode).bits() & 0o7777;
-    if mode & 0o077 == 0 {
-        return Ok(());
-    }
-    rustix::fs::fchmod(&fd, Mode::from_raw_mode(mode & !0o077)).map_err(failed)
 }
 
 #[cfg(not(unix))]
@@ -1099,6 +1165,37 @@ mod tests {
             Err(RepairError::NotPlain { .. })
         ));
         assert_eq!(mode(&elsewhere), 0o644);
+    }
+
+    #[tokio::test]
+    async fn permission_repairs_need_no_read_access_from_the_owner() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        let set = |path: &Path, mode| {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap()
+        };
+        let root = tempfile::tempdir().unwrap();
+        let profile = root.path().join(random());
+        let vault = a206_broker::vault_path(&profile);
+        std::fs::create_dir_all(vault.parent().unwrap()).unwrap();
+        std::fs::write(&vault, random()).unwrap();
+        set(&vault, 0o066);
+        let fix = Repair::RestrictVault {
+            path: vault.clone(),
+            mode: 0o066,
+        };
+        repair(&profile, None, &fix).await.unwrap();
+        assert_eq!(mode(&vault), 0o000);
+        set(&vault, 0o600);
+        let directory = vault.parent().unwrap().to_owned();
+        set(&directory, 0o355);
+        let fix = Repair::RestrictVaultDirectory {
+            path: directory.clone(),
+            mode: 0o355,
+        };
+        repair(&profile, None, &fix).await.unwrap();
+        assert_eq!(mode(&directory), 0o300);
+        set(&directory, 0o700);
     }
 
     #[tokio::test]
