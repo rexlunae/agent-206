@@ -65,9 +65,11 @@ pub(crate) struct Signal {
     /// redelivery is answered at least once rather than never.
     returned: Vec<String>,
     failed: std::sync::atomic::AtomicBool,
-    /// The listener of a session that ended, still holding messages it
-    /// queued before its connection closed.
-    ended: Option<Listener>,
+    /// Listeners of sessions that ended, oldest first, still holding
+    /// messages they queued before their connections closed. A replacement
+    /// session can end before the older ones are drained, so none replaces
+    /// another.
+    ended: VecDeque<Listener>,
 }
 
 struct Session {
@@ -95,7 +97,7 @@ impl Signal {
             recent: Arc::default(),
             returned: Vec::new(),
             failed: std::sync::atomic::AtomicBool::new(false),
-            ended: None,
+            ended: VecDeque::new(),
         }
     }
 
@@ -112,7 +114,7 @@ impl Signal {
             .is_some_and(|session| session.outgoing.is_closed())
             && let Some(ended) = self.session.take()
         {
-            self.ended = Some(ended.listener);
+            self.ended.push_back(ended.listener);
         }
         if let Some(session) = &self.session {
             return Ok(session.account.clone());
@@ -172,11 +174,11 @@ impl Signal {
                 recent.insert(&key);
             }
         }
-        if let Some(ended) = self.ended.as_mut() {
+        while let Some(ended) = self.ended.front_mut() {
             match ended.receive().await {
                 Ok(batch) => return Ok(self.unhandled(batch)),
                 // Drained; its failure was the reason for reconnecting.
-                Err(_) => self.ended = None,
+                Err(_) => drop(self.ended.pop_front()),
             }
         }
         let Some(session) = self.session.as_mut() else {
@@ -808,5 +810,68 @@ mod tests {
         // A credential across the cut is removed whole, not cut to a prefix.
         let straddling = refusal_text(&format!("{} {token}", "x".repeat(MAX_REFUSAL - 10)));
         assert!(!straddling.contains("ghp_"), "{straddling}");
+    }
+
+    /// A session that ended with `count` messages queued.
+    fn ended_session(login: &str, count: usize) -> (Session, Vec<String>) {
+        let messages: Vec<_> = (0..count)
+            .map(|_| {
+                let params = json!({
+                    "account": login,
+                    "envelope": {
+                        "sourceUuid": aci(),
+                        "timestamp": 1,
+                        "dataMessage": { "message": aci() },
+                    }
+                });
+                received(&params, login).unwrap()
+            })
+            .collect();
+        let keys = messages.iter().map(|(key, _)| key.clone()).collect();
+        let listener = Listener::start(SERVICE, login.to_owned(), move |queue| async move {
+            for (key, event) in messages {
+                if let Err(error) = queue.push(key, event) {
+                    return error;
+                }
+            }
+            MessengerError::SocketEnded { service: SERVICE }
+        });
+        let (outgoing, requests) = mpsc::channel(1);
+        drop(requests);
+        let account = Account {
+            id: login.to_owned(),
+            name: None,
+        };
+        let session = Session {
+            listener,
+            outgoing,
+            account,
+        };
+        (session, keys)
+    }
+
+    #[tokio::test]
+    async fn sessions_ending_one_after_another_keep_every_queued_message() {
+        let login = "+15550000001";
+        let mut signal = Signal::new(None, Some(login.to_owned()));
+        // More than one batch, so the first session is still being drained
+        // when its replacement ends too.
+        let (first, mut expected) = ended_session(login, 65);
+        let (second, rest) = ended_session(login, 3);
+        expected.extend(rest);
+        let mut answered = Vec::new();
+
+        signal.session = Some(first);
+        // There is no daemon to reconnect to; the ended session is kept.
+        assert!(signal.connect().await.is_err());
+        let batch = signal.receive(None).await.unwrap();
+        answered.extend(batch.events.into_iter().map(|(key, _)| key));
+
+        signal.session = Some(second);
+        assert!(signal.connect().await.is_err());
+        while let Ok(batch) = signal.receive(None).await {
+            answered.extend(batch.events.into_iter().map(|(key, _)| key));
+        }
+        assert_eq!(answered, expected);
     }
 }
