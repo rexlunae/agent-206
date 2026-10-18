@@ -114,3 +114,40 @@ fn the_subagent_tools_do_not_keep_a_closed_gateway_alive() {
         "tool hosts outlived the gateway"
     );
 }
+
+#[test]
+fn a_coordinator_is_offered_its_recorded_members_even_without_their_files() {
+    let member = a206_core::TeamMember {
+        profile: name(),
+        name: name(),
+        description: Some(name()),
+    };
+    let mut coordinator = caller(None, &[key(Id::new_v4(), &name())]);
+    coordinator.team = Some(Box::new(a206_core::ThreadTeam {
+        id: name(),
+        name: name(),
+        digest: String::new(),
+        instructions: String::new(),
+        role: a206_core::TeamRole::Coordinator,
+        coordinator: member.clone(),
+        members: vec![member.clone()],
+    }));
+    let specs = DelegationHost::specs(&coordinator, &AgentProfiles::default());
+    let spawn = specs.iter().find(|s| s.name == SPAWN).unwrap();
+    let profile = &spawn.parameters["properties"]["profile"];
+    assert_eq!(profile["enum"], json!([member.profile]));
+    assert!(
+        profile["description"]
+            .as_str()
+            .unwrap()
+            .contains(&member.name)
+    );
+    assert_eq!(spawn.parameters["required"], json!(["task", "profile"]));
+
+    // Outside a team, the profile is optional and offered only when listed.
+    let plain = caller(None, &[key(Id::new_v4(), &name())]);
+    let specs = DelegationHost::specs(&plain, &AgentProfiles::default());
+    let spawn = specs.iter().find(|s| s.name == SPAWN).unwrap();
+    assert!(spawn.parameters["properties"].get("profile").is_none());
+    assert_eq!(spawn.parameters["required"], json!(["task"]));
+}

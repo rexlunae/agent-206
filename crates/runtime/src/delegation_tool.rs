@@ -19,7 +19,7 @@ use crate::{
     tools::{self, ToolHost, ToolListing, ToolOutput, ToolRequest, ToolScope, ToolSpec},
 };
 use a206_core::{
-    AgentProfile, AgentProfiles, Capability, ErrorKind, ErrorReport, Id, Mode, ModelKey, RunState,
+    AgentProfiles, Capability, ErrorKind, ErrorReport, Id, Mode, ModelKey, RunState,
     ToolPermission, UnavailableTools,
 };
 use futures_util::future::BoxFuture;
@@ -221,14 +221,23 @@ impl DelegationHost {
     }
 
     fn specs(caller: &Caller, profiles: &AgentProfiles) -> Vec<ToolSpec> {
-        // A coordinator is offered only its team's member profiles, and must
-        // name one; the gateway refuses any other.
+        // A coordinator is offered its team's member profiles as recorded
+        // when the team started, so the declaration stays whole if a file
+        // goes; it must name one, and the gateway refuses any other or one
+        // that can no longer be read.
         let team = caller.team.as_ref().filter(|_| caller.coordinates());
-        let offered: Vec<&AgentProfile> = profiles
-            .profiles
-            .iter()
-            .filter(|p| team.is_none_or(|t| t.has_member(&p.id)))
-            .collect();
+        let offered: Vec<(&str, &str, Option<&String>)> = match team {
+            Some(team) => team
+                .members
+                .iter()
+                .map(|m| (m.profile.as_str(), m.name.as_str(), m.description.as_ref()))
+                .collect(),
+            None => profiles
+                .profiles
+                .iter()
+                .map(|p| (p.id.as_str(), p.name.as_str(), p.description.as_ref()))
+                .collect(),
+        };
         let thread = json!({"type": "string", "description": "The subagent's ID, as subagent_spawn or subagent_list returned it."});
         let modes: Vec<Value> = Mode::ALL.iter().map(|m| json!(m)).collect();
         let capabilities: Vec<Value> = caller.capabilities.iter().map(|c| json!(c)).collect();
@@ -244,15 +253,15 @@ impl DelegationHost {
             "capabilities": {"type": "array", "items": {"type": "string", "enum": capabilities}, "description": "Capabilities to give it; defaults to all of yours its mode and profile allow."}
         });
         if !offered.is_empty() {
-            let ids: Vec<Value> = offered.iter().map(|p| json!(p.id)).collect();
+            let ids: Vec<Value> = offered.iter().map(|(id, ..)| json!(id)).collect();
             let summaries: Vec<String> = offered
                 .iter()
-                .map(|p| {
-                    let summary = match &p.description {
-                        Some(description) => format!("{}: {description}", p.name),
-                        None => p.name.clone(),
+                .map(|(id, name, description)| {
+                    let summary = match description {
+                        Some(description) => format!("{name}: {description}"),
+                        None => name.to_string(),
                     };
-                    format!("- {}: {}", p.id, truncate(&summary, SUMMARY))
+                    format!("- {id}: {}", truncate(&summary, SUMMARY))
                 })
                 .collect();
             spawn["profile"] = json!({

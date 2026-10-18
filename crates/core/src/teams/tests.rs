@@ -41,7 +41,7 @@ fn a_team_starts_with_its_coordinators_mode_and_a_permitted_model_only() {
     parent.grant.capabilities = [Capability::ReadWorkspace].into();
     let team = team();
     let profiles = AgentProfiles {
-        profiles: vec![profile("lead", Some(&model))],
+        profiles: vec![profile("lead", Some(&model)), profile("member", None)],
         problems: vec![],
     };
     let Some(Command::StartTeam {
@@ -56,15 +56,23 @@ fn a_team_starts_with_its_coordinators_mode_and_a_permitted_model_only() {
         panic!("the team could not start");
     };
     assert_eq!((id, started), (parent.id, team.id.clone()));
-    assert_eq!((mode, chosen), (Mode::Research, model));
+    assert_eq!((mode, chosen), (Mode::Research, model.clone()));
     assert_eq!(requested, parent.grant.capabilities);
 
     // A coordinator naming a model the conversation does not permit, or a
-    // missing coordinator profile, starts nothing.
+    // missing coordinator or member profile, starts nothing.
     let elsewhere = AgentProfiles {
-        profiles: vec![profile("lead", Some(&self::model()))],
+        profiles: vec![
+            profile("lead", Some(&self::model())),
+            profile("member", None),
+        ],
         problems: vec![],
     };
+    let memberless = AgentProfiles {
+        profiles: vec![profile("lead", Some(&model))],
+        problems: vec![],
+    };
+    assert_eq!(start(&team, &parent, &memberless, &[]), None);
     assert_eq!(start(&team, &parent, &elsewhere, &[]), None);
     assert_eq!(start(&team, &parent, &AgentProfiles::default(), &[]), None);
 }
