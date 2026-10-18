@@ -155,13 +155,10 @@ impl MessengerKind {
         matches!(self, Self::Webhook)
     }
     /// Whether the kind can post to one of its allowed chats outside a reply
-    /// in that chat. IRC and Signal send over the receiving session's own
-    /// connection, so only that session can post.
+    /// in that chat: every kind that receives (IRC and Signal post through
+    /// their running session).
     pub fn posts_to_chats(self) -> bool {
-        matches!(
-            self,
-            Self::Telegram | Self::Matrix | Self::Discord | Self::Slack | Self::Beeper
-        )
+        !self.is_send_only()
     }
     /// Whether the kind's endpoint is a signal-cli daemon ([`SignalDaemon`]).
     pub fn is_signal(self) -> bool {

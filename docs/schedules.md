@@ -86,10 +86,10 @@ runs, or when the gateway was stopped before it saw the end).
 ## Posting replies to a messenger
 
 The user can give a job a messenger destination (`Job::deliver_to`): a webhook
-by its name, or an allowed chat of a Telegram, Matrix, Discord, Slack or Beeper
-messenger as `name/chat`, the same destinations the `send_message` tool offers
-(`messengers::post_destinations` lists the configured ones). IRC and Signal are
-not offered: they post only over their receiving session. `SetJobDelivery`
+by its name, or an allowed chat of any other messenger as `name/chat`, the same
+destinations the `send_message` tool offers (`messengers::post_destinations`
+lists the configured ones; IRC and Signal post through their running session).
+`SetJobDelivery`
 accepts only a destination configured now; models cannot set it, and the
 schedule tools neither show nor change it.
 
@@ -195,4 +195,4 @@ Delivery is tested against a webhook stand-in through a real vault broker
 (`crates/runtime/tests/send_message.rs`), plus validation of destinations in
 `gateway/schedules/tests.rs`.
 
-Not yet: posting to IRC or Signal, and jitter for many jobs due at once.
+Not yet: jitter for many jobs due at once.

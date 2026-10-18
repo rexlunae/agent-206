@@ -3,7 +3,7 @@
 //! ordinary `Send` request, journaled and admitted like one from the app.
 use super::{Gateway, GatewayError, Result, poisoned};
 use crate::error::check;
-use crate::messengers::{Desired, Host, MessengerError};
+use crate::messengers::{Desired, Host, MessengerError, Poster};
 use a206_core::messengers::{MAX_ALLOWED_CHATS, valid_field as field, valid_name};
 use a206_core::*;
 use std::collections::BTreeSet;
@@ -331,6 +331,16 @@ impl Host for Gateway {
             .find(|m| m.role == Role::Assistant && !m.text.trim().is_empty())
             .map(|m| m.text.clone()))
     }
+    fn post_through(&self, name: &str, poster: Option<Poster>) {
+        self.posters.send_modify(|posters| match poster {
+            Some(poster) => {
+                posters.insert(name.to_owned(), poster);
+            }
+            None => {
+                posters.remove(name);
+            }
+        });
+    }
     fn update(&self, name: &str, change: impl FnOnce(&mut MessengerStatus) + Send) {
         let result = self.lock().and_then(|mut store| {
             let Some(status) = store.state.messengers.iter_mut().find(|s| s.name == name) else {
@@ -352,10 +362,18 @@ impl Host for Gateway {
     }
 }
 
-/// Sends through send-only messengers (webhooks) for the `send_message`
-/// tool. It holds the gateway without its tool hosts, so holding it forms no
-/// cycle, and offers only what the tool needs: which webhooks may be used and
-/// a send to one of them.
+/// How a post to a chat goes out.
+enum Route {
+    /// One request through the vault broker per part.
+    Request,
+    /// Through the messenger's running session (IRC, Signal).
+    Session(Poster),
+}
+
+/// Sends for the `send_message` tool: to webhooks, and to allowed chats of
+/// connected messengers. It holds the gateway without its tool hosts, so
+/// holding it forms no cycle, and offers only what the tool needs: where it
+/// may post and a send to one of those destinations.
 #[derive(Clone)]
 pub struct Outbox {
     base: Gateway,
@@ -391,6 +409,21 @@ impl Outbox {
         }
     }
 
+    /// How a post to a chat of `config` goes out, or `None` if its kind
+    /// posts through the running session and none runs with `config`.
+    fn route(&self, config: &MessengerConfig) -> Option<Route> {
+        if crate::messengers::chat_part_limit(config.kind).is_some() {
+            return Some(Route::Request);
+        }
+        self.base
+            .posters
+            .borrow()
+            .get(&config.name)
+            .filter(|poster| poster.config() == config)
+            .cloned()
+            .map(Route::Session)
+    }
+
     /// Where a model may post: each webhook by its name, and each allowed
     /// chat of a messenger that can post outside a reply as `name/chat`.
     /// Only messengers that are enabled and not disconnected by the user
@@ -404,8 +437,9 @@ impl Outbox {
             let config = &entry.config;
             if config.kind.is_send_only() {
                 destinations.push(config.name.clone());
-            } else if crate::messengers::chat_part_limit(config.kind).is_some()
+            } else if crate::messengers::posts_to_chats(config.kind)
                 && connected.contains(&config.name)
+                && self.route(config).is_some()
             {
                 destinations.extend(
                     config
@@ -441,16 +475,21 @@ impl Outbox {
                     && match chat {
                         None => config.kind.is_send_only(),
                         Some(chat) => {
-                            crate::messengers::chat_part_limit(config.kind).is_some()
+                            crate::messengers::posts_to_chats(config.kind)
                                 && connected.contains(name)
                                 && config.allowed_chats.contains(chat)
                         }
                     }
             })
-            .map(|entry| entry.config.clone())
-            .ok_or_else(|| MessengerError::NoDestination {
-                destination: destination.to_owned(),
-            })?;
+            .map(|entry| entry.config.clone());
+        let no_destination = || MessengerError::NoDestination {
+            destination: destination.to_owned(),
+        };
+        let config = config.ok_or_else(no_destination)?;
+        let route = match chat {
+            Some(_) => Some(self.route(&config).ok_or_else(no_destination)?),
+            None => None,
+        };
         let pairing = Host::pairing(&self.base).ok_or(MessengerError::NoPairing)?;
         // The user may withdraw the messenger, or the chat, while a long
         // message is going out; the parts still to send then stay unsent.
@@ -464,9 +503,14 @@ impl Outbox {
         let root = Host::root(&self.base);
         let result = match chat {
             None => crate::messengers::webhook::send(root, pairing, &config, text, withdrawn).await,
-            Some(chat) => {
-                crate::messengers::post(root, pairing, &config, chat, text, withdrawn).await
-            }
+            Some(chat) => match &route {
+                Some(Route::Session(poster)) => {
+                    crate::messengers::post_through(poster, chat, text, withdrawn).await
+                }
+                Some(Route::Request) | None => {
+                    crate::messengers::post(root, pairing, &config, chat, text, withdrawn).await
+                }
+            },
         };
         // A webhook's only state is whether its last message went out; a
         // chat messenger's state is its connection, left as it is.

@@ -17,7 +17,7 @@
 use super::listener::{Listener, Queue};
 use super::{Account, Api, Batch, Event, Inbound, MessengerError, Result};
 use a206_broker::{MAX_IRC_LINE, Socket, SocketEvent, SocketScheme};
-use a206_core::messengers::{irc_lowercase, valid_irc_channel, valid_irc_nick};
+use a206_core::messengers::{MAX_IRC_NICK, irc_lowercase, valid_irc_channel, valid_irc_nick};
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
@@ -27,7 +27,7 @@ const SERVICE: &str = "IRC";
 /// adds when it relays a message, so the relayed line still fits in 512 bytes.
 const RELAY_ROOM: usize = 120;
 /// Most lines one reply is sent as; the rest is cut with a notice.
-const MAX_REPLY_LINES: usize = 24;
+pub(crate) const MAX_REPLY_LINES: usize = 24;
 /// Time between lines, so a long reply is not taken for a flood. A direct
 /// reply's lines each follow their own `WHOIS`, so they are spaced twice this.
 const LINE_SPACING: Duration = Duration::from_millis(700);
@@ -175,15 +175,46 @@ impl Irc {
         &self,
         work: impl FnOnce(oneshot::Sender<Result<()>>) -> Outgoing,
     ) -> Result<()> {
-        let ended = || MessengerError::SocketEnded { service: SERVICE };
         let session = self.session.as_ref().ok_or_else(ended)?;
-        let (done, answer) = oneshot::channel();
-        session
-            .outgoing
-            .send(work(done))
-            .await
-            .map_err(|_| ended())?;
-        answer.await.map_err(|_| ended())?
+        request(&session.outgoing, work).await
+    }
+
+    /// A way for `send_message` to post through the running session.
+    pub(crate) fn poster(&self) -> Option<Poster> {
+        let session = self.session.as_ref()?;
+        Some(Poster(session.outgoing.downgrade()))
+    }
+}
+
+fn ended() -> MessengerError {
+    MessengerError::SocketEnded { service: SERVICE }
+}
+
+async fn request(
+    outgoing: &mpsc::Sender<Outgoing>,
+    work: impl FnOnce(oneshot::Sender<Result<()>>) -> Outgoing,
+) -> Result<()> {
+    let (done, answer) = oneshot::channel();
+    outgoing.send(work(done)).await.map_err(|_| ended())?;
+    answer.await.map_err(|_| ended())?
+}
+
+/// Posts through a session without keeping it open: once the session ends,
+/// a post fails as [`MessengerError::SocketEnded`].
+#[derive(Clone)]
+pub(crate) struct Poster(mpsc::WeakSender<Outgoing>);
+impl Poster {
+    /// Send one line made by [`post_lines`], as a reply is sent: paced, and
+    /// to a direct chat only while the account still holds the nickname it
+    /// last wrote from during this session.
+    pub(crate) async fn send(&self, chat: &str, line: &str) -> Result<()> {
+        let outgoing = self.0.upgrade().ok_or_else(ended)?;
+        request(&outgoing, |done| Outgoing::Reply {
+            chat: chat.to_owned(),
+            text: line.to_owned(),
+            done,
+        })
+        .await
     }
 }
 
@@ -578,9 +609,51 @@ fn message_event(line: &Line<'_>, target: &str, text: &str, own: &str) -> Event 
 /// target's length.
 fn reply_lines(target: &str, text: &str) -> Vec<String> {
     let header = format!("PRIVMSG {target} :");
-    let budget = MAX_IRC_LINE
-        .saturating_sub(RELAY_ROOM + header.len())
-        .max(TRUNCATED.len());
+    let mut parts = text_lines(text, line_budget(target.len()));
+    if parts.len() > MAX_REPLY_LINES {
+        parts.truncate(MAX_REPLY_LINES - 1);
+        parts.push(TRUNCATED.to_owned());
+    }
+    parts
+        .into_iter()
+        .map(|part| format!("{header}{part}"))
+        .collect()
+}
+
+/// The lines `send_message` posts `text` to `chat` in, one per
+/// [`Poster::send`], or why it cannot be posted whole: a message that needs
+/// more than [`MAX_REPLY_LINES`] lines is refused rather than cut. A direct
+/// chat's lines are sized for the longest nickname, so the nickname the
+/// account uses does not split them further.
+pub(crate) fn post_lines(chat: &str, text: &str) -> Result<Vec<String>> {
+    let target = if valid_irc_channel(chat) {
+        chat.len()
+    } else {
+        MAX_IRC_NICK
+    };
+    let lines = text_lines(text, line_budget(target));
+    if lines.is_empty() {
+        return Err(MessengerError::EmptyMessage);
+    }
+    if lines.len() > MAX_REPLY_LINES {
+        return Err(MessengerError::TooManyLines {
+            most: MAX_REPLY_LINES,
+        });
+    }
+    Ok(lines)
+}
+
+/// Bytes of text one `PRIVMSG` to a target of `target` bytes carries.
+fn line_budget(target: usize) -> usize {
+    let header = "PRIVMSG  :".len() + target;
+    MAX_IRC_LINE
+        .saturating_sub(RELAY_ROOM + header)
+        .max(TRUNCATED.len())
+}
+
+/// `text` as non-empty lines of at most `budget` bytes, without control
+/// characters.
+fn text_lines(text: &str, budget: usize) -> Vec<String> {
     let mut parts = vec![];
     for line in text.lines() {
         let clean: String = line
@@ -595,14 +668,7 @@ fn reply_lines(target: &str, text: &str) -> Vec<String> {
             rest = tail.trim_start();
         }
     }
-    if parts.len() > MAX_REPLY_LINES {
-        parts.truncate(MAX_REPLY_LINES - 1);
-        parts.push(TRUNCATED.to_owned());
-    }
     parts
-        .into_iter()
-        .map(|part| format!("{header}{part}"))
-        .collect()
 }
 
 /// `text` split after at most `limit` bytes, at the last space when there

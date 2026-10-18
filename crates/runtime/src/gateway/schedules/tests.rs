@@ -541,11 +541,11 @@ fn a_runs_reply_is_the_last_answer_after_its_own_message() {
 }
 
 #[test]
-fn every_kind_that_posts_to_chats_has_a_chat_post_size() {
+fn the_kinds_offered_for_posting_are_the_kinds_the_outbox_posts_to() {
     for kind in MessengerKind::ALL {
         assert_eq!(
             kind.posts_to_chats(),
-            crate::messengers::chat_part_limit(kind).is_some(),
+            crate::messengers::posts_to_chats(kind),
             "{kind:?}"
         );
     }
@@ -575,7 +575,11 @@ async fn only_configured_post_destinations_are_accepted() {
         with_chat(&bot, MessengerKind::Telegram),
         with_chat(&irc, MessengerKind::Irc),
     ];
-    let mut expected = vec![hook.clone(), format!("{bot}/{chat}")];
+    let mut expected = vec![
+        hook.clone(),
+        format!("{bot}/{chat}"),
+        format!("{irc}/{chat}"),
+    ];
     expected.sort();
     let mut offered = messengers::post_destinations(&settings.messengers);
     offered.sort();
@@ -585,16 +589,19 @@ async fn only_configured_post_destinations_are_accepted() {
         id: created.id,
         to: Some(to.to_owned()),
     };
-    for to in [hook.clone(), format!("{bot}/{chat}")] {
+    for to in [
+        hook.clone(),
+        format!("{irc}/{chat}"),
+        format!("{bot}/{chat}"),
+    ] {
         let Reply::Job(set) = send(&g, deliver(&to)).await else {
             panic!("{to} accepted");
         };
         assert_eq!(set.deliver_to, Some(to));
     }
-    // IRC posts only over its receiving session; a chat must be allowed;
-    // a chat messenger is named with its chat.
+    // A chat must be allowed, and a chat messenger is named with its chat.
     for to in [
-        format!("{irc}/{chat}"),
+        format!("{irc}/{}", nonce()),
         format!("{bot}/{}", nonce()),
         bot.clone(),
         nonce(),

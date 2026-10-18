@@ -201,6 +201,11 @@ mod native {
         Plan {
             thread: uuid::Uuid,
         },
+        /// Show the provider-reported tokens and cost a conversation has
+        /// used over all its runs, alone and with its subagents.
+        Usage {
+            thread: uuid::Uuid,
+        },
         /// Answer questions agents asked with `ask_user`.
         Prompts {
             #[command(subcommand)]
@@ -1113,6 +1118,34 @@ mod native {
                         print!(
                             "{}",
                             toml::to_string_pretty(&Plan { steps: thread.plan })?
+                        );
+                        return Ok(());
+                    }
+                    Action::Usage { thread } => {
+                        let Reply::Snapshot(snapshot) = client.call(Command::Snapshot).await? else {
+                            anyhow::bail!("failed to read the conversation");
+                        };
+                        let own = snapshot
+                            .threads
+                            .iter()
+                            .find(|t| t.id == thread)
+                            .ok_or_else(|| anyhow::anyhow!("conversation not found"))?
+                            .usage_total
+                            .clone();
+                        #[derive(serde::Serialize)]
+                        struct Totals {
+                            conversation: a206_core::UsageTotal,
+                            with_subagents: a206_core::UsageTotal,
+                        }
+                        print!(
+                            "{}",
+                            toml::to_string_pretty(&Totals {
+                                conversation: own,
+                                with_subagents: a206_core::UsageTotal::with_subagents(
+                                    &snapshot.threads,
+                                    thread
+                                ),
+                            })?
                         );
                         return Ok(());
                     }
