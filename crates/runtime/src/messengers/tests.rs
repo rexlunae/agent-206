@@ -2546,3 +2546,466 @@ async fn signal_waits_for_the_user_when_the_daemon_does_not_serve_the_account() 
     stop.cancel();
     supervisor.await.unwrap();
 }
+
+/// A stand-in Beeper Desktop API. Every message and chat activity takes the
+/// next number of one counter; cursors name such a number.
+#[derive(Clone, Default)]
+struct BeeperDesktop {
+    token: String,
+    accounts: Arc<Mutex<Value>>,
+    state: Arc<Mutex<BeeperChats>>,
+    /// Statuses the next sends answer with; then 200.
+    send_statuses: Arc<Mutex<VecDeque<u16>>>,
+    /// Chat ids and texts of accepted sends.
+    sent: Arc<Mutex<Vec<(String, String)>>>,
+    chat_lists: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[derive(Default)]
+struct BeeperChats {
+    counter: u64,
+    chats: BTreeMap<String, BeeperChat>,
+}
+
+struct BeeperChat {
+    info: Value,
+    activity: u64,
+    messages: Vec<(u64, Value)>,
+}
+
+impl BeeperChats {
+    fn chat(&mut self, id: &str, kind: &str, network: &str, title: &str) {
+        self.counter += 1;
+        let activity = self.counter;
+        self.chats.insert(
+            id.to_owned(),
+            BeeperChat {
+                info: json!({"id": id, "accountID": random(), "network": network, "title": title, "type": kind}),
+                activity,
+                messages: vec![],
+            },
+        );
+    }
+    /// Add `message` (with a fresh id) to `chat`.
+    fn post(&mut self, chat: &str, mut message: Value) {
+        self.counter += 1;
+        let at = self.counter;
+        message["id"] = json!(random());
+        message["chatID"] = json!(chat);
+        let chat = self.chats.get_mut(chat).unwrap();
+        chat.activity = at;
+        chat.messages.push((at, message));
+    }
+}
+
+impl BeeperDesktop {
+    fn chat(&self, id: &str, kind: &str, network: &str, title: &str) {
+        self.state.lock().unwrap().chat(id, kind, network, title);
+    }
+    fn post(&self, chat: &str, message: Value) {
+        self.state.lock().unwrap().post(chat, message);
+    }
+    fn lists(&self) -> usize {
+        self.chat_lists.load(Ordering::SeqCst)
+    }
+}
+
+fn beeper_text(sender: &str, text: &str) -> Value {
+    json!({"senderID": sender, "senderName": random(), "text": text, "type": "TEXT"})
+}
+
+fn cursor_after(query: &HashMap<String, String>, prefix: char) -> Option<u64> {
+    (query.get("direction").map(String::as_str) == Some("after"))
+        .then(|| query.get("cursor")?.strip_prefix(prefix)?.parse().ok())
+        .flatten()
+}
+
+async fn serve_beeper(desktop: BeeperDesktop) -> String {
+    use axum::http::{HeaderMap, StatusCode};
+    use axum::response::{IntoResponse, Response};
+    fn authorized(desktop: &BeeperDesktop, headers: &HeaderMap) -> bool {
+        bearer(headers).as_deref() == Some(desktop.token.as_str())
+    }
+    let accounts = |State(desktop): State<BeeperDesktop>, headers: HeaderMap| async move {
+        if !authorized(&desktop, &headers) {
+            return StatusCode::UNAUTHORIZED.into_response();
+        }
+        Json(desktop.accounts.lock().unwrap().clone()).into_response()
+    };
+    let chats = |State(desktop): State<BeeperDesktop>,
+                 headers: HeaderMap,
+                 Query(query): Query<HashMap<String, String>>| async move {
+        assert!(authorized(&desktop, &headers), "no token");
+        desktop.chat_lists.fetch_add(1, Ordering::SeqCst);
+        let state = desktop.state.lock().unwrap();
+        let limit: usize = query.get("limit").unwrap().parse().unwrap();
+        let after = cursor_after(&query, 'c').unwrap_or(0);
+        let mut chats: Vec<_> = state
+            .chats
+            .values()
+            .filter(|c| c.activity > after)
+            .collect();
+        // The most recent changes first, as Beeper lists chats; a full page
+        // leaves the oldest changes out.
+        chats.sort_by_key(|c| std::cmp::Reverse(c.activity));
+        let more = chats.len() > limit;
+        chats.truncate(limit);
+        let newest = chats.first().map_or(after, |c| c.activity);
+        let items: Vec<_> = chats
+            .iter()
+            .map(|c| {
+                let mut info = c.info.clone();
+                if let Some((_, last)) = c.messages.last() {
+                    info["preview"] = last.clone();
+                }
+                info
+            })
+            .collect();
+        Json(json!({"items": items, "hasMore": more, "newestCursor": format!("c{newest}")}))
+    };
+    let chat = |State(desktop): State<BeeperDesktop>, Path(id): Path<String>| async move {
+        let state = desktop.state.lock().unwrap();
+        match state.chats.get(&id) {
+            Some(chat) => Json(chat.info.clone()).into_response(),
+            None => StatusCode::NOT_FOUND.into_response(),
+        }
+    };
+    let messages = |State(desktop): State<BeeperDesktop>,
+                    headers: HeaderMap,
+                    Path(id): Path<String>,
+                    Query(query): Query<HashMap<String, String>>| async move {
+        assert!(authorized(&desktop, &headers), "no token");
+        let state = desktop.state.lock().unwrap();
+        let Some(chat) = state.chats.get(&id) else {
+            return StatusCode::NOT_FOUND.into_response();
+        };
+        let before = (query.get("direction").map(String::as_str) == Some("before"))
+            .then(|| query.get("cursor")?.strip_prefix('m')?.parse::<u64>().ok())
+            .flatten();
+        let (from, items, more): (u64, Vec<_>, bool) = match cursor_after(&query, 'm') {
+            Some(after) => (
+                after,
+                chat.messages.iter().filter(|(at, _)| *at > after).collect(),
+                false,
+            ),
+            // The latest page, or the page before `cursor`: twenty messages,
+            // and whether older ones remain.
+            None => {
+                let earlier: Vec<_> = chat
+                    .messages
+                    .iter()
+                    .filter(|(at, _)| before.is_none_or(|before| *at < before))
+                    .collect();
+                let skip = earlier.len().saturating_sub(20);
+                (0, earlier[skip..].to_vec(), skip > 0)
+            }
+        };
+        let newest = items.last().map_or(from, |(at, _)| *at);
+        let oldest = items.first().map_or(from, |(at, _)| *at);
+        let items: Vec<_> = items.into_iter().map(|(_, m)| m.clone()).collect();
+        Json(json!({
+            "items": items,
+            "hasMore": more,
+            "newestCursor": format!("m{newest}"),
+            "oldestCursor": format!("m{oldest}"),
+        }))
+        .into_response()
+    };
+    let send = |State(desktop): State<BeeperDesktop>,
+                headers: HeaderMap,
+                Path(id): Path<String>,
+                Json(body): Json<Value>| async move {
+        assert!(authorized(&desktop, &headers), "no token");
+        let status = desktop.send_statuses.lock().unwrap().pop_front();
+        if let Some(status) = status {
+            return Response::builder()
+                .status(status)
+                .body(axum::body::Body::empty())
+                .unwrap();
+        }
+        let text = body["text"].as_str().unwrap().to_owned();
+        desktop
+            .sent
+            .lock()
+            .unwrap()
+            .push((id.clone(), text.clone()));
+        // The reply shows up in the chat as the user's own message.
+        desktop.post(
+            &id,
+            json!({"senderID": random(), "text": text, "type": "TEXT", "isSender": true}),
+        );
+        Json(json!({"chatID": id, "pendingMessageID": random()})).into_response()
+    };
+    let router = Router::new()
+        .route("/v1/accounts", get(accounts))
+        .route("/v1/chats", get(chats))
+        .route("/v1/chats/{id}", get(chat))
+        .route("/v1/chats/{id}/messages", get(messages).post(send))
+        .with_state(desktop);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    origin
+}
+
+async fn beeper_setup() -> (
+    BeeperDesktop,
+    String,
+    tempfile::TempDir,
+    String,
+    Recorder,
+    crate::provider::PairingAnchor,
+) {
+    let network = random();
+    let desktop = BeeperDesktop {
+        token: random(),
+        accounts: Arc::new(Mutex::new(
+            json!([{"accountID": random(), "network": network, "status": "connected"}]),
+        )),
+        ..BeeperDesktop::default()
+    };
+    let origin = serve_beeper(desktop.clone()).await;
+    let (dir, credential, pairing, anchor) = broker(&origin, &desktop.token).await;
+    let host = Recorder {
+        root: dir.path().to_owned(),
+        pairing,
+        pairings: Arc::new(watch::Sender::new(0)),
+        threads: Arc::default(),
+        turns: Arc::default(),
+        statuses: Arc::default(),
+        connects: Arc::default(),
+        changed: Arc::default(),
+    };
+    (desktop, origin, dir, credential, host, anchor)
+}
+
+fn beeper_config(name: &str, origin: &str, credential: &str, chats: &[&str]) -> MessengerConfig {
+    MessengerConfig {
+        kind: MessengerKind::Beeper,
+        allowed_chats: chats.iter().map(|chat| (*chat).to_owned()).collect(),
+        ..config(name, origin, credential, 0)
+    }
+}
+
+/// Run `entry` until `done`, then stop it.
+async fn beeper_run(host: &Recorder, entry: MessengerConfig, done: impl Fn(&Recorder) -> bool) {
+    let (_desired, receiver) = watch::channel(vec![Desired {
+        config: entry,
+        run: true,
+    }]);
+    let stop = CancellationToken::new();
+    let supervisor = tokio::spawn(supervise(host.clone(), receiver, FAST, stop.clone()));
+    host.until(done).await;
+    stop.cancel();
+    supervisor.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn beeper_answers_allowed_chats_as_the_user_and_never_history() {
+    let (desktop, origin, _dir, credential, host, _anchor) = beeper_setup().await;
+    let name = "beeper";
+    let (direct, group, other) = (random(), random(), random());
+    let (friend, member, stranger) = (random(), random(), random());
+    let (group_title, other_title) = (random(), random());
+    desktop.chat(&direct, "single", "WhatsApp", &random());
+    desktop.chat(&group, "group", "iMessage", &group_title);
+    desktop.chat(&other, "single", "Signal", &other_title);
+    desktop.post(&direct, beeper_text(&friend, &random()));
+    let mut entry = beeper_config(name, &origin, &credential, &[&direct, &group]);
+    entry.allowed_users.insert(member.clone());
+    // Direct chats answer anyone in them only while no senders are listed.
+    entry.allowed_users.insert(friend.clone());
+
+    let (_desired, receiver) = watch::channel(vec![Desired {
+        config: entry,
+        run: true,
+    }]);
+    let stop = CancellationToken::new();
+    let supervisor = tokio::spawn(supervise(host.clone(), receiver, FAST, stop.clone()));
+    // The session marked where each chat ends and looked for changes once.
+    host.until(|h| h.status(name).state == MessengerState::Connected && desktop.lists() >= 2)
+        .await;
+    let (hello, question) = (random(), random());
+    desktop.post(&direct, beeper_text(&friend, &hello));
+    desktop.post(&group, beeper_text(&stranger, &random()));
+    desktop.post(
+        &group,
+        json!({"senderID": member, "text": random(), "type": "NOTICE"}),
+    );
+    desktop.post(&group, beeper_text(&member, &question));
+    desktop.post(&other, beeper_text(&stranger, &random()));
+    host.until(|_| desktop.sent.lock().unwrap().len() == 2)
+        .await;
+    host.until(|h| h.status(name).refused.len() == 2).await;
+    // The replies came back as the user's own messages, which are ignored.
+    let seen = desktop.lists();
+    host.until(|_| desktop.lists() >= seen + 3).await;
+    stop.cancel();
+    supervisor.await.unwrap();
+
+    let status = host.status(name);
+    let network = desktop.accounts.lock().unwrap()[0]["network"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(status.account, Some(format!("Beeper: {network}")));
+    let turns: BTreeSet<_> = host
+        .turns
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|t| t.1.clone())
+        .collect();
+    assert_eq!(turns, BTreeSet::from([hello.clone(), question.clone()]));
+    let sent: BTreeSet<_> = desktop.sent.lock().unwrap().iter().cloned().collect();
+    assert_eq!(
+        sent,
+        BTreeSet::from([
+            (direct.clone(), format!("reply to {hello}")),
+            (group.clone(), format!("reply to {question}")),
+        ])
+    );
+    let refused: BTreeSet<_> = status
+        .refused
+        .iter()
+        .map(|r| (r.chat.clone(), r.sender.clone(), r.title.clone()))
+        .collect();
+    assert_eq!(
+        refused,
+        BTreeSet::from([
+            (other, None, Some(format!("Signal: {other_title}"))),
+            (
+                group,
+                Some(stranger),
+                Some(format!("iMessage: {group_title}"))
+            ),
+        ])
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn beeper_answers_each_message_at_most_once_when_a_reply_fails() {
+    let (desktop, origin, _dir, credential, host, _anchor) = beeper_setup().await;
+    let name = "beeper";
+    let (chat, friend) = (random(), random());
+    desktop.chat(&chat, "single", "WhatsApp", &random());
+    desktop.send_statuses.lock().unwrap().push_back(500);
+    let entry = beeper_config(name, &origin, &credential, &[&chat]);
+    let (_desired, receiver) = watch::channel(vec![Desired {
+        config: entry,
+        run: true,
+    }]);
+    let stop = CancellationToken::new();
+    let supervisor = tokio::spawn(supervise(host.clone(), receiver, FAST, stop.clone()));
+    host.until(|h| h.status(name).state == MessengerState::Connected && desktop.lists() >= 2)
+        .await;
+    let (first, second) = (random(), random());
+    desktop.post(&chat, beeper_text(&friend, &first));
+    desktop.post(&chat, beeper_text(&friend, &second));
+    // The first reply fails, which ends the session; the second message is
+    // still answered after reconnecting, and the first is not repeated.
+    host.until(|_| !desktop.sent.lock().unwrap().is_empty())
+        .await;
+    let seen = desktop.lists();
+    host.until(|_| desktop.lists() >= seen + 3).await;
+    stop.cancel();
+    supervisor.await.unwrap();
+
+    assert!(
+        host.connects(name) >= 2,
+        "the failed reply ended the session"
+    );
+    let turns: Vec<_> = host
+        .turns
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|t| t.1.clone())
+        .collect();
+    assert_eq!(turns, vec![first, second.clone()]);
+    assert_eq!(
+        *desktop.sent.lock().unwrap(),
+        vec![(chat, format!("reply to {second}"))]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rejected_beeper_token_waits_for_the_user() {
+    let (_desktop, origin, _dir, _credential, mut host, _anchor) = beeper_setup().await;
+    // A credential holding another token, in a broker paired with the host.
+    let (dir, wrong, pairing, _anchor) = broker(&origin, &random()).await;
+    host.root = dir.path().to_owned();
+    host.pairing = pairing;
+    let name = "beeper";
+    beeper_run(&host, beeper_config(name, &origin, &wrong, &[]), |h| {
+        h.status(name).state == MessengerState::Failed
+    })
+    .await;
+    let status = host.status(name);
+    assert_eq!(
+        status.failure.map(|f| f.kind),
+        Some(ErrorKind::PermissionDenied)
+    );
+    assert_eq!(host.connects(name), 1, "not retried");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn beeper_finds_allowed_chats_behind_busy_lists_and_new_chats_and_rechecks_accounts() {
+    let (desktop, origin, _dir, credential, host, _anchor) = beeper_setup().await;
+    let name = "beeper";
+    let (busy, later, friend) = (random(), random(), random());
+    desktop.chat(&busy, "single", "WhatsApp", &random());
+    // `later` is allowed before Beeper has such a chat.
+    let entry = beeper_config(name, &origin, &credential, &[&busy, &later]);
+    let (_desired, receiver) = watch::channel(vec![Desired {
+        config: entry,
+        run: true,
+    }]);
+    let stop = CancellationToken::new();
+    let supervisor = tokio::spawn(supervise(host.clone(), receiver, FAST, stop.clone()));
+    host.until(|h| h.status(name).state == MessengerState::Connected && desktop.lists() >= 2)
+        .await;
+    // More of `later`'s messages than one page holds.
+    let behind = random();
+    let first: Vec<String> = (0..45).map(|_| random()).collect();
+    {
+        // At once, so one look sees it all: the allowed chat changes first,
+        // then more chats than one page holds.
+        let mut state = desktop.state.lock().unwrap();
+        state.post(&busy, beeper_text(&friend, &behind));
+        for _ in 0..100 {
+            let other = random();
+            state.chat(&other, "single", "Signal", &random());
+            state.post(&other, beeper_text(&random(), &random()));
+        }
+        // A chat created after the session started, and its first messages.
+        state.chat(&later, "single", "iMessage", &random());
+        for text in &first {
+            state.post(&later, beeper_text(&friend, text));
+        }
+    }
+    host.until(|_| desktop.sent.lock().unwrap().len() == 1 + first.len())
+        .await;
+    // Once nothing is left to answer, another token reaching other accounts
+    // is still noticed.
+    let seen = desktop.lists();
+    host.until(|_| desktop.lists() >= seen + 3).await;
+    let network = random();
+    *desktop.accounts.lock().unwrap() = json!([{"accountID": random(), "network": network}]);
+    host.until(|h| h.status(name).account == Some(format!("Beeper: {network}")))
+        .await;
+    stop.cancel();
+    supervisor.await.unwrap();
+
+    let sent = desktop.sent.lock().unwrap().clone();
+    let to = |chat: &str| -> Vec<String> {
+        sent.iter()
+            .filter(|(to, _)| to == chat)
+            .map(|(_, text)| text.clone())
+            .collect()
+    };
+    assert_eq!(to(&busy), [format!("reply to {behind}")]);
+    // Every message the new chat held is answered once, in order.
+    let replies: Vec<_> = first.iter().map(|t| format!("reply to {t}")).collect();
+    assert_eq!(to(&later), replies);
+}

@@ -57,15 +57,20 @@ pub enum MessengerKind {
     /// Signal through a signal-cli daemon the user runs, which holds the
     /// account's keys; Agent 206 talks to its local JSON-RPC socket.
     Signal,
+    /// Beeper Desktop's local API, which reaches the chat networks the user
+    /// connected to Beeper (WhatsApp, iMessage, Google Chat and others) and
+    /// answers as the user's own accounts there.
+    Beeper,
 }
 impl MessengerKind {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Telegram,
         Self::Matrix,
         Self::Discord,
         Self::Slack,
         Self::Irc,
         Self::Signal,
+        Self::Beeper,
     ];
     pub fn label(self) -> &'static str {
         match self {
@@ -75,6 +80,7 @@ impl MessengerKind {
             Self::Slack => "Slack",
             Self::Irc => "IRC",
             Self::Signal => "Signal",
+            Self::Beeper => "Beeper",
         }
     }
     /// The service's official API endpoint, used unless an entry names
@@ -86,6 +92,8 @@ impl MessengerKind {
             Self::Discord => Some("https://discord.com"),
             Self::Slack => Some("https://slack.com"),
             Self::Irc | Self::Signal => None,
+            // Beeper Desktop serves its API on this loopback port.
+            Self::Beeper => Some("http://localhost:23373"),
         }
     }
     /// How the user obtains the token the vault stores for this kind.
@@ -108,6 +116,9 @@ impl MessengerKind {
             }
             Self::Signal => {
                 "Register or link the account with signal-cli and run its daemon yourself (signal-cli daemon --socket PATH --receive-mode=manual); signal-cli keeps the account's keys, so no vault credential is used"
+            }
+            Self::Beeper => {
+                "In Beeper Desktop, turn on the Desktop API, create a token under Settings, Integrations, Approved connections, and store it in the vault, bound to the API origin. Replies are sent as you, from your own accounts"
             }
         }
     }

@@ -8,6 +8,7 @@
 //! through [`Host::converse`], under that thread's mode, grants and approvals.
 //! A person in an allowed chat can therefore do whatever the user could do
 //! by typing into that thread, and nothing more.
+mod beeper;
 mod discord;
 mod irc;
 mod listener;
@@ -109,6 +110,8 @@ pub enum MessengerError {
     Refused { service: &'static str },
     #[error("{service} did not identify the bot account")]
     NoAccountId { service: &'static str },
+    #[error("Beeper Desktop has no chat accounts connected yet; add one in Beeper")]
+    BeeperNoAccounts,
     #[error(
         "room {chat} is end-to-end encrypted, which Agent 206 does not support yet; it neither reads nor answers there"
     )]
@@ -171,9 +174,10 @@ impl crate::error::Classified for MessengerError {
             | Self::Backlog { .. } => ErrorKind::Unavailable,
             Self::DiscordIntents => ErrorKind::PermissionDenied,
             Self::Rejected { .. } | Self::IrcCapabilities { .. } => ErrorKind::Provider,
-            Self::RecipientGone { .. } | Self::SignalUnreachable { .. } | Self::SignalTimeout => {
-                ErrorKind::Unavailable
-            }
+            Self::RecipientGone { .. }
+            | Self::SignalUnreachable { .. }
+            | Self::SignalTimeout
+            | Self::BeeperNoAccounts => ErrorKind::Unavailable,
             Self::SignalRefused { .. } => ErrorKind::Provider,
             Self::TooLarge { .. } => ErrorKind::Protocol,
             Self::Status { .. } | Self::Refused { .. } => ErrorKind::Provider,
@@ -287,6 +291,7 @@ enum Adapter {
     Slack(slack::Slack),
     Irc(irc::Irc),
     Signal(signal::Signal),
+    Beeper(beeper::Beeper),
 }
 impl Adapter {
     /// The adapter for `config`. Kinds that spend a vault credential talk
@@ -318,6 +323,9 @@ impl Adapter {
             MessengerKind::Signal => {
                 Self::Signal(signal::Signal::new(config.endpoint(), config.login.clone()))
             }
+            MessengerKind::Beeper => {
+                Self::Beeper(beeper::Beeper::new(api, config.allowed_chats.clone()))
+            }
         }
     }
     /// Check the credential and name the account.
@@ -329,6 +337,7 @@ impl Adapter {
             Self::Slack(adapter) => adapter.connect().await,
             Self::Irc(adapter) => adapter.connect().await,
             Self::Signal(adapter) => adapter.connect().await,
+            Self::Beeper(adapter) => adapter.connect().await,
         }
     }
     /// Wait for the next batch after `cursor`.
@@ -340,6 +349,7 @@ impl Adapter {
             Self::Slack(adapter) => adapter.receive(cursor).await,
             Self::Irc(adapter) => adapter.receive(cursor).await,
             Self::Signal(adapter) => adapter.receive(cursor).await,
+            Self::Beeper(adapter) => adapter.receive(cursor).await,
         }
     }
     /// Fails with [`MessengerError::EncryptedRoom`] if an answer could not be
@@ -350,16 +360,21 @@ impl Adapter {
             | Self::Discord(_)
             | Self::Slack(_)
             | Self::Irc(_)
-            | Self::Signal(_) => Ok(()),
+            | Self::Signal(_)
+            | Self::Beeper(_) => Ok(()),
             Self::Matrix(adapter) => adapter.check_room(chat).await,
         }
     }
     async fn join(&self, chat: &str) -> Result<()> {
         match self {
             // Telegram, Discord and Slack add bots to chats themselves, and
-            // signal-cli joins groups for the account; none report
+            // signal-cli and Beeper join groups for the account; none report
             // invitations here.
-            Self::Telegram(_) | Self::Discord(_) | Self::Slack(_) | Self::Signal(_) => Ok(()),
+            Self::Telegram(_)
+            | Self::Discord(_)
+            | Self::Slack(_)
+            | Self::Signal(_)
+            | Self::Beeper(_) => Ok(()),
             Self::Matrix(adapter) => adapter.join(chat).await,
             Self::Irc(adapter) => adapter.join(chat).await,
         }
@@ -372,6 +387,7 @@ impl Adapter {
             Self::Slack(adapter) => adapter.send(chat, text).await,
             Self::Irc(adapter) => adapter.send(chat, text).await,
             Self::Signal(adapter) => adapter.send(chat, text).await,
+            Self::Beeper(adapter) => adapter.send(chat, text).await,
         }
     }
 }
@@ -796,6 +812,30 @@ fn split(text: &str, limit: usize) -> Vec<&str> {
         let (part, tail) = rest.split_at(end);
         parts.push(part);
         rest = tail;
+    }
+    parts
+}
+
+/// Said at the end of a reply that was cut to a service's part limit.
+const CUT_SHORT: &str = "\n(reply cut short; read the rest in Agent 206)";
+
+/// `text` in non-blank parts of at most `limit` UTF-16 units, at most
+/// `most` of them; a reply cut at that count ends by saying so, so a
+/// partial answer is never sent as if it were whole.
+fn bounded_parts(text: &str, limit: usize, most: usize) -> Vec<String> {
+    let mut parts: Vec<String> = split(text, limit)
+        .into_iter()
+        .filter(|part| !part.trim().is_empty())
+        .map(str::to_owned)
+        .collect();
+    if parts.len() > most {
+        parts.truncate(most);
+        let last = parts.pop().unwrap_or_default();
+        let kept = split(&last, limit - CUT_SHORT.encode_utf16().count())
+            .into_iter()
+            .next()
+            .unwrap_or_default();
+        parts.push(format!("{kept}{CUT_SHORT}"));
     }
     parts
 }
