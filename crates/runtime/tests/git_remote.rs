@@ -568,6 +568,7 @@ async fn rig() -> Rig {
         origin: origin.clone(),
         username: username.clone(),
         credential,
+        forge: None,
     });
     let rig = Rig {
         gateway,

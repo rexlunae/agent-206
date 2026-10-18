@@ -673,6 +673,47 @@ The result names the branch, remote, `tracking_branch`, the old and new
 commits and how many objects arrived. Not yet: ssh remotes, several branches
 or tags at once, pruning, and packs over about 4 MiB.
 
+## Reading pull requests (`pull_requests`, `pull_request`)
+
+`runtime/src/forge.rs` offers two read-only tools beside `git_push` and
+`git_fetch`, under the same condition (a git credential for at least one
+forge) and the conversation's GitRead grant. Their host policy is Allow, so
+once the user permits them on the conversation they run without a
+per-call approval; they only send GET requests.
+
+- `pull_requests` lists up to 30 pull requests of the repository, newest
+  first: `state` is `open` (default), `closed` (closed without merging),
+  `merged` or `all`, and `branch` keeps those from one branch of the
+  repository. `complete` is false when the page was full.
+- `pull_request` reads one by `number`: its details and description (cut
+  at 8,000 characters), the checks on its head commit and its reviews, at
+  most 100 of each.
+
+Both take `remote` (default: the current branch's remote, else `origin`);
+its URL must be an HTTPS repository URL, as for a fetch. Crate `a206-forge`
+describes every forge the same way (state, draft, source and target
+branches, check status and conclusion, review state) and keeps a forge's
+own word in `reported` where it has no counterpart (`unknown`):
+
+| Forge | Pull requests | Checks | Reviews |
+| --- | --- | --- | --- |
+| GitHub (github.com, GitHub Enterprise Server) | pulls | check runs and commit statuses | reviews |
+| GitLab (v4 API) | merge requests (`iid`) | jobs of the head pipeline (allowed failures are `neutral`) | approvals only |
+
+The forge's API comes from the git credential's `forge` (`kind` GitHub or
+GitLab, and `api`, its base URL such as
+`https://git.example/api/v3`); github.com and gitlab.com have bundled
+presets (`https://api.github.com`, `https://gitlab.com/api/v4`). Without
+one the call fails before anything is sent. The vault broker sends the git
+credential's vault credential to the API as a bearer token, so that vault
+credential must also be bound to the API's origin (for github.com,
+`https://api.github.com`). Every text field is cleaned of control
+characters and bounded; what a forge returns was written by other people
+and reaches the model as tool data. A refused token, a missing pull
+request and an answer not shaped like the API's are separate errors. Not
+yet: opening, commenting on or merging pull requests, Gitea or Forgejo,
+further pages, and setting `forge` from the GUI (use `settings --apply`).
+
 ## Output rules
 
 Before a tool result reaches the model, the run engine passes it through the

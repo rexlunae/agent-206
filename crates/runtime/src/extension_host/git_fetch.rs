@@ -8,7 +8,7 @@
 use super::{
     git::{check, git_failure, open, unsupported},
     git_branch::branch_name,
-    git_commit::has_hooks,
+    git_commit::{Settings, has_hooks},
     git_push::{
         MAX_ANCESTRY, ancestor, head_branch, host, peeled, remote_name, remote_url, settings,
     },
@@ -121,14 +121,7 @@ pub(crate) fn target(
         [spec] if *spec == mapping => false,
         _ => return Err(RemoteError::Refspec(remote)),
     };
-    let configured = settings
-        .string(&format!("remote.{remote}.url"))
-        .ok_or_else(|| RemoteError::NoRemote(remote.clone()))?;
-    let configured = std::str::from_utf8(&configured).map_err(|_| RemoteError::RemoteUrl)?;
-    if settings.rewrites(configured, false) {
-        return Err(RemoteError::Rewritten);
-    }
-    let url = remote_url(configured)?;
+    let url = fetch_url(&settings, &remote)?;
     let tracking = format!("refs/remotes/{remote}/{branch}");
     let previous = peeled(&repo, &tracking).map_err(host)?;
     let mut tips: Vec<ObjectId> = previous.into_iter().collect();
@@ -149,6 +142,34 @@ pub(crate) fn target(
         tips,
         haves,
     })
+}
+
+/// The HTTPS URL `remote` fetches from; one that a setting would rewrite is
+/// refused.
+fn fetch_url(settings: &Settings, remote: &str) -> Result<url::Url, RemoteError> {
+    let configured = settings
+        .string(&format!("remote.{remote}.url"))
+        .ok_or_else(|| RemoteError::NoRemote(remote.to_owned()))?;
+    let configured = std::str::from_utf8(&configured).map_err(|_| RemoteError::RemoteUrl)?;
+    if settings.rewrites(configured, false) {
+        return Err(RemoteError::Rewritten);
+    }
+    remote_url(configured)
+}
+
+/// The name and URL of `remote` (default: the current branch's remote,
+/// else `origin`) in the project at `root`, for the pull request tools.
+pub(crate) fn remote_repository(
+    root: PathBuf,
+    remote: Option<&str>,
+    interrupt: &AtomicBool,
+) -> Result<(String, url::Url), RemoteError> {
+    let repo = open(root, interrupt).map_err(host)?;
+    let settings = settings(&repo).map_err(host)?;
+    let current = head_branch(&repo)?;
+    let remote = remote_name(&settings, current.as_deref().unwrap_or_default(), remote)?;
+    let url = fetch_url(&settings, &remote)?;
+    Ok((remote, url))
 }
 
 /// Up to [`MAX_HAVES`] commits reachable from `tips`, newest first.
