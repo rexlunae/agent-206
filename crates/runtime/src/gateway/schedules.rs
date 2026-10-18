@@ -80,6 +80,7 @@ impl Gateway {
             next: Some(next),
             last: None,
             author,
+            history: 0,
         };
         store.state.jobs.push(job.clone());
         store.persist(Some(EventKind::JobChanged { id: job.id }))?;
@@ -115,6 +116,16 @@ impl Gateway {
         )?;
         store.persist(Some(EventKind::JobChanged { id }))?;
         Ok(Reply::Ok)
+    }
+
+    /// See [`Command::JobRuns`].
+    pub(super) fn job_runs(&self, id: Id) -> Result<Reply> {
+        let store = self.lock()?;
+        check(
+            store.state.jobs.iter().any(|job| job.id == id),
+            GatewayError::NotFound("scheduled message not found"),
+        )?;
+        Ok(Reply::JobRuns(store.job_runs(id)?))
     }
 
     /// Run a job now, leaving its schedule as it is.
@@ -155,12 +166,12 @@ impl Gateway {
                     job.next = None;
                     job.enabled = false;
                     job.last = Some(JobRun {
-                        id: Id::new_v4(),
-                        at: now,
                         outcome: JobOutcome::Refused(crate::error::handle(
                             "schedule_job",
                             &GatewayError::from(error),
                         )),
+                        ended: Some(now),
+                        ..JobRun::start(now)
                     });
                     due.push(job.clone());
                 }
@@ -268,11 +279,30 @@ impl Gateway {
         let Some(job) = store.state.jobs.iter_mut().find(|job| job.id == id) else {
             return Ok(());
         };
-        match &mut job.last {
-            Some(last) if last.id == run => last.outcome = outcome,
-            _ => return Ok(()),
-        }
-        store.persist(Some(EventKind::JobChanged { id }))?;
+        let ended = Some(now());
+        let settled = match &mut job.last {
+            Some(last) if last.id == run => {
+                last.outcome = outcome;
+                last.ended = ended;
+                None
+            }
+            // A newer run is the latest; this one ends in the history only.
+            _ => {
+                let Some(mut earlier) = store
+                    .job_runs(id)?
+                    .into_iter()
+                    .find(|earlier| earlier.id == run)
+                else {
+                    // Already pruned from the history.
+                    return Ok(());
+                };
+                earlier.outcome = outcome;
+                earlier.ended = ended;
+                job_mut(&mut store.state, id)?.history += 1;
+                Some(earlier)
+            }
+        };
+        store.persist_settling(Some(EventKind::JobChanged { id }), settled.as_ref())?;
         Ok(())
     }
 

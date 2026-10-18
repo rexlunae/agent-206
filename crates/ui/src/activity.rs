@@ -536,6 +536,7 @@ mod tests {
             next: None,
             last: None,
             author: Default::default(),
+            history: 0,
         };
         snapshot.threads.push(thread.clone());
         snapshot.jobs.push(job.clone());
