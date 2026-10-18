@@ -765,7 +765,11 @@ impl Gateway {
         }
         let result = match result {
             Some(Ok(turn)) => {
-                let message = partial.finish(thread, turn.text.clone());
+                let message = partial.finish(
+                    thread,
+                    turn.text.clone(),
+                    Some((turn.reasoning.clone(), turn.reasoning_shortened)),
+                );
                 Some(Ok((turn, message)))
             }
             Some(Err(error)) => {

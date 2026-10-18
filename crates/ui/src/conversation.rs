@@ -475,7 +475,12 @@ fn Conversation(thread: Thread, target: Option<Uuid>) -> Element {
                                 Badge { tone: BadgeTone::Accent, Icon { name: IconName::Search, size: IconSize::Sm } "Linked message" }
                             }
                         }
-                        p { class: "a206-message-text", "{message.text}" }
+                        if !message.reasoning.is_empty() {
+                            MessageReasoning { message: message.clone(), live: running && thread.messages.last().is_some_and(|last| last.id == message.id) }
+                        }
+                        if !message.text.is_empty() || message.reasoning.is_empty() {
+                            p { class: "a206-message-text", "{message.text}" }
+                        }
                         for file in &message.attachments { Badge { Icon { name: IconName::File, size: IconSize::Sm } "{file.name} · {file.text.len()} B" } }
                         for call in &message.tool_calls { crate::tools::ToolTrace { key: "{call.id}", call: call.clone() } }
                     }
@@ -993,6 +998,19 @@ fn unreadable(error: dioxus::CapturedError) -> ErrorReport {
         .caused_by(ErrorReport::capture(&**error, |_| None))
 }
 
+/// The reasoning a model streamed with a reply, collapsed above its text.
+/// `live` while the reply is still streaming.
+#[component]
+fn MessageReasoning(message: a206_core::Message, live: bool) -> Element {
+    rsx! {
+        Reasoning { state: if live { Lifecycle::Running } else { Lifecycle::Complete },
+            p { class: "a206-message-reasoning", "{message.reasoning}" }
+            if message.reasoning_shortened {
+                Badge { tone: BadgeTone::Warning, "Reasoning was longer than a message keeps; the rest was not recorded" }
+            }
+        }
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1073,6 +1091,39 @@ mod tests {
         let mut dom = VirtualDom::new_with_props(root, Shown { thread });
         dom.rebuild_in_place();
         dioxus_ssr::render(&dom)
+    }
+
+    #[test]
+    fn reasoning_shows_collapsed_with_its_state_and_any_shortening() {
+        fn shown(message: a206_core::Message, live: bool) -> String {
+            #[derive(Props, Clone, PartialEq)]
+            struct Shown {
+                message: a206_core::Message,
+                live: bool,
+            }
+            fn root(props: Shown) -> Element {
+                rsx! { MessageReasoning { message: props.message, live: props.live } }
+            }
+            let mut dom = VirtualDom::new_with_props(root, Shown { message, live });
+            dom.rebuild_in_place();
+            dioxus_ssr::render(&dom)
+        }
+        let mut message = a206_core::Message::new(
+            Role::Assistant,
+            Uuid::new_v4().to_string(),
+            0,
+            CodingBackend::Native,
+        );
+        message.reasoning = Uuid::new_v4().to_string();
+        let live = shown(message.clone(), true);
+        assert!(live.contains(&message.reasoning), "{live}");
+        assert!(live.contains("Thinking"), "{live}");
+        assert!(!live.contains(" open"), "collapsed: {live}");
+        assert!(!live.contains("not recorded"), "{live}");
+        message.reasoning_shortened = true;
+        let settled = shown(message.clone(), false);
+        assert!(settled.contains("Thought"), "{settled}");
+        assert!(settled.contains("the rest was not recorded"), "{settled}");
     }
 
     #[test]

@@ -141,6 +141,9 @@ pub enum Progress {
     Text(String),
     /// Text appended to the reply (native provider streams).
     Delta(String),
+    /// Reasoning text appended to the reply's reasoning (native provider
+    /// streams), shown apart from the reply and never sent to a model.
+    Reasoning(String),
     Activity(String),
 }
 pub fn validate_config(config: &BackendConfig) -> Result<()> {

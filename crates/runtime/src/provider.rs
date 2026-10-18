@@ -610,16 +610,25 @@ fn price(value: Option<&Value>) -> Option<f64> {
 }
 /// The longest reply text the conversation accepts.
 pub const MAX_REPLY_TEXT: usize = 128 * 1024;
+/// The longest reasoning text a reply keeps; later reasoning is not
+/// recorded and the reply says it was shortened.
+pub const MAX_REASONING_TEXT: usize = 128 * 1024;
 /// One model response: its text, the tool calls it requested, and usage.
 #[derive(Debug)]
 pub struct Turn {
     pub text: String,
+    /// Reasoning the provider streamed beside the text, for display only.
+    pub reasoning: String,
+    /// More reasoning arrived than [`MAX_REASONING_TEXT`].
+    pub reasoning_shortened: bool,
     pub calls: Vec<crate::tool_calls::StreamedCall>,
     pub usage: Usage,
 }
 /// Generate a reply, streaming it. Each text delta is sent on `progress` as
 /// [`Progress::Delta`](crate::backends::Progress::Delta) in arrival order,
 /// after it passed every check; the returned text is their concatenation.
+/// Reasoning the provider streams is sent the same way as
+/// [`Progress::Reasoning`](crate::backends::Progress::Reasoning).
 /// An error after some deltas means the reply is incomplete, never that the
 /// partial text is the answer. `tools` are offered to the model; the calls it
 /// requests are returned, never run here.
@@ -707,6 +716,11 @@ pub async fn complete(
             }
             let mut body = json!({"systemInstruction": {"parts": [{"text": prompt}]},
                 "contents": contents });
+            // Thought summaries are returned only when asked for, and only
+            // models the API reports as thinking accept the request.
+            if info.reasoning == Some(true) {
+                body["generationConfig"] = json!({"thinkingConfig": {"includeThoughts": true}});
+            }
             if !tools.is_empty() {
                 let declarations: Vec<_> = tools
                     .iter()
@@ -960,9 +974,16 @@ impl Sink<'_> {
         // survives a failure does not depend on network read boundaries.
         let decoded = self.decoder.feed_into(bytes, &mut events);
         for event in events {
-            if let Some(delta) = self.reply.event(&event)? {
-                // A closed receiver means nobody is watching this run any
-                // more; the reply is still returned to whoever awaits it.
+            let appended = self.reply.event(&event)?;
+            // A closed receiver means nobody is watching this run any more;
+            // the reply is still returned to whoever awaits it.
+            if let Some(reasoning) = appended.reasoning {
+                self.progress
+                    .send(crate::backends::Progress::Reasoning(reasoning))
+                    .await
+                    .ignore();
+            }
+            if let Some(delta) = appended.text {
                 self.progress
                     .send(crate::backends::Progress::Delta(delta))
                     .await
@@ -1079,6 +1100,8 @@ async fn stream_brokered(
 struct StreamedReply {
     api: ProviderApi,
     text: String,
+    reasoning: String,
+    reasoning_shortened: bool,
     usage: Usage,
     /// The protocol's own end marker arrived; later events are ignored.
     ended: bool,
@@ -1094,6 +1117,8 @@ impl StreamedReply {
         Self {
             api,
             text: String::new(),
+            reasoning: String::new(),
+            reasoning_shortened: false,
             usage: Usage {
                 input_tokens: None,
                 output_tokens: None,
@@ -1105,17 +1130,18 @@ impl StreamedReply {
             markup: crate::markup::Filter::default(),
         }
     }
-    /// Apply one event and return the text it appends, if any.
-    fn event(&mut self, event: &crate::sse::Event) -> Result<Option<String>> {
+    /// Apply one event and return the text and reasoning it appends.
+    fn event(&mut self, event: &crate::sse::Event) -> Result<Appended> {
         if self.ended {
-            return Ok(None);
+            return Ok(Appended::default());
         }
         if self.api == ProviderApi::OpenAi && event.data == "[DONE]" {
             self.ended = true;
-            return Ok(None);
+            return Ok(Appended::default());
         }
         let value: Value = serde_json::from_str(&event.data).map_err(ProviderError::Event)?;
         let tokens = |pointer: &str| value.pointer(pointer).and_then(Value::as_u64);
+        let mut thought: Option<String> = None;
         let delta = match self.api {
             ProviderApi::OpenAi => {
                 if let Some(error) = value.get("error") {
@@ -1154,6 +1180,17 @@ impl StreamedReply {
                         )
                         .map_err(ProviderError::ToolCall)?;
                 }
+                // Servers name the field differently; one that sends both
+                // sends the same text twice, so only the first is kept.
+                thought = ["reasoning_content", "reasoning"]
+                    .iter()
+                    .find_map(|field| {
+                        value
+                            .pointer(&format!("/choices/0/delta/{field}"))?
+                            .as_str()
+                            .filter(|text| !text.is_empty())
+                    })
+                    .map(ToOwned::to_owned);
                 value
                     .pointer("/choices/0/delta/content")
                     .and_then(Value::as_str)
@@ -1176,6 +1213,19 @@ impl StreamedReply {
                             .ok_or(ProviderError::Malformed("text delta without text"))?
                             .to_owned(),
                     )
+                }
+                Some("content_block_delta")
+                    if value.pointer("/delta/type").and_then(Value::as_str)
+                        == Some("thinking_delta") =>
+                {
+                    thought = Some(
+                        value
+                            .pointer("/delta/thinking")
+                            .and_then(Value::as_str)
+                            .ok_or(ProviderError::Malformed("thinking delta without text"))?
+                            .to_owned(),
+                    );
+                    None
                 }
                 Some("content_block_start")
                     if value.pointer("/content_block/type").and_then(Value::as_str)
@@ -1242,7 +1292,8 @@ impl StreamedReply {
                         &["type"],
                     ));
                 }
-                // Pings, block boundaries, thinking and unknown future events.
+                // Pings, block boundaries, signatures, redacted thinking and
+                // unknown future events.
                 _ => None,
             },
             ProviderApi::Gemini => {
@@ -1284,17 +1335,39 @@ impl StreamedReply {
                         })
                         .map_err(ProviderError::ToolCall)?;
                 }
+                thought = thought_parts(parts);
                 text_parts(parts, "text", true)
             }
         };
-        let Some(delta) = delta
+        let reasoning = thought.and_then(|t| self.think(&t));
+        let text = delta
             .map(|d| self.markup.feed(&d))
-            .filter(|d| !d.is_empty())
-        else {
-            return Ok(None);
+            .filter(|d| !d.is_empty());
+        if let Some(text) = &text {
+            self.append(text)?;
+        }
+        Ok(Appended { text, reasoning })
+    }
+    /// Record streamed reasoning up to [`MAX_REASONING_TEXT`] and return
+    /// what was recorded. Reasoning beyond the limit is dropped rather than
+    /// failing a reply that is otherwise fine.
+    fn think(&mut self, text: &str) -> Option<String> {
+        if self.reasoning_shortened || text.is_empty() {
+            return None;
+        }
+        let room = MAX_REASONING_TEXT - self.reasoning.len();
+        let kept = if text.len() <= room {
+            text
+        } else {
+            self.reasoning_shortened = true;
+            let mut end = room;
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            &text[..end]
         };
-        self.append(&delta)?;
-        Ok(Some(delta))
+        self.reasoning.push_str(kept);
+        (!kept.is_empty()).then(|| kept.to_owned())
     }
     fn append(&mut self, text: &str) -> Result<()> {
         check(
@@ -1334,6 +1407,8 @@ impl StreamedReply {
         )?;
         Ok(Turn {
             text: self.text,
+            reasoning: self.reasoning,
+            reasoning_shortened: self.reasoning_shortened,
             calls: self.calls.finish().map_err(ProviderError::ToolCall)?,
             usage: self.usage,
         })
@@ -1357,6 +1432,22 @@ fn upstream_error(error: &Value, fields: &[&str]) -> ProviderError {
                     .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
         });
     ProviderError::Upstream { code }
+}
+/// Text and reasoning one stream event appended.
+#[derive(Debug, Default)]
+struct Appended {
+    text: Option<String>,
+    reasoning: Option<String>,
+}
+/// The text of Gemini thought-summary parts.
+fn thought_parts(parts: Option<&Value>) -> Option<String> {
+    let texts: Vec<_> = parts?
+        .as_array()?
+        .iter()
+        .filter(|part| part.get("thought").and_then(Value::as_bool) == Some(true))
+        .filter_map(|part| part.get("text").and_then(Value::as_str))
+        .collect();
+    (!texts.is_empty()).then(|| texts.join(""))
 }
 fn text_parts(parts: Option<&Value>, key: &str, skip_thought: bool) -> Option<String> {
     let parts = parts?.as_array()?;

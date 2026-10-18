@@ -47,7 +47,9 @@ pub use schedules::{Jobs, MAX_AGENT_JOBS};
 struct PartialReply {
     message: Option<Id>,
     text: String,
-    /// Text changed since it was last written to the thread.
+    /// Streamed reasoning, kept beside the text for display.
+    reasoning: String,
+    /// Text or reasoning changed since it was last written to the thread.
     dirty: bool,
     published: Option<tokio::time::Instant>,
 }
@@ -58,6 +60,7 @@ impl PartialReply {
         match update {
             crate::backends::Progress::Text(text) => self.text = text,
             crate::backends::Progress::Delta(delta) => self.text.push_str(&delta),
+            crate::backends::Progress::Reasoning(delta) => self.reasoning.push_str(&delta),
             crate::backends::Progress::Activity(_) => return false,
         }
         self.dirty = true;
@@ -79,7 +82,8 @@ impl PartialReply {
             .and_then(|id| thread.messages.iter_mut().find(|m| m.id == id));
         if let Some(existing) = found {
             existing.text.clone_from(&self.text);
-        } else if !self.text.is_empty() {
+            existing.reasoning.clone_from(&self.reasoning);
+        } else if !self.text.is_empty() || !self.reasoning.is_empty() {
             let id = *self.message.get_or_insert_with(Id::new_v4);
             thread.messages.push(Message {
                 id,
@@ -90,6 +94,8 @@ impl PartialReply {
                 backend: thread.backend,
                 tool_calls: vec![],
                 compaction: None,
+                reasoning: self.reasoning.clone(),
+                reasoning_shortened: false,
             });
         }
     }
@@ -101,23 +107,29 @@ impl PartialReply {
         Ok(())
     }
     /// Replace streamed text with the final reply, which always gets a
-    /// message; returns that message's ID.
-    fn finish(mut self, thread: &mut Thread, text: String) -> Id {
+    /// message; returns that message's ID. `reasoning` is the reply's final
+    /// reasoning and whether it was shortened, when the backend reports it.
+    fn finish(
+        mut self,
+        thread: &mut Thread,
+        text: String,
+        reasoning: Option<(String, bool)>,
+    ) -> Id {
         self.text = text;
+        let shortened = reasoning.as_ref().is_some_and(|(_, shortened)| *shortened);
+        if let Some((reasoning, _)) = reasoning {
+            self.reasoning = reasoning;
+        }
         let id = *self.message.get_or_insert_with(Id::new_v4);
         if !thread.messages.iter().any(|m| m.id == id) {
-            thread.messages.push(Message {
-                id,
-                role: Role::Assistant,
-                text: String::new(),
-                attachments: vec![],
-                at: now(),
-                backend: thread.backend,
-                tool_calls: vec![],
-                compaction: None,
-            });
+            let mut message = Message::new(Role::Assistant, String::new(), now(), thread.backend);
+            message.id = id;
+            thread.messages.push(message);
         }
         self.apply(thread);
+        if let Some(message) = thread.messages.iter_mut().find(|m| m.id == id) {
+            message.reasoning_shortened = shortened;
+        }
         id
     }
 }
@@ -1228,6 +1240,8 @@ impl Gateway {
                         backend: thread.backend,
                         tool_calls: vec![],
                         compaction: None,
+                        reasoning: String::new(),
+                        reasoning_shortened: false,
                     });
                     thread.state = RunState::Running;
                     thread.backend_activity = None;
@@ -1346,7 +1360,7 @@ impl Gateway {
                 let thread = store.thread_mut(id)?;
                 match result {
                     Some(Ok((text, usage))) => {
-                        partial.finish(thread, text);
+                        partial.finish(thread, text, None);
                         // A backend reports one total for its whole run.
                         thread.run_usage = Some(usage.clone());
                         thread.usage = Some(usage);
