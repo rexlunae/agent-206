@@ -161,7 +161,7 @@ fn MessengerCard(now: u64, config: MessengerConfig, status: MessengerStatus) -> 
             Checkbox { label: rsx! { "Enabled" }, checked: ReadSignal::from(enabled), onchange: { let name = name.clone(); move |on: bool| save_messenger(state, &name, |m| m.enabled = on) } }
             if let Some(report) = status.failure.clone() { ErrorNotice { report, title: if send_only { "Last message failed".to_string() } else { "Messenger failed".to_string() } } }
             if send_only {
-                p { class: "a206-muted", "Models post here with send_message once you permit that tool in a conversation, and you approve each message. Nothing is received." }
+                p { class: "a206-muted", "Models post here with send_message once you permit that tool in a conversation, and you approve each message. Nothing is received. Send test message posts \"{a206_core::messengers::TEST_MESSAGE}\" so you can check where messages arrive." }
                 Field { label: rsx! { "Message format" },
                     Select { label: name!("Message format"), value: ReadSignal::from(format_selected),
                         options: WebhookFormat::ALL.into_iter().map(|f| SelectChoice::new(f.label(), f.label())).collect(),
@@ -200,6 +200,7 @@ fn MessengerCard(now: u64, config: MessengerConfig, status: MessengerStatus) -> 
         }
         CardFooter {
             if send_only {
+                Button { variant: ButtonVariant::Secondary, availability: if config.enabled && config.credential.is_some() { Availability::Enabled } else { Availability::Disabled }, onclick: { let name = name.clone(); move |_| dispatch(state, Command::SendTestMessage { destination: name.clone() }) }, "Send test message" }
             } else if running {
                 Button { variant: ButtonVariant::Secondary, onclick: { let name = name.clone(); move |_| dispatch(state, Command::DisconnectMessenger { name: name.clone() }) }, "Disconnect" }
             } else {

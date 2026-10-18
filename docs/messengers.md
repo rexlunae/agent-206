@@ -504,6 +504,18 @@ Messengers page, whose status for a chat messenger is its connection.
 IRC and Signal chats cannot be posted to yet: they send over the running
 messenger's own connection, which the tool does not share.
 
+## Test messages
+
+To see where a messenger's posts arrive before a model uses it, the user
+sends "Test message from Agent 206." with **Send test message** on a
+webhook's card, or `agent206 messenger test NAME` (add `--chat CHAT` for an
+allowed chat of a connected messenger). It goes to the same destinations
+`send_message` offers, through the vault broker in the same way, and needs no
+conversation or model; no approval is asked because the user sent it. A
+destination that is not an enabled webhook or an allowed chat of a running
+messenger is refused. A retried request returns its first result rather than
+posting again. A webhook's card shows the outcome as for any other send.
+
 ## Interface for the run engine
 
 `a206_runtime::messengers::Host` is the boundary between a messenger and the
@@ -531,8 +543,8 @@ participant cannot approve their own request.
 - WhatsApp, Google Chat and iMessage on their own (they are reached through
   Beeper), and Teams conversations (webhooks only post to a channel).
 - Posting to IRC and Signal chats with `send_message`, a test
-  send from the Messengers page or CLI, and webhook delivery of scheduled
-  messages' replies.
+  send to a chat from the Messengers page (the CLI's `--chat` does it), and
+  webhook delivery of scheduled messages' replies.
 - Beeper attachments, reactions and replies to a specific message, the
   experimental WebSocket event stream, and remembering cursors across
   restarts.

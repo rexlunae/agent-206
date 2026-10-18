@@ -211,6 +211,10 @@ impl WebhookFormat {
     }
 }
 
+/// The text a user's test send posts, so they can see where a messenger's
+/// messages arrive before a model posts there.
+pub const TEST_MESSAGE: &str = "Test message from Agent 206.";
+
 /// Port of IRC over TLS when an `ircs://` endpoint names none.
 pub const IRCS_PORT: u16 = 6697;
 /// Port of plain IRC, accepted only on loopback.

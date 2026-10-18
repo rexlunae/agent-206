@@ -644,3 +644,60 @@ async fn a_chat_withdrawn_mid_message_gets_no_more_of_it() {
     assert_eq!(bot.posted.lock().unwrap().len(), 1);
     assert!(result.contains("1 of 2 parts"), "{result}");
 }
+
+#[tokio::test]
+async fn a_test_send_posts_once_to_an_enabled_webhook_without_a_model() {
+    let Setup {
+        gateway,
+        state: _state,
+        hooks,
+        hook,
+        key,
+        ..
+    } = setup(ProviderApi::OpenAi).await;
+    let test = a206_protocol::Request {
+        id: Id::new_v4(),
+        body: Command::SendTestMessage {
+            destination: hook.clone(),
+        },
+    };
+    assert_eq!(gateway.request(test.clone()).await.body, Reply::Ok);
+    // A retried request returns its recorded reply instead of posting again.
+    assert_eq!(gateway.request(test).await.body, Reply::Ok);
+    let delivered = hooks.received.lock().unwrap().clone();
+    let [(at, body)] = delivered.as_slice() else {
+        panic!("one message: {delivered:?}");
+    };
+    assert_eq!(at, &key);
+    assert_eq!(body["content"], messengers::TEST_MESSAGE);
+    assert_eq!(
+        gateway.snapshot().unwrap().messengers[0].state,
+        MessengerState::Ready
+    );
+
+    // A destination that is not configured, or a webhook the user
+    // disconnected, is refused and nothing more is sent.
+    let refused = |reply: Reply| match reply {
+        Reply::Error(report) => assert_eq!(report.kind, ErrorKind::NotFound, "{report:?}"),
+        reply => panic!("expected a refusal: {reply:?}"),
+    };
+    refused(
+        request(
+            &gateway,
+            Command::SendTestMessage {
+                destination: nonce(),
+            },
+        )
+        .await,
+    );
+    assert_eq!(
+        request(
+            &gateway,
+            Command::DisconnectMessenger { name: hook.clone() }
+        )
+        .await,
+        Reply::Ok
+    );
+    refused(request(&gateway, Command::SendTestMessage { destination: hook }).await);
+    assert_eq!(hooks.received.lock().unwrap().len(), 1);
+}
