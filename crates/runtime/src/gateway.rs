@@ -449,39 +449,47 @@ const REFRESH_RETRY: u64 = 300;
 /// What the request journal keeps of a command: an installed module is
 /// recorded by its SHA-256 rather than copied, which still tells a retry
 /// apart from a different request reusing its id.
-impl Gateway {
-    /// Record a newly staged image, removing the oldest staged images no
-    /// message refers to beyond [`crate::images::MAX_UNSENT`]. Removal holds
-    /// the store lock, as admitting a message does.
-    fn keep_unsent(&self, digest: &str) -> Result<()> {
-        let store = self.lock()?;
-        let referenced: BTreeSet<&str> = store
-            .state
-            .threads
-            .iter()
-            .flat_map(|t| &t.messages)
-            .flat_map(|m| &m.images)
-            .map(|i| i.digest.as_str())
-            .collect();
-        let mut staged = self.staged.lock().map_err(poisoned("staged images"))?;
-        staged.retain(|d| d != digest && !referenced.contains(d.as_str()));
-        if !referenced.contains(digest) {
-            staged.push_back(digest.to_owned());
-        }
-        while staged.len() > crate::images::MAX_UNSENT {
-            let Some(oldest) = staged.pop_front() else {
-                break;
-            };
-            // A file left behind is removed at the next start.
-            if let Err(error) = self.images.remove(&oldest) {
-                tracing::warn!(
-                    error = &error as &dyn std::error::Error,
-                    "an unsent image was not removed"
-                );
-            }
-        }
-        Ok(())
+/// Store an image and record it as staged, removing the oldest staged images
+/// no message refers to beyond [`crate::images::MAX_UNSENT`]. The staged list
+/// stays locked from writing the file to recording it, so a concurrent
+/// staging cannot remove a file this one has just confirmed; removal also
+/// holds the store lock, as admitting a message does. Blocking.
+fn stage_unsent(
+    store: &Mutex<Store>,
+    staged: &Mutex<std::collections::VecDeque<String>>,
+    images: &crate::images::Images,
+    name: &str,
+    data: &[u8],
+) -> Result<ImageAttachment> {
+    let mut staged = staged.lock().map_err(poisoned("staged images"))?;
+    let image = images.stage(name, data)?;
+    let digest = image.digest.as_str();
+    let store = store.lock().map_err(poisoned("state"))?;
+    let referenced: BTreeSet<&str> = store
+        .state
+        .threads
+        .iter()
+        .flat_map(|t| &t.messages)
+        .flat_map(|m| &m.images)
+        .map(|i| i.digest.as_str())
+        .collect();
+    staged.retain(|d| d != digest && !referenced.contains(d.as_str()));
+    if !referenced.contains(digest) {
+        staged.push_back(digest.to_owned());
     }
+    while staged.len() > crate::images::MAX_UNSENT {
+        let Some(oldest) = staged.pop_front() else {
+            break;
+        };
+        // A file left behind is removed at the next start.
+        if let Err(error) = images.remove(&oldest) {
+            tracing::warn!(
+                error = &error as &dyn std::error::Error,
+                "an unsent image was not removed"
+            );
+        }
+    }
+    Ok(image)
 }
 fn journal_form(command: &Command) -> std::borrow::Cow<'_, Command> {
     match command {
@@ -1700,10 +1708,12 @@ impl Gateway {
                 Ok(Reply::Text(String::from_utf8_lossy(&output).into_owned()))
             }
             Command::StageImage { name, data } => {
-                let images = self.images.clone();
-                let image =
-                    tokio::task::spawn_blocking(move || images.stage(&name, &data)).await??;
-                self.keep_unsent(&image.digest)?;
+                let (store, staged, images) =
+                    (self.store.clone(), self.staged.clone(), self.images.clone());
+                let image = tokio::task::spawn_blocking(move || {
+                    stage_unsent(&store, &staged, &images, &name, &data)
+                })
+                .await??;
                 Ok(Reply::Image(image))
             }
             Command::ReadImage { digest } => {
