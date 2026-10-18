@@ -258,29 +258,13 @@ impl Repository {
     /// API is `api`.
     pub fn new(api: &ForgeApi, remote: &Url) -> Result<Self, ForgeError> {
         let base = api_url(&api.api)?;
-        let mut path: Vec<String> = remote
-            .path_segments()
-            .into_iter()
-            .flatten()
-            .filter(|segment| !segment.is_empty())
-            .map(|segment| {
-                // Not UTF-8 leaves it empty, which is refused below.
-                percent_encoding::percent_decode_str(segment)
-                    .decode_utf8()
-                    .map_or_else(|_| String::new(), |decoded| decoded.into_owned())
-            })
-            .collect();
+        let mut path = decoded_segments(remote);
         // A forge served under a path prefix has it in both addresses
         // (`https://host/gitlab/group/project.git` and
         // `https://host/gitlab/api/v4`); it is not part of the project.
         if remote.origin() == base.origin() {
-            let api_path: Vec<&str> = base
-                .path_segments()
-                .into_iter()
-                .flatten()
-                .filter(|segment| !segment.is_empty())
-                .collect();
-            if let Some(at) = api_path.iter().rposition(|segment| *segment == "api") {
+            let api_path = decoded_segments(&base);
+            if let Some(at) = api_path.iter().rposition(|segment| segment == "api") {
                 let prefix = &api_path[..at];
                 if path.len() > prefix.len() && path.iter().zip(prefix).all(|(a, b)| a == b) {
                     path.drain(..prefix.len());
@@ -420,6 +404,21 @@ impl Repository {
         // A base that cannot take a path was refused by `api_url`.
         url
     }
+}
+
+/// The non-empty segments of `url`'s path, percent-decoded; one that is not
+/// UTF-8 is left empty, which [`Repository::new`] refuses.
+fn decoded_segments(url: &Url) -> Vec<String> {
+    url.path_segments()
+        .into_iter()
+        .flatten()
+        .filter(|segment| !segment.is_empty())
+        .map(|segment| {
+            percent_encoding::percent_decode_str(segment)
+                .decode_utf8()
+                .map_or_else(|_| String::new(), |decoded| decoded.into_owned())
+        })
+        .collect()
 }
 
 /// `text` without control characters other than line breaks and tabs, cut

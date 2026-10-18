@@ -68,6 +68,17 @@ fn remotes_name_repositories_in_each_forges_shape() {
         repository.pull_request_url(3).path(),
         format!("/gitlab/api/v4/projects/{group}%2F{name}/merge_requests/3")
     );
+    // An escaped prefix matches the same prefix in the remote.
+    let escaped = api(
+        ForgeKind::GitLab,
+        "https://forge.example/my%20gitlab/api/v4",
+    );
+    let repository = Repository::new(
+        &escaped,
+        &remote(&format!("/my%20gitlab/{group}/{name}.git")),
+    )
+    .unwrap();
+    assert_eq!(repository.name(), format!("{group}/{name}"));
     // Only on the API's own host, and never the whole path.
     let elsewhere =
         Url::parse(&format!("https://{}.example/gitlab/{group}/{name}", word())).unwrap();
