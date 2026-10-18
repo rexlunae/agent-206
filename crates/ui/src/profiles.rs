@@ -140,7 +140,11 @@ pub(crate) fn Delegate(thread: Uuid) -> Element {
         }
         Button { size: ButtonSize::Sm, variant: ButtonVariant::Secondary, disabled: request.is_none(), onclick: move |_| {
             if let Some((mode, model)) = request.clone() {
-                dispatch(state, Command::CreateSubagent { parent: thread, title: title.clone(), mode, model, requested: Default::default(), profile: id.clone() });
+                let command = match id.clone() {
+                    Some(profile) => Command::CreateProfileSubagent { parent: thread, title: title.clone(), mode, model, requested: Default::default(), profile },
+                    None => Command::CreateSubagent { parent: thread, title: title.clone(), mode, model, requested: Default::default() },
+                };
+                dispatch(state, command);
             }
         }, "Create delegated conversation" }
     } }

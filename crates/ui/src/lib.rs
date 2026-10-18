@@ -398,7 +398,9 @@ fn store_web_session(token: &str) -> Result<(), String> {
 pub(crate) fn dispatch(mut state: State, command: Command) {
     let navigate = matches!(
         command,
-        Command::CreateThread { .. } | Command::CreateSubagent { .. }
+        Command::CreateThread { .. }
+            | Command::CreateSubagent { .. }
+            | Command::CreateProfileSubagent { .. }
     );
     spawn(async move {
         let mut destination = None;

@@ -1,5 +1,9 @@
 # Agent profiles
 
+Profile-based delegation uses the distinct `CreateProfileSubagent` command.
+Older gateways refuse it; they cannot silently ignore a profile's policy as an
+unknown optional field. Ordinary `CreateSubagent` remains wire compatible.
+
 An agent profile is a named, reusable preset for subagents: a mode, a model, the
 most capabilities to give and instructions added to the subagent's prompt. It is
 Agent 206's counterpart to RustyClaw's named agent registry (`agents.rs`,

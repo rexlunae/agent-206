@@ -311,16 +311,24 @@ impl Delegator {
         spawn: Spawn,
         withheld: &[&str],
     ) -> Result<Child, ErrorReport> {
-        let reply = self
-            .request(Command::CreateSubagent {
+        let command = match spawn.profile {
+            Some(profile) => Command::CreateProfileSubagent {
                 parent: caller,
                 title: spawn.title,
                 mode: spawn.mode,
                 model: spawn.model,
                 requested: spawn.requested,
-                profile: spawn.profile,
-            })
-            .await?;
+                profile,
+            },
+            None => Command::CreateSubagent {
+                parent: caller,
+                title: spawn.title,
+                mode: spawn.mode,
+                model: spawn.model,
+                requested: spawn.requested,
+            },
+        };
+        let reply = self.request(command).await?;
         let Reply::Thread(thread) = reply else {
             return Err(crate::error::report(&GatewayError::Invalid(
                 "unexpected reply to CreateSubagent",

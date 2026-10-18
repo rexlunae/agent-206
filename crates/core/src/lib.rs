@@ -1016,11 +1016,16 @@ pub enum Command {
         mode: Mode,
         model: ModelKey,
         requested: BTreeSet<Capability>,
-        /// Start from this agent profile: its mode and model must match,
-        /// its capabilities narrow `requested`, and its instructions join
-        /// the subagent's prompt.
-        #[serde(default)]
-        profile: Option<String>,
+    },
+    /// Create with enforced profile constraints. A distinct opcode ensures an
+    /// older gateway refuses rather than ignoring an optional policy field.
+    CreateProfileSubagent {
+        parent: Id,
+        title: String,
+        mode: Mode,
+        model: ModelKey,
+        requested: BTreeSet<Capability>,
+        profile: String,
     },
     Events {
         after: u64,
@@ -1199,6 +1204,7 @@ impl Command {
             Self::AnswerPrompt { .. } => "answer_prompt",
             Self::CreateProject { .. } => "create_project",
             Self::CreateSubagent { .. } => "create_subagent",
+            Self::CreateProfileSubagent { .. } => "create_profile_subagent",
             Self::Events { .. } => "events",
             Self::Download { .. } => "download",
             Self::CancelDownload { .. } => "cancel_download",
@@ -1530,6 +1536,47 @@ pub enum VaultReply {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn profile_creation_is_refused_by_gateways_without_profile_policy() {
+        #[derive(Serialize, Deserialize)]
+        enum LegacyCommand {
+            CreateSubagent {
+                parent: Id,
+                title: String,
+                mode: Mode,
+                model: ModelKey,
+                requested: BTreeSet<Capability>,
+            },
+        }
+        let parent = Id::new_v4();
+        let model = ModelKey {
+            provider: Id::new_v4(),
+            model: Id::new_v4().to_string(),
+        };
+        let title = Id::new_v4().to_string();
+        let legacy = LegacyCommand::CreateSubagent {
+            parent,
+            title: title.clone(),
+            mode: Mode::Plan,
+            model: model.clone(),
+            requested: BTreeSet::new(),
+        };
+        let bytes = rmp_serde::to_vec_named(&legacy).unwrap();
+        assert!(
+            matches!(rmp_serde::from_slice::<Command>(&bytes).unwrap(), Command::CreateSubagent { parent: found, .. } if found == parent)
+        );
+        let command = Command::CreateProfileSubagent {
+            parent,
+            title,
+            mode: Mode::Plan,
+            model,
+            requested: BTreeSet::new(),
+            profile: Id::new_v4().to_string(),
+        };
+        let bytes = rmp_serde::to_vec_named(&command).unwrap();
+        assert_eq!(rmp_serde::from_slice::<Command>(&bytes).unwrap(), command);
+        assert!(rmp_serde::from_slice::<LegacyCommand>(&bytes).is_err());
+    }
     #[test]
     fn settings_saved_before_later_sections_still_load() {
         let mut table: toml::Table = toml::from_str(

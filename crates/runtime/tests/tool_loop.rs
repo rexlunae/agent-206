@@ -835,7 +835,6 @@ async fn delegated_conversations_cannot_permit_more_than_their_parent() {
             mode: Mode::Chat,
             model: rig.model.clone(),
             requested: Default::default(),
-            profile: None,
         })
         .await
     else {
@@ -896,7 +895,6 @@ async fn delegate(rig: &mut Rig, mode: Mode, requested: &[Capability], tool: &st
             mode,
             model: rig.model.clone(),
             requested: requested.iter().copied().collect(),
-            profile: None,
         })
         .await
     else {
@@ -2203,13 +2201,13 @@ async fn a_subagent_started_from_a_profile_takes_its_mode_model_and_instructions
 
     // The same checks hold for a client's CreateSubagent.
     let refused = rig
-        .run(Command::CreateSubagent {
+        .run(Command::CreateProfileSubagent {
             parent: rig.thread,
             title: nonce(),
             mode: Mode::Code,
             model: rig.model.clone(),
             requested: Default::default(),
-            profile: Some(id.into()),
+            profile: id.into(),
         })
         .await;
     let Reply::Error(report) = refused else {
@@ -2716,7 +2714,6 @@ async fn a_subagents_token_budget_stays_within_its_parents() {
             mode: Mode::Chat,
             model: rig.model.clone(),
             requested: Default::default(),
-            profile: None,
         })
         .await
     else {

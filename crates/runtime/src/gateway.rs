@@ -1409,45 +1409,38 @@ impl Gateway {
                 mode,
                 model,
                 requested,
+            } => {
+                self.create_subagent(
+                    parent,
+                    Spawn {
+                        title,
+                        mode,
+                        model,
+                        requested,
+                        profile: None,
+                    },
+                )
+                .await
+            }
+            Command::CreateProfileSubagent {
+                parent,
+                title,
+                mode,
+                model,
+                requested,
                 profile,
             } => {
-                let profile = match profile {
-                    Some(id) => Some(self.agent_profile(id).await?),
-                    None => None,
-                };
-                let mut store = self.lock()?;
-                validate_model(&store.state, &model)?;
-                let parent_thread = store.thread(parent)?.clone();
-                check(
-                    parent_thread.subagent_models.contains(&model),
-                    GatewayError::Denied("model is not permitted for this thread's subagents"),
-                )?;
-                let requested = match &profile {
-                    Some(profile) => crate::agent_profiles::admit(
-                        profile,
+                self.create_subagent(
+                    parent,
+                    Spawn {
+                        title,
                         mode,
-                        &model,
-                        &store.state.settings.providers,
+                        model,
                         requested,
-                    )?,
-                    None => requested,
-                };
-                let mut thread = Thread::new(title, mode);
-                thread.project = parent_thread.project;
-                thread.parent = Some(parent);
-                thread.model = Some(model.clone());
-                thread.profile = profile.as_ref().map(|p| Box::new(p.into()));
-                thread.grant = parent_thread.grant.attenuate(
-                    mode,
-                    &Grant {
-                        capabilities: requested,
-                        models: [model].into(),
+                        profile: Some(profile),
                     },
-                    &mode.ceiling(),
-                );
-                store.state.threads.push(thread.clone());
-                store.persist(Some(EventKind::ThreadCreated { id: thread.id }))?;
-                Ok(Reply::Thread(Box::new(thread)))
+                )
+                .await
             }
             Command::Download {
                 url,
