@@ -117,6 +117,16 @@ impl Gateway {
         Ok(Reply::Ok)
     }
 
+    /// See [`Command::JobRuns`].
+    pub(super) fn job_runs(&self, id: Id) -> Result<Reply> {
+        let store = self.lock()?;
+        check(
+            store.state.jobs.iter().any(|job| job.id == id),
+            GatewayError::NotFound("scheduled message not found"),
+        )?;
+        Ok(Reply::JobRuns(store.job_runs(id)?))
+    }
+
     /// Run a job now, leaving its schedule as it is.
     pub(super) fn run_job(&self, id: Id) -> Result<Reply> {
         let at = now();
@@ -155,12 +165,12 @@ impl Gateway {
                     job.next = None;
                     job.enabled = false;
                     job.last = Some(JobRun {
-                        id: Id::new_v4(),
-                        at: now,
                         outcome: JobOutcome::Refused(crate::error::handle(
                             "schedule_job",
                             &GatewayError::from(error),
                         )),
+                        ended: Some(now),
+                        ..JobRun::start(now)
                     });
                     due.push(job.clone());
                 }
@@ -268,8 +278,12 @@ impl Gateway {
             return Ok(());
         };
         match &mut job.last {
-            Some(last) if last.id == run => last.outcome = outcome,
-            _ => return Ok(()),
+            Some(last) if last.id == run => {
+                last.outcome = outcome;
+                last.ended = Some(now());
+            }
+            // A newer run is the latest; this one ends in the history only.
+            _ => return Ok(store.settle_run(run, outcome, now())?),
         }
         store.persist(Some(EventKind::JobChanged { id }))?;
         Ok(())

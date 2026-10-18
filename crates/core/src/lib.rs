@@ -1208,6 +1208,11 @@ pub enum Command {
     RunJob {
         id: Id,
     },
+    /// A job's latest runs, newest first: up to
+    /// [`schedule::MAX_JOB_RUNS`], kept while the job exists.
+    JobRuns {
+        id: Id,
+    },
     /// Add a message to `thread`'s running native run. The run reads it
     /// before its next model request, after any tool calls in progress, and
     /// continues instead of ending while one waits. Refused when no native
@@ -1291,6 +1296,7 @@ impl Command {
             Self::SetJobEnabled { .. } => "set_job_enabled",
             Self::RemoveJob { .. } => "remove_job",
             Self::RunJob { .. } => "run_job",
+            Self::JobRuns { .. } => "job_runs",
             Self::Steer { .. } => "steer",
             Self::PauseRun { .. } => "pause_run",
             Self::ResumeRun { .. } => "resume_run",
@@ -1322,6 +1328,7 @@ pub enum Reply {
     Activity(ActivityPage),
     Extension(Box<PluginSummary>),
     Job(Box<Job>),
+    JobRuns(Vec<JobRun>),
 }
 impl Reply {
     /// Separate a gateway-reported failure from a successful reply.

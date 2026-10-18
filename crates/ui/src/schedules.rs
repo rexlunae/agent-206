@@ -1,10 +1,11 @@
 //! Scheduled messages: text the gateway sends to a conversation at set times.
 //! The same gateway commands as `agent206 schedule`; a job carries no
 //! authority of its own and runs under its conversation's permissions.
-use crate::{PageFrame, State, dispatch, error::ErrorNotice, route::Route};
+use crate::{PageFrame, State, call, dispatch, error::ErrorNotice, route::Route};
 use a206_core::{
-    Command, Job, JobAuthor, JobKind, JobOutcome, Schedule, ScheduleInputError, Snapshot,
-    schedule::{format_interval, parse_interval, parse_local},
+    Command, ErrorKind, ErrorReport, Job, JobAuthor, JobKind, JobOutcome, JobRun, Reply, Schedule,
+    ScheduleInputError, Snapshot,
+    schedule::{MAX_JOB_RUNS, format_interval, parse_interval, parse_local},
 };
 use fc_dioxus::prelude::*;
 use jiff::{Timestamp, tz::TimeZone};
@@ -68,6 +69,15 @@ fn outcome(outcome: &JobOutcome, kind: JobKind) -> (BadgeTone, &'static str) {
     }
 }
 
+/// How one run in a job's history went. A run shown as running that is not
+/// the job's current run ended while the gateway was stopped, unrecorded.
+fn run_outcome(run: &JobRun, kind: JobKind, current: Option<Uuid>) -> (BadgeTone, &'static str) {
+    if run.outcome == JobOutcome::Running && current != Some(run.id) {
+        return (BadgeTone::Neutral, "Ended; result not recorded");
+    }
+    outcome(&run.outcome, kind)
+}
+
 fn title(snapshot: &Snapshot, thread: Uuid) -> Option<String> {
     snapshot
         .threads
@@ -97,6 +107,7 @@ fn JobCard(job: Job, conversation: Option<String>) -> Element {
     let state = use_context::<State>();
     let zone = TimeZone::system();
     let id = job.id;
+    let mut history = use_signal(|| false);
     let author = match job.author {
         JobAuthor::User => "Added by you",
         JobAuthor::Agent { .. } => "Added by the conversation's model, with your approval",
@@ -128,13 +139,80 @@ fn JobCard(job: Job, conversation: Option<String>) -> Element {
                 } }
                 if let JobOutcome::Refused(report) = &last.outcome { ErrorNotice { report: report.clone(), title: "The latest run was not sent".to_string() } }
             }
+            if history() { JobHistory { job: job.clone() } }
         }
         CardFooter {
             Button { variant: ButtonVariant::Secondary, onclick: move |_| dispatch(state, Command::SetJobEnabled { id, enabled: !job.enabled }), if job.enabled { "Pause" } else { "Resume" } }
             Button { variant: ButtonVariant::Secondary, onclick: move |_| dispatch(state, Command::RunJob { id }), "Run now" }
+            Button { variant: ButtonVariant::Ghost, onclick: move |_| history.toggle(), if history() { "Hide run history" } else { "Run history" } }
             Button { variant: ButtonVariant::Ghost, onclick: move |_| dispatch(state, Command::RemoveJob { id }), "Remove" }
         }
     } }
+}
+
+async fn load_runs(id: Uuid) -> Result<Vec<JobRun>, ErrorReport> {
+    match call(Command::JobRuns { id }).await? {
+        Reply::JobRuns(runs) => Ok(runs),
+        Reply::Error(report) => Err(report),
+        _ => Err(ErrorReport::new(
+            ErrorKind::Protocol,
+            "gateway did not list the job's runs",
+        )),
+    }
+}
+
+/// A job's latest runs, newest first, as the gateway keeps them.
+#[component]
+fn JobHistory(job: Job) -> Element {
+    let id = job.id;
+    let mut runs = use_signal(|| None::<Vec<JobRun>>);
+    let mut failure = use_signal(|| None::<ErrorReport>);
+    let reload = move || {
+        spawn(async move {
+            match load_runs(id).await {
+                Ok(list) => {
+                    failure.set(None);
+                    runs.set(Some(list));
+                }
+                Err(report) => failure.set(Some(report)),
+            }
+        });
+    };
+    use_hook(reload);
+    rsx! { div { class: "a206-stack",
+        if let Some(report) = failure() { ErrorNotice { report, title: "Run history unavailable".to_string(), dismiss: move |_| failure.set(None) } }
+        match runs() {
+            None if failure().is_none() => rsx! { p { class: "a206-muted", "Loading run history…" } },
+            None => rsx! {},
+            Some(list) => rsx! { RunList { runs: list, kind: job.kind, current: job.last.as_ref().map(|run| run.id) } },
+        }
+        div { Button { size: ButtonSize::Sm, variant: ButtonVariant::Ghost, onclick: move |_| reload(), "Refresh run history" } }
+    } }
+}
+
+#[component]
+fn RunList(runs: Vec<JobRun>, kind: JobKind, current: Option<Uuid>) -> Element {
+    let zone = TimeZone::system();
+    if runs.is_empty() {
+        return rsx! { p { class: "a206-muted", "It has not run yet." } };
+    }
+    rsx! {
+        p { class: "a206-muted", "The gateway keeps the latest {MAX_JOB_RUNS} runs of each scheduled message, newest first." }
+        ul { class: "a206-stack",
+            for run in runs {
+                li { key: "{run.id}",
+                    { let (tone, label) = run_outcome(&run, kind, current); rsx! {
+                        div { class: "a206-row",
+                            span { "{show_time(run.at, &zone)}" }
+                            Badge { tone, "{label}" }
+                            if let Some(ended) = run.ended { span { class: "a206-muted", "took {format_interval(ended.saturating_sub(run.at))}" } }
+                        }
+                    } }
+                    if let JobOutcome::Refused(report) = &run.outcome { ErrorNotice { report: report.clone(), title: "Not sent".to_string() } }
+                }
+            }
+        }
+    }
 }
 
 /// How the form's job repeats.

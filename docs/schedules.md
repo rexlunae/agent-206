@@ -69,7 +69,8 @@ the system) pauses the job and records why.
   jobs; `kind` is `Message` (the default) or `Heartbeat`, which takes no text.
 - `SetJobEnabled { id, enabled }` pauses or resumes it.
 - `RunJob { id }` runs it now and leaves its schedule as it is.
-- `RemoveJob { id }` deletes it; its conversation keeps what it sent.
+- `RemoveJob { id }` deletes it and its run history; its conversation keeps what it sent.
+- `JobRuns { id }` lists the job's latest runs, newest first (`Reply::JobRuns`).
 
 Jobs are in `Snapshot::jobs`, and each change publishes `JobChanged { id }`.
 `Job::last` records the latest run, with its own ID so a late result of an
@@ -77,12 +78,27 @@ earlier run never replaces a newer one: `Running`, `Complete`, `Failed` (the
 conversation shows the failure), `Cancelled`, `Quiet` (a heartbeat check that
 found nothing needing attention) or `Refused` with the gateway's
 report when the message was not run, for example because the conversation was
-busy or had no model.
+busy or had no model. `JobRun::ended` is when the run ended (`None` while it
+runs, or when the gateway was stopped before it saw the end).
+
+## Run history
+
+The gateway keeps each job's latest 50 runs (`schedule::MAX_JOB_RUNS`) in a
+`job_runs` table of its state database, beside the snapshot. Every change to a
+job's latest run is written in the same transaction as the snapshot that shows
+it, so the history and `Job::last` never disagree. A run that a newer one
+replaced as the latest still records how it ended. Older runs are dropped as
+new ones start, and removing the job removes its history. A run the history
+shows as running that is not the job's latest ended while the gateway was
+stopped, and the page labels it as such rather than guessing an outcome.
+`JobRuns` is read-only and not journaled. RustyClaw keeps an unbounded
+per-job JSON Lines file (`cron.rs` `record_run`/`get_runs`); here the history
+is bounded and lives in the same database as the jobs.
 
 CLI: `agent206 schedule list`, `schedule add THREAD --name N --text T` (or
 `--heartbeat` instead of `--text`) with one
 of `--at RFC3339`, `--in 90m`, `--every 90m [--anchor RFC3339]` or `--cron EXPR [--zone Z]`,
-and `schedule pause|resume|run|remove ID`. Times and intervals are parsed by
+and `schedule pause|resume|run|runs|remove ID` (`runs` prints the job's run history as TOML). Times and intervals are parsed by
 `a206_core::schedule::{parse_instant, parse_interval}`, shared with the page below.
 
 ## Schedules page
@@ -90,7 +106,7 @@ and `schedule pause|resume|run|remove ID`. Times and intervals are parsed by
 Desktop, TUI and web share the Schedules page (`/schedules`, `crates/ui/src/schedules.rs`).
 It lists every job, soonest first, with its conversation, what its schedule means,
 who added it, its next time and its latest run (a refusal shows the gateway's
-report; a heartbeat check shows whether anything needed attention), and offers Pause/Resume, Run now and Remove. Its form sends `ScheduleJob`
+report; a heartbeat check shows whether anything needed attention), and offers Pause/Resume, Run now, Run history (its latest runs with outcomes, how long each took and any refusal) and Remove. Its form sends `ScheduleJob`
 with a message or a heartbeat check:
 once at a date and time in an IANA zone (prefilled with the client's own zone;
 `parse_local` moves a time a clock change skips forward by the gap and takes the

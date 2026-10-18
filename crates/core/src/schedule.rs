@@ -108,6 +108,10 @@ pub struct JobRun {
     /// Unix seconds.
     pub at: u64,
     pub outcome: JobOutcome,
+    /// When the run ended, in Unix seconds; `None` while it runs, and for a
+    /// run whose end the gateway did not see (it was stopped meanwhile).
+    #[serde(default)]
+    pub ended: Option<u64>,
 }
 impl JobRun {
     /// A run starting at `at`.
@@ -116,9 +120,13 @@ impl JobRun {
             id: Id::new_v4(),
             at,
             outcome: JobOutcome::Running,
+            ended: None,
         }
     }
 }
+
+/// Most runs of one job the gateway keeps in its history.
+pub const MAX_JOB_RUNS: usize = 50;
 
 /// A message the gateway sends to `thread` on `schedule`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

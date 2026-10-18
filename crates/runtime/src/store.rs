@@ -1,6 +1,6 @@
 //! SQLite WAL snapshot, event journal and durable request deduplication.
 use crate::provider::now;
-use a206_core::*;
+use a206_core::{schedule::MAX_JOB_RUNS, *};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::path::{Path, PathBuf};
 
@@ -87,7 +87,9 @@ impl Store {
             CREATE TABLE IF NOT EXISTS snapshot(id INTEGER PRIMARY KEY CHECK(id=1), payload BLOB NOT NULL);
             CREATE TABLE IF NOT EXISTS events(seq INTEGER PRIMARY KEY AUTOINCREMENT, payload BLOB NOT NULL);
             CREATE TABLE IF NOT EXISTS requests(id TEXT PRIMARY KEY, request BLOB NOT NULL, reply BLOB);
-            CREATE TABLE IF NOT EXISTS extension_state(extension TEXT NOT NULL, key TEXT NOT NULL, value BLOB NOT NULL, PRIMARY KEY(extension, key));")?;
+            CREATE TABLE IF NOT EXISTS extension_state(extension TEXT NOT NULL, key TEXT NOT NULL, value BLOB NOT NULL, PRIMARY KEY(extension, key));
+            CREATE TABLE IF NOT EXISTS job_runs(seq INTEGER PRIMARY KEY AUTOINCREMENT, job TEXT NOT NULL, run TEXT NOT NULL UNIQUE, payload BLOB NOT NULL);
+            CREATE INDEX IF NOT EXISTS job_runs_by_job ON job_runs(job, seq);")?;
         let data: Option<Vec<u8>> = db
             .query_row("SELECT payload FROM snapshot WHERE id=1", [], |row| {
                 row.get(0)
@@ -193,6 +195,12 @@ impl Store {
                 ));
             }
         }
+        // Recovery settled interrupted runs; their history follows.
+        let tx = store.db.transaction()?;
+        for job in &store.state.jobs {
+            record_run(&tx, &store.state, job.id)?;
+        }
+        tx.commit()?;
         store.persist(None)?;
         Ok(store)
     }
@@ -223,6 +231,10 @@ impl Store {
         }
         let tx = self.db.transaction()?;
         if let Some(kind) = kind {
+            let job = match kind {
+                EventKind::JobChanged { id } => Some(id),
+                _ => None,
+            };
             let seq = self.state.last_event + 1;
             let event = Event {
                 sequence: seq,
@@ -238,9 +250,46 @@ impl Store {
                 "DELETE FROM events WHERE seq < ?1",
                 [seq.saturating_sub(10_000)],
             )?;
+            // Every change to a job's latest run publishes this, so its
+            // history commits with the snapshot that shows it.
+            if let Some(job) = job {
+                record_run(&tx, &self.state, job)?;
+            }
         }
         tx.execute("INSERT INTO snapshot(id,payload) VALUES(1,?1) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload", [rmp_serde::to_vec_named(&self.state)?])?;
         tx.commit()?;
+        Ok(())
+    }
+    /// See [`Command::JobRuns`](a206_core::Command::JobRuns).
+    pub fn job_runs(&self, job: Id) -> Result<Vec<JobRun>> {
+        let mut stmt = self
+            .db
+            .prepare("SELECT payload FROM job_runs WHERE job=?1 ORDER BY seq DESC LIMIT ?2")?;
+        let rows = stmt.query_map(params![job.to_string(), MAX_JOB_RUNS], |row| {
+            row.get::<_, Vec<u8>>(0)
+        })?;
+        rows.map(|r| Ok(rmp_serde::from_slice(&r?)?)).collect()
+    }
+    /// Record how an earlier run, no longer its job's latest, ended.
+    pub fn settle_run(&self, run: Id, outcome: JobOutcome, ended: u64) -> Result<()> {
+        let key = run.to_string();
+        let payload: Option<Vec<u8>> = self
+            .db
+            .query_row("SELECT payload FROM job_runs WHERE run=?1", [&key], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        // Pruned from the history meanwhile.
+        let Some(payload) = payload else {
+            return Ok(());
+        };
+        let mut settled: JobRun = rmp_serde::from_slice(&payload)?;
+        settled.outcome = outcome;
+        settled.ended = Some(ended);
+        self.db.execute(
+            "UPDATE job_runs SET payload=?1 WHERE run=?2",
+            params![rmp_serde::to_vec_named(&settled)?, key],
+        )?;
         Ok(())
     }
     pub fn events(&self, after: u64) -> Result<Vec<Event>> {
@@ -424,6 +473,28 @@ fn bundled_plugins(previous: &[PluginSummary]) -> Result<Vec<PluginSummary>> {
         .collect();
     plugins.extend(installed);
     Ok(plugins)
+}
+
+/// Keep `job`'s latest run in its history, which holds its newest
+/// [`MAX_JOB_RUNS`] runs; a removed job's history goes with it.
+fn record_run(tx: &rusqlite::Transaction<'_>, state: &Snapshot, job: Id) -> Result<()> {
+    let key = job.to_string();
+    let Some(found) = state.jobs.iter().find(|j| j.id == job) else {
+        tx.execute("DELETE FROM job_runs WHERE job=?1", [&key])?;
+        return Ok(());
+    };
+    let Some(run) = &found.last else {
+        return Ok(());
+    };
+    tx.execute(
+        "INSERT INTO job_runs(job,run,payload) VALUES(?1,?2,?3) ON CONFLICT(run) DO UPDATE SET payload=excluded.payload",
+        params![key, run.id.to_string(), rmp_serde::to_vec_named(run)?],
+    )?;
+    tx.execute(
+        "DELETE FROM job_runs WHERE job=?1 AND seq NOT IN (SELECT seq FROM job_runs WHERE job=?1 ORDER BY seq DESC LIMIT ?2)",
+        params![key, MAX_JOB_RUNS],
+    )?;
+    Ok(())
 }
 
 #[cfg(test)]
