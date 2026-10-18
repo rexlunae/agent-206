@@ -2,6 +2,7 @@
 //! vault broker. Secret-bearing fields use [`WireSecret`], which zeroizes and
 //! never prints its value.
 use a206_vault::{AccessPolicy, CredentialMeta, CredentialValue, Secret};
+pub use a206_vault_channel::IMPORT_REVIEW_VERSION as IMPORT_REVIEW_SCHEMA_VERSION;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::BTreeMap;
 use zeroize::Zeroizing;
@@ -16,13 +17,16 @@ use zeroize::Zeroizing;
 /// [`Request::ImportVault`], version 6 [`AuthScheme::TelegramBot`] and
 /// version 7 [`HttpMethod::Put`], version 8 [`Request::SocketOpen`] with
 /// [`AuthScheme::DiscordBot`], version 9 [`SocketScheme::IrcSasl`], and version
-/// 10 encrypted setup channels and TOTP cancellation. A broker accepts greetings from
+/// 10 encrypted setup channels and TOTP cancellation, and 11 reviewed vault
+/// imports. A broker accepts greetings from
 /// [`MIN_BROKER_VERSION`] up to this version, and a client falls back to the
 /// newest version an older broker accepts (see `Client::version`), so streams
 /// are only requested from brokers that understand them.
-pub const BROKER_VERSION: u16 = 10;
+pub const BROKER_VERSION: u16 = 11;
+/// First version with connection-held source reviews and guarded vault import.
+pub const REVIEWED_IMPORT_VERSION: u16 = 11;
 /// The oldest protocol version this broker still serves and this client still
-/// speaks. Versions 3 to 10 differ only by the requests, roles and schemes they add.
+/// speaks. Versions 3 to 11 differ only by the requests, roles and schemes they add.
 pub const MIN_BROKER_VERSION: u16 = 3;
 /// The first version that serves [`Request::ProviderStream`].
 pub const STREAM_VERSION: u16 = 4;
@@ -272,6 +276,19 @@ pub struct ProviderCall {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Request {
+    ReviewVaultImport {
+        version: u16,
+        source: std::path::PathBuf,
+    },
+    ApplyVaultImport {
+        version: u16,
+        review: uuid::Uuid,
+        password: WireSecret,
+        totp: Option<WireSecret>,
+    },
+    CancelVaultImport {
+        version: u16,
+    },
     /// Must be the first message on every connection.
     Hello {
         role: Role,
@@ -402,6 +419,10 @@ pub struct BrokerStatus {
 /// is flattened to a string before it reaches the client or tracing.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
 pub enum BrokerError {
+    #[error("vault import review is unavailable; preview the source again")]
+    ImportReviewUnavailable,
+    #[error("source vault changed; preview it again before importing")]
+    ImportSourceChanged,
     #[error("encrypted vault channel failed")]
     Channel(#[source] a206_core::ErrorReport),
     #[error("the vault is locked")]
@@ -523,6 +544,7 @@ pub enum UpstreamFailure {
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Reply {
     Ok,
+    VaultImportReview(a206_vault_channel::ImportReview),
     ChannelKey(Vec<u8>),
     ChannelOpened(#[serde(with = "serde_bytes")] Vec<u8>),
     ChannelMessage(#[serde(with = "serde_bytes")] Vec<u8>),

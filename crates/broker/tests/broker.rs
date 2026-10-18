@@ -1199,7 +1199,7 @@ async fn scripted_broker(version: u16, frames: Vec<Reply>) -> tempfile::TempDir 
 
 #[tokio::test]
 async fn old_pairing_status_is_unknown_until_the_broker_can_report_a_proven_holder() {
-    for version in [7, 8, 9, BROKER_VERSION] {
+    for version in [7, 8, 9, 10, BROKER_VERSION] {
         let broker = scripted_broker(
             version,
             vec![Reply::Status(BrokerStatus {
@@ -1216,7 +1216,7 @@ async fn old_pairing_status_is_unknown_until_the_broker_can_report_a_proven_hold
         let observed = status(&mut client).await;
         assert_eq!(
             observed.gateway_paired,
-            if version == BROKER_VERSION {
+            if version >= SETUP_CHANNEL_VERSION {
                 Some(true)
             } else {
                 None
@@ -2268,5 +2268,301 @@ async fn relay_cannot_replace_an_authenticated_channel_or_replay_messages() {
         matches!(secure_call(&mut fresh, &mut other, Q::PairGateway).await, a206_vault_channel::Reply::Error(e) if e.code == a206_vault_channel::Code::StepUpRequired)
     );
     user(&root).await.call(Request::Shutdown).await.unwrap();
+    task.await.unwrap();
+}
+
+fn migration_source() -> (tempfile::TempDir, PathBuf, String, String) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("secrets.json");
+    let password = random();
+    let value = random();
+    let mut source = a206_vault::Vault::locked(path.clone());
+    source
+        .unlock(&a206_vault::Secret::new(password.clone()))
+        .unwrap();
+    let mut policy = meta(vec![]);
+    policy.policy = AccessPolicy::SkillOnly(vec![random()]);
+    policy.disabled = true;
+    source
+        .put_credential(
+            &random(),
+            &policy,
+            a206_vault::CredentialValue::Single(a206_vault::Secret::new(value.clone())),
+        )
+        .unwrap();
+    (dir, path, password, value)
+}
+fn migration_preview(source: PathBuf) -> Request {
+    Request::ReviewVaultImport {
+        version: a206_vault_channel::IMPORT_REVIEW_VERSION,
+        source,
+    }
+}
+fn migration_apply(review: uuid::Uuid, password: &str) -> Request {
+    Request::ApplyVaultImport {
+        version: a206_vault_channel::IMPORT_REVIEW_VERSION,
+        review,
+        password: WireSecret::new(password.into()),
+        totp: None,
+    }
+}
+async fn migration_review(client: &mut Client, source: &Path) -> a206_vault_channel::ImportReview {
+    match client
+        .call(migration_preview(source.to_owned()))
+        .await
+        .unwrap()
+    {
+        Reply::VaultImportReview(review) => review,
+        other => panic!("missing migration review: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn reviewed_migration_is_connection_bound_revocable_and_source_guarded() {
+    let (_dir, root, task) = start().await;
+    let (_source_dir, source, password, value) = migration_source();
+    let original = std::fs::read(&source).unwrap();
+    let mut a = user(&root).await;
+    let mut b = user(&root).await;
+    let mut gateway = Client::connect(&root, Role::Gateway).await.unwrap();
+    let mut relay = Client::connect(&root, Role::Relay).await.unwrap();
+    assert_eq!(
+        denied(
+            a.call(Request::ReviewVaultImport {
+                version: a206_vault_channel::IMPORT_REVIEW_VERSION + 1,
+                source: source.clone()
+            })
+            .await
+        ),
+        BrokerError::Invalid(InvalidRequest::UnsupportedVersion)
+    );
+    assert_eq!(
+        denied(a.call(migration_preview("relative.json".into())).await),
+        BrokerError::Invalid(InvalidRequest::ImportSource)
+    );
+    assert_eq!(
+        denied(gateway.call(migration_preview(source.clone())).await),
+        BrokerError::Forbidden
+    );
+    assert_eq!(
+        denied(relay.call(migration_preview(source.clone())).await),
+        BrokerError::Forbidden
+    );
+    let first = migration_review(&mut a, &source).await;
+    assert_eq!(first.bytes, original.len() as u64);
+    assert!(!vault_path(&root).exists());
+    assert_eq!(std::fs::read(&source).unwrap(), original);
+    assert_eq!(
+        denied(b.call(migration_apply(first.id, &password)).await),
+        BrokerError::ImportReviewUnavailable
+    );
+    let second = migration_review(&mut a, &source).await;
+    assert_eq!(
+        denied(a.call(migration_apply(first.id, &password)).await),
+        BrokerError::ImportReviewUnavailable
+    );
+    a.call(Request::CancelVaultImport {
+        version: a206_vault_channel::IMPORT_REVIEW_VERSION,
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        denied(a.call(migration_apply(second.id, &password)).await),
+        BrokerError::ImportReviewUnavailable
+    );
+    let review = migration_review(&mut a, &source).await;
+    let mut changed = original.clone();
+    changed[0] ^= 1;
+    std::fs::write(&source, &changed).unwrap();
+    assert_eq!(
+        denied(a.call(migration_apply(review.id, &password)).await),
+        BrokerError::ImportSourceChanged
+    );
+    assert!(!vault_path(&root).exists());
+    assert_eq!(std::fs::read(&source).unwrap(), changed);
+    assert_eq!(
+        denied(a.call(migration_apply(review.id, &password)).await),
+        BrokerError::ImportReviewUnavailable
+    );
+    std::fs::write(&source, &original).unwrap();
+    let review = migration_review(&mut a, &source).await;
+    let encoded = a206_protocol::encode(&a206_protocol::Response {
+        id: uuid::Uuid::new_v4(),
+        body: Reply::VaultImportReview(review.clone()),
+    })
+    .unwrap();
+    assert!(
+        !encoded
+            .windows(value.len())
+            .any(|part| part == value.as_bytes())
+    );
+    assert!(!format!("{:?}", migration_apply(review.id, &password)).contains(&password));
+    assert_eq!(
+        denied(a.call(migration_apply(review.id, &random())).await),
+        BrokerError::AuthenticationFailed
+    );
+    assert!(matches!(
+        a.call(migration_apply(review.id, &password)).await.unwrap(),
+        Reply::Ok
+    ));
+    assert_eq!(
+        denied(a.call(migration_apply(review.id, &password)).await),
+        BrokerError::ImportReviewUnavailable
+    );
+    assert_eq!(
+        denied(a.call(migration_preview(source.clone())).await),
+        BrokerError::VaultExists
+    );
+    assert_eq!(std::fs::read(vault_path(&root)).unwrap(), original);
+    assert_eq!(std::fs::read(&source).unwrap(), original);
+    let Reply::Credentials { typed, .. } = a.call(Request::Credentials).await.unwrap() else {
+        panic!()
+    };
+    assert!(typed[0].1.disabled);
+    assert!(matches!(typed[0].1.policy, AccessPolicy::SkillOnly(_)));
+    assert_eq!(status(&mut a).await.agent_access, Some(false));
+    a.call(Request::Shutdown).await.unwrap();
+    task.await.unwrap();
+}
+
+#[tokio::test]
+async fn reviewed_migration_preserves_an_enrolled_factor_requirement() {
+    let (_dir, root, task) = start().await;
+    let (_source_dir, source, password, _) = migration_source();
+    let mut original = a206_vault::Vault::locked(source.clone());
+    original
+        .unlock(&a206_vault::Secret::new(password.clone()))
+        .unwrap();
+    let now = 1_800_000_015;
+    let pending = original.begin_totp_enrollment(&random(), now).unwrap();
+    let generator = totp_rs::TOTP::new_unchecked(
+        totp_rs::Algorithm::SHA1,
+        6,
+        1,
+        30,
+        totp_rs::Secret::Encoded(pending.manual_key().expose(str::to_owned))
+            .to_bytes()
+            .unwrap(),
+        None,
+        String::new(),
+    );
+    original
+        .confirm_totp_enrollment(&pending, &generator.generate(now), now)
+        .unwrap();
+    original.lock();
+    let before = std::fs::read(&source).unwrap();
+    let mut a = user(&root).await;
+    let review = migration_review(&mut a, &source).await;
+    assert_eq!(
+        denied(a.call(migration_apply(review.id, &password)).await),
+        BrokerError::TotpRequired
+    );
+    assert!(!vault_path(&root).exists());
+    assert_eq!(std::fs::read(&source).unwrap(), before);
+    a.call(Request::Lock).await.unwrap();
+    assert_eq!(
+        denied(a.call(migration_apply(review.id, &password)).await),
+        BrokerError::ImportReviewUnavailable
+    );
+    a.call(Request::Shutdown).await.unwrap();
+    task.await.unwrap();
+}
+
+#[tokio::test]
+async fn encrypted_reviewed_migration_checks_sources_without_exposing_credentials() {
+    use a206_vault_channel::{
+        Code, IMPORT_REVIEW_VERSION as VERSION, Reply as R, Request as Q, Secret,
+    };
+    let (_dir, root, task) = start().await;
+    let (_source_dir, source, password, _) = migration_source();
+    let original = std::fs::read(&source).unwrap();
+    let (mut relay, mut channel) = secure_open(&root).await;
+    let preview = || Q::ReviewVaultImport {
+        version: VERSION,
+        source: source.clone(),
+    };
+    let apply = |review| Q::ApplyVaultImport {
+        version: VERSION,
+        review,
+        password: Secret::new(password.clone()),
+        totp: None,
+    };
+    let R::VaultImportReview(review) = secure_call(&mut relay, &mut channel, preview()).await
+    else {
+        panic!()
+    };
+    let mut changed = original.clone();
+    changed[0] ^= 1;
+    std::fs::write(&source, changed).unwrap();
+    let R::Error(error) = secure_call(&mut relay, &mut channel, apply(review.id)).await else {
+        panic!()
+    };
+    assert_eq!(error.code, Code::ImportSourceChanged);
+    assert_eq!(error.report.kind, a206_core::ErrorKind::Conflict);
+    assert!(error.report.correlation.is_some());
+    assert!(!format!("{error:?}").contains(&password));
+    assert!(!vault_path(&root).exists());
+    std::fs::write(&source, &original).unwrap();
+    let R::VaultImportReview(review) = secure_call(&mut relay, &mut channel, preview()).await
+    else {
+        panic!()
+    };
+    let bytes = channel.seal(&apply(review.id)).unwrap();
+    assert!(
+        !bytes
+            .windows(password.len())
+            .any(|part| part == password.as_bytes())
+    );
+    let Reply::ChannelMessage(bytes) = relay.call(Request::ChannelMessage { bytes }).await.unwrap()
+    else {
+        panic!()
+    };
+    assert!(matches!(channel.open::<R>(&bytes).unwrap(), R::Ok));
+    assert_eq!(std::fs::read(&source).unwrap(), original);
+    assert_eq!(std::fs::read(vault_path(&root)).unwrap(), original);
+    user(&root).await.call(Request::Shutdown).await.unwrap();
+    task.await.unwrap();
+}
+
+#[tokio::test]
+async fn reviewed_migration_refuses_older_peers_before_sending() {
+    let broker = scripted_broker(REVIEWED_IMPORT_VERSION - 1, vec![Reply::Ok]).await;
+    let mut a = user(broker.path()).await;
+    for request in [
+        migration_preview("/source".into()),
+        migration_apply(uuid::Uuid::new_v4(), &random()),
+        Request::CancelVaultImport {
+            version: a206_vault_channel::IMPORT_REVIEW_VERSION,
+        },
+    ] {
+        assert!(matches!(
+            a.call(request).await,
+            Err(ClientError::ReviewedImportUnsupported)
+        ));
+    }
+    assert!(matches!(a.call(Request::Status).await.unwrap(), Reply::Ok));
+}
+
+#[tokio::test]
+async fn reviewed_migration_cannot_replace_a_target_created_after_review() {
+    let (_dir, root, task) = start().await;
+    let (_source_dir, source, password, _) = migration_source();
+    let source_before = std::fs::read(&source).unwrap();
+    let mut a = user(&root).await;
+    let mut b = user(&root).await;
+    let review = migration_review(&mut a, &source).await;
+    b.call(unlock(&random(), None, true)).await.unwrap();
+    let target_before = std::fs::read(vault_path(&root)).unwrap();
+    assert_eq!(
+        denied(a.call(migration_apply(review.id, &password)).await),
+        BrokerError::VaultExists
+    );
+    assert_eq!(
+        denied(a.call(Request::PairGateway).await),
+        BrokerError::StepUpRequired
+    );
+    assert_eq!(std::fs::read(vault_path(&root)).unwrap(), target_before);
+    assert_eq!(std::fs::read(&source).unwrap(), source_before);
+    a.call(Request::Shutdown).await.unwrap();
     task.await.unwrap();
 }

@@ -6,6 +6,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ClientError {
+    #[error(
+        "the running vault broker is too old for reviewed import; run `agent206 vault stop`, then retry"
+    )]
+    ReviewedImportUnsupported,
     #[error("vault broker is not running or unreachable")]
     Io(#[from] std::io::Error),
     #[error("vault broker protocol error")]
@@ -143,6 +147,15 @@ impl Client {
 
     /// Send one request. A broker error reply becomes `ClientError::Broker`.
     pub async fn call(&mut self, body: Request) -> Result<Reply, ClientError> {
+        if matches!(
+            &body,
+            Request::ReviewVaultImport { .. }
+                | Request::ApplyVaultImport { .. }
+                | Request::CancelVaultImport { .. }
+        ) && self.version < REVIEWED_IMPORT_VERSION
+        {
+            return Err(ClientError::ReviewedImportUnsupported);
+        }
         let id = self.send(body).await?;
         let mut reply = self.recv(id).await?;
         if self.version < SETUP_CHANNEL_VERSION

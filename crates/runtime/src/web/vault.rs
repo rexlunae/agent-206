@@ -70,7 +70,7 @@ pub(super) async fn handle(State(state): State<Web>, headers: HeaderMap, bytes: 
 async fn connect(root: &std::path::Path) -> Result<Client, crate::vault::VaultError> {
     // Starts the broker if needed. No password or secret-bearing request is sent.
     let user = crate::vault::connect(root).await?;
-    if user.version() < a206_broker::SETUP_CHANNEL_VERSION {
+    if user.version() < a206_broker::REVIEWED_IMPORT_VERSION {
         return Err(crate::vault::VaultError::ChannelUnsupported);
     }
     drop(user);

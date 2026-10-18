@@ -9,6 +9,19 @@ use zeroize::Zeroizing;
 const PATTERN: &str = "Noise_NK_25519_ChaChaPoly_SHA256";
 const PROLOGUE: &[u8] = b"Agent206 vault setup v1";
 pub const MAX_MESSAGE: usize = 65535;
+pub const IMPORT_REVIEW_VERSION: u16 = 1;
+
+/// Public identity of a source held privately by this broker connection.
+/// This describes file bytes, not decrypted contents or format validity.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImportReview {
+    #[serde(default)]
+    pub version: u16,
+    pub id: a206_core::Id,
+    pub source: std::path::PathBuf,
+    pub bytes: u64,
+    pub sha256: [u8; 32],
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -100,6 +113,19 @@ fn bounded(bytes: &[u8]) -> Result<(), Error> {
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Request {
     Status,
+    ReviewVaultImport {
+        version: u16,
+        source: std::path::PathBuf,
+    },
+    ApplyVaultImport {
+        version: u16,
+        review: a206_core::Id,
+        password: Secret,
+        totp: Option<Secret>,
+    },
+    CancelVaultImport {
+        version: u16,
+    },
     Unlock {
         password: Secret,
         totp: Option<Secret>,
@@ -131,6 +157,7 @@ pub struct Status {
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Reply {
     Ok,
+    VaultImportReview(ImportReview),
     Status(Status),
     TotpEnrollment {
         otpauth_url: Secret,
@@ -145,6 +172,8 @@ pub enum Reply {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Code {
     Other,
+    ImportReviewUnavailable,
+    ImportSourceChanged,
     TotpRequired,
     TotpReplayed,
     StepUpRequired,
