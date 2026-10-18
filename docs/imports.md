@@ -16,15 +16,15 @@ secrets or commands are counted, never stored, so they cannot reach the preview.
 | Source | Result |
 | --- | --- |
 | `[model]` provider and `[[custom_providers]]` | Provider account from the matching preset (endpoint from the source, else the preset), added only when no account has the same API and endpoint. The credential name RustyClaw used (for example `OPENAI_API_KEY`) is referenced and shown in the preview with the origin it must be bound to. The broker spends it only for that exact origin: an untyped or unbound entry is refused until the user types and binds it (`vault adopt … --destination`), and a credential the user already bound to that origin is used as bound. Endpoints the gateway would refuse (not HTTPS or loopback HTTP, or carrying credentials, a query or a fragment) are skipped. The old default model is shown as a note and never selected. Copilot device-flow and unknown providers are reported and skipped |
-| `credentials/secrets.json`, password-protected | `--apply` asks for its password (and TOTP code when enrolled) and sends `ImportVault` to the broker, which copies the encrypted file, opens only the copy, verifies both factors there and links it in only if this profile has no vault. Policies, kinds, disabled flags, agent access and TOTP enrollment travel inside the vault unchanged; the source is never written. Key-file vaults are reported as unsupported |
+| `credentials/secrets.json`, password-protected | `--apply` uses the broker's held source review, asks for its password and enrolled TOTP code, and imports only the checked bytes on a private copy when this profile has no vault. Security and `vault import FILE [--apply]` use the same operations. Policies, kinds, disabled flags, agent access and TOTP enrollment are preserved; the source is never written. Key-file vaults remain unsupported |
 | `[[messengers]]` | Telegram, Matrix, Discord, Slack and IRC entries become disabled messengers with no credential, keeping `allowed_chats` and `allowed_users` as their allow-lists. A Matrix entry keeps its `homeserver` as the endpoint (an HTTPS, or loopback HTTP, origin); one without a usable homeserver is reported and skipped, and its `user_id` is not needed because the gateway asks the homeserver which account the token belongs to. An IRC entry keeps `server` and `port` as an `ircs://` endpoint, `nick` (RustyClaw's default `RustyClaw` when unset) as the services login and `irc_channels` among its allowed chats, with channel and user names folded as the network compares them; only entries with `use_tls` import, since Agent 206 never sends a password over plain text to a remote server. RustyClaw's IRC `allowed_users` were nicknames and are now matched against services accounts, which are usually the same names but stricter: someone using the nickname without signing in to that account is no longer accepted. Agent 206 additionally refuses group messages from senders who are not listed, so no restriction is widened. Tokens (Slack's `app_token` included) and passwords are never read; the preview says when one stays behind and how to store it in the vault. Signal entries are reported and skipped with instructions: RustyClaw ran signal-cli itself, while Agent 206 connects to a signal-cli daemon the user runs, which the source does not name. WhatsApp, iMessage and Google Chat entries are reported and skipped with a pointer to connecting that network to Beeper Desktop and adding a Beeper messenger. Entries for other services, with a separate `config_path` or with chat ids the gateway would refuse are reported and skipped. Names are reduced to lowercase letters, digits and hyphens and made unique; an entry whose name a messenger of the same kind already has counts as already imported |
 | MCP servers, tool permissions, disabled tool groups, services, engines, sandbox, skills, plaintext registry token | Counted and left inactive. Denies in tool permissions cannot be represented yet, so nothing is granted in their place |
 | SOUL.md/AGENTS.md, conversations, memory, messenger system prompt | Reported as not imported yet |
 | `totp_enabled`, `agent_access` configuration flags | Ignored: enrollment and agent access come from the encrypted vault |
 
 Applying writes an owner-only receipt (`imports/<id>.toml`) with the source
-digest, accounts and messengers added and whether the vault was copied, which is the rollback
-record. A repeated import adds nothing. Import only attaches to a running
+digest, accounts and messengers added and whether the vault was copied. This is
+provenance for later review; automatic rollback is not available. A repeated import adds nothing. Import only attaches to a running
 gateway and never starts one, so a preview changes nothing.
 
 The legacy `import rustyclaw --apply` command retains these limitations:
@@ -59,8 +59,9 @@ Review schema v2 is checked before GUI/CLI presentation; unversioned development
 replies are refused with an update action. Rejected URLs are omitted
 from previews because they can contain inline passwords or signed tokens.
 Providers still need live API discovery; messengers are saved disabled and
-without credentials. Vault migration is not offered here: use the existing
-trusted-terminal broker flow. Other tool adapters remain planned.
+without credentials. Vault migration is a separate action on Security or through
+`agent206 vault import FILE --apply`; settings selection never copies or unlocks
+a vault. Other tool adapters remain planned.
 
 Before any reader reply (including the legacy terminal flow), the remaining
 preview strings are checked for known credential shapes. A match refuses the
@@ -89,9 +90,9 @@ prints the receipt data and exits unsuccessfully. The ordinary gateway request
 journal deduplicates application retries. Source/target guards, selected items,
 inactive authority, disabled messenger restrictions, replay and receipt failures
 are tested against the actual isolated reader and gateway; the CLI is tested
-through the real binary. Rollback and GUI vault migration remain planned.
+through the real binary. Rollback remains planned.
 
-### Vault source identity (library foundation)
+### Reviewed vault migration
 
 `a206_vault::Vault::review_import` reads a regular, bounded source file without
 decrypting it or creating a target, returning only its byte count and SHA-256.
@@ -105,12 +106,43 @@ again. A changed source leaves the target absent and locked; existing targets
 remain protected. Password, enrolled TOTP, replay protection and policy checks
 still run on the private copy. The identity is not evidence of a valid vault.
 
-This is a tested library primitive, not a broker command or GUI migration flow.
-The existing CLI and broker still use the legacy import operation. The next
-integration must hold the reviewed identity in the broker, use versioned native
-and encrypted setup requests, refuse older peers rather than falling back to an
-unguarded import, and expose an explicit review/apply flow before claiming GUI
-vault migration. Vault rollback and key-file migration remain pending.
+Security and Get started offer **Import a RustyClaw vault** while the target has
+no vault. Select an absolute encrypted **file** on the broker host, preview its
+path, byte count and source SHA-256, then enter its password and any enrolled
+authenticator code. The native CLI offers `vault import FILE` for read-only
+preview and `vault import FILE --apply` for a fresh preview and authenticated
+copy, without starting a gateway. `import rustyclaw --apply` uses the same
+reviewed broker operation for its vault category.
+
+Broker protocol v11 carries schema-v1 `ReviewVaultImport`, `ApplyVaultImport`
+and `CancelVaultImport` on both native and authenticated encrypted setup
+channels. The broker holds one review per private connection. Apply accepts
+only its opaque ID and authentication, never a supplied digest or replacement
+configuration. New previews replace old reviews; cancellation, locking,
+disconnect, source change and successful copy invalidate them. TOTP challenges
+and authentication retries keep the review but recheck source bytes. Old peers
+are refused; no client falls back to unreviewed import. The old `ImportVault`
+opcode remains for older trusted terminal clients.
+
+The source's policies, disabled flags, agent-access setting and enrolled factor
+remain authoritative. No task/tool grants or provider accounts are imported.
+TOTP verification advances replay state only in the private target copy; the
+source stays unchanged. Inputs clear on submission, and passwords are not held
+for retries. An interrupted request may already have committed: check vault
+status rather than assuming cancellation rolled it back.
+
+After copy, the broker writes an owner-only, atomically published and synced
+TOML receipt under `vault/imports/<review-id>.toml`. Its source identity and time
+contain no credentials. Copy and receipt are ordered operations: a write/sync
+failure returns a confirmed `VaultImportApplied` with a structured
+`receipt_error`. The GUI keeps this beside the actual vault and pairing states;
+the CLI reports the copied vault and exits unsuccessfully before further import
+steps. A receipt failure never replaces or deletes the imported vault.
+
+These controls operate on this computer's broker for desktop/TUI, or the web
+server's local broker after trusted-key verification. Remote SSH vault controls,
+key-file migration, rollback and other import adapters remain pending. Native
+desktop/TUI interactive acceptance remains unverified.
 
 ### Isolated source reader
 

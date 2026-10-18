@@ -15,6 +15,28 @@ fn checked(reply: Reply) -> Result<Reply, Failure> {
         reply => Ok(reply),
     }
 }
+// Keep generic setup compatible with v10, while declining migration before
+// serializing a reviewed request or its secrets for an unsupported connection.
+#[cfg(any(target_arch = "wasm32", test))]
+fn reviewed_supported(version: u16, request: &Request) -> Result<(), Failure> {
+    if version < a206_vault_channel::REVIEWED_IMPORT_BROKER_VERSION
+        && matches!(
+            request,
+            Request::ReviewVaultImport { .. }
+                | Request::ApplyVaultImport { .. }
+                | Request::CancelVaultImport { .. }
+        )
+    {
+        return Err(Failure {
+            code: Code::Other,
+            report: a206_core::ErrorReport::new(
+                a206_core::ErrorKind::Unavailable,
+                "This broker cannot review vault imports. Stop the old vault broker and retry with the updated application.",
+            ),
+        });
+    }
+    Ok(())
+}
 #[cfg(not(target_arch = "wasm32"))]
 mod imp {
     use super::*;
@@ -22,6 +44,15 @@ mod imp {
     #[derive(Clone)]
     pub struct Session(a206_runtime::vault::Session);
     fn failure(error: a206_runtime::vault::VaultError) -> Failure {
+        if let a206_runtime::vault::VaultError::Broker(a206_broker::ClientError::Broker(
+            a206_broker::BrokerError::ImportFailure(report),
+        )) = &error
+        {
+            return Failure {
+                code: Code::Other,
+                report: report.clone(),
+            };
+        }
         let code = match &error {
             a206_runtime::vault::VaultError::Broker(a206_broker::ClientError::Broker(error)) => {
                 a206_broker::channel::code(error)
@@ -66,6 +97,23 @@ mod imp {
             self.0.pair_if_running().await.map_err(failure)
         }
     }
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        #[test]
+        fn native_import_failure_keeps_the_logged_reference_at_the_display_root() {
+            let report = a206_core::ErrorReport::new(a206_core::ErrorKind::Storage, "partial copy")
+                .with_correlation(uuid::Uuid::new_v4())
+                .caused_by(a206_core::ErrorReport::new(
+                    a206_core::ErrorKind::PermissionDenied,
+                    "denied",
+                ));
+            let error = a206_runtime::vault::VaultError::Broker(a206_broker::ClientError::Broker(
+                a206_broker::BrokerError::ImportFailure(report.clone()),
+            ));
+            assert_eq!(failure(error).report, report);
+        }
+    }
 }
 #[cfg(target_arch = "wasm32")]
 mod imp {
@@ -76,6 +124,7 @@ mod imp {
     struct Active {
         id: String,
         channel: Channel,
+        broker_version: u16,
     }
     #[derive(Clone)]
     pub struct Session {
@@ -115,17 +164,25 @@ mod imp {
             let mut active = self.active.borrow_mut().take();
             if active.is_none() {
                 let (handshake, first) = Handshake::start(&self.key).map_err(transport)?;
-                let RelayReply::Opened { session, response } =
-                    relay(RelayRequest::Open { first }).await?
+                let RelayReply::Opened {
+                    session,
+                    response,
+                    broker_version,
+                } = relay(RelayRequest::Open { first }).await?
                 else {
                     return Err(unexpected());
                 };
                 active = Some(Active {
                     id: session,
                     channel: handshake.finish(&response).map_err(transport)?,
+                    broker_version,
                 });
             }
             let mut active = active.ok_or_else(unexpected)?;
+            if let Err(error) = reviewed_supported(active.broker_version, &request) {
+                *self.active.borrow_mut() = Some(active);
+                return Err(error);
+            }
             let bytes = active.channel.seal(&request).map_err(transport)?;
             let RelayReply::Message(bytes) = relay(RelayRequest::Exchange {
                 session: active.id.clone(),
@@ -197,3 +254,55 @@ mod imp {
     }
 }
 pub(crate) use imp::{Session, Target};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn old_or_unknown_relays_keep_setup_but_never_send_reviewed_imports() {
+        for version in [0, 8, 9, 10] {
+            assert!(reviewed_supported(version, &Request::Status).is_ok());
+            assert!(reviewed_supported(version, &Request::Lock).is_ok());
+            let error = reviewed_supported(
+                version,
+                &Request::ReviewVaultImport {
+                    version: a206_vault_channel::IMPORT_REVIEW_VERSION,
+                    source: "/source".into(),
+                },
+            )
+            .unwrap_err();
+            assert!(error.report.message.contains("Stop the old vault broker"));
+            assert!(
+                reviewed_supported(
+                    version,
+                    &Request::ApplyVaultImport {
+                        version: a206_vault_channel::IMPORT_REVIEW_VERSION,
+                        review: uuid::Uuid::new_v4(),
+                        password: a206_vault_channel::Secret::new(uuid::Uuid::new_v4().to_string()),
+                        totp: None,
+                    }
+                )
+                .is_err()
+            );
+            assert!(
+                reviewed_supported(
+                    version,
+                    &Request::CancelVaultImport {
+                        version: a206_vault_channel::IMPORT_REVIEW_VERSION
+                    }
+                )
+                .is_err()
+            );
+        }
+        assert!(
+            reviewed_supported(
+                11,
+                &Request::ReviewVaultImport {
+                    version: a206_vault_channel::IMPORT_REVIEW_VERSION,
+                    source: "/source".into()
+                }
+            )
+            .is_ok()
+        );
+    }
+}

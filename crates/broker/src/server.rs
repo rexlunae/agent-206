@@ -19,6 +19,7 @@ use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio_util::sync::CancellationToken;
 use zeroize::Zeroizing;
 
+mod import;
 mod irc;
 mod socket;
 
@@ -26,6 +27,7 @@ const MAX_NAME: usize = 256;
 const MAX_DESTINATIONS: usize = 16;
 
 struct Shared {
+    root: std::path::PathBuf,
     identity: a206_vault_channel::Identity,
     vault: Mutex<Vault>,
     throttle: AuthThrottle<()>,
@@ -98,6 +100,8 @@ impl Shared {
 
 #[derive(Default)]
 struct Session {
+    version: u16,
+    import_review: Option<a206_vault_channel::ImportReview>,
     channel: Option<a206_vault_channel::Channel>,
     channel_opened: bool,
     role: Option<Role>,
@@ -284,6 +288,7 @@ fn handle(shared: &Shared, session: &mut Session, request: Request) -> Handled {
                 if (MIN_BROKER_VERSION..=BROKER_VERSION).contains(&version) =>
             {
                 session.role = Some(role);
+                session.version = version;
                 ok()
             }
             Request::Hello { .. } => Err(BrokerError::Invalid(InvalidRequest::UnsupportedVersion)),
@@ -374,6 +379,39 @@ fn handle(shared: &Shared, session: &mut Session, request: Request) -> Handled {
         }
     };
     match request {
+        Request::ReviewVaultImport { version, source } => {
+            import::version(session, version)?;
+            import::review(shared, session, source)
+        }
+        Request::ApplyVaultImport {
+            version,
+            review,
+            password,
+            totp,
+        } => {
+            import::version(session, version)?;
+            let held = session
+                .import_review
+                .as_ref()
+                .filter(|held| held.id == review)
+                .cloned()
+                .ok_or(BrokerError::ImportReviewUnavailable)?;
+            let source = held.source.clone();
+            import::apply(
+                shared,
+                session,
+                &source,
+                &password,
+                totp.as_ref().map(WireSecret::expose),
+                now,
+                Some(held),
+            )
+        }
+        Request::CancelVaultImport { version } => {
+            import::version(session, version)?;
+            session.import_review = None;
+            ok()
+        }
         Request::Hello { .. }
         | Request::ChannelKey
         | Request::OpenChannel { .. }
@@ -444,50 +482,24 @@ fn handle(shared: &Shared, session: &mut Session, request: Request) -> Handled {
             drop(vault);
             shared.throttle.success(&());
             session.step_up.grant(now, generation);
+            session.import_review = None;
             ok()
         }
         Request::ImportVault {
             source,
             password,
             totp,
-        } => {
-            shared
-                .throttle
-                .check(&(), now)
-                .map_err(|l| BrokerError::LockedOut {
-                    retry_after_secs: l.retry_after.as_secs().max(1),
-                })?;
-            if !source.is_absolute() {
-                return Err(BrokerError::Invalid(InvalidRequest::ImportSource));
-            }
-            let mut vault = shared.vault();
-            let secret = Secret::new(password.expose().to_owned());
-            match vault.import(&source, &secret, totp.as_deref(), unix_now()) {
-                Ok(ImportCheck::Imported) => {}
-                Ok(ImportCheck::TotpRequired) => return Err(BrokerError::TotpRequired),
-                Ok(ImportCheck::Totp(outcome)) => {
-                    return Err(failed(shared, now, totp_error(outcome)));
-                }
-                // A wrong password for the source counts like a failed unlock.
-                Err(VaultError::Crypto) => {
-                    return Err(failed(shared, now, BrokerError::AuthenticationFailed));
-                }
-                Err(error @ VaultError::ImportSource(_)) => {
-                    tracing::info!(
-                        error = &error as &dyn std::error::Error,
-                        "vault import source refused"
-                    );
-                    return Err(vault_error(error));
-                }
-                Err(error) => return Err(vault_error(error)),
-            }
-            let generation = vault.generation();
-            drop(vault);
-            shared.throttle.success(&());
-            session.step_up.grant(now, generation);
-            ok()
-        }
+        } => import::apply(
+            shared,
+            session,
+            &source,
+            &password,
+            totp.as_deref(),
+            now,
+            None,
+        ),
         Request::Lock => {
+            session.import_review = None;
             shared.vault().lock();
             session.step_up.revoke();
             session.pending = None;
@@ -1234,6 +1246,7 @@ pub async fn serve(root: &Path) -> std::io::Result<()> {
     let listener = tokio::net::UnixListener::bind(&path)?;
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
     let shared = Arc::new(Shared {
+        root: root.to_owned(),
         identity: a206_vault_channel::Identity::generate().map_err(std::io::Error::other)?,
         vault: Mutex::new(Vault::locked(crate::vault_path(root))),
         throttle: AuthThrottle::default(),

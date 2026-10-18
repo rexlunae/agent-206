@@ -66,7 +66,7 @@ pub(crate) fn Imports() -> Element {
         }
         if let Some(report) = failure() { ErrorNotice { report, title: "Import preview unavailable".to_string() } }
         if let Some(value) = review() { ReviewPanel { key: "{value.id}", review: value } }
-        Alert { title: rsx! { "Credentials and other tools" }, "This screen imports selected connection settings and disabled messengers. It does not import vaults, plaintext credentials, grants, hooks, plugins or MCP servers. Password-protected RustyClaw vault migration is available through `agent206 import rustyclaw` on the trusted terminal. Other source adapters are still planned." }
+        Alert { title: rsx! { "Credentials and other tools" }, "This screen imports selected connection settings and disabled messengers. It does not import vaults, plaintext credentials, grants, hooks, plugins or MCP servers. Review a password-protected RustyClaw vault separately on Security or with `agent206 vault import`. Other source adapters are still planned." }
     } }
 }
 
@@ -102,7 +102,7 @@ fn ReviewPanel(review: Review) -> Element {
             for (index, messenger) in preview.messengers.iter().enumerate() {
                 MessengerRow { key: "messenger-{index}", messenger: messenger.clone(), index, selection, enabled }
             }
-            if preview.vault.is_some() { Alert { title: rsx! { "Vault left unchanged" }, "An encrypted vault was found. Import it from the trusted terminal; this selection does not copy or unlock it." } }
+            if preview.vault.is_some() { Alert { title: rsx! { "Vault left unchanged" }, "An encrypted vault was found. Review it separately on Security or with `agent206 vault import`. This settings selection does not copy or unlock it." } }
             if !preview.inactive.is_empty() || !preview.unsupported.is_empty() {
                 Disclosure { summary: rsx! { "Other data left behind" },
                     for item in &preview.inactive { p { "{inactive_label(item.category)}: {item.count}" } }

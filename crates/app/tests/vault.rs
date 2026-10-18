@@ -49,3 +49,60 @@ async fn broker_autostarts_reports_locked_state_and_stops() -> Result<()> {
     assert!(!socket.exists());
     Ok(())
 }
+
+#[tokio::test]
+async fn vault_import_preview_never_copies_unlocks_or_starts_a_gateway() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let root = directory.path().join("target");
+    std::fs::create_dir(&root)?;
+    std::fs::write(root.join("gateway.stopped"), "deliberately stopped")?;
+    let source = directory.path().join("source/secrets.json");
+    let password = uuid::Uuid::new_v4().to_string();
+    let mut original = a206_vault::Vault::locked(source.clone());
+    original.unlock(&a206_vault::Secret::new(password.clone()))?;
+    original.lock();
+    let before = std::fs::read(&source)?;
+    // Explicitly owned process; failed assertions kill it on drop. A successful
+    // run requests shutdown and awaits it before dropping the private profile.
+    let mut broker = vault(&root, &["broker"])?
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()?;
+    tokio::time::timeout(support::TIMEOUT, async {
+        loop {
+            match a206_broker::Client::connect(&root, a206_broker::Role::User).await {
+                Ok(_) => break,
+                Err(a206_broker::ClientError::Io(error))
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                    ) =>
+                {
+                    tokio::task::yield_now().await
+                }
+                Err(error) => panic!("test broker failed: {error:?}"),
+            }
+        }
+    })
+    .await?;
+    let mut command = vault(&root, &["import"])?;
+    command.arg(&source);
+    let output = capture(command).await?;
+    assert!(output.status.success(), "{output:?}");
+    let text = String::from_utf8(output.stdout)?;
+    assert!(text.contains("SHA-256") && text.contains("Not imported"));
+    assert!(!text.contains(&password));
+    assert_eq!(std::fs::read(&source)?, before);
+    assert!(!a206_broker::vault_path(&root).exists());
+    assert!(!root.join("gateway.sock").exists());
+    assert!(root.join("gateway.stopped").exists());
+    let stop = capture(vault(&root, &["stop"])?).await?;
+    assert!(stop.status.success(), "{stop:?}");
+    assert!(
+        tokio::time::timeout(support::TIMEOUT, broker.wait())
+            .await??
+            .success()
+    );
+    Ok(())
+}

@@ -53,9 +53,11 @@ agent206 --data-dir <profile-directory> import rustyclaw <source-directory>
 Review the preview and use `--apply` only for the categories you intend to import.
 The command runs on the gateway host and uses the isolated broker for encrypted
 vault adoption. It never replaces an existing vault. See [imports.md](imports.md)
-for policy preservation, supported categories and partial-failure behavior. A GUI
-import review/apply screen and adapters for other tools remain planned; this web
-flow does not invoke foreign commands or import grants implicitly.
+for policy preservation, supported categories and partial-failure behavior. Security
+and Get started also offer reviewed whole-vault migration, described below;
+the Import settings page separately reviews selected connection settings.
+Adapters for other tools remain planned. Neither flow invokes foreign commands
+or imports grants implicitly.
 
 ## Channel and trust boundary
 
@@ -122,3 +124,34 @@ components. The `Disclosure` manual-key alternative is expanded automatically
 for TUI, where SVG is unavailable, or if QR encoding fails. An independent Rust
 `rqrr` decoder tests the actual rendered geometry against the complete URI.
 The pending QR geometry is sensitive and is discarded with the enrollment.
+
+## Import an existing password vault
+
+After trusted-key verification, open **Import a RustyClaw vault** on Security or
+Get started while this profile has no vault. Select its absolute encrypted file
+path on the web server's broker host, then **Preview vault import**. Check the
+path, byte count and source SHA-256 before entering its original password and
+current authenticator code. This is a whole-vault operation; existing vaults are
+never replaced or merged, and key-file vaults are not supported yet.
+
+The broker holds the review on this private connection and rechecks source bytes
+before every attempt, including TOTP retries. Its policies, disabled flags,
+agent-access setting and authenticator enrollment are retained; task/tool grants
+and provider accounts are unchanged. Source bytes stay intact, while successful
+TOTP verification advances the target copy's replay state. Inputs clear on
+submission; a challenge asks you to reenter the password and code.
+
+The result shows actual vault/pairing state and an owner-only TOML receipt path.
+A receipt or pairing failure is shown beside the confirmed copy. If the request
+was interrupted, check vault status before retrying: a sent copy may have
+committed. Cancel clears an unapplied review; it is not rollback. Broker v11 is
+required for migration, with no fallback to an older unreviewed import. Existing
+unlock/enrollment controls still work with v10. The relay reports the negotiated
+version of the channel's socket; missing or older version metadata refuses
+migration before sending a reviewed request, with instructions to stop the old
+broker and retry. Remote SSH migration,
+key-file migration and rollback remain pending.
+
+The equivalent terminal flow on the broker host is `agent206 vault import FILE`
+for preview and `agent206 vault import FILE --apply` for a fresh review and
+authenticated import. Neither starts a gateway.

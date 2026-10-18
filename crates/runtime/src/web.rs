@@ -1605,7 +1605,10 @@ mod tests {
         let (handshake, first) = Handshake::start(&public).unwrap();
         let (_, reply) =
             post::<_, RR>(&router, &state, "/api/vault/channel", RQ::Open { first }).await;
-        let RR::Opened { session, response } = reply else {
+        let RR::Opened {
+            session, response, ..
+        } = reply
+        else {
             panic!("{reply:?}");
         };
         let mut channel = handshake.finish(&response).unwrap();

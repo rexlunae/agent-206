@@ -29,6 +29,21 @@ fn text(value: wire::Secret) -> String {
 pub fn request(value: wire::Request) -> Request {
     match value {
         wire::Request::Status => Request::Status,
+        wire::Request::ReviewVaultImport { version, source } => {
+            Request::ReviewVaultImport { version, source }
+        }
+        wire::Request::ApplyVaultImport {
+            version,
+            review,
+            password,
+            totp,
+        } => Request::ApplyVaultImport {
+            version,
+            review,
+            password: secret(password),
+            totp: totp.map(secret),
+        },
+        wire::Request::CancelVaultImport { version } => Request::CancelVaultImport { version },
         wire::Request::Unlock {
             password,
             totp,
@@ -51,6 +66,8 @@ pub fn request(value: wire::Request) -> Request {
 }
 pub fn code(error: &BrokerError) -> wire::Code {
     match error {
+        BrokerError::ImportReviewUnavailable => wire::Code::ImportReviewUnavailable,
+        BrokerError::ImportSourceChanged => wire::Code::ImportSourceChanged,
         BrokerError::TotpRequired => wire::Code::TotpRequired,
         BrokerError::TotpReplayed => wire::Code::TotpReplayed,
         BrokerError::StepUpRequired => wire::Code::StepUpRequired,
@@ -61,7 +78,14 @@ pub fn code(error: &BrokerError) -> wire::Code {
 }
 pub fn reply(result: Result<Reply, BrokerError>) -> wire::Reply {
     match result {
+        Ok(Reply::Error(BrokerError::ImportFailure(report)))
+        | Err(BrokerError::ImportFailure(report)) => wire::Reply::Error(wire::Failure {
+            code: wire::Code::Other,
+            report,
+        }),
         Ok(Reply::Ok) => wire::Reply::Ok,
+        Ok(Reply::VaultImportReview(review)) => wire::Reply::VaultImportReview(review),
+        Ok(Reply::VaultImportApplied(applied)) => wire::Reply::VaultImportApplied(applied),
         Ok(Reply::Status(s)) => wire::Reply::Status(status(s)),
         Ok(Reply::TotpEnrollment {
             otpauth_url,
@@ -83,6 +107,9 @@ pub fn reply(result: Result<Reply, BrokerError>) -> wire::Reply {
                 BrokerError::NoPendingEnrollment
                 | BrokerError::AlreadyExists
                 | BrokerError::VaultExists => ErrorKind::Conflict,
+                BrokerError::ImportReviewUnavailable | BrokerError::ImportSourceChanged => {
+                    ErrorKind::Conflict
+                }
                 BrokerError::Invalid(_) => ErrorKind::InvalidRequest,
                 BrokerError::Channel(_) => ErrorKind::Protocol,
                 BrokerError::NotFound => ErrorKind::NotFound,

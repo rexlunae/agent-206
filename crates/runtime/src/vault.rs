@@ -34,7 +34,7 @@ pub enum VaultError {
     #[error("unexpected vault broker reply")]
     UnexpectedReply,
     #[error(
-        "the running vault broker does not support encrypted web setup; run `agent206 vault stop`, then retry"
+        "the running vault broker does not support current encrypted setup; run `agent206 vault stop`, then retry"
     )]
     ChannelUnsupported,
     #[error(transparent)]

@@ -18,6 +18,7 @@ use a206_vault_channel::{
     Status as BrokerStatus,
 };
 use fc_dioxus::prelude::*;
+mod migration;
 #[cfg(not(target_arch = "wasm32"))]
 use std::path::{Path, PathBuf};
 
@@ -120,8 +121,18 @@ struct Panel {
     flow: Signal<Flow>,
     held: Signal<Option<WireSecret>>,
     enrollment: Signal<Option<Enrollment>>,
+    import_review: Signal<Option<a206_vault_channel::ImportReview>>,
+    import_totp: Signal<bool>,
+    import_result: Signal<Option<a206_vault_channel::ImportApplied>>,
     /// The Get started checklist, when this panel is on that page.
     progress: Option<VaultProgress>,
+}
+impl PartialEq for Panel {
+    fn eq(&self, other: &Self) -> bool {
+        // Each panel owns one stable set of signals. Children subscribe to
+        // their values; identity distinguishes panels and gateway remounts.
+        self.session == other.session
+    }
 }
 /// A stopped broker holds no unlocked vault, so its vault reads as locked.
 #[cfg(not(target_arch = "wasm32"))]
@@ -168,6 +179,7 @@ impl Panel {
         self.failure.set(None);
         self.warning.set(None);
         self.notice.set(None);
+        self.import_result.set(None);
         true
     }
     fn fail(mut self, operation: &'static str, title: &str, error: &VaultError) {
@@ -242,21 +254,7 @@ impl Panel {
                 Ok(_) => {
                     self.held.set(None);
                     self.flow.set(Flow::Idle);
-                    // This connection holds the unlock's step-up, so it can pair now.
-                    match self.session().pair_if_running().await {
-                        Ok(true) => self.notice.set(Some("Vault unlocked and gateway paired.")),
-                        Ok(false) => self.notice.set(Some(
-                            "Vault unlocked. Start the gateway, then pair it here so it can use credentials.",
-                        )),
-                        Err(error) => {
-                            self.notice.set(Some("Vault unlocked."));
-                            self.warning.set(Some(failure(
-                                "vault_pair",
-                                "The vault is unlocked, but the gateway could not be paired",
-                                &error,
-                            )));
-                        }
-                    }
+                    self.after_unlock(false).await;
                 }
                 Err(error) if !create && broker_refused(&error, BrokerError::TotpRequired) => {
                     self.held.set(Some(password));
@@ -275,6 +273,35 @@ impl Panel {
             }
             self.finish().await;
         });
+    }
+    async fn after_unlock(mut self, imported: bool) {
+        self.import_review.set(None);
+        self.import_totp.set(false);
+        // Both unlock and import grant a fresh step-up on this connection.
+        match self.session().pair_if_running().await {
+            Ok(true) => self.notice.set(Some(if imported {
+                "Vault imported and gateway paired."
+            } else {
+                "Vault unlocked and gateway paired."
+            })),
+            Ok(false) => self.notice.set(Some(if imported {
+                "Vault imported and unlocked. Start the gateway, then pair it here."
+            } else {
+                "Vault unlocked. Start the gateway, then pair it here so it can use credentials."
+            })),
+            Err(error) => {
+                self.notice.set(Some(if imported {
+                    "Vault imported and unlocked."
+                } else {
+                    "Vault unlocked."
+                }));
+                self.warning.set(Some(failure(
+                    "vault_pair",
+                    "The vault is unlocked, but the gateway could not be paired",
+                    &error,
+                )));
+            }
+        }
     }
     fn lock(mut self) {
         if !self.begin() {
@@ -476,9 +503,7 @@ fn VaultPlacement(placement: Placement) -> Element {
 
 /// Each submit takes the typed secret out of its field before anything else.
 fn take(mut field: Signal<String>) -> String {
-    let value = field();
-    field.set(String::new());
-    value
+    std::mem::take(&mut *field.write())
 }
 #[component]
 fn VaultPanel(target: Target) -> Element {
@@ -493,6 +518,9 @@ fn VaultPanel(target: Target) -> Element {
         flow: use_signal(|| Flow::Idle),
         held: use_signal(|| None),
         enrollment: use_signal(|| None),
+        import_review: use_signal(|| None),
+        import_totp: use_signal(|| false),
+        import_result: use_signal(|| None),
         progress: VaultProgress::listener(),
     };
     // Reads only through `peek`, so this runs once, after the first render.
@@ -559,16 +587,16 @@ fn VaultPanel(target: Target) -> Element {
                 if status.unlocked && status.totp_enrolled == Some(true) && status.gateway_paired == Some(true) {
                     Alert { tone: AlertTone::Success, title: rsx! { "Vault enrollment verified" }, "Encryption is active, an authenticator is enrolled, and the gateway holds a current pairing. Lock and unlock once to check your recovery workflow. Restarting the gateway requires pairing it again." }
                 }
-                if !status.exists {
-                    Alert { title: rsx! { "Bringing an existing RustyClaw vault?" },
-                        p { "Preview migration on the gateway host before creating an empty vault. Import preserves the encrypted source and its restrictions, and never replaces a vault that already exists." }
-                        code { "agent206 --data-dir <profile-directory> import rustyclaw <source-directory>" }
-                        p { "Review the preview before using --apply. The import review screen and adapters for other tools are still being built." }
+                if !status.exists && flow == Flow::Idle {
+                    migration::Migration { panel,
+                        onpreview: move |source| { take(password); take(confirm); take(code); panel.preview_import(source); },
+                        onapply: move |(source_password, source_code)| { take(password); take(confirm); take(code); panel.apply_import(source_password, source_code); },
+                        oncancel: move |_| panel.cancel_import(),
                     }
                 } else if status.unlocked && status.totp_enrolled == Some(true) {
                     Alert { title: rsx! { "Optional: bring over your connections" },
-                        p { "You can preview RustyClaw provider and messenger settings without replacing this vault. Run the import command on the gateway host; review every category before applying." }
-                        code { "agent206 --data-dir <profile-directory> import rustyclaw <source-directory> --skip-vault" }
+                        p { "Preview RustyClaw provider and messenger settings separately. Choose each item before importing." }
+                        Link { to: crate::Route::Imports {}, "Review connection settings" }
                         p { "Migration does not activate foreign hooks, extensions, permissions, or model choices." }
                     }
                 }
@@ -577,6 +605,10 @@ fn VaultPanel(target: Target) -> Element {
             }
             if let Some(message) = (panel.notice)() {
                 Alert { tone: AlertTone::Success, urgency: Urgency::Polite, "{message}" }
+            }
+            if let Some(applied) = (panel.import_result)() {
+                if let Some(path) = applied.receipt { p { class: "a206-muted", "Vault import receipt: {path.display()}" } }
+                if let Some(report) = applied.receipt_error { ErrorNotice { report, title: "Vault imported; receipt not confirmed".to_string() } }
             }
             if let Some(Failure { title, report }) = (panel.failure)() {
                 ErrorNotice { report, title }

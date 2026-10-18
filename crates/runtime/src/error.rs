@@ -250,6 +250,7 @@ impl Classified for a206_broker::BrokerError {
     fn kind(&self) -> Option<ErrorKind> {
         use a206_broker::{BrokerError as B, UpstreamFailure as U};
         Some(match self {
+            B::ImportFailure(report) => report.kind,
             B::Locked | B::NoVault | B::LockedOut { .. } | B::GatewayNotPaired => {
                 ErrorKind::Unavailable
             }
@@ -260,7 +261,11 @@ impl Classified for a206_broker::BrokerError {
             | B::StepUpRequired
             | B::Forbidden
             | B::Denied(_) => ErrorKind::PermissionDenied,
-            B::NoPendingEnrollment | B::AlreadyExists | B::VaultExists => ErrorKind::Conflict,
+            B::NoPendingEnrollment
+            | B::AlreadyExists
+            | B::VaultExists
+            | B::ImportReviewUnavailable
+            | B::ImportSourceChanged => ErrorKind::Conflict,
             B::NotFound => ErrorKind::NotFound,
             B::Invalid(_) => ErrorKind::InvalidRequest,
             B::Channel(_) => ErrorKind::Protocol,
@@ -279,6 +284,8 @@ impl Classified for a206_broker::ClientError {
             C::Protocol(_) | C::Stream(_) => Some(ErrorKind::Protocol),
             // The provider layer falls back before this can reach a client.
             C::StreamUnsupported | C::SocketUnsupported => Some(ErrorKind::Unavailable),
+            // Reviewed migration must never fall back to unguarded import.
+            C::ReviewedImportUnsupported => Some(ErrorKind::Unavailable),
             C::SocketMessage => Some(ErrorKind::InvalidRequest),
             // `transparent` hides the reply from the chain, so classify it here.
             C::Broker(reply) => reply.kind(),
