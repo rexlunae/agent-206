@@ -992,6 +992,12 @@ pub enum Command {
         thread: Id,
         budget: ToolBudget,
     },
+    /// Atomically update limits only if the saved values still match the review.
+    UpdateToolBudget {
+        thread: Id,
+        budget: ToolBudget,
+        expected: ToolBudget,
+    },
     /// Answer a pending approval. `digest` must be the one the user was
     /// shown, so a decision applies only to that exact call.
     ResolveApproval {
@@ -1200,6 +1206,7 @@ impl Command {
             Self::ListTools { .. } => "list_tools",
             Self::SetToolPermission { .. } => "set_tool_permission",
             Self::SetToolBudget { .. } => "set_tool_budget",
+            Self::UpdateToolBudget { .. } => "update_tool_budget",
             Self::ResolveApproval { .. } => "resolve_approval",
             Self::AnswerPrompt { .. } => "answer_prompt",
             Self::CreateProject { .. } => "create_project",

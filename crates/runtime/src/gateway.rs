@@ -1362,7 +1362,12 @@ impl Gateway {
                 tool,
                 permission,
             } => self.set_tool_permission(thread, tool, permission),
-            Command::SetToolBudget { thread, budget } => self.set_tool_budget(thread, budget),
+            Command::SetToolBudget { thread, budget } => self.set_tool_budget(thread, budget, None),
+            Command::UpdateToolBudget {
+                thread,
+                budget,
+                expected,
+            } => self.set_tool_budget(thread, budget, Some(expected)),
             Command::ResolveApproval {
                 thread,
                 approval,

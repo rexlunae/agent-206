@@ -152,7 +152,7 @@ leaves unknown fails the run (`RunError::UsageUnknown`), even after a final
 reply, which is kept, instead of letting it run or end unmeasured. CLI: `tools budget THREAD --rounds R --tool-calls C
 [--tokens T]`.
 
-Commands: `ListTools`, `SetToolPermission`, `SetToolBudget`, `ResolveApproval`.
+Commands: `ListTools`, `SetToolPermission`, `SetToolBudget`, `UpdateToolBudget`, `ResolveApproval`.
 CLI: `agent206 tools list|permit|budget` and `agent206 approvals list|approve|deny`.
 
 ## Approvals
@@ -751,3 +751,27 @@ the GUI or CLI; credential scanning of instruction files, attachments and
 outbound requests, and user-defined credential shapes; scanning user
 messages, messenger messages, instruction files and attachments for text
 addressed to the model, and blocking or quarantining flagged results.
+
+The shared native-conversation inspector and conversation-details popover offer
+**Run limits** for the shared gateway budget policy: model rounds, tool calls
+(including zero) and an optional token budget. The popover keeps the controls
+available in split views. Saved local limits and the effective ceilings from the
+snapshot's full ancestor chain are displayed separately; missing or cyclic
+lineage is shown as unavailable, never unlimited. The display uses the same
+budget intersection operation as the gateway; only the gateway decides what
+runs. Offline and pending saves are disabled, malformed input cannot be saved,
+and gateway errors keep their structured causes. A conflicting external change
+preserves the draft and requires reloading the saved limits. UI rendering and
+input/lineage behavior are unit-tested; desktop and TUI interaction acceptance is pending.
+GUI saves use `UpdateToolBudget` with the reviewed budget as `expected`; the gateway
+compares it under the same lock as the write and returns a structured conflict
+without changing the saved limits if another client edited them. The existing
+CLI `SetToolBudget` operation remains supported. Older gateways refuse the new
+command instead of ignoring its compare condition. Command and MessagePack
+compatibility tests cover both paths.
+
+A disposable loopback web profile was also exercised through the actual browser:
+saving from both surfaces updates both, invalid rounds disable Save, and a CLI
+edit while the browser holds a draft preserves it and blocks the stale save until
+Reload. No provider accounts, credentials or tool grants were configured.
+Desktop and TUI interaction acceptance remains pending.
