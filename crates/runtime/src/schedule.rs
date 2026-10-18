@@ -1,7 +1,7 @@
 //! When scheduled messages are due: pure functions of a schedule and a time,
 //! so the scheduler's decisions are tested without a clock.
 use a206_core::{
-    ErrorKind, ErrorReport, Job, JobKind, JobOutcome, Role, RunState, Schedule, Thread,
+    Delivery, ErrorKind, ErrorReport, Job, JobKind, JobOutcome, Role, RunState, Schedule, Thread,
     schedule::{heartbeat_run, is_heartbeat_ok},
 };
 use jiff::{Timestamp, tz::TimeZone};
@@ -128,6 +128,15 @@ pub fn first(schedule: &Schedule, now: u64) -> Result<u64, ScheduleError> {
 /// never sent it is due again at once, so the message is sent exactly once.
 pub fn recover(jobs: &mut [Job], threads: &[Thread]) {
     for job in jobs {
+        // No post survives a restart: one still going out may or may not
+        // have reached its destination.
+        if let Some(run) = job
+            .last
+            .as_mut()
+            .filter(|run| run.delivery == Some(Delivery::Posting))
+        {
+            run.delivery = Some(Delivery::Unrecorded);
+        }
         let Some(run) = job
             .last
             .as_mut()
@@ -179,7 +188,17 @@ pub fn recover(jobs: &mut [Job], threads: &[Thread]) {
                     {
                         JobOutcome::Quiet
                     }
-                    _ if answered => JobOutcome::Complete,
+                    _ if answered => {
+                        // Its reply was never posted: posting starts only
+                        // after the run's end is recorded.
+                        if job.deliver_to.is_some() {
+                            run.delivery = Some(Delivery::Failed(ErrorReport::new(
+                                ErrorKind::Unavailable,
+                                "The gateway stopped before posting this run's reply.",
+                            )));
+                        }
+                        JobOutcome::Complete
+                    }
                     _ => JobOutcome::Failed,
                 }
             }

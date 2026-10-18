@@ -23,6 +23,7 @@ fn job(thread: Uuid) -> Job {
         last: None,
         author: JobAuthor::User,
         history: 0,
+        deliver_to: None,
     }
 }
 
@@ -61,6 +62,7 @@ fn jobs_show_their_conversation_author_state_and_refusal() {
         at: refused.created,
         outcome: JobOutcome::Refused(ErrorReport::new(ErrorKind::Conflict, refusal.clone())),
         ended: None,
+        delivery: None,
     });
     let mut paused = job(thread.id);
     paused.enabled = false;
@@ -165,6 +167,7 @@ fn heartbeat_checks_show_their_checklist_and_whether_anything_needed_attention()
             at: job.created,
             outcome,
             ended: None,
+            delivery: None,
         });
         job
     };
@@ -233,4 +236,61 @@ fn run_history_shows_each_run_and_marks_unrecorded_ends() {
         html.contains(&format!("took {}", format_interval(took))),
         "{html}"
     );
+}
+
+#[test]
+fn run_history_shows_whether_each_reply_was_posted() {
+    let at = 86_400 + arbitrary(4_000_000_000);
+    let parts = 2 + arbitrary(8);
+    let refusal = format!("gone-{}", Uuid::new_v4().simple());
+    let run = |delivery| JobRun {
+        outcome: JobOutcome::Complete,
+        delivery: Some(delivery),
+        ..JobRun::start(at)
+    };
+    let html = render_runs(vec![
+        run(Delivery::Sent { parts: 1 }),
+        run(Delivery::Sent { parts }),
+        run(Delivery::Failed(ErrorReport::new(
+            ErrorKind::NotFound,
+            refusal.clone(),
+        ))),
+        run(Delivery::Posting),
+        run(Delivery::Unrecorded),
+        JobRun::start(at),
+    ]);
+    assert_eq!(html.matches("Reply posted<").count(), 1, "{html}");
+    assert_eq!(html.matches("Posting reply").count(), 1, "{html}");
+    assert_eq!(html.matches("it may not have arrived").count(), 1, "{html}");
+    assert!(
+        html.contains(&format!("Reply posted in {parts} parts")),
+        "{html}"
+    );
+    assert_eq!(html.matches("Reply not posted").count(), 2, "{html}");
+    assert!(html.contains(&refusal), "{html}");
+}
+
+#[test]
+fn a_job_offers_each_configured_destination_and_keeps_a_withdrawn_one() {
+    let (hook, bot, chat, gone) = (
+        format!("h-{}", Uuid::new_v4().simple()),
+        format!("b-{}", Uuid::new_v4().simple()),
+        format!("c-{}", Uuid::new_v4().simple()),
+        format!("g-{}", Uuid::new_v4().simple()),
+    );
+    let destinations = vec![hook.clone(), format!("{bot}/{chat}")];
+    let values = |choices: Vec<SelectChoice>| {
+        choices
+            .into_iter()
+            .map(|c| (c.value, c.label))
+            .collect::<Vec<_>>()
+    };
+    let offered = values(delivery_choices(&destinations, Some(&hook)));
+    assert_eq!(offered.len(), 3, "{offered:?}");
+    assert_eq!(offered[0].0, NOWHERE);
+    assert_eq!(offered[2].0, format!("{bot}/{chat}"));
+    let kept = values(delivery_choices(&destinations, Some(&gone)));
+    assert_eq!(kept.len(), 4, "{kept:?}");
+    assert_eq!(kept[3].0, gone);
+    assert!(kept[3].1.contains("no longer configured"), "{kept:?}");
 }

@@ -154,6 +154,12 @@ impl MessengerKind {
     pub fn is_send_only(self) -> bool {
         matches!(self, Self::Webhook)
     }
+    /// Whether the kind can post to one of its allowed chats outside a reply
+    /// in that chat: every kind that receives (IRC and Signal post through
+    /// their running session).
+    pub fn posts_to_chats(self) -> bool {
+        !self.is_send_only()
+    }
     /// Whether the kind's endpoint is a signal-cli daemon ([`SignalDaemon`]).
     pub fn is_signal(self) -> bool {
         matches!(self, Self::Signal)
@@ -609,6 +615,27 @@ impl MessengerStatus {
 pub struct ChatBinding {
     pub messenger: String,
     pub chat: String,
+}
+
+/// Where a gateway can post outside a chat's own replies, as the user
+/// configured it: each webhook by its name, and each allowed chat of a kind
+/// that [posts to chats](MessengerKind::posts_to_chats) as `name/chat`.
+/// Whether a messenger is enabled or connected is checked when it posts.
+pub fn post_destinations(configs: &[MessengerConfig]) -> Vec<String> {
+    let mut destinations = vec![];
+    for config in configs {
+        if config.kind.is_send_only() {
+            destinations.push(config.name.clone());
+        } else if config.kind.posts_to_chats() {
+            destinations.extend(
+                config
+                    .allowed_chats
+                    .iter()
+                    .map(|chat| format!("{}/{chat}", config.name)),
+            );
+        }
+    }
+    destinations
 }
 
 #[cfg(test)]
