@@ -23,7 +23,8 @@ pub(super) fn stage(
     root: PathBuf,
     paths: &[String],
     unstage: bool,
-    user: &UserGit,
+    // Read only to stage: unstaging uses nothing but `HEAD` and the index.
+    user: impl FnOnce() -> Result<UserGit, HostFailure>,
     interrupt: &AtomicBool,
 ) -> Result<HostReply, HostFailure> {
     if paths.is_empty() || paths.len() > MAX_COMMIT_PATHS {
@@ -52,9 +53,11 @@ pub(super) fn stage(
     let changes = if unstage {
         from_head(&repo, &index, &named, interrupt)?
     } else {
-        let settings = Settings::resolve(&repo, user)?;
-        from_working_tree(&repo, &root, &index, &settings, user, &named, interrupt)?
+        let user = user()?;
+        let settings = Settings::resolve(&repo, &user)?;
+        from_working_tree(&repo, &root, &index, &settings, &user, &named, interrupt)?
     };
+    refuse_mixed_shapes(&index, &changes)?;
     // The last point at which the call can stop without changing the index.
     check(interrupt)?;
     update_index(&mut index, changes);
@@ -92,13 +95,12 @@ fn from_working_tree(
             if entry.mode == Mode::COMMIT {
                 return Err(directory());
             }
-        } else {
-            refuse_unknown_shape(index, path)?;
         }
         let recorded_executable = indexed.is_some_and(|e| e.mode == Mode::FILE_EXECUTABLE);
         match files.read(root, path, indexed.is_some(), recorded_executable)? {
             Some(change) => changes.push((path.to_owned(), change)),
             None if indexed.is_some() => changes.push((path.to_owned(), Change::Remove)),
+            None if holds_entries(index, path) => return Err(directory()),
             None => {
                 return Err(failure(
                     HostErrorCode::NotFound,
@@ -110,21 +112,52 @@ fn from_working_tree(
     Ok(changes)
 }
 
-/// A path git does not track yet must not sit below a file git tracks, nor
-/// above files it tracks: git keeps one or the other.
-fn refuse_unknown_shape(index: &gix::index::File, path: &BStr) -> Result<(), HostFailure> {
-    let below_file = path
-        .char_indices()
-        .filter(|(_, _, c)| *c == '/')
-        .any(|(start, _, _)| index.entry_by_path(path[..start].as_bstr()).is_some());
-    if below_file {
-        return Err(failure(
-            HostErrorCode::Conflict,
-            "a parent of the path is a file in git",
-        ));
+/// Git's index holds a path as a file or as a directory, never both: no
+/// written path may sit below a file that stays in the index, nor above
+/// entries that stay in it.
+fn refuse_mixed_shapes(
+    index: &gix::index::File,
+    changes: &[(BString, Change)],
+) -> Result<(), HostFailure> {
+    let (mut written, mut removed) = (BTreeSet::new(), BTreeSet::new());
+    for (path, change) in changes {
+        match change {
+            Change::Write { .. } => written.insert(path.as_bstr()),
+            Change::Remove => removed.insert(path.as_bstr()),
+        };
     }
-    if holds_entries(index, path) {
-        return Err(directory());
+    let stays = |path: &BStr| {
+        written.contains(path) || (!removed.contains(path) && index.entry_by_path(path).is_some())
+    };
+    for path in &written {
+        let below_file = path
+            .char_indices()
+            .filter(|(_, _, c)| *c == '/')
+            .any(|(start, _, _)| stays(path[..start].as_bstr()));
+        if below_file {
+            return Err(failure(
+                HostErrorCode::Conflict,
+                "a parent of the path is a file in git; name that file too",
+            ));
+        }
+        let mut prefix = path.to_vec();
+        prefix.push(b'/');
+        let prefix = prefix.as_bstr();
+        let indexed_below = index.prefixed_entries(prefix).is_some_and(|entries| {
+            entries
+                .iter()
+                .any(|entry| !removed.contains(entry.path(index)))
+        });
+        let written_below = written
+            .range(prefix..)
+            .next()
+            .is_some_and(|below| below.starts_with(prefix));
+        if indexed_below || written_below {
+            return Err(failure(
+                HostErrorCode::Conflict,
+                "git tracks files below the path; name those files too",
+            ));
+        }
     }
     Ok(())
 }

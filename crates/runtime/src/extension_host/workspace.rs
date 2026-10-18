@@ -718,9 +718,25 @@ pub(super) enum Tracked {
     Link(Vec<u8>),
 }
 /// The file at `path` as git would commit it, reached without following a
-/// symbolic link anywhere on the way; `None` when nothing is there.
+/// symbolic link anywhere on the way; `None` when git would store nothing
+/// there: nothing exists, a directory does, or a parent is a file.
 pub(super) fn tracked(root: PathBuf, path: &str) -> Result<Option<Tracked>, HostFailure> {
     use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
+    let workspace = open_workspace(root.clone())?;
+    let mut parent = PathBuf::new();
+    for name in writable_path(path)?
+        .parent()
+        .into_iter()
+        .flat_map(Path::components)
+    {
+        parent.push(name);
+        if workspace
+            .symlink_metadata(&parent)
+            .is_ok_and(|metadata| metadata.is_file())
+        {
+            return Ok(None);
+        }
+    }
     let (directory, name) = match writable(root, path) {
         Err(failure) if failure.code == HostErrorCode::NotFound => return Ok(None),
         found => found?,
@@ -736,6 +752,9 @@ pub(super) fn tracked(root: PathBuf, path: &str) -> Result<Option<Tracked>, Host
         return Ok(Some(Tracked::Link(
             target.into_os_string().into_encoded_bytes(),
         )));
+    }
+    if metadata.is_dir() {
+        return Ok(None);
     }
     if !metadata.is_file() {
         return Err(not_regular());

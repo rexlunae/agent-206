@@ -234,3 +234,82 @@ async fn staging_never_runs_repository_programs() {
     );
     assert!(!marker.exists());
 }
+
+#[tokio::test]
+async fn a_file_and_a_directory_never_share_a_path_in_the_index() {
+    let (dir, store) = store();
+    let root = &project(dir.path());
+    repository(root, &[("a", "one\n")]);
+    let x = unique("x");
+    // `a` becomes a directory in the working tree.
+    std::fs::remove_file(root.join("a")).unwrap();
+    std::fs::create_dir(root.join("a")).unwrap();
+    std::fs::write(root.join("a/x"), &x).unwrap();
+    let mut host = writer(&store, root);
+    // Adding `a/x` while the index keeps the file `a` would hold both.
+    let before = index(root);
+    assert_eq!(
+        code(host.handle(stage(&["a/x"], false)).await),
+        Some(HostErrorCode::Conflict)
+    );
+    assert_eq!(index(root), before);
+    assert_eq!(
+        host.handle(stage(&["a", "a/x"], false)).await,
+        HostReply::Done
+    );
+    assert_eq!(staged(root, "a"), None);
+    assert_eq!(staged(root, "a/x"), Some(x.clone()));
+
+    // Unstaging only `a` would put HEAD's file back beside `a/x`.
+    let before = index(root);
+    assert_eq!(
+        code(host.handle(stage(&["a"], true)).await),
+        Some(HostErrorCode::Conflict)
+    );
+    assert_eq!(index(root), before);
+    assert_eq!(
+        host.handle(stage(&["a", "a/x"], true)).await,
+        HostReply::Done
+    );
+    assert_eq!(staged(root, "a").as_deref(), Some("one\n"));
+    assert_eq!(staged(root, "a/x"), None);
+
+    // And back: the directory `a` turns into a file again.
+    assert_eq!(
+        host.handle(stage(&["a", "a/x"], false)).await,
+        HostReply::Done
+    );
+    std::fs::remove_dir_all(root.join("a")).unwrap();
+    let file = unique("file");
+    std::fs::write(root.join("a"), &file).unwrap();
+    let before = index(root);
+    assert_eq!(
+        code(host.handle(stage(&["a"], false)).await),
+        Some(HostErrorCode::Conflict)
+    );
+    assert_eq!(index(root), before);
+    assert_eq!(
+        host.handle(stage(&["a", "a/x"], false)).await,
+        HostReply::Done
+    );
+    assert_eq!(staged(root, "a"), Some(file));
+    assert_eq!(staged(root, "a/x"), None);
+}
+
+#[tokio::test]
+async fn unstaging_does_not_read_the_users_git_configuration() {
+    let (dir, store) = store();
+    let root = &project(dir.path());
+    repository(root, &[("a.txt", "one\n")]);
+    std::fs::write(root.join("a.txt"), unique("a")).unwrap();
+    let mut host = writer(&store, root);
+    assert_eq!(host.handle(stage(&["a.txt"], false)).await, HostReply::Done);
+    // Unreadable user configuration refuses staging but not unstaging.
+    host.user_git = || Err(failure(HostErrorCode::Io, "unreadable"));
+    assert_eq!(
+        code(host.handle(stage(&["a.txt"], false)).await),
+        Some(HostErrorCode::Io)
+    );
+    assert_eq!(host.handle(stage(&["a.txt"], true)).await, HostReply::Done);
+    assert_eq!(staged(root, "a.txt").as_deref(), Some("one\n"));
+}

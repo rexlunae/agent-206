@@ -1006,7 +1006,7 @@ impl HostCalls {
                 // still reaches the guest before the invocation is dropped.
                 let budget = self.write_budget()?;
                 git_write_call_with_timeout(
-                    move |interrupt| git_stage::stage(root, &paths, unstage, &user()?, &interrupt),
+                    move |interrupt| git_stage::stage(root, &paths, unstage, user, &interrupt),
                     budget,
                 )
                 .await

@@ -341,9 +341,11 @@ commits read them, under the same refusals that apply to a file: an ignored
 untracked path, `filter`, `ident` and `working-tree-encoding` attributes,
 carriage returns git would convert, conflicts, a merge or rebase in progress,
 and split or sparse indexes. Hooks, signing and identity play no part, as
-`git add` uses none. Directories and submodules are refused (name their
-files), as is a new path below a file git tracks. One refused path refuses
-the whole call, and the index lock is held throughout, so the index is
+`git add` uses none, and unstaging reads no user configuration at all.
+Directories and submodules are refused (name their files). The index never
+ends up holding a file and entries below it at the same path: replacing a
+file with a directory, or the reverse, is staged or unstaged by naming both
+the file and the paths below it. One refused path refuses the whole call, and the index lock is held throughout, so the index is
 written once or not at all.
 
 A fetch is a `GET` through the same guard as downloads
@@ -424,7 +426,7 @@ Tool text is extension output, never instructions.
 | Domain | Operations | Authority |
 | --- | --- | --- |
 | workspace | Multi-hunk patch | `write_workspace` |
-| git | Stage without committing, branches, push | `git_write` (push also needs a forge credential handle) |
+| git | Commit what is staged, branches, push | `git_write` (push also needs a forge credential handle) |
 | forge | PRs, reviews, checks, logs | adapter-specific scoped credential handle |
 | network | Requests other than `GET`, headers, brokered credentials | `network` + destination + secret handle |
 | downloads | Enqueue, cancel, subscribe | destination and origin grants |
