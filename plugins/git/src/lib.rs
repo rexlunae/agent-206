@@ -89,11 +89,30 @@ impl Extension for Git {
                     })
                 };
                 let message = required("message")?;
-                let paths: Vec<&str> = required("paths")?
-                    .lines()
-                    .filter(|path| !path.is_empty())
-                    .collect();
-                let commit = host::git_commit(message, &paths)?;
+                let staged = bool_arg(args, "staged")?.unwrap_or(false);
+                let paths = string_arg(args, "paths")?;
+                let commit = match (staged, paths) {
+                    (true, None) => host::git_commit_staged(message)?,
+                    (true, Some(_)) => {
+                        return Err(GuestError::new(
+                            "invalid_argument",
+                            "give either `paths` or `staged`, not both",
+                        ));
+                    }
+                    (false, paths) => {
+                        let paths: Vec<&str> = paths
+                            .ok_or_else(|| {
+                                GuestError::new(
+                                    "invalid_argument",
+                                    "`paths` is required unless `staged` is true",
+                                )
+                            })?
+                            .lines()
+                            .filter(|path| !path.is_empty())
+                            .collect();
+                        host::git_commit(message, &paths)?
+                    }
+                };
                 format!("committed {} {}", commit.id, commit.summary)
             }
             "git_stage" => {
