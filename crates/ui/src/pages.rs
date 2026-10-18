@@ -197,7 +197,7 @@ pub fn Documents() -> Element {
 pub fn Security() -> Element {
     rsx! { PageFrame { kicker: "Settings", title: "Security", description: "Manage vault authentication and gateway access.",
         div { class: "a206-grid",
-            Card { CardHeader { CardTitle { "Least privilege" } } CardBody { p { "New conversations have no tool grants. Delegated capabilities are intersected with their parent, mode and extension manifest." } } }
+            Card { CardHeader { CardTitle { "Tool access" } } CardBody { p { "New conversations have no tool permissions. Subagents cannot receive more access than their parent or mode allows. Extensions require explicit grants." } } }
             Card { CardHeader { CardTitle { "Encrypted vault" } } CardBody { p { "Credentials stay encrypted when locked. Unlock the vault and pair the gateway before using provider credentials." } } }
             Card { CardHeader { CardTitle { "Verified SSH" } } CardBody { p { "Remote connections use your OpenSSH configuration and verified host keys. Gateway setup shows an unknown host's fingerprint and trusts it only after you confirm it." } } }
         }

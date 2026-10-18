@@ -63,7 +63,7 @@ pub fn Providers() -> Element {
         }
         PresetLibrary {}
         h2 { "Coding-agent backends" }
-        p { class: "a206-muted", "Optional agent engines, independent of your model connections. Runtime files stay outside private application state." }
+        p { class: "a206-muted", "Configure optional Codex or Claude Agent runtimes separately from model providers." }
         for kind in [CodingBackend::Codex, CodingBackend::ClaudeAgent] {
             BackendEditor { key: "{kind.label()}", kind, initial: snapshot.settings.backends.iter().find(|b| b.kind == kind).cloned() }
         }
