@@ -16,6 +16,59 @@ fn random() -> String {
     Id::new_v4().to_string()
 }
 
+/// A filesystem socket entry does not establish bind/listen or greeting readiness.
+async fn ready<T, F, Fut>(mut connect: F) -> Result<T, a206_broker::ClientError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, a206_broker::ClientError>>,
+{
+    loop {
+        match connect().await {
+            Err(a206_broker::ClientError::Io(error))
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                ) =>
+            {
+                tokio::task::yield_now().await
+            }
+            result => return result,
+        }
+    }
+}
+
+#[tokio::test]
+async fn broker_readiness_retries_transient_startup_errors_only() {
+    let mut attempts = 0;
+    ready(|| {
+        attempts += 1;
+        std::future::ready(match attempts {
+            1 => Err(a206_broker::ClientError::Io(
+                std::io::ErrorKind::NotFound.into(),
+            )),
+            2 => Err(a206_broker::ClientError::Io(
+                std::io::ErrorKind::ConnectionRefused.into(),
+            )),
+            _ => Ok(()),
+        })
+    })
+    .await
+    .unwrap();
+    assert_eq!(attempts, 3);
+    let mut attempts = 0;
+    let result = ready(|| {
+        attempts += 1;
+        std::future::ready(Err::<(), _>(a206_broker::ClientError::Io(
+            std::io::ErrorKind::PermissionDenied.into(),
+        )))
+    })
+    .await;
+    assert!(
+        matches!(result, Err(a206_broker::ClientError::Io(e)) if e.kind() == std::io::ErrorKind::PermissionDenied)
+    );
+    assert_eq!(attempts, 1);
+}
+
 /// What the stand-in Bot API serves and records.
 #[derive(Clone, Default)]
 struct Bot {
@@ -134,11 +187,31 @@ async fn broker_with(
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().to_owned();
     let serving = root.clone();
-    tokio::spawn(async move { serve(&serving).await.unwrap() });
-    while !socket_path(&root).exists() {
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
-    let mut user = Client::connect(&root, Role::User).await.unwrap();
+    let mut server = tokio::spawn(async move { serve(&serving).await });
+    let startup = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        tokio::select! {
+            connected = ready(|| Client::connect(&root, Role::User)) => connected,
+            stopped = &mut server => panic!("test broker exited before readiness: {stopped:?}"),
+        }
+    })
+    .await;
+    let mut user = match startup {
+        Ok(Ok(client)) => client,
+        Ok(Err(error)) => {
+            server.abort();
+            let stopped = server.await;
+            panic!("test broker connection failed: {error:?}; server stopped: {stopped:?}");
+        }
+        Err(error) => {
+            server.abort();
+            let stopped = server.await;
+            panic!("test broker readiness timed out: {error:?}; server stopped: {stopped:?}");
+        }
+    };
+    // Deliberately detached after successful readiness: the test's Tokio
+    // runtime owns the server lifetime and cancels it when the test ends.
+    // Failed startup above aborts and awaits it before deleting the profile.
+    drop(server);
     user.call(Request::Unlock {
         password: WireSecret::new(random()),
         totp: None,
