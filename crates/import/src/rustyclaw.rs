@@ -219,6 +219,7 @@ fn messenger_kind(id: &str) -> Option<MessengerKind> {
         "discord" => Some(MessengerKind::Discord),
         "slack" => Some(MessengerKind::Slack),
         "irc" => Some(MessengerKind::Irc),
+        "signal" => Some(MessengerKind::Signal),
         _ => None,
     }
 }
@@ -306,6 +307,7 @@ fn plan_messengers(settings: &Settings, source: Vec<Messenger>) -> Vec<Messenger
                     (Some(_), _) => Err(UnsupportedMessenger::PlainTextIrc),
                     (None, _) => Err(UnsupportedMessenger::InvalidEndpoint),
                 },
+                Some(MessengerKind::Signal) => Err(UnsupportedMessenger::NoSignalDaemon),
                 Some(kind) if kind.default_endpoint().is_none() => messenger
                     .homeserver
                     .as_deref()
@@ -1011,6 +1013,39 @@ nick = "not a nick"
         assert_eq!(network.login.as_deref(), Some(nick.as_str()));
         assert_eq!(network.allowed_chats, BTreeSet::from(["#rust".to_owned()]));
         assert_eq!(network.allowed_users, BTreeSet::from(["friend".to_owned()]));
+    }
+
+    #[test]
+    fn signal_accounts_are_reported_because_no_daemon_is_named() {
+        let phone = format!("+1{}", &uuid::Uuid::new_v4().as_u128().to_string()[..10]);
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            &dir.path().join("config.toml"),
+            &format!(
+                r##"
+[[messengers]]
+name = "phone"
+messenger_type = "signal"
+phone = "{phone}"
+allowed_users = ["{phone}"]
+"##
+            ),
+        );
+        let mut settings = Settings::default();
+        let preview = preview(dir.path(), &settings, None).unwrap();
+        let [phone_entry] = &preview.messengers[..] else {
+            panic!("{:?}", preview.messengers)
+        };
+        assert_eq!(phone_entry.kind, Some(MessengerKind::Signal));
+        assert_eq!(
+            phone_entry.action,
+            MessengerAction::Unsupported {
+                reason: UnsupportedMessenger::NoSignalDaemon
+            }
+        );
+        assert!(phone_entry.allowed_users.is_empty() && phone_entry.login.is_none());
+        assert!(preview.apply_messengers(&mut settings).is_empty());
+        assert!(settings.messengers.is_empty());
     }
 
     #[test]

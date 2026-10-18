@@ -149,7 +149,9 @@ fn MessengerCard(now: u64, config: MessengerConfig, status: MessengerStatus) -> 
             if config.kind.needs_login() {
                 LoginRow { messenger: config.name.clone(), current: config.login.clone() }
             }
-            CredentialRow { messenger: config.name.clone(), app: false, current: config.credential.clone() }
+            if config.kind.needs_credential() {
+                CredentialRow { messenger: config.name.clone(), app: false, current: config.credential.clone() }
+            }
             if config.kind.needs_app_credential() {
                 CredentialRow { messenger: config.name.clone(), app: true, current: config.app_credential.clone() }
             }
@@ -268,16 +270,6 @@ fn edit_list(
     });
 }
 
-/// A typed chat or sender as the messenger compares it: IRC names fold the
-/// way the network compares them, so `#Rust` allows `#rust`.
-fn fold(kind: MessengerKind, name: String) -> String {
-    if kind.is_irc() {
-        a206_core::messengers::irc_lowercase(&name)
-    } else {
-        name
-    }
-}
-
 #[component]
 fn AllowList(
     messenger: String,
@@ -303,7 +295,7 @@ fn AllowList(
             Input { aria_label: if senders { "Sender id to allow" } else { "Chat id to allow" }, value: ReadSignal::from(draft), oninput: move |v| draft.set(v), placeholder: if senders { "Sender id" } else { "Chat id" } }
             Button { size: ButtonSize::Sm, variant: ButtonVariant::Secondary, availability: if ready { Availability::Enabled } else { Availability::Disabled }, onclick: move |_| {
                 let value = draft().trim().to_owned();
-                edit_list(state, &messenger, senders, |list, kind| { list.insert(fold(kind, value)); });
+                edit_list(state, &messenger, senders, |list, kind| { list.insert(kind.fold(&value)); });
                 draft.set(String::new());
             }, if senders { "Allow sender" } else { "Allow chat" } }
         }
@@ -381,15 +373,19 @@ fn AddMessenger() -> Element {
     let needs_endpoint = selected.is_some_and(|k| k.default_endpoint().is_none());
     let needs_app = selected.is_some_and(MessengerKind::needs_app_credential);
     let needs_login = selected.is_some_and(MessengerKind::needs_login);
+    let needs_credential = selected.is_some_and(MessengerKind::needs_credential);
     let irc = selected.is_some_and(MessengerKind::is_irc);
+    let signal = selected.is_some_and(MessengerKind::is_signal);
     let ready = selected.is_some()
         && (!needs_login || !login().trim().is_empty())
         && !name().trim().is_empty()
-        && !credential().trim().is_empty()
+        && (!needs_credential || !credential().trim().is_empty())
         && (!needs_app || !app_credential().trim().is_empty())
         && (!needs_endpoint || !endpoint().trim().is_empty());
     let endpoint_hint = if irc {
         "Required: the IRC server, as ircs://host or ircs://host:port. Only TLS is used."
+    } else if signal {
+        "Required: your signal-cli daemon's socket, as unix:///path/to/socket or tcp://127.0.0.1:port. Agent 206 never starts or stops it."
     } else if needs_endpoint {
         "Required: your homeserver's client API origin, with no path."
     } else {
@@ -405,20 +401,22 @@ fn AddMessenger() -> Element {
                     options: MessengerKind::ALL.into_iter().map(|k| SelectChoice::new(k.label(), k.label())).collect(),
                     onchange: move |value: String| kind.set(Some(value))
                 } }
-                Field { label: rsx! { "Vault credential" }, hint: rsx! { "The name of the vault entry holding the token, never the token itself." }, Input { value: ReadSignal::from(credential), oninput: move |v| credential.set(v), placeholder: "Credential name" } }
+                if needs_credential {
+                    Field { label: rsx! { "Vault credential" }, hint: rsx! { "The name of the vault entry holding the token, never the token itself." }, Input { value: ReadSignal::from(credential), oninput: move |v| credential.set(v), placeholder: "Credential name" } }
+                }
                 if needs_login {
-                    Field { label: rsx! { "Login" }, hint: rsx! { "The bot's nickname, registered as an account with the network's services." }, Input { value: ReadSignal::from(login), oninput: move |v| login.set(v), placeholder: "Nickname" } }
+                    Field { label: rsx! { "Login" }, hint: rsx! { if signal { "The account's phone number (+ and digits), as signal-cli serves it." } else { "The bot's nickname, registered as an account with the network's services." } }, Input { value: ReadSignal::from(login), oninput: move |v| login.set(v), placeholder: if signal { "+15551234567" } else { "Nickname" } } }
                 }
                 if needs_app {
                     Field { label: rsx! { "App-level token credential" }, hint: rsx! { "The vault entry holding the app-level token the service sends events with." }, Input { value: ReadSignal::from(app_credential), oninput: move |v| app_credential.set(v), placeholder: "Credential name" } }
                 }
-                Field { label: rsx! { if irc { "Server" } else { "API endpoint" } }, hint: rsx! { "{endpoint_hint}" }, Input { value: ReadSignal::from(endpoint), oninput: move |v| endpoint.set(v), placeholder: selected.and_then(|k| k.default_endpoint()).unwrap_or(if irc { "ircs://irc.example" } else { "https://homeserver.example" }) } }
+                Field { label: rsx! { if irc { "Server" } else if signal { "signal-cli daemon" } else { "API endpoint" } }, hint: rsx! { "{endpoint_hint}" }, Input { value: ReadSignal::from(endpoint), oninput: move |v| endpoint.set(v), placeholder: selected.and_then(|k| k.default_endpoint()).unwrap_or(if irc { "ircs://irc.example" } else if signal { "unix:///run/user/1000/signal-cli/socket" } else { "https://homeserver.example" }) } }
             }
         }
         CardFooter { Button { variant: ButtonVariant::Primary, availability: if ready { Availability::Enabled } else { Availability::Disabled }, onclick: move |_| {
             let Some(service) = selected else { return };
             let mut entry = MessengerConfig::new(name().trim().to_owned(), service);
-            entry.credential = Some(credential().trim().to_owned());
+            entry.credential = Some(credential().trim().to_owned()).filter(|c| service.needs_credential() && !c.is_empty());
             entry.app_credential = Some(app_credential().trim().to_owned()).filter(|c| service.needs_app_credential() && !c.is_empty());
             entry.endpoint = Some(endpoint().trim().to_owned()).filter(|e| !e.is_empty());
             entry.login = Some(login().trim().to_owned()).filter(|l| service.needs_login() && !l.is_empty());
@@ -511,14 +509,5 @@ mod tests {
         };
         assert_eq!(parse_model(&model_value(&key)), Some(key));
         assert_eq!(parse_model(&Uuid::new_v4().to_string()), None);
-    }
-
-    #[test]
-    fn typed_irc_names_fold_and_other_ids_stay_as_typed() {
-        let name = format!("#{}", Uuid::new_v4().simple()).to_uppercase();
-        assert_eq!(fold(MessengerKind::Irc, name.clone()), name.to_lowercase());
-        for kind in MessengerKind::ALL.into_iter().filter(|k| !k.is_irc()) {
-            assert_eq!(fold(kind, name.clone()), name);
-        }
     }
 }

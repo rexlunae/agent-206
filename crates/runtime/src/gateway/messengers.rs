@@ -23,10 +23,12 @@ pub(super) fn validate(messengers: &[MessengerConfig]) -> Result<()> {
             GatewayError::Invalid("messenger names must be unique"),
         )?;
         let endpoint = messenger.endpoint().ok_or(GatewayError::Invalid(
-            "this messenger needs the URL of its server (for Matrix, the homeserver; for IRC, ircs://host:port)",
+            "this messenger needs the URL of its server (for Matrix, the homeserver; for IRC, ircs://host:port; for Signal, the signal-cli daemon's socket)",
         ))?;
         if messenger.kind.is_irc() {
             validate_irc(messenger, endpoint)?;
+        } else if messenger.kind.is_signal() {
+            validate_signal(messenger, endpoint)?;
         } else {
             let endpoint = a206_core::providers::base_url(endpoint)?;
             // The broker puts a Telegram token in the first path segment, so a
@@ -37,7 +39,7 @@ pub(super) fn validate(messengers: &[MessengerConfig]) -> Result<()> {
             )?;
             check(
                 messenger.login.is_none(),
-                GatewayError::Invalid("only IRC messengers sign in with a login"),
+                GatewayError::Invalid("only IRC and Signal messengers sign in with a login"),
             )?;
         }
         check(
@@ -97,6 +99,46 @@ fn validate_irc(messenger: &MessengerConfig, endpoint: &str) -> Result<()> {
             .chain(&messenger.allowed_users)
             .all(|name| irc_lowercase(name) == *name),
         GatewayError::Invalid("write IRC channels and account names in lowercase"),
+    )?;
+    Ok(())
+}
+
+/// A Signal entry names a local signal-cli daemon and the account it
+/// serves, spends no vault credential, and allows direct chats and senders
+/// by ACI and groups by their id, so a listed id is exactly what signal-cli
+/// reports.
+fn validate_signal(messenger: &MessengerConfig, endpoint: &str) -> Result<()> {
+    use a206_core::messengers::{
+        SignalDaemon, valid_signal_account, valid_signal_aci, valid_signal_group,
+    };
+    SignalDaemon::parse(endpoint).map_err(GatewayError::SignalDaemon)?;
+    check(
+        messenger.login.as_deref().is_some_and(valid_signal_account),
+        GatewayError::Invalid(
+            "a Signal messenger needs a login: the account signal-cli serves, as +number or its ACI",
+        ),
+    )?;
+    check(
+        messenger.credential.is_none() && messenger.app_credential.is_none(),
+        GatewayError::Invalid(
+            "a Signal messenger uses no vault credential: signal-cli keeps the account's keys",
+        ),
+    )?;
+    check(
+        messenger
+            .allowed_chats
+            .iter()
+            .all(|chat| valid_signal_aci(chat) || valid_signal_group(chat)),
+        GatewayError::Invalid(
+            "Signal chats are group ids or, for direct messages, the sender's ACI (lowercase)",
+        ),
+    )?;
+    check(
+        messenger
+            .allowed_users
+            .iter()
+            .all(|user| valid_signal_aci(user)),
+        GatewayError::Invalid("Signal senders are ACIs (lowercase)"),
     )?;
     Ok(())
 }

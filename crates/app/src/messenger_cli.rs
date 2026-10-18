@@ -56,11 +56,13 @@ pub struct Options {
     /// events with (Slack's xapp- token).
     #[arg(long)]
     app_credential: Option<String>,
-    /// Account name the bot signs in with (IRC: its registered nickname).
+    /// Account the bot signs in as (IRC: its registered nickname; Signal:
+    /// the account's +number, as signal-cli serves it).
     #[arg(long)]
     login: Option<String>,
     /// API base URL, when not the service's official endpoint. Required for
-    /// Matrix (the homeserver's client API origin) and IRC (ircs://host:port).
+    /// Matrix (the homeserver's client API origin), IRC (ircs://host:port)
+    /// and Signal (the signal-cli daemon: unix:///path or tcp://127.0.0.1:port).
     #[arg(long)]
     endpoint: Option<String>,
     /// Provider id for new chat threads; requires --model.
@@ -123,14 +125,10 @@ fn entry<'a>(settings: &'a mut Settings, name: &str) -> Result<&'a mut Messenger
     }
 }
 
-/// A chat or sender as the messenger compares it: IRC names fold the way
-/// the network compares them, so `#Rust` allows `#rust`.
+/// A chat or sender as the messenger compares it ([`MessengerKind::fold`]),
+/// so `#Rust` allows `#rust` on IRC.
 fn fold(entry: &MessengerConfig, name: String) -> String {
-    if entry.kind.is_irc() {
-        a206_core::messengers::irc_lowercase(&name)
-    } else {
-        name
-    }
+    entry.kind.fold(&name)
 }
 
 /// The settings `action` saves, or `None` for actions that are not edits.
