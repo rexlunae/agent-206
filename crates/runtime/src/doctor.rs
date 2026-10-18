@@ -12,7 +12,7 @@ use a206_core::{
 use a206_vault::{CredentialKind, CredentialMeta};
 use std::path::{Path, PathBuf};
 
-pub use a206_core::doctor::{Check, DoctorReport, Finding, Health};
+pub use a206_core::doctor::{Check, DoctorReport, Finding, Health, Repair};
 
 /// What the broker said, or why it could not be asked.
 #[derive(Debug, Clone, PartialEq)]
@@ -260,6 +260,140 @@ fn credential_problem(facts: &Facts, provider: &ProviderConfig) -> Option<Findin
     } else {
         None
     }
+}
+
+/// The repairs `doctor --repair` offers for these facts: open profile and
+/// vault permissions, and provider model lists that are missing or stale
+/// while the provider's credential is usable. Everything else needs the
+/// user's own decision (a vault password, a credential, a gateway target).
+pub fn repairs(facts: &Facts) -> Vec<Repair> {
+    let mut repairs = vec![];
+    if let Some(mode) = facts.profile_mode.filter(|mode| open(*mode)) {
+        repairs.push(Repair::RestrictProfile {
+            path: facts.profile.clone(),
+            mode,
+        });
+    }
+    let vault_mode = match &facts.broker {
+        BrokerFacts::Stopped { vault_mode } | BrokerFacts::Running { vault_mode, .. } => {
+            *vault_mode
+        }
+        _ => None,
+    };
+    if let Some(mode) = vault_mode.filter(|mode| open(*mode)) {
+        repairs.push(Repair::RestrictVault {
+            path: a206_broker::vault_path(&facts.profile),
+            mode,
+        });
+    }
+    if let Some(Ok(snapshot)) = &facts.snapshot {
+        for provider in &snapshot.settings.providers {
+            let catalog = snapshot.catalogs.iter().find(|c| c.provider == provider.id);
+            if credential_problem(facts, provider).is_none()
+                && catalog.is_none_or(|catalog| catalog.stale(facts.now))
+            {
+                repairs.push(Repair::RefreshCatalog {
+                    provider: provider.id,
+                    label: provider.label.clone(),
+                });
+            }
+        }
+    }
+    repairs
+}
+
+/// Why one repair could not be made. Nothing is retried or worked around.
+#[derive(Debug, thiserror::Error)]
+pub enum RepairError {
+    #[error("{} is a symbolic link or not the expected kind of file; it was left unchanged", path.display())]
+    NotPlain { path: PathBuf },
+    #[error("could not change the permissions of {}", path.display())]
+    Permissions {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("could not reach the gateway")]
+    Gateway(#[source] crate::control::ControlError),
+    #[error("the gateway refused the request")]
+    Refused(#[source] ErrorReport),
+    #[error("the gateway gave an unexpected reply")]
+    UnexpectedReply,
+    #[error("permission repairs are not available on this platform")]
+    Unsupported,
+}
+impl crate::error::Classified for RepairError {
+    fn kind(&self) -> Option<a206_core::ErrorKind> {
+        match self {
+            Self::Refused(report) => Some(report.kind),
+            Self::Gateway(error) => error.kind(),
+            _ => None,
+        }
+    }
+}
+
+/// Make one repair. Permission repairs only clear group and other bits and
+/// refuse symbolic links; a catalog refresh is the same gateway command the
+/// Connections page sends.
+pub async fn repair(
+    root: &Path,
+    remote: Option<String>,
+    repair: &Repair,
+) -> Result<(), RepairError> {
+    match repair {
+        Repair::RestrictProfile { path, .. } => restrict(path, true),
+        Repair::RestrictVault { path, .. } => {
+            restrict(path, false)?;
+            match path.parent() {
+                Some(dir) => restrict(dir, true),
+                None => Ok(()),
+            }
+        }
+        Repair::RefreshCatalog { provider, .. } => {
+            let controller = crate::control::GatewayController::attach(root.to_owned(), remote);
+            match controller
+                .call(a206_core::Command::RefreshCatalog {
+                    provider: *provider,
+                })
+                .await
+                .map_err(RepairError::Gateway)?
+            {
+                Reply::Error(report) => Err(RepairError::Refused(report)),
+                Reply::Catalog(_) => Ok(()),
+                _ => Err(RepairError::UnexpectedReply),
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn restrict(path: &Path, directory: bool) -> Result<(), RepairError> {
+    use std::os::unix::fs::PermissionsExt;
+    let failed = |source| RepairError::Permissions {
+        path: path.to_owned(),
+        source,
+    };
+    // set_permissions follows links, so a link here could narrow a file
+    // elsewhere; refuse anything but the plain file or directory expected.
+    let metadata = std::fs::symlink_metadata(path).map_err(failed)?;
+    if metadata.file_type().is_symlink()
+        || (directory && !metadata.is_dir())
+        || (!directory && !metadata.is_file())
+    {
+        return Err(RepairError::NotPlain {
+            path: path.to_owned(),
+        });
+    }
+    let mode = metadata.permissions().mode() & 0o7777;
+    if mode & 0o077 == 0 {
+        return Ok(());
+    }
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode & !0o077)).map_err(failed)
+}
+
+#[cfg(not(unix))]
+fn restrict(_path: &Path, _directory: bool) -> Result<(), RepairError> {
+    Err(RepairError::Unsupported)
 }
 
 fn mode(path: &Path) -> Option<u32> {
@@ -742,5 +876,128 @@ mod tests {
         assert_eq!(facts.target, Ok(None));
         assert_eq!(facts.broker, BrokerFacts::Stopped { vault_mode: None });
         assert_eq!(facts.profile_mode, None);
+    }
+
+    #[test]
+    fn repairs_cover_open_permissions_and_catalogs_a_usable_credential_can_refresh() {
+        let missing = provider(None);
+        let stale = provider(None);
+        let fresh = provider(None);
+        let unusable = provider(Some(random()));
+        let catalogs = vec![catalog(&stale, 1, 1_000), catalog(&fresh, 1, 2_000)];
+        let mut broker = unlocked(vec![], vec![]);
+        if let BrokerFacts::Running { vault_mode, .. } = &mut broker {
+            *vault_mode = Some(0o644);
+        }
+        let mut facts = facts(
+            Some(snapshot(
+                vec![
+                    missing.clone(),
+                    stale.clone(),
+                    fresh.clone(),
+                    unusable.clone(),
+                ],
+                catalogs.clone(),
+            )),
+            broker,
+            Some(true),
+        );
+        facts.profile_mode = Some(0o755);
+        assert_eq!(
+            repairs(&facts),
+            [
+                Repair::RestrictProfile {
+                    path: facts.profile.clone(),
+                    mode: 0o755
+                },
+                Repair::RestrictVault {
+                    path: a206_broker::vault_path(&facts.profile),
+                    mode: 0o644
+                },
+                Repair::RefreshCatalog {
+                    provider: missing.id,
+                    label: missing.label.clone()
+                },
+                Repair::RefreshCatalog {
+                    provider: stale.id,
+                    label: stale.label.clone()
+                },
+            ]
+        );
+        let healthy = super::tests::facts(
+            Some(snapshot(vec![fresh], catalogs)),
+            unlocked(vec![], vec![]),
+            Some(true),
+        );
+        assert!(repairs(&healthy).is_empty());
+        let mut remote = healthy;
+        remote.profile_mode = Some(0o700);
+        remote.broker = BrokerFacts::Remote;
+        remote.snapshot = None;
+        assert!(repairs(&remote).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn permission_repairs_clear_only_group_and_other_bits_and_refuse_links() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        let set = |path: &Path, mode| {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap()
+        };
+        let root = tempfile::tempdir().unwrap();
+        let profile = root.path().join(random());
+        std::fs::create_dir(&profile).unwrap();
+        set(&profile, 0o751);
+        let fix = Repair::RestrictProfile {
+            path: profile.clone(),
+            mode: 0o751,
+        };
+        repair(&profile, None, &fix).await.unwrap();
+        assert_eq!(mode(&profile), 0o700);
+        let vault = a206_broker::vault_path(&profile);
+        std::fs::create_dir(vault.parent().unwrap()).unwrap();
+        std::fs::write(&vault, random()).unwrap();
+        set(&vault, 0o464);
+        set(vault.parent().unwrap(), 0o755);
+        let fix = Repair::RestrictVault {
+            path: vault.clone(),
+            mode: 0o464,
+        };
+        repair(&profile, None, &fix).await.unwrap();
+        assert_eq!(mode(&vault), 0o400);
+        assert_eq!(mode(vault.parent().unwrap()), 0o700);
+
+        let elsewhere = root.path().join(random());
+        std::fs::write(&elsewhere, random()).unwrap();
+        set(&elsewhere, 0o644);
+        std::fs::remove_file(&vault).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &vault).unwrap();
+        assert!(matches!(
+            repair(&profile, None, &fix).await,
+            Err(RepairError::NotPlain { .. })
+        ));
+        assert_eq!(mode(&elsewhere), 0o644);
+        let wrong_kind = Repair::RestrictProfile {
+            path: elsewhere.clone(),
+            mode: 0o644,
+        };
+        assert!(matches!(
+            repair(&profile, None, &wrong_kind).await,
+            Err(RepairError::NotPlain { .. })
+        ));
+        assert_eq!(mode(&elsewhere), 0o644);
+    }
+
+    #[tokio::test]
+    async fn a_refresh_without_a_reachable_gateway_reports_why() {
+        let root = tempfile::tempdir().unwrap();
+        let fix = Repair::RefreshCatalog {
+            provider: uuid::Uuid::new_v4(),
+            label: random(),
+        };
+        let error = repair(root.path(), None, &fix).await.unwrap_err();
+        assert!(matches!(error, RepairError::Gateway(_)), "{error:?}");
+        assert!(std::error::Error::source(&error).is_some());
     }
 }

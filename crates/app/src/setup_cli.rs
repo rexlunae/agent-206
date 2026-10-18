@@ -1,6 +1,7 @@
 //! `agent206 setup` and `agent206 import`: terminal walkthroughs over the same
 //! gateway setup, vault broker requests and settings API as the desktop and
 //! terminal clients. Every security decision stays with the broker.
+use crate::doctor_cli::confirm;
 use crate::vault_cli;
 use a206_core::{Command, GatewayAction, GatewayPhase, GatewayTarget, MessengerKind, Reply};
 use a206_import::{
@@ -9,7 +10,6 @@ use a206_import::{
 };
 use anyhow::{Context, Result, bail};
 use clap::Subcommand;
-use std::io::BufRead;
 use std::path::{Path, PathBuf};
 
 #[derive(Subcommand)]
@@ -49,20 +49,6 @@ pub enum ImportSource {
         #[arg(long)]
         toml: bool,
     },
-}
-
-/// Ask a yes/no question; a closed input answers no.
-fn confirm(question: &str) -> Result<bool> {
-    use std::io::Write;
-    print!("{question} [Y/n] ");
-    std::io::stdout().flush()?;
-    let mut answer = String::new();
-    if std::io::stdin().lock().read_line(&mut answer)? == 0 {
-        println!();
-        return Ok(false);
-    }
-    let answer = answer.trim();
-    Ok(answer.is_empty() || answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes"))
 }
 
 /// The vault part of first-run setup on this computer: create or unlock the

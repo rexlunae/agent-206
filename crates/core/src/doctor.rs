@@ -298,3 +298,39 @@ impl DoctorReport {
             .unwrap_or(Health::Ok)
     }
 }
+
+/// A change `agent206 doctor --repair` can make after the user confirms it.
+/// Repairs only remove permission bits or ask the gateway to fetch a model
+/// list it would fetch anyway; none creates, deletes, unlocks or grants.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "repair", rename_all = "snake_case")]
+pub enum Repair {
+    /// Remove group and other permissions from the profile directory.
+    RestrictProfile { path: PathBuf, mode: u32 },
+    /// Remove group and other permissions from the vault file and its directory.
+    RestrictVault { path: PathBuf, mode: u32 },
+    /// Fetch this provider's model list from its API through the gateway.
+    RefreshCatalog { provider: crate::Id, label: String },
+}
+
+impl std::fmt::Display for Repair {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RestrictProfile { path, mode } => write!(
+                f,
+                "make profile {} private (mode {mode:o} to {:o})",
+                path.display(),
+                mode & !0o077
+            ),
+            Self::RestrictVault { path, mode } => write!(
+                f,
+                "make vault file {} and its directory private (mode {mode:o} to {:o})",
+                path.display(),
+                mode & !0o077
+            ),
+            Self::RefreshCatalog { label, .. } => {
+                write!(f, "{label}: fetch the model list from its API")
+            }
+        }
+    }
+}
