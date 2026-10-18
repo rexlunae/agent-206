@@ -4,6 +4,7 @@ use crate::{
     PageFrame, Shell,
     activity::Activity,
     conversation::Workspace as Chat,
+    inbox::Inbox,
     messengers::Messengers,
     pages::{
         Browser, Conversations, Documents, Downloads, Extensions, Joshua, Overview as Workspace,
@@ -38,6 +39,8 @@ pub(crate) enum Route {
     Activity {},
     #[route("/running")]
     Running {},
+    #[route("/waiting")]
+    Inbox {},
     #[route("/connections")]
     Providers {},
     #[route("/messengers")]
@@ -76,6 +79,7 @@ impl Route {
             Self::Projects {} => IconName::Folder,
             Self::Activity {} => IconName::Clock,
             Self::Running {} => IconName::Play,
+            Self::Inbox {} => IconName::Bell,
             Self::Providers {} => IconName::Link,
             Self::Messengers {} => IconName::Send,
             Self::Downloads {} => IconName::Download,
@@ -98,6 +102,7 @@ impl Route {
                 Self::Projects {},
                 Self::Conversations {},
                 Self::Running {},
+                Self::Inbox {},
                 Self::Activity {},
             ],
             vec![
@@ -126,6 +131,7 @@ impl Route {
             Self::Projects {} => "Projects",
             Self::Activity {} => "Activity",
             Self::Running {} => "Running work",
+            Self::Inbox {} => "Waiting on you",
             Self::Providers {} => "Connections",
             Self::Messengers {} => "Messengers",
             Self::Downloads {} => "Downloads",

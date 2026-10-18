@@ -706,9 +706,9 @@ pub struct SkillSummary {
     pub emoji: Option<String>,
     /// Enabled, and unchanged since the user approved it.
     pub enabled: bool,
-    /// Enabled once, but `SKILL.md` changed since; it is not offered until re-enabled.
+    /// Enabled once, but the package changed since; not offered until re-enabled.
     pub changed: bool,
-    /// SHA-256 of `SKILL.md` as it is now; approving requires it.
+    /// Content digest of the package as it is now; approving requires it.
     pub digest: Option<String>,
     /// Requirements this gateway's computer does not meet.
     pub unmet: Vec<String>,
@@ -716,17 +716,29 @@ pub struct SkillSummary {
     pub expects_env: Vec<String>,
     /// Why the skill could not be read.
     pub failure: Option<ErrorReport>,
-    /// What the pre-install audit found in `SKILL.md`, for the user's review.
+    /// What the pre-install audit found in the package, for the user's review.
     #[serde(default)]
     pub audit: AuditReport,
 }
-/// The exact `SKILL.md` a user reviews, with the digest that approves it.
+/// The exact package a user reviews, with the digest that approves it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SkillText {
     pub name: String,
     pub text: String,
-    /// SHA-256 of `text`; pass it to [`Command::SetSkillEnabled`].
+    /// Content digest of this package; pass it to [`Command::SetSkillEnabled`].
     pub digest: String,
+    #[serde(default)]
+    pub files: Vec<SkillReviewFile>,
+    #[serde(default)]
+    pub audit: AuditReport,
+}
+/// A supporting file in the exact package snapshot being approved.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillReviewFile {
+    pub path: String,
+    pub bytes: u64,
+    /// Binary content is listed, but never interpreted or executed.
+    pub text: Option<String>,
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Snapshot {

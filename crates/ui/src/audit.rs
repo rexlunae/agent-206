@@ -5,6 +5,10 @@ use fc_dioxus::prelude::*;
 fn place(finding: &AuditFinding) -> String {
     match &finding.location {
         AuditLocation::Line(line) => format!("Line {line}"),
+        AuditLocation::File { path, line } => match line {
+            Some(line) => format!("{path}, line {line}"),
+            None => path.clone(),
+        },
         AuditLocation::Field { item: None, field } => {
             let label = field.label();
             let mut chars = label.chars();

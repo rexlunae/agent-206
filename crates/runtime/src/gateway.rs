@@ -156,6 +156,8 @@ pub enum GatewayError {
     Endpoint(#[from] provider::EndpointError),
     #[error("the IRC server is not allowed")]
     IrcServer(#[source] a206_core::messengers::IrcServerError),
+    #[error("the signal-cli daemon endpoint is not allowed")]
+    SignalDaemon(#[source] a206_core::messengers::SignalDaemonError),
     #[error(transparent)]
     Presets(#[from] provider::PresetError),
     #[error(transparent)]
@@ -231,9 +233,11 @@ impl crate::error::Classified for GatewayError {
     fn kind(&self) -> Option<ErrorKind> {
         use crate::error::classify;
         Some(match self {
-            Self::Invalid(_) | Self::DownloadUrl(_) | Self::Search(_) | Self::IrcServer(_) => {
-                ErrorKind::InvalidRequest
-            }
+            Self::Invalid(_)
+            | Self::DownloadUrl(_)
+            | Self::Search(_)
+            | Self::IrcServer(_)
+            | Self::SignalDaemon(_) => ErrorKind::InvalidRequest,
             Self::NotFound(_) => ErrorKind::NotFound,
             Self::Conflict(_) => ErrorKind::Conflict,
             Self::Denied(_) => ErrorKind::PermissionDenied,

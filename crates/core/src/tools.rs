@@ -131,6 +131,16 @@ pub struct ToolCall {
     /// kind. The removed text is not kept.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub redactions: Vec<OutputCount>,
+    /// Text in the result that reads as instructions to the model, by kind.
+    /// Hidden characters are removed; the rest is kept, and the model is
+    /// told it came from the tool.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub injection: Vec<OutputCount>,
+    /// How many times in a row the run has made this exact call, once that
+    /// reaches the repeat threshold; the model is told when it reads the
+    /// result.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repeated: Option<u32>,
 }
 
 /// How an output rule reduced a tool result. The reduced text is the call's

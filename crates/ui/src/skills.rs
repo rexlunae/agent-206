@@ -138,12 +138,31 @@ pub fn Skills() -> Element {
         }
         if let Some(reviewed) = review.read().text.clone() {
             Card { variant: CardVariant::Elevated,
-                CardHeader { CardTitle { "{reviewed.name}" } CardSubtitle { "SKILL.md as it was read for this review" } }
-                CardBody { pre { class: "a206-message-text", "{reviewed.text}" } }
+                CardHeader { CardTitle { "{reviewed.name}" } CardSubtitle { "Package snapshot for this review" } }
+                CardBody {
+                    AuditFindings { report: reviewed.audit.clone() }
+                    Disclosure { summary: rsx! { "SKILL.md" }, open: true,
+                        pre { class: "a206-message-text", "{reviewed.text}" }
+                    }
+                    SupportingFiles { files: reviewed.files.clone() }
+                }
                 CardFooter {
-                    Button { variant: ButtonVariant::Primary, onclick: { let reviewed = reviewed.clone(); move |_| toggle(reviewed.name.clone(), true, Some(reviewed.digest.clone())) }, "Approve this text and enable" }
+                    Button { variant: ButtonVariant::Primary, onclick: { let reviewed = reviewed.clone(); move |_| toggle(reviewed.name.clone(), true, Some(reviewed.digest.clone())) }, "Approve this package and enable" }
                     Button { variant: ButtonVariant::Ghost, onclick: move |_| review.write().close(), "Close" }
                 }
+            }
+        }
+    }
+}
+
+#[component]
+fn SupportingFiles(files: Vec<a206_core::SkillReviewFile>) -> Element {
+    rsx! {
+        for file in &files {
+            Disclosure { key: "{file.path}", summary: rsx! { "{file.path} · {file.bytes} bytes" },
+                if let Some(text) = &file.text {
+                    pre { class: "a206-message-text", "{text}" }
+                } else { p { "Binary content: the text audit cannot inspect this file. Review it separately before approval." } }
             }
         }
     }
@@ -152,11 +171,42 @@ pub fn Skills() -> Element {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn supporting_review_shows_text_and_binary_limits_without_rendering_author_markup() {
+        use a206_core::SkillReviewFile;
+        fn root(files: Vec<SkillReviewFile>) -> Element {
+            rsx! { SupportingFiles { files } }
+        }
+        let mut dom = VirtualDom::new_with_props(
+            root,
+            vec![
+                SkillReviewFile {
+                    path: "scripts/setup.sh".into(),
+                    bytes: 9,
+                    text: Some("<script>untrusted()</script>".into()),
+                },
+                SkillReviewFile {
+                    path: "data.bin".into(),
+                    bytes: 2,
+                    text: None,
+                },
+            ],
+        );
+        dom.rebuild_in_place();
+        let html = dioxus_ssr::render(&dom);
+        assert!(html.contains("scripts/setup.sh"));
+        assert!(html.contains("data.bin"));
+        assert!(html.contains("the text audit cannot inspect this file"));
+        assert!(html.contains("untrusted()"));
+        assert!(!html.contains("<script>untrusted()"));
+    }
     fn text(name: &str, digest: &str) -> SkillText {
         SkillText {
             name: name.into(),
             text: name.into(),
             digest: digest.into(),
+            files: vec![],
+            audit: Default::default(),
         }
     }
     #[test]

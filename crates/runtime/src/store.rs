@@ -522,6 +522,8 @@ mod tests {
             signature: None,
             reduction: None,
             redactions: Vec::new(),
+            injection: Vec::new(),
+            repeated: None,
         };
         message.tool_calls = vec![
             call(ToolCallState::AwaitingApproval),

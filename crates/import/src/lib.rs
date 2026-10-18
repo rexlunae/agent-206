@@ -222,6 +222,13 @@ pub enum UnsupportedMessenger {
     PlainTextIrc,
     /// The IRC nickname is not one Agent 206 can sign in with.
     InvalidLogin,
+    /// Signal: the source ran signal-cli itself, while Agent 206 connects
+    /// to a signal-cli daemon the user runs, which the source does not name.
+    NoSignalDaemon,
+    /// A network Agent 206 reaches through Beeper Desktop rather than on its
+    /// own (WhatsApp, iMessage, Google Chat); the source's account does not
+    /// carry over.
+    ThroughBeeper,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

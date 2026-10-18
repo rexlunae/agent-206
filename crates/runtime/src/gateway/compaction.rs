@@ -185,7 +185,11 @@ fn transcript(previous: Option<&Message>, older: &[Message]) -> String {
                     call.state,
                     bounded(&call.arguments, MAX_TOOL_TEXT),
                     bounded(
-                        call.output.as_deref().unwrap_or("(no result)"),
+                        &if call.output.is_some() {
+                            provider::tool_result(call)
+                        } else {
+                            "(no result)".into()
+                        },
                         MAX_TOOL_TEXT
                     ),
                 ));

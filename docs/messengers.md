@@ -1,8 +1,9 @@
 # Messengers
 
 A messenger connects a chat service account to Agent 206 so that people can
-talk to a thread from that service. Telegram, Matrix, Discord, Slack and IRC
-are implemented;
+talk to a thread from that service. Telegram, Matrix, Discord, Slack, IRC,
+Signal and Beeper (which reaches WhatsApp, iMessage, Google Chat and the
+other networks Beeper Desktop connects to) are implemented;
 RustyClaw's other channels are listed in
 [parity.md](parity.md#messengers--channels).
 
@@ -15,14 +16,17 @@ of the desktop, web and terminal apps):
 ```toml
 [[messengers]]
 name = "team"                 # lowercase letters, digits, single hyphens
-kind = "telegram"             # or "matrix", "discord", "slack" or "irc"
+kind = "telegram"             # or "matrix", "discord", "slack", "irc", "signal" or "beeper"
 enabled = false               # off until the user turns it on
 credential = "team-token"     # vault credential name, never the token
+                              # (Signal has none)
 # app_credential = "team-app"  # Slack only: the app-level token's credential
-# login = "teambot"           # IRC only: the services account (and nickname)
+# login = "teambot"           # IRC: the services account (and nickname);
+                              # Signal: the account's +number or ACI
 # endpoint = "https://..."    # an origin; defaults to the official API,
                               # required for Matrix (the homeserver) and
-                              # IRC (the server, ircs://host[:port])
+                              # IRC (the server, ircs://host[:port]) and
+                              # Signal (the signal-cli daemon)
 allowed_chats = ["-1001234"]  # chats whose messages reach a thread
 allowed_users = ["5551234"]   # senders accepted; groups need it
 model = { provider = "<provider id>", model = "<id from the provider's API>" }
@@ -322,6 +326,111 @@ agent206 messenger enable libera
   the bot's own earlier connection, until the server notices it is gone) is
   retried with the usual backoff, with the failure shown meanwhile.
 
+## Signal
+
+A Signal messenger talks through a [signal-cli](https://github.com/AsamK/signal-cli)
+daemon that the user installs, registers or links and runs. signal-cli holds
+the account's keys and does all of Signal's encryption, so the account has
+no vault credential: Agent 206 never sees or stores those keys, and the
+gateway never starts, stops or updates the daemon. Run it in multi-account
+mode with manual receiving, so that messages wait with Signal until the
+gateway subscribes:
+
+```sh
+signal-cli daemon --socket "$XDG_RUNTIME_DIR/signal-cli/socket" --receive-mode=manual
+agent206 messenger add phone --kind signal --endpoint "unix://$XDG_RUNTIME_DIR/signal-cli/socket" --login +15551234567
+agent206 messenger allow phone <ACI of the person>
+agent206 messenger allow-sender phone <ACI of the person>
+agent206 messenger enable phone
+```
+
+- **Daemon.** The endpoint is `unix:///absolute/path` (the daemon's
+  `--socket`) or `tcp://127.0.0.1:port` / `tcp://[::1]:port` (its `--tcp`);
+  any other host is refused, since the JSON-RPC interface has no
+  authentication and anyone who can reach it can use the account. Prefer
+  the Unix socket, whose file permissions decide who else can. A TCP
+  connection whose peer turns out not to be loopback is closed.
+- **Account.** `login` is the account's number in `+E.164` form or its ACI.
+  On connecting the gateway asks the daemon to list its accounts and stops,
+  waiting for the user, when the login is not one of them; otherwise it
+  subscribes to that account's messages.
+- **Identity.** Senders are ACIs (the account UUID signal-cli reports once it
+  has decrypted and authenticated a message), not phone numbers, which can
+  be hidden or change hands. A direct chat is the sender's ACI; a group chat
+  is its base64 group id. UUIDs are saved lowercase. `agent206 messenger
+  list` and the Messengers page show refused chats and senders by these ids,
+  so the first message from someone can be allowed from there.
+- **What is read and sent.** Only text messages are answered; reactions,
+  edits, deletions, receipts, typing, stories and messages synced from the
+  account's other devices are ignored, and each message is handled once,
+  also when signal-cli delivers it again after a reconnect. A message with
+  group information is never taken for a direct chat. Replies go to the
+  same ACI or group in parts of at most 2000 characters, at most eight
+  (longer replies end with a note that they were cut), each sent after
+  signal-cli accepted the previous one. A request the daemon does not
+  answer within a minute fails; when the daemon refuses one, its reason is
+  shown on one line with anything shaped like a credential removed.
+- **Delivery.** With `--receive-mode=manual` messages that arrive while the
+  gateway is stopped wait with Signal and are answered once it reconnects;
+  a daemon receiving on its own may have taken them already. As with every
+  messenger, the gateway runs it only while paired with an unlocked vault.
+
+## Beeper
+
+A Beeper messenger talks to [Beeper Desktop](https://www.beeper.com)'s
+local API, so one entry reaches every chat network the user connected to
+Beeper: WhatsApp, iMessage, Google Chat, Google Messages, Instagram,
+LinkedIn and the others it bridges. Unlike a bot, it answers **as the
+user**, from their own accounts on those networks, the same way as a
+message typed in Beeper; the people in an allowed chat see the agent's
+replies as coming from the user.
+
+In Beeper Desktop turn on the Desktop API, then create a token under
+Settings, Integrations, Approved connections, and store it in the vault
+bound to the API origin:
+
+```sh
+agent206 vault add beeper-token --kind token --destination http://localhost:23373
+agent206 messenger add beeper --kind beeper --credential beeper-token
+agent206 messenger allow beeper '<chat id from the refused list>'
+agent206 messenger enable beeper
+```
+
+- **Token.** The Desktop API token reads and sends in every chat of every
+  connected account, so it stays in the vault: the broker attaches it as a
+  bearer token for the bound origin only. The default endpoint is Beeper
+  Desktop on the gateway's computer (`http://localhost:23373`); a Beeper
+  elsewhere needs an `https://` origin.
+- **What is read.** The chat list says which chats have new activity. Only
+  allowed chats have their messages fetched; another chat with activity
+  from someone else is listed as refused, by its id and its network and
+  title, so it can be allowed from there. A direct chat (Beeper's "single")
+  is answered while `allowed_users` is empty; every other chat answers only
+  listed senders, whose ids are Beeper's fully qualified user ids. Only text
+  from other people is answered: the user's own messages (which include the
+  agent's replies), notices, media, deleted and hidden messages are not.
+- **Delivery.** Beeper has no long poll, so the chat list is polled every
+  two seconds. A session first marks where each allowed chat's messages
+  end, so history is never answered. Each message is handled at most once
+  while the gateway runs: reading resumes from the last batch the gateway
+  finished, and a reply that fails to send is reported, not retried.
+  Cursors are held in memory, so messages that arrive while the gateway is
+  stopped are not answered. When more chats changed since the last look than
+  one page of the chat list holds (100), every allowed chat is checked
+  directly. An allowed chat that did not exist, or was empty, when the
+  session started has everything it holds answered once it appears, up to
+  eight pages of messages read backwards from the newest. The
+  gateway checks which accounts the token reaches before every look, so a
+  replaced token starts afresh.
+- **Replies** go to the same chat in parts of at most 4000 characters, at
+  most eight (longer replies end with a note that they were cut). Beeper
+  converts Markdown to its rich text. End-to-end encryption to the networks
+  is Beeper's: a reply travels the same way as one the user types there.
+- **Account.** The status names the networks of the connected accounts
+  ("Beeper: WhatsApp, Signal"). With no account connected the messenger
+  retries until one is. Adding or removing an account starts afresh, without
+  answering what arrived in between.
+
 ## Interface for the run engine
 
 `a206_runtime::messengers::Host` is the boundary between a messenger and the
@@ -346,7 +455,12 @@ participant cannot approve their own request.
 
 ## Not yet
 
-- Signal, WhatsApp, Google Chat, Teams, iMessage and webhooks.
+- WhatsApp, Google Chat and iMessage on their own (they are reached through
+  Beeper), Teams and webhooks.
+- Beeper attachments, reactions and replies to a specific message, the
+  experimental WebSocket event stream, and remembering cursors across
+  restarts.
+- Signal attachments, mentions and quoted replies.
 - IRC certificate fingerprints or custom roots, SASL EXTERNAL, networks
   without `account-tag`, and channel keys.
 - Slack thread replies, the Events API over HTTP (Socket Mode only) and

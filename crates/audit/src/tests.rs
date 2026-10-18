@@ -129,6 +129,11 @@ fn cases() -> Vec<(AuditRule, Vec<String>, Vec<String>)> {
 fn each_rule_flags_its_patterns_and_spares_ordinary_text() {
     let cases = cases();
     for rule in AuditRule::ALL {
+        // OpaqueFile is emitted by the package reader, not the text scanner;
+        // a206-skills tests binary and NUL-containing package contents.
+        if rule == AuditRule::OpaqueFile {
+            continue;
+        }
         assert!(
             cases.iter().any(|(r, _, _)| *r == rule),
             "{rule:?} has no test case"

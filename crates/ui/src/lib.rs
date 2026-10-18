@@ -7,6 +7,7 @@ mod error;
 mod extensions;
 mod files;
 mod health;
+mod inbox;
 mod mcp;
 mod messengers;
 mod pages;
@@ -749,10 +750,13 @@ fn Sidebar() -> Element {
     let route = use_route::<Route>();
     let snapshot = state.data.read();
     let [primary, workbench, control] = Route::navigation();
+    let waiting = crate::inbox::count(&snapshot);
     rsx! { NavSidebar { class: "a206-sidebar", label: name!("Workspace navigation"), title: rsx! { "Workspace" }, collapsible: false,
         div { class: "a206-nav-group",
             for item in primary {
-                LinkButton { variant: ButtonVariant::Ghost, size: ButtonSize::Sm, class: if route == item { "a206-nav-active" } else { "" }, href: item.to_string(), Icon { name: item.icon(), size: IconSize::Sm } "{item.label()}" }
+                LinkButton { variant: ButtonVariant::Ghost, size: ButtonSize::Sm, class: if route == item { "a206-nav-active" } else { "" }, href: item.to_string(), Icon { name: item.icon(), size: IconSize::Sm } "{item.label()}"
+                    if item == (Route::Inbox {}) && waiting > 0 { Badge { tone: BadgeTone::Warning, "{waiting}" } }
+                }
             }
         }
         div { class: "a206-nav-group",

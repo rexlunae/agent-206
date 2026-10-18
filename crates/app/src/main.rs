@@ -907,7 +907,14 @@ mod native {
                             match client.call(Command::ReadSkill { name }).await? {
                                 Reply::Skill(skill) => {
                                     print!("{}", skill.text);
-                                    let audit = a206_audit::text(&skill.text);
+                                    for file in &skill.files {
+                                        println!("\n--- {} ({} bytes) ---", file.path, file.bytes);
+                                        match &file.text {
+                                            Some(text) => println!("{text}"),
+                                            None => println!("Binary content: not inspected by the text audit."),
+                                        }
+                                    }
+                                    let audit = &skill.audit;
                                     if !audit.is_clean() {
                                         eprintln!("\nCheck before approving; the audit matched:");
                                         for finding in &audit.findings {
@@ -915,6 +922,8 @@ mod native {
                                                 finding.location
                                             {
                                                 eprintln!("  line {line}: {}", finding.rule.label());
+                                            } else if let a206_core::AuditLocation::File { path, line } = &finding.location {
+                                                eprintln!("  {path}{}: {}", line.map(|line| format!(":{line}")).unwrap_or_default(), finding.rule.label());
                                             }
                                         }
                                         if audit.more > 0 {
@@ -922,7 +931,7 @@ mod native {
                                         }
                                     }
                                     eprintln!(
-                                        "\nTo approve exactly this text: agent206 skills enable {} --digest {}",
+                                        "\nTo approve exactly this package: agent206 skills enable {} --digest {}",
                                         skill.name, skill.digest
                                     );
                                     return Ok(());

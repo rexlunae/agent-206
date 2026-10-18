@@ -921,6 +921,7 @@ impl HostCalls {
                 ignore_case,
                 include,
                 max_matches,
+                include_ignored,
             } => {
                 let root = self.workspace()?;
                 blocking(move || {
@@ -928,6 +929,7 @@ impl HostCalls {
                         regex,
                         ignore_case,
                         include: include.as_deref(),
+                        include_ignored,
                     };
                     workspace::search_pattern(root, &path, &pattern, options, max_matches)
                 })
@@ -937,9 +939,11 @@ impl HostCalls {
                 path,
                 glob,
                 max_results,
+                include_ignored,
             } => {
                 let root = self.workspace()?;
-                blocking(move || workspace::find(root, &path, &glob, max_results)).await
+                blocking(move || workspace::find(root, &path, &glob, include_ignored, max_results))
+                    .await
             }
             HostRequest::WriteFile {
                 path,
