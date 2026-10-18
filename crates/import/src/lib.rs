@@ -8,6 +8,7 @@
 //! vault itself (`a206_broker::Request::ImportVault`).
 #![forbid(unsafe_code)]
 pub mod claude_code;
+pub mod codex;
 pub mod rustyclaw;
 
 use std::path::{Path, PathBuf};

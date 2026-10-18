@@ -53,6 +53,48 @@ async fn claude_code_review_and_selected_apply_use_the_same_gateway_commands() -
     Ok(())
 }
 
+#[tokio::test]
+async fn codex_review_and_selected_apply_use_the_same_gateway_commands() -> Result<()> {
+    let app = App::start(tempfile::tempdir()?, Default::default()).await?;
+    let source = tempfile::tempdir()?;
+    let private = random();
+    let id = uuid::Uuid::new_v4().simple().to_string();
+    let base = format!("https://{id}.example.test/v1");
+    let text = format!(
+        "model = \"{private}\"\nmodel_provider = \"{id}\"\n[model_providers.{id}]\nname = \"{private}\"\nbase_url = \"{base}\"\nexperimental_bearer_token = \"{private}\"\n[mcp_servers.x]\ncommand = \"{private}\"\n"
+    );
+    std::fs::write(source.path().join("config.toml"), &text)?;
+    let output = app
+        .cli(&[
+            "import",
+            "review-codex",
+            source.path().to_str().context("source path")?,
+        ])
+        .await?;
+    ensure!(!output.contains(&private));
+    let review: a206_core::imports::Review = toml::from_str(&output)?;
+    ensure!(review.preview.tool == a206_core::imports::Tool::Codex);
+    ensure!(app.snapshot().await?.settings.providers.is_empty());
+    let receipt: a206_core::imports::Receipt = toml::from_str(
+        &app.cli(&[
+            "import",
+            "apply-review",
+            &review.id.to_string(),
+            "--provider",
+            "0",
+        ])
+        .await?,
+    )?;
+    ensure!(receipt.providers_added.len() == 1 && !receipt.vault_imported);
+    let snapshot = app.snapshot().await?;
+    ensure!(snapshot.settings.providers[0].api == a206_core::ProviderApi::OpenAi);
+    ensure!(snapshot.settings.providers[0].base_url == base);
+    ensure!(snapshot.settings.providers[0].credential.is_none());
+    ensure!(snapshot.settings.mcp_servers.is_empty());
+    ensure!(std::fs::read_to_string(source.path().join("config.toml"))? == text);
+    Ok(())
+}
+
 /// A RustyClaw settings directory with one hosted and one local provider.
 fn rustyclaw(dir: &Path) -> Result<std::path::PathBuf> {
     let root = dir.join("rustyclaw");
