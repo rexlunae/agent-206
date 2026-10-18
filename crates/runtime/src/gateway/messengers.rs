@@ -397,8 +397,23 @@ impl Outbox {
                 name: name.to_owned(),
             })?;
         let pairing = Host::pairing(&self.base).ok_or(MessengerError::NoPairing)?;
-        let result =
-            crate::messengers::webhook::send(Host::root(&self.base), pairing, &config, text).await;
+        // The user may withdraw the webhook while a long message is going
+        // out; the parts still to send then stay unsent.
+        let current = self.base.messengers.subscribe();
+        let withdrawn = || {
+            !current
+                .borrow()
+                .iter()
+                .any(|entry| entry.run && entry.config == config)
+        };
+        let result = crate::messengers::webhook::send(
+            Host::root(&self.base),
+            pairing,
+            &config,
+            text,
+            withdrawn,
+        )
+        .await;
         match &result {
             Ok(_) => self.base.update(name, |status| {
                 status.state = MessengerState::Ready;

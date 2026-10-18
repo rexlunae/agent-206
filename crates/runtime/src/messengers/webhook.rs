@@ -64,19 +64,27 @@ fn body(format: WebhookFormat, text: &str) -> Value {
 }
 
 /// Send `text` to the webhook `config` names, in order; the number of parts
-/// sent. A part that fails stops the rest, and the error says how many were
+/// sent. `withdrawn` is asked before each part: once the user has disabled,
+/// disconnected or changed the webhook, nothing more is sent. A part that
+/// fails or is withheld stops the rest, and the error says how many were
 /// already delivered.
 pub async fn send(
     root: PathBuf,
     pairing: BrokerPairing,
     config: &MessengerConfig,
     text: &str,
+    withdrawn: impl Fn() -> bool,
 ) -> Result<usize> {
     let parts = parts(config.format, text)?;
     let api = Api::new(root, pairing, config)?;
     let total = parts.len();
     for (sent, part) in parts.iter().enumerate() {
         let delivered = async {
+            if withdrawn() {
+                return Err(MessengerError::Withdrawn {
+                    name: config.name.clone(),
+                });
+            }
             let body = serde_json::to_vec(&body(config.format, part)).map_err(|source| {
                 MessengerError::Malformed {
                     service: api.service,

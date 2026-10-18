@@ -119,6 +119,8 @@ pub enum MessengerError {
     NoPairing,
     #[error("there is no enabled webhook named {name}")]
     NoWebhook { name: String },
+    #[error("webhook {name} was disabled, disconnected or changed, so nothing more was sent")]
+    Withdrawn { name: String },
     #[error("the message is empty")]
     EmptyMessage,
     #[error(
@@ -183,6 +185,7 @@ impl crate::error::Classified for MessengerError {
             | Self::MessageTooLong { .. } => ErrorKind::InvalidRequest,
             Self::NoWebhook { .. } => ErrorKind::NotFound,
             Self::NoPairing => ErrorKind::Unavailable,
+            Self::Withdrawn { .. } => ErrorKind::Cancelled,
             Self::PartlySent { source, .. } => return crate::error::classify(source.as_ref()),
             Self::TurnAborted(_) => ErrorKind::Internal,
             Self::BrokerTooOld | Self::VaultUnavailable(_) => ErrorKind::Unavailable,

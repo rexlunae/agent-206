@@ -15,28 +15,44 @@ use std::time::Duration;
 use support::*;
 
 type Received = Arc<Mutex<Vec<(String, Value)>>>;
+type Gateway = a206_runtime::gateway::Gateway;
+
+/// What the webhook service saw, and a webhook the user disconnects through
+/// this gateway as soon as the first post arrives.
+#[derive(Clone, Default)]
+struct Hooks {
+    received: Received,
+    disconnect: Arc<Mutex<Option<(Gateway, String)>>>,
+}
 
 /// A webhook service: records what each key received.
-async fn serve_hooks() -> (String, Received) {
-    let received = Received::default();
-    let router = Router::new()
-        .route(
-            "/api/webhooks/{key}",
-            post(
-                |State(received): State<Received>,
-                 Path(key): Path<String>,
-                 Json(body): Json<Value>| async move {
-                    received.lock().unwrap().push((key, body));
-                    axum::http::StatusCode::NO_CONTENT
-                },
-            ),
-        )
-        .with_state(received.clone());
+async fn serve_hooks() -> (String, Hooks) {
+    let hooks = Hooks::default();
+    let router =
+        Router::new()
+            .route(
+                "/api/webhooks/{key}",
+                post(
+                    |State(hooks): State<Hooks>,
+                     Path(key): Path<String>,
+                     Json(body): Json<Value>| async move {
+                        hooks.received.lock().unwrap().push((key, body));
+                        let disconnect = hooks.disconnect.lock().unwrap().take();
+                        if let Some((gateway, name)) = disconnect {
+                            let reply =
+                                request(&gateway, Command::DisconnectMessenger { name }).await;
+                            assert_eq!(reply, Reply::Ok);
+                        }
+                        axum::http::StatusCode::NO_CONTENT
+                    },
+                ),
+            )
+            .with_state(hooks.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let origin = format!("http://{}", listener.local_addr().unwrap());
     // Detached: the server lives as long as the test's runtime.
     tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
-    (origin, received)
+    (origin, hooks)
 }
 
 /// An unlocked broker in a new profile holding `url` as a credential bound to
@@ -98,15 +114,25 @@ async fn approval(gateway: &a206_runtime::gateway::Gateway, thread: Id) -> Appro
     .unwrap_or_else(wait("the approval request"))
 }
 
-#[tokio::test]
-async fn a_model_posts_to_a_webhook_only_after_the_user_approves_and_never_sees_its_url() {
-    let (origin, received) = serve_hooks().await;
+/// A gateway paired with a broker holding a Discord webhook's URL, and a
+/// conversation that permits `send_message`.
+struct Setup {
+    gateway: Gateway,
+    state: tempfile::TempDir,
+    hooks: Hooks,
+    hook: String,
+    key: String,
+    requests: tokio::sync::mpsc::Receiver<Opened>,
+    thread: Id,
+}
+
+async fn setup(api: ProviderApi) -> Setup {
+    let (origin, hooks) = serve_hooks().await;
     let key = nonce();
     let (state, credential, pairing) =
         broker(&origin, &format!("{origin}/api/webhooks/{key}")).await;
-    let gateway = a206_runtime::gateway::Gateway::open(state.path()).unwrap();
-    let api = ProviderApi::OpenAi;
-    let (model, mut requests) = connect(&gateway, api).await;
+    let gateway = Gateway::open(state.path()).unwrap();
+    let (model, requests) = connect(&gateway, api).await;
     let hook = format!("h-{}", nonce());
     let mut settings = gateway.snapshot().unwrap().settings;
     settings.messengers.push(MessengerConfig {
@@ -158,8 +184,32 @@ async fn a_model_posts_to_a_webhook_only_after_the_user_approves_and_never_sees_
     )
     .await;
     assert_eq!(permitted, Reply::Ok);
+    Setup {
+        gateway,
+        state,
+        hooks,
+        hook,
+        key,
+        requests,
+        thread: thread.id,
+    }
+}
 
-    let task = send(&gateway, thread.id);
+#[tokio::test]
+async fn a_model_posts_to_a_webhook_only_after_the_user_approves_and_never_sees_its_url() {
+    let api = ProviderApi::OpenAi;
+    let Setup {
+        gateway,
+        state,
+        hooks,
+        hook,
+        key,
+        mut requests,
+        thread,
+    } = setup(api).await;
+    let received = hooks.received;
+    let tool = a206_runtime::message_tool::SEND;
+    let task = send(&gateway, thread);
     let first = next_request(&mut requests).await;
     assert!(offered(api, &first.body).contains(&tool.to_owned()));
     assert!(first.body.to_string().contains(&hook));
@@ -175,11 +225,11 @@ async fn a_model_posts_to_a_webhook_only_after_the_user_approves_and_never_sees_
             &nonce(),
         ))
         .await;
-    let asked = approval(&gateway, thread.id).await;
+    let asked = approval(&gateway, thread).await;
     assert_eq!(asked.tool, tool);
     assert!(asked.arguments.contains(&refused));
     let resolve = |asked: ApprovalRequest, decision| Command::ResolveApproval {
-        thread: thread.id,
+        thread,
         approval: asked.id,
         digest: asked.digest,
         decision,
@@ -202,7 +252,7 @@ async fn a_model_posts_to_a_webhook_only_after_the_user_approves_and_never_sees_
             &nonce(),
         ))
         .await;
-    let asked = approval(&gateway, thread.id).await;
+    let asked = approval(&gateway, thread).await;
     assert!(asked.arguments.contains(&text));
     assert_eq!(
         request(&gateway, resolve(asked, ApprovalDecision::Approve)).await,
@@ -255,9 +305,54 @@ async fn a_model_posts_to_a_webhook_only_after_the_user_approves_and_never_sees_
         .await,
         Reply::Ok
     );
-    let task = send(&gateway, thread.id);
+    let task = send(&gateway, thread);
     let next = next_request(&mut requests).await;
     assert!(!offered(api, &next.body).contains(&tool.to_owned()));
     next.respond(text_response(api, &nonce())).await;
     assert_eq!(finished(task).await.state, RunState::Complete);
+}
+
+#[tokio::test]
+async fn a_webhook_withdrawn_mid_message_gets_no_more_of_it() {
+    let api = ProviderApi::OpenAi;
+    let Setup {
+        gateway,
+        state: _state,
+        hooks,
+        hook,
+        mut requests,
+        thread,
+        ..
+    } = setup(api).await;
+    // The user disconnects the webhook as soon as its first part arrives.
+    *hooks.disconnect.lock().unwrap() = Some((gateway.clone(), hook.clone()));
+    let tool = a206_runtime::message_tool::SEND;
+    let task = send(&gateway, thread);
+    let first = next_request(&mut requests).await;
+    // Two Discord parts.
+    let text: String = (0..100).map(|_| nonce()).collect::<Vec<_>>().join(" ");
+    let call = Call::new(tool, json!({"destination": hook, "text": text}));
+    first
+        .respond(calls_response(api, std::slice::from_ref(&call), &nonce()))
+        .await;
+    let asked = approval(&gateway, thread).await;
+    assert_eq!(
+        request(
+            &gateway,
+            Command::ResolveApproval {
+                thread,
+                approval: asked.id,
+                digest: asked.digest,
+                decision: ApprovalDecision::Approve,
+            },
+        )
+        .await,
+        Reply::Ok
+    );
+    let second = next_request(&mut requests).await;
+    let result = result_for(api, &second.body, &call.id).unwrap();
+    second.respond(text_response(api, &nonce())).await;
+    assert_eq!(finished(task).await.state, RunState::Complete);
+    assert_eq!(hooks.received.lock().unwrap().len(), 1);
+    assert!(result.contains("1 of 2 parts"), "{result}");
 }
