@@ -221,6 +221,23 @@ impl DelegationHost {
     }
 
     fn specs(caller: &Caller, profiles: &AgentProfiles) -> Vec<ToolSpec> {
+        // A coordinator is offered its team's member profiles as recorded
+        // when the team started, so the declaration stays whole if a file
+        // goes; it must name one, and the gateway refuses any other or one
+        // that can no longer be read.
+        let team = caller.team.as_ref().filter(|_| caller.coordinates());
+        let offered: Vec<(&str, &str, Option<&String>)> = match team {
+            Some(team) => team
+                .members
+                .iter()
+                .map(|m| (m.profile.as_str(), m.name.as_str(), m.description.as_ref()))
+                .collect(),
+            None => profiles
+                .profiles
+                .iter()
+                .map(|p| (p.id.as_str(), p.name.as_str(), p.description.as_ref()))
+                .collect(),
+        };
         let thread = json!({"type": "string", "description": "The subagent's ID, as subagent_spawn or subagent_list returned it."});
         let modes: Vec<Value> = Mode::ALL.iter().map(|m| json!(m)).collect();
         let capabilities: Vec<Value> = caller.capabilities.iter().map(|c| json!(c)).collect();
@@ -235,24 +252,27 @@ impl DelegationHost {
             "model": {"type": "string", "enum": models, "description": "Defaults to the profile's model, else your model when it is permitted for subagents."},
             "capabilities": {"type": "array", "items": {"type": "string", "enum": capabilities}, "description": "Capabilities to give it; defaults to all of yours its mode and profile allow."}
         });
-        if !profiles.profiles.is_empty() {
-            let ids: Vec<Value> = profiles.profiles.iter().map(|p| json!(p.id)).collect();
-            let summaries: Vec<String> = profiles
-                .profiles
+        if !offered.is_empty() {
+            let ids: Vec<Value> = offered.iter().map(|(id, ..)| json!(id)).collect();
+            let summaries: Vec<String> = offered
                 .iter()
-                .map(|p| {
-                    let summary = match &p.description {
-                        Some(description) => format!("{}: {description}", p.name),
-                        None => p.name.clone(),
+                .map(|(id, name, description)| {
+                    let summary = match description {
+                        Some(description) => format!("{name}: {description}"),
+                        None => name.to_string(),
                     };
-                    format!("- {}: {}", p.id, truncate(&summary, SUMMARY))
+                    format!("- {id}: {}", truncate(&summary, SUMMARY))
                 })
                 .collect();
             spawn["profile"] = json!({
                 "type": "string",
                 "enum": ids,
                 "description": format!(
-                    "Start from one of the user's agent profiles, which sets its mode, model, capabilities and extra instructions:\n{}",
+                    "{}, which sets its mode, model, capabilities and extra instructions:\n{}",
+                    match team {
+                        Some(team) => format!("The member of team {} to give the task to: its agent profile", team.name),
+                        None => "Start from one of the user's agent profiles".into(),
+                    },
                     summaries.join("\n")
                 ),
             });
@@ -272,7 +292,7 @@ impl DelegationHost {
                 json!({
                     "type": "object",
                     "properties": spawn,
-                    "required": ["task"],
+                    "required": if team.is_some() { json!(["task", "profile"]) } else { json!(["task"]) },
                     "additionalProperties": false
                 }),
             ),
@@ -346,6 +366,11 @@ impl DelegationHost {
                 };
                 let profile = match text(arguments, "profile").map_err(fail)? {
                     Some(id) => Some(self.delegator.profile(id).await?),
+                    None if caller.coordinates() => {
+                        return Err(crate::error::report(
+                            &crate::agent_teams::TeamError::MemberRequired,
+                        ));
+                    }
                     None => None,
                 };
                 let mode = match text(arguments, "mode").map_err(fail)? {
