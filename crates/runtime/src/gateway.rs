@@ -1460,6 +1460,7 @@ impl Gateway {
                     return Ok(Reply::Thread(Box::new(thread)));
                 };
                 let (sender, mut progress) = tokio::sync::mpsc::channel(32);
+                let dispatched = Arc::<std::sync::atomic::AtomicUsize>::default();
                 let operation = async {
                     Ok::<_, GatewayError>(
                         crate::backends::complete(crate::backends::Run {
@@ -1472,6 +1473,7 @@ impl Gateway {
                             state_root: &root,
                             progress: sender,
                             cancel: token.clone(),
+                            dispatched: dispatched.clone(),
                         })
                         .await?,
                     )
@@ -1514,6 +1516,15 @@ impl Gateway {
                 self.running.lock().map_err(poisoned("run"))?.remove(&id);
                 let mut store = self.lock()?;
                 let thread = store.thread_mut(id)?;
+                // A backend reports one total for its whole run; a run that
+                // ended without one counts once if it reached the provider.
+                match &result {
+                    Some(Ok((_, usage))) => thread.usage_total.record(config.id, usage),
+                    _ if dispatched.load(std::sync::atomic::Ordering::Relaxed) > 0 => {
+                        thread.usage_total.record_incomplete()
+                    }
+                    _ => {}
+                }
                 match result {
                     Some(Ok((text, usage))) => {
                         partial.finish(thread, text, None);

@@ -214,6 +214,7 @@ async fn compaction_starts_only_above_the_threshold_of_a_known_limit() {
 
         // Above it: the next run first summarizes all but the last two turns.
         let asked = nonce();
+        let counted = rig.thread().usage_total;
         let run = rig.send(rig.thread, &asked);
         let summary_request = rig.next().await;
         for text in [&first.0, &first.1, &second.0, &second.1] {
@@ -266,6 +267,16 @@ async fn compaction_starts_only_above_the_threshold_of_a_known_limit() {
             Some(summary_input + final_input)
         );
         assert_eq!(thread.usage.unwrap().input_tokens, Some(final_input));
+        // The conversation's total counts the summary request too.
+        let total = &thread.usage_total;
+        assert_eq!(total.reports, counted.reports + 2);
+        assert_eq!(
+            total.input_tokens.exact(),
+            counted
+                .input_tokens
+                .exact()
+                .map(|sum| sum + summary_input + final_input)
+        );
     }
 }
 
@@ -436,6 +447,12 @@ async fn a_failed_summary_reports_its_cause_and_changes_nothing() {
         let after = rig.thread();
         assert_eq!(after.messages, before.messages);
         assert_eq!(after.state, before.state);
+        // The failed summary request is counted, with nothing reported.
+        assert_eq!(
+            after.usage_total.incomplete,
+            before.usage_total.incomplete + 1
+        );
+        assert_eq!(after.usage_total.reports, before.usage_total.reports);
 
         // Started by a run: the run fails with it; the history stays.
         let limit = limit();

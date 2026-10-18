@@ -5,7 +5,7 @@ use crate::{
 use a206_core::{
     Capability, CodingBackend, Command, CompactionTrigger, ErrorKind, ErrorReport, ImageAttachment,
     ImageType, InstructionStatus, MAX_IMAGE_BYTES, MAX_IMAGES, Mode, ModelKey, PlanStatus, Reply,
-    Role, RunState, TextAttachment, Thread,
+    Role, RunState, Tally, TextAttachment, Thread, UsageTotal,
 };
 use fc_dioxus::prelude::*;
 use std::collections::HashMap;
@@ -902,6 +902,9 @@ fn ThreadFacts(thread: Thread) -> Element {
         v.map(|v| v.to_string())
             .unwrap_or_else(|| "Not reported".into())
     };
+    let total = &thread.usage_total;
+    let family = UsageTotal::with_subagents(&snapshot.threads, thread.id);
+    let has_subagents = snapshot.threads.iter().any(|t| t.parent == Some(thread.id));
     rsx! { div { class: "a206-thread-facts",
         dl { class: "a206-fact-grid",
             dt { "Agent engine" } dd { "{thread.backend.label()}" }
@@ -917,6 +920,12 @@ fn ThreadFacts(thread: Thread) -> Element {
             dt { "Last request input / output" } dd { "{number(input)} / {number(output)}" }
             dt { "Run input / output" } dd { "{number(run_input)} / {number(run_output)}" }
             dt { "Run cost" } dd { {cost.map(|c| format!("{c:.6}")).unwrap_or_else(|| "Not reported".into())} }
+            dt { "Conversation input / output" } dd { "{tokens_label(total, &total.input_tokens)} / {tokens_label(total, &total.output_tokens)}" }
+            dt { "Conversation cost" } dd { "{costs_label(total, &snapshot.settings.providers)}" }
+            if has_subagents {
+                dt { "With subagents input / output" } dd { "{tokens_label(&family, &family.input_tokens)} / {tokens_label(&family, &family.output_tokens)}" }
+                dt { "With subagents cost" } dd { "{costs_label(&family, &snapshot.settings.providers)}" }
+            }
             dt { "Input / output rate" } dd { "{price(model.and_then(|m| m.input_cost_per_token))} / {price(model.and_then(|m| m.output_cost_per_token))}" }
             dt { "Account balance" } dd { {catalog.and_then(|c| c.balance.map(|v| format!("{v:.4} {}", c.balance_currency.as_deref().unwrap_or("provider units")))).unwrap_or_else(|| "Not reported".into())} }
             dt { "Token balance" } dd { "{number(catalog.and_then(|c| c.token_balance))}" }
@@ -925,12 +934,72 @@ fn ThreadFacts(thread: Thread) -> Element {
         }
         if let Some(percent) = pct { Progress { label: name!("Context window used"), value: ProgressValue::Of { value: percent.min(100.0), max: 100.0 } } }
         p { class: "a206-fact-note", "Last response · provider-reported usage" }
+        p { class: "a206-fact-note", {totals_note(if has_subagents { &family } else { total })} }
         div { class: "a206-permissions",
             strong { "Tool permissions" }
             if thread.grant.capabilities.is_empty() { span { class: "a206-muted", "None granted" } }
             for grant in &thread.grant.capabilities { Badge { "{grant:?}" } }
         }
     } }
+}
+
+/// A summed token count, marked as a lower bound unless it is the whole of
+/// what was used.
+fn tokens_label(total: &UsageTotal, tally: &Tally<u64>) -> String {
+    match total.exact(tally) {
+        Some(sum) => sum.to_string(),
+        None if tally.unreported > 0 => {
+            format!("At least {} ({} unreported)", tally.sum, tally.unreported)
+        }
+        None => format!("At least {}", tally.sum),
+    }
+}
+/// Each provider's summed cost, in its own units, named by its connection.
+fn costs_label(total: &UsageTotal, providers: &[a206_core::ProviderConfig]) -> String {
+    if total.costs.is_empty() {
+        return "Not reported".into();
+    }
+    total
+        .costs
+        .iter()
+        .map(|cost| {
+            let tally = &cost.cost;
+            let value = match total.exact(tally) {
+                Some(sum) => format!("{sum:.6}"),
+                None if tally.unreported > 0 => {
+                    format!(
+                        "at least {:.6} ({} unreported)",
+                        tally.sum, tally.unreported
+                    )
+                }
+                None => format!("at least {:.6}", tally.sum),
+            };
+            let name = providers
+                .iter()
+                .find(|p| p.id == cost.provider)
+                .map(|p| p.label.as_str())
+                .unwrap_or("Removed connection");
+            format!("{name}: {value}")
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+/// What the conversation totals count, and what they leave out.
+fn totals_note(total: &UsageTotal) -> String {
+    let mut note = format!(
+        "Conversation totals · {} provider usage reports",
+        total.reports
+    );
+    if total.incomplete > 0 {
+        note.push_str(&format!(
+            ", {} requests reached a provider but ended before a finished response and reported nothing",
+            total.incomplete
+        ));
+    }
+    if !total.from_start {
+        note.push_str(", requests made before totals were kept are not counted");
+    }
+    note
 }
 
 /// The checklist the conversation's models keep with `plan_update`.

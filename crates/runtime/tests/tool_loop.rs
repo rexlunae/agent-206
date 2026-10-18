@@ -1352,7 +1352,7 @@ async fn a_tool_reported_error_reaches_the_user_with_its_explanation() {
 }
 
 #[tokio::test]
-async fn the_context_shows_the_last_request_while_cost_counts_the_whole_run() {
+async fn the_context_shows_the_last_request_while_cost_counts_the_run_and_the_conversation() {
     let api = ProviderApi::Anthropic;
     let name = nonce();
     let mut rig = rig(api, vec![tool(&name, ToolPermission::Allow, &[])], None).await;
@@ -1391,6 +1391,21 @@ async fn the_context_shows_the_last_request_while_cost_counts_the_whole_run() {
     let thread = finished(task).await;
     assert_eq!(thread.state, RunState::Failed);
     assert_eq!(thread.run_usage, None);
+    // The conversation's total keeps every run, the failed one included:
+    // its request ended without a finished response, so it reported nothing.
+    let total = thread.usage_total;
+    assert!(total.from_start);
+    assert_eq!((total.reports, total.incomplete), (2, 1));
+    assert_eq!(total.input_tokens.exact(), Some(first_in + last_in));
+    assert_eq!(total.output_tokens.exact(), Some(first_out + last_out));
+    // With a request that reported nothing, no sum is the whole of it.
+    assert_eq!(total.exact(&total.input_tokens), None);
+    // Anthropic reports no cost, so none is summed for this provider.
+    let [cost] = &total.costs[..] else {
+        panic!("one provider: {:?}", total.costs);
+    };
+    assert_eq!(cost.provider, rig.model.provider);
+    assert_eq!((cost.cost.sum, cost.cost.unreported), (0.0, 2));
 }
 
 #[tokio::test]
