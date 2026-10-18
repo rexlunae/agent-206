@@ -32,7 +32,7 @@ pub fn Overview() -> Element {
         div { class: "a206-grid",
             Metric { label: name!("Conversations"), title: rsx! { "Conversations" }, value: Some(snapshot.threads.len() as f64), display: snapshot.threads.len().to_string(), meta: rsx! {} }
             Metric { label: name!("Projects"), title: rsx! { "Projects" }, value: Some(snapshot.projects.len() as f64), display: snapshot.projects.len().to_string(), meta: rsx! { "Coordinator conversations" } }
-            Metric { label: name!("Connected providers"), title: rsx! { "Providers" }, value: Some(snapshot.settings.providers.len() as f64), display: snapshot.settings.providers.len().to_string(), meta: rsx! { "Configured connections" } }
+            Metric { label: name!("Configured providers"), title: rsx! { "Providers" }, value: Some(snapshot.settings.providers.len() as f64), display: snapshot.settings.providers.len().to_string(), meta: rsx! { "Configured connections" } }
         }
         Card { variant: CardVariant::Elevated,
             CardHeader { CardTitle { "Recent conversations" } }
@@ -203,7 +203,7 @@ pub fn Security() -> Element {
         }
         VaultControls {}
         GatewayControls {}
-        Alert { title: rsx! { "Security implementation status" }, "Provider API keys are used only inside the separate vault broker, for the exact origins you bind them to. Adding and changing credentials and their policies, and removing two-factor authentication, still run from `agent206 vault`. The agent approval flow is not built yet, so agents still cannot use credentials and privileged extension imports remain unavailable." }
+        Alert { title: rsx! { "Credential management" }, "Use `agent206 vault` on the gateway host to add credentials, change access policies or remove two-factor authentication. Agent-requested credential use is unavailable." }
     } }
 }
 /// Native clients run vault setup against their broker; the web client reads
