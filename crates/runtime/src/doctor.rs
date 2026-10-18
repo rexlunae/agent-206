@@ -52,6 +52,9 @@ pub struct Facts {
     /// The workspace, when the gateway is running and answered.
     pub snapshot: Option<Result<Box<Snapshot>, ErrorReport>>,
     pub broker: BrokerFacts,
+    /// Permission bits of the local vault directory, `None` when it does
+    /// not exist or the broker is remote.
+    pub vault_directory_mode: Option<u32>,
     pub now: u64,
 }
 
@@ -192,6 +195,9 @@ fn vault_checks(facts: &Facts, gateway_running: bool, checks: &mut Vec<Check>) {
     if let Some(mode) = vault_mode.filter(|mode| open(*mode)) {
         checks.push(check(Finding::VaultFileOpen { mode }));
     }
+    if let Some(mode) = facts.vault_directory_mode.filter(|mode| open(*mode)) {
+        checks.push(check(Finding::VaultDirectoryOpen { mode }));
+    }
 }
 
 fn provider_checks(facts: &Facts, snapshot: &Snapshot, checks: &mut Vec<Check>) {
@@ -280,16 +286,29 @@ pub fn repairs(facts: &Facts) -> Vec<Repair> {
         }
         _ => None,
     };
+    let vault = a206_broker::vault_path(&facts.profile);
     if let Some(mode) = vault_mode.filter(|mode| open(*mode)) {
         repairs.push(Repair::RestrictVault {
-            path: a206_broker::vault_path(&facts.profile),
+            path: vault.clone(),
+            mode,
+        });
+    }
+    if let (Some(mode), Some(path)) = (
+        facts.vault_directory_mode.filter(|mode| open(*mode)),
+        vault.parent(),
+    ) {
+        repairs.push(Repair::RestrictVaultDirectory {
+            path: path.to_owned(),
             mode,
         });
     }
     if let Some(Ok(snapshot)) = &facts.snapshot {
         for provider in &snapshot.settings.providers {
             let catalog = snapshot.catalogs.iter().find(|c| c.provider == provider.id);
-            if credential_problem(facts, provider).is_none()
+            // The gateway spends a credential only through its pairing, so a
+            // credentialed refresh is offered only while both sides hold one.
+            if (provider.credential.is_none() || paired(facts))
+                && credential_problem(facts, provider).is_none()
                 && catalog.is_none_or(|catalog| catalog.stale(facts.now))
             {
                 repairs.push(Repair::RefreshCatalog {
@@ -300,6 +319,19 @@ pub fn repairs(facts: &Facts) -> Vec<Repair> {
         }
     }
     repairs
+}
+
+/// True only when the gateway and the unlocked local broker both report an
+/// active pairing; a remote or locked broker cannot confirm one from here.
+fn paired(facts: &Facts) -> bool {
+    let held = facts
+        .gateway
+        .as_ref()
+        .and_then(|report| report.info.as_ref())
+        .and_then(|info| info.vault_paired);
+    held == Some(true)
+        && matches!(&facts.broker, BrokerFacts::Running { status, .. }
+            if status.unlocked && status.gateway_paired == Some(true))
 }
 
 /// Why one repair could not be made. Nothing is retried or worked around.
@@ -342,13 +374,8 @@ pub async fn repair(
 ) -> Result<(), RepairError> {
     match repair {
         Repair::RestrictProfile { path, .. } => restrict(path, true),
-        Repair::RestrictVault { path, .. } => {
-            restrict(path, false)?;
-            match path.parent() {
-                Some(dir) => restrict(dir, true),
-                None => Ok(()),
-            }
-        }
+        Repair::RestrictVault { path, .. } => restrict(path, false),
+        Repair::RestrictVaultDirectory { path, .. } => restrict(path, true),
         Repair::RefreshCatalog { provider, .. } => {
             let controller = crate::control::GatewayController::attach(root.to_owned(), remote);
             match controller
@@ -368,27 +395,42 @@ pub async fn repair(
 
 #[cfg(unix)]
 fn restrict(path: &Path, directory: bool) -> Result<(), RepairError> {
-    use std::os::unix::fs::PermissionsExt;
-    let failed = |source| RepairError::Permissions {
+    use rustix::fs::{FileType, Mode, OFlags};
+    let failed = |source: rustix::io::Errno| RepairError::Permissions {
         path: path.to_owned(),
-        source,
+        source: source.into(),
     };
-    // set_permissions follows links, so a link here could narrow a file
-    // elsewhere; refuse anything but the plain file or directory expected.
-    let metadata = std::fs::symlink_metadata(path).map_err(failed)?;
-    if metadata.file_type().is_symlink()
-        || (directory && !metadata.is_dir())
-        || (!directory && !metadata.is_file())
-    {
-        return Err(RepairError::NotPlain {
-            path: path.to_owned(),
-        });
+    let not_plain = || RepairError::NotPlain {
+        path: path.to_owned(),
+    };
+    // Change the mode through a descriptor opened without following a final
+    // link, so a link swapped in after the check cannot redirect the change.
+    // NONBLOCK keeps a FIFO put in its place from stalling the open.
+    let mut flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+    if directory {
+        flags |= OFlags::DIRECTORY;
     }
-    let mode = metadata.permissions().mode() & 0o7777;
+    let fd = match rustix::fs::open(path, flags, Mode::empty()) {
+        Ok(fd) => fd,
+        Err(rustix::io::Errno::LOOP | rustix::io::Errno::NOTDIR) => return Err(not_plain()),
+        Err(error) => return Err(failed(error)),
+    };
+    let stat = rustix::fs::fstat(&fd).map_err(failed)?;
+    let kind = FileType::from_raw_mode(stat.st_mode);
+    if kind
+        != if directory {
+            FileType::Directory
+        } else {
+            FileType::RegularFile
+        }
+    {
+        return Err(not_plain());
+    }
+    let mode = Mode::from_raw_mode(stat.st_mode).bits() & 0o7777;
     if mode & 0o077 == 0 {
         return Ok(());
     }
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode & !0o077)).map_err(failed)
+    rustix::fs::fchmod(&fd, Mode::from_raw_mode(mode & !0o077)).map_err(failed)
 }
 
 #[cfg(not(unix))]
@@ -496,10 +538,12 @@ pub async fn gather_for(
         gateway = Some(report);
     }
     let remote = matches!(&target, Ok(Some(GatewayTarget::Ssh { .. })));
-    let broker = if remote {
-        BrokerFacts::Remote
+    let (broker, vault_directory_mode) = if remote {
+        (BrokerFacts::Remote, None)
     } else {
-        broker(root).await
+        let directory = a206_broker::vault_path(root);
+        let directory = directory.parent().unwrap_or(root);
+        (broker(root).await, mode(directory))
     };
     Facts {
         profile: root.to_owned(),
@@ -508,6 +552,7 @@ pub async fn gather_for(
         gateway,
         snapshot,
         broker,
+        vault_directory_mode,
         now,
     }
 }
@@ -552,7 +597,7 @@ pub async fn check_detached(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use a206_core::{Catalog, GatewayInfo, ProviderApi, Settings};
+    use a206_core::{Catalog, GatewayInfo, Id, ProviderApi, Settings};
     use a206_vault::AccessPolicy;
 
     fn random() -> String {
@@ -608,6 +653,7 @@ mod tests {
             gateway: Some(running(paired)),
             snapshot: snapshot.map(|s| Ok(Box::new(s))),
             broker,
+            vault_directory_mode: Some(0o700),
             now: 1_000,
         }
     }
@@ -694,6 +740,7 @@ mod tests {
             gateway: None,
             snapshot: None,
             broker: BrokerFacts::Stopped { vault_mode: None },
+            vault_directory_mode: None,
             now: 0,
         };
         let report = evaluate(&facts);
@@ -937,6 +984,65 @@ mod tests {
         assert!(repairs(&remote).is_empty());
     }
 
+    #[test]
+    fn a_credentialed_refresh_is_offered_only_while_the_gateway_is_paired() {
+        let name = random();
+        let keyed = provider(Some(name.clone()));
+        let origin = url::Url::parse(&keyed.base_url)
+            .unwrap()
+            .origin()
+            .ascii_serialization();
+        let keyless = provider(None);
+        let snap = snapshot(vec![keyed.clone(), keyless.clone()], vec![]);
+        let credentials = || vec![(name.clone(), meta(vec![origin.clone()], false))];
+        let offered = |facts: &Facts| -> Vec<Id> {
+            repairs(facts)
+                .into_iter()
+                .filter_map(|repair| match repair {
+                    Repair::RefreshCatalog { provider, .. } => Some(provider),
+                    _ => None,
+                })
+                .collect()
+        };
+        let paired = facts(
+            Some(snap.clone()),
+            unlocked(credentials(), vec![]),
+            Some(true),
+        );
+        assert_eq!(offered(&paired), [keyed.id, keyless.id]);
+        let unpaired = facts(
+            Some(snap.clone()),
+            unlocked(credentials(), vec![]),
+            Some(false),
+        );
+        assert_eq!(offered(&unpaired), [keyless.id]);
+        let mut broker_unpaired = unlocked(credentials(), vec![]);
+        if let BrokerFacts::Running { status, .. } = &mut broker_unpaired {
+            status.gateway_paired = Some(false);
+        }
+        let broker_side = facts(Some(snap.clone()), broker_unpaired, Some(true));
+        assert_eq!(offered(&broker_side), [keyless.id]);
+        let remote = facts(Some(snap), BrokerFacts::Remote, Some(true));
+        assert_eq!(offered(&remote), [keyless.id]);
+    }
+
+    #[test]
+    fn an_open_vault_directory_is_reported_and_repaired_on_its_own() {
+        let mut facts = facts(None, unlocked(vec![], vec![]), Some(true));
+        facts.vault_directory_mode = Some(0o755);
+        assert!(
+            findings(&evaluate(&facts)).contains(&&Finding::VaultDirectoryOpen { mode: 0o755 })
+        );
+        let vault = a206_broker::vault_path(&facts.profile);
+        assert_eq!(
+            repairs(&facts),
+            [Repair::RestrictVaultDirectory {
+                path: vault.parent().unwrap().to_owned(),
+                mode: 0o755
+            }]
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn permission_repairs_clear_only_group_and_other_bits_and_refuse_links() {
@@ -966,6 +1072,12 @@ mod tests {
         };
         repair(&profile, None, &fix).await.unwrap();
         assert_eq!(mode(&vault), 0o400);
+        assert_eq!(mode(vault.parent().unwrap()), 0o755);
+        let directory = Repair::RestrictVaultDirectory {
+            path: vault.parent().unwrap().to_owned(),
+            mode: 0o755,
+        };
+        repair(&profile, None, &directory).await.unwrap();
         assert_eq!(mode(vault.parent().unwrap()), 0o700);
 
         let elsewhere = root.path().join(random());

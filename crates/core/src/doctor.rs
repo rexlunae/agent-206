@@ -56,6 +56,9 @@ pub enum Finding {
     VaultFileOpen {
         mode: u32,
     },
+    VaultDirectoryOpen {
+        mode: u32,
+    },
     VaultLocked,
     VaultUnlocked,
     TotpEnrolled,
@@ -137,6 +140,7 @@ impl Finding {
             | VaultMissing
             | VaultBrokerUnreachable
             | VaultFileOpen { .. }
+            | VaultDirectoryOpen { .. }
             | PairingMissing
             | NoProviders
             | ProviderCredentialMissing { .. }
@@ -163,7 +167,8 @@ impl Finding {
             VaultMissing => "agent206 setup, or agent206 import rustyclaw --apply".into(),
             VaultBrokerStopped | VaultLocked => "agent206 vault unlock".into(),
             VaultBrokerUnreachable => "agent206 vault stop, then agent206 vault unlock".into(),
-            VaultFileOpen { .. } => "chmod 600 the vault file and 700 its directory".into(),
+            VaultFileOpen { .. } => "chmod 600 the vault file".into(),
+            VaultDirectoryOpen { .. } => "chmod 700 the vault directory".into(),
             TotpNotEnrolled => "agent206 vault totp enroll".into(),
             PairingMissing => "agent206 vault pair".into(),
             NoProviders => "agent206 providers presets, then agent206 providers add".into(),
@@ -220,6 +225,10 @@ impl std::fmt::Display for Finding {
                     "the vault file is readable by other users (mode {mode:o})"
                 )
             }
+            VaultDirectoryOpen { mode } => write!(
+                f,
+                "the vault directory is accessible to other users (mode {mode:o})"
+            ),
             VaultLocked => f.write_str("the vault is locked"),
             VaultUnlocked => f.write_str("the vault is unlocked"),
             TotpEnrolled => f.write_str("two-factor authentication is enrolled"),
@@ -307,8 +316,10 @@ impl DoctorReport {
 pub enum Repair {
     /// Remove group and other permissions from the profile directory.
     RestrictProfile { path: PathBuf, mode: u32 },
-    /// Remove group and other permissions from the vault file and its directory.
+    /// Remove group and other permissions from the vault file.
     RestrictVault { path: PathBuf, mode: u32 },
+    /// Remove group and other permissions from the vault directory.
+    RestrictVaultDirectory { path: PathBuf, mode: u32 },
     /// Fetch this provider's model list from its API through the gateway.
     RefreshCatalog { provider: crate::Id, label: String },
 }
@@ -324,7 +335,13 @@ impl std::fmt::Display for Repair {
             ),
             Self::RestrictVault { path, mode } => write!(
                 f,
-                "make vault file {} and its directory private (mode {mode:o} to {:o})",
+                "make vault file {} private (mode {mode:o} to {:o})",
+                path.display(),
+                mode & !0o077
+            ),
+            Self::RestrictVaultDirectory { path, mode } => write!(
+                f,
+                "make vault directory {} private (mode {mode:o} to {:o})",
                 path.display(),
                 mode & !0o077
             ),
