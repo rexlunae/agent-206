@@ -254,7 +254,7 @@ async fn paginates_native_catalogs_and_dispatches_protocol_specific_text() {
         .await
         .unwrap();
         assert_eq!(text, api.text);
-        let (streamed, _) = drain(&mut deltas);
+        let (streamed, ..) = drain(&mut deltas);
         assert_eq!(streamed, api.text);
         assert_eq!(usage.input_tokens, Some(api.limit));
         assert_eq!(usage.output_tokens, Some(api.output));
@@ -686,22 +686,31 @@ async fn next_delta(deltas: &mut tokio::sync::mpsc::Receiver<Progress>) -> Strin
             .expect("the stream closed early");
         match update {
             Progress::Delta(delta) => return delta,
-            Progress::Reasoning(_) => continue,
+            Progress::Reasoning { .. } => continue,
             Progress::Text(_) | Progress::Activity(_) => panic!("native streams send deltas"),
         }
     }
 }
-/// Every text delta and every reasoning delta published so far.
-fn drain(deltas: &mut tokio::sync::mpsc::Receiver<Progress>) -> (String, Vec<String>) {
-    let (mut text, mut reasoning) = (String::new(), vec![]);
+/// Every text delta and every non-empty reasoning delta published so far,
+/// and how many reasoning updates said the reasoning was shortened.
+fn drain(deltas: &mut tokio::sync::mpsc::Receiver<Progress>) -> (String, Vec<String>, usize) {
+    let (mut text, mut reasoning, mut shortened) = (String::new(), vec![], 0);
     while let Ok(update) = deltas.try_recv() {
         match update {
             Progress::Delta(delta) => text.push_str(&delta),
-            Progress::Reasoning(delta) => reasoning.push(delta),
+            Progress::Reasoning {
+                text: delta,
+                shortened: cut,
+            } => {
+                shortened += usize::from(cut);
+                if !delta.is_empty() {
+                    reasoning.push(delta);
+                }
+            }
             Progress::Text(_) | Progress::Activity(_) => panic!("native streams send deltas"),
         }
     }
-    (text, reasoning)
+    (text, reasoning, shortened)
 }
 async fn upstream_closed(feed: &tokio::sync::mpsc::Sender<Vec<u8>>, why: &str) {
     tokio::time::timeout(std::time::Duration::from_secs(10), feed.closed())
@@ -961,7 +970,7 @@ async fn reasoning_streams_apart_from_the_reply_and_is_never_sent_back() {
         assert_eq!(turn.text, text, "{api:?}");
         assert_eq!(turn.reasoning, expected, "{api:?}");
         assert!(!turn.reasoning_shortened);
-        let (streamed, reasoning) = drain(&mut deltas);
+        let (streamed, reasoning, _) = drain(&mut deltas);
         assert_eq!(streamed, text, "{api:?}");
         assert_eq!(reasoning, streamed_thoughts, "{api:?}");
 
@@ -989,17 +998,21 @@ async fn reasoning_beyond_the_limit_is_cut_and_the_reply_still_completes() {
         }
         // Four-byte characters, so the limit falls inside one.
         let piece = "\u{1f600}".repeat(4097);
-        let mut sent = 0;
-        while sent <= provider::MAX_REASONING_TEXT {
+        let (mut sent, mut shortened) = (0, 0);
+        // One more piece after the cut is dropped without another notice.
+        while sent <= provider::MAX_REASONING_TEXT + piece.len() {
             send_split(&opened.feed, &reasoning_event(api, &piece, 0)).await;
             sent += piece.len();
-            drain(&mut deltas);
+            shortened += drain(&mut deltas).2;
         }
         let text = Id::new_v4().to_string();
         send_split(&opened.feed, &text_event(api, &text)).await;
         send_split(&opened.feed, &closing_events(api, 1, 1)).await;
         drop(opened.feed);
         let turn = task.await.unwrap().unwrap();
+        shortened += drain(&mut deltas).2;
+        // The stream itself says so, so a reply that later fails keeps it.
+        assert_eq!(shortened, 1, "{api:?}");
         assert_eq!(turn.text, text, "{api:?}");
         assert!(turn.reasoning_shortened, "{api:?}");
         assert!(turn.reasoning.len() <= provider::MAX_REASONING_TEXT);
@@ -1035,7 +1048,7 @@ async fn tool_call_markup_written_as_text_is_removed_from_the_reply() {
         drop(opened.feed);
         let (text, _) = task.await.unwrap().unwrap();
         assert_eq!(text, format!("{intro} `<tool_call>` {outro} <"), "{api:?}");
-        let (streamed, _) = drain(&mut deltas);
+        let (streamed, ..) = drain(&mut deltas);
         assert!(!streamed.contains(&call), "{api:?}: {streamed}");
         // The held `<` is the last delta.
         assert_eq!(streamed, text, "{api:?}");

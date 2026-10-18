@@ -49,6 +49,8 @@ struct PartialReply {
     text: String,
     /// Streamed reasoning, kept beside the text for display.
     reasoning: String,
+    /// Reasoning beyond the kept limit was dropped.
+    reasoning_shortened: bool,
     /// Text or reasoning changed since it was last written to the thread.
     dirty: bool,
     published: Option<tokio::time::Instant>,
@@ -60,7 +62,10 @@ impl PartialReply {
         match update {
             crate::backends::Progress::Text(text) => self.text = text,
             crate::backends::Progress::Delta(delta) => self.text.push_str(&delta),
-            crate::backends::Progress::Reasoning(delta) => self.reasoning.push_str(&delta),
+            crate::backends::Progress::Reasoning { text, shortened } => {
+                self.reasoning.push_str(&text);
+                self.reasoning_shortened |= shortened;
+            }
             crate::backends::Progress::Activity(_) => return false,
         }
         self.dirty = true;
@@ -83,6 +88,7 @@ impl PartialReply {
         if let Some(existing) = found {
             existing.text.clone_from(&self.text);
             existing.reasoning.clone_from(&self.reasoning);
+            existing.reasoning_shortened = self.reasoning_shortened;
         } else if !self.text.is_empty() || !self.reasoning.is_empty() {
             let id = *self.message.get_or_insert_with(Id::new_v4);
             thread.messages.push(Message {
@@ -95,7 +101,7 @@ impl PartialReply {
                 tool_calls: vec![],
                 compaction: None,
                 reasoning: self.reasoning.clone(),
-                reasoning_shortened: false,
+                reasoning_shortened: self.reasoning_shortened,
             });
         }
     }
@@ -116,9 +122,9 @@ impl PartialReply {
         reasoning: Option<(String, bool)>,
     ) -> Id {
         self.text = text;
-        let shortened = reasoning.as_ref().is_some_and(|(_, shortened)| *shortened);
-        if let Some((reasoning, _)) = reasoning {
+        if let Some((reasoning, shortened)) = reasoning {
             self.reasoning = reasoning;
+            self.reasoning_shortened = shortened;
         }
         let id = *self.message.get_or_insert_with(Id::new_v4);
         if !thread.messages.iter().any(|m| m.id == id) {
@@ -127,9 +133,6 @@ impl PartialReply {
             thread.messages.push(message);
         }
         self.apply(thread);
-        if let Some(message) = thread.messages.iter_mut().find(|m| m.id == id) {
-            message.reasoning_shortened = shortened;
-        }
         id
     }
 }
@@ -2126,6 +2129,31 @@ fn project_root(store: &Store, id: Id) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shortened_reasoning_is_marked_while_streaming_before_any_final_reply() {
+        let mut thread = Thread::new(Id::new_v4().to_string(), Mode::Chat);
+        let mut partial = PartialReply::default();
+        let kept = Id::new_v4().to_string();
+        partial.update(crate::backends::Progress::Reasoning {
+            text: kept.clone(),
+            shortened: false,
+        });
+        partial.apply(&mut thread);
+        assert!(!thread.messages[0].reasoning_shortened);
+        // The cut can arrive with nothing left to keep.
+        partial.update(crate::backends::Progress::Reasoning {
+            text: String::new(),
+            shortened: true,
+        });
+        partial.apply(&mut thread);
+        // A stream that fails here never reaches `finish`; the notice stays.
+        let [message] = &thread.messages[..] else {
+            panic!("one partial reply expected");
+        };
+        assert_eq!(message.reasoning, kept);
+        assert!(message.reasoning_shortened);
+    }
 
     #[tokio::test]
     async fn committed_shutdown_survives_a_lost_acknowledgement() {

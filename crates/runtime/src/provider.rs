@@ -977,11 +977,12 @@ impl Sink<'_> {
             let appended = self.reply.event(&event)?;
             // A closed receiver means nobody is watching this run any more;
             // the reply is still returned to whoever awaits it.
-            if let Some(reasoning) = appended.reasoning {
-                self.progress
-                    .send(crate::backends::Progress::Reasoning(reasoning))
-                    .await
-                    .ignore();
+            if appended.reasoning.is_some() || appended.shortened {
+                let reasoning = crate::backends::Progress::Reasoning {
+                    text: appended.reasoning.unwrap_or_default(),
+                    shortened: appended.shortened,
+                };
+                self.progress.send(reasoning).await.ignore();
             }
             if let Some(delta) = appended.text {
                 self.progress
@@ -1339,14 +1340,20 @@ impl StreamedReply {
                 text_parts(parts, "text", true)
             }
         };
+        let was_shortened = self.reasoning_shortened;
         let reasoning = thought.and_then(|t| self.think(&t));
+        let shortened = self.reasoning_shortened && !was_shortened;
         let text = delta
             .map(|d| self.markup.feed(&d))
             .filter(|d| !d.is_empty());
         if let Some(text) = &text {
             self.append(text)?;
         }
-        Ok(Appended { text, reasoning })
+        Ok(Appended {
+            text,
+            reasoning,
+            shortened,
+        })
     }
     /// Record streamed reasoning up to [`MAX_REASONING_TEXT`] and return
     /// what was recorded. Reasoning beyond the limit is dropped rather than
@@ -1438,6 +1445,8 @@ fn upstream_error(error: &Value, fields: &[&str]) -> ProviderError {
 struct Appended {
     text: Option<String>,
     reasoning: Option<String>,
+    /// This event's reasoning reached the limit; the rest is dropped.
+    shortened: bool,
 }
 /// The text of Gemini thought-summary parts.
 fn thought_parts(parts: Option<&Value>) -> Option<String> {

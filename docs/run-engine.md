@@ -41,8 +41,8 @@ tool calls, a budget is used up, or the user cancels:
    repeated provider call IDs are replaced.
    Calls are recorded in order while their arguments fit in the conversation's
    remaining storage, keeping a reserve for settling this response's calls and
-   for the next round (the longest reply the provider path accepts, its metadata
-   and its own settlement); the rest fail with a `Storage` report and no stored
+   for the next round (the longest reply the provider path accepts, the most
+   reasoning a reply keeps, its metadata and its own settlement); the rest fail with a `Storage` report and no stored
    arguments, and the run goes on. Tool outputs are likewise cut to the space
    above that reserve. A round never starts without room for its reply; if that
    room is gone the run fails with `HistoryFull` instead of streaming a reply it

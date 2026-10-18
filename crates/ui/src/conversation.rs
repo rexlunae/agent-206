@@ -476,7 +476,7 @@ fn Conversation(thread: Thread, target: Option<Uuid>) -> Element {
                             }
                         }
                         if !message.reasoning.is_empty() {
-                            MessageReasoning { message: message.clone(), live: running && thread.messages.last().is_some_and(|last| last.id == message.id) }
+                            MessageReasoning { message: message.clone(), live: reasoning_live(&thread, message, running) }
                         }
                         if !message.text.is_empty() || message.reasoning.is_empty() {
                             p { class: "a206-message-text", "{message.text}" }
@@ -1000,6 +1000,17 @@ fn unreadable(error: dioxus::CapturedError) -> ErrorReport {
 
 /// The reasoning a model streamed with a reply, collapsed above its text.
 /// `live` while the reply is still streaming.
+/// Reasoning is still being written only while it is the newest part of the
+/// running reply: once text or a tool call follows, that round has thought.
+fn reasoning_live(thread: &a206_core::Thread, message: &a206_core::Message, running: bool) -> bool {
+    running
+        && message.text.is_empty()
+        && message.tool_calls.is_empty()
+        && thread
+            .messages
+            .last()
+            .is_some_and(|last| last.id == message.id)
+}
 #[component]
 fn MessageReasoning(message: a206_core::Message, live: bool) -> Element {
     rsx! {
@@ -1124,6 +1135,30 @@ mod tests {
         let settled = shown(message.clone(), false);
         assert!(settled.contains("Thought"), "{settled}");
         assert!(settled.contains("the rest was not recorded"), "{settled}");
+    }
+
+    #[test]
+    fn reasoning_is_live_only_until_its_round_writes_text_or_calls_a_tool() {
+        let mut thread = Thread::new(Uuid::new_v4().to_string(), Mode::default());
+        let mut message =
+            a206_core::Message::new(Role::Assistant, String::new(), 0, CodingBackend::Native);
+        message.reasoning = Uuid::new_v4().to_string();
+        thread.messages.push(message.clone());
+        assert!(reasoning_live(&thread, &message, true));
+        assert!(!reasoning_live(&thread, &message, false));
+        // The run carries on with text or tools: this round's thinking ended.
+        let mut answered = message.clone();
+        answered.text = Uuid::new_v4().to_string();
+        thread.messages[0] = answered.clone();
+        assert!(!reasoning_live(&thread, &answered, true));
+        // An earlier round's reply is never live, even with no text.
+        thread.messages.push(a206_core::Message::new(
+            Role::Assistant,
+            Uuid::new_v4().to_string(),
+            0,
+            CodingBackend::Native,
+        ));
+        assert!(!reasoning_live(&thread, &message, true));
     }
 
     #[test]
