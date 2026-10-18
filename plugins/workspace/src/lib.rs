@@ -44,6 +44,7 @@ impl Extension for Workspace {
                     regex: bool_arg(args, "regex")?.unwrap_or(false),
                     ignore_case: bool_arg(args, "ignore_case")?.unwrap_or(false),
                     include: string_arg(args, "include")?,
+                    include_ignored: bool_arg(args, "include_ignored")?.unwrap_or(false),
                 };
                 let found = host::search_pattern(path, query, options, max)?;
                 let mut lines: Vec<String> = found
@@ -66,7 +67,8 @@ impl Extension for Workspace {
                 let path = string_arg(args, "path")?.unwrap_or(".");
                 let max = int_arg(args, "max_results")?.unwrap_or(DEFAULT_FOUND);
                 let max = u32::try_from(max.clamp(1, 1000)).unwrap_or(1);
-                let found = host::find(path, pattern, max)?;
+                let ignored = bool_arg(args, "include_ignored")?.unwrap_or(false);
+                let found = host::find_including(path, pattern, ignored, max)?;
                 let mut lines: Vec<String> = found
                     .entries
                     .iter()
