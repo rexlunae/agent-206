@@ -12,6 +12,7 @@ mod discord;
 mod irc;
 mod listener;
 mod matrix;
+mod signal;
 mod slack;
 mod telegram;
 
@@ -47,8 +48,27 @@ pub enum MessengerError {
     NoEndpoint { service: &'static str },
     #[error("the IRC server is not allowed")]
     IrcServer(#[source] a206_core::messengers::IrcServerError),
-    #[error("the IRC messenger has no login; set it to the bot's registered nickname")]
+    #[error(
+        "the messenger has no login; set it to the account it signs in as (IRC: the registered nickname; Signal: the number signal-cli serves)"
+    )]
     NoLogin,
+    #[error("the signal-cli daemon endpoint is not allowed")]
+    SignalDaemon(#[source] a206_core::messengers::SignalDaemonError),
+    #[error("could not reach the signal-cli daemon; start it, or check the messenger's endpoint")]
+    SignalUnreachable {
+        #[source]
+        source: std::io::Error,
+    },
+    #[error(
+        "the signal-cli daemon does not serve {account}; register or link it there, and run the daemon without -a so it serves every account"
+    )]
+    SignalAccount { account: String },
+    #[error("signal-cli refused the request ({code}: {message})")]
+    SignalRefused { code: i64, message: String },
+    #[error("signal-cli did not answer in time")]
+    SignalTimeout,
+    #[error("{service} sent a message larger than Agent 206 reads")]
+    TooLarge { service: &'static str },
     #[error(
         "the IRC server does not offer SASL sign-in and account tags, which Agent 206 needs to know who sent each message ({code})"
     )]
@@ -129,6 +149,8 @@ impl crate::error::Classified for MessengerError {
             | Self::NoAppCredential { .. }
             | Self::NoEndpoint { .. }
             | Self::IrcServer(_)
+            | Self::SignalDaemon(_)
+            | Self::SignalAccount { .. }
             | Self::NoLogin
             | Self::NoModel
             | Self::Endpoint(_)
@@ -149,7 +171,11 @@ impl crate::error::Classified for MessengerError {
             | Self::Backlog { .. } => ErrorKind::Unavailable,
             Self::DiscordIntents => ErrorKind::PermissionDenied,
             Self::Rejected { .. } | Self::IrcCapabilities { .. } => ErrorKind::Provider,
-            Self::RecipientGone { .. } => ErrorKind::Unavailable,
+            Self::RecipientGone { .. } | Self::SignalUnreachable { .. } | Self::SignalTimeout => {
+                ErrorKind::Unavailable
+            }
+            Self::SignalRefused { .. } => ErrorKind::Provider,
+            Self::TooLarge { .. } => ErrorKind::Protocol,
             Self::Status { .. } | Self::Refused { .. } => ErrorKind::Provider,
             Self::Conversation(error) => return crate::error::classify(error.as_ref()),
             Self::Turn(report) => report.kind,
@@ -166,6 +192,8 @@ impl MessengerError {
                 | Self::NoAppCredential { .. }
                 | Self::NoEndpoint { .. }
                 | Self::IrcServer(_)
+                | Self::SignalDaemon(_)
+                | Self::SignalAccount { .. }
                 | Self::NoLogin
                 | Self::IrcCapabilities { .. }
                 | Self::Endpoint(_)
@@ -258,8 +286,20 @@ enum Adapter {
     Discord(discord::Discord),
     Slack(slack::Slack),
     Irc(irc::Irc),
+    Signal(signal::Signal),
 }
 impl Adapter {
+    /// The adapter for `config`. Kinds that spend a vault credential talk
+    /// through the broker; Signal talks to the user's own signal-cli.
+    fn open(root: PathBuf, pairing: BrokerPairing, config: &MessengerConfig) -> Result<Self> {
+        if config.kind.is_signal() {
+            return Ok(Self::Signal(signal::Signal::new(
+                config.endpoint(),
+                config.login.clone(),
+            )));
+        }
+        Ok(Self::new(config, Api::new(root, pairing, config)?))
+    }
     fn new(config: &MessengerConfig, api: Api) -> Self {
         match config.kind {
             MessengerKind::Telegram => Self::Telegram(telegram::Telegram::new(api)),
@@ -275,6 +315,9 @@ impl Adapter {
                 config.login.clone(),
                 config.allowed_chats.clone(),
             )),
+            MessengerKind::Signal => {
+                Self::Signal(signal::Signal::new(config.endpoint(), config.login.clone()))
+            }
         }
     }
     /// Check the credential and name the account.
@@ -285,6 +328,7 @@ impl Adapter {
             Self::Discord(adapter) => adapter.connect().await,
             Self::Slack(adapter) => adapter.connect().await,
             Self::Irc(adapter) => adapter.connect().await,
+            Self::Signal(adapter) => adapter.connect().await,
         }
     }
     /// Wait for the next batch after `cursor`.
@@ -295,21 +339,27 @@ impl Adapter {
             Self::Discord(adapter) => adapter.receive(cursor).await,
             Self::Slack(adapter) => adapter.receive(cursor).await,
             Self::Irc(adapter) => adapter.receive(cursor).await,
+            Self::Signal(adapter) => adapter.receive(cursor).await,
         }
     }
     /// Fails with [`MessengerError::EncryptedRoom`] if an answer could not be
     /// sent to `chat` as it is now.
     async fn check_chat(&self, chat: &str) -> Result<()> {
         match self {
-            Self::Telegram(_) | Self::Discord(_) | Self::Slack(_) | Self::Irc(_) => Ok(()),
+            Self::Telegram(_)
+            | Self::Discord(_)
+            | Self::Slack(_)
+            | Self::Irc(_)
+            | Self::Signal(_) => Ok(()),
             Self::Matrix(adapter) => adapter.check_room(chat).await,
         }
     }
     async fn join(&self, chat: &str) -> Result<()> {
         match self {
-            // Telegram, Discord and Slack add bots to chats themselves and
-            // report no invitations.
-            Self::Telegram(_) | Self::Discord(_) | Self::Slack(_) => Ok(()),
+            // Telegram, Discord and Slack add bots to chats themselves, and
+            // signal-cli joins groups for the account; none report
+            // invitations here.
+            Self::Telegram(_) | Self::Discord(_) | Self::Slack(_) | Self::Signal(_) => Ok(()),
             Self::Matrix(adapter) => adapter.join(chat).await,
             Self::Irc(adapter) => adapter.join(chat).await,
         }
@@ -321,6 +371,7 @@ impl Adapter {
             Self::Discord(adapter) => adapter.send(chat, text).await,
             Self::Slack(adapter) => adapter.send(chat, text).await,
             Self::Irc(adapter) => adapter.send(chat, text).await,
+            Self::Signal(adapter) => adapter.send(chat, text).await,
         }
     }
 }
@@ -564,8 +615,8 @@ async fn session<H: Host>(
     let adapter = match adapter.take() {
         Some((current, kept)) if current == pairing => adapter.insert((current, kept)),
         _ => {
-            let api = Api::new(host.root(), pairing.clone(), config)?;
-            adapter.insert((pairing, Adapter::new(config, api)))
+            let opened = Adapter::open(host.root(), pairing.clone(), config)?;
+            adapter.insert((pairing, opened))
         }
     };
     let adapter = &mut adapter.1;

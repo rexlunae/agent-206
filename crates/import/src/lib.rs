@@ -222,6 +222,9 @@ pub enum UnsupportedMessenger {
     PlainTextIrc,
     /// The IRC nickname is not one Agent 206 can sign in with.
     InvalidLogin,
+    /// Signal: the source ran signal-cli itself, while Agent 206 connects
+    /// to a signal-cli daemon the user runs, which the source does not name.
+    NoSignalDaemon,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

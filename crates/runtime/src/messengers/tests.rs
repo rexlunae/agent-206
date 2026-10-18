@@ -9,6 +9,7 @@ use axum::{
 };
 use serde_json::{Value, json};
 use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
 fn random() -> String {
@@ -2128,6 +2129,420 @@ async fn irc_without_a_login_waits_for_the_user() {
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     assert_eq!(host.connects(&name), 1);
     assert!(server.received.lock().unwrap().is_empty());
+    stop.cancel();
+    supervisor.await.unwrap();
+}
+
+/// A stand-in signal-cli daemon on a Unix socket: it serves `accounts`,
+/// sends `early` before answering `subscribeReceive` and `script` after,
+/// and records every request it receives. With `hang_up_after`, the first
+/// connection closes after answering that many `send`s (or, with
+/// `unanswered`, on receiving the last of them, after sending `on_hang_up`),
+/// and the next subscription
+/// sends `replay`.
+#[derive(Clone, Default)]
+struct SignalDaemon {
+    accounts: Vec<String>,
+    early: Arc<Mutex<Vec<Value>>>,
+    script: Arc<Mutex<Vec<Value>>>,
+    replay: Arc<Mutex<Vec<Value>>>,
+    hang_up_after: usize,
+    unanswered: bool,
+    on_hang_up: Arc<Mutex<Vec<Value>>>,
+    sent: Arc<std::sync::atomic::AtomicUsize>,
+    hung_up: Arc<std::sync::atomic::AtomicBool>,
+    received: Arc<Mutex<Vec<Value>>>,
+}
+
+async fn serve_signal(dir: &std::path::Path, daemon: SignalDaemon) -> String {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let path = dir.join(format!("{}.sock", &random()[..8]));
+    let listener = tokio::net::UnixListener::bind(&path).unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let daemon = daemon.clone();
+            tokio::spawn(async move {
+                let (reader, mut writer) = stream.into_split();
+                let mut lines = BufReader::new(reader).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    let request: Value = serde_json::from_str(&line).unwrap();
+                    daemon.received.lock().unwrap().push(request.clone());
+                    let id = request["id"].clone();
+                    let mut send = vec![];
+                    match request["method"].as_str() {
+                        Some("listAccounts") => {
+                            let accounts: Vec<Value> = daemon
+                                .accounts
+                                .iter()
+                                .map(|number| json!({ "number": number }))
+                                .collect();
+                            send.push(json!({ "jsonrpc": "2.0", "id": id, "result": accounts }));
+                        }
+                        Some("subscribeReceive") => {
+                            send.append(&mut daemon.early.lock().unwrap());
+                            send.push(json!({ "jsonrpc": "2.0", "id": id, "result": 0 }));
+                            send.append(&mut daemon.script.lock().unwrap());
+                            if daemon.hung_up.load(Ordering::SeqCst) {
+                                send.append(&mut daemon.replay.lock().unwrap());
+                            }
+                        }
+                        Some("send")
+                            if daemon.unanswered
+                                && !daemon.hung_up.load(Ordering::SeqCst)
+                                && daemon.sent.load(Ordering::SeqCst) + 1
+                                    == daemon.hang_up_after =>
+                        {
+                            daemon.sent.fetch_add(1, Ordering::SeqCst);
+                            let last = std::mem::take(&mut *daemon.on_hang_up.lock().unwrap());
+                            for message in last {
+                                let mut line = serde_json::to_vec(&message).unwrap();
+                                line.push(b'\n');
+                                if writer.write_all(&line).await.is_err() {
+                                    break;
+                                }
+                            }
+                            daemon.hung_up.store(true, Ordering::SeqCst);
+                            return;
+                        }
+                        Some("send") => {
+                            send.push(
+                                json!({ "jsonrpc": "2.0", "id": id, "result": { "timestamp": 1 } }),
+                            );
+                        }
+                        _ => send.push(json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "error": { "code": -32601, "message": "Method not implemented" }
+                        })),
+                    }
+                    for message in send {
+                        let mut line = serde_json::to_vec(&message).unwrap();
+                        line.push(b'\n');
+                        if writer.write_all(&line).await.is_err() {
+                            return;
+                        }
+                    }
+                    if request["method"] == "send"
+                        && daemon.sent.fetch_add(1, Ordering::SeqCst) + 1 == daemon.hang_up_after
+                        && !daemon.hung_up.swap(true, Ordering::SeqCst)
+                    {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    format!("unix://{}", path.display())
+}
+
+fn signal_message(account: &str, from: &str, timestamp: u64, data: Value) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "method": "receive",
+        "params": {
+            "subscription": 0,
+            "result": {
+                "account": account,
+                "envelope": {
+                    "sourceUuid": from,
+                    "sourceName": random(),
+                    "timestamp": timestamp,
+                    "dataMessage": data,
+                }
+            }
+        }
+    })
+}
+
+fn signal_host(dir: &tempfile::TempDir, pairing: BrokerPairing) -> Recorder {
+    Recorder {
+        root: dir.path().to_owned(),
+        pairing,
+        pairings: Arc::new(watch::Sender::new(0)),
+        threads: Arc::default(),
+        turns: Arc::default(),
+        statuses: Arc::default(),
+        connects: Arc::default(),
+        changed: Arc::default(),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn signal_answers_listed_people_through_the_users_own_daemon() {
+    use base64::Engine;
+    let aci = || Id::new_v4().hyphenated().to_string();
+    let number = format!("+1555{}", 1_000_000 + std::process::id() % 1_000_000);
+    let (friend, member, stranger) = (aci(), aci(), aci());
+    let group = base64::engine::general_purpose::STANDARD.encode(Id::new_v4().as_bytes().repeat(2));
+    let (q1, q2) = (random(), random());
+    // No vault credential: the broker is there only because messengers run
+    // while the gateway is paired.
+    let (dir, _credential, pairing, _anchor) = broker("https://unused.invalid", &random()).await;
+    let daemon = SignalDaemon {
+        accounts: vec![number.clone()],
+        ..SignalDaemon::default()
+    };
+    daemon.script.lock().unwrap().extend([
+        signal_message(&number, &friend, 1, json!({ "message": q1 })),
+        // Delivered twice: answered once.
+        signal_message(&number, &friend, 1, json!({ "message": q1 })),
+        signal_message(
+            &number,
+            &stranger,
+            2,
+            json!({ "message": random(), "groupInfo": { "groupId": group } }),
+        ),
+        signal_message(
+            &number,
+            &member,
+            3,
+            json!({ "message": q2, "groupInfo": { "groupId": group } }),
+        ),
+        // Another account the daemon serves.
+        signal_message("+15550000000", &friend, 4, json!({ "message": random() })),
+    ]);
+    let endpoint = serve_signal(dir.path(), daemon.clone()).await;
+    let host = signal_host(&dir, pairing);
+    let entry = MessengerConfig {
+        enabled: true,
+        endpoint: Some(endpoint),
+        login: Some(number.clone()),
+        allowed_chats: BTreeSet::from([friend.clone(), group.clone()]),
+        allowed_users: BTreeSet::from([friend.clone(), member.clone()]),
+        model: Some(ModelKey {
+            provider: Id::new_v4(),
+            model: random(),
+        }),
+        ..MessengerConfig::new("signal".to_owned(), MessengerKind::Signal)
+    };
+    let (_desired, receiver) = watch::channel(vec![Desired {
+        config: entry,
+        run: true,
+    }]);
+    let stop = CancellationToken::new();
+    let supervisor = tokio::spawn(supervise(host.clone(), receiver, FAST, stop.clone()));
+    let sends = || -> Vec<Value> {
+        daemon
+            .received
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r["method"] == "send")
+            .map(|r| r["params"].clone())
+            .collect()
+    };
+    host.until(|h| sends().len() == 2 && !h.status("signal").refused.is_empty())
+        .await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let status = host.status("signal");
+    assert_eq!(status.state, MessengerState::Connected);
+    assert_eq!(status.account.as_deref(), Some(number.as_str()));
+    let turns: Vec<String> = host
+        .turns
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(_, t)| t.clone())
+        .collect();
+    assert_eq!(turns, [q1.clone(), q2.clone()]);
+    assert_eq!(
+        sends(),
+        [
+            json!({ "account": number, "recipient": [friend], "message": format!("reply to {q1}") }),
+            json!({ "account": number, "groupId": group, "message": format!("reply to {q2}") }),
+        ]
+    );
+    let refused: Vec<_> = status
+        .refused
+        .iter()
+        .map(|r| (r.chat.clone(), r.sender.clone()))
+        .collect();
+    assert_eq!(refused, [(group.clone(), Some(stranger))]);
+    // Subscribed for this account only.
+    let received = daemon.received.lock().unwrap().clone();
+    assert!(
+        received
+            .iter()
+            .any(|r| r["method"] == "subscribeReceive" && r["params"]["account"] == number)
+    );
+    stop.cancel();
+    supervisor.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn signal_keeps_early_messages_and_answers_none_twice_across_a_reconnect() {
+    let number = format!("+1555{}", 1_000_000 + std::process::id() % 1_000_000);
+    let friend = Id::new_v4().hyphenated().to_string();
+    let (q1, q2, q3) = (random(), random(), random());
+    let (dir, _credential, pairing, _anchor) = broker("https://unused.invalid", &random()).await;
+    let daemon = SignalDaemon {
+        accounts: vec![number.clone()],
+        hang_up_after: 2,
+        ..SignalDaemon::default()
+    };
+    let message = |timestamp, text: &String| {
+        signal_message(&number, &friend, timestamp, json!({ "message": text }))
+    };
+    // Sent before the subscription is confirmed.
+    daemon.early.lock().unwrap().push(message(1, &q1));
+    daemon.script.lock().unwrap().push(message(2, &q2));
+    // After the reconnect: an answered message again, then a new one.
+    daemon
+        .replay
+        .lock()
+        .unwrap()
+        .extend([message(2, &q2), message(3, &q3)]);
+    let endpoint = serve_signal(dir.path(), daemon.clone()).await;
+    let host = signal_host(&dir, pairing);
+    let entry = MessengerConfig {
+        enabled: true,
+        endpoint: Some(endpoint),
+        login: Some(number.clone()),
+        allowed_chats: BTreeSet::from([friend.clone()]),
+        allowed_users: BTreeSet::from([friend.clone()]),
+        model: Some(ModelKey {
+            provider: Id::new_v4(),
+            model: random(),
+        }),
+        ..MessengerConfig::new("signal".to_owned(), MessengerKind::Signal)
+    };
+    let (_desired, receiver) = watch::channel(vec![Desired {
+        config: entry,
+        run: true,
+    }]);
+    let stop = CancellationToken::new();
+    let supervisor = tokio::spawn(supervise(host.clone(), receiver, FAST, stop.clone()));
+    let sends = || -> Vec<Value> {
+        daemon
+            .received
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r["method"] == "send")
+            .map(|r| r["params"]["message"].clone())
+            .collect()
+    };
+    host.until(|_| sends().len() == 3).await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(daemon.hung_up.load(Ordering::SeqCst));
+    let turns: Vec<String> = host
+        .turns
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(_, t)| t.clone())
+        .collect();
+    assert_eq!(turns, [q1.clone(), q2.clone(), q3.clone()]);
+    assert_eq!(
+        sends(),
+        [q1, q2, q3].map(|q| json!(format!("reply to {q}")))
+    );
+    stop.cancel();
+    supervisor.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn signal_answers_what_a_failed_session_left_unhandled() {
+    let number = format!("+1555{}", 1_000_000 + std::process::id() % 1_000_000);
+    let friend = Id::new_v4().hyphenated().to_string();
+    let (q1, q2) = (random(), random());
+    let (dir, _credential, pairing, _anchor) = broker("https://unused.invalid", &random()).await;
+    // q2 arrives while q1's reply waits, which never gets an answer: the
+    // connection closes with q2 queued on it. signal-cli does not send q2
+    // again.
+    let daemon = SignalDaemon {
+        accounts: vec![number.clone()],
+        hang_up_after: 1,
+        unanswered: true,
+        ..SignalDaemon::default()
+    };
+    let message = |timestamp, text: &String| {
+        signal_message(&number, &friend, timestamp, json!({ "message": text }))
+    };
+    daemon.script.lock().unwrap().push(message(1, &q1));
+    daemon.on_hang_up.lock().unwrap().push(message(2, &q2));
+    daemon.replay.lock().unwrap().push(message(1, &q1));
+    let endpoint = serve_signal(dir.path(), daemon.clone()).await;
+    let host = signal_host(&dir, pairing);
+    let entry = MessengerConfig {
+        enabled: true,
+        endpoint: Some(endpoint),
+        login: Some(number.clone()),
+        allowed_chats: BTreeSet::from([friend.clone()]),
+        allowed_users: BTreeSet::from([friend.clone()]),
+        model: Some(ModelKey {
+            provider: Id::new_v4(),
+            model: random(),
+        }),
+        ..MessengerConfig::new("signal".to_owned(), MessengerKind::Signal)
+    };
+    let (_desired, receiver) = watch::channel(vec![Desired {
+        config: entry,
+        run: true,
+    }]);
+    let stop = CancellationToken::new();
+    let supervisor = tokio::spawn(supervise(host.clone(), receiver, FAST, stop.clone()));
+    let sends = || -> Vec<Value> {
+        daemon
+            .received
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r["method"] == "send")
+            .map(|r| r["params"]["message"].clone())
+            .collect()
+    };
+    host.until(|_| sends().len() == 3).await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    // q2, queued by the session that failed, is answered through the new
+    // one; q1, whose reply never went out, is answered when signal-cli
+    // delivers it again.
+    assert_eq!(
+        sends(),
+        [&q1, &q2, &q1].map(|q| json!(format!("reply to {q}")))
+    );
+    stop.cancel();
+    supervisor.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn signal_waits_for_the_user_when_the_daemon_does_not_serve_the_account() {
+    let (dir, _credential, pairing, _anchor) = broker("https://unused.invalid", &random()).await;
+    let daemon = SignalDaemon {
+        accounts: vec!["+15550000000".to_owned()],
+        ..SignalDaemon::default()
+    };
+    let endpoint = serve_signal(dir.path(), daemon.clone()).await;
+    let host = signal_host(&dir, pairing);
+    let number = format!("+1555{}", 2_000_000 + std::process::id() % 1_000_000);
+    let entry = MessengerConfig {
+        enabled: true,
+        endpoint: Some(endpoint),
+        login: Some(number.clone()),
+        ..MessengerConfig::new("signal".to_owned(), MessengerKind::Signal)
+    };
+    let (_desired, receiver) = watch::channel(vec![Desired {
+        config: entry,
+        run: true,
+    }]);
+    let stop = CancellationToken::new();
+    let supervisor = tokio::spawn(supervise(host.clone(), receiver, FAST, stop.clone()));
+    host.until(|h| h.status("signal").state == MessengerState::Failed)
+        .await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(host.connects("signal"), 1);
+    let failure = host.status("signal").failure.unwrap();
+    assert!(failure.message.contains(&number), "{failure:?}");
+    // Never subscribed to another account's messages.
+    assert!(
+        !daemon
+            .received
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|r| r["method"] == "subscribeReceive")
+    );
     stop.cancel();
     supervisor.await.unwrap();
 }
