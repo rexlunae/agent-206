@@ -507,7 +507,7 @@ messenger's own connection, which the tool does not share.
 ## Test messages
 
 To see where a messenger's posts arrive before a model uses it, the user
-sends "Test message from Agent 206." with **Send test message** on a
+sends "Test message from Agent 206." with **Send test message** on a ready
 webhook's card, or `agent206 messenger test NAME` (add `--chat CHAT` for an
 allowed chat of a connected messenger). It goes to the same destinations
 `send_message` offers, through the vault broker in the same way, and needs no
