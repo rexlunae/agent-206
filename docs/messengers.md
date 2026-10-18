@@ -483,7 +483,8 @@ agent206 messenger enable team-hook
 ## Posting to chats
 
 `send_message` also posts to the allowed chats of a running Telegram, Matrix,
-Discord, Slack or Beeper messenger, outside any turn of that chat. The
+Discord, Slack, IRC, Signal or Beeper messenger, outside any turn of that
+chat. The
 destination is `name/chat`, the entry's name and the chat's id as it is
 listed in `allowed_chats`; only chats of messengers that are enabled, not
 disconnected and connected right now are offered, so a messenger that failed
@@ -501,8 +502,17 @@ from the chat service; the user names the chat in the conversation. A failed
 post is reported in the tool's result in the conversation, not on the
 Messengers page, whose status for a chat messenger is its connection.
 
-IRC and Signal chats cannot be posted to yet: they send over the running
-messenger's own connection, which the tool does not share.
+IRC and Signal send over the running messenger's own connection, so their
+posts go through that session rather than a new connection, and only while it
+runs with the settings the post was checked against:
+
+- **IRC** posts each line of the message as one paced `PRIVMSG`, as a reply
+  is sent; a message that would take more than 24 lines is refused whole
+  rather than cut. A direct chat is reached only after its account wrote to
+  the bot since it connected, and each line follows a `WHOIS` check that the
+  nickname still belongs to that account; otherwise the post is refused.
+- **Signal** posts parts of at most 2000 characters, each one message,
+  through the user's signal-cli daemon.
 
 ## Test messages
 
@@ -542,9 +552,8 @@ participant cannot approve their own request.
 
 - WhatsApp, Google Chat and iMessage on their own (they are reached through
   Beeper), and Teams conversations (webhooks only post to a channel).
-- Posting to IRC and Signal chats with `send_message`, a test
-  send to a chat from the Messengers page (the CLI's `--chat` does it), and
-  webhook delivery of scheduled messages' replies.
+- A test send to a chat from the Messengers page (the CLI's `--chat` does
+  it), and webhook delivery of scheduled messages' replies.
 - Beeper attachments, reactions and replies to a specific message, the
   experimental WebSocket event stream, and remembering cursors across
   restarts.
