@@ -271,6 +271,7 @@ async fn protections_git_would_apply_refuse_a_switch() {
         "eol",
         "link",
         "no identity",
+        "reflog",
         "missing",
         "invalid",
     ] {
@@ -305,6 +306,12 @@ async fn protections_git_would_apply_refuse_a_switch() {
                 (None, HostErrorCode::Unsupported)
             }
             "no identity" => (None, HostErrorCode::Unsupported),
+            "reflog" => {
+                let log = root.join(".git/logs/HEAD");
+                std::fs::remove_file(&log).unwrap();
+                std::fs::create_dir(&log).unwrap();
+                (None, HostErrorCode::Io)
+            }
             "missing" => (Some(unique("missing")), HostErrorCode::NotFound),
             _ => (Some("-x".to_owned()), HostErrorCode::Invalid),
         };
@@ -349,4 +356,29 @@ async fn switching_needs_both_grants() {
     };
     assert!(made.current);
     assert_eq!(current(root).as_deref(), Some(main.as_str()));
+}
+
+#[tokio::test]
+async fn an_empty_folder_keeps_a_file_from_replacing_its_folder() {
+    let (dir, store) = store();
+    let root = &project(dir.path());
+    switchable(root, &[("a.txt", "one\n")]);
+    let (folder, _) = branch_with(root, &[("dir/t.txt", "tracked\n", EntryKind::Blob)]);
+    let mut host = switcher(&store, root);
+    let reply = host.handle(switch(&folder)).await;
+    assert!(matches!(reply, HostReply::Branch(_)), "{reply:?}");
+    let (file, _) = branch_with(root, &[("dir", "a file\n", EntryKind::Blob)]);
+    std::fs::create_dir(root.join("dir/empty")).unwrap();
+    let before = tree_files(root);
+    assert_eq!(
+        code(host.handle(switch(&file)).await),
+        Some(HostErrorCode::Conflict)
+    );
+    assert_eq!(tree_files(root), before);
+    assert_eq!(current(root).as_deref(), Some(folder.as_str()));
+    // Without it, the folder gives way to the file.
+    std::fs::remove_dir(root.join("dir/empty")).unwrap();
+    let reply = host.handle(switch(&file)).await;
+    assert!(matches!(reply, HostReply::Branch(_)), "{reply:?}");
+    assert_eq!(text(root, "dir").as_deref(), Some("a file\n"));
 }

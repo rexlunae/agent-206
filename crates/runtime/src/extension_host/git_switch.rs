@@ -150,6 +150,9 @@ pub(super) fn switch(
         }
     }
 
+    // Opened now, so a reflog that cannot be written refuses the switch
+    // before anything changes.
+    let mut head_log = open_head_log(&repo).map_err(|e| git_failure("switch", &e))?;
     // The last point at which the switch can stop with nothing changed.
     check(&interrupt)?;
     let removals = steps
@@ -230,40 +233,52 @@ pub(super) fn switch(
         .to_ref(&mut time)
         .to_owned()
         .map_err(|e| git_failure("switch", &e))?;
-    if let Err(error) = log_head(&repo, left, commit.id, &entry, &message) {
-        // HEAD has moved and the switch is done; only the record of the
-        // move for `git reflog` and `git switch -` is missing.
+    let line = log_line(&repo, left, commit.id, &entry, &message);
+    if let Err(error) = line.and_then(|line| {
+        use std::io::Write;
+        head_log.write_all(&line)
+    }) {
         tracing::warn!(
             error = &error as &dyn std::error::Error,
             "could not record the branch switch in HEAD's reflog"
         );
+        return Err(failure(
+            HostErrorCode::Io,
+            &format!(
+                "switched to {name}, but HEAD's reflog could not record the move, \
+                 so `git switch -` will not return to {from}"
+            ),
+        ));
     }
     tracing::info!(commit = %reply.commit, "extension switched git branch");
     Ok(HostReply::Branch(reply))
 }
 
-/// Append the line git writes to HEAD's reflog on a checkout.
-fn log_head(
+/// HEAD's reflog, opened to append the line git writes on a checkout.
+fn open_head_log(repo: &gix::Repository) -> std::io::Result<std::fs::File> {
+    let logs = repo.git_dir().join("logs");
+    std::fs::create_dir_all(&logs)?;
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(logs.join("HEAD"))
+}
+
+/// The line git appends to HEAD's reflog on a checkout.
+fn log_line(
     repo: &gix::Repository,
     left: Option<ObjectId>,
     now: ObjectId,
     signature: &gix::actor::Signature,
     message: &str,
-) -> std::io::Result<()> {
-    use std::io::Write;
+) -> std::io::Result<Vec<u8>> {
     let left = left.unwrap_or_else(|| ObjectId::null(repo.object_hash()));
     let mut line = format!("{left} {now} ").into_bytes();
     signature.write_to(&mut line)?;
     line.push(b'\t');
     line.extend_from_slice(message.as_bytes());
     line.push(b'\n');
-    let logs = repo.git_dir().join("logs");
-    std::fs::create_dir_all(&logs)?;
-    std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(logs.join("HEAD"))?
-        .write_all(&line)
+    Ok(line)
 }
 
 /// Whether git would convert line endings when writing files out.
@@ -321,6 +336,7 @@ fn plan(
 ) -> Result<Vec<(String, Step)>, HostFailure> {
     let (old, new) = (index.entries(), next.entries());
     let mut steps = Vec::new();
+    let mut changed = 0usize;
     let mut kept = Vec::new();
     let mut bytes = 0u64;
     let (mut i, mut j) = (0, 0);
@@ -369,12 +385,13 @@ fn plan(
             .to_str()
             .map_err(|_| unsupported("a changed path is not UTF-8"))?
             .to_owned();
-        if steps.len() == MAX_SWITCH_FILES {
+        if changed == MAX_SWITCH_FILES {
             return Err(failure(
                 HostErrorCode::TooLarge,
                 "the switch changes more than 1,000 files; switch with git itself",
             ));
         }
+        changed += 1;
         let mut read = |id: ObjectId| -> Result<Vec<u8>, HostFailure> {
             let size = repo
                 .find_header(id)

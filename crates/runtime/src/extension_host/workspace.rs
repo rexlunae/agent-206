@@ -1236,8 +1236,8 @@ pub(super) fn in_the_way(
     }
 }
 
-/// Whether the directory at `path` holds only paths in `leaving`, so
-/// removing them empties it. Its walk reads at most [`MAX_ENTRIES`] entries;
+/// Whether the directory at `path` holds only paths in `leaving`, and no
+/// empty folder, so removing them removes it. Its walk reads at most [`MAX_ENTRIES`] entries;
 /// a larger one counts as holding something else.
 fn only_leaving(
     workspace: &Dir,
@@ -1247,7 +1247,9 @@ fn only_leaving(
     let mut pending = vec![path.to_owned()];
     let mut seen = 0usize;
     while let Some(directory) = pending.pop() {
+        let mut empty = true;
         for entry in workspace.read_dir(&directory).map_err(|e| io_failure(&e))? {
+            empty = false;
             let entry = entry.map_err(|e| io_failure(&e))?;
             seen += 1;
             let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
@@ -1263,6 +1265,11 @@ fn only_leaving(
             } else if !leaving.contains(below.as_str()) {
                 return Ok(false);
             }
+        }
+        // Removing files prunes only the folders they were in, so an empty
+        // folder would stay and keep the file out.
+        if empty {
+            return Ok(false);
         }
     }
     Ok(true)

@@ -362,7 +362,7 @@ branch: the working tree and the index change to the branch's commit, then
 needs both `git_write` and `write_workspace`, since it rewrites project files.
 Nothing is carried over: any staged or unstaged change to a tracked file
 refuses the switch as `conflict`, as does an untracked or ignored file (or a
-folder holding one) where the branch has a file. Untracked files elsewhere
+folder holding one, or an empty folder) where the branch has a file. Untracked files elsewhere
 stay. Files the branch does not change keep their index data, so git does
 not read them again. These are `unsupported`: a `post-checkout` or
 `reference-transaction` hook; `core.autocrlf` or `core.eol=crlf`; a changed
@@ -370,7 +370,7 @@ file that the branch's attributes give a `filter`, `ident`,
 `working-tree-encoding` or `eol=crlf`; submodules; a symbolic link the
 branch would create; a sparse checkout; a bare repository; and a merge,
 rebase or similar in progress. `user.name` and `user.email` are required for
-the reflog. Every check is made before the first file changes. If writing a
+the reflog, and a reflog that cannot be opened refuses the switch as `io`. Every check is made before the first file changes. If writing a
 file then fails, the call fails naming that file and saying that the index
 and `HEAD` still name the previous branch.
 
