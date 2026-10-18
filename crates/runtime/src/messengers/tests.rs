@@ -262,8 +262,17 @@ struct Recorder {
     /// How many times each messenger started connecting.
     connects: Arc<Mutex<BTreeMap<String, u32>>>,
     changed: Arc<tokio::sync::Notify>,
+    /// Sessions offered to `send_message`, by messenger.
+    posters: Arc<Mutex<BTreeMap<String, Poster>>>,
 }
 impl Host for Recorder {
+    fn post_through(&self, name: &str, poster: Option<Poster>) {
+        let mut posters = self.posters.lock().unwrap();
+        match poster {
+            Some(poster) => posters.insert(name.to_owned(), poster),
+            None => posters.remove(name),
+        };
+    }
     fn root(&self) -> PathBuf {
         self.root.clone()
     }
@@ -397,6 +406,7 @@ async fn setup(
         statuses: Arc::default(),
         connects: Arc::default(),
         changed: Arc::default(),
+        posters: Arc::default(),
     };
     (bot, origin, dir, credential, host, anchor)
 }
@@ -841,6 +851,7 @@ async fn matrix_setup() -> (
         statuses: Arc::default(),
         connects: Arc::default(),
         changed: Arc::default(),
+        posters: Arc::default(),
     };
     (server, origin, dir, credential, host, anchor)
 }
@@ -1457,6 +1468,7 @@ async fn discord_setup() -> (
         statuses: Arc::default(),
         connects: Arc::default(),
         changed: Arc::default(),
+        posters: Arc::default(),
     };
     (api, origin, dir, credential, host, anchor)
 }
@@ -1753,6 +1765,7 @@ async fn slack_setup(
         statuses: Arc::default(),
         connects: Arc::default(),
         changed: Arc::default(),
+        posters: Arc::default(),
     };
     let config = MessengerConfig {
         kind: MessengerKind::Slack,
@@ -2077,6 +2090,7 @@ async fn irc_answers_signed_in_people_and_checks_nicknames_before_direct_replies
         statuses: Arc::default(),
         connects: Arc::default(),
         changed: Arc::default(),
+        posters: Arc::default(),
     };
     let entry = MessengerConfig {
         kind: MessengerKind::Irc,
@@ -2185,6 +2199,7 @@ async fn irc_without_a_login_waits_for_the_user() {
         statuses: Arc::default(),
         connects: Arc::default(),
         changed: Arc::default(),
+        posters: Arc::default(),
     };
     let entry = MessengerConfig {
         kind: MessengerKind::Irc,
@@ -2338,6 +2353,7 @@ fn signal_host(dir: &tempfile::TempDir, pairing: BrokerPairing) -> Recorder {
         statuses: Arc::default(),
         connects: Arc::default(),
         changed: Arc::default(),
+        posters: Arc::default(),
     }
 }
 
@@ -2848,6 +2864,7 @@ async fn beeper_setup() -> (
         statuses: Arc::default(),
         connects: Arc::default(),
         changed: Arc::default(),
+        posters: Arc::default(),
     };
     (desktop, origin, dir, credential, host, anchor)
 }
@@ -3081,4 +3098,198 @@ async fn beeper_finds_allowed_chats_behind_busy_lists_and_new_chats_and_rechecks
     // Every message the new chat held is answered once, in order.
     let replies: Vec<_> = first.iter().map(|t| format!("reply to {t}")).collect();
     assert_eq!(to(&later), replies);
+}
+
+impl Recorder {
+    fn poster(&self, name: &str) -> Option<Poster> {
+        self.posters.lock().unwrap().get(name).cloned()
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn irc_posts_go_out_on_the_running_session_line_by_line() {
+    let nickname = || format!("n{}", &random().replace('-', "")[..10]);
+    let (login, friend, friend_nick, absent) = (nickname(), nickname(), nickname(), nickname());
+    let channel = format!("#{}", nickname());
+    let server = IrcServer {
+        password: random(),
+        channels: 1,
+        ..IrcServer::default()
+    };
+    let question = random();
+    server.script.lock().unwrap().push(format!(
+        "@account={friend} :{friend_nick}!u@h PRIVMSG {{nick}} :{question}"
+    ));
+    server
+        .accounts
+        .lock()
+        .unwrap()
+        .insert(friend_nick.clone(), VecDeque::from([friend.clone()]));
+    let origin = serve_irc(server.clone()).await;
+    let (dir, credential, pairing, _anchor) = broker(&origin, &server.password).await;
+    let host = signal_host(&dir, pairing);
+    let entry = MessengerConfig {
+        kind: MessengerKind::Irc,
+        login: Some(login.clone()),
+        allowed_chats: BTreeSet::from([channel.clone(), friend.clone(), absent.clone()]),
+        allowed_users: BTreeSet::from([friend.clone(), absent.clone()]),
+        ..config("irc", &origin, &credential, 0)
+    };
+    let (_desired, receiver) = watch::channel(vec![Desired {
+        config: entry.clone(),
+        run: true,
+    }]);
+    let stop = CancellationToken::new();
+    let supervisor = tokio::spawn(supervise(host.clone(), receiver, FAST, stop.clone()));
+    let privmsgs = |target: &str| -> Vec<String> {
+        let prefix = format!("PRIVMSG {target} :");
+        server
+            .received
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|l| l.strip_prefix(&prefix).map(str::to_owned))
+            .collect()
+    };
+    // The friend's message tells the session which nickname they use.
+    host.until(|h| {
+        h.poster("irc").is_some() && privmsgs(&friend_nick) == [format!("reply to {question}")]
+    })
+    .await;
+    let poster = host.poster("irc").unwrap();
+    assert_eq!(poster.config(), &entry);
+    let (first, second) = (random(), random());
+    let text = format!("{first}\n\n\u{7}{second}\n");
+    assert_eq!(
+        post_through(&poster, &channel, &text, || false)
+            .await
+            .unwrap(),
+        2
+    );
+    // Sent lines reach the server through the broker shortly after.
+    host.until(|_| privmsgs(&channel) == [first.clone(), second.clone()])
+        .await;
+    // A direct chat's lines each follow a check of the nickname.
+    assert_eq!(
+        post_through(&poster, &friend, &first, || false)
+            .await
+            .unwrap(),
+        1
+    );
+    host.until(|_| privmsgs(&friend_nick)[1..] == [first.clone()])
+        .await;
+    let whois = format!("WHOIS {friend_nick}");
+    assert!(server.received.lock().unwrap().contains(&whois));
+    // An account that has not written during this session cannot be found.
+    assert!(matches!(
+        post_through(&poster, &absent, &first, || false).await,
+        Err(MessengerError::RecipientGone { .. })
+    ));
+    // Too long to send whole: nothing goes out.
+    let long = (0..=irc::MAX_REPLY_LINES)
+        .map(|_| random())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(matches!(
+        post_through(&poster, &channel, &long, || false).await,
+        Err(MessengerError::TooManyLines { .. })
+    ));
+    assert_eq!(privmsgs(&channel).len(), 2);
+    // Withdrawn after the first line: the rest stays unsent.
+    let asked = std::sync::atomic::AtomicUsize::new(0);
+    let withdrawn = || asked.fetch_add(1, Ordering::SeqCst) > 0;
+    assert!(matches!(
+        post_through(&poster, &channel, &text, withdrawn).await,
+        Err(MessengerError::PartlySent {
+            sent: 1,
+            total: 2,
+            ..
+        })
+    ));
+    host.until(|_| privmsgs(&channel).len() == 3).await;
+    assert_eq!(privmsgs(&channel), [first.clone(), second, first]);
+    // Stopping the messenger withdraws its session.
+    stop.cancel();
+    supervisor.await.unwrap();
+    assert!(host.poster("irc").is_none());
+    assert!(matches!(
+        post_through(&poster, &channel, &random(), || false).await,
+        Err(MessengerError::SocketEnded { .. })
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn signal_posts_go_out_through_the_daemon_session_in_parts() {
+    use base64::Engine;
+    let number = format!("+1555{}", 1_000_000 + std::process::id() % 1_000_000);
+    let friend = Id::new_v4().hyphenated().to_string();
+    let group = base64::engine::general_purpose::STANDARD.encode(Id::new_v4().as_bytes().repeat(2));
+    let (dir, _credential, pairing, _anchor) = broker("https://unused.invalid", &random()).await;
+    let daemon = SignalDaemon {
+        accounts: vec![number.clone()],
+        ..SignalDaemon::default()
+    };
+    let endpoint = serve_signal(dir.path(), daemon.clone()).await;
+    let host = signal_host(&dir, pairing);
+    let entry = MessengerConfig {
+        enabled: true,
+        endpoint: Some(endpoint),
+        login: Some(number.clone()),
+        allowed_chats: BTreeSet::from([friend.clone(), group.clone()]),
+        ..MessengerConfig::new("signal".to_owned(), MessengerKind::Signal)
+    };
+    let (_desired, receiver) = watch::channel(vec![Desired {
+        config: entry.clone(),
+        run: true,
+    }]);
+    let stop = CancellationToken::new();
+    let supervisor = tokio::spawn(supervise(host.clone(), receiver, FAST, stop.clone()));
+    host.until(|h| {
+        h.poster("signal").is_some() && h.status("signal").state == MessengerState::Connected
+    })
+    .await;
+    let sends = || -> Vec<Value> {
+        daemon
+            .received
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r["method"] == "send")
+            .map(|r| r["params"].clone())
+            .collect()
+    };
+    let poster = host.poster("signal").unwrap();
+    assert_eq!(poster.config(), &entry);
+    let first = "a".repeat(signal::MAX_MESSAGE);
+    let rest = random();
+    let sent = post_through(&poster, &group, &format!("{first}{rest}"), || false).await;
+    assert_eq!(sent.unwrap(), 2);
+    let direct = random();
+    assert_eq!(
+        post_through(&poster, &friend, &direct, || false)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        sends(),
+        [
+            json!({ "account": number, "groupId": group, "message": first }),
+            json!({ "account": number, "groupId": group, "message": rest }),
+            json!({ "account": number, "recipient": [friend], "message": direct }),
+        ]
+    );
+    let long = "a".repeat(signal::MAX_MESSAGE * MAX_SENT_PARTS + 1);
+    assert!(matches!(
+        post_through(&poster, &group, &long, || false).await,
+        Err(MessengerError::MessageTooLong { .. })
+    ));
+    assert_eq!(sends().len(), 3);
+    stop.cancel();
+    supervisor.await.unwrap();
+    assert!(host.poster("signal").is_none());
+    assert!(matches!(
+        post_through(&poster, &group, &random(), || false).await,
+        Err(MessengerError::SocketEnded { .. })
+    ));
 }

@@ -738,3 +738,118 @@ async fn a_webhook_disconnected_while_a_message_goes_out_stays_stopped() {
     assert_eq!(hooks.received.lock().unwrap().len(), 1);
     settled(MessengerState::Stopped).await;
 }
+
+/// A signal-cli daemon serving `account` on a Unix socket in `dir`; the
+/// `send` params it received.
+async fn serve_signal(dir: &std::path::Path, account: String) -> (String, Received) {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let path = dir.join(format!("{}.sock", &nonce()[..8]));
+    let listener = tokio::net::UnixListener::bind(&path).unwrap();
+    let received = Received::default();
+    let sends = received.clone();
+    // Detached: the daemon lives as long as the test's runtime.
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (account, sends) = (account.clone(), sends.clone());
+            // Detached: one connection, ended by the gateway or the runtime.
+            tokio::spawn(async move {
+                let (reader, mut writer) = stream.into_split();
+                let mut lines = BufReader::new(reader).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    let request: Value = serde_json::from_str(&line).unwrap();
+                    let result = match request["method"].as_str() {
+                        Some("listAccounts") => json!([{ "number": account }]),
+                        Some("subscribeReceive") => json!(0),
+                        Some("send") => {
+                            sends
+                                .lock()
+                                .unwrap()
+                                .push((account.clone(), request["params"].clone()));
+                            json!({ "timestamp": 1 })
+                        }
+                        method => panic!("unexpected request {method:?}"),
+                    };
+                    let reply = json!({ "jsonrpc": "2.0", "id": request["id"], "result": result });
+                    let mut line = serde_json::to_vec(&reply).unwrap();
+                    line.push(b'\n');
+                    if writer.write_all(&line).await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    (format!("unix://{}", path.display()), received)
+}
+
+#[tokio::test]
+async fn a_test_send_reaches_a_signal_group_through_the_running_session() {
+    use base64::Engine;
+    let (state, _credential, pairing) = broker("https://unused.invalid", &nonce()).await;
+    let account = format!("+1555{}", 1_000_000 + std::process::id() % 1_000_000);
+    let (endpoint, sends) = serve_signal(state.path(), account.clone()).await;
+    let group = base64::engine::general_purpose::STANDARD.encode(Id::new_v4().as_bytes().repeat(2));
+    let name = format!("s-{}", nonce());
+    let gateway = Gateway::open(state.path()).unwrap();
+    let mut settings = gateway.snapshot().unwrap().settings;
+    settings.messengers.push(MessengerConfig {
+        enabled: true,
+        endpoint: Some(endpoint),
+        login: Some(account.clone()),
+        allowed_chats: [group.clone()].into(),
+        ..MessengerConfig::new(name.clone(), MessengerKind::Signal)
+    });
+    assert_eq!(
+        request(&gateway, Command::SaveSettings(Box::new(settings))).await,
+        Reply::Ok
+    );
+    assert_eq!(
+        request(&gateway, Command::PairBroker { pairing }).await,
+        Reply::Ok
+    );
+    let supervisor = gateway.clone();
+    // Detached: the messengers run as long as the test's runtime.
+    tokio::spawn(async move { supervisor.supervise_messengers().await });
+    tokio::time::timeout(PATIENCE, async {
+        while gateway.snapshot().unwrap().messengers[0].state != MessengerState::Connected {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(wait("the messenger to connect"));
+    let destination = format!("{name}/{group}");
+    assert_eq!(
+        request(
+            &gateway,
+            Command::SendTestMessage {
+                destination: destination.clone()
+            }
+        )
+        .await,
+        Reply::Ok
+    );
+    let delivered = sends.lock().unwrap().clone();
+    let [(_, params)] = delivered.as_slice() else {
+        panic!("one message: {delivered:?}");
+    };
+    assert_eq!(
+        params,
+        &json!({ "account": account, "groupId": group, "message": messengers::TEST_MESSAGE })
+    );
+
+    // A chat that is not allowed, or a messenger the user disconnected, is
+    // refused and nothing more is sent.
+    let refused = |reply: Reply| match reply {
+        Reply::Error(report) => assert_eq!(report.kind, ErrorKind::NotFound, "{report:?}"),
+        reply => panic!("expected a refusal: {reply:?}"),
+    };
+    let other = format!("{name}/{}", nonce());
+    refused(request(&gateway, Command::SendTestMessage { destination: other }).await);
+    assert_eq!(
+        request(&gateway, Command::DisconnectMessenger { name }).await,
+        Reply::Ok
+    );
+    refused(request(&gateway, Command::SendTestMessage { destination }).await);
+    assert_eq!(sends.lock().unwrap().len(), 1);
+}
