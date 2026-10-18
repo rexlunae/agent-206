@@ -250,6 +250,7 @@ impl Classified for a206_broker::BrokerError {
     fn kind(&self) -> Option<ErrorKind> {
         use a206_broker::{BrokerError as B, UpstreamFailure as U};
         Some(match self {
+            B::ImportFailure(report) => report.kind,
             B::Locked | B::NoVault | B::LockedOut { .. } | B::GatewayNotPaired => {
                 ErrorKind::Unavailable
             }

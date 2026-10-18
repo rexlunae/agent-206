@@ -419,6 +419,8 @@ pub struct BrokerStatus {
 /// is flattened to a string before it reaches the client or tracing.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
 pub enum BrokerError {
+    #[error("vault import failed")]
+    ImportFailure(#[source] a206_core::ErrorReport),
     #[error("vault import review is unavailable; preview the source again")]
     ImportReviewUnavailable,
     #[error("source vault changed; preview it again before importing")]

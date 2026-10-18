@@ -78,6 +78,11 @@ pub fn code(error: &BrokerError) -> wire::Code {
 }
 pub fn reply(result: Result<Reply, BrokerError>) -> wire::Reply {
     match result {
+        Ok(Reply::Error(BrokerError::ImportFailure(report)))
+        | Err(BrokerError::ImportFailure(report)) => wire::Reply::Error(wire::Failure {
+            code: wire::Code::Other,
+            report,
+        }),
         Ok(Reply::Ok) => wire::Reply::Ok,
         Ok(Reply::VaultImportReview(review)) => wire::Reply::VaultImportReview(review),
         Ok(Reply::VaultImportApplied(applied)) => wire::Reply::VaultImportApplied(applied),

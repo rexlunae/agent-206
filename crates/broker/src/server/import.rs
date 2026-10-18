@@ -5,6 +5,28 @@ use a206_vault_channel::{IMPORT_REVIEW_VERSION, ImportReview};
 use std::path::PathBuf;
 mod receipt;
 
+// New reviewed operations retain storage and partial-copy causes at the wire
+// boundary. Authentication failures remain deliberately opaque.
+fn failure(error: VaultError, id: uuid::Uuid) -> BrokerError {
+    use a206_core::{ErrorKind, ErrorReport};
+    if !matches!(
+        error,
+        VaultError::ImportSource(_) | VaultError::Io(_) | VaultError::ImportLeftInPlace(_)
+    ) {
+        return vault_error(error);
+    }
+    tracing::warn!(error = &error as &dyn std::error::Error, import = %id, "vault import failed");
+    BrokerError::ImportFailure(
+        ErrorReport::capture(&error, |link| {
+            link.downcast_ref::<VaultError>().map(|error| match error {
+                VaultError::ImportSource(_) => ErrorKind::InvalidRequest,
+                _ => ErrorKind::Storage,
+            })
+        })
+        .with_correlation(id),
+    )
+}
+
 pub(super) fn version(session: &Session, version: u16) -> Result<(), BrokerError> {
     if session.version < REVIEWED_IMPORT_VERSION || version != IMPORT_REVIEW_VERSION {
         return Err(BrokerError::Invalid(InvalidRequest::UnsupportedVersion));
@@ -21,10 +43,14 @@ pub(super) fn review(shared: &Shared, session: &mut Session, path: PathBuf) -> H
     // A new attempt invalidates the previous review, even if reading fails.
     session.import_review = None;
     source(&path)?;
-    let identity = shared.vault().review_import(&path).map_err(vault_error)?;
+    let id = uuid::Uuid::new_v4();
+    let identity = shared
+        .vault()
+        .review_import(&path)
+        .map_err(|error| failure(error, id))?;
     let review = ImportReview {
         version: IMPORT_REVIEW_VERSION,
-        id: uuid::Uuid::new_v4(),
+        id,
         source: path,
         bytes: identity.bytes,
         sha256: identity.sha256,
@@ -78,7 +104,10 @@ pub(super) fn apply(
         }
         Err(ReviewedImportError::Vault(error)) => {
             session.import_review = None;
-            return Err(vault_error(error));
+            return Err(match &review {
+                Some(review) => failure(error, review.id),
+                None => vault_error(error),
+            });
         }
     }
     session.import_review = None;
@@ -92,5 +121,42 @@ pub(super) fn apply(
             review,
         )))),
         None => ok(), // Legacy clients retain their original reply contract.
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn partial_copy_failure_keeps_cause_and_correlation_on_both_wires() {
+        let id = uuid::Uuid::new_v4();
+        let error = failure(
+            VaultError::ImportLeftInPlace(std::io::Error::from(
+                std::io::ErrorKind::PermissionDenied,
+            )),
+            id,
+        );
+        let bytes = a206_protocol::encode(&error).unwrap();
+        let native: BrokerError = a206_protocol::Decoder::default()
+            .feed(&bytes)
+            .unwrap()
+            .remove(0);
+        assert_eq!(native, error);
+        let BrokerError::ImportFailure(report) = &native else {
+            panic!("missing import failure")
+        };
+        assert!(report.message.contains("imported vault is in place"));
+        assert_eq!(report.kind, a206_core::ErrorKind::Storage);
+        assert_eq!(report.correlation, Some(id));
+        assert_eq!(
+            report.source.as_ref().unwrap().kind,
+            a206_core::ErrorKind::PermissionDenied
+        );
+        let a206_vault_channel::Reply::Error(encrypted) =
+            crate::channel::reply(Err(native.clone()))
+        else {
+            panic!("missing encrypted failure")
+        };
+        assert_eq!(&encrypted.report, report);
     }
 }
