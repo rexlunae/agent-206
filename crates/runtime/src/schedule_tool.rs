@@ -319,6 +319,7 @@ fn describe(job: &Job, thread: Id) -> Value {
             JobOutcome::Failed => json!("failed"),
             JobOutcome::Cancelled => json!("cancelled"),
             JobOutcome::Quiet => json!("quiet"),
+            JobOutcome::Unrecorded => json!("unrecorded"),
             JobOutcome::Refused(report) => json!({ "refused": report.message }),
         };
         json!({ "at": time(run.at), "outcome": outcome })

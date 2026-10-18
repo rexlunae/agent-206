@@ -320,3 +320,135 @@ fn a_heartbeat_is_quiet_by_its_reply_even_when_steering_follows_it() {
         JobOutcome::Failed
     );
 }
+
+fn runs(reply: Reply) -> Vec<JobRun> {
+    match reply {
+        Reply::JobRuns(runs) => runs,
+        other => panic!("expected a job's runs, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_jobs_runs_are_kept_newest_first_and_go_with_it() {
+    let state = tempfile::tempdir().unwrap();
+    let id = {
+        let g = Gateway::open(state.path()).unwrap();
+        let thread = thread(&g).await;
+        let Reply::Job(created) = schedule(&g, thread, every(schedule::MIN_INTERVAL)).await else {
+            panic!("job scheduled");
+        };
+        assert!(runs(send(&g, Command::JobRuns { id: created.id }).await).is_empty());
+        let mut started = vec![];
+        for _ in 0..3 {
+            let Reply::Job(ran) = send(&g, Command::RunJob { id: created.id }).await else {
+                panic!("job ran");
+            };
+            started.push(ran.last.unwrap().id);
+            ended(&g, created.id).await;
+        }
+        let history = runs(send(&g, Command::JobRuns { id: created.id }).await);
+        started.reverse();
+        assert_eq!(history.iter().map(|r| r.id).collect::<Vec<_>>(), started);
+        // This thread has no model, so each run was refused, and ended.
+        assert!(
+            history
+                .iter()
+                .all(|r| matches!(r.outcome, JobOutcome::Refused(_))
+                    && r.ended.is_some_and(|ended| ended >= r.at))
+        );
+        created.id
+    };
+    // The history survives a restart.
+    let g = Gateway::open(state.path()).unwrap();
+    assert_eq!(runs(send(&g, Command::JobRuns { id }).await).len(), 3);
+    assert_eq!(send(&g, Command::RemoveJob { id }).await, Reply::Ok);
+    assert_eq!(
+        kind(send(&g, Command::JobRuns { id }).await),
+        ErrorKind::NotFound
+    );
+    assert!(g.lock().unwrap().job_runs(id).unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn the_history_keeps_a_bounded_number_of_runs_and_settles_earlier_ones() {
+    let state = tempfile::tempdir().unwrap();
+    let g = Gateway::open(state.path()).unwrap();
+    let thread = thread(&g).await;
+    let Reply::Job(created) = schedule(&g, thread, every(schedule::MIN_INTERVAL)).await else {
+        panic!("job scheduled");
+    };
+    let at = arbitrary();
+    let start = |run: &JobRun| {
+        let mut store = g.lock().unwrap();
+        job_mut(&mut store.state, created.id).unwrap().last = Some(run.clone());
+        store
+            .persist(Some(EventKind::JobChanged { id: created.id }))
+            .unwrap();
+    };
+    let first = JobRun::start(at);
+    start(&first);
+    // A newer run starts before the first one ends.
+    let second = JobRun::start(at);
+    start(&second);
+    let revision = job(&g, created.id).history;
+    g.finish_job(created.id, first.id, JobOutcome::Failed)
+        .unwrap();
+    // Clients showing the history learn that it changed.
+    assert_ne!(job(&g, created.id).history, revision);
+    let history = g.lock().unwrap().job_runs(created.id).unwrap();
+    assert_eq!(history[0], second, "the latest run is still running");
+    assert_eq!(history[1].id, first.id);
+    assert_eq!(history[1].outcome, JobOutcome::Failed);
+    assert!(history[1].ended.is_some());
+
+    let extra = 1 + arbitrary() as usize % 8;
+    let mut newest = vec![];
+    for _ in 0..a206_core::schedule::MAX_JOB_RUNS + extra {
+        let run = JobRun::start(at);
+        start(&run);
+        newest.push(run.id);
+    }
+    newest.reverse();
+    newest.truncate(a206_core::schedule::MAX_JOB_RUNS);
+    let kept: Vec<Id> = runs(send(&g, Command::JobRuns { id: created.id }).await)
+        .into_iter()
+        .map(|r| r.id)
+        .collect();
+    assert_eq!(kept, newest);
+}
+
+#[tokio::test]
+async fn runs_still_going_at_a_restart_end_unrecorded_in_the_history() {
+    let state = tempfile::tempdir().unwrap();
+    let (id, first, second) = {
+        let g = Gateway::open(state.path()).unwrap();
+        let thread = thread(&g).await;
+        let Reply::Job(created) = schedule(&g, thread, every(schedule::MIN_INTERVAL)).await else {
+            panic!("job scheduled");
+        };
+        let at = arbitrary();
+        let (first, second) = (JobRun::start(at), JobRun::start(at));
+        for run in [&first, &second] {
+            let mut store = g.lock().unwrap();
+            job_mut(&mut store.state, created.id).unwrap().last = Some(run.clone());
+            store
+                .persist(Some(EventKind::JobChanged { id: created.id }))
+                .unwrap();
+        }
+        // Both are still going: the earlier one only in the history.
+        let history = g.lock().unwrap().job_runs(created.id).unwrap();
+        assert!(history.iter().all(|r| r.outcome == JobOutcome::Running));
+        (created.id, first.id, second.id)
+    };
+    let g = Gateway::open(state.path()).unwrap();
+    let history = runs(send(&g, Command::JobRuns { id }).await);
+    assert_eq!(history[1].id, first);
+    assert_eq!(history[1].outcome, JobOutcome::Unrecorded);
+    // The latest is settled from its conversation, as `Job::last` is.
+    assert_eq!(history[0].id, second);
+    assert_eq!(Some(&history[0]), job(&g, id).last.as_ref());
+    assert!(!matches!(
+        history[0].outcome,
+        JobOutcome::Running | JobOutcome::Unrecorded
+    ));
+}

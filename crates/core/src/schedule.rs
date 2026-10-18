@@ -96,6 +96,10 @@ pub enum JobOutcome {
     /// The gateway did not run the message, for example because the
     /// conversation was busy or had no model.
     Refused(ErrorReport),
+    /// The gateway stopped before it saw how this run ended. Only an earlier
+    /// run in a job's history ends this way; restart recovery settles the
+    /// latest run from its conversation.
+    Unrecorded,
 }
 
 /// One run of a job.
@@ -108,6 +112,10 @@ pub struct JobRun {
     /// Unix seconds.
     pub at: u64,
     pub outcome: JobOutcome,
+    /// When the run ended, in Unix seconds; `None` while it runs, and for a
+    /// run whose end the gateway did not see (it was stopped meanwhile).
+    #[serde(default)]
+    pub ended: Option<u64>,
 }
 impl JobRun {
     /// A run starting at `at`.
@@ -116,9 +124,13 @@ impl JobRun {
             id: Id::new_v4(),
             at,
             outcome: JobOutcome::Running,
+            ended: None,
         }
     }
 }
+
+/// Most runs of one job the gateway keeps in its history.
+pub const MAX_JOB_RUNS: usize = 50;
 
 /// A message the gateway sends to `thread` on `schedule`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -141,6 +153,11 @@ pub struct Job {
     pub last: Option<JobRun>,
     #[serde(default)]
     pub author: JobAuthor,
+    /// Changes when an earlier run, no longer `last`, ends in the run
+    /// history, so a client showing the history reloads it. `last` covers
+    /// every other change.
+    #[serde(default)]
+    pub history: u64,
 }
 
 /// Why a time or interval someone typed for a schedule cannot be used.
