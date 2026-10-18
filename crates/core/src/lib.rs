@@ -1924,7 +1924,7 @@ mod tests {
         thread.usage_total.record(
             Id::new_v4(),
             &Usage {
-                input_tokens: Some(1),
+                input_tokens: Some(Id::new_v4().as_u128() as u64 % 10_000 + 1),
                 output_tokens: None,
                 cost: None,
             },
