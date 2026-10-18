@@ -827,6 +827,7 @@ impl Gateway {
                 signature: streamed.signature,
                 reduction: None,
                 redactions: Vec::new(),
+                injection: Vec::new(),
             };
             let usable = match parsed {
                 Err(error) => {
@@ -1065,8 +1066,10 @@ impl Gateway {
             } else {
                 text
             };
+            let (text, injection) = scan_output(&record.tool, text);
             record.redactions = redactions;
             record.reduction = reduction;
+            record.injection = injection;
             text
         };
         self.update_call(
@@ -1275,6 +1278,29 @@ fn redact_output(tool: &str, text: String) -> (String, Vec<OutputCount>) {
     (redacted.text, found)
 }
 
+/// A tool result without hidden characters, and the kinds of text in it
+/// that read as instructions to the model. The rest of the text is kept;
+/// the model is told where it came from when it reads the result.
+fn scan_output(tool: &str, text: String) -> (String, Vec<OutputCount>) {
+    let Some(scanned) = a206_injection_scan::scan(&text) else {
+        return (text, Vec::new());
+    };
+    let found: Vec<_> = scanned
+        .found
+        .into_iter()
+        .map(|found| OutputCount {
+            name: found.kind.to_owned(),
+            count: found.count,
+        })
+        .collect();
+    tracing::info!(
+        tool,
+        kinds = ?found.iter().map(|count| count.name.as_str()).collect::<Vec<_>>(),
+        "tool result contains text addressed to the model"
+    );
+    (scanned.text, found)
+}
+
 /// Add `more` to `counts`, keeping one entry per name in name order.
 fn merge_counts(counts: &mut Vec<OutputCount>, more: Vec<OutputCount>) {
     for count in more {
@@ -1291,8 +1317,10 @@ fn merge_counts(counts: &mut Vec<OutputCount>, more: Vec<OutputCount>) {
 fn redact_failure(record: &mut ToolCall) {
     if let Some(output) = record.output.take() {
         let (output, redactions) = redact_output(&record.tool, output);
+        let (output, injection) = scan_output(&record.tool, output);
         record.output = Some(output);
         record.redactions = redactions;
+        record.injection = injection;
     }
     let mut link = record.error.as_mut();
     while let Some(report) = link {
@@ -1441,6 +1469,7 @@ mod output_tests {
             signature: None,
             reduction: None,
             redactions: Vec::new(),
+            injection: Vec::new(),
         }
     }
     #[test]

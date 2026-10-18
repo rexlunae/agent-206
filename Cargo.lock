@@ -109,6 +109,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "a206-injection-scan"
+version = "0.1.0"
+dependencies = [
+ "regex",
+]
+
+[[package]]
 name = "a206-leak-scan"
 version = "0.1.0"
 dependencies = [
@@ -202,6 +209,7 @@ dependencies = [
  "a206-broker",
  "a206-core",
  "a206-extensions",
+ "a206-injection-scan",
  "a206-leak-scan",
  "a206-mcp",
  "a206-output-rules",
