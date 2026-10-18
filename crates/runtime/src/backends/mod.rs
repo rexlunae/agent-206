@@ -197,6 +197,8 @@ pub struct Run<'a> {
     pub state_root: &'a Path,
     pub progress: mpsc::Sender<Progress>,
     pub cancel: tokio_util::sync::CancellationToken,
+    /// Counts the model requests the backend sent to the provider.
+    pub dispatched: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 pub async fn complete(run: Run<'_>) -> Result<(String, Usage)> {
     let Run {
@@ -209,6 +211,7 @@ pub async fn complete(run: Run<'_>) -> Result<(String, Usage)> {
         state_root,
         progress,
         cancel,
+        dispatched,
     } = run;
     validate_selection(config, thread, backend)?;
     check(
@@ -216,7 +219,7 @@ pub async fn complete(run: Run<'_>) -> Result<(String, Usage)> {
         BackendError::ModelMismatch,
     )?;
     let mut input = transcript(thread)?;
-    let proxy = proxy::Proxy::start(config.clone(), info.clone())
+    let proxy = proxy::Proxy::start(config.clone(), info.clone(), dispatched)
         .await
         .map_err(BackendError::Proxy)?;
     // Dropping an unfinished launch tears down whatever it started.
