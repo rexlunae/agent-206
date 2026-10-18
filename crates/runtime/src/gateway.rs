@@ -1497,6 +1497,11 @@ impl Gateway {
                 self.running.lock().map_err(poisoned("run"))?.remove(&id);
                 let mut store = self.lock()?;
                 let thread = store.thread_mut(id)?;
+                // A backend reports one total for its whole run.
+                match &result {
+                    Some(Ok((_, usage))) => thread.usage_total.record(usage),
+                    _ => thread.usage_total.record_incomplete(),
+                }
                 match result {
                     Some(Ok((text, usage))) => {
                         partial.finish(thread, text, None);

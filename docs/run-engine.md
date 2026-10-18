@@ -63,6 +63,18 @@ the run for cost; a count any request did not report leaves that total unknown.
 It is cleared when a message is sent and set only when the run completes, so a
 failed or cancelled run shows no cost rather than the previous run's.
 
+`Thread::usage_total` keeps a running total over every run of the conversation:
+each finished response of a native round or a compaction summary (automatic or
+asked for), and each coding-backend run's reported total, whether or not the run
+finished. Each figure (input tokens, output tokens, cost) is a sum of what was
+reported plus a count of reports that left it out, so a partial sum is shown as
+"at least" rather than as exact. Requests that ended without a finished response
+(failed or cancelled) are counted as `incomplete`: a provider may have charged
+for them, but none reported usage. A conversation saved before totals were kept
+has `from_start = false`. `UsageTotal::with_subagents` adds the totals of every
+subagent conversation below one. The conversation popover shows both, and
+`agent206 usage THREAD` prints them as TOML.
+
 Every call ends with model-facing result text and, unless it succeeded, a
 structured `ErrorReport` that clients display. When a tool reports its own
 failure (`ToolOutput::is_error`), the model receives the tool's text and the
@@ -713,7 +725,8 @@ previous summary first.
   message and cuts fall only before user messages, every tool call keeps its
   result in OpenAI, Anthropic and Gemini form. `Thread::usage` becomes unknown
   until the next request reports it.
-- **Accounting.** An automatic compaction's usage is added to `Thread::run_usage`;
+- **Accounting.** Every summary request is counted in `Thread::usage_total`,
+  including one whose summary is then discarded. An automatic compaction's usage is added to `Thread::run_usage`;
   it does not count against the round budget.
 - **Failure and cancellation.** Nothing changes until the summary is complete. A
   failed summary (`CompactionError::Summary`, with the provider failure as its

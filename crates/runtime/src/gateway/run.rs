@@ -775,6 +775,10 @@ impl Gateway {
         if noticed {
             thread.backend_activity = None;
         }
+        match &result {
+            Some(Ok(turn)) => thread.usage_total.record(&turn.usage),
+            _ => thread.usage_total.record_incomplete(),
+        }
         let result = match result {
             Some(Ok(turn)) => {
                 let message = partial.finish(

@@ -5,7 +5,7 @@ use crate::{
 use a206_core::{
     Capability, CodingBackend, Command, CompactionTrigger, ErrorKind, ErrorReport, ImageAttachment,
     ImageType, InstructionStatus, MAX_IMAGE_BYTES, MAX_IMAGES, Mode, ModelKey, PlanStatus, Reply,
-    Role, RunState, TextAttachment, Thread,
+    Role, RunState, Tally, TextAttachment, Thread, UsageTotal,
 };
 use fc_dioxus::prelude::*;
 use std::collections::HashMap;
@@ -902,6 +902,9 @@ fn ThreadFacts(thread: Thread) -> Element {
         v.map(|v| v.to_string())
             .unwrap_or_else(|| "Not reported".into())
     };
+    let total = &thread.usage_total;
+    let family = UsageTotal::with_subagents(&snapshot.threads, thread.id);
+    let has_subagents = snapshot.threads.iter().any(|t| t.parent == Some(thread.id));
     rsx! { div { class: "a206-thread-facts",
         dl { class: "a206-fact-grid",
             dt { "Agent engine" } dd { "{thread.backend.label()}" }
@@ -917,6 +920,12 @@ fn ThreadFacts(thread: Thread) -> Element {
             dt { "Last request input / output" } dd { "{number(input)} / {number(output)}" }
             dt { "Run input / output" } dd { "{number(run_input)} / {number(run_output)}" }
             dt { "Run cost" } dd { {cost.map(|c| format!("{c:.6}")).unwrap_or_else(|| "Not reported".into())} }
+            dt { "Conversation input / output" } dd { "{tokens_label(&total.input_tokens)} / {tokens_label(&total.output_tokens)}" }
+            dt { "Conversation cost" } dd { "{cost_tally_label(&total.cost)}" }
+            if has_subagents {
+                dt { "With subagents input / output" } dd { "{tokens_label(&family.input_tokens)} / {tokens_label(&family.output_tokens)}" }
+                dt { "With subagents cost" } dd { "{cost_tally_label(&family.cost)}" }
+            }
             dt { "Input / output rate" } dd { "{price(model.and_then(|m| m.input_cost_per_token))} / {price(model.and_then(|m| m.output_cost_per_token))}" }
             dt { "Account balance" } dd { {catalog.and_then(|c| c.balance.map(|v| format!("{v:.4} {}", c.balance_currency.as_deref().unwrap_or("provider units")))).unwrap_or_else(|| "Not reported".into())} }
             dt { "Token balance" } dd { "{number(catalog.and_then(|c| c.token_balance))}" }
@@ -925,12 +934,47 @@ fn ThreadFacts(thread: Thread) -> Element {
         }
         if let Some(percent) = pct { Progress { label: name!("Context window used"), value: ProgressValue::Of { value: percent.min(100.0), max: 100.0 } } }
         p { class: "a206-fact-note", "Last response · provider-reported usage" }
+        p { class: "a206-fact-note", {totals_note(if has_subagents { &family } else { total })} }
         div { class: "a206-permissions",
             strong { "Tool permissions" }
             if thread.grant.capabilities.is_empty() { span { class: "a206-muted", "None granted" } }
             for grant in &thread.grant.capabilities { Badge { "{grant:?}" } }
         }
     } }
+}
+
+/// A summed token count, marked as a lower bound when some reports lacked it.
+fn tokens_label(tally: &Tally<u64>) -> String {
+    match tally.exact() {
+        Some(sum) => sum.to_string(),
+        None => format!("At least {} ({} unreported)", tally.sum, tally.unreported),
+    }
+}
+fn cost_tally_label(tally: &Tally<f64>) -> String {
+    match tally.exact() {
+        Some(sum) => format!("{sum:.6}"),
+        None => format!(
+            "At least {:.6} ({} unreported)",
+            tally.sum, tally.unreported
+        ),
+    }
+}
+/// What the conversation totals count, and what they leave out.
+fn totals_note(total: &UsageTotal) -> String {
+    let mut note = format!(
+        "Conversation totals · {} provider usage reports",
+        total.reports
+    );
+    if total.incomplete > 0 {
+        note.push_str(&format!(
+            ", {} requests ended before a finished response and reported nothing",
+            total.incomplete
+        ));
+    }
+    if !total.from_start {
+        note.push_str(", requests made before totals were kept are not counted");
+    }
+    note
 }
 
 /// The checklist the conversation's models keep with `plan_update`.

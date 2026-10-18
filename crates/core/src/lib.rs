@@ -517,6 +517,99 @@ pub struct Usage {
     pub output_tokens: Option<u64>,
     pub cost: Option<f64>,
 }
+/// A running sum of one usage figure, with how many reports left it out.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct Tally<T> {
+    /// The sum of every reported value.
+    pub sum: T,
+    /// Reports that did not include this figure.
+    pub unreported: u64,
+}
+impl<T: Copy + std::ops::Add<Output = T>> Tally<T> {
+    fn add(&mut self, value: Option<T>) {
+        match value {
+            Some(value) => self.sum = self.sum + value,
+            None => self.unreported += 1,
+        }
+    }
+    fn merge(&mut self, other: &Self) {
+        self.sum = self.sum + other.sum;
+        self.unreported += other.unreported;
+    }
+    /// The sum, when every report included this figure.
+    pub fn exact(&self) -> Option<T> {
+        (self.unreported == 0).then_some(self.sum)
+    }
+}
+/// Everything a conversation's model use has reported, over every run:
+/// replies, tool rounds, summaries and coding-backend runs, whether the
+/// run finished or not. Only provider-reported figures are summed.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct UsageTotal {
+    /// Whether counting began when the conversation did. A conversation
+    /// created before totals were kept has earlier requests uncounted.
+    pub from_start: bool,
+    /// Finished model responses, and coding-backend runs, that reported
+    /// usage or could have.
+    pub reports: u64,
+    /// Requests that ended without a finished response: failed or
+    /// cancelled. A provider may have charged for them; none reported it.
+    pub incomplete: u64,
+    pub input_tokens: Tally<u64>,
+    pub output_tokens: Tally<u64>,
+    /// In the provider's reported units.
+    pub cost: Tally<f64>,
+}
+impl UsageTotal {
+    /// The total of a conversation that has just begun.
+    pub fn started() -> Self {
+        Self {
+            from_start: true,
+            ..Self::default()
+        }
+    }
+    /// Count one finished response's reported usage.
+    pub fn record(&mut self, usage: &Usage) {
+        self.reports += 1;
+        self.input_tokens.add(usage.input_tokens);
+        self.output_tokens.add(usage.output_tokens);
+        self.cost.add(usage.cost);
+    }
+    /// Count a request that ended without a finished response.
+    pub fn record_incomplete(&mut self) {
+        self.incomplete += 1;
+    }
+    /// Add another conversation's total, such as a subagent's.
+    pub fn merge(&mut self, other: &Self) {
+        self.from_start &= other.from_start;
+        self.reports += other.reports;
+        self.incomplete += other.incomplete;
+        self.input_tokens.merge(&other.input_tokens);
+        self.output_tokens.merge(&other.output_tokens);
+        self.cost.merge(&other.cost);
+    }
+    /// The total of `root` and every subagent conversation below it.
+    pub fn with_subagents(threads: &[Thread], root: Id) -> Self {
+        let mut total = Self::started();
+        let mut pending = vec![root];
+        let mut seen = BTreeSet::new();
+        while let Some(id) = pending.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            if let Some(thread) = threads.iter().find(|t| t.id == id) {
+                total.merge(&thread.usage_total);
+            }
+            pending.extend(
+                threads
+                    .iter()
+                    .filter(|t| t.parent == Some(id))
+                    .map(|t| t.id),
+            );
+        }
+        total
+    }
+}
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Thread {
     pub id: Id,
@@ -535,6 +628,9 @@ pub struct Thread {
     /// count any request did not report makes its total unknown.
     #[serde(default)]
     pub run_usage: Option<Usage>,
+    /// Every model request the conversation has made.
+    #[serde(default)]
+    pub usage_total: UsageTotal,
     #[serde(default)]
     pub effort: Option<String>,
     #[serde(default)]
@@ -657,6 +753,7 @@ impl Thread {
             state: RunState::Idle,
             usage: None,
             run_usage: None,
+            usage_total: UsageTotal::started(),
             effort: None,
             backend: CodingBackend::Native,
             backend_activity: None,
@@ -1672,6 +1769,61 @@ pub enum VaultReply {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn usage_totals_sum_what_was_reported_and_count_what_was_not() {
+        let n = || (Id::new_v4().as_u128() % 10_000) as u64 + 1;
+        let (a, b, c) = (n(), n(), n());
+        let mut total = UsageTotal::started();
+        total.record(&Usage {
+            input_tokens: Some(a),
+            output_tokens: Some(b),
+            cost: None,
+        });
+        assert_eq!(total.input_tokens.exact(), Some(a));
+        total.record(&Usage {
+            input_tokens: None,
+            output_tokens: Some(c),
+            cost: None,
+        });
+        total.record_incomplete();
+        // A sum some report left out is a lower bound, never exact.
+        assert_eq!(total.input_tokens.exact(), None);
+        assert_eq!(total.input_tokens.sum, a);
+        assert_eq!(total.output_tokens.exact(), Some(b + c));
+        assert_eq!((total.reports, total.incomplete), (2, 1));
+        assert_eq!(total.cost.unreported, 2);
+
+        // Subagents below a conversation are added; others are not.
+        let mut root = Thread::new(Id::new_v4().to_string(), Mode::Chat);
+        root.usage_total = total.clone();
+        let mut child = Thread::new(Id::new_v4().to_string(), Mode::Chat);
+        child.parent = Some(root.id);
+        child.usage_total.record(&Usage {
+            input_tokens: Some(a),
+            output_tokens: Some(b),
+            cost: None,
+        });
+        // A conversation from before totals were kept marks the sum partial.
+        let mut grandchild = Thread::new(Id::new_v4().to_string(), Mode::Chat);
+        grandchild.parent = Some(child.id);
+        grandchild.usage_total.from_start = false;
+        let unrelated = {
+            let mut thread = Thread::new(Id::new_v4().to_string(), Mode::Chat);
+            thread.usage_total.record(&Usage {
+                input_tokens: Some(n()),
+                output_tokens: Some(n()),
+                cost: None,
+            });
+            thread
+        };
+        let threads = vec![root.clone(), child.clone(), grandchild, unrelated];
+        let family = UsageTotal::with_subagents(&threads, root.id);
+        assert_eq!(family.reports, 3);
+        assert_eq!(family.output_tokens.exact(), Some(2 * b + c));
+        assert!(!family.from_start);
+        assert_eq!(UsageTotal::with_subagents(&threads, child.id).reports, 1);
+    }
+
     #[test]
     fn profile_creation_is_refused_by_gateways_without_profile_policy() {
         #[derive(Serialize, Deserialize)]
