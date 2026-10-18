@@ -1,7 +1,7 @@
 id = "agent206.git"
 name = "Git"
-description = "Shows the status, history and diffs of a project's git repository and commits named files, without running anything the repository configures."
-version = "0.1.0"
+description = "Shows the status, history and diffs of a project's git repository and stages or commits named files, without running anything the repository configures."
+version = "0.2.0"
 abi = 2
 capabilities = ["git_read", "git_write"]
 
@@ -52,3 +52,19 @@ name = "paths"
 type = "string"
 description = "Files to commit, one per line, relative to the repository root."
 required = true
+
+[[tools]]
+name = "git_stage"
+description = "Stage the current working-tree content of exactly the named files, like `git add` (a named file that no longer exists is staged as removed), or with unstage, set them back to their HEAD content, like `git reset -- <paths>`. Only the index changes; the files themselves are not touched."
+capabilities = ["git_write"]
+
+[[tools.params]]
+name = "paths"
+type = "string"
+description = "Files to stage or unstage, one per line, relative to the repository root."
+required = true
+
+[[tools.params]]
+name = "unstage"
+type = "boolean"
+description = "Unstage instead of staging. Defaults to false."

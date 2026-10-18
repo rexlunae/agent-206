@@ -23,8 +23,8 @@ and an `overview` panel. `apply_patch` reads a unified diff (`git diff` or
 quoted paths are refused, as is a hunk with more or fewer lines than the
 counts in its `@@` header. The write tools need a separate `write_workspace` grant. It also bundles
 `agent206.git` (`plugins/git`) with `git_status`, `git_log` and `git_diff`
-tools under the `git_read` grant and a `git_commit` tool under its own
-`git_write` grant, and `agent206.web` (`plugins/web`) with `fetch_url` (the
+tools under the `git_read` grant and `git_stage` and `git_commit` tools under
+their own `git_write` grant, and `agent206.web` (`plugins/web`) with `fetch_url` (the
 raw response) and `read_web_page` tools under the `network` grant.
 `read_web_page` reads HTML in one pass in the guest, without a DOM: it drops
 scripts, styles, navigation, headers, footers, asides, forms and similar
@@ -274,6 +274,7 @@ unsafe operation.
 | `git_status` | `git_read` + a project | branch, `HEAD` id, changed paths (staged, unstaged, untracked) | 1,000 entries; 5 s per git call; renames not tracked; submodules ignored |
 | `git_log { max }` | `git_read` + a project | commits from `HEAD`: id, summary, author name (no email), author time | 200 commits |
 | `git_diff { path, staged }` | `git_read` + a project | unified diff of one file (`HEAD`→index when `staged`, else index→working tree; a symbolic link compares its target text), or `binary` | 512 KiB per side (checked before a blob is read), 192 KiB of text, 3 context lines; at most 8,192 input lines combined and 1,000,000 line pairs, otherwise a budget failure |
+| `git_stage { paths, unstage }` | `git_write` + a project | done | 1 to 100 paths, 512 KiB per file and 8 MiB together; the same deadline as `git_commit`; see [Staging](#staging) |
 | `git_commit { message, paths }` | `git_write` + a project | the new commit: id, summary, author name, time | 1 to 100 paths, 16 KiB message, 512 KiB per file and 8 MiB together; 5 s and 3 s before the invocation's deadline, but once the commit is written it is reported, even past that; see [Commits](#commits) |
 | `fetch { url }` | `network` + a declared host | final status (any, not only 2xx), `Content-Type`, body, whether it was cut, whether a redirect was followed | 512 KiB body; 8 s including redirects; 5 redirects |
 | `state_get { key }` | nothing | the extension's own value | — |
@@ -327,6 +328,23 @@ nothing is committed. If the index cannot be written after the commit, the
 failure names the commit that was made. A commit stops before its point of
 no return 3 s ahead of the invocation's deadline, so a commit that is made
 always reaches the guest; with less time left the call fails with `budget`.
+
+### Staging
+
+`git_stage` changes only the index. It puts the working-tree content of
+exactly the named paths in the index, like `git add <paths>`, and stages a
+named tracked path that no longer exists as removed; with `unstage` it sets
+the named paths back to their `HEAD` entries, like `git reset -- <paths>`,
+dropping a path `HEAD` does not have from the index. The working tree,
+`HEAD` and every other index entry stay as they are. Files are read as
+commits read them, under the same refusals that apply to a file: an ignored
+untracked path, `filter`, `ident` and `working-tree-encoding` attributes,
+carriage returns git would convert, conflicts, a merge or rebase in progress,
+and split or sparse indexes. Hooks, signing and identity play no part, as
+`git add` uses none. Directories and submodules are refused (name their
+files), as is a new path below a file git tracks. One refused path refuses
+the whole call, and the index lock is held throughout, so the index is
+written once or not at all.
 
 A fetch is a `GET` through the same guard as downloads
 (`crates/runtime/src/network.rs`). The URL and every redirect must be

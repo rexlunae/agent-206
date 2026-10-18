@@ -1067,7 +1067,7 @@ impl Gateway {
                 check(
                     !capabilities.contains(&Capability::GitWrite)
                         || capabilities.contains(&Capability::GitRead),
-                    GatewayError::Invalid("changing git history also requires reading it"),
+                    GatewayError::Invalid("staging and committing in git also require reading it"),
                 )?;
                 // Only the network reaches beyond the project.
                 check(
