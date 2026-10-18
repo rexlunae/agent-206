@@ -518,8 +518,9 @@ runs with the settings the post was checked against:
 
 To see where a messenger's posts arrive before a model uses it, the user
 sends "Test message from Agent 206." with **Send test message** on a ready
-webhook's card, or `agent206 messenger test NAME` (add `--chat CHAT` for an
-allowed chat of a connected messenger). It goes to the same destinations
+webhook's card, with **Send test** beside an allowed chat of a connected
+messenger, or `agent206 messenger test NAME` (add `--chat CHAT` for an
+allowed chat). It goes to the same destinations
 `send_message` offers, through the vault broker in the same way, and needs no
 conversation or model; no approval is asked because the user sent it. A
 destination that is not an enabled webhook or an allowed chat of a running
@@ -552,8 +553,7 @@ participant cannot approve their own request.
 
 - WhatsApp, Google Chat and iMessage on their own (they are reached through
   Beeper), and Teams conversations (webhooks only post to a channel).
-- A test send to a chat from the Messengers page (the CLI's `--chat` does
-  it), and webhook delivery of scheduled messages' replies.
+- Webhook delivery of scheduled messages' replies.
 - Beeper attachments, reactions and replies to a specific message, the
   experimental WebSocket event stream, and remembering cursors across
   restarts.

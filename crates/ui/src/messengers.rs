@@ -187,8 +187,8 @@ fn MessengerCard(now: u64, config: MessengerConfig, status: MessengerStatus) -> 
                 }
             }
             if !model_known { Alert { tone: AlertTone::Warning, title: rsx! { "Model not in a current catalog" }, "The chosen model is not listed by its provider, or that list has expired. New chats cannot start until you refresh the provider on the Connections page or choose another model." } }
-            AllowList { messenger: config.name.clone(), title: "Allowed chats", hint: "Chat ids whose messages reach a conversation.", entries: config.allowed_chats.iter().cloned().collect::<Vec<_>>(), senders: false }
-            AllowList { messenger: config.name.clone(), title: "Allowed senders", hint: "User ids accepted in allowed chats. Group chats accept only these senders; once any is listed, private chats do too.", entries: config.allowed_users.iter().cloned().collect::<Vec<_>>(), senders: true }
+            AllowList { messenger: config.name.clone(), title: "Allowed chats", hint: format!("Chat ids whose messages reach a conversation. While the messenger is connected, Send test posts \"{}\" to that chat.", a206_core::messengers::TEST_MESSAGE), entries: config.allowed_chats.iter().cloned().collect::<Vec<_>>(), senders: false, testable: chat_tests_available(&config, &status) }
+            AllowList { messenger: config.name.clone(), title: "Allowed senders", hint: "User ids accepted in allowed chats. Group chats accept only these senders; once any is listed, private chats do too.", entries: config.allowed_users.iter().cloned().collect::<Vec<_>>(), senders: true, testable: false }
             if !status.refused.is_empty() {
                 h3 { "Refused recently" }
                 p { class: "a206-muted", "The latest {a206_core::messengers::MAX_REFUSED_CHATS} refused chats or senders are shown. Older entries are replaced; add other room IDs under Allowed chats. Titles come from the chat service and may be misleading. Allow only chats and people you recognize." }
@@ -285,6 +285,18 @@ fn edit_list(
     });
 }
 
+/// Whether the user can send a test message to an allowed chat of `config`
+/// now: the gateway offers a chat only while its messenger is connected.
+fn chat_tests_available(config: &MessengerConfig, status: &MessengerStatus) -> bool {
+    !config.kind.is_send_only() && config.enabled && status.state == MessengerState::Connected
+}
+
+/// Where a test message to `chat` of messenger `name` is sent.
+fn chat_destination(name: &str, chat: &str) -> String {
+    format!("{name}/{chat}")
+}
+
+/// One allow-list; `testable` offers a test send to each entry.
 #[component]
 fn AllowList(
     messenger: String,
@@ -292,6 +304,7 @@ fn AllowList(
     hint: String,
     entries: Vec<String>,
     senders: bool,
+    testable: bool,
 ) -> Element {
     let state = use_context::<State>();
     let mut draft = use_signal(String::new);
@@ -303,7 +316,12 @@ fn AllowList(
         for entry in entries {
             div { key: "{entry}", class: "a206-row a206-between",
                 code { "{entry}" }
-                Button { size: ButtonSize::Sm, variant: ButtonVariant::Ghost, onclick: { let messenger = messenger.clone(); let entry = entry.clone(); move |_| edit_list(state, &messenger, senders, |list, _| { list.remove(&entry); }) }, "Remove" }
+                div { class: "a206-row",
+                    if !senders {
+                        Button { size: ButtonSize::Sm, variant: ButtonVariant::Ghost, availability: if testable { Availability::Enabled } else { Availability::Disabled }, onclick: { let destination = chat_destination(&messenger, &entry); move |_| dispatch(state, Command::SendTestMessage { destination: destination.clone() }) }, "Send test" }
+                    }
+                    Button { size: ButtonSize::Sm, variant: ButtonVariant::Ghost, onclick: { let messenger = messenger.clone(); let entry = entry.clone(); move |_| edit_list(state, &messenger, senders, |list, _| { list.remove(&entry); }) }, "Remove" }
+                }
             }
         }
         div { class: "a206-row",
@@ -532,6 +550,90 @@ mod tests {
         assert!(current_models(&snapshot, expires_at - 1).any(|m| m.key == key));
         assert!(model_choices(&snapshot, expires_at).is_empty());
         assert_eq!(current_models(&snapshot, expires_at).count(), 0);
+    }
+
+    #[test]
+    fn chat_tests_are_offered_only_while_an_enabled_chat_messenger_is_connected() {
+        let id = || Uuid::new_v4().simple().to_string();
+        let (name, chat) = (format!("m-{}", id()), id());
+        let mut config = MessengerConfig::new(name.clone(), MessengerKind::Telegram);
+        config.enabled = true;
+        let mut status = MessengerStatus {
+            state: MessengerState::Connected,
+            ..MessengerStatus::default()
+        };
+        assert!(chat_tests_available(&config, &status));
+        for state in [
+            MessengerState::Stopped,
+            MessengerState::Connecting,
+            MessengerState::Failed,
+            MessengerState::WaitingForVault,
+        ] {
+            status.state = state;
+            assert!(!chat_tests_available(&config, &status), "{state:?}");
+        }
+        status.state = MessengerState::Connected;
+        config.enabled = false;
+        assert!(!chat_tests_available(&config, &status));
+        // A webhook has no chats; its card has its own test button.
+        let mut webhook = MessengerConfig::new(name.clone(), MessengerKind::Webhook);
+        webhook.enabled = true;
+        assert!(!chat_tests_available(&webhook, &status));
+        assert_eq!(chat_destination(&name, &chat), format!("{name}/{chat}"));
+    }
+
+    fn render_page(snapshot: a206_core::Snapshot) -> String {
+        use dioxus::history::{History, MemoryHistory};
+        #[derive(Clone, Debug, PartialEq, Routable)]
+        enum Fixture {
+            #[route("/")]
+            Page {},
+        }
+        #[component]
+        fn Page() -> Element {
+            let snapshot = use_context::<a206_core::Snapshot>();
+            let state = crate::route::tests::loaded_state(snapshot);
+            use_context_provider(|| state);
+            rsx! { Messengers {} }
+        }
+        fn app() -> Element {
+            rsx! { Router::<Fixture> {} }
+        }
+        let mut dom = VirtualDom::new(app);
+        dom.provide_root_context(snapshot);
+        dom.provide_root_context(
+            std::rc::Rc::new(MemoryHistory::default()) as std::rc::Rc<dyn History>
+        );
+        dom.rebuild_in_place();
+        dioxus_ssr::render(&dom)
+    }
+
+    #[test]
+    fn allowed_chats_of_a_connected_messenger_offer_a_test_send() {
+        let id = || Uuid::new_v4().simple().to_string();
+        let mut config = MessengerConfig::new(format!("m-{}", id()), MessengerKind::Telegram);
+        config.enabled = true;
+        config.allowed_chats.insert(id());
+        config.allowed_users.insert(id());
+        let mut snapshot = crate::empty_snapshot();
+        snapshot.settings.messengers.push(config.clone());
+        snapshot.messengers.push(MessengerStatus {
+            name: config.name.clone(),
+            state: MessengerState::Connected,
+            ..MessengerStatus::default()
+        });
+        // The one test button's tag: offered for the chat, not the sender.
+        let button = |html: &str| {
+            assert_eq!(html.matches(">Send test<").count(), 1, "{html}");
+            let end = html.find(">Send test<").unwrap();
+            let start = html[..end].rfind("<button").unwrap();
+            html[start..end].to_owned()
+        };
+        let connected = button(&render_page(snapshot.clone()));
+        assert!(!connected.contains("disabled"), "{connected}");
+        snapshot.messengers[0].state = MessengerState::Stopped;
+        let stopped = button(&render_page(snapshot));
+        assert!(stopped.contains("disabled"), "{stopped}");
     }
 
     #[test]
