@@ -25,7 +25,7 @@ pub fn Overview() -> Element {
         }
         if crate::welcome::unfinished(&snapshot, now) {
             Card { variant: CardVariant::Subtle, CardBody { div { class: "a206-row a206-between",
-                div { strong { "Setup incomplete" } p { class: "a206-muted", "Review gateway, vault and provider setup." } }
+                div { strong { "Setup incomplete" } p { class: "a206-muted", "Open the setup checklist to see the remaining steps." } }
                 LinkButton { variant: ButtonVariant::Primary, href: Route::Welcome {}.to_string(), "Get started" }
             } } }
         }
@@ -190,7 +190,7 @@ pub fn Documents() -> Element {
             Button { variant: ButtonVariant::Secondary, onclick: move |_| if let Ok(project) = Uuid::parse_str(&project()) { read(Command::GitStatus { project }); }, "Git status" }
         }
         if let Some(report) = failure() { ErrorNotice { report } }
-        Card { CardBody { if output().is_empty() { EmptyState { compact: true, title: rsx! { "No document selected" }, body: rsx! { "Select a project, then read a document or inspect its Git status." } } } else { pre { class: "a206-document", "{output}" } } } }
+        Card { CardBody { if output().is_empty() { EmptyState { compact: true, title: rsx! { "No text to display" }, body: rsx! { "Select a project to read a document or inspect Git status. Empty files return no text." } } } else { pre { class: "a206-document", "{output}" } } } }
     } }
 }
 #[component]
