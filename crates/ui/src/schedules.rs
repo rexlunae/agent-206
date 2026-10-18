@@ -180,10 +180,10 @@ fn JobHistory(job: Job) -> Element {
         });
     };
     // Each change to the latest run (a new run, or how one ended) is in the
-    // history too.
-    let last = job.last.clone();
-    use_effect(use_reactive!(|last| {
-        let _ = last;
+    // history too, as is an earlier run ending after a newer one started.
+    let (last, settled) = (job.last.clone(), job.history);
+    use_effect(use_reactive!(|last, settled| {
+        let _ = (last, settled);
         reload();
     }));
     rsx! { div { class: "a206-stack",

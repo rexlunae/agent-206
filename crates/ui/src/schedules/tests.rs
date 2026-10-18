@@ -22,6 +22,7 @@ fn job(thread: Uuid) -> Job {
         next: Some(at),
         last: None,
         author: JobAuthor::User,
+        history: 0,
     }
 }
 

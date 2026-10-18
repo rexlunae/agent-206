@@ -80,6 +80,7 @@ impl Gateway {
             next: Some(next),
             last: None,
             author,
+            history: 0,
         };
         store.state.jobs.push(job.clone());
         store.persist(Some(EventKind::JobChanged { id: job.id }))?;
@@ -283,7 +284,10 @@ impl Gateway {
                 last.ended = Some(now());
             }
             // A newer run is the latest; this one ends in the history only.
-            _ => return Ok(store.settle_run(run, outcome, now())?),
+            _ => {
+                job.history = job.history.wrapping_add(1);
+                store.settle_run(run, outcome, now())?;
+            }
         }
         store.persist(Some(EventKind::JobChanged { id }))?;
         Ok(())

@@ -88,7 +88,8 @@ The gateway keeps each job's latest 50 runs (`schedule::MAX_JOB_RUNS`) in a
 job's latest run is written in the same transaction as the snapshot that shows
 it, so the history and `Job::last` never disagree. A run that a newer one
 replaced as the latest stays running in the history until it ends, and then
-records how. Older runs are dropped as
+records how; that changes `Job::history` and publishes `JobChanged`, so a page
+showing the history reloads it, as it does whenever `Job::last` changes. Older runs are dropped as
 new ones start, and removing the job removes its history. When the gateway starts,
 restart recovery settles each job's latest run from its conversation, and any
 earlier run still shown as running becomes `Unrecorded` (the page says "Ended;

@@ -153,6 +153,11 @@ pub struct Job {
     pub last: Option<JobRun>,
     #[serde(default)]
     pub author: JobAuthor,
+    /// Changes when an earlier run, no longer `last`, ends in the run
+    /// history, so a client showing the history reloads it. `last` covers
+    /// every other change.
+    #[serde(default)]
+    pub history: u64,
 }
 
 /// Why a time or interval someone typed for a schedule cannot be used.

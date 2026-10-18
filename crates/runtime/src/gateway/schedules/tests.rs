@@ -390,8 +390,11 @@ async fn the_history_keeps_a_bounded_number_of_runs_and_settles_earlier_ones() {
     // A newer run starts before the first one ends.
     let second = JobRun::start(at);
     start(&second);
+    let revision = job(&g, created.id).history;
     g.finish_job(created.id, first.id, JobOutcome::Failed)
         .unwrap();
+    // Clients showing the history learn that it changed.
+    assert_ne!(job(&g, created.id).history, revision);
     let history = g.lock().unwrap().job_runs(created.id).unwrap();
     assert_eq!(history[0], second, "the latest run is still running");
     assert_eq!(history[1].id, first.id);
