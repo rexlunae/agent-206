@@ -232,15 +232,39 @@ async fn an_earlier_run_ending_late_leaves_the_latest_result() {
     job_mut(&mut g.lock().unwrap().state, created.id)
         .unwrap()
         .last = Some(second.clone());
-    g.finish_job(created.id, first.id, JobOutcome::Failed, false)
-        .unwrap();
-    assert_eq!(job(&g, created.id).last, Some(second.clone()));
-    g.finish_job(created.id, second.id, JobOutcome::Complete, false)
-        .unwrap();
+    let (stale, kept) = (cursor(), cursor());
+    g.finish_job(
+        created.id,
+        second.id,
+        JobOutcome::Complete,
+        false,
+        Some(Some(kept.clone())),
+    )
+    .unwrap();
+    // The earlier check's cursor must not replace what the newer one kept.
+    g.finish_job(
+        created.id,
+        first.id,
+        JobOutcome::Failed,
+        false,
+        Some(Some(stale)),
+    )
+    .unwrap();
+    let after = job(&g, created.id);
     assert_eq!(
-        job(&g, created.id).last.map(|run| run.outcome),
+        after.last.map(|run| run.outcome),
         Some(JobOutcome::Complete)
     );
+    assert_eq!(after.cursor, Some(kept.clone()));
+    // The cursor is written with the outcome, so a reopened gateway has it.
+    drop(g);
+    let g = Gateway::open(state.path()).unwrap();
+    assert_eq!(job(&g, created.id).cursor, Some(kept));
+}
+
+/// A cursor with generated contents.
+fn cursor() -> ByteBuf {
+    ByteBuf::from(Id::new_v4().as_bytes().to_vec())
 }
 
 #[tokio::test]
@@ -400,7 +424,7 @@ async fn the_history_keeps_a_bounded_number_of_runs_and_settles_earlier_ones() {
         .deliver_to = Some(to.clone());
     // A run with a reply to post records its end first, as posting.
     assert_eq!(
-        g.finish_job(created.id, first.id, JobOutcome::Complete, true)
+        g.finish_job(created.id, first.id, JobOutcome::Complete, true, None)
             .unwrap(),
         Some(to)
     );
@@ -415,7 +439,7 @@ async fn the_history_keeps_a_bounded_number_of_runs_and_settles_earlier_ones() {
     let posted = Delivery::Sent {
         parts: 1 + arbitrary() % 8,
     };
-    g.update_run(created.id, first.id, |_, run| {
+    g.update_run(created.id, first.id, None, |_, run| {
         run.delivery = Some(posted.clone())
     })
     .unwrap();
@@ -426,7 +450,8 @@ async fn the_history_keeps_a_bounded_number_of_runs_and_settles_earlier_ones() {
         let run = JobRun::start(at);
         start(&run);
         assert_eq!(
-            g.finish_job(created.id, run.id, outcome, posts).unwrap(),
+            g.finish_job(created.id, run.id, outcome, posts, None)
+                .unwrap(),
             None
         );
         assert_eq!(job(&g, created.id).last.unwrap().delivery, None);
@@ -453,12 +478,12 @@ async fn the_history_keeps_a_bounded_number_of_runs_and_settles_earlier_ones() {
     let to = job(&g, created.id).deliver_to;
     assert!(to.is_some());
     assert_eq!(
-        g.finish_job(created.id, pruned, JobOutcome::Complete, true)
+        g.finish_job(created.id, pruned, JobOutcome::Complete, true, None)
             .unwrap(),
         to
     );
     assert_eq!(
-        g.finish_job(created.id, pruned, JobOutcome::Failed, true)
+        g.finish_job(created.id, pruned, JobOutcome::Failed, true, None)
             .unwrap(),
         None
     );
@@ -467,7 +492,7 @@ async fn the_history_keeps_a_bounded_number_of_runs_and_settles_earlier_ones() {
         Reply::Ok
     );
     assert_eq!(
-        g.finish_job(created.id, pruned, JobOutcome::Complete, true)
+        g.finish_job(created.id, pruned, JobOutcome::Complete, true, None)
             .unwrap(),
         None
     );

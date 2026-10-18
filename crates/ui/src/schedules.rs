@@ -166,7 +166,9 @@ fn trigger_args(
 ) -> Result<Args, ArgInputError> {
     let mut args = Args::new();
     for param in params {
-        let text = inputs.get(&param.name).map_or("", |text| text.trim());
+        // Spaces may belong to a string; only parsed values drop them.
+        let raw = inputs.get(&param.name).map_or("", String::as_str);
+        let text = raw.trim();
         if text.is_empty() {
             if param.required {
                 return Err(ArgInputError::Missing(param.name.clone()));
@@ -178,7 +180,7 @@ fn trigger_args(
             kind: param.kind,
         };
         let value = match param.kind {
-            ParamKind::String => Value::Str(text.to_owned()),
+            ParamKind::String => Value::Str(raw.to_owned()),
             ParamKind::Integer => Value::Int(text.parse().map_err(|_| wrong())?),
             ParamKind::Number => Value::Float(text.parse().map_err(|_| wrong())?),
             ParamKind::Boolean => Value::Bool(text.parse().map_err(|_| wrong())?),

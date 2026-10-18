@@ -173,6 +173,28 @@ pub struct Scope {
     /// or `None` for a user acting directly, bounded only by the user's grant
     /// to the extension.
     pub ceiling: Option<BTreeSet<Capability>>,
+    /// Reads the caller's ceiling as it stands now, for an invocation that
+    /// runs without anyone watching it, such as a scheduled trigger check:
+    /// each host call is checked against it as well, so a conversation grant
+    /// withdrawn mid-invocation stops the calls that need it.
+    pub current: Option<CurrentCeiling>,
+}
+
+/// Reads a caller's current ceiling; `None` once the caller is gone.
+#[derive(Clone)]
+pub struct CurrentCeiling(Arc<dyn Fn() -> Option<BTreeSet<Capability>> + Send + Sync>);
+impl CurrentCeiling {
+    pub fn new(read: impl Fn() -> Option<BTreeSet<Capability>> + Send + Sync + 'static) -> Self {
+        Self(Arc::new(read))
+    }
+    fn read(&self) -> Option<BTreeSet<Capability>> {
+        (self.0)()
+    }
+}
+impl std::fmt::Debug for CurrentCeiling {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CurrentCeiling")
+    }
 }
 
 /// An enabled extension tool, as the run engine offers it to models.
@@ -630,6 +652,7 @@ impl ExtensionHost {
         let host = HostCalls {
             extension: manifest.id.clone(),
             effective: declared.clone(),
+            current: scope.current,
             workspace: scope.workspace,
             skills_root: self.data_dir.join("skills"),
             store: Arc::clone(&self.store),
@@ -799,6 +822,8 @@ struct HostCalls {
     skills_root: PathBuf,
     extension: String,
     effective: BTreeSet<Capability>,
+    /// The caller's current ceiling, read again for every call.
+    current: Option<CurrentCeiling>,
     workspace: Option<PathBuf>,
     store: Arc<Mutex<Store>>,
     /// The manifest's network destinations.
@@ -932,6 +957,24 @@ impl HostCalls {
         };
         if let Some(message) = denied {
             return Err(failure(HostErrorCode::Denied, &message));
+        }
+        // Read outside the store lock: the caller's ceiling may take it.
+        if let Some(current) = &self.current {
+            let message = match current.read() {
+                None => Some("the conversation this runs for is gone".to_owned()),
+                Some(ceiling) => required
+                    .iter()
+                    .find(|c| !ceiling.contains(c))
+                    .map(|missing| {
+                        format!(
+                            "the conversation this runs for no longer allows \"{}\"",
+                            missing.label()
+                        )
+                    }),
+            };
+            if let Some(message) = message {
+                return Err(failure(HostErrorCode::Denied, &message));
+            }
         }
         match request {
             HostRequest::SkillList => {

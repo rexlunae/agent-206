@@ -47,7 +47,7 @@ description = "Most bytes of text to return, 1 to 196608. Defaults to 50000."
 
 [[triggers]]
 name = "page_changed"
-description = "Fires when the readable text of a public HTTPS page changes, and reports the start of its new text. The first check only records the page; a page that cannot be fetched fails the run without firing."
+description = "Fires when the readable text of a public HTTPS page changes, and reports the start of its new text. The first check only records the page; a page that cannot be fetched fails the run without firing. Only the first 512 KiB of the page is read, so a change after that is not seen."
 capabilities = ["network"]
 
 [[triggers.params]]

@@ -52,7 +52,8 @@ replaces the long-running process, so nothing runs between checks.
   extension must be installed and `args` must match the trigger's declared
   parameters (no unknown names, required ones present, exact kinds; an empty
   value is left out). `text` is optional here: what to do when it fires,
-  sent before the extension's report.
+  sent before the extension's report, at most 64 KiB so the message with its
+  report stays within what a conversation accepts.
 - Each run is authorized like an agent's tool call in that conversation: the
   extension must be enabled, the user must have granted it every capability
   the trigger declares, and the conversation's own grant must include them
@@ -65,21 +66,29 @@ replaces the long-running process, so nothing runs between checks.
   extension's report (at most 32 KiB, cut at a character boundary with a
   notice) marked as extension output, never instructions. As with tool
   results, Unicode tag characters and credential-shaped strings are removed
-  from the report first, and when it contains text addressed to the model
-  the message says which kinds were found. The reply ends the run `Complete`
+  from the report first, and when the part of it the message includes
+  contains text addressed to the model, the message says which kinds were
+  found. The reply ends the run `Complete`
   and is shown as "Fired; answered".
 - The extension may keep up to 4 KiB (`Job::cursor`) for the next check of the
   same job, such as a fingerprint of what it saw. It is stored with the job
   only once the run's message was accepted (or the run was quiet), so a
   report the conversation refused, for example because it was busy, is
-  reported again by the next check. Removing the job removes it.
+  reported again by the next check. It is written together with the run's
+  outcome, and only while that run is the job's latest, so a restart cannot
+  repeat a check already recorded and an older check that ends late cannot
+  replace what a newer one kept. Each host call of the check is held to the
+  conversation's grant as it stands at that call, so withdrawing it stops a
+  check already running. Removing the job removes it.
 
 The bundled extensions offer two triggers. `agent206.workspace`
 `file_changed { path }` (`read_workspace`) fires when a project file is
 created, changed or removed and quotes the start of its new text.
 `agent206.web` `page_changed { url }` (`network`) fires when the readable text
 of a public HTTPS page changes, through the same SSRF guard as `fetch_url`; a
-page that answers with an error status fails the run instead of firing. Both
+page that answers with an error status fails the run instead of firing. It
+compares only the text of the first 512 KiB of the page, the `fetch` body
+limit, so a change past that point is not seen. Both
 record the first check without firing and compare 64-bit FNV-1a fingerprints,
 which detect change and defend against nothing.
 

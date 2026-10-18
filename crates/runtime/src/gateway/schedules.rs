@@ -14,7 +14,9 @@
 use super::{Gateway, GatewayError, Result};
 use crate::{error::check, provider::now, schedule, tools::ToolScope};
 use a206_core::{
-    schedule::{heartbeat_message, is_heartbeat_ok, trigger_message},
+    schedule::{
+        MAX_TRIGGER_TEXT, heartbeat_message, is_heartbeat_ok, report_shown, trigger_message,
+    },
     *,
 };
 use a206_protocol::Request;
@@ -59,10 +61,8 @@ impl Gateway {
                 args,
             } => {
                 check(
-                    text.len() <= MAX_TEXT,
-                    GatewayError::Invalid(
-                        "what to do when a trigger fires is at most 131072 bytes",
-                    ),
+                    text.len() <= MAX_TRIGGER_TEXT,
+                    GatewayError::Invalid("what to do when a trigger fires is at most 65536 bytes"),
                 )?;
                 // An empty value is no value, as a call reads it.
                 args.retain(|_, value| *value != extension::Value::Nil);
@@ -275,14 +275,10 @@ impl Gateway {
                 Ok(Some(text)) => gateway.send_job(thread, &job.kind, text).await,
             };
             // A refused message is reported again by the next check.
-            if let Some(cursor) = cursor.filter(|_| !matches!(outcome, JobOutcome::Refused(_)))
-                && let Err(error) = gateway.keep_cursor(id, cursor)
-            {
-                crate::error::handle("schedule_job", &error);
-            }
+            let cursor = cursor.filter(|_| !matches!(outcome, JobOutcome::Refused(_)));
             // Nobody waits on this task, so a failure to record the outcome
             // is logged; the conversation still shows the run itself.
-            let to = match gateway.finish_job(id, run, outcome, reply.is_some()) {
+            let to = match gateway.finish_job(id, run, outcome, reply.is_some(), cursor) {
                 Ok(to) => to,
                 Err(error) => {
                     crate::error::handle("schedule_job", &error);
@@ -294,7 +290,7 @@ impl Gateway {
             };
             let delivery = gateway.deliver(&to, &reply).await;
             if let Err(error) =
-                gateway.update_run(id, run, |_, last| last.delivery = Some(delivery))
+                gateway.update_run(id, run, None, |_, last| last.delivery = Some(delivery))
             {
                 crate::error::handle("schedule_delivery", &error);
             }
@@ -389,10 +385,17 @@ impl Gateway {
         else {
             return Err(GatewayError::Invalid("this job checks no trigger"));
         };
-        let scope = self.scope(job.thread)?;
+        let thread = job.thread;
+        let scope = self.scope(thread)?;
+        let gateway = self.clone();
         let scope = crate::extension_host::Scope {
             workspace: scope.workspace,
             ceiling: Some(scope.capabilities),
+            // Nobody watches the check, so each of its host calls is held
+            // to the conversation's grant as it stands at that moment.
+            current: Some(crate::extension_host::CurrentCeiling::new(move || {
+                gateway.scope(thread).ok().map(|scope| scope.capabilities)
+            })),
         };
         let output = self
             .extensions
@@ -408,7 +411,8 @@ impl Gateway {
         let message = output.fired.map(|report| {
             let (report, hidden) = a206_injection_scan::remove_hidden(report);
             let report = a206_leak_scan::redact(&report).map_or(report, |redacted| redacted.text);
-            let mut kinds: Vec<&str> = a206_injection_scan::find(&report)
+            // Only what the message includes is pointed out.
+            let mut kinds: Vec<&str> = a206_injection_scan::find(report_shown(&report))
                 .into_iter()
                 .map(|found| found.kind)
                 .collect();
@@ -426,26 +430,18 @@ impl Gateway {
         });
         Ok((message, output.cursor))
     }
-    /// Keep what a trigger check's extension returned for the job's next check.
-    fn keep_cursor(&self, id: Id, cursor: Option<ByteBuf>) -> Result<()> {
-        let mut store = self.lock()?;
-        let Some(job) = store.state.jobs.iter_mut().find(|job| job.id == id) else {
-            // Removed while it ran: nothing to keep.
-            return Ok(());
-        };
-        if job.cursor != cursor {
-            job.cursor = cursor;
-            store.persist(None)?;
-        }
-        Ok(())
-    }
     /// Apply `change` to run `run` of job `id`, given the job's current
     /// messenger destination: to `Job::last` while it is that run, else to
     /// its row in the history. `None` when the job, or the run, is gone.
+    ///
+    /// `cursor`, when given, becomes the job's trigger cursor in the same
+    /// write, but only while `run` is its latest run: a check that started
+    /// earlier must not undo what a newer one kept.
     fn update_run<T>(
         &self,
         id: Id,
         run: Id,
+        cursor: Option<Option<ByteBuf>>,
         change: impl FnOnce(Option<String>, &mut JobRun) -> T,
     ) -> Result<Option<T>> {
         let mut store = self.lock()?;
@@ -455,7 +451,13 @@ impl Gateway {
         };
         let to = job.deliver_to.clone();
         let (result, settled) = match &mut job.last {
-            Some(last) if last.id == run => (change(to, last), None),
+            Some(last) if last.id == run => {
+                let result = change(to, last);
+                if let Some(cursor) = cursor {
+                    job.cursor = cursor;
+                }
+                (result, None)
+            }
             // A newer run is the latest; this one changes in the history only.
             _ => {
                 let Some(mut earlier) = store
@@ -478,16 +480,19 @@ impl Gateway {
     /// Record how a run ended. When it has a reply to post and the job a
     /// destination, the run is recorded as posting and the destination
     /// returned, so a gateway stopped while posting leaves a record of it.
+    /// A trigger check's `cursor` is kept with the outcome, as
+    /// [`Self::update_run`] describes.
     fn finish_job(
         &self,
         id: Id,
         run: Id,
         outcome: JobOutcome,
         posts: bool,
+        cursor: Option<Option<ByteBuf>>,
     ) -> Result<Option<String>> {
         let ended = Some(now());
         let posts = posts && outcome == JobOutcome::Complete;
-        let recorded = self.update_run(id, run, |to, last| {
+        let recorded = self.update_run(id, run, cursor, |to, last| {
             let to = to.filter(|_| posts);
             last.outcome = outcome;
             last.ended = ended;

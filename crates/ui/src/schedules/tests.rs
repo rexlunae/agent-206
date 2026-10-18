@@ -372,12 +372,13 @@ fn trigger_fields_become_arguments_of_their_declared_kinds() {
     let count = arbitrary(1_000_000) as i64;
     let mut inputs = std::collections::BTreeMap::new();
     inputs.insert(text.name.clone(), format!(" {value} "));
-    inputs.insert(number.name.clone(), count.to_string());
+    inputs.insert(number.name.clone(), format!(" {count} "));
     inputs.insert(flag.name.clone(), "true".into());
     inputs.insert(ratio.name.clone(), "0.5".into());
     inputs.insert(optional.name.clone(), "  ".into());
     let args = trigger_args(&params, &inputs).unwrap();
-    assert_eq!(args[&text.name], Value::Str(value));
+    // A string keeps its spaces; a parsed value does not need them gone.
+    assert_eq!(args[&text.name], Value::Str(format!(" {value} ")));
     assert_eq!(args[&number.name], Value::Int(count));
     assert_eq!(args[&flag.name], Value::Bool(true));
     assert_eq!(args[&ratio.name], Value::Float(0.5));

@@ -1382,6 +1382,16 @@ async fn a_trigger_check_reports_a_changed_file_to_its_conversation() {
         .await,
     );
     assert_eq!(unknown.kind, ErrorKind::NotFound, "{unknown:?}");
+    // The job's text leaves room for the report in one message.
+    let mut long = schedule(
+        EXTENSION,
+        vec![("path", extension::Value::Str(path.clone()))],
+    );
+    if let Command::ScheduleJob { text, .. } = &mut long {
+        *text = "a".repeat(a206_core::schedule::MAX_TRIGGER_TEXT + 1);
+    }
+    let long = failure(rig.run(long).await);
+    assert_eq!(long.kind, ErrorKind::InvalidRequest, "{long:?}");
 
     let instructions = nonce();
     let Command::ScheduleJob {
