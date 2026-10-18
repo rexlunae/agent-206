@@ -426,6 +426,9 @@ until the user permits them on that conversation.
   (`profile`): its mode and model become the defaults, its capabilities narrow
   the grant and its instructions join the subagent's prompt. A profile only
   narrows; see [agent-profiles.md](agent-profiles.md).
+- A team coordinator's `subagent_spawn` offers only the team's member profiles
+  and requires one, and the gateway refuses any other; see
+  [agent-teams.md](agent-teams.md).
 - `CancelRun` cancels the thread's run and the runs of every thread delegated
   from it, whoever started them. A subagent run is reserved under its parent's
   run token before `subagent_spawn`/`subagent_send` returns, and only that
@@ -439,7 +442,8 @@ delegator reaches the gateway's tool hosts through a weak link, so the hosts
 holding it never keep a closed gateway alive. A gateway that gains a tool host
 (`with_tool_host`) gets subagent tools bound to its own host list, so its other
 clones keep theirs. Tests: `crates/runtime/tests/tool_loop.rs` (spawn,
-inherited permissions, wait, cascading cancel, refusals, steering, profiles),
+inherited permissions, wait, cascading cancel, refusals, steering, profiles,
+teams),
 `delegation_tool/tests.rs` and `gateway/delegation/tests.rs` (reservations,
 clones, waiting on user-started runs).
 
@@ -539,13 +543,18 @@ offered. Clients: a plan card above the composer in the shared conversation view
 ## Messages out (`send_message`)
 
 `runtime/src/message_tool.rs` offers `send_message`, after RustyClaw's
-`message` tool, while the user has an enabled webhook messenger they have not
-disconnected. Its arguments are `destination`, the webhook's entry name (an
-enum of the current names), and `text`. The host's policy is Ask, so even a
+`message` tool, while the user has an enabled webhook messenger, or an
+allowed chat of an enabled Telegram, Matrix, Discord, Slack or Beeper
+messenger, that they have not disconnected. Its arguments are `destination`,
+a webhook's entry name or `name/chat` for a chat (an enum of the current
+destinations; the gateway checks the destination again when sending), and
+`text`. The host's policy is Ask, so even a
 conversation that permits the tool approves each call, and the host refuses
 any call the user did not approve. The result names the destination and the
-number of parts sent; the webhook URL never appears in the listing, the
-result or the conversation. See [messengers.md](messengers.md#webhooks).
+number of parts sent; the webhook URL or bot token never appears in the
+listing, the result or the conversation. See
+[messengers.md](messengers.md#webhooks) and
+[posting to chats](messengers.md#posting-to-chats).
 
 ## Output rules
 

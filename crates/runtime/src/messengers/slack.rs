@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 const SERVICE: &str = "Slack";
 /// Slack truncates messages past 40,000 characters and advises at most
 /// 4,000; split at that, counting UTF-16 code units.
-const MAX_MESSAGE_UNITS: usize = 4000;
+pub(super) const MAX_MESSAGE_UNITS: usize = 4000;
 /// How many recent messages are remembered, so one Slack delivers again
 /// (an envelope retried before its acknowledgement arrived, possibly on the
 /// next socket) is not answered twice.

@@ -72,6 +72,8 @@ enforces is the file as it is then.
   from.
 - The Modes settings page lists every profile and every unusable file.
 - `agent206 profiles` prints the same listing as TOML.
+- Agent teams start a coordinator and members from profiles
+  ([agent-teams.md](agent-teams.md)).
 
 ## Not yet
 

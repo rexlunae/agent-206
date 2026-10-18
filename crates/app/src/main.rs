@@ -17,6 +17,8 @@ mod running_cli;
 mod schedule_cli;
 #[cfg(all(unix, not(target_arch = "wasm32")))]
 mod setup_cli;
+#[cfg(not(target_arch = "wasm32"))]
+mod teams_cli;
 #[cfg(all(unix, not(target_arch = "wasm32")))]
 mod vault_cli;
 #[cfg(not(target_arch = "wasm32"))]
@@ -137,6 +139,12 @@ mod native {
         /// Show the agent profiles subagents can start from, and any profile
         /// file that could not be used.
         Profiles,
+        /// Show the agent teams a conversation can start, and any team file
+        /// that could not be used; or start one.
+        Teams {
+            #[command(subcommand)]
+            command: Option<crate::teams_cli::TeamAction>,
+        },
         /// Show gateway and workspace status without starting a service.
         Status,
         /// Export the current workspace snapshot as TOML.
@@ -782,6 +790,9 @@ mod native {
                 }
                 if let Action::Profiles = action {
                     return crate::profiles_cli::run(&client).await;
+                }
+                if let Action::Teams { command } = action {
+                    return crate::teams_cli::run(&client, command).await;
                 }
                 let command = match action {
                     Action::Providers {

@@ -49,8 +49,8 @@ pub enum ProfileError {
     Instructions,
     #[error("`connection` names which connection lists `model`, so it needs `model`")]
     ConnectionWithoutModel,
-    #[error("only the first {MAX_PROFILES} profile files are read")]
-    TooMany,
+    #[error("only the first {limit} files are read")]
+    TooMany { limit: usize },
     #[error("no agent profile is named `{0}`")]
     Unknown(String),
     #[error("agent profile `{0}` could not be read")]
@@ -85,7 +85,7 @@ impl crate::error::Classified for ProfileError {
             | Self::Description
             | Self::Instructions
             | Self::ConnectionWithoutModel
-            | Self::TooMany
+            | Self::TooMany { .. }
             | Self::Mode { .. }
             | Self::AmbiguousModel { .. }
             | Self::ModelMismatch { .. } => ErrorKind::InvalidRequest,
@@ -113,6 +113,44 @@ struct File {
 /// Every profile in `dir`, by ID, with the files that could not be used. A
 /// missing directory holds no profiles.
 pub fn load(dir: &Path) -> Result<AgentProfiles, ProfileError> {
+    let (profiles, problems) = load_dir(dir, MAX_PROFILES, "Additional profile files", |s| {
+        parse(&s.id, &s.text, s.digest)
+    })?;
+    Ok(AgentProfiles { profiles, problems })
+}
+
+/// The profile named `id` in `dir`.
+pub fn find(dir: &Path, id: &str) -> Result<AgentProfile, ProfileError> {
+    match source(dir, id) {
+        Ok(None) => Err(ProfileError::Unknown(id.into())),
+        Ok(Some(s)) => parse(&s.id, &s.text, s.digest),
+        Err(error) => Err(error),
+    }
+    .map_err(|error| match error {
+        ProfileError::Unknown(_) => error,
+        error => ProfileError::Unusable(id.into(), Box::new(error)),
+    })
+}
+
+/// One `<id>.toml` file's ID, text and SHA-256.
+pub(crate) struct Source {
+    pub id: String,
+    pub text: String,
+    pub digest: String,
+}
+
+/// Each usable file of a directory of `<id>.toml` files, read with `parse`,
+/// in name order, beside a problem for each that is not. At most `limit`
+/// are read; `excess` names the rest. A missing directory holds none.
+pub(crate) fn load_dir<T, E>(
+    dir: &Path,
+    limit: usize,
+    excess: &str,
+    parse: impl Fn(Source) -> Result<T, E>,
+) -> Result<(Vec<T>, Vec<ProfileProblem>), ProfileError>
+where
+    E: std::error::Error + crate::error::Classified + From<ProfileError> + 'static,
+{
     let directory = |source| ProfileError::Directory {
         path: dir.to_owned(),
         source,
@@ -120,60 +158,58 @@ pub fn load(dir: &Path) -> Result<AgentProfiles, ProfileError> {
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(AgentProfiles::default());
+            return Ok(Default::default());
         }
         Err(source) => return Err(directory(source)),
     };
     let mut files = BTreeSet::new();
-    let mut excess = false;
+    let mut more = false;
     for entry in entries {
         let path = entry.map_err(directory)?.path();
         if path.extension().is_some_and(|e| e == "toml") {
             files.insert(path);
-            if files.len() > MAX_PROFILES {
+            if files.len() > limit {
                 files.pop_last();
-                excess = true;
+                more = true;
             }
         }
     }
-    let mut loaded = AgentProfiles::default();
+    let (mut found, mut problems) = (vec![], vec![]);
     for path in &files {
         let file = path
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
-        match read(path) {
-            Ok(profile) => loaded.profiles.push(profile),
-            Err(error) => loaded.problems.push(ProfileProblem {
+        match read(path).map_err(E::from).and_then(&parse) {
+            Ok(item) => found.push(item),
+            Err(error) => problems.push(ProfileProblem {
                 file,
                 error: crate::error::report(&error),
             }),
         }
     }
-    if excess {
-        loaded.problems.push(ProfileProblem {
-            file: String::from("Additional profile files"),
-            error: crate::error::report(&ProfileError::TooMany),
+    if more {
+        problems.push(ProfileProblem {
+            file: excess.into(),
+            error: crate::error::report(&ProfileError::TooMany { limit }),
         });
     }
-    Ok(loaded)
+    Ok((found, problems))
 }
 
-/// The profile named `id` in `dir`.
-pub fn find(dir: &Path, id: &str) -> Result<AgentProfile, ProfileError> {
+/// The file `<id>.toml` in `dir`, or `None` if there is none.
+pub(crate) fn source(dir: &Path, id: &str) -> Result<Option<Source>, ProfileError> {
     if !valid_id(id) {
-        return Err(ProfileError::Unknown(id.into()));
+        return Ok(None);
     }
     let path = dir.join(format!("{id}.toml"));
     match std::fs::symlink_metadata(&path) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            Err(ProfileError::Unknown(id.into()))
-        }
-        _ => read(&path).map_err(|error| ProfileError::Unusable(id.into(), Box::new(error))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        _ => read(&path).map(Some),
     }
 }
 
-fn read(path: &Path) -> Result<AgentProfile, ProfileError> {
+fn read(path: &Path) -> Result<Source, ProfileError> {
     let id = path
         .file_stem()
         .and_then(|s| s.to_str())
@@ -194,7 +230,24 @@ fn read(path: &Path) -> Result<AgentProfile, ProfileError> {
     }
     let digest = crate::instructions::hex(&Sha256::digest(&bytes));
     let text = String::from_utf8(bytes).map_err(ProfileError::Utf8)?;
-    parse(id, &text, digest)
+    Ok(Source {
+        id: id.into(),
+        text,
+        digest,
+    })
+}
+
+/// `text` trimmed, or `None` when blank; refused when over `limit` bytes.
+pub(crate) fn optional(
+    text: Option<String>,
+    limit: usize,
+    error: ProfileError,
+) -> Result<Option<String>, ProfileError> {
+    let text = text.map(|t| t.trim().to_owned()).filter(|t| !t.is_empty());
+    match text {
+        Some(t) if t.len() > limit => Err(error),
+        text => Ok(text),
+    }
 }
 
 /// A profile from its file's text.
@@ -207,16 +260,7 @@ pub fn parse(id: &str, text: &str, digest: String) -> Result<AgentProfile, Profi
     if name.is_empty() || name.len() > MAX_NAME {
         return Err(ProfileError::Name);
     }
-    let description = file
-        .description
-        .map(|d| d.trim().to_owned())
-        .filter(|d| !d.is_empty());
-    if description
-        .as_ref()
-        .is_some_and(|d| d.len() > MAX_DESCRIPTION)
-    {
-        return Err(ProfileError::Description);
-    }
+    let description = optional(file.description, MAX_DESCRIPTION, ProfileError::Description)?;
     if file.instructions.len() > MAX_INSTRUCTIONS {
         return Err(ProfileError::Instructions);
     }

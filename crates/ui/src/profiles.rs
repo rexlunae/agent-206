@@ -2,11 +2,8 @@
 //! creating a delegated conversation. Profiles are files in the gateway's
 //! profile, so both read a fresh listing rather than the snapshot.
 use crate::{State, call, dispatch, error::ErrorNotice};
-use a206_core::{
-    AgentProfile, AgentProfiles, Command, ErrorReport, Mode, ModelKey, ProviderConfig, Reply,
-};
+use a206_core::{AgentProfile, AgentProfiles, Command, ErrorReport, Reply};
 use fc_dioxus::prelude::*;
-use std::collections::BTreeSet;
 use uuid::Uuid;
 
 async fn load() -> Result<AgentProfiles, ErrorReport> {
@@ -33,24 +30,7 @@ fn selected<'a>(
     }
 }
 
-/// The mode and model a delegated conversation started from `profile` asks
-/// for: the profile's mode (Plan when it names none) and the first of the
-/// `permitted` models it names. `None` when it names none of them.
-pub(crate) fn delegation(
-    profile: Option<&AgentProfile>,
-    permitted: &BTreeSet<ModelKey>,
-    providers: &[ProviderConfig],
-) -> Option<(Mode, ModelKey)> {
-    let mode = profile.and_then(|p| p.mode).unwrap_or(Mode::Plan);
-    let mut matching = permitted
-        .iter()
-        .filter(|key| profile.is_none_or(|p| p.names(key, providers)));
-    let model = matching.next()?;
-    if profile.is_some_and(|p| p.model.is_some()) && matching.next().is_some() {
-        return None;
-    }
-    Some((mode, model.clone()))
-}
+pub(crate) use a206_core::profiles::delegation;
 
 /// The profiles on the Modes page, with any file that could not be used.
 #[component]
