@@ -437,6 +437,9 @@ pub struct Gateway {
     messengers: tokio::sync::watch::Sender<Vec<crate::messengers::Desired>>,
     /// Messengers the user disconnected; they connect again only on request.
     messengers_stopped: Arc<Mutex<BTreeSet<String>>>,
+    /// Running IRC and Signal sessions `send_message` posts through, by
+    /// messenger name.
+    posters: tokio::sync::watch::Sender<BTreeMap<String, crate::messengers::Poster>>,
     mcp: McpClient,
     /// This gateway's subagent tools and the hosts their subagents run with.
     delegation: delegation::Binding,
@@ -611,6 +614,7 @@ impl Gateway {
             pairings: tokio::sync::watch::Sender::new(0),
             messengers: tokio::sync::watch::Sender::new(desired),
             messengers_stopped: Arc::new(Mutex::new(BTreeSet::new())),
+            posters: tokio::sync::watch::Sender::new(BTreeMap::new()),
             mcp,
             delegation: Default::default(),
             reserved: Arc::default(),

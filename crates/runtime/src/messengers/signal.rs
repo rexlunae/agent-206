@@ -32,7 +32,7 @@ const SERVICE: &str = "Signal";
 /// members stay well under this; anything longer ends the session.
 const MAX_LINE: usize = 1 << 20;
 /// Characters per message, as Signal's own clients send them.
-const MAX_MESSAGE: usize = 2000;
+pub(crate) const MAX_MESSAGE: usize = 2000;
 /// Most parts one reply is sent as.
 const MAX_PARTS: usize = 8;
 /// Ends a reply that did not fit in [`MAX_PARTS`] messages.
@@ -214,19 +214,45 @@ impl Signal {
     }
 
     async fn reply(&self, chat: &str, text: &str) -> Result<()> {
-        let ended = || MessengerError::SocketEnded { service: SERVICE };
         let session = self.session.as_ref().ok_or_else(ended)?;
-        let (done, answer) = oneshot::channel();
-        session
-            .outgoing
-            .send(Reply {
-                chat: chat.to_owned(),
-                text: text.to_owned(),
-                done,
-            })
-            .await
-            .map_err(|_| ended())?;
-        answer.await.map_err(|_| ended())?
+        request(&session.outgoing, chat, text).await
+    }
+
+    /// A way for `send_message` to post through the running session. Its
+    /// posts are not replies to the batch being handled, so a failed one
+    /// does not count against that batch.
+    pub(crate) fn poster(&self) -> Option<Poster> {
+        let session = self.session.as_ref()?;
+        Some(Poster(session.outgoing.downgrade()))
+    }
+}
+
+fn ended() -> MessengerError {
+    MessengerError::SocketEnded { service: SERVICE }
+}
+
+async fn request(outgoing: &mpsc::Sender<Reply>, chat: &str, text: &str) -> Result<()> {
+    let (done, answer) = oneshot::channel();
+    outgoing
+        .send(Reply {
+            chat: chat.to_owned(),
+            text: text.to_owned(),
+            done,
+        })
+        .await
+        .map_err(|_| ended())?;
+    answer.await.map_err(|_| ended())?
+}
+
+/// Posts through a session without keeping it open: once the session ends,
+/// a post fails as [`MessengerError::SocketEnded`].
+#[derive(Clone)]
+pub(crate) struct Poster(mpsc::WeakSender<Reply>);
+impl Poster {
+    /// Send `text`, at most [`MAX_MESSAGE`] characters, as one message.
+    pub(crate) async fn send(&self, chat: &str, text: &str) -> Result<()> {
+        let outgoing = self.0.upgrade().ok_or_else(ended)?;
+        request(&outgoing, chat, text).await
     }
 }
 

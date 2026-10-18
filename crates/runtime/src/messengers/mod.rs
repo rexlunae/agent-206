@@ -25,6 +25,7 @@ use a206_core::{MessengerState, MessengerStatus};
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
@@ -129,6 +130,8 @@ pub enum MessengerError {
         "the message is longer than this destination takes ({most} characters); send a shorter one"
     )]
     MessageTooLong { most: usize },
+    #[error("the message takes more than {most} IRC lines; send a shorter one")]
+    TooManyLines { most: usize },
     #[error("{sent} of {total} parts were sent before one failed")]
     PartlySent {
         sent: usize,
@@ -185,7 +188,8 @@ impl crate::error::Classified for MessengerError {
             | Self::SendOnly { .. }
             | Self::NoChatPosts { .. }
             | Self::EmptyMessage
-            | Self::MessageTooLong { .. } => ErrorKind::InvalidRequest,
+            | Self::MessageTooLong { .. }
+            | Self::TooManyLines { .. } => ErrorKind::InvalidRequest,
             Self::NoDestination { .. } => ErrorKind::NotFound,
             Self::NoPairing => ErrorKind::Unavailable,
             Self::Withdrawn { .. } => ErrorKind::Cancelled,
@@ -419,6 +423,23 @@ impl Adapter {
             Self::Irc(adapter) => adapter.join(chat).await,
         }
     }
+    /// How `send_message` posts through this adapter's running session,
+    /// for kinds that send over the session's own connection.
+    fn poster(&self, config: &MessengerConfig) -> Option<Poster> {
+        let link = match self {
+            Self::Irc(adapter) => Link::Irc(adapter.poster()?),
+            Self::Signal(adapter) => Link::Signal(adapter.poster()?),
+            Self::Telegram(_)
+            | Self::Matrix(_)
+            | Self::Discord(_)
+            | Self::Slack(_)
+            | Self::Beeper(_) => return None,
+        };
+        Some(Poster {
+            config: Arc::new(config.clone()),
+            link,
+        })
+    }
     async fn send(&self, chat: &str, text: &str) -> Result<()> {
         match self {
             Self::Telegram(adapter) => adapter.send(chat, text).await,
@@ -454,6 +475,29 @@ pub trait Host: Clone + Send + Sync + 'static {
     ) -> impl Future<Output = Result<Option<String>>> + Send;
     /// Change the messenger's published status.
     fn update(&self, name: &str, change: impl FnOnce(&mut MessengerStatus) + Send);
+    /// Offer the running session of messenger `name` to `send_message`, or
+    /// withdraw it with `None` once the messenger stops.
+    fn post_through(&self, name: &str, poster: Option<Poster>);
+}
+
+/// How `send_message` posts to an IRC or Signal chat: through the
+/// messenger's running session, which holds the only connection, for the
+/// configuration that session runs with.
+#[derive(Clone)]
+pub struct Poster {
+    config: Arc<MessengerConfig>,
+    link: Link,
+}
+#[derive(Clone)]
+enum Link {
+    Irc(irc::Poster),
+    Signal(signal::Poster),
+}
+impl Poster {
+    /// The configuration the session runs with.
+    pub fn config(&self) -> &MessengerConfig {
+        &self.config
+    }
 }
 
 /// A configured messenger and whether it should run now.
@@ -620,6 +664,9 @@ async fn run<H: Host>(
             host.update(&name, |s| s.state = MessengerState::Stopped);
         }
     }
+    // The supervisor awaits this before starting the messenger again, so a
+    // newer session's poster is never withdrawn here.
+    host.post_through(&name, None);
 }
 
 /// How far one account's updates are handled. Cursors are per account, and
@@ -684,6 +731,9 @@ async fn session<H: Host>(
     };
     let adapter = &mut adapter.1;
     let mut account = adapter.connect().await?;
+    if let Some(poster) = adapter.poster(config) {
+        host.post_through(&config.name, Some(poster));
+    }
     host.update(&config.name, |s| {
         s.state = MessengerState::Connected;
         s.account = account.name.clone();
@@ -945,10 +995,17 @@ async fn send_in_parts<F: Future<Output = Result<()>>>(
     Ok(total)
 }
 
-/// The longest part `send_message` posts to a chat of `kind`, or `None` if a
-/// model cannot post to its chats outside a reply. Kinds that send each part
-/// with one request through the broker can; IRC and Signal send over the
-/// running messenger's own connection, which is not shared with the tool.
+/// Whether a model can post to chats of `kind` outside a reply: with one
+/// request through the broker per part ([`chat_part_limit`]), or for IRC and
+/// Signal through the running session ([`post_through`]).
+pub fn posts_to_chats(kind: MessengerKind) -> bool {
+    chat_part_limit(kind).is_some() || matches!(kind, MessengerKind::Irc | MessengerKind::Signal)
+}
+
+/// The longest part `send_message` posts to a chat of `kind` with one
+/// request through the broker, or `None` for kinds it does not post to that
+/// way. IRC and Signal send over the running messenger's own connection,
+/// through [`post_through`].
 pub fn chat_part_limit(kind: MessengerKind) -> Option<usize> {
     match kind {
         MessengerKind::Telegram => Some(telegram::MAX_MESSAGE_UNITS),
@@ -982,6 +1039,35 @@ pub(crate) async fn post(
         adapter.send(chat, &part).await
     })
     .await
+}
+
+/// Post `text` to `chat` through `poster`'s running session; the number of
+/// parts sent. IRC posts each line as a part, refusing a message that needs
+/// more lines than a reply may have; Signal posts parts of one message each.
+/// See [`send_in_parts`] for `withdrawn`.
+pub(crate) async fn post_through(
+    poster: &Poster,
+    chat: &str,
+    text: &str,
+    withdrawn: impl Fn() -> bool,
+) -> Result<usize> {
+    let name = &poster.config.name;
+    match &poster.link {
+        Link::Irc(link) => {
+            let lines = irc::post_lines(chat, text)?;
+            send_in_parts(name, lines, withdrawn, |line| async move {
+                link.send(chat, &line).await
+            })
+            .await
+        }
+        Link::Signal(link) => {
+            let parts = sent_parts(text, signal::MAX_MESSAGE)?;
+            send_in_parts(name, parts, withdrawn, |part| async move {
+                link.send(chat, &part).await
+            })
+            .await
+        }
+    }
 }
 
 /// Destination-bound requests through the vault broker for one messenger.
