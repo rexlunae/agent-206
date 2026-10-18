@@ -5,7 +5,8 @@ talk to a thread from that service. Telegram, Matrix, Discord, Slack, IRC,
 Signal and Beeper (which reaches WhatsApp, iMessage, Google Chat and the
 other networks Beeper Desktop connects to) are implemented, and webhook
 messengers let a model post to Slack, Discord, Google Chat, Teams and other
-incoming webhooks with the user's approval;
+incoming webhooks with the user's approval, as it can to the allowed chats of
+most receiving messengers;
 RustyClaw's other channels are listed in
 [parity.md](parity.md#messengers--channels).
 
@@ -470,6 +471,30 @@ agent206 messenger enable team-hook
   rest, and the error says how many were delivered. The last failure is shown
   on the Messengers page until a send succeeds.
 
+## Posting to chats
+
+`send_message` also posts to the allowed chats of a running Telegram, Matrix,
+Discord, Slack or Beeper messenger, outside any turn of that chat. The
+destination is `name/chat`, the entry's name and the chat's id as it is
+listed in `allowed_chats`; only chats of messengers that are enabled, not
+disconnected and connected right now are offered, so a messenger that failed
+(for example on a refused token) offers none. If the user allowed more chats
+than fit in the tool's schema, the destinations are not listed and the model
+asks the user which chat they mean; the gateway checks every destination it
+is given either way. The same rules apply as for a webhook: the user
+approves each call, the gateway refuses a destination that is not an
+allowed chat of a running messenger even after approval, a long message goes
+out in at most eight parts of the service's message length, and a part is
+not sent once the user disables or disconnects the messenger or removes the
+chat. The message is sent the way a reply is, so Matrix still never posts to
+an encrypted room. Chat titles are not shown to the model, since they come
+from the chat service; the user names the chat in the conversation. A failed
+post is reported in the tool's result in the conversation, not on the
+Messengers page, whose status for a chat messenger is its connection.
+
+IRC and Signal chats cannot be posted to yet: they send over the running
+messenger's own connection, which the tool does not share.
+
 ## Interface for the run engine
 
 `a206_runtime::messengers::Host` is the boundary between a messenger and the
@@ -496,7 +521,7 @@ participant cannot approve their own request.
 
 - WhatsApp, Google Chat and iMessage on their own (they are reached through
   Beeper), and Teams conversations (webhooks only post to a channel).
-- Sending to the chats of receiving messengers with `send_message`, a test
+- Posting to IRC and Signal chats with `send_message`, a test
   send from the Messengers page or CLI, webhook delivery of scheduled
   messages' replies, and importing RustyClaw webhook entries (reported as an
   unknown kind, since their URL is the secret).

@@ -17,7 +17,7 @@ use std::time::Duration;
 const SERVICE: &str = "Discord";
 /// Discord's limit for one message. Splitting counts UTF-16 code units,
 /// which are never fewer than characters.
-const MAX_MESSAGE_UNITS: usize = 2000;
+pub(super) const MAX_MESSAGE_UNITS: usize = 2000;
 /// Guild messages, direct messages and message content. Message content
 /// is a privileged intent the bot's owner turns on in the developer portal.
 const INTENTS: u64 = (1 << 9) | (1 << 12) | (1 << 15);

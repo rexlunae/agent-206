@@ -18,6 +18,12 @@ use serde_json::{Map, Value, json};
 /// Sends a message to one of the user's webhooks.
 pub const SEND: &str = "send_message";
 
+/// Most bytes the destination list takes in the schema. The catalog drops a
+/// tool whose schema passes 32 KiB, and a user may allow hundreds of long
+/// chat ids; beyond this the destinations are not listed, and the gateway
+/// still checks each one it is given.
+const MAX_LISTED: usize = 24 * 1024;
+
 /// Why a `send_message` call was refused before anything was sent.
 #[derive(Debug, thiserror::Error)]
 pub enum MessageToolError {
@@ -55,13 +61,24 @@ impl MessageHost {
     }
 
     fn spec(destinations: Vec<String>) -> ToolSpec {
+        let listed =
+            serde_json::to_vec(&destinations).map_or(usize::MAX, |list| list.len()) <= MAX_LISTED;
+        let mut description = String::from(
+            "Send a message to one of the user's webhooks, such as a team chat channel, or to a chat the user allowed on one of their messengers (named `messenger/chat`). It is posted as it is, outside this conversation, and the user approves each call. Long messages are sent in a few parts, leaving out any part that would hold only whitespace; a message too long for the destination is refused whole.",
+        );
+        let mut destination = json!({"type": "string", "description": "A webhook by the name the user gave it, or `messenger/chat` for an allowed chat of a messenger."});
+        if listed {
+            destination["enum"] = json!(destinations);
+        } else {
+            description.push_str(" The user allowed too many destinations to list here; ask them which webhook or chat they mean.");
+        }
         ToolSpec {
             name: SEND.into(),
-            description: "Send a message to one of the user's webhooks, such as a team chat channel. It is posted as it is, outside this conversation, and the user approves each call. Long messages are sent in a few parts, leaving out any part that would hold only whitespace; a message too long for the webhook is refused whole.".into(),
+            description,
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "destination": {"type": "string", "enum": destinations, "description": "The webhook, by the name the user gave it."},
+                    "destination": destination,
                     "text": {"type": "string", "description": "The message, as plain text."}
                 },
                 "required": ["destination", "text"],
@@ -110,12 +127,7 @@ fn text<'a>(args: &'a Map<String, Value>, name: &'static str) -> Result<&'a str,
 impl ToolHost for MessageHost {
     fn list<'a>(&'a self, _scope: &'a ToolScope) -> BoxFuture<'a, ToolListing> {
         Box::pin(async move {
-            let destinations: Vec<String> = self
-                .outbox
-                .destinations()
-                .into_iter()
-                .map(|(name, _)| name)
-                .collect();
+            let destinations = self.outbox.destinations();
             ToolListing {
                 tools: if destinations.is_empty() {
                     vec![]
@@ -137,5 +149,32 @@ impl ToolHost for MessageHost {
                 is_error: false,
             })
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn destinations_are_listed_unless_the_list_would_crowd_out_the_tool() {
+        let name = || uuid::Uuid::new_v4().simple().to_string();
+        let few: Vec<String> = (0..3).map(|_| name()).collect();
+        let spec = MessageHost::spec(few.clone());
+        assert_eq!(
+            spec.parameters["properties"]["destination"]["enum"],
+            json!(few)
+        );
+        // 256 chats of 255-byte ids, the most one messenger may allow.
+        let many: Vec<String> = (0..256)
+            .map(|_| format!("{}/{}", name(), "x".repeat(255)))
+            .collect();
+        let spec = MessageHost::spec(many);
+        let destination = &spec.parameters["properties"]["destination"];
+        assert!(destination.get("enum").is_none());
+        assert_eq!(destination["type"], "string");
+        let schema = serde_json::to_vec(&spec.parameters).unwrap().len();
+        assert!(schema < 32 * 1024, "{schema}");
+        assert!(spec.description.len() <= 4096);
     }
 }
