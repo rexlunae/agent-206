@@ -180,7 +180,7 @@ pub mod mcp;
 pub mod schedule;
 pub use mcp::{McpServerConfig, McpServerState, McpServerStatus, McpToolInfo, ToolPolicy};
 pub use providers::{ProviderApi, ProviderPreset, ProviderPresetList};
-pub use schedule::{Job, JobAuthor, JobOutcome, JobRun, Schedule, ScheduleInputError};
+pub use schedule::{Job, JobAuthor, JobKind, JobOutcome, JobRun, Schedule, ScheduleInputError};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1103,12 +1103,16 @@ pub enum Command {
         #[serde(default)]
         digest: Option<String>,
     },
-    /// Send `text` to `thread` on `schedule`. The job is enabled.
+    /// Send `text` (or, for a heartbeat check, `HEARTBEAT.md`) to `thread`
+    /// on `schedule`. The job is enabled.
     ScheduleJob {
         name: String,
         thread: Id,
+        /// The message; empty for a heartbeat check.
         text: String,
         schedule: Schedule,
+        #[serde(default)]
+        kind: JobKind,
     },
     /// Pause or resume a job; resuming computes its next time from now.
     SetJobEnabled {

@@ -1,7 +1,7 @@
 //! `agent206 schedule`: messages the gateway sends to a conversation at set
 //! times. Each run is an ordinary message under the conversation's grants.
 use a206_core::{
-    Command, Job, Reply, Schedule,
+    Command, Job, JobKind, Reply, Schedule,
     schedule::{parse_instant, parse_interval},
 };
 use a206_runtime::client::Client;
@@ -12,7 +12,8 @@ use clap::Subcommand;
 pub enum ScheduleAction {
     /// List scheduled messages with their next and latest runs.
     List,
-    /// Schedule a message. Give exactly one of --at, --in, --every or --cron.
+    /// Schedule a message (--text) or a heartbeat check of the project's
+    /// HEARTBEAT.md (--heartbeat). Give exactly one of --at, --in, --every or --cron.
     Add {
         /// The conversation the message is sent to.
         thread: uuid::Uuid,
@@ -20,8 +21,13 @@ pub enum ScheduleAction {
         #[arg(long)]
         name: String,
         /// The message text.
-        #[arg(long)]
-        text: String,
+        #[arg(long, required_unless_present = "heartbeat")]
+        text: Option<String>,
+        /// Send the checklist in HEARTBEAT.md at the conversation's project
+        /// root, read when the job runs; a reply of exactly HEARTBEAT_OK is
+        /// recorded as quiet.
+        #[arg(long, conflicts_with = "text")]
+        heartbeat: bool,
         /// Once, at an RFC 3339 time such as 2026-10-18T09:00:00Z.
         #[arg(long, group = "when")]
         at: Option<String>,
@@ -100,6 +106,7 @@ pub async fn run(client: &Client, action: ScheduleAction) -> Result<()> {
             thread,
             name,
             text,
+            heartbeat,
             at,
             after,
             every,
@@ -107,9 +114,14 @@ pub async fn run(client: &Client, action: ScheduleAction) -> Result<()> {
             cron,
             zone,
         } => Command::ScheduleJob {
+            kind: if heartbeat {
+                JobKind::Heartbeat
+            } else {
+                JobKind::Message
+            },
             name,
             thread,
-            text,
+            text: text.unwrap_or_default(),
             schedule: schedule(at, after, every, anchor, cron, zone)?,
         },
         ScheduleAction::Pause { id } => Command::SetJobEnabled { id, enabled: false },
@@ -184,5 +196,38 @@ mod tests {
         let fraction = format!("{seconds}.{}s", 1 + seconds % 9);
         assert!(schedule(None, None, Some(fraction), None, None, None).is_err());
         assert!(schedule(Some("tomorrow".into()), None, None, None, None, None).is_err());
+    }
+
+    #[test]
+    fn a_job_sends_either_text_or_a_heartbeat_check() {
+        #[derive(clap::Parser)]
+        struct Cli {
+            #[command(subcommand)]
+            action: ScheduleAction,
+        }
+        let thread = uuid::Uuid::new_v4().to_string();
+        let name = uuid::Uuid::new_v4().to_string();
+        let parse = |extra: &[&str]| {
+            let mut args = vec!["schedule", "add", &thread, "--name", &name, "--every", "1h"];
+            args.extend_from_slice(extra);
+            <Cli as clap::Parser>::try_parse_from(args).map(|cli| cli.action)
+        };
+        let Ok(ScheduleAction::Add {
+            text, heartbeat, ..
+        }) = parse(&["--heartbeat"])
+        else {
+            panic!("a heartbeat check was refused");
+        };
+        assert!(heartbeat && text.is_none());
+        let message = uuid::Uuid::new_v4().to_string();
+        let Ok(ScheduleAction::Add {
+            text, heartbeat, ..
+        }) = parse(&["--text", &message])
+        else {
+            panic!("a message was refused");
+        };
+        assert!(!heartbeat && text == Some(message.clone()));
+        assert!(parse(&[]).is_err(), "neither text nor a heartbeat");
+        assert!(parse(&["--text", &message, "--heartbeat"]).is_err());
     }
 }

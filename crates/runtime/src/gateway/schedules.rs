@@ -2,9 +2,14 @@
 //! `Send`, so it is admitted, journaled and run like a message the user typed,
 //! under the conversation's grants and permissions as they are at that time.
 //! A job that comes due while the gateway is stopped runs once when it starts.
+//! A heartbeat check reads the project's `HEARTBEAT.md` when it runs and sends
+//! it the same way; a reply of exactly `HEARTBEAT_OK` ends it as quiet.
 use super::{Gateway, GatewayError, Result};
-use crate::{error::check, provider::now, schedule};
-use a206_core::*;
+use crate::{error::check, provider::now, schedule, tools::ToolScope};
+use a206_core::{
+    schedule::{heartbeat_message, is_heartbeat_ok},
+    *,
+};
 use a206_protocol::Request;
 use std::time::Duration;
 
@@ -22,6 +27,7 @@ impl Gateway {
         name: String,
         thread: Id,
         text: String,
+        kind: JobKind,
         schedule: Schedule,
         author: JobAuthor,
     ) -> Result<Job> {
@@ -30,10 +36,16 @@ impl Gateway {
             !name.is_empty() && name.len() <= MAX_NAME,
             GatewayError::Invalid("job names are 1–200 bytes"),
         )?;
-        check(
-            !text.trim().is_empty() && text.len() <= MAX_TEXT,
-            GatewayError::Invalid("job messages are 1–131072 bytes"),
-        )?;
+        match kind {
+            JobKind::Message => check(
+                !text.trim().is_empty() && text.len() <= MAX_TEXT,
+                GatewayError::Invalid("job messages are 1–131072 bytes"),
+            )?,
+            JobKind::Heartbeat => check(
+                text.is_empty(),
+                GatewayError::Invalid("a heartbeat check sends HEARTBEAT.md and takes no text"),
+            )?,
+        }
         let created = now();
         // Relative schedules count from now by this clock, not the client's.
         let schedule = schedule::resolve(schedule, created)?;
@@ -61,6 +73,7 @@ impl Gateway {
             name,
             thread,
             text,
+            kind,
             schedule,
             enabled: true,
             created,
@@ -182,28 +195,19 @@ impl Gateway {
             return;
         };
         let gateway = self.clone();
-        let (id, thread, text) = (job.id, job.thread, job.text.clone());
+        let (id, thread, kind, text) = (job.id, job.thread, job.kind, job.text.clone());
         // Detached: the run belongs to the conversation, where the user sees
         // and can cancel it; shutdown cancels every run, which ends this task.
         drop(tokio::spawn(async move {
-            let reply = gateway
-                .request(Request {
-                    id: Id::new_v4(),
-                    body: Command::Send {
-                        thread,
-                        text,
-                        attachments: vec![],
-                    },
-                })
-                .await;
-            let outcome = match reply.body {
-                Reply::Thread(thread) => match thread.state {
-                    RunState::Complete => JobOutcome::Complete,
-                    RunState::Cancelled => JobOutcome::Cancelled,
-                    _ => JobOutcome::Failed,
-                },
-                Reply::Error(report) => JobOutcome::Refused(report),
-                _ => JobOutcome::Failed,
+            let text = match kind {
+                JobKind::Message => Ok(Some(text)),
+                JobKind::Heartbeat => gateway.heartbeat(thread, run).await,
+            };
+            let outcome = match text {
+                Err(error) => JobOutcome::Refused(crate::error::handle("schedule_job", &error)),
+                // An empty checklist has nothing to check.
+                Ok(None) => JobOutcome::Quiet,
+                Ok(Some(text)) => gateway.send_job(thread, kind, text).await,
             };
             // Nobody waits on this task, so a failure to record the outcome
             // is logged; the conversation still shows the run itself.
@@ -211,6 +215,51 @@ impl Gateway {
                 crate::error::handle("schedule_job", &error);
             }
         }));
+    }
+    /// Send a job's message to `thread` and report how its run ended.
+    async fn send_job(&self, thread: Id, kind: JobKind, text: String) -> JobOutcome {
+        let reply = self
+            .request(Request {
+                id: Id::new_v4(),
+                body: Command::Send {
+                    thread,
+                    text,
+                    attachments: vec![],
+                },
+            })
+            .await;
+        match reply.body {
+            Reply::Thread(thread) => ended(kind, &thread),
+            Reply::Error(report) => JobOutcome::Refused(report),
+            _ => JobOutcome::Failed,
+        }
+    }
+    /// The heartbeat check message for `thread`, from `HEARTBEAT.md` at its
+    /// project root as the conversation's grants allow reading it now, or
+    /// `None` when the checklist is empty.
+    async fn heartbeat(&self, thread: Id, run: Id) -> Result<Option<String>> {
+        let readable = |scope: &ToolScope| {
+            check(
+                crate::instructions::permitted(&scope.capabilities),
+                GatewayError::Denied(
+                    "this conversation may not read its project, so not HEARTBEAT.md",
+                ),
+            )
+        };
+        let scope = self.scope(thread)?;
+        let root = scope.workspace.clone().ok_or(GatewayError::NotFound(
+            "a heartbeat check needs a conversation with a project folder",
+        ))?;
+        readable(&scope)?;
+        let checklist =
+            tokio::task::spawn_blocking(move || crate::instructions::heartbeat(root)).await?;
+        // The grant may have been withdrawn while the file was read.
+        readable(&self.scope(thread)?)?;
+        match checklist.map_err(GatewayError::Heartbeat)? {
+            None => Err(GatewayError::NotFound("the project has no HEARTBEAT.md")),
+            Some(checklist) if checklist.trim().is_empty() => Ok(None),
+            Some(checklist) => Ok(Some(heartbeat_message(&checklist, run))),
+        }
     }
     fn finish_job(&self, id: Id, run: Id, outcome: JobOutcome) -> Result<()> {
         let mut store = self.lock()?;
@@ -275,7 +324,14 @@ impl Jobs {
         schedule: Schedule,
     ) -> std::result::Result<Job, ErrorReport> {
         self.base
-            .schedule_job(name, thread, text, schedule, JobAuthor::Agent { thread })
+            .schedule_job(
+                name,
+                thread,
+                text,
+                JobKind::Message,
+                schedule,
+                JobAuthor::Agent { thread },
+            )
             .map_err(|error| crate::error::report(&error))
     }
     /// The jobs that message `thread`.
@@ -302,6 +358,27 @@ impl Jobs {
             self.base.remove_job(id)
         })();
         removed.map(drop).map_err(|e| crate::error::report(&e))
+    }
+}
+
+/// How a job's run ended, from its conversation once the run returned.
+fn ended(kind: JobKind, thread: &Thread) -> JobOutcome {
+    match thread.state {
+        // Messages steered too late for the run follow its reply.
+        RunState::Complete
+            if kind == JobKind::Heartbeat
+                && thread
+                    .messages
+                    .iter()
+                    .rev()
+                    .find(|m| m.role == Role::Assistant)
+                    .is_some_and(|m| is_heartbeat_ok(&m.text)) =>
+        {
+            JobOutcome::Quiet
+        }
+        RunState::Complete => JobOutcome::Complete,
+        RunState::Cancelled => JobOutcome::Cancelled,
+        _ => JobOutcome::Failed,
     }
 }
 

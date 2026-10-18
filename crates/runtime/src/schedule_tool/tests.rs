@@ -73,6 +73,7 @@ async fn a_model_reaches_only_its_own_conversations_jobs_and_removes_only_its_ow
     let Reply::Job(users) = send(
         &g,
         Command::ScheduleJob {
+            kind: a206_core::JobKind::Message,
             name: nonce(),
             thread: mine,
             text: nonce(),
@@ -135,6 +136,7 @@ async fn a_conversation_keeps_a_bounded_number_of_jobs_its_models_added() {
     let user = send(
         &g,
         Command::ScheduleJob {
+            kind: a206_core::JobKind::Message,
             name: nonce(),
             thread: mine,
             text: nonce(),
@@ -235,6 +237,7 @@ async fn listings_stay_whole_json_below_the_output_cap() {
         let reply = send(
             &g,
             Command::ScheduleJob {
+                kind: a206_core::JobKind::Message,
                 name: nonce(),
                 thread: mine,
                 text: message.clone(),
