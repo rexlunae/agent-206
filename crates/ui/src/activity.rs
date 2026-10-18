@@ -525,6 +525,7 @@ mod tests {
         let mut snapshot = crate::empty_snapshot();
         let thread = Thread::new(Id::new_v4().simple().to_string(), Mode::Chat);
         let job = a206_core::schedule::Job {
+            kind: a206_core::JobKind::Message,
             id: Id::new_v4(),
             name: Id::new_v4().simple().to_string(),
             thread: thread.id,
