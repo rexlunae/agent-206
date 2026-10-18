@@ -2,7 +2,7 @@
 //! gateway setup, vault broker requests and settings API as the desktop and
 //! terminal clients. Every security decision stays with the broker.
 use crate::vault_cli;
-use a206_core::{Command, GatewayAction, GatewayPhase, GatewayTarget, Reply};
+use a206_core::{Command, GatewayAction, GatewayPhase, GatewayTarget, MessengerKind, Reply};
 use a206_import::{
     InactiveCategory, MessengerAction, Preview, ProviderAction, Receipt, Unsupported,
     UnsupportedMessenger, UnsupportedProvider, VaultPlan, VaultProtection,
@@ -226,7 +226,12 @@ fn print_preview(preview: &Preview) {
         if messenger.action != MessengerAction::Add {
             continue;
         }
-        if messenger.allowed_chats.is_empty() {
+        if let (Some(format), Some(endpoint)) = (messenger.format, &messenger.endpoint) {
+            println!(
+                "    a webhook that only sends, as {}; store its whole URL in the vault, bound to {endpoint}",
+                format.label()
+            );
+        } else if messenger.allowed_chats.is_empty() {
             println!("    no chat is allowed until you allow one");
         } else {
             println!(
@@ -252,7 +257,7 @@ fn print_preview(preview: &Preview) {
         }
         if messenger.token_left_behind {
             println!(
-                "    its token was stored in plain text and stays behind; add it to the vault yourself"
+                "    its token, password or webhook URL was stored in plain text and stays behind; add it to the vault yourself"
             );
         }
     }
@@ -460,9 +465,15 @@ pub async fn import(root: &Path, remote: Option<String>, source: ImportSource) -
                 .or_else(|| messenger.kind.and_then(|kind| kind.default_endpoint()))
                 .unwrap_or_default(),
         );
-        println!(
-            "To use messenger {name}: agent206 vault add {name}-token --kind token --destination {origin}, then agent206 messenger set {name} --credential {name}-token, agent206 messenger allow {name} <chat> and agent206 messenger enable {name}"
-        );
+        if messenger.kind.is_some_and(MessengerKind::is_send_only) {
+            println!(
+                "To use webhook {name}: agent206 vault add {name}-url --kind token --destination {origin} with the whole webhook URL as its value, then agent206 messenger set {name} --credential {name}-url and agent206 messenger enable {name}"
+            );
+        } else {
+            println!(
+                "To use messenger {name}: agent206 vault add {name}-token --kind token --destination {origin}, then agent206 messenger set {name} --credential {name}-token, agent206 messenger allow {name} <chat> and agent206 messenger enable {name}"
+            );
+        }
     }
     Ok(())
 }
