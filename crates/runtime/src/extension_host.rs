@@ -1278,6 +1278,7 @@ mod fetch;
 mod git;
 mod git_branch;
 mod git_commit;
+pub(crate) mod git_fetch;
 pub(crate) mod git_push;
 mod git_stage;
 mod git_switch;

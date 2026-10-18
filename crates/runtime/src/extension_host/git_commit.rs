@@ -187,16 +187,28 @@ impl Settings {
             .string(key)
             .or_else(|| self.user.string(key))
     }
-    /// Whether a `url.<base>.insteadOf` or `pushInsteadOf` rule, which git
-    /// applies to remote URLs, matches `url`.
-    pub(super) fn rewrites(&self, url: &str) -> bool {
+    /// Every value of a multi-valued setting, the user's first.
+    pub(super) fn strings(&self, key: &str) -> Vec<BString> {
+        [&self.user, &self.repository]
+            .into_iter()
+            .flat_map(|config| config.strings(key).unwrap_or_default())
+            .collect()
+    }
+    /// Whether a `url.<base>.insteadOf` rule, or for a push also a
+    /// `pushInsteadOf` rule, which git applies to remote URLs, matches `url`.
+    pub(super) fn rewrites(&self, url: &str, push: bool) -> bool {
+        let keys: &[&str] = if push {
+            &["insteadOf", "pushInsteadOf"]
+        } else {
+            &["insteadOf"]
+        };
         [&self.repository, &self.user].into_iter().any(|config| {
             config
                 .sections_by_name("url")
                 .into_iter()
                 .flatten()
                 .any(|section| {
-                    ["insteadOf", "pushInsteadOf"].iter().any(|key| {
+                    keys.iter().any(|key| {
                         section
                             .values(key)
                             .iter()

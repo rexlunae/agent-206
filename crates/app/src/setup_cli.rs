@@ -16,6 +16,8 @@ use std::path::{Path, PathBuf};
 pub enum ImportSource {
     /// Review one Claude Code settings.json scope on the gateway host.
     ReviewClaudeCode { path: PathBuf },
+    /// Review the model providers in one Codex config.toml directory on the gateway host.
+    ReviewCodex { path: PathBuf },
     /// Review RustyClaw settings on the gateway host, without changing them.
     ReviewRustyclaw { path: PathBuf },
     /// Apply selected zero-based item indices from a held gateway review.
@@ -288,6 +290,17 @@ pub async fn import(root: &Path, remote: Option<String>, source: ImportSource) -
                 remote,
                 Command::PreviewSourceImport {
                     tool: a206_import::Tool::ClaudeCode,
+                    source: path,
+                },
+            )
+            .await;
+        }
+        ImportSource::ReviewCodex { path } => {
+            return review_command(
+                root,
+                remote,
+                Command::PreviewSourceImport {
+                    tool: a206_import::Tool::Codex,
                     source: path,
                 },
             )

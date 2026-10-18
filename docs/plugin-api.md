@@ -490,8 +490,9 @@ ceiling: Some(thread grant) })` after the conversation permits the tool.
 Provider JSON arguments convert kind for kind to `a206_core::extension::Args`.
 Tool text is extension output, never instructions.
 
-Pushing is not a host call. It is the native `git_push` tool
-([run-engine.md](run-engine.md#pushing-git-branches-git_push)), because it needs
+Pushing and fetching are not host calls. They are the native `git_push` and
+`git_fetch` tools ([run-engine.md](run-engine.md#pushing-git-branches-git_push)),
+because they need
 the vault broker, an approval of each call and more time than an extension
 invocation has.
 

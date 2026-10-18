@@ -2715,11 +2715,11 @@ async fn reviewed_migration_reports_confirmed_copy_and_failed_receipt_separately
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn git_calls_send_the_token_as_basic_auth_to_the_receive_pack_service() {
+async fn git_calls_send_the_token_as_basic_auth_to_the_service_they_name() {
     use axum::{
         Router,
         body::Bytes,
-        extract::RawQuery,
+        extract::{Path, RawQuery},
         http::{HeaderMap, StatusCode, header},
         routing::{get, post},
     };
@@ -2750,13 +2750,19 @@ async fn git_calls_send_the_token_as_basic_auth_to_the_receive_pack_service() {
             .route(
                 "/team/repo.git/info/refs",
                 get(move |RawQuery(query): RawQuery, headers: HeaderMap| {
+                    // The advertisement of the service asked for.
+                    let service = query
+                        .as_deref()
+                        .and_then(|q| q.strip_prefix("service="))
+                        .unwrap_or_default()
+                        .to_owned();
                     record(&a, "refs", query, &headers, vec![]);
                     let advertised = advertised.clone();
                     async move {
                         (
                             [(
                                 header::CONTENT_TYPE,
-                                "application/x-git-receive-pack-advertisement",
+                                format!("application/x-{service}-advertisement"),
                             )],
                             advertised,
                         )
@@ -2764,19 +2770,34 @@ async fn git_calls_send_the_token_as_basic_auth_to_the_receive_pack_service() {
                 }),
             )
             .route(
-                "/team/repo.git/git-receive-pack",
-                post(move |headers: HeaderMap, body: Bytes| {
-                    record(&b, "pack", None, &headers, body.to_vec());
-                    let answered = answered.clone();
-                    async move {
-                        (
-                            [(
-                                header::CONTENT_TYPE,
-                                "application/x-git-receive-pack-result",
-                            )],
-                            answered,
-                        )
-                    }
+                "/team/repo.git/{service}",
+                post(
+                    move |Path(service): Path<String>, headers: HeaderMap, body: Bytes| {
+                        record(&b, "pack", None, &headers, body.to_vec());
+                        let answered = answered.clone();
+                        async move {
+                            (
+                                [(
+                                    header::CONTENT_TYPE,
+                                    format!("application/x-{service}-result"),
+                                )],
+                                answered,
+                            )
+                        }
+                    },
+                ),
+            )
+            // Answers every service with a push's advertisement.
+            .route(
+                "/mixed/info/refs",
+                get(|| async {
+                    (
+                        [(
+                            header::CONTENT_TYPE,
+                            "application/x-git-receive-pack-advertisement",
+                        )],
+                        random(),
+                    )
                 }),
             )
             // A sign-in page answers with HTML, not git.
@@ -2833,13 +2854,13 @@ async fn git_calls_send_the_token_as_basic_auth_to_the_receive_pack_service() {
         .call(call(&bound, repository.clone(), None))
         .await
         .unwrap();
-    assert_eq!(reply(advertisement), (200, advertised));
+    assert_eq!(reply(advertisement), (200, advertised.clone()));
     let pack = random().into_bytes();
     let result = gateway
         .call(call(&bound, repository.clone(), Some(pack.clone())))
         .await
         .unwrap();
-    assert_eq!(reply(result), (200, answered));
+    assert_eq!(reply(result), (200, answered.clone()));
     let basic = format!(
         "Basic {}",
         base64::engine::general_purpose::STANDARD.encode(format!("{username}:{token}"))
@@ -2918,4 +2939,55 @@ async fn git_calls_send_the_token_as_basic_auth_to_the_receive_pack_service() {
             BrokerError::Invalid(InvalidRequest::GitUsername)
         );
     }
+
+    // A fetch goes to the upload-pack service, with the same credential
+    // handling, and only accepts that service's answers.
+    seen.lock().unwrap().clear();
+    let fetch = |repository: String, request: Option<Vec<u8>>| {
+        Request::GitUploadPack(GitCall {
+            credential: bound.clone(),
+            username: username.clone(),
+            repository,
+            request,
+        })
+    };
+    let advertisement = gateway.call(fetch(repository.clone(), None)).await.unwrap();
+    assert_eq!(reply(advertisement), (200, advertised));
+    let wants = random().into_bytes();
+    let result = gateway
+        .call(fetch(repository.clone(), Some(wants.clone())))
+        .await
+        .unwrap();
+    assert_eq!(reply(result), (200, answered));
+    let basic = format!(
+        "Basic {}",
+        base64::engine::general_purpose::STANDARD.encode(format!("{username}:{token}"))
+    );
+    assert_eq!(
+        *seen.lock().unwrap(),
+        [
+            (
+                "refs application/x-git-upload-pack-advertisement".to_owned(),
+                Some("service=git-upload-pack".to_owned()),
+                basic.clone(),
+                String::new(),
+                vec![],
+            ),
+            (
+                "pack application/x-git-upload-pack-result".to_owned(),
+                None,
+                basic,
+                "application/x-git-upload-pack-request".to_owned(),
+                wants,
+            ),
+        ]
+    );
+    assert_eq!(
+        denied(gateway.call(fetch(format!("{origin}/mixed"), None)).await),
+        BrokerError::Upstream(UpstreamFailure::NotGit)
+    );
+    assert_eq!(
+        denied(a.call(fetch(repository.clone(), None)).await),
+        BrokerError::Forbidden
+    );
 }
