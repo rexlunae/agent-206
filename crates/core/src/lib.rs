@@ -1247,6 +1247,12 @@ pub enum Command {
     DisconnectMessenger {
         name: String,
     },
+    /// Send [`messengers::TEST_MESSAGE`] to a destination `send_message`
+    /// could post to: an enabled webhook by its name, or an allowed chat of
+    /// a connected messenger as `name/chat` (user operation).
+    SendTestMessage {
+        destination: String,
+    },
     /// Start an enabled MCP server and list its tools (user operation).
     ConnectMcpServer {
         name: String,
@@ -1376,6 +1382,7 @@ impl Command {
             Self::PairBroker { .. } => "pair_broker",
             Self::ConnectMessenger { .. } => "connect_messenger",
             Self::DisconnectMessenger { .. } => "disconnect_messenger",
+            Self::SendTestMessage { .. } => "send_test_message",
             Self::ConnectMcpServer { .. } => "connect_mcp_server",
             Self::DisconnectMcpServer { .. } => "disconnect_mcp_server",
             Self::Skills => "skills",
