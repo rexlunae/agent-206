@@ -276,6 +276,24 @@ async fn a_write_finishing_after_the_deadline_reports_its_outcome() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn a_file_replaced_by_a_directory_is_not_committed_as_a_removal() {
+    let (dir, store) = store();
+    let root = &project(dir.path());
+    committable(root, &[("a", "one\n")]);
+    std::fs::remove_file(root.join("a")).unwrap();
+    std::fs::create_dir(root.join("a")).unwrap();
+    std::fs::write(root.join("a/x"), unique("x")).unwrap();
+    let before = head(root);
+    let mut host = writer(&store, root);
+    assert_eq!(
+        code(host.handle(commit("m", &["a"])).await),
+        Some(HostErrorCode::Unsupported)
+    );
+    assert_eq!(head(root), before);
+    assert_eq!(committed(root, "a").as_deref(), Some("one\n"));
+}
+
+#[tokio::test]
 async fn modes_and_links_are_recorded_without_following_links() {
     use std::os::unix::fs::PermissionsExt;
     let (dir, store) = store();

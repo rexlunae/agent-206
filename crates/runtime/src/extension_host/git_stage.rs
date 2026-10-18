@@ -97,7 +97,7 @@ fn from_working_tree(
             }
         }
         let recorded_executable = indexed.is_some_and(|e| e.mode == Mode::FILE_EXECUTABLE);
-        match files.read(root, path, indexed.is_some(), recorded_executable)? {
+        match files.read(root, path, named, indexed.is_some(), recorded_executable)? {
             Some(change) => changes.push((path.to_owned(), change)),
             None if indexed.is_some() => changes.push((path.to_owned(), Change::Remove)),
             None if holds_entries(index, path) => return Err(directory()),

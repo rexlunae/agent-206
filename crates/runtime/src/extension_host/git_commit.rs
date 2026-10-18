@@ -280,7 +280,7 @@ pub(super) fn commit(
         }
         let recorded_executable = previous == Some(EntryKind::BlobExecutable)
             || indexed.is_some_and(|e| e.mode == Mode::FILE_EXECUTABLE);
-        let Some(change) = files.read(&root, path, known, recorded_executable)? else {
+        let Some(change) = files.read(&root, path, &named, known, recorded_executable)? else {
             if !known {
                 return Err(failure(
                     HostErrorCode::NotFound,
@@ -376,6 +376,15 @@ fn entry_kind(mode: Mode) -> EntryKind {
         Mode::SYMLINK => EntryKind::Link,
         _ => EntryKind::Blob,
     }
+}
+/// Whether `named` holds a path below `path`.
+pub(super) fn names_below(named: &BTreeSet<BString>, path: &BStr) -> bool {
+    let mut prefix = path.to_owned();
+    prefix.push(b'/');
+    named
+        .range(prefix.clone()..)
+        .next()
+        .is_some_and(|below| below.starts_with(prefix.as_slice()))
 }
 pub(super) fn index_mode(kind: EntryKind) -> Mode {
     match kind {
@@ -589,11 +598,14 @@ impl<'repo> WorkingFiles<'repo> {
 
     /// Store `path`'s working-tree content as a blob; `None` when nothing is
     /// there. `known` paths are tracked, so ignore rules do not refuse them;
-    /// `recorded_executable` is kept when `core.fileMode` is off.
+    /// `recorded_executable` is kept when `core.fileMode` is off. A
+    /// directory is refused, unless it replaces a tracked file and `named`
+    /// also holds paths below it: then the file is gone, as with `None`.
     pub(super) fn read(
         &mut self,
         root: &std::path::Path,
         path: &BStr,
+        named: &BTreeSet<BString>,
         known: bool,
         recorded_executable: bool,
     ) -> Result<Option<Change>, HostFailure> {
@@ -602,6 +614,12 @@ impl<'repo> WorkingFiles<'repo> {
             return Ok(None);
         };
         let (bytes, kind) = match file {
+            Tracked::Directory if known && names_below(named, path) => return Ok(None),
+            Tracked::Directory => {
+                return Err(unsupported(
+                    "a named path is a directory; name the files in it",
+                ));
+            }
             Tracked::Link(target) => (target, EntryKind::Link),
             Tracked::File { bytes, executable } => {
                 let executable = if self.file_mode {

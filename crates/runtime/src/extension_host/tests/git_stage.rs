@@ -246,11 +246,16 @@ async fn a_file_and_a_directory_never_share_a_path_in_the_index() {
     std::fs::create_dir(root.join("a")).unwrap();
     std::fs::write(root.join("a/x"), &x).unwrap();
     let mut host = writer(&store, root);
-    // Adding `a/x` while the index keeps the file `a` would hold both.
+    // Adding `a/x` while the index keeps the file `a` would hold both, and
+    // naming the directory alone would drop `a` without what replaced it.
     let before = index(root);
     assert_eq!(
         code(host.handle(stage(&["a/x"], false)).await),
         Some(HostErrorCode::Conflict)
+    );
+    assert_eq!(
+        code(host.handle(stage(&["a"], false)).await),
+        Some(HostErrorCode::Unsupported)
     );
     assert_eq!(index(root), before);
     assert_eq!(
