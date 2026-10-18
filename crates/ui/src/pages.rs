@@ -12,8 +12,7 @@ pub fn Overview() -> Element {
     rsx! { section { class: "a206-page", div { class: "a206-page-inner",
         Card { variant: CardVariant::Feature, as_: CardTag::Div, class: "a206-hero",
             div { class: "a206-hero-copy",
-                p { class: "a206-eyebrow a206-kicker", "Work in progress" }
-                h1 { "Your workspace" }
+                h1 { "Workspace" }
                 p { class: "a206-muted", "Conversations, projects, and local services." }
                 div { class: "a206-row",
                     Button { variant: ButtonVariant::Primary, onclick: move |_| dispatch(state, Command::CreateThread { title: "New conversation".into(), mode: Mode::Chat }), "Start a conversation" }
@@ -26,14 +25,14 @@ pub fn Overview() -> Element {
         }
         if crate::welcome::unfinished(&snapshot, now) {
             Card { variant: CardVariant::Subtle, CardBody { div { class: "a206-row a206-between",
-                div { strong { "Finish setting up." } p { class: "a206-muted", "Connect a model provider, secure the vault and start a conversation, with each step's current state in one checklist." } }
+                div { strong { "Setup incomplete" } p { class: "a206-muted", "Review gateway, vault and provider setup." } }
                 LinkButton { variant: ButtonVariant::Primary, href: Route::Welcome {}.to_string(), "Get started" }
             } } }
         }
         div { class: "a206-grid",
-            Metric { label: name!("Conversations"), title: rsx! { "Conversations" }, value: Some(snapshot.threads.len() as f64), display: snapshot.threads.len().to_string(), meta: rsx! { "Your ongoing work" } }
-            Metric { label: name!("Projects"), title: rsx! { "Projects" }, value: Some(snapshot.projects.len() as f64), display: snapshot.projects.len().to_string(), meta: rsx! { "Each with its own coordinator" } }
-            Metric { label: name!("Connected providers"), title: rsx! { "Providers" }, value: Some(snapshot.settings.providers.len() as f64), display: snapshot.settings.providers.len().to_string(), meta: rsx! { "API-discovered model catalogs" } }
+            Metric { label: name!("Conversations"), title: rsx! { "Conversations" }, value: Some(snapshot.threads.len() as f64), display: snapshot.threads.len().to_string(), meta: rsx! {} }
+            Metric { label: name!("Projects"), title: rsx! { "Projects" }, value: Some(snapshot.projects.len() as f64), display: snapshot.projects.len().to_string(), meta: rsx! { "Coordinator conversations" } }
+            Metric { label: name!("Connected providers"), title: rsx! { "Providers" }, value: Some(snapshot.settings.providers.len() as f64), display: snapshot.settings.providers.len().to_string(), meta: rsx! { "Configured connections" } }
         }
         Card { variant: CardVariant::Elevated,
             CardHeader { CardTitle { "Recent conversations" } }
@@ -42,26 +41,26 @@ pub fn Overview() -> Element {
             }
             CardFooter { LinkButton { variant: ButtonVariant::Ghost, href: Route::Conversations {}.to_string(), "All conversations ({snapshot.threads.len()})" } }
         }
-        div { class: "a206-row a206-between", h2 { "Your workbench" } span { class: "a206-eyebrow", "Built around your workflow" } }
+        h2 { "Shortcuts" }
         div { class: "a206-grid",
-            for (number, title, body, target) in [
-                ("01", "Connect your intelligence", "Bring an API endpoint or run locally with Joshua. Model choices come directly from your provider.", Route::Providers {}),
-                ("02", "Give the work a home", "Keep a project coordinator and delegated conversations together, with split views for context.", Route::Projects {}),
-                ("03", "Make the workspace yours", "Choose your visual theme and tune the prompts that guide each agent mode.", Route::Appearance {}),
+            for (title, body, target) in [
+                ("Connections", "Configure providers and refresh available models.", Route::Providers {}),
+                ("Projects", "Create a project or open its coordinator.", Route::Projects {}),
+                ("Appearance", "Set the theme, color scheme and contrast.", Route::Appearance {}),
             ] {
-                Card { variant: CardVariant::Elevated, CardHeader { Badge { tone: BadgeTone::Accent, "{number}" } CardTitle { "{title}" } }
+                Card { variant: CardVariant::Elevated, CardHeader { CardTitle { "{title}" } }
                     CardBody { p { class: "a206-muted", "{body}" } }
-                    CardFooter { LinkButton { variant: ButtonVariant::Ghost, href: target.to_string(), "Open →" } }
+                    CardFooter { LinkButton { variant: ButtonVariant::Ghost, href: target.to_string(), "Open {title}" } }
                 }
             }
         }
-        Card { variant: CardVariant::Subtle, CardBody { div { class: "a206-row a206-between", div { strong { "Permission is part of the conversation." } p { class: "a206-muted", "Agents begin without tool grants. Modes and delegated tasks can narrow access further." } } LinkButton { variant: ButtonVariant::Secondary, href: Route::Security {}.to_string(), "Security details" } } } }
+        Card { variant: CardVariant::Subtle, CardBody { div { class: "a206-row a206-between", div { strong { "Tool permissions" } p { class: "a206-muted", "Agents begin without tool grants. Modes and delegated tasks can narrow access further." } } LinkButton { variant: ButtonVariant::Secondary, href: Route::Security {}.to_string(), "Security details" } } } }
     } } }
 }
 #[component]
 pub fn Conversations() -> Element {
     let mut query = use_signal(String::new);
-    rsx! { PageFrame { kicker: "Conversations", title: "Your conversations.", description: "Find and reopen any conversation, including project coordinators and delegated work.",
+    rsx! { PageFrame { kicker: "Workspace", title: "Conversations", description: "Find and reopen any conversation, including project coordinators and delegated work.",
         Card {
             CardBody {
                 Field { label: rsx! { "Search conversation titles" }, Input { value: ReadSignal::from(query), oninput: move |value| query.set(value), placeholder: "Search by title" } }
@@ -107,7 +106,7 @@ pub fn Projects() -> Element {
     let state = use_context::<State>();
     let mut name = use_signal(String::new);
     let mut root = use_signal(String::new);
-    rsx! { PageFrame { kicker: "Project spaces", title: "Give your work a home.", description: "Each project gets a coordinator conversation. Open delegated conversations alongside it as the work grows.",
+    rsx! { PageFrame { kicker: "Workspace", title: "Projects", description: "Create a project with a workspace directory and coordinator conversation.",
         Card { CardBody { div { class: "a206-grid",
             Field { label: rsx! { "Project name" }, Input { value: ReadSignal::from(name), oninput: move |v| name.set(v) } }
             Field { label: rsx! { "Workspace directory" }, Input { value: ReadSignal::from(root), oninput: move |v| root.set(v), placeholder: "Absolute path on the gateway host" } }
@@ -127,13 +126,13 @@ pub fn Downloads() -> Element {
     let mut name = use_signal(String::new);
     let mut hash = use_signal(String::new);
     let mut models_directory = use_signal(|| false);
-    rsx! { PageFrame { kicker: "Transfer center", title: "Keep everything in motion.", description: "A shared view of downloads, progress and integrity checks. Completed files are published only after verification.",
+    rsx! { PageFrame { kicker: "Workbench", title: "Downloads", description: "Start, monitor or cancel downloads. Supply a SHA-256 hash to verify the file.",
         Card { CardBody { div { class: "a206-grid",
             Field { label: rsx! { "Download URL" }, Input { value: ReadSignal::from(url), oninput: move |v| url.set(v), r#type: InputType::Url } }
             Field { label: rsx! { "Filename" }, Input { value: ReadSignal::from(name), oninput: move |v| name.set(v) } }
             Field { label: rsx! { "Expected SHA-256 (optional)" }, Input { value: ReadSignal::from(hash), oninput: move |v| hash.set(v) } }
         } Checkbox { label: rsx! { "Save in ~/models for Joshua" }, onchange: move |v| models_directory.set(v) } } CardFooter { Button { variant: ButtonVariant::Primary, onclick: move |_| dispatch(state, Command::Download { url: url(), name: name(), sha256: (!hash().is_empty()).then_some(hash()), models_directory: models_directory() }), "Start download" } } }
-        if state.data.read().downloads.is_empty() { EmptyState { compact: true, title: rsx! { "All clear" }, body: rsx! { "Your downloads will appear here." } } }
+        if state.data.read().downloads.is_empty() { EmptyState { compact: true, title: rsx! { "No downloads" }, body: rsx! { "Your downloads will appear here." } } }
         for download in &state.data.read().downloads {
             { let id = download.id; let running = matches!(download.state, DownloadState::Queued | DownloadState::Running);
               rsx! { Transfer { key: "{id}", label: name!("Download progress"), title: rsx! { "{download.name}" },
@@ -151,7 +150,7 @@ pub fn Downloads() -> Element {
 pub fn Browser() -> Element {
     let mut address = use_signal(String::new);
     let mut source = use_signal(String::new);
-    rsx! { PageFrame { kicker: "Web workbench", title: "See what you're building.", description: "Preview a development server in a sandboxed browser surface.",
+    rsx! { PageFrame { kicker: "Workbench", title: "Browser preview", description: "Preview a development server in a sandboxed browser surface.",
         div { class: "a206-row", div { class: "a206-grow", Field { label: rsx! { "Preview URL" }, Input { value: ReadSignal::from(address), oninput: move |v| address.set(v), r#type: InputType::Url, placeholder: "Enter your development server URL" } } }
             Button { variant: ButtonVariant::Primary, onclick: move |_| source.set(address()), "Open preview" }
         }
@@ -181,7 +180,7 @@ pub fn Documents() -> Element {
             }
         });
     };
-    rsx! { PageFrame { kicker: "Project workbench", title: "Keep the details close.", description: "Read project text and inspect Git state without leaving your workspace.",
+    rsx! { PageFrame { kicker: "Workbench", title: "Documents & Git", description: "Read a project file or inspect its Git status.",
         div { class: "a206-grid",
             Field { label: rsx! { "Project" }, NativeSelect { value: project(), onchange: move |v| project.set(v), option { value: "", "Select a project…" } for p in &state.data.read().projects { option { value: "{p.id}", "{p.name}" } } } }
             Field { label: rsx! { "Document path" }, Input { value: ReadSignal::from(path), oninput: move |v| path.set(v), placeholder: "Path relative to your project" } }
@@ -191,15 +190,15 @@ pub fn Documents() -> Element {
             Button { variant: ButtonVariant::Secondary, onclick: move |_| if let Ok(project) = Uuid::parse_str(&project()) { read(Command::GitStatus { project }); }, "Git status" }
         }
         if let Some(report) = failure() { ErrorNotice { report } }
-        Card { CardBody { if output().is_empty() { EmptyState { compact: true, title: rsx! { "A closer look" }, body: rsx! { "Select a project, then read a document or inspect its Git status." } } } else { pre { class: "a206-document", "{output}" } } } }
+        Card { CardBody { if output().is_empty() { EmptyState { compact: true, title: rsx! { "No document selected" }, body: rsx! { "Select a project, then read a document or inspect its Git status." } } } else { pre { class: "a206-document", "{output}" } } } }
     } }
 }
 #[component]
 pub fn Security() -> Element {
-    rsx! { PageFrame { kicker: "Trust & control", title: "You hold the keys.", description: "A visible boundary between conversation, tools and credentials.",
+    rsx! { PageFrame { kicker: "Settings", title: "Security", description: "Manage vault authentication and gateway access.",
         div { class: "a206-grid",
             Card { CardHeader { CardTitle { "Least privilege" } } CardBody { p { "New conversations have no tool grants. Delegated capabilities are intersected with their parent, mode and extension manifest." } } }
-            Card { CardHeader { CardTitle { "Encrypted vault" } } CardBody { p { "SecureStore-compatible encrypted storage with explicit locking, redacted secret types and atomic private writes." } } }
+            Card { CardHeader { CardTitle { "Encrypted vault" } } CardBody { p { "Credentials stay encrypted when locked. Unlock the vault and pair the gateway before using provider credentials." } } }
             Card { CardHeader { CardTitle { "Verified SSH" } } CardBody { p { "Remote connections use your OpenSSH configuration and verified host keys. Gateway setup shows an unknown host's fingerprint and trusts it only after you confirm it." } } }
         }
         VaultControls {}
@@ -229,7 +228,7 @@ pub fn Joshua() -> Element {
     let mut remote = use_signal(String::new);
     let mut service_status =
         use_signal(|| "Check status to inspect the managed process.".to_owned());
-    rsx! { PageFrame { kicker: "Local intelligence", title: "Make room for Joshua.", description: "Run a model from ~/models, locally or through a verified SSH connection. Discover its model identity from the running API.",
+    rsx! { PageFrame { kicker: "Services", title: "Joshua", description: "Run a model from ~/models locally or over SSH.",
         Card { CardHeader { CardTitle { "Managed inference" } } CardBody { div { class: "a206-grid",
             Field { label: rsx! { "Connection name" }, Input { value: ReadSignal::from(label), oninput: move |v| label.set(v) } }
             Field { label: rsx! { "Model filename in ~/models" }, Input { value: ReadSignal::from(model), oninput: move |v| model.set(v) } }
@@ -254,7 +253,7 @@ pub fn Gateway() -> Element {
     let state = use_context::<State>();
     let report = state.gateway.read();
     let info = report.as_ref().and_then(|report| report.info.as_ref());
-    rsx! { PageFrame { kicker: "Gateway", title: "Your agents' home base.", description: "Manage the gateway shared by your clients. Starting a process and completing its security setup are separate steps.",
+    rsx! { PageFrame { kicker: "Services", title: "Gateway", description: "Manage the gateway shared by your clients. Starting a process and completing its security setup are separate steps.",
         GatewayControls {}
         Card { variant: CardVariant::Elevated,
             CardHeader { CardTitle { "Connection details" } }

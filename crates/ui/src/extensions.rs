@@ -56,7 +56,7 @@ pub fn Extensions() -> Element {
     };
     let plugins = state.data.read().plugins.clone();
     let proposals = state.data.read().extension_proposals.clone();
-    rsx! { PageFrame { kicker: "Extend your workspace", title: "Small tools. New possibilities.", description: "Compiled WASM extensions run in a separate, bounded process and use only what you grant.",
+    rsx! { PageFrame { kicker: "Workbench", title: "Extensions", description: "Install extensions, review their permissions and enable the tools you need.",
         Field { label: rsx! { "Project for extension panels" },
             NativeSelect { value: project(), onchange: { let mut project = project; move |v| project.set(v) },
                 option { value: "", "No project" }

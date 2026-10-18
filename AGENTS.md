@@ -145,6 +145,8 @@ attribution. Prefer a small replacement over carrying historical architecture.
   contributor rules before changing them. Never modify generated toolkit assets.
 - Keep product UI focused on useful actions; do not present implementation details
   or nonfunctional buttons as finished features. No fake activity or invented stats.
+- Write functional UI copy: name pages and actions directly, explain controls,
+  state and constraints, and omit slogans, promotional claims and decorative prose.
 
 ## Validation and delivery
 

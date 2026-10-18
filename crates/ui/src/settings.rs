@@ -18,7 +18,7 @@ pub fn Providers() -> Element {
         .iter()
         .find(|p| Some(&p.id) == preset.read().as_ref());
     let snapshot = state.data.read();
-    rsx! { PageFrame { kicker: "Connections", title: "Intelligence, on your terms.", description: "Connect an API endpoint. Its available models and reported limits are discovered live.",
+    rsx! { PageFrame { kicker: "Settings", title: "Connections", description: "Connect an API endpoint. Its available models and reported limits are discovered live.",
         Card { CardHeader { CardTitle { "Add a provider" } CardSubtitle { "Choose a connector. Models and account facts come from its API." } }
             CardBody { div { class: "a206-grid",
                 Field { label: rsx! { "Provider" }, Select { label: name!("Provider connector"), value: ReadSignal::from(preset), placeholder: "Choose provider",
@@ -67,13 +67,13 @@ pub fn Providers() -> Element {
         for kind in [CodingBackend::Codex, CodingBackend::ClaudeAgent] {
             BackendEditor { key: "{kind.label()}", kind, initial: snapshot.settings.backends.iter().find(|b| b.kind == kind).cloned() }
         }
-        Alert { title: rsx! { "Credentialed providers" }, "This preview connects to endpoints that do not require API credentials. Vault-backed provider authentication is not enabled yet." }
+        Alert { title: rsx! { "Credentialed providers" }, "Store API credentials in the vault and bind them to the provider's API origin. Unlock the vault and pair the gateway before use." }
     } }
 }
 #[component]
 pub fn Appearance() -> Element {
     let mut state = use_context::<State>();
-    rsx! { PageFrame { kicker: "Make it yours", title: "A workspace that feels right.", description: "Choose a future-css design, palette, color scheme and contrast. Your choice applies across the workspace.",
+    rsx! { PageFrame { kicker: "Settings", title: "Appearance", description: "Choose a theme, palette, color scheme and contrast.",
         ThemePicker { value: ReadSignal::from(state.theme), onchange: move |choice: ThemeChoice| {
             state.theme.set(choice);
             let mut settings = state.data.read().settings.clone();
@@ -86,7 +86,7 @@ pub fn Appearance() -> Element {
 #[component]
 pub fn Prompts() -> Element {
     let state = use_context::<State>();
-    rsx! { PageFrame { kicker: "Agent behavior", title: "The right mode for the work.", description: "Prompts guide behavior. Tool permissions are enforced separately at the gateway.",
+    rsx! { PageFrame { kicker: "Settings", title: "Agent modes", description: "Prompts guide behavior. Tool permissions are enforced separately at the gateway.",
         for mode in Mode::ALL { PromptEditor { key: "{mode.label()}", mode, initial: state.data.read().settings.prompts.iter().find(|p| p.mode == mode).map(|p| p.prompt.clone()).unwrap_or_default() } }
         ProgramDirectories {}
     } }

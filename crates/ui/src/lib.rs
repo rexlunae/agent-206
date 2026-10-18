@@ -724,7 +724,7 @@ fn Header(palette: Signal<bool>, navigable: bool) -> Element {
     let state = use_context::<State>();
     let route = use_route::<Route>();
     rsx! { header { class: "a206-topbar",
-        div { class: "a206-brand", img { src: asset!("/assets/agent206.svg"), alt: "", width: "34", height: "34" } "Agent 206" span { "YOUR WORK. YOUR AGENTS." } }
+        div { class: "a206-brand", img { src: asset!("/assets/agent206.svg"), alt: "", width: "34", height: "34" } "Agent 206" }
         div { class: "a206-row",
             IconButton { icon: IconName::ArrowStart, label: name!("Go back"), size: ButtonSize::Sm, variant: ButtonVariant::Ghost,
                 availability: if state.navigator.can_go_back() { Availability::Enabled } else { Availability::Disabled },
@@ -761,7 +761,7 @@ fn Sidebar() -> Element {
         }
         div { class: "a206-nav-group",
             NavHeading { "Conversations" }
-            if snapshot.threads.is_empty() { p { class: "a206-muted", "A fresh start." } }
+            if snapshot.threads.is_empty() { p { class: "a206-muted", "No conversations" } }
             for thread in snapshot.threads.iter().rev().take(12) {
                 { let id = thread.id; rsx! {
                     LinkButton { key: "{id}", size: ButtonSize::Sm, variant: ButtonVariant::Ghost, class: if matches!(route, Route::Chat { id: current, .. } if current == id) { "a206-nav-active" } else { "" }, href: Route::Chat { id, split: None, message: None }.to_string(),
