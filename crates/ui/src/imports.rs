@@ -188,10 +188,11 @@ fn MessengerRow(
         if available { Badge { "Will be imported disabled" } }
         if !available { Badge { {messenger_status(&messenger.action)} } }
         if let Some(endpoint) = &messenger.endpoint { p { class: "a206-muted", "{endpoint}" } }
-        Disclosure { summary: rsx! { "Source restrictions: {messenger.allowed_chats.len()} chats · {messenger.allowed_users.len()} senders" },
+        if let Some(format) = messenger.format { p { class: "a206-muted", "Send-only webhook · posts as {format.label()}" } }
+        if messenger.format.is_none() { Disclosure { summary: rsx! { "Source restrictions: {messenger.allowed_chats.len()} chats · {messenger.allowed_users.len()} senders" },
             p { "Allowed chats: {messenger.allowed_chats.iter().cloned().collect::<Vec<_>>().join(\", \")}" }
             p { "Allowed senders: {messenger.allowed_users.iter().cloned().collect::<Vec<_>>().join(\", \")}" }
-        }
+        } }
         if messenger.token_left_behind { p { class: "a206-muted", "Plaintext source credentials are not copied. Imported entries need a vault credential before connecting; existing credentials stay unchanged." } }
     } }
 }
