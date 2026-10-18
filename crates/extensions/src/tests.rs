@@ -268,6 +268,7 @@ fn search_tool_reports_matches_and_truncation() {
                 ("max_matches", Value::Int(9000)),
                 ("regex", Value::Bool(true)),
                 ("include", Value::Str(include.clone())),
+                ("include_ignored", Value::Bool(true)),
             ],
         ),
         Limits::default(),
@@ -287,6 +288,7 @@ fn search_tool_reports_matches_and_truncation() {
             ignore_case: false,
             include: Some(include),
             max_matches: 500,
+            include_ignored: true,
         }]
     );
 }
@@ -343,6 +345,7 @@ fn find_tool_lists_entries_and_truncation() {
             path: within,
             glob,
             max_results: 1,
+            include_ignored: false,
         }]
     );
 }

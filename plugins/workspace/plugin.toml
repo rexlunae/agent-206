@@ -1,7 +1,7 @@
 id = "agent206.workspace"
 name = "Workspace files"
 description = "Lists, finds, searches, reads and edits files in a project workspace, and shows an overview panel."
-version = "0.5.0"
+version = "0.6.0"
 abi = 2
 capabilities = ["read_workspace", "write_workspace"]
 
@@ -28,7 +28,7 @@ required = true
 
 [[tools]]
 name = "find_files"
-description = "Find files and directories in the project workspace whose path matches a glob, such as `*.rs` or `src/**/test_*.py`. Skips .git and does not follow symlinks."
+description = "Find files and directories in the project workspace whose path matches a glob, such as `*.rs` or `src/**/test_*.py`. Skips .git and what the project's .gitignore files exclude, and does not follow symlinks."
 capabilities = ["read_workspace"]
 
 [[tools.params]]
@@ -43,13 +43,18 @@ type = "string"
 description = "Directory to look in, relative to the workspace root. Defaults to the root."
 
 [[tools.params]]
+name = "include_ignored"
+type = "boolean"
+description = "Also look in files and directories that .gitignore excludes. Defaults to false."
+
+[[tools.params]]
 name = "max_results"
 type = "integer"
 description = "Most entries to return, from 1 to 1000. Defaults to 200."
 
 [[tools]]
 name = "search_text"
-description = "Find lines containing a text, or matching a regular expression, in UTF-8 files of the project workspace. Case-sensitive unless ignore_case is true. Skips .git and does not follow symlinks."
+description = "Find lines containing a text, or matching a regular expression, in UTF-8 files of the project workspace. Case-sensitive unless ignore_case is true. Skips .git and what the project's .gitignore files exclude, and does not follow symlinks."
 capabilities = ["read_workspace"]
 
 [[tools.params]]
@@ -77,6 +82,11 @@ description = "Search only files matching this glob, read like find_files' patte
 name = "path"
 type = "string"
 description = "Directory to search, relative to the workspace root. Defaults to the root."
+
+[[tools.params]]
+name = "include_ignored"
+type = "boolean"
+description = "Also look in files and directories that .gitignore excludes. Defaults to false."
 
 [[tools.params]]
 name = "max_matches"

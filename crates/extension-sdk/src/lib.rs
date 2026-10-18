@@ -175,6 +175,8 @@ pub struct SearchOptions<'a> {
     pub ignore_case: bool,
     /// Search only files whose path matches this glob.
     pub include: Option<&'a str>,
+    /// Also search what git ignores.
+    pub include_ignored: bool,
 }
 
 pub mod host {
@@ -289,17 +291,29 @@ pub mod host {
             ignore_case: options.ignore_case,
             include: options.include.map(Into::into),
             max_matches,
+            include_ignored: options.include_ignored,
         })? {
             HostReply::Matches(result) => Ok(result),
             _ => Err(unexpected()),
         }
     }
-    /// Entries under `path` matching `glob`; see [`HostRequest::Find`].
+    /// Entries under `path` matching `glob` that git does not ignore; see
+    /// [`HostRequest::Find`].
     pub fn find(path: &str, glob: &str, max_results: u32) -> Result<FindResult, HostFailure> {
+        find_including(path, glob, false, max_results)
+    }
+    /// [`find`], also returning what git ignores when `include_ignored`.
+    pub fn find_including(
+        path: &str,
+        glob: &str,
+        include_ignored: bool,
+        max_results: u32,
+    ) -> Result<FindResult, HostFailure> {
         match call(&HostRequest::Find {
             path: path.into(),
             glob: glob.into(),
             max_results,
+            include_ignored,
         })? {
             HostReply::Found(result) => Ok(result),
             _ => Err(unexpected()),
