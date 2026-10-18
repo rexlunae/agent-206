@@ -153,6 +153,16 @@ impl Settings {
             home: user.home.clone(),
         })
     }
+    /// `user.name` and `user.email`, which commits and reflogs record.
+    pub(super) fn identity(&self) -> Result<(BString, BString), HostFailure> {
+        let identity = |key| self.string(key).filter(|value| !value.trim().is_empty());
+        match (identity("user.name"), identity("user.email")) {
+            (Some(name), Some(email)) => Ok((name, email)),
+            _ => Err(unsupported(
+                "set user.name and user.email in git configuration first",
+            )),
+        }
+    }
     fn string(&self, key: &str) -> Option<BString> {
         self.repository
             .string(key)
@@ -237,21 +247,12 @@ pub(super) fn commit(
             "this repository signs commits (commit.gpgSign), which extensions cannot do",
         ));
     }
-    if has_hooks(&repo, &settings) {
+    if has_hooks(&repo, &settings, &COMMIT_HOOKS) {
         return Err(unsupported(
             "the repository has commit hooks, which extensions never run",
         ));
     }
-    let identity = |key| {
-        settings
-            .string(key)
-            .filter(|value| !value.trim().is_empty())
-    };
-    let (Some(name), Some(email)) = (identity("user.name"), identity("user.email")) else {
-        return Err(unsupported(
-            "set user.name and user.email in git configuration first",
-        ));
-    };
+    let (name, email) = settings.identity()?;
     // Hold the index lock from here on, as `git commit` does, so no other
     // git process changes the index or commits in between.
     let (lock, mut index) = lock_index(&repo)?;
@@ -480,7 +481,8 @@ fn parent_is_file(
         })
 }
 
-fn has_hooks(repo: &gix::Repository, settings: &Settings) -> bool {
+/// Whether the repository holds any of `hooks`.
+pub(super) fn has_hooks(repo: &gix::Repository, settings: &Settings, hooks: &[&str]) -> bool {
     let base = repo.workdir().unwrap_or(repo.git_dir());
     let directory = match settings.path("core.hooksPath", base) {
         Ok(Some(directory)) => directory,
@@ -488,7 +490,7 @@ fn has_hooks(repo: &gix::Repository, settings: &Settings) -> bool {
         // A hooks path that cannot be resolved is assumed to hold hooks.
         Err(()) => return true,
     };
-    COMMIT_HOOKS
+    hooks
         .iter()
         .any(|hook| std::fs::symlink_metadata(directory.join(hook)).is_ok())
 }

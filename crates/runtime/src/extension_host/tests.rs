@@ -4,6 +4,7 @@ use super::*;
 
 mod fetch;
 mod git;
+mod git_branch;
 mod git_commit;
 mod git_stage;
 mod patch;

@@ -981,6 +981,24 @@ impl HostCalls {
                 let root = self.workspace()?;
                 git_call(move |interrupt| git::log(root, max, &interrupt)).await
             }
+            HostRequest::GitBranches => {
+                let root = self.workspace()?;
+                git_call(move |interrupt| git_branch::list(root, &interrupt)).await
+            }
+            HostRequest::GitCreateBranch { name, start } => {
+                let root = self.workspace()?;
+                let user = self.user_git;
+                // As for a commit: a branch made at the last moment still
+                // reaches the guest.
+                let budget = self.write_budget()?;
+                git_write_call_with_timeout(
+                    move |interrupt| {
+                        git_branch::create(root, &name, start.as_deref(), user, &interrupt)
+                    },
+                    budget,
+                )
+                .await
+            }
             HostRequest::GitDiff { path, staged } => {
                 let root = self.workspace()?;
                 git_call(move |interrupt| git::diff(root, &path, staged, &interrupt)).await
@@ -1198,6 +1216,7 @@ impl Drop for Interrupt {
 }
 mod fetch;
 mod git;
+mod git_branch;
 mod git_commit;
 mod git_stage;
 pub mod packages;
