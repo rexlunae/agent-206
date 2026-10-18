@@ -19,11 +19,12 @@ use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio_util::sync::CancellationToken;
 use zeroize::Zeroizing;
 
+mod credentials;
 mod import;
 mod irc;
 mod socket;
 
-const MAX_NAME: usize = 256;
+const MAX_NAME: usize = a206_vault_channel::MAX_CREDENTIAL_NAME_BYTES;
 const MAX_DESTINATIONS: usize = 16;
 
 struct Shared {
@@ -265,6 +266,14 @@ fn check_name(name: &str) -> Result<(), BrokerError> {
     Ok(())
 }
 
+fn require_step_up(session: &Session, generation: u64, now: Instant) -> Result<(), BrokerError> {
+    if session.step_up.is_active(now, generation) {
+        Ok(())
+    } else {
+        Err(BrokerError::StepUpRequired)
+    }
+}
+
 /// Record an authentication failure and translate a triggered lockout.
 fn failed(shared: &Shared, now: Instant, error: BrokerError) -> BrokerError {
     match shared.throttle.failure(&(), now) {
@@ -378,14 +387,15 @@ fn handle(shared: &Shared, session: &mut Session, request: Request) -> Handled {
         _ => {}
     }
     // Step-ups are bound to the vault generation, so any lock voids them.
-    let require_step_up = |session: &Session, generation: u64| {
-        if session.step_up.is_active(now, generation) {
-            Ok(())
-        } else {
-            Err(BrokerError::StepUpRequired)
-        }
-    };
+    let require_step_up =
+        |session: &Session, generation: u64| require_step_up(session, generation, now);
     match request {
+        Request::CredentialPage {
+            version,
+            after,
+            limit,
+        } => credentials::page(shared, session, version, after, limit),
+        Request::AddApiKey(input) => credentials::add(shared, session, input, now),
         Request::ReviewVaultImport { version, source } => {
             import::version(session, version)?;
             import::review(shared, session, source)
@@ -652,28 +662,10 @@ fn handle(shared: &Shared, session: &mut Session, request: Request) -> Handled {
         }
         Request::PutCredential {
             name,
-            mut meta,
+            meta,
             value,
             replace,
-        } => {
-            check_name(&name)?;
-            meta.destinations = origins(meta.destinations)?;
-            let mut vault = shared.vault();
-            require_step_up(session, vault.generation())?;
-            // Checked under the same guard as the write, so two adds of one
-            // name cannot both succeed.
-            if !replace {
-                match vault.credential(&name) {
-                    Ok(_) => return Err(BrokerError::AlreadyExists),
-                    Err(VaultError::NotFound) => {}
-                    Err(error) => return Err(vault_error(error)),
-                }
-            }
-            vault
-                .put_credential(&name, &meta, (&value).into())
-                .map_err(vault_error)?;
-            ok()
-        }
+        } => credentials::put(shared, session, name, meta, value, replace, now),
         Request::UpdateCredential {
             name,
             policy,

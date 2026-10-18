@@ -288,7 +288,9 @@ impl Classified for a206_broker::ClientError {
             // The provider layer falls back before this can reach a client.
             C::StreamUnsupported | C::SocketUnsupported => Some(ErrorKind::Unavailable),
             // Reviewed migration must never fall back to unguarded import.
-            C::ReviewedImportUnsupported => Some(ErrorKind::Unavailable),
+            C::ReviewedImportUnsupported | C::CredentialsUnsupported => {
+                Some(ErrorKind::Unavailable)
+            }
             C::SocketMessage => Some(ErrorKind::InvalidRequest),
             // `transparent` hides the reply from the chain, so classify it here.
             C::Broker(reply) => reply.kind(),

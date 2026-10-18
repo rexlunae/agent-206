@@ -18,15 +18,18 @@ use zeroize::Zeroizing;
 /// version 7 [`HttpMethod::Put`], version 8 [`Request::SocketOpen`] with
 /// [`AuthScheme::DiscordBot`], version 9 [`SocketScheme::IrcSasl`], and version
 /// 10 encrypted setup channels and TOTP cancellation, 11 reviewed vault
-/// imports, 12 [`AuthScheme::WebhookUrl`] and 13 [`Request::GitReceivePack`]. A broker accepts greetings from
+/// imports, 12 [`AuthScheme::WebhookUrl`], 13 [`Request::GitReceivePack`],
+/// and 14 bounded metadata pages and
+/// fixed-policy API-key creation. A broker accepts greetings from
 /// [`MIN_BROKER_VERSION`] up to this version, and a client falls back to the
 /// newest version an older broker accepts (see `Client::version`), so streams
 /// are only requested from brokers that understand them.
-pub const BROKER_VERSION: u16 = 13;
+pub const BROKER_VERSION: u16 = 14;
+pub use a206_vault_channel::CREDENTIALS_BROKER_VERSION as CREDENTIALS_VERSION;
 /// First version with connection-held source reviews and guarded vault import.
 pub use a206_vault_channel::REVIEWED_IMPORT_BROKER_VERSION as REVIEWED_IMPORT_VERSION;
 /// The oldest protocol version this broker still serves and this client still
-/// speaks. Versions 3 to 13 differ only by the requests, roles and schemes they add.
+/// speaks. Versions 3 to 14 differ only by the requests, roles and schemes they add.
 pub const MIN_BROKER_VERSION: u16 = 3;
 /// The first version that serves [`Request::ProviderStream`].
 pub const STREAM_VERSION: u16 = 4;
@@ -309,7 +312,22 @@ pub struct GitCall {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct ApiKeyInput {
+    pub version: u16,
+    pub name: String,
+    pub label: String,
+    pub destinations: Vec<String>,
+    pub value: WireSecret,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub enum Request {
+    CredentialPage {
+        version: u16,
+        after: Option<String>,
+        limit: u16,
+    },
+    AddApiKey(ApiKeyInput),
     ReviewVaultImport {
         version: u16,
         source: std::path::PathBuf,
@@ -504,6 +522,12 @@ pub enum BrokerError {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
 pub enum InvalidRequest {
+    #[error("credential page limit or cursor is invalid")]
+    CredentialPage,
+    #[error("API key is empty or exceeds the credential setup size limit")]
+    ApiKeyValue,
+    #[error("credential label is empty, too long or contains control characters")]
+    CredentialLabel,
     #[error("unsupported broker protocol version")]
     UnsupportedVersion,
     #[error("the connection already identified itself")]
@@ -558,6 +582,10 @@ pub enum InvalidRequest {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
 pub enum VaultFailure {
+    #[error(
+        "credential metadata exceeds the private page limit; inspect it with a trusted local tool"
+    )]
+    MetadataTooLarge,
     #[error("stored vault data is corrupted")]
     Corrupted,
     #[error("vault encryption failed")]
@@ -594,6 +622,7 @@ pub enum UpstreamFailure {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Reply {
+    CredentialPage(a206_vault_channel::CredentialPage),
     Ok,
     VaultImportReview(a206_vault_channel::ImportReview),
     VaultImportApplied(a206_vault_channel::ImportApplied),

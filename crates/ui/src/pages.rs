@@ -203,7 +203,7 @@ pub fn Security() -> Element {
         }
         VaultControls {}
         GatewayControls {}
-        Alert { title: rsx! { "Credential management" }, "Use `agent206 vault` on the gateway host to add credentials, change access policies or remove two-factor authentication. Agent-requested credential use is unavailable." }
+        Alert { title: rsx! { "Other credential operations" }, "Security can list credential policies and add API keys. Use `agent206 vault` on the gateway host for other entry kinds, policy changes, deletion or two-factor removal. Agent-requested credential use is unavailable." }
     } }
 }
 /// Vault setup uses the same state machine on every renderer.

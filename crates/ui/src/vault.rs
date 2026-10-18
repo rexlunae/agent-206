@@ -18,6 +18,7 @@ use a206_vault_channel::{
     Status as BrokerStatus,
 };
 use fc_dioxus::prelude::*;
+mod credentials;
 mod migration;
 #[cfg(not(target_arch = "wasm32"))]
 use std::path::{Path, PathBuf};
@@ -83,6 +84,7 @@ fn known(value: Option<bool>) -> &'static str {
 enum Task {
     Pair,
     Enroll,
+    AddCredential,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Flow {
@@ -124,6 +126,9 @@ struct Panel {
     import_review: Signal<Option<a206_vault_channel::ImportReview>>,
     import_totp: Signal<bool>,
     import_result: Signal<Option<a206_vault_channel::ImportApplied>>,
+    credential_page: Signal<Option<a206_vault_channel::CredentialPage>>,
+    credential_failure: Signal<Option<Failure>>,
+    key_editor: Signal<bool>,
     /// The Get started checklist, when this panel is on that page.
     progress: Option<VaultProgress>,
 }
@@ -195,6 +200,10 @@ impl Panel {
         }
     }
     fn show(mut self, status: BrokerStatus) {
+        if !status.unlocked {
+            self.credential_page.set(None);
+            self.key_editor.set(false);
+        }
         self.report(VaultSeen::Facts(VaultFacts {
             exists: status.exists,
             unlocked: status.unlocked,
@@ -367,6 +376,10 @@ impl Panel {
     }
     async fn perform(mut self, task: Task) {
         match task {
+            Task::AddCredential => {
+                self.flow.set(Flow::Idle);
+                self.key_editor.set(true);
+            }
             Task::Pair => match self.session().pair_gateway().await {
                 Ok(()) => {
                     self.flow.set(Flow::Idle);
@@ -521,6 +534,9 @@ fn VaultPanel(target: Target) -> Element {
         import_review: use_signal(|| None),
         import_totp: use_signal(|| false),
         import_result: use_signal(|| None),
+        credential_page: use_signal(|| None),
+        credential_failure: use_signal(|| None),
+        key_editor: use_signal(|| false),
         progress: VaultProgress::listener(),
     };
     // Reads only through `peek`, so this runs once, after the first render.
@@ -626,7 +642,7 @@ fn VaultPanel(target: Target) -> Element {
                     }
                 },
                 Flow::StepUp(task) => rsx! {
-                    p { if task == Task::Pair { "Confirm it is you before pairing the gateway." } else { "Confirm it is you before enrolling an authenticator." } }
+                    p { match task { Task::Pair => "Confirm it is you before pairing the gateway.", Task::Enroll => "Confirm it is you before enrolling an authenticator.", Task::AddCredential => "Confirm it is you before adding an API key." } }
                     if enrolled {
                         Field { label: rsx! { "Authenticator code" },
                             Input { value: ReadSignal::from(code), oninput: move |v| code.set(v), autocomplete: "one-time-code", inputmode: "numeric" }
@@ -726,7 +742,17 @@ fn VaultPanel(target: Target) -> Element {
                 },
             }
         }
-    } }
+    }
+    if let Some(Failure { title, report }) = (panel.credential_failure)() {
+        ErrorNotice { report, title }
+    }
+    if status.as_ref().is_some_and(|s| s.unlocked) {
+        credentials::Credentials { panel,
+            onread: move |after| panel.read_credentials(after),
+            onadd: move |input| panel.add_key(input),
+        }
+    }
+    }
 }
 
 #[cfg(test)]

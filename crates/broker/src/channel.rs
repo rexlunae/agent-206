@@ -28,6 +28,28 @@ fn text(value: wire::Secret) -> String {
 }
 pub fn request(value: wire::Request) -> Request {
     match value {
+        wire::Request::CredentialPage {
+            version,
+            after,
+            limit,
+        } => Request::CredentialPage {
+            version,
+            after,
+            limit,
+        },
+        wire::Request::AddApiKey {
+            version,
+            name,
+            label,
+            destinations,
+            value,
+        } => Request::AddApiKey(crate::ApiKeyInput {
+            version,
+            name,
+            label,
+            destinations,
+            value: secret(value),
+        }),
         wire::Request::Status => Request::Status,
         wire::Request::ReviewVaultImport { version, source } => {
             Request::ReviewVaultImport { version, source }
@@ -78,12 +100,15 @@ pub fn code(error: &BrokerError) -> wire::Code {
 }
 pub fn reply(result: Result<Reply, BrokerError>) -> wire::Reply {
     match result {
-        Ok(Reply::Error(BrokerError::ImportFailure(report)))
-        | Err(BrokerError::ImportFailure(report)) => wire::Reply::Error(wire::Failure {
-            code: wire::Code::Other,
-            report,
-        }),
+        Ok(Reply::Error(BrokerError::ImportFailure(report) | BrokerError::Channel(report)))
+        | Err(BrokerError::ImportFailure(report) | BrokerError::Channel(report)) => {
+            wire::Reply::Error(wire::Failure {
+                code: wire::Code::Other,
+                report,
+            })
+        }
         Ok(Reply::Ok) => wire::Reply::Ok,
+        Ok(Reply::CredentialPage(page)) => wire::Reply::CredentialPage(page),
         Ok(Reply::VaultImportReview(review)) => wire::Reply::VaultImportReview(review),
         Ok(Reply::VaultImportApplied(applied)) => wire::Reply::VaultImportApplied(applied),
         Ok(Reply::Status(s)) => wire::Reply::Status(status(s)),
@@ -154,5 +179,25 @@ pub fn status(s: crate::BrokerStatus) -> wire::Status {
         agent_access: s.agent_access,
         step_up_active: s.step_up_active,
         gateway_paired: s.gateway_paired,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn channel_failures_preserve_root_kind_cause_and_correlation() {
+        let report = ErrorReport::new(ErrorKind::Protocol, "metadata encoding failed")
+            .caused_by(ErrorReport::new(ErrorKind::Storage, "synthetic cause"))
+            .with_correlation(uuid::Uuid::new_v4());
+        for result in [
+            Err(BrokerError::Channel(report.clone())),
+            Ok(Reply::Error(BrokerError::Channel(report.clone()))),
+        ] {
+            let wire::Reply::Error(failure) = reply(result) else {
+                panic!()
+            };
+            assert_eq!(failure.report, report);
+        }
     }
 }
