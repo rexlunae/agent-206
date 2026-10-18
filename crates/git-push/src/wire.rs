@@ -9,17 +9,37 @@ pub enum WireError {
     Truncated,
     #[error("the server's answer is malformed: {0}")]
     Malformed(&'static str),
-    #[error("the server's answer is not for git-receive-pack")]
-    Service,
+    #[error("the server's answer is not for {0}")]
+    Service(&'static str),
     #[error("the repository uses {remote} object ids, but the local one uses {local}")]
     ObjectFormat { remote: String, local: String },
     #[error("the server does not report the outcome of a push (report-status)")]
     NoReportStatus,
+    #[error("the server refused: {0}")]
+    Server(String),
     #[error("the push command is longer than a {0}-byte packet; use a shorter branch name")]
     TooLong(usize),
 }
 
-/// The references a server holds, as it advertises them before a push.
+/// The smart HTTP service a conversation is with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Service {
+    /// `git-receive-pack`, which a push talks to.
+    ReceivePack,
+    /// `git-upload-pack`, which a fetch talks to.
+    UploadPack,
+}
+impl Service {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::ReceivePack => "git-receive-pack",
+            Self::UploadPack => "git-upload-pack",
+        }
+    }
+}
+
+/// The references a server holds, as it advertises them before a push or
+/// fetch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Advertisement {
     /// Each reference with the object it points at. References whose names
@@ -37,7 +57,7 @@ impl Advertisement {
             .find(|(reference, _)| reference == name)
             .map(|(_, id)| *id)
     }
-    fn capability(&self, name: &str) -> bool {
+    pub(crate) fn capability(&self, name: &str) -> bool {
         self.capabilities.iter().any(|c| c == name)
     }
     /// Every object the server says it has.
@@ -50,13 +70,18 @@ impl Advertisement {
     }
 }
 
-/// Parse a smart HTTP advertisement (`info/refs?service=git-receive-pack`)
-/// for a repository whose object ids are `hash`.
-pub fn parse_advertisement(body: &[u8], hash: gix::hash::Kind) -> Result<Advertisement, WireError> {
+/// Parse a smart HTTP advertisement (`info/refs?service=<service>`) for a
+/// repository whose object ids are `hash`.
+pub fn parse_advertisement(
+    body: &[u8],
+    service: Service,
+    hash: gix::hash::Kind,
+) -> Result<Advertisement, WireError> {
     let mut reader = Reader::new(body);
-    let first = reader.next()?.ok_or(WireError::Service)?;
-    if pkt::line(first) != b"# service=git-receive-pack" {
-        return Err(WireError::Service);
+    let foreign = || WireError::Service(service.name());
+    let first = reader.next()?.ok_or_else(foreign)?;
+    if pkt::line(first) != format!("# service={}", service.name()).as_bytes() {
+        return Err(foreign());
     }
     if reader.next()?.is_some() {
         return Err(WireError::Malformed(
@@ -90,7 +115,8 @@ pub fn parse_advertisement(body: &[u8], hash: gix::hash::Kind) -> Result<Adverti
         }
         if line.starts_with(b"shallow ") {
             // A shallow server repository: it is missing history, which a
-            // fast-forward check below cannot see past.
+            // push's fast-forward check cannot see past and a fetch would
+            // not bring.
             return Err(WireError::Malformed("the server repository is shallow"));
         }
         let (id, name) =
@@ -133,7 +159,7 @@ pub fn parse_advertisement(body: &[u8], hash: gix::hash::Kind) -> Result<Adverti
     Ok(advertised)
 }
 
-fn object_id(hex: &[u8], hash: gix::hash::Kind) -> Result<ObjectId, WireError> {
+pub(crate) fn object_id(hex: &[u8], hash: gix::hash::Kind) -> Result<ObjectId, WireError> {
     if hex.len() != hash.len_in_hex() {
         return Err(WireError::Malformed("an object id has the wrong length"));
     }
@@ -244,7 +270,7 @@ pub fn parse_report(body: &[u8], name: &str) -> Result<Report, WireError> {
 const MAX_REASON: usize = 200;
 
 /// Server text as one printable line of at most [`MAX_REASON`] characters.
-fn clean(text: &[u8]) -> String {
+pub(crate) fn clean(text: &[u8]) -> String {
     let text = String::from_utf8_lossy(text);
     let mut cleaned: String = text
         .chars()
@@ -297,6 +323,7 @@ mod tests {
                 Some(third.as_bytes()),
                 None,
             ]),
+            Service::ReceivePack,
             Kind::Sha1,
         )
         .unwrap();
@@ -316,6 +343,7 @@ mod tests {
         );
         let advertised = parse_advertisement(
             &body(&[service(), None, Some(empty.as_bytes()), None]),
+            Service::ReceivePack,
             Kind::Sha1,
         )
         .unwrap();
@@ -371,13 +399,20 @@ mod tests {
         ];
         for case in cases {
             assert!(
-                parse_advertisement(&body(&case), Kind::Sha1).is_err(),
+                parse_advertisement(&body(&case), Service::ReceivePack, Kind::Sha1).is_err(),
                 "{case:?}"
             );
         }
         let mut trailing = body(&[service(), None, Some(main.as_bytes()), None]);
         trailing.extend_from_slice(b"0000");
-        assert!(parse_advertisement(&trailing, Kind::Sha1).is_err());
+        assert!(parse_advertisement(&trailing, Service::ReceivePack, Kind::Sha1).is_err());
+        // A push's advertisement is not a fetch's, nor the other way round.
+        let push = body(&[service(), None, Some(main.as_bytes()), None]);
+        assert!(parse_advertisement(&push, Service::ReceivePack, Kind::Sha1).is_ok());
+        assert!(matches!(
+            parse_advertisement(&push, Service::UploadPack, Kind::Sha1),
+            Err(WireError::Service("git-upload-pack"))
+        ));
     }
 
     #[test]

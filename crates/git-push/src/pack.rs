@@ -18,17 +18,23 @@ pub struct Limits {
 /// Why the objects of a push could not be chosen or packed.
 #[derive(Debug, thiserror::Error)]
 pub enum PackError {
-    #[error("the push would send more than {0} commits")]
+    #[error("the push or fetch would carry more than {0} commits")]
     TooManyCommits(usize),
-    #[error("the push would send more than {0} objects")]
+    #[error("the push or fetch would carry more than {0} objects")]
     TooManyObjects(usize),
-    #[error("the push would send more than {0} bytes")]
+    #[error("the push or fetch would carry more than {0} bytes")]
     TooLarge(usize),
-    #[error("the push includes an object larger than {0} bytes")]
+    #[error("the push or fetch includes an object larger than {0} bytes")]
     ObjectTooLarge(usize),
-    #[error("the push was cancelled")]
+    #[error("the push or fetch was cancelled")]
     Interrupted,
-    #[error("the commits to push include a submodule, which cannot be pushed with them")]
+    #[error("the server's answer is not a git pack")]
+    NotAPack,
+    #[error("the server's pack could not be read and stored")]
+    Unreadable(#[source] gix::Error),
+    #[error("the fetched objects do not include everything the fetched commit reaches")]
+    Incomplete,
+    #[error("the commits include a submodule, which cannot be pushed or fetched with them")]
     Submodule,
     #[error("the repository could not be read")]
     Git(#[from] gix::Error),

@@ -628,7 +628,7 @@ impl Gateway {
         Arc::make_mut(&mut gateway.tool_hosts).push(message_tools);
         // Pushing git branches, denied in each conversation until the user
         // permits it, and then still approved by the user call by call.
-        let push_tools = Arc::new(crate::git_push::PushHost::new(gateway.pushes()));
+        let push_tools = Arc::new(crate::git_remote::RemoteHost::new(gateway.pushes()));
         Arc::make_mut(&mut gateway.tool_hosts).push(push_tools);
         // The plan tool, denied in each conversation until the user permits it.
         let plan_tools = Arc::new(crate::plan_tool::PlanHost::new(gateway.plans()));

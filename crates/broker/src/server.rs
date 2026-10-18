@@ -361,7 +361,8 @@ fn handle(shared: &Shared, session: &mut Session, request: Request) -> Handled {
             | Request::ProviderStream(_)
             | Request::SocketOpen(_)
             | Request::SocketSend { .. }
-            | Request::GitReceivePack(_),
+            | Request::GitReceivePack(_)
+            | Request::GitUploadPack(_),
         ) => {}
         (Role::Gateway, _)
         | (
@@ -371,7 +372,8 @@ fn handle(shared: &Shared, session: &mut Session, request: Request) -> Handled {
             | Request::ProviderStream(_)
             | Request::SocketOpen(_)
             | Request::SocketSend { .. }
-            | Request::GitReceivePack(_),
+            | Request::GitReceivePack(_)
+            | Request::GitUploadPack(_),
         ) => {
             return Err(BrokerError::Forbidden);
         }
@@ -776,7 +778,8 @@ fn handle(shared: &Shared, session: &mut Session, request: Request) -> Handled {
         Request::SocketOpen(call) => socket(shared, session, call),
         // A connection carrying a socket never reaches here with one.
         Request::SocketSend { .. } => Err(BrokerError::Invalid(InvalidRequest::NoSocket)),
-        Request::GitReceivePack(call) => git(shared, session, call),
+        Request::GitReceivePack(call) => git(shared, session, call, GitService::ReceivePack),
+        Request::GitUploadPack(call) => git(shared, session, call, GitService::UploadPack),
     }
 }
 
@@ -902,7 +905,37 @@ fn provider(shared: &Shared, session: &Session, call: ProviderCall, stream: bool
 
 /// Validate one round of a git push and attach the token, as HTTP Basic
 /// authentication, for the repository's exact origin.
-fn git(shared: &Shared, session: &Session, call: GitCall) -> Handled {
+/// The smart HTTP service a [`GitCall`] is for.
+#[derive(Clone, Copy)]
+enum GitService {
+    ReceivePack,
+    UploadPack,
+}
+impl GitService {
+    fn name(self) -> &'static str {
+        match self {
+            Self::ReceivePack => "git-receive-pack",
+            Self::UploadPack => "git-upload-pack",
+        }
+    }
+    /// The content types of its advertisement, its request and its result.
+    fn types(self) -> [&'static str; 3] {
+        match self {
+            Self::ReceivePack => [
+                "application/x-git-receive-pack-advertisement",
+                "application/x-git-receive-pack-request",
+                "application/x-git-receive-pack-result",
+            ],
+            Self::UploadPack => [
+                "application/x-git-upload-pack-advertisement",
+                "application/x-git-upload-pack-request",
+                "application/x-git-upload-pack-result",
+            ],
+        }
+    }
+}
+
+fn git(shared: &Shared, session: &Session, call: GitCall, service: GitService) -> Handled {
     use base64::Engine as _;
     let (vault, epoch) = paired(shared, session)?;
     let invalid = || BrokerError::Invalid(InvalidRequest::GitRepository);
@@ -937,23 +970,16 @@ fn git(shared: &Shared, session: &Session, call: GitCall) -> Handled {
         .map_err(vault_error)?;
     drop(vault);
     let base = url.path().trim_end_matches('/').to_owned();
+    let [advertisement, request, result] = service.types();
     let (method, expect, content_type) = match call.request {
         None => {
             url.set_path(&format!("{base}/info/refs"));
-            url.set_query(Some("service=git-receive-pack"));
-            (
-                HttpMethod::Get,
-                "application/x-git-receive-pack-advertisement",
-                "application/json",
-            )
+            url.set_query(Some(&format!("service={}", service.name())));
+            (HttpMethod::Get, advertisement, "application/json")
         }
         Some(_) => {
-            url.set_path(&format!("{base}/git-receive-pack"));
-            (
-                HttpMethod::Post,
-                "application/x-git-receive-pack-result",
-                "application/x-git-receive-pack-request",
-            )
+            url.set_path(&format!("{base}/{}", service.name()));
+            (HttpMethod::Post, result, request)
         }
     };
     Ok(Outcome::Send(Box::new(Outbound {

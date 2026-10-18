@@ -33,6 +33,10 @@ impl<'a> Reader<'a> {
     pub fn is_empty(&self) -> bool {
         self.rest.is_empty()
     }
+    /// What has not been read yet.
+    pub fn rest(&self) -> &'a [u8] {
+        self.rest
+    }
     /// The next packet, or an error at the end of the body or on a malformed
     /// length.
     pub fn next(&mut self) -> Result<Packet<'a>, WireError> {
