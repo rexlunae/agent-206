@@ -25,6 +25,7 @@ mod settings;
 mod skills;
 mod slash;
 mod subagents;
+mod teams;
 mod tools;
 mod totp_enrollment;
 mod welcome;
@@ -422,6 +423,7 @@ pub(crate) fn dispatch(mut state: State, command: Command) {
         Command::CreateThread { .. }
             | Command::CreateSubagent { .. }
             | Command::CreateProfileSubagent { .. }
+            | Command::StartTeam { .. }
     );
     spawn(async move {
         let mut destination = None;
