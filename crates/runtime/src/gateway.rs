@@ -179,6 +179,8 @@ pub enum GatewayError {
     #[error(transparent)]
     Presets(#[from] provider::PresetError),
     #[error(transparent)]
+    Messenger(#[from] crate::messengers::MessengerError),
+    #[error(transparent)]
     Backend(#[from] crate::backends::BackendError),
     #[error(transparent)]
     Process(#[from] crate::process::ProcessError),
@@ -285,6 +287,7 @@ impl crate::error::Classified for GatewayError {
             Self::Provider(error) => return classify(error),
             Self::Endpoint(error) => return classify(error),
             Self::Presets(error) => return classify(error),
+            Self::Messenger(error) => return classify(error),
             Self::Backend(error) => return classify(error),
             Self::Process(error) => return classify(error),
             Self::Download(error) => return classify(error),
@@ -1062,6 +1065,12 @@ impl Gateway {
             }
             Command::ConnectMessenger { name } => self.connect_messenger(&name, true),
             Command::DisconnectMessenger { name } => self.connect_messenger(&name, false),
+            Command::SendTestMessage { destination } => {
+                self.outbox()
+                    .send(&destination, a206_core::messengers::TEST_MESSAGE)
+                    .await?;
+                Ok(Reply::Ok)
+            }
             Command::RefreshCatalog { provider } => {
                 let config = self
                     .lock()?
