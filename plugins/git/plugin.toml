@@ -1,9 +1,9 @@
 id = "agent206.git"
 name = "Git"
-description = "Shows the status, history, branches and diffs of a project's git repository, stages and commits changes and creates branches, without running anything the repository configures."
-version = "0.4.0"
+description = "Shows the status, history, branches and diffs of a project's git repository, stages and commits changes, and creates and switches branches, without running anything the repository configures."
+version = "0.5.0"
 abi = 2
-capabilities = ["git_read", "git_write"]
+capabilities = ["git_read", "git_write", "write_workspace"]
 
 [[tools]]
 name = "git_status"
@@ -40,6 +40,17 @@ required = true
 name = "start"
 type = "string"
 description = "A local branch name or full commit id to start from. Defaults to HEAD."
+
+[[tools]]
+name = "git_switch"
+description = "Switch to an existing local branch, like `git switch <branch>`: the project's files and the index change to the branch's commit and it becomes the current branch. Refused when there are uncommitted or staged changes, when a file would replace an untracked or ignored one, and when the repository has checkout hooks, line-ending conversion, filters, submodules or symbolic links the switch would create."
+capabilities = ["git_write", "write_workspace"]
+
+[[tools.params]]
+name = "name"
+type = "string"
+description = "The local branch to switch to, such as feature/login."
+required = true
 
 [[tools]]
 name = "git_diff"

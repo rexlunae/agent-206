@@ -871,18 +871,23 @@ impl HostCalls {
     async fn execute(&mut self, request: HostRequest) -> Result<HostReply, HostFailure> {
         // The stored plugin is read again for every call, so disabling or
         // revoking takes effect inside an invocation already running.
-        let required = a206_extensions::required_capability(&request);
-        let allowed = self.lock()?.state.plugins.iter().any(|p| {
-            p.id == self.extension
-                && p.source == self.source
-                && p.enabled
-                && required.is_none_or(|c| p.granted.contains(&c) && self.effective.contains(&c))
-        });
-        if !allowed {
-            let message = match required {
-                Some(capability) => format!("this call is not granted \"{}\"", capability.label()),
-                None => "this extension is not enabled".into(),
-            };
+        let required = a206_extensions::required_capabilities(&request);
+        let denied = {
+            let store = self.lock()?;
+            match store
+                .state
+                .plugins
+                .iter()
+                .find(|p| p.id == self.extension && p.source == self.source && p.enabled)
+            {
+                None => Some("this extension is not enabled".to_owned()),
+                Some(plugin) => required
+                    .iter()
+                    .find(|c| !(plugin.granted.contains(c) && self.effective.contains(c)))
+                    .map(|missing| format!("this call is not granted \"{}\"", missing.label())),
+            }
+        };
+        if let Some(message) = denied {
             return Err(failure(HostErrorCode::Denied, &message));
         }
         match request {
@@ -995,6 +1000,18 @@ impl HostCalls {
                     move |interrupt| {
                         git_branch::create(root, &name, start.as_deref(), user, &interrupt)
                     },
+                    budget,
+                )
+                .await
+            }
+            HostRequest::GitSwitchBranch { name } => {
+                let root = self.workspace()?;
+                let user = self.user_git;
+                // A switch that has started changing files finishes and is
+                // reported, so it must start early enough to reach the guest.
+                let budget = self.write_budget()?;
+                git_write_call_with_timeout(
+                    move |interrupt| git_switch::switch(root, &name, user, interrupt),
                     budget,
                 )
                 .await
@@ -1219,6 +1236,7 @@ mod git;
 mod git_branch;
 mod git_commit;
 mod git_stage;
+mod git_switch;
 pub mod packages;
 mod patch;
 mod proposals;

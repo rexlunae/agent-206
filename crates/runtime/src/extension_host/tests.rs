@@ -7,6 +7,7 @@ mod git;
 mod git_branch;
 mod git_commit;
 mod git_stage;
+mod git_switch;
 mod patch;
 use a206_extensions::abi::{EntryKind, SearchMatch};
 

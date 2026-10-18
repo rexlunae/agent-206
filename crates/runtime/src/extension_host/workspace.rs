@@ -53,7 +53,7 @@ fn io_failure(error: &std::io::Error) -> HostFailure {
         _ => failure(HostErrorCode::Io, "the workspace could not be accessed"),
     }
 }
-fn open_workspace(root: PathBuf) -> Result<Dir, HostFailure> {
+pub(super) fn open_workspace(root: PathBuf) -> Result<Dir, HostFailure> {
     Dir::open_ambient_dir(root, cap_std::ambient_authority()).map_err(|e| io_failure(&e))
 }
 fn not_regular() -> HostFailure {
@@ -1205,6 +1205,160 @@ fn plan<'a>(workspace: &Dir, file: &'a FilePatch) -> Result<Planned<'a>, HostFai
         original,
         text,
     })
+}
+
+/// Whether something stands where a branch switch would create `path`:
+/// anything at the path itself, or a parent that is not a directory (a
+/// file or a symbolic link), unless `leaving`, the paths the switch removes
+/// first, holds that parent.
+pub(super) fn in_the_way(
+    workspace: &Dir,
+    path: &str,
+    leaving: &std::collections::BTreeSet<&str>,
+) -> Result<bool, HostFailure> {
+    writable_path(path)?;
+    let mut end = 0;
+    loop {
+        let next = path[end..].find('/').map(|at| end + at);
+        let prefix = &path[..next.unwrap_or(path.len())];
+        match workspace.symlink_metadata(prefix) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(io_failure(&error)),
+            Ok(metadata) if next.is_none() && metadata.is_dir() => {
+                return Ok(!only_leaving(workspace, prefix, leaving)?);
+            }
+            Ok(_) if next.is_none() => return Ok(!leaving.contains(prefix)),
+            Ok(metadata) if metadata.is_dir() => {}
+            // Nothing below a path the switch removes exists yet.
+            Ok(_) => return Ok(!leaving.contains(prefix)),
+        }
+        end = next.map_or(path.len(), |at| at + 1);
+    }
+}
+
+/// Whether the directory at `path` holds only paths in `leaving`, so
+/// removing them empties it. Its walk reads at most [`MAX_ENTRIES`] entries;
+/// a larger one counts as holding something else.
+fn only_leaving(
+    workspace: &Dir,
+    path: &str,
+    leaving: &std::collections::BTreeSet<&str>,
+) -> Result<bool, HostFailure> {
+    let mut pending = vec![path.to_owned()];
+    let mut seen = 0usize;
+    while let Some(directory) = pending.pop() {
+        for entry in workspace.read_dir(&directory).map_err(|e| io_failure(&e))? {
+            let entry = entry.map_err(|e| io_failure(&e))?;
+            seen += 1;
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                return Ok(false);
+            };
+            let below = format!("{directory}/{name}");
+            if seen > MAX_ENTRIES {
+                return Ok(false);
+            }
+            // `DirEntry::file_type` describes the entry, not a link target.
+            if entry.file_type().map_err(|e| io_failure(&e))?.is_dir() {
+                pending.push(below);
+            } else if !leaving.contains(below.as_str()) {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
+}
+
+/// Remove a file or symbolic link a branch switch replaces, if it still
+/// holds `expected`, then the parent directories that leaves empty.
+pub(super) fn remove_checked_out(
+    workspace: &Dir,
+    path: &str,
+    link: bool,
+    expected: &[u8],
+) -> Result<(), HostFailure> {
+    let relative = writable_path(path)?;
+    let (Some(name), parent) = (relative.file_name(), relative.parent()) else {
+        return Err(failure(HostErrorCode::Invalid, "invalid path"));
+    };
+    let parent = parent.unwrap_or(Path::new(""));
+    let directory = descend(
+        workspace.try_clone().map_err(|e| io_failure(&e))?,
+        parent,
+        false,
+    )?;
+    let held = if link {
+        directory
+            .read_link_contents(name)
+            .map(|target| target.into_os_string().into_encoded_bytes())
+            .map_err(|e| io_failure(&e))?
+    } else {
+        read_bounded(open_regular(&directory, name)?)?.ok_or_else(too_large)?
+    };
+    if held != expected {
+        return Err(failure(
+            HostErrorCode::Conflict,
+            "a file changed during the switch",
+        ));
+    }
+    directory.remove_file(name).map_err(|e| io_failure(&e))?;
+    let mut emptied = Some(parent);
+    while let Some(directory) = emptied.filter(|d| !d.as_os_str().is_empty()) {
+        // A directory that still holds untracked files stays, as with git;
+        // any other failure only leaves an empty directory, which git
+        // does not track.
+        if workspace.remove_dir(directory).is_err() {
+            break;
+        }
+        emptied = directory.parent();
+    }
+    Ok(())
+}
+
+/// Put a file a branch switch checks out at `path`: a new one where
+/// nothing is, or a replacement of a file that still holds `expected`,
+/// with the executable bit git records. Missing parents are made.
+pub(super) fn check_out_file(
+    workspace: &Dir,
+    path: &str,
+    contents: &[u8],
+    expected: Option<&[u8]>,
+    executable: bool,
+) -> Result<(), HostFailure> {
+    let relative = writable_path(path)?;
+    let (Some(name), parent) = (
+        relative.file_name().and_then(|name| name.to_str()),
+        relative.parent().unwrap_or(Path::new("")),
+    ) else {
+        return Err(failure(HostErrorCode::Invalid, "invalid path"));
+    };
+    let directory = descend(
+        workspace.try_clone().map_err(|e| io_failure(&e))?,
+        parent,
+        true,
+    )?;
+    let replacing = expected.is_some();
+    let staged = stage(&directory, name, contents, replacing, replacing)?;
+    #[cfg(unix)]
+    {
+        use cap_std::fs::PermissionsExt;
+        let mode = directory
+            .symlink_metadata(&staged.temporary)
+            .map_err(|e| io_failure(&e))?
+            .permissions()
+            .mode();
+        // Execute where reading is allowed, as git checks files out.
+        let mode = if executable {
+            mode | ((mode & 0o444) >> 2)
+        } else {
+            mode & !0o111
+        };
+        directory
+            .set_permissions(&staged.temporary, cap_std::fs::Permissions::from_mode(mode))
+            .map_err(|e| io_failure(&e))?;
+    }
+    #[cfg(not(unix))]
+    let _ = executable; // No executable bit to set.
+    staged.publish(expected)
 }
 
 #[cfg(test)]

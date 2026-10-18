@@ -87,6 +87,12 @@ impl Extension for Git {
                 let branch = host::git_create_branch(name, start)?;
                 format!("created {} at {}", branch.name, short(&branch.commit))
             }
+            "git_switch" => {
+                let name = string_arg(args, "name")?
+                    .ok_or_else(|| GuestError::new("invalid_argument", "`name` is required"))?;
+                let branch = host::git_switch_branch(name)?;
+                format!("switched to {} at {}", branch.name, short(&branch.commit))
+            }
             "git_diff" => {
                 let path = string_arg(args, "path")?
                     .ok_or_else(|| GuestError::new("invalid_argument", "`path` is required"))?;

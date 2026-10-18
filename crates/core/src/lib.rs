@@ -51,7 +51,7 @@ impl Capability {
             Self::Execute => "Run project commands",
             Self::Network => "Use the network",
             Self::GitRead => "Read git history",
-            Self::GitWrite => "Stage and commit in git",
+            Self::GitWrite => "Commit and change branches in git",
             Self::ReviewPullRequests => "Review pull requests",
             Self::Download => "Download files",
             Self::Browser => "Use the browser",
