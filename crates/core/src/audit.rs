@@ -24,9 +24,11 @@ pub enum AuditRule {
     SecretValue,
     /// Decodes text and runs it, hiding what runs.
     EncodedCommand,
+    /// Supporting content cannot be checked by the text-pattern scanner.
+    OpaqueFile,
 }
 impl AuditRule {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::RemoteScript,
         Self::ReverseShell,
         Self::CredentialFile,
@@ -34,6 +36,7 @@ impl AuditRule {
         Self::HiddenText,
         Self::SecretValue,
         Self::EncodedCommand,
+        Self::OpaqueFile,
     ];
     pub fn label(self) -> &'static str {
         match self {
@@ -46,6 +49,7 @@ impl AuditRule {
             Self::HiddenText => "Contains invisible or direction-changing characters",
             Self::SecretValue => "Contains what looks like a key or token",
             Self::EncodedCommand => "Decodes hidden text and runs it",
+            Self::OpaqueFile => "Contains a file the text audit cannot inspect",
         }
     }
 }
@@ -56,6 +60,10 @@ impl AuditRule {
 pub enum AuditLocation {
     /// A line of the reviewed file, counted from 1.
     Line(u32),
+    File {
+        path: String,
+        line: Option<u32>,
+    },
     /// A text field of an extension's manifest, such as a tool's description.
     Field {
         /// The tool, parameter or panel the field belongs to; none for the
@@ -155,11 +163,19 @@ mod tests {
                 field: AuditField::ToolDescription,
             },
         });
+        audit.push(AuditFinding {
+            rule: AuditRule::RemoteScript,
+            location: AuditLocation::File {
+                path: "scripts/setup.sh".into(),
+                line: Some(2),
+            },
+        });
         let audit = audit.finish();
         let text = toml::to_string_pretty(&Listing { audit }).unwrap();
         assert!(text.contains("line = 7"), "{text}");
         assert!(text.contains(&item), "{text}");
         assert!(text.contains("tool_description"), "{text}");
+        assert!(text.contains("scripts/setup.sh"), "{text}");
     }
 
     #[test]

@@ -37,11 +37,11 @@ environment, so credentials must come through the vault.
 
 ## Approval
 
-Installed skills start **off**. Approval names the text the user reviewed:
-`agent206 skills show NAME` prints `SKILL.md` and its SHA-256 digest, and
+Installed skills start **off**. Approval names the package the user reviewed:
+`agent206 skills show NAME` prints `SKILL.md`, supporting text files and the package digest, and
 `agent206 skills enable NAME --digest HEX` approves it; on the Extensions page,
-**Review** opens the text and **Approve this text and enable** approves what is
-shown. If the file changed after that review, approval is refused. The digest is
+**Review** opens the package and **Approve this package and enable** approves what is
+shown. If any file changed after that review, approval is refused. The digest is
 recorded in `settings.toml` (`enabled_skills`); saving settings never changes
 it, so approval stays a separate user operation. Any later edit makes the skill
 "changed": it is withheld from models until the user reviews and enables it
@@ -55,10 +55,21 @@ instructions to ignore the system prompt or keep something from the user,
 invisible characters, key-like values or decoded commands are reported by line
 on the skill's card, in `skills list` and after `skills show`. Findings advise
 the review; approval works the same either way, and a clean report proves
-nothing. Supporting files are not yet audited. Installing or editing a skill changes files only, so the page's
+nothing. Supporting text files are audited too, with relative paths and line
+numbers; binary or NUL-containing files are explicitly flagged as uninspected.
+The review includes each file's path, size and text where readable, without
+executing any content. Installing or editing a skill changes files only, so the page's
 **Refresh** re-reads the folder.
 
-Bounds: 256 skill folders, 256 KiB per `SKILL.md`, 1 MiB per supporting file.
+Bounds: 256 skill folders, 256 KiB per `SKILL.md`, 1 MiB per supporting file,
+128 entries per package, 16 directory levels and 2 MiB total. Symlinks, special
+files and unrepresentable paths refuse the entire package rather than producing
+a partial audit. Hidden supporting files are included. Approval pins sorted,
+length-framed paths and file bytes; adding, removing, renaming or editing a file
+withdraws approval. Existing standalone `SKILL.md` approvals remain valid;
+packages with supporting files need review again after this upgrade. Model file
+reads serve the digest-checked snapshot, without reopening a file after checking
+its approval. Pattern matching remains advisory and is not a malware scanner.
 Supporting files are read only by relative path inside the skill; absolute paths,
 `..` and symlinks are refused, and files are opened without following symlinks
 at any step, so a link swapped in during a read cannot reach outside the skill.

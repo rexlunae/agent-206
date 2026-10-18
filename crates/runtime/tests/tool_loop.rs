@@ -1815,6 +1815,106 @@ async fn a_credential_an_output_rule_joins_is_removed_too() {
     );
 }
 
+// ── Argument types and repeated calls ───────────────────────────────────────
+
+#[tokio::test]
+async fn arguments_take_their_declared_types_and_repeats_are_reported() {
+    let api = ProviderApi::OpenAi;
+    let name = nonce();
+    let mut spec = tool(&name, ToolPermission::Allow, &[]);
+    spec.parameters = json!({"type": "object", "properties": {
+        "count": {"type": "integer"}, "label": {"type": "string"},
+    }});
+    let mut rig = rig(api, vec![spec], None).await;
+    rig.permit(&name, ToolPermission::Allow).await;
+    let count = u32::from_str_radix(&nonce()[..6], 16).unwrap();
+    let task = rig.send();
+    let mut ids = vec![];
+    // The model sends a string for the integer and a number for the string,
+    // the same way each round.
+    let threshold = 5; // docs/run-engine.md: reported from the fifth request in a row
+    let mut request = rig.next_request().await;
+    for round in 0..threshold {
+        let call = Call::new(&name, json!({"count": count.to_string(), "label": count}));
+        ids.push(call.id.clone());
+        request.respond(calls_response(api, &[call], "")).await;
+        let (_, ran) = tokio::time::timeout(PATIENCE, rig.calls.recv())
+            .await
+            .unwrap_or_else(wait("the tool to run"))
+            .unwrap();
+        assert_eq!(
+            Value::Object(ran.arguments.clone()),
+            json!({"count": count, "label": count.to_string()}),
+            "round {round}"
+        );
+        request = rig.next_request().await;
+        let seen = result_for(api, &request.body, ids.last().unwrap()).unwrap();
+        let noted = seen.contains("times in a row");
+        assert_eq!(noted, round + 1 == threshold, "round {round}: {seen}");
+        if noted {
+            assert!(
+                seen.contains(&format!("requested {threshold} times")),
+                "{seen}"
+            );
+        }
+    }
+    request.respond(text_response(api, &nonce())).await;
+    let thread = finished(task).await;
+    assert_eq!(thread.state, RunState::Complete, "{:?}", thread.error);
+    let recorded = calls_of(&thread);
+    assert_eq!(recorded.len(), threshold);
+    for (n, call) in recorded.iter().enumerate() {
+        assert!(call.healed, "{n}");
+        assert_eq!(
+            call.arguments,
+            json!({"count": count, "label": count.to_string()}).to_string()
+        );
+        let expected = (n + 1 >= threshold).then_some(threshold as u32);
+        assert_eq!(call.repeated, expected, "{n}");
+    }
+}
+
+#[tokio::test]
+async fn a_request_repeated_within_a_response_still_ends_the_streak_it_interrupts() {
+    let api = ProviderApi::OpenAi;
+    let (first, other) = (nonce(), nonce());
+    let specs = [&first, &other].map(|name| tool(name, ToolPermission::Allow, &[]));
+    let mut rig = rig(api, specs.to_vec(), None).await;
+    rig.permit(&first, ToolPermission::Allow).await;
+    rig.permit(&other, ToolPermission::Allow).await;
+    let task = rig.send();
+    let threshold = 5; // docs/run-engine.md: reported from the fifth request in a row
+    // One response asks for the first tool, the other, then the first again:
+    // the last request made is the first tool's, so it starts the streak.
+    let mut request = rig.next_request().await;
+    let calls = [&first, &other, &first].map(|name| Call::new(name, json!({})));
+    request.respond(calls_response(api, &calls, "")).await;
+    for _ in 0..2 {
+        tokio::time::timeout(PATIENCE, rig.calls.recv())
+            .await
+            .unwrap_or_else(wait("the tools to run"))
+            .unwrap();
+    }
+    for _ in 2..=threshold {
+        request = rig.next_request().await;
+        let call = Call::new(&first, json!({}));
+        request.respond(calls_response(api, &[call], "")).await;
+        tokio::time::timeout(PATIENCE, rig.calls.recv())
+            .await
+            .unwrap_or_else(wait("the tool to run"))
+            .unwrap();
+    }
+    request = rig.next_request().await;
+    request.respond(text_response(api, &nonce())).await;
+    let thread = finished(task).await;
+    assert_eq!(thread.state, RunState::Complete, "{:?}", thread.error);
+    let repeated: Vec<_> = calls_of(&thread).iter().map(|call| call.repeated).collect();
+    // Three requests in the first response, then one per round.
+    let mut expected = vec![None; threshold + 1];
+    expected.push(Some(threshold as u32));
+    assert_eq!(repeated, expected);
+}
+
 // ── Text addressed to the model ─────────────────────────────────────────────
 
 #[tokio::test]

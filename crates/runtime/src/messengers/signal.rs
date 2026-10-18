@@ -36,7 +36,6 @@ const MAX_MESSAGE: usize = 2000;
 /// Most parts one reply is sent as.
 const MAX_PARTS: usize = 8;
 /// Ends a reply that did not fit in [`MAX_PARTS`] messages.
-const CUT_SHORT: &str = "\n(reply cut short; read the rest in Agent 206)";
 /// How long the daemon may take to answer a request.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// Replies waiting for the session.
@@ -636,21 +635,7 @@ fn received(params: &Value, login: &str) -> Option<(String, Event)> {
 /// `send` params for each part of `text` to `chat`: a group by id, or the
 /// ACI a direct chat names.
 fn send_params(login: &str, chat: &str, text: &str) -> Vec<Value> {
-    let mut parts: Vec<String> = super::split(text, MAX_MESSAGE)
-        .into_iter()
-        .filter(|part| !part.trim().is_empty())
-        .map(str::to_owned)
-        .collect();
-    if parts.len() > MAX_PARTS {
-        // The last part makes room to say the reply was cut short.
-        parts.truncate(MAX_PARTS);
-        let last = parts.pop().unwrap_or_default();
-        let kept = super::split(&last, MAX_MESSAGE - CUT_SHORT.len())
-            .into_iter()
-            .next()
-            .unwrap_or_default();
-        parts.push(format!("{kept}{CUT_SHORT}"));
-    }
+    let parts = super::bounded_parts(text, MAX_MESSAGE, MAX_PARTS);
     parts
         .into_iter()
         .map(|part| {
@@ -786,13 +771,13 @@ mod tests {
             cut[MAX_PARTS - 1]["message"]
                 .as_str()
                 .unwrap()
-                .ends_with(CUT_SHORT)
+                .ends_with(crate::messengers::CUT_SHORT)
         );
         assert!(
             !direct.last().unwrap()["message"]
                 .as_str()
                 .unwrap()
-                .ends_with(CUT_SHORT)
+                .ends_with(crate::messengers::CUT_SHORT)
         );
     }
 

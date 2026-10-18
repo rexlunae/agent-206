@@ -49,7 +49,8 @@ pub enum MessengerAction {
 
 #[derive(clap::Args)]
 pub struct Options {
-    /// Vault credential holding the bot or access token, never the token itself.
+    /// Vault credential holding the bot or access token (Beeper: the Desktop
+    /// API token), never the token itself.
     #[arg(long)]
     credential: Option<String>,
     /// Vault credential holding the app-level token a service receives

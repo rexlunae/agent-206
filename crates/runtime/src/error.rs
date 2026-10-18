@@ -199,7 +199,7 @@ impl Classified for a206_skills::SkillError {
         Some(match self {
             Directory(_) | Read(_) => return None,
             NotFound => ErrorKind::NotFound,
-            Name | Path | TooMany { .. } | TooLarge { .. } | FileTooLarge { .. } => {
+            Name | Path | PackageLimit | TooMany { .. } | TooLarge { .. } | FileTooLarge { .. } => {
                 ErrorKind::InvalidRequest
             }
             NotText(_) | NoFrontmatter | Frontmatter(_) | Metadata(_) | NameMismatch
