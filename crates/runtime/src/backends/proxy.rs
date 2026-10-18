@@ -39,6 +39,7 @@ struct Scope {
     token: String,
     stop: tokio_util::sync::CancellationToken,
     requests: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    dispatched: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 pub struct Proxy {
     task: tokio::task::JoinHandle<()>,
@@ -53,7 +54,13 @@ impl Drop for Proxy {
     }
 }
 impl Proxy {
-    pub async fn start(config: ProviderConfig, model: ModelInfo) -> std::io::Result<Self> {
+    /// Serve the backend's model requests; `dispatched` counts those sent
+    /// on to the provider.
+    pub async fn start(
+        config: ProviderConfig,
+        model: ModelInfo,
+        dispatched: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) -> std::io::Result<Self> {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let port = listener.local_addr()?.port();
         let token = Id::new_v4().to_string();
@@ -64,6 +71,7 @@ impl Proxy {
             token: token.clone(),
             stop: stop.clone(),
             requests: Default::default(),
+            dispatched,
         };
         let router = Router::new()
             .route("/{*path}", any(forward))
@@ -184,6 +192,12 @@ async fn forward(
                 request = request.header("anthropic-beta", beta);
             }
         }
+        // Counting tokens is not a model request.
+        if path != "messages/count_tokens" {
+            scope
+                .dispatched
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         let upstream = tokio::select! {
             result = request.send() => result.map_err(|error| crate::provider::ProviderError::Transport(error.without_url()))?,
             _ = scope.stop.cancelled() => return Err(ProxyError::Cancelled),
@@ -282,7 +296,9 @@ mod tests {
         .unwrap()
         .models
         .remove(0);
-        let proxy = Proxy::start(config, info).await.unwrap();
+        let proxy = Proxy::start(config, info, Default::default())
+            .await
+            .unwrap();
         let base = format!("http://127.0.0.1:{}/v1", proxy.port());
         let client = reqwest::Client::new();
         assert_eq!(

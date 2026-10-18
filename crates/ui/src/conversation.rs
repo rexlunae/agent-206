@@ -920,11 +920,11 @@ fn ThreadFacts(thread: Thread) -> Element {
             dt { "Last request input / output" } dd { "{number(input)} / {number(output)}" }
             dt { "Run input / output" } dd { "{number(run_input)} / {number(run_output)}" }
             dt { "Run cost" } dd { {cost.map(|c| format!("{c:.6}")).unwrap_or_else(|| "Not reported".into())} }
-            dt { "Conversation input / output" } dd { "{tokens_label(&total.input_tokens)} / {tokens_label(&total.output_tokens)}" }
-            dt { "Conversation cost" } dd { "{cost_tally_label(&total.cost)}" }
+            dt { "Conversation input / output" } dd { "{tokens_label(total, &total.input_tokens)} / {tokens_label(total, &total.output_tokens)}" }
+            dt { "Conversation cost" } dd { "{costs_label(total, &snapshot.settings.providers)}" }
             if has_subagents {
-                dt { "With subagents input / output" } dd { "{tokens_label(&family.input_tokens)} / {tokens_label(&family.output_tokens)}" }
-                dt { "With subagents cost" } dd { "{cost_tally_label(&family.cost)}" }
+                dt { "With subagents input / output" } dd { "{tokens_label(&family, &family.input_tokens)} / {tokens_label(&family, &family.output_tokens)}" }
+                dt { "With subagents cost" } dd { "{costs_label(&family, &snapshot.settings.providers)}" }
             }
             dt { "Input / output rate" } dd { "{price(model.and_then(|m| m.input_cost_per_token))} / {price(model.and_then(|m| m.output_cost_per_token))}" }
             dt { "Account balance" } dd { {catalog.and_then(|c| c.balance.map(|v| format!("{v:.4} {}", c.balance_currency.as_deref().unwrap_or("provider units")))).unwrap_or_else(|| "Not reported".into())} }
@@ -943,21 +943,46 @@ fn ThreadFacts(thread: Thread) -> Element {
     } }
 }
 
-/// A summed token count, marked as a lower bound when some reports lacked it.
-fn tokens_label(tally: &Tally<u64>) -> String {
-    match tally.exact() {
+/// A summed token count, marked as a lower bound unless it is the whole of
+/// what was used.
+fn tokens_label(total: &UsageTotal, tally: &Tally<u64>) -> String {
+    match total.exact(tally) {
         Some(sum) => sum.to_string(),
-        None => format!("At least {} ({} unreported)", tally.sum, tally.unreported),
+        None if tally.unreported > 0 => {
+            format!("At least {} ({} unreported)", tally.sum, tally.unreported)
+        }
+        None => format!("At least {}", tally.sum),
     }
 }
-fn cost_tally_label(tally: &Tally<f64>) -> String {
-    match tally.exact() {
-        Some(sum) => format!("{sum:.6}"),
-        None => format!(
-            "At least {:.6} ({} unreported)",
-            tally.sum, tally.unreported
-        ),
+/// Each provider's summed cost, in its own units, named by its connection.
+fn costs_label(total: &UsageTotal, providers: &[a206_core::ProviderConfig]) -> String {
+    if total.costs.is_empty() {
+        return "Not reported".into();
     }
+    total
+        .costs
+        .iter()
+        .map(|cost| {
+            let tally = &cost.cost;
+            let value = match total.exact(tally) {
+                Some(sum) => format!("{sum:.6}"),
+                None if tally.unreported > 0 => {
+                    format!(
+                        "at least {:.6} ({} unreported)",
+                        tally.sum, tally.unreported
+                    )
+                }
+                None => format!("at least {:.6}", tally.sum),
+            };
+            let name = providers
+                .iter()
+                .find(|p| p.id == cost.provider)
+                .map(|p| p.label.as_str())
+                .unwrap_or("Removed connection");
+            format!("{name}: {value}")
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 /// What the conversation totals count, and what they leave out.
 fn totals_note(total: &UsageTotal) -> String {
@@ -967,7 +992,7 @@ fn totals_note(total: &UsageTotal) -> String {
     );
     if total.incomplete > 0 {
         note.push_str(&format!(
-            ", {} requests ended before a finished response and reported nothing",
+            ", {} requests reached a provider but ended before a finished response and reported nothing",
             total.incomplete
         ));
     }

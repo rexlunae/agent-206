@@ -66,12 +66,17 @@ failed or cancelled run shows no cost rather than the previous run's.
 `Thread::usage_total` keeps a running total over every run of the conversation:
 each finished response of a native round or a compaction summary (automatic or
 asked for), and each coding-backend run's reported total, whether or not the run
-finished. Each figure (input tokens, output tokens, cost) is a sum of what was
-reported plus a count of reports that left it out, so a partial sum is shown as
-"at least" rather than as exact. Requests that ended without a finished response
-(failed or cancelled) are counted as `incomplete`: a provider may have charged
-for them, but none reported usage. A conversation saved before totals were kept
-has `from_start = false`. `UsageTotal::with_subagents` adds the totals of every
+finished. Each figure (input tokens, output tokens) is a sum of what was
+reported plus a count of reports that left it out. Cost is kept per provider
+connection (`UsageTotal::costs`) and never added across providers, whose
+currencies and billing may differ. Requests that ended without a finished
+response (failed or cancelled) are counted as `incomplete`: a provider may have
+charged for them, but none reported usage. A coding-backend run that failed
+before its proxy sent any request to the provider is not counted. A
+conversation saved before totals were kept has `from_start = false`.
+`UsageTotal::exact` gives a figure only when it was counted from the start with
+no missing report and no incomplete request; otherwise clients show the sum as
+"at least". `UsageTotal::with_subagents` adds the totals of every
 subagent conversation below one. The conversation popover shows both, and
 `agent206 usage THREAD` prints them as TOML.
 

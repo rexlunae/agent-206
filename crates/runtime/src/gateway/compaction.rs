@@ -282,23 +282,24 @@ impl Gateway {
         let turn = tokio::select! {
             turn = operation => turn,
             _ = request.cancel.cancelled() => {
-                self.count_summary(request.thread, None)?;
+                self.count_summary(request, None)?;
                 return Err(CompactionError::Cancelled.into());
             }
         };
         // Counted whatever becomes of the summary: the request was made.
-        self.count_summary(request.thread, turn.as_ref().ok().map(|t| &t.usage))?;
+        self.count_summary(request, turn.as_ref().ok().map(|t| &t.usage))?;
         let turn = turn.map_err(CompactionError::Summary)?;
         check(!request.cancel.is_cancelled(), CompactionError::Cancelled)?;
         let summary = turn.text.trim();
         check(!summary.is_empty(), CompactionError::EmptySummary)?;
         Ok((summary.to_owned(), turn.usage))
     }
-    fn count_summary(&self, id: Id, usage: Option<&Usage>) -> Result<()> {
+    fn count_summary(&self, request: &Request<'_>, usage: Option<&Usage>) -> Result<()> {
+        let id = request.thread;
         let mut store = self.lock()?;
         let total = &mut store.thread_mut(id)?.usage_total;
         match usage {
-            Some(usage) => total.record(usage),
+            Some(usage) => total.record(request.config.id, usage),
             None => total.record_incomplete(),
         }
         store.persist(Some(EventKind::ThreadChanged { id }))?;
