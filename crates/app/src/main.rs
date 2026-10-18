@@ -436,7 +436,7 @@ mod native {
             /// Agent 206 backend only: read git history (git status, log, diff).
             #[arg(long)]
             git_read: bool,
-            /// Agent 206 backend only: commit (implies --git-read).
+            /// Agent 206 backend only: stage and commit (implies --git-read).
             #[arg(long)]
             git_write: bool,
             /// Agent 206 backend only: fetch from the network; commands may use it too.
@@ -571,6 +571,7 @@ mod native {
                 #[cfg(feature = "tui")]
                 {
                     a206_ui::configure(root, args.remote);
+                    a206_ui::configure_terminal();
                     dioxus_tui::launch(a206_ui::App)
                 }
                 #[cfg(not(feature = "tui"))]

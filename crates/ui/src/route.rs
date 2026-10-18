@@ -295,7 +295,7 @@ pub(crate) mod tests {
     fn shared_router_renders_initial_page_and_back_forward_history() {
         let (mut dom, history) = app_at("/connections");
         let initial = dioxus_ssr::render(&dom);
-        assert!(initial.contains("Intelligence, on your terms."));
+        assert!(initial.contains("<h1>Connections</h1>"));
         assert!(initial.contains("href=\"/connections\" aria-current=\"page\""));
         let router = dom.in_scope(ScopeId::ROOT, || dioxus::router::root_router().unwrap());
         dom.in_scope(ScopeId::ROOT, || {
@@ -303,21 +303,21 @@ pub(crate) mod tests {
         });
         dom.render_immediate(&mut dioxus::core::NoOpMutations);
         assert_eq!(history.current_route(), "/projects");
-        assert!(dioxus_ssr::render(&dom).contains("Give your work a home."));
+        assert!(dioxus_ssr::render(&dom).contains("<h1>Projects</h1>"));
         dom.in_scope(ScopeId::ROOT, || router.go_back());
         dom.render_immediate(&mut dioxus::core::NoOpMutations);
         assert_eq!(history.current_route(), "/connections");
-        assert!(dioxus_ssr::render(&dom).contains("Intelligence, on your terms."));
+        assert!(dioxus_ssr::render(&dom).contains("<h1>Connections</h1>"));
         dom.in_scope(ScopeId::ROOT, || router.go_forward());
         dom.render_immediate(&mut dioxus::core::NoOpMutations);
         assert_eq!(history.current_route(), "/projects");
-        assert!(dioxus_ssr::render(&dom).contains("Give your work a home."));
+        assert!(dioxus_ssr::render(&dom).contains("<h1>Projects</h1>"));
         // The shell remains mounted: existing navigation history survives another page.
         dom.in_scope(ScopeId::ROOT, || {
             router.push(Route::Appearance {});
         });
         dom.render_immediate(&mut dioxus::core::NoOpMutations);
-        assert!(dioxus_ssr::render(&dom).contains("A workspace that feels right."));
+        assert!(dioxus_ssr::render(&dom).contains("<h1>Appearance</h1>"));
         assert!(history.can_go_back());
         assert!(!history.can_go_forward());
     }

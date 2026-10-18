@@ -1,4 +1,4 @@
-//! Bundled git extension. Every repository read or commit is a host call
+//! Bundled git extension. Every repository read, staging or commit is a host call
 //! that the gateway authorizes against the caller's `git_read` or
 //! `git_write` grant.
 use a206_extension_sdk::{
@@ -95,6 +95,20 @@ impl Extension for Git {
                     .collect();
                 let commit = host::git_commit(message, &paths)?;
                 format!("committed {} {}", commit.id, commit.summary)
+            }
+            "git_stage" => {
+                let paths: Vec<&str> = string_arg(args, "paths")?
+                    .ok_or_else(|| GuestError::new("invalid_argument", "`paths` is required"))?
+                    .lines()
+                    .filter(|path| !path.is_empty())
+                    .collect();
+                let unstage = bool_arg(args, "unstage")?.unwrap_or(false);
+                host::git_stage(&paths, unstage)?;
+                format!(
+                    "{} {}",
+                    if unstage { "unstaged" } else { "staged" },
+                    paths.join(", ")
+                )
             }
             _ => return Err(GuestError::new("unknown_tool", format!("no tool `{name}`"))),
         };

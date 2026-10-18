@@ -8,17 +8,24 @@
 //! held as a zeroizing [`WireSecret`], never rendered. The enrollment key is
 //! shown as text content so it can be copied into an authenticator app.
 use crate::error::{ErrorNotice, record};
+use crate::vault_backend::{Session, Target, unexpected};
 use crate::welcome::{VaultFacts, VaultProgress, VaultSeen};
-use a206_broker::{BrokerError, BrokerStatus, ClientError, Reply, Request, WireSecret};
-use a206_core::{ErrorReport, GatewayTarget};
-use a206_runtime::vault::{Session, VaultError};
+use a206_core::ErrorReport;
+#[cfg(not(target_arch = "wasm32"))]
+use a206_core::GatewayTarget;
+use a206_vault_channel::{
+    Code as BrokerError, Failure as VaultError, Reply, Request, Secret as WireSecret,
+    Status as BrokerStatus,
+};
 use fc_dioxus::prelude::*;
+#[cfg(not(target_arch = "wasm32"))]
 use std::path::{Path, PathBuf};
 
 /// The account name shown in the authenticator app, as the CLI uses by default.
 const TOTP_ACCOUNT: &str = "agent206";
 
 /// Where this client's vault controls apply.
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Clone, PartialEq)]
 pub(crate) enum Placement {
     /// This computer's profile: its broker serves the local gateway.
@@ -30,6 +37,7 @@ pub(crate) enum Placement {
     /// The client was started without a profile.
     NoProfile,
 }
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn placement() -> Placement {
     let Some((root, remote)) = crate::PROFILE.lock().ok().and_then(|p| p.clone()) else {
         return Placement::NoProfile;
@@ -88,6 +96,7 @@ enum Flow {
 struct Enrollment {
     otpauth_url: WireSecret,
     manual_key: WireSecret,
+    graphic: Result<crate::totp_enrollment::Graphic, ErrorReport>,
 }
 
 /// A failure to show, with a title naming what went wrong for the user.
@@ -115,6 +124,7 @@ struct Panel {
     progress: Option<VaultProgress>,
 }
 /// A stopped broker holds no unlocked vault, so its vault reads as locked.
+#[cfg(not(target_arch = "wasm32"))]
 fn stopped(root: &Path) -> BrokerStatus {
     BrokerStatus {
         exists: a206_broker::vault_path(root).exists(),
@@ -126,10 +136,10 @@ fn stopped(root: &Path) -> BrokerStatus {
     }
 }
 fn broker_refused(error: &VaultError, expected: BrokerError) -> bool {
-    matches!(error, VaultError::Broker(ClientError::Broker(refusal)) if *refusal == expected)
+    error.code == expected
 }
 fn failure(operation: &'static str, title: &str, error: &VaultError) -> Failure {
-    let report = a206_runtime::error::report(error);
+    let report = error.report.clone();
     record(operation, &report);
     Failure {
         title: title.to_owned(),
@@ -185,6 +195,7 @@ impl Panel {
     /// The Get started page's background re-read. It never starts a broker,
     /// so a deliberate `vault stop` stays stopped, and its failure is shown
     /// apart from action failures and cleared by the next good read.
+    #[cfg(not(target_arch = "wasm32"))]
     async fn poll(mut self, root: &Path) {
         match self.session().status_if_running().await {
             Ok(found) => self.show(found.unwrap_or_else(|| stopped(root))),
@@ -224,7 +235,7 @@ impl Panel {
         spawn(async move {
             let request = Request::Unlock {
                 password: WireSecret::new(password.expose().to_owned()),
-                totp,
+                totp: totp.map(WireSecret::new),
                 create,
             };
             match self.session().call(request).await {
@@ -309,7 +320,10 @@ impl Panel {
         spawn(async move {
             match self
                 .session()
-                .call(Request::StepUp { password, totp })
+                .call(Request::StepUp {
+                    password,
+                    totp: totp.map(WireSecret::new),
+                })
                 .await
             {
                 Ok(_) => self.perform(task).await,
@@ -349,6 +363,7 @@ impl Panel {
                         ..
                     }) => {
                         self.enrollment.set(Some(Enrollment {
+                            graphic: crate::totp_enrollment::Graphic::encode(otpauth_url.expose()),
                             otpauth_url,
                             manual_key,
                         }));
@@ -359,7 +374,7 @@ impl Panel {
                         self.fail(
                             "vault_totp_begin",
                             "Could not start enrollment",
-                            &VaultError::UnexpectedReply,
+                            &unexpected(),
                         );
                     }
                     Err(error) if broker_refused(&error, BrokerError::StepUpRequired) => {
@@ -378,7 +393,13 @@ impl Panel {
             return;
         }
         spawn(async move {
-            match self.session().call(Request::ConfirmTotp { code }).await {
+            match self
+                .session()
+                .call(Request::ConfirmTotp {
+                    code: WireSecret::new(code),
+                })
+                .await
+            {
                 Ok(_) => {
                     self.enrollment.set(None);
                     self.flow.set(Flow::Idle);
@@ -387,10 +408,7 @@ impl Panel {
                 // A mistyped or expired code can be retried with the next one.
                 Err(error)
                     if broker_refused(&error, BrokerError::AuthenticationFailed)
-                        || matches!(
-                            error,
-                            VaultError::Broker(ClientError::Broker(BrokerError::ClockDrift { .. }))
-                        ) =>
+                        || error.code == BrokerError::ClockDrift =>
                 {
                     self.fail(
                         "vault_totp_confirm",
@@ -411,21 +429,33 @@ impl Panel {
         self.held.write().take()
     }
     fn cancel(mut self) {
+        let pending = self.enrollment.peek().is_some();
         self.held.set(None);
         self.enrollment.set(None);
         self.flow.set(Flow::Idle);
+        // Also discard the broker-held pending seed, rather than only hiding it.
+        if pending && self.begin() {
+            spawn(async move {
+                if let Err(error) = self.session().call(Request::CancelTotp).await {
+                    self.fail("vault_totp_cancel", "Could not cancel enrollment", &error);
+                }
+                self.finish().await;
+            });
+        }
     }
 }
 
 /// The Security page's vault section for this client.
+#[cfg(not(target_arch = "wasm32"))]
 #[component]
 pub(crate) fn VaultSection() -> Element {
     rsx! { VaultPlacement { placement: placement() } }
 }
+#[cfg(not(target_arch = "wasm32"))]
 #[component]
 fn VaultPlacement(placement: Placement) -> Element {
     match placement {
-        Placement::Local(root) => rsx! { VaultPanel { root } },
+        Placement::Local(root) => rsx! { VaultPanel { target: root } },
         Placement::Remote(endpoint) => rsx! {
             Card { variant: CardVariant::Subtle,
                 CardHeader { CardTitle { "Vault" } Badge { tone: BadgeTone::Neutral, "Remote gateway" } }
@@ -451,9 +481,9 @@ fn take(mut field: Signal<String>) -> String {
     value
 }
 #[component]
-fn VaultPanel(root: PathBuf) -> Element {
+fn VaultPanel(target: Target) -> Element {
     let panel = Panel {
-        session: use_signal(|| Session::open(root.clone())),
+        session: use_signal(|| Session::open(target.clone())),
         status: use_signal(|| None),
         failure: use_signal(|| None),
         warning: use_signal(|| None),
@@ -467,19 +497,26 @@ fn VaultPanel(root: PathBuf) -> Element {
     };
     // Reads only through `peek`, so this runs once, after the first render.
     use_effect(move || panel.check());
-    // On the Get started page, keep the checklist current with changes other
-    // clients make. Skipped while an action or a multi-step flow is running.
-    let polled = root.clone();
+    // Gateway stop/restart and locks from another client revoke pairings.
+    // Refresh without erasing an action's outcome, and serialize with submits
+    // because the encrypted channel uses ordered nonces. A failed connection
+    // stops polling until the user explicitly retries.
+    #[cfg(not(target_arch = "wasm32"))]
+    let poll_target = target.clone();
     use_future(move || {
-        let root = polled.clone();
+        #[cfg(not(target_arch = "wasm32"))]
+        let target = poll_target.clone();
         async move {
-            if panel.progress.is_none() {
-                return;
-            }
+            let mut panel = panel;
             loop {
                 futures_timer::Delay::new(crate::welcome::VAULT_POLL).await;
-                if !*panel.busy.peek() && *panel.flow.peek() == Flow::Idle {
-                    panel.poll(&root).await;
+                if !*panel.busy.peek() && panel.status.peek().is_some() {
+                    panel.busy.set(true);
+                    #[cfg(not(target_arch = "wasm32"))]
+                    panel.poll(&target).await;
+                    #[cfg(target_arch = "wasm32")]
+                    panel.refresh().await;
+                    panel.busy.set(false);
                 }
             }
         }
@@ -514,6 +551,26 @@ fn VaultPanel(root: PathBuf) -> Element {
                     DescriptionItem { term: rsx! { "Encrypted vault" }, if status.exists { "Created" } else { "Not created yet" } }
                     DescriptionItem { term: rsx! { "Two-factor authentication" }, "{known(status.totp_enrolled)}" }
                     DescriptionItem { term: rsx! { "Agent credential access" }, "{known(status.agent_access)}" }
+                    DescriptionItem { term: rsx! { "Gateway pairing" }, "{known(status.gateway_paired)}" }
+                }
+                if status.unlocked && status.totp_enrolled == Some(false) {
+                    Alert { tone: AlertTone::Warning, title: rsx! { "Verify an authenticator next" }, "Your vault is encrypted. Set up two-factor authentication and confirm a code before considering enrollment complete. Agent credential access stays off by default." }
+                }
+                if status.unlocked && status.totp_enrolled == Some(true) && status.gateway_paired == Some(true) {
+                    Alert { tone: AlertTone::Success, title: rsx! { "Vault enrollment verified" }, "Encryption is active, an authenticator is enrolled, and the gateway holds a current pairing. Lock and unlock once to check your recovery workflow. Restarting the gateway requires pairing it again." }
+                }
+                if !status.exists {
+                    Alert { title: rsx! { "Bringing an existing RustyClaw vault?" },
+                        p { "Preview migration on the gateway host before creating an empty vault. Import preserves the encrypted source and its restrictions, and never replaces a vault that already exists." }
+                        code { "agent206 --data-dir <profile-directory> import rustyclaw <source-directory>" }
+                        p { "Review the preview before using --apply. The import review screen and adapters for other tools are still being built." }
+                    }
+                } else if status.unlocked && status.totp_enrolled == Some(true) {
+                    Alert { title: rsx! { "Optional: bring over your connections" },
+                        p { "You can preview RustyClaw provider and messenger settings without replacing this vault. Run the import command on the gateway host; review every category before applying." }
+                        code { "agent206 --data-dir <profile-directory> import rustyclaw <source-directory> --skip-vault" }
+                        p { "Migration does not activate foreign hooks, extensions, permissions, or model choices." }
+                    }
                 }
             } else if (panel.failure)().is_none() && (panel.poll_failure)().is_none() {
                 p { class: "a206-muted", role: "status", "Checking the vault…" }
@@ -550,11 +607,7 @@ fn VaultPanel(root: PathBuf) -> Element {
                 },
                 Flow::Confirm => rsx! {
                     if let Some(enrollment) = panel.enrollment.read().as_ref() {
-                        p { "Add this account to your authenticator app with the setup key, or open the setup link on a device that has the app. Then enter the first code it shows." }
-                        DescriptionList { layout: DlLayout::Stacked,
-                            DescriptionItem { term: rsx! { "Setup key" }, code { class: "a206-secret-text", "{enrollment.manual_key.expose()}" } }
-                            DescriptionItem { term: rsx! { "Setup link" }, code { class: "a206-secret-text", "{enrollment.otpauth_url.expose()}" } }
-                        }
+                        {crate::totp_enrollment::view(enrollment.otpauth_url.expose(), enrollment.manual_key.expose(), &enrollment.graphic)}
                     }
                     Field { label: rsx! { "Code from the app" },
                         Input { value: ReadSignal::from(code), oninput: move |v| code.set(v), autocomplete: "one-time-code", inputmode: "numeric" }
@@ -590,7 +643,7 @@ fn VaultPanel(root: PathBuf) -> Element {
                             }
                         },
                         "Unlock" }
-                    Button { variant: ButtonVariant::Ghost, availability: availability.clone(), onclick: move |_| panel.cancel(), "Cancel" }
+                    Button { variant: ButtonVariant::Ghost, availability: availability.clone(), onclick: move |_| { take(password); take(confirm); take(code); panel.cancel(); }, "Cancel" }
                 },
                 Flow::StepUp(task) => rsx! {
                     Button { variant: ButtonVariant::Primary, availability: availability.clone(), busy,
@@ -602,12 +655,12 @@ fn VaultPanel(root: PathBuf) -> Element {
                             }
                         },
                         "Continue" }
-                    Button { variant: ButtonVariant::Ghost, availability: availability.clone(), onclick: move |_| panel.cancel(), "Cancel" }
+                    Button { variant: ButtonVariant::Ghost, availability: availability.clone(), onclick: move |_| { take(password); take(confirm); take(code); panel.cancel(); }, "Cancel" }
                 },
                 Flow::Confirm => rsx! {
                     Button { variant: ButtonVariant::Primary, availability: availability.clone(), busy,
                         onclick: move |_| panel.confirm(take(code)), "Confirm enrollment" }
-                    Button { variant: ButtonVariant::Ghost, availability: availability.clone(), onclick: move |_| panel.cancel(), "Cancel" }
+                    Button { variant: ButtonVariant::Ghost, availability: availability.clone(), onclick: move |_| { take(password); take(confirm); take(code); panel.cancel(); }, "Cancel" }
                 },
                 Flow::Idle => rsx! {
                     if offer.create {
@@ -663,7 +716,7 @@ mod tests {
     fn a_status_failure_never_hides_the_action_failure() {
         let shown = |title: &str| Failure {
             title: title.to_owned(),
-            report: a206_runtime::error::report(&VaultError::GatewayClosed),
+            report: unexpected().report,
         };
         let (mut primary, mut secondary) = (Some(shown("action")), None);
         keep_both(&mut primary, &mut secondary, shown("status"));
@@ -727,5 +780,88 @@ mod tests {
         assert!(html.contains("not available here yet"), "{html}");
         assert!(!html.contains("<button"), "{html}");
         assert!(!html.contains("<input"), "{html}");
+    }
+}
+
+/// A public key entered from the gateway's trusted terminal authenticates the
+/// broker independently of the HTTP relay. Never trust an API-returned key alone.
+#[cfg(target_arch = "wasm32")]
+#[component]
+pub(crate) fn VaultSection() -> Element {
+    let mut verified = use_signal(|| None::<Vec<u8>>);
+    let mut key = use_signal(String::new);
+    let mut problem = use_signal(|| None::<String>);
+    let mut busy = use_signal(|| false);
+    if let Some(target) = verified() {
+        return rsx! {
+            Alert { tone: AlertTone::Success, title: rsx! { "Encrypted vault connection" },
+                "The broker key is verified for this panel. Passwords and authenticator setup travel encrypted directly to the vault broker."
+            }
+            VaultPanel { target }
+            Button { variant: ButtonVariant::Ghost, onclick: move |_| verified.set(None), "Disconnect vault controls" }
+        };
+    }
+    rsx! {
+        // Public status/lock remains available before the independent key
+        // verification. No password or authenticator seed uses that API.
+        crate::web_vault::WebVault {}
+        Card { variant: CardVariant::Feature,
+            CardHeader { CardTitle { "Connect securely to your vault" } Badge { tone: BadgeTone::Warning, "Verification required" } }
+            CardBody {
+                p { "Before entering a password, verify the vault broker using a trusted terminal on the computer running your gateway." }
+                p { "Run this command with the same data directory used by the web server:" }
+                code { "agent206 --data-dir <profile-directory> vault channel-key" }
+                Field { label: rsx! { "Broker public key" }, hint: rsx! { "Paste the 64 hexadecimal characters printed in that terminal. This public key is safe to copy; never paste a password here." },
+                    Input { value: ReadSignal::from(key), oninput: move |value: String| { key.set(value); problem.set(None); }, autocomplete: "off" }
+                }
+                if let Some(message) = problem() { Alert { tone: AlertTone::Danger, "{message}" } }
+            }
+            CardFooter {
+                Button { variant: ButtonVariant::Primary, busy: busy(), availability: if busy() { Availability::Disabled } else { Availability::Enabled },
+                    onclick: move |_| {
+                        let value = key().trim().to_owned();
+                        let parsed = parse_public_key(&value);
+                        let Some(public) = parsed else { problem.set(Some("Enter the complete 64-character hexadecimal public key.".into())); return; };
+                        busy.set(true);
+                        spawn(async move {
+                            // Verify possession before displaying secret-bearing inputs.
+                            let session = Session::open(public.clone());
+                            match session.status().await {
+                                Ok(_) => { key.set(String::new()); verified.set(Some(public)); }
+                                Err(error) => problem.set(Some(error.report.detail())),
+                            }
+                            busy.set(false);
+                        });
+                    }, "Verify and open vault setup" }
+            }
+        }
+    }
+}
+#[cfg(any(target_arch = "wasm32", test))]
+fn parse_public_key(value: &str) -> Option<Vec<u8>> {
+    if value.len() != 64 || !value.is_ascii() {
+        return None;
+    }
+    (0..64)
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&value[i..i + 2], 16).ok())
+        .collect()
+}
+
+#[cfg(test)]
+mod key_tests {
+    use super::parse_public_key;
+    #[test]
+    fn public_keys_are_exactly_32_bytes_and_never_accept_secret_like_input() {
+        assert_eq!(parse_public_key(&"a1".repeat(32)), Some(vec![0xa1; 32]));
+        for invalid in [
+            "a1".repeat(31),
+            "a1".repeat(33),
+            "x1".repeat(32),
+            "é".repeat(32),
+            "password".into(),
+        ] {
+            assert!(parse_public_key(&invalid).is_none());
+        }
     }
 }

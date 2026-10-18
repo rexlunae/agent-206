@@ -24,6 +24,7 @@ mod skills;
 mod slash;
 mod subagents;
 mod tools;
+mod totp_enrollment;
 mod welcome;
 #[cfg(target_arch = "wasm32")]
 use a206_core::Ignore;
@@ -32,8 +33,25 @@ mod setup;
 mod sign_in;
 #[cfg(target_arch = "wasm32")]
 use sign_in::SignOut;
-#[cfg(not(target_arch = "wasm32"))]
 mod vault;
+mod vault_backend;
+#[cfg(not(target_arch = "wasm32"))]
+static TERMINAL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Select the text alternative for a renderer without SVG support.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn configure_terminal() {
+    TERMINAL.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+fn terminal_mode() -> bool {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        TERMINAL.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        false
+    }
+}
 #[cfg(target_arch = "wasm32")]
 mod web_vault;
 use a206_core::{
@@ -727,7 +745,7 @@ fn Header(palette: Signal<bool>, navigable: bool) -> Element {
     let state = use_context::<State>();
     let route = use_route::<Route>();
     rsx! { header { class: "a206-topbar",
-        div { class: "a206-brand", img { src: asset!("/assets/agent206.svg"), alt: "", width: "34", height: "34" } "Agent 206" span { "YOUR WORK. YOUR AGENTS." } }
+        div { class: "a206-brand", img { src: asset!("/assets/agent206.svg"), alt: "", width: "34", height: "34" } "Agent 206" }
         div { class: "a206-row",
             IconButton { icon: IconName::ArrowStart, label: name!("Go back"), size: ButtonSize::Sm, variant: ButtonVariant::Ghost,
                 availability: if state.navigator.can_go_back() { Availability::Enabled } else { Availability::Disabled },
@@ -764,7 +782,7 @@ fn Sidebar() -> Element {
         }
         div { class: "a206-nav-group",
             NavHeading { "Conversations" }
-            if snapshot.threads.is_empty() { p { class: "a206-muted", "A fresh start." } }
+            if snapshot.threads.is_empty() { p { class: "a206-muted", "No conversations" } }
             for thread in snapshot.threads.iter().rev().take(12) {
                 { let id = thread.id; rsx! {
                     LinkButton { key: "{id}", size: ButtonSize::Sm, variant: ButtonVariant::Ghost, class: if matches!(route, Route::Chat { id: current, .. } if current == id) { "a206-nav-active" } else { "" }, href: Route::Chat { id, split: None, message: None }.to_string(),

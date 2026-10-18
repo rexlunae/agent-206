@@ -383,6 +383,14 @@ pub mod host {
             _ => Err(unexpected()),
         }
     }
+    /// Stage the working-tree content of exactly `paths`, or with
+    /// `unstage`, set them back to `HEAD`. Only the index changes.
+    pub fn git_stage(paths: &[&str], unstage: bool) -> Result<(), HostFailure> {
+        done(call(&HostRequest::GitStage {
+            paths: paths.iter().map(|path| (*path).into()).collect(),
+            unstage,
+        })?)
+    }
     /// `GET` a public HTTPS URL on a host the manifest declares. Any final
     /// status is a response, not a failure.
     pub fn fetch(url: &str) -> Result<FetchResponse, HostFailure> {

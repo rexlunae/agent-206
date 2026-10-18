@@ -144,7 +144,15 @@ impl Client {
     /// Send one request. A broker error reply becomes `ClientError::Broker`.
     pub async fn call(&mut self, body: Request) -> Result<Reply, ClientError> {
         let id = self.send(body).await?;
-        self.recv(id).await
+        let mut reply = self.recv(id).await?;
+        if self.version < SETUP_CHANNEL_VERSION
+            && let Reply::Status(status) = &mut reply
+        {
+            // Older brokers counted minting a capability as paired, without
+            // proof of receipt by a gateway. That fact is unknown to us.
+            status.gateway_paired = None;
+        }
+        Ok(reply)
     }
 
     /// Start a streamed provider call and wait for the upstream status.

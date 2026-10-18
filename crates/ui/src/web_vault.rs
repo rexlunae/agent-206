@@ -1,7 +1,6 @@
-//! The Security page's vault card in the web client. The vault lives with the
-//! web server, and its password and enrollment key never pass through a
-//! browser, so this card shows the vault's state and can lock it; unlocking,
-//! creating, enrolling and pairing stay with the desktop and terminal apps.
+//! Public vault status and locking before broker-key verification. This card
+//! never requests secret values; the separate verified channel owns creation,
+//! unlocking, enrollment and pairing through the shared Security panel.
 use crate::error::{ErrorNotice, record};
 use crate::welcome::{VaultFacts, VaultProgress, VaultSeen};
 use a206_core::{ErrorReport, VaultReply, VaultRequest, VaultState};
@@ -191,9 +190,9 @@ pub(crate) fn WebVault() -> Element {
             if let Some((title, report)) = failure() {
                 ErrorNotice { report, title: title.to_string() }
             }
-            p { class: "a206-muted", "Create, unlock and pair the vault, and enroll two-factor authentication, from the desktop or terminal app on the web server's computer, or with `agent206 vault` there. The browser never handles the vault password." }
+            p { class: "a206-muted", "Verify the broker public key below to create, unlock and pair the vault or enroll two-factor authentication through an encrypted connection. You can also use the desktop, terminal app or `agent206 vault` on the gateway host." }
             if unlocked && crate::sign_in::network() {
-                p { class: "a206-muted", "Locking also stops new sign-ins from other devices until the vault is unlocked on that computer." }
+                p { class: "a206-muted", "Locking also stops new sign-ins from other devices until the vault is unlocked." }
             }
         }
         CardFooter {

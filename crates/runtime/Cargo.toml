@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 [dependencies]
+a206-vault-channel.workspace = true
 a206-core.workspace = true
 a206-protocol.workspace = true
 a206-extensions.workspace = true

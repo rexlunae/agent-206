@@ -714,13 +714,34 @@ pub(super) fn read_worktree(root: PathBuf, path: &str) -> Result<Option<Vec<u8>>
 }
 /// A working-tree file as a commit records it.
 pub(super) enum Tracked {
-    File { bytes: Vec<u8>, executable: bool },
+    File {
+        bytes: Vec<u8>,
+        executable: bool,
+    },
     Link(Vec<u8>),
+    /// A directory, which git stores only as the files below it.
+    Directory,
 }
 /// The file at `path` as git would commit it, reached without following a
-/// symbolic link anywhere on the way; `None` when nothing is there.
+/// symbolic link anywhere on the way; `None` when nothing is there for git,
+/// as when a parent is a file.
 pub(super) fn tracked(root: PathBuf, path: &str) -> Result<Option<Tracked>, HostFailure> {
     use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
+    let workspace = open_workspace(root.clone())?;
+    let mut parent = PathBuf::new();
+    for name in writable_path(path)?
+        .parent()
+        .into_iter()
+        .flat_map(Path::components)
+    {
+        parent.push(name);
+        if workspace
+            .symlink_metadata(&parent)
+            .is_ok_and(|metadata| metadata.is_file())
+        {
+            return Ok(None);
+        }
+    }
     let (directory, name) = match writable(root, path) {
         Err(failure) if failure.code == HostErrorCode::NotFound => return Ok(None),
         found => found?,
@@ -736,6 +757,9 @@ pub(super) fn tracked(root: PathBuf, path: &str) -> Result<Option<Tracked>, Host
         return Ok(Some(Tracked::Link(
             target.into_os_string().into_encoded_bytes(),
         )));
+    }
+    if metadata.is_dir() {
+        return Ok(Some(Tracked::Directory));
     }
     if !metadata.is_file() {
         return Err(not_regular());

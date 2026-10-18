@@ -26,6 +26,7 @@ const MAX_NAME: usize = 256;
 const MAX_DESTINATIONS: usize = 16;
 
 struct Shared {
+    identity: a206_vault_channel::Identity,
     vault: Mutex<Vault>,
     throttle: AuthThrottle<()>,
     stop: CancellationToken,
@@ -97,6 +98,8 @@ impl Shared {
 
 #[derive(Default)]
 struct Session {
+    channel: Option<a206_vault_channel::Channel>,
+    channel_opened: bool,
     role: Option<Role>,
     step_up: StepUpWindow,
     /// A pending enrollment and the vault generation it was started under.
@@ -294,6 +297,48 @@ fn handle(shared: &Shared, session: &mut Session, request: Request) -> Handled {
             _ => Err(BrokerError::Forbidden),
         };
     };
+    if matches!(request, Request::ChannelKey) && matches!(role, Role::User | Role::Relay) {
+        return Ok(Outcome::Reply(Reply::ChannelKey(
+            shared.identity.public.clone(),
+        )));
+    }
+    if role == Role::Relay {
+        return match request {
+            Request::OpenChannel { first } if !session.channel_opened => {
+                // One handshake per socket. A relay must never replace a
+                // browser's channel and inherit its step-up or pending seed.
+                session.channel_opened = true;
+                let (channel, response) = shared
+                    .identity
+                    .accept(&first)
+                    .map_err(crate::channel::channel_error)?;
+                session.channel = Some(channel);
+                Ok(Outcome::Reply(Reply::ChannelOpened(response)))
+            }
+            Request::ChannelMessage { bytes } => {
+                // Take first: every crypto/protocol failure permanently voids this channel.
+                let mut channel = session.channel.take().ok_or(BrokerError::Forbidden)?;
+                let operation = channel
+                    .open::<a206_vault_channel::Request>(&bytes)
+                    .map_err(crate::channel::channel_error)?;
+                let request = crate::channel::request(operation);
+                session.role = Some(Role::User);
+                let outcome = handle(shared, session, request);
+                session.role = Some(Role::Relay);
+                let reply = crate::channel::reply(outcome.map(|outcome| match outcome {
+                    Outcome::Reply(reply) => reply,
+                    // The typed setup surface cannot send or open provider sockets.
+                    Outcome::Send(_) | Outcome::Socket(_) => Reply::Error(BrokerError::Forbidden),
+                }));
+                let bytes = channel
+                    .seal(&reply)
+                    .map_err(crate::channel::channel_error)?;
+                session.channel = Some(channel);
+                Ok(Outcome::Reply(Reply::ChannelMessage(bytes)))
+            }
+            _ => Err(BrokerError::Forbidden),
+        };
+    }
     match (role, &request) {
         (_, Request::Hello { .. }) => {
             return Err(BrokerError::Invalid(InvalidRequest::AlreadyGreeted));
@@ -329,15 +374,21 @@ fn handle(shared: &Shared, session: &mut Session, request: Request) -> Handled {
         }
     };
     match request {
-        Request::Hello { .. } => Err(BrokerError::Forbidden),
+        Request::Hello { .. }
+        | Request::ChannelKey
+        | Request::OpenChannel { .. }
+        | Request::ChannelMessage { .. } => Err(BrokerError::Forbidden),
+        Request::CancelTotp => {
+            session.pending = None;
+            ok()
+        }
         Request::Status => {
             let vault = shared.vault();
             let unlocked = !vault.is_locked();
             let gateway_paired = unlocked.then(|| {
-                shared
-                    .pairing()
-                    .as_ref()
-                    .is_some_and(|pairing| pairing.generation == vault.generation())
+                shared.pairing().as_ref().is_some_and(|pairing| {
+                    pairing.generation == vault.generation() && pairing.holder.is_some()
+                })
             });
             Ok(Outcome::Reply(Reply::Status(BrokerStatus {
                 exists: vault.exists(),
@@ -1183,6 +1234,7 @@ pub async fn serve(root: &Path) -> std::io::Result<()> {
     let listener = tokio::net::UnixListener::bind(&path)?;
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
     let shared = Arc::new(Shared {
+        identity: a206_vault_channel::Identity::generate().map_err(std::io::Error::other)?,
         vault: Mutex::new(Vault::locked(crate::vault_path(root))),
         throttle: AuthThrottle::default(),
         stop: CancellationToken::new(),

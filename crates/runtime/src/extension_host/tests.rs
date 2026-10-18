@@ -5,6 +5,7 @@ use super::*;
 mod fetch;
 mod git;
 mod git_commit;
+mod git_stage;
 mod patch;
 use a206_extensions::abi::{EntryKind, SearchMatch};
 
