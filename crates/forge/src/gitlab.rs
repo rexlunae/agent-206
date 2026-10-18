@@ -2,10 +2,12 @@
 //! jobs of a merge request's head pipeline are its checks, and approvals
 //! are its reviews.
 use super::{
-    Check, CheckStatus, Conclusion, DETAIL_PAGE, ForgeError, Listed, MAX_BODY, PAGE, PullRequest,
-    Repository, Review, ReviewState, State, answer, bounded, label, label_opt,
+    Change, Check, CheckStatus, Conclusion, DETAIL_PAGE, ForgeError, Listed, MAX_BODY,
+    NewPullRequest, PAGE, PullRequest, Repository, Review, ReviewState, State, answer, bounded,
+    label, label_opt,
 };
 use serde::Deserialize;
+use serde_json::json;
 use url::Url;
 
 #[derive(Deserialize)]
@@ -74,6 +76,37 @@ pub(super) fn parse_list(body: &[u8]) -> Result<(Vec<PullRequest>, usize), Forge
             .collect(),
         read,
     ))
+}
+
+pub(super) fn create(repository: &Repository, new: &NewPullRequest<'_>) -> Change {
+    // GitLab marks a merge request as a draft by its title.
+    let title = if new.draft {
+        format!("Draft: {}", new.title)
+    } else {
+        new.title.to_owned()
+    };
+    let mut body = json!({
+        "title": title,
+        "source_branch": new.source,
+        "target_branch": new.target,
+    });
+    if let Some(text) = new.body {
+        body["description"] = json!(text);
+    }
+    Change {
+        url: project(repository, &["merge_requests"]),
+        body: body.to_string().into_bytes(),
+    }
+}
+
+pub(super) fn comment(repository: &Repository, number: u64, text: &str) -> Change {
+    Change {
+        url: project(
+            repository,
+            &["merge_requests", &number.to_string(), "notes"],
+        ),
+        body: json!({"body": text}).to_string().into_bytes(),
+    }
 }
 
 pub(super) fn pull_url(repository: &Repository, number: u64) -> Url {

@@ -481,3 +481,86 @@ fn gitlab_merge_requests_checks_and_approvals() {
         Err(ForgeError::Answer(_))
     ));
 }
+
+#[test]
+fn opening_and_commenting_send_each_forges_fields() {
+    let (owner, name) = (word(), word());
+    let github = Repository::new(
+        &api(ForgeKind::GitHub, "https://forge.example/api/v3"),
+        &remote(&format!("/{owner}/{name}")),
+    )
+    .unwrap();
+    let gitlab = Repository::new(
+        &api(ForgeKind::GitLab, "https://forge.example/api/v4"),
+        &remote(&format!("/{owner}/{name}")),
+    )
+    .unwrap();
+    let (title, text, source, target) = (word(), word(), word(), word());
+    let new = NewPullRequest {
+        title: &title,
+        body: Some(&text),
+        source: &source,
+        target: &target,
+        draft: true,
+    };
+    let sent = github.create_pull_request(&new);
+    assert_eq!(
+        sent.url.path(),
+        format!("/api/v3/repos/{owner}/{name}/pulls")
+    );
+    let body: Value = serde_json::from_slice(&sent.body).unwrap();
+    assert_eq!(
+        body,
+        json!({"title": title, "head": source, "base": target, "draft": true, "body": text})
+    );
+    let sent = gitlab.create_pull_request(&new);
+    assert_eq!(
+        sent.url.path(),
+        format!("/api/v4/projects/{owner}%2F{name}/merge_requests")
+    );
+    let body: Value = serde_json::from_slice(&sent.body).unwrap();
+    assert_eq!(
+        body,
+        json!({"title": format!("Draft: {title}"), "source_branch": source, "target_branch": target, "description": text})
+    );
+    // Without a description or draft flag, nothing extra is sent.
+    let plain = NewPullRequest {
+        body: None,
+        draft: false,
+        ..new
+    };
+    let body: Value = serde_json::from_slice(&gitlab.create_pull_request(&plain).body).unwrap();
+    assert_eq!(body["title"], title);
+    assert!(body.get("description").is_none());
+
+    let sent = github.comment(5, &text);
+    assert_eq!(
+        sent.url.path(),
+        format!("/api/v3/repos/{owner}/{name}/issues/5/comments")
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&sent.body).unwrap(),
+        json!({"body": text})
+    );
+    let sent = gitlab.comment(5, &text);
+    assert!(sent.url.path().ends_with("/merge_requests/5/notes"));
+    let url = format!("https://forge.example/{}", word());
+    let posted = github
+        .parse_comment(&bytes(&json!({"id": 77, "html_url": url})))
+        .unwrap();
+    assert_eq!(
+        posted,
+        Comment {
+            id: 77,
+            url: Some(url)
+        }
+    );
+    let posted = gitlab
+        .parse_comment(&bytes(&json!({"id": 78, "body": text})))
+        .unwrap();
+    assert_eq!(posted.url, None);
+    assert!(matches!(
+        github.parse_comment(br#"{"id": "x"}"#),
+        Err(ForgeError::Answer(_))
+    ));
+}

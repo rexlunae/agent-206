@@ -1,13 +1,16 @@
-//! Reading pull requests of the project's repository for the native run
-//! engine: a [`ToolHost`] whose `pull_requests` lists them and whose
-//! `pull_request` reads one with its checks and reviews, on whichever forge
-//! hosts the remote, described the same way (crate `a206-forge`).
+//! Pull requests of the project's repository for the native run engine: a
+//! [`ToolHost`] whose `pull_requests` lists them, `pull_request` reads one
+//! with its checks and reviews, `pull_request_create` opens one and
+//! `pull_request_comment` comments on one, on whichever forge hosts the
+//! remote, described the same way (crate `a206-forge`).
 //!
-//! The tools only read. They send the git credential the user set for the
-//! remote's origin to the forge's API as a bearer token, through the vault
-//! broker, which attaches it only where the vault credential is bound; the
-//! gateway never sees it. Like every tool, they are denied in a
-//! conversation until the user permits them, and need its GitRead grant.
+//! The tools send the git credential the user set for the remote's origin
+//! to the forge's API as a bearer token, through the vault broker, which
+//! attaches it only where the vault credential is bound; the gateway never
+//! sees it. Like every tool, they are denied in a conversation until the
+//! user permits them. Reading needs the conversation's GitRead grant;
+//! opening and commenting need GitWrite and the user's approval of each
+//! call, since they publish what the model wrote.
 //! What a forge returns is written by whoever opened the pull request, so
 //! it reaches the model as tool data, never as instructions.
 use crate::{
@@ -27,6 +30,12 @@ use std::sync::{Arc, atomic::AtomicBool};
 pub const LIST: &str = "pull_requests";
 /// Reads one pull request, its checks and its reviews.
 pub const READ: &str = "pull_request";
+/// Opens a pull request.
+pub const CREATE: &str = "pull_request_create";
+/// Comments on a pull request.
+pub const COMMENT: &str = "pull_request_comment";
+/// Longest branch name accepted, in bytes; git allows more, forges less.
+const MAX_BRANCH: usize = 255;
 
 /// Why reading pull requests was refused or failed.
 #[derive(Debug, thiserror::Error)]
@@ -41,6 +50,16 @@ pub enum ForgeToolError {
     Number,
     #[error("`state` must be open, closed, merged or all")]
     State,
+    #[error("`{name}` must be text of 1 to {max} characters without control characters")]
+    Text { name: &'static str, max: usize },
+    #[error("`{0}` is required")]
+    Missing(&'static str),
+    #[error("there is no current branch to propose; name one in `branch`")]
+    NoBranch,
+    #[error(
+        "the forge rejected the request (HTTP {status}); the branch may not be on the forge yet, or a pull request for it may already be open"
+    )]
+    Rejected { status: u16 },
     #[error(
         "no forge API is known for {origin}; set the forge's kind and API address on its git credential"
     )]
@@ -61,9 +80,14 @@ pub enum ForgeToolError {
 impl crate::error::Classified for ForgeToolError {
     fn kind(&self) -> Option<ErrorKind> {
         Some(match self {
-            Self::Type(_) | Self::Unknown(_) | Self::Number | Self::State => {
-                ErrorKind::InvalidRequest
-            }
+            Self::Type(_)
+            | Self::Unknown(_)
+            | Self::Number
+            | Self::State
+            | Self::Text { .. }
+            | Self::Missing(_)
+            | Self::NoBranch => ErrorKind::InvalidRequest,
+            Self::Rejected { .. } => ErrorKind::Conflict,
             Self::UnknownTool(_) | Self::NotFound => ErrorKind::NotFound,
             Self::NoForge { .. } => ErrorKind::InvalidRequest,
             Self::Refused { .. } => ErrorKind::PermissionDenied,
@@ -81,8 +105,8 @@ fn fail(error: ForgeToolError) -> ErrorReport {
     crate::error::report(&error)
 }
 
-/// Offers `pull_requests` and `pull_request` in conversations with a
-/// project, once the user has set a git credential for at least one forge.
+/// Offers the pull request tools in conversations with a project, once the
+/// user has set a git credential for at least one forge.
 pub struct ForgeHost {
     pushes: Pushes,
 }
@@ -137,39 +161,101 @@ impl ForgeHost {
         }
     }
 
+    fn create_spec() -> ToolSpec {
+        ToolSpec {
+            name: CREATE.into(),
+            description: "Open a pull request (GitLab merge request) on the forge that hosts one of the project's git remotes, proposing a branch already pushed there (see git_push) for merging into another. The user approves each call. Returns the new pull request.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string", "description": format!("The title, at most {} characters.", a206_forge::MAX_LABEL)},
+                    "body": {"type": "string", "description": format!("The description, in the forge's Markdown, at most {} characters.", a206_forge::MAX_TEXT)},
+                    "base": {"type": "string", "description": "The branch to merge into, such as main."},
+                    "branch": {"type": "string", "description": "The branch to propose, by its name on the forge. Defaults to the current branch."},
+                    "draft": {"type": "boolean", "description": "Open it as a draft. Defaults to false."},
+                    "remote": {"type": "string", "description": "The git remote whose forge to use. Defaults to the current branch's remote, else origin."}
+                },
+                "required": ["title", "base"],
+                "additionalProperties": false
+            }),
+            capabilities: [Capability::GitWrite].into(),
+            permission: ToolPermission::Ask,
+            whole_output: false,
+        }
+    }
+
+    fn comment_spec() -> ToolSpec {
+        ToolSpec {
+            name: COMMENT.into(),
+            description: "Post a comment on a pull request (GitLab merge request) of the project's repository. The user approves each call. Returns the comment's id and web address.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "number": {"type": "integer", "minimum": 1, "description": "The pull request's number."},
+                    "body": {"type": "string", "description": format!("The comment, in the forge's Markdown, at most {} characters.", a206_forge::MAX_TEXT)},
+                    "remote": {"type": "string", "description": "The git remote whose forge to use. Defaults to the current branch's remote, else origin."}
+                },
+                "required": ["number", "body"],
+                "additionalProperties": false
+            }),
+            capabilities: [Capability::GitWrite].into(),
+            permission: ToolPermission::Ask,
+            whole_output: false,
+        }
+    }
+
     async fn run(&self, scope: &ToolScope, request: &ToolRequest) -> Result<Value, ForgeToolError> {
         let args = &request.arguments;
         let allowed: &[&str] = match request.name.as_str() {
             LIST => &["state", "branch", "remote"],
             READ => &["number", "remote"],
+            CREATE => &["title", "body", "base", "branch", "draft", "remote"],
+            COMMENT => &["number", "body", "remote"],
             _ => return Err(ForgeToolError::UnknownTool(request.name.clone())),
         };
         if let Some(key) = args.keys().find(|key| !allowed.contains(&key.as_str())) {
             return Err(ForgeToolError::Unknown(key.clone()));
         }
-        let question = if request.name == LIST {
-            let listed = match text(args, "state")?.as_deref() {
-                None | Some("open") => Listed::Open,
-                Some("closed") => Listed::Closed,
-                Some("merged") => Listed::Merged,
-                Some("all") => Listed::All,
-                Some(_) => return Err(ForgeToolError::State),
-            };
-            Question::List(listed, text(args, "branch")?)
-        } else {
-            match args.get("number") {
-                Some(Value::Number(number)) => number.as_u64().filter(|n| *n > 0),
-                _ => None,
+        let question = match request.name.as_str() {
+            LIST => {
+                let listed = match text(args, "state")?.as_deref() {
+                    None | Some("open") => Listed::Open,
+                    Some("closed") => Listed::Closed,
+                    Some("merged") => Listed::Merged,
+                    Some("all") => Listed::All,
+                    Some(_) => return Err(ForgeToolError::State),
+                };
+                Question::List(listed, text(args, "branch")?)
             }
-            .map(Question::Read)
-            .ok_or(ForgeToolError::Number)?
+            READ => Question::Read(number(args)?),
+            CREATE => Question::Create {
+                title: required(args, "title", a206_forge::MAX_LABEL, false)?,
+                body: optional(args, "body", a206_forge::MAX_TEXT, true)?,
+                base: required(args, "base", MAX_BRANCH, false)?,
+                branch: optional(args, "branch", MAX_BRANCH, false)?,
+                draft: match args.get("draft") {
+                    None | Some(Value::Null) => false,
+                    Some(Value::Bool(draft)) => *draft,
+                    Some(_) => return Err(ForgeToolError::Type("draft")),
+                },
+            },
+            _ => Question::Comment {
+                number: number(args)?,
+                body: required(args, "body", a206_forge::MAX_TEXT, true)?,
+            },
         };
+        // The gateway asks the user first; never publish what it did not.
+        if matches!(question, Question::Create { .. } | Question::Comment { .. })
+            && !request.approved
+        {
+            return Err(RemoteError::NotApproved.into());
+        }
         let remote = text(args, "remote")?;
         let root = scope.workspace.clone().ok_or(RemoteError::NoProject)?;
         // Dropping this future (a cancelled run) stops the repository work.
         let interrupt = Arc::new(AtomicBool::new(false));
         let _stop = Interrupt(Arc::clone(&interrupt));
-        let (remote, url) =
+        let (remote, url, current) =
             blocking(move || remote_repository(root, remote.as_deref(), &interrupt)).await?;
         let origin = url.origin().ascii_serialization();
         let credential = self
@@ -199,6 +285,39 @@ impl ForgeHost {
         };
         let number = match question {
             Question::Read(number) => number,
+            Question::Create {
+                title,
+                body,
+                base,
+                branch,
+                draft,
+            } => {
+                let source = branch.or(current).ok_or(ForgeToolError::NoBranch)?;
+                let change = repository.create_pull_request(&a206_forge::NewPullRequest {
+                    title: &title,
+                    body: body.as_deref(),
+                    source: &source,
+                    target: &base,
+                    draft,
+                });
+                let body = forge.post(change).await?;
+                return Ok(json!({
+                    "remote": remote,
+                    "repository": repository.name(),
+                    "forge": repository.kind().label(),
+                    "pull_request": repository.parse_pull_request(&body)?,
+                }));
+            }
+            Question::Comment { number, body } => {
+                let posted = forge.post(repository.comment(number, &body)).await?;
+                return Ok(json!({
+                    "remote": remote,
+                    "repository": repository.name(),
+                    "forge": repository.kind().label(),
+                    "number": number,
+                    "comment": repository.parse_comment(&posted)?,
+                }));
+            }
             Question::List(listed, branch) => {
                 let mut listing = repository.listing(listed, branch.as_deref());
                 while let Some(url) = listing.next(&repository) {
@@ -277,6 +396,53 @@ fn fill<T: Serialize>(used: &mut usize, items: Vec<T>) -> (Vec<Value>, bool) {
 enum Question {
     List(Listed, Option<String>),
     Read(u64),
+    Create {
+        title: String,
+        body: Option<String>,
+        base: String,
+        branch: Option<String>,
+        draft: bool,
+    },
+    Comment {
+        number: u64,
+        body: String,
+    },
+}
+
+/// A pull request `number`.
+fn number(args: &serde_json::Map<String, Value>) -> Result<u64, ForgeToolError> {
+    match args.get("number") {
+        Some(Value::Number(number)) => number.as_u64().filter(|n| *n > 0),
+        _ => None,
+    }
+    .ok_or(ForgeToolError::Number)
+}
+
+/// Text argument `name`, sent to the forge as given: not blank, at most
+/// `max` characters, with no control characters but line breaks and tabs
+/// where `lines`.
+fn optional(
+    args: &serde_json::Map<String, Value>,
+    name: &'static str,
+    max: usize,
+    lines: bool,
+) -> Result<Option<String>, ForgeToolError> {
+    let Some(value) = text(args, name)? else {
+        return Ok(None);
+    };
+    let allowed = |c: char| !c.is_control() || lines && matches!(c, '\n' | '\r' | '\t');
+    if value.trim().is_empty() || value.chars().count() > max || !value.chars().all(allowed) {
+        return Err(ForgeToolError::Text { name, max });
+    }
+    Ok(Some(value))
+}
+fn required(
+    args: &serde_json::Map<String, Value>,
+    name: &'static str,
+    max: usize,
+    lines: bool,
+) -> Result<String, ForgeToolError> {
+    optional(args, name, max, lines)?.ok_or(ForgeToolError::Missing(name))
 }
 
 /// Requests to one forge's API with the user's credential.
@@ -287,15 +453,27 @@ struct Forge {
 }
 impl Forge {
     async fn get(&mut self, url: url::Url) -> Result<Vec<u8>, ForgeToolError> {
+        self.send(a206_broker::HttpMethod::Get, url, None).await
+    }
+    async fn post(&mut self, change: a206_forge::Change) -> Result<Vec<u8>, ForgeToolError> {
+        self.send(a206_broker::HttpMethod::Post, change.url, Some(change.body))
+            .await
+    }
+    async fn send(
+        &mut self,
+        method: a206_broker::HttpMethod,
+        url: url::Url,
+        body: Option<Vec<u8>>,
+    ) -> Result<Vec<u8>, ForgeToolError> {
         let (status, body) = self
             .broker
             .provider(a206_broker::ProviderCall {
                 credential: self.credential.clone(),
-                method: a206_broker::HttpMethod::Get,
+                method,
                 url: url.to_string(),
                 auth: a206_broker::AuthScheme::Bearer,
                 anthropic_version: None,
-                body: None,
+                body,
             })
             .await?;
         match status {
@@ -305,6 +483,7 @@ impl Forge {
                 api: self.api.api.clone(),
             }),
             404 => Err(ForgeToolError::NotFound),
+            409 | 422 => Err(ForgeToolError::Rejected { status }),
             status => Err(ForgeToolError::Status { status }),
         }
     }
@@ -322,7 +501,12 @@ impl ToolHost for ForgeHost {
                 .unwrap_or(false);
             ToolListing {
                 tools: if configured && scope.workspace.is_some() {
-                    vec![Self::list_spec(), Self::read_spec()]
+                    vec![
+                        Self::list_spec(),
+                        Self::read_spec(),
+                        Self::create_spec(),
+                        Self::comment_spec(),
+                    ]
                 } else {
                     vec![]
                 },

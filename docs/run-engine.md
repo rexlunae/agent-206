@@ -673,7 +673,7 @@ The result names the branch, remote, `tracking_branch`, the old and new
 commits and how many objects arrived. Not yet: ssh remotes, several branches
 or tags at once, pruning, and packs over about 4 MiB.
 
-## Reading pull requests (`pull_requests`, `pull_request`)
+## Pull requests (`pull_requests`, `pull_request`, `pull_request_create`, `pull_request_comment`)
 
 `runtime/src/forge.rs` offers two read-only tools beside `git_push` and
 `git_fetch`, under the same condition (a git credential for at least one
@@ -697,7 +697,28 @@ gateway cutting the text, the tool leaves out the last pull requests, checks
 or reviews that would take a result past 64 KiB and marks that list
 incomplete.
 
-Both take `remote` (default: the current branch's remote, else `origin`);
+Two more publish what the model wrote, so they need the GitWrite grant
+and have host policy Ask: the user approves each call, whatever the
+conversation's permission for the tool.
+
+- `pull_request_create` opens a pull request (`title`, `base`, optional
+  `body`, `draft`) proposing `branch` (default: the current branch, which
+  must already be on the forge; see `git_push`). GitLab drafts are marked
+  by a `Draft:` title prefix. The result is the new pull request.
+- `pull_request_comment` posts `body` on pull request `number` (a GitHub
+  issue comment, a GitLab merge request note) and returns its id and web
+  address.
+
+Titles, branches and comments are sent as given or refused: blank text,
+text over its limit (256 characters for titles and branch names,
+60,000 for descriptions and comments) and control characters (other than
+line breaks and tabs in descriptions and comments) are invalid requests,
+and nothing is sent. A forge's 409 or 422 (a pull request already open for
+the branch, a branch it does not have) is a conflict error; the broker does
+not relay the forge's error text. A call whose answer was lost may still
+have been applied, and is not retried.
+
+All four take `remote` (default: the current branch's remote, else `origin`);
 its URL must be an HTTPS repository URL, as for a fetch. Crate `a206-forge`
 describes every forge the same way (state, draft, source and target
 branches, check status and conclusion, review state) and keeps a forge's
@@ -721,7 +742,7 @@ credential must also be bound to the API's origin (for github.com,
 characters and bounded; what a forge returns was written by other people
 and reaches the model as tool data. A refused token, a missing pull
 request and an answer not shaped like the API's are separate errors. Not
-yet: opening, commenting on or merging pull requests, Gitea or Forgejo,
+yet: merging pull requests, review comments on lines, Gitea or Forgejo,
 pages beyond these, and setting `forge` from the GUI (use `settings --apply`).
 
 ## Output rules
