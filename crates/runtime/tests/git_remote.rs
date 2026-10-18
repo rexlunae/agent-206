@@ -936,4 +936,20 @@ async fn fetches_follow_the_refspec_and_store_nothing_incomplete() {
     assert_eq!(record.state, ToolCallState::Failed);
     assert_eq!(error_kind(&record), ErrorKind::InvalidRequest);
     assert_eq!(rig.forge.seen.lock().unwrap().len(), seen);
+
+    // So is the usual mapping beside another one, which git would also
+    // update.
+    let text = std::fs::read_to_string(&config).unwrap();
+    std::fs::write(
+        &config,
+        text.replace(
+            "fetch = +refs/heads/*:refs/heads/*",
+            "fetch = +refs/heads/*:refs/remotes/origin/*\n\tfetch = +refs/tags/*:refs/tags/*",
+        ),
+    )
+    .unwrap();
+    let (record, _) = rig.fetch(json!({}), ApprovalDecision::Approve).await;
+    assert_eq!(record.state, ToolCallState::Failed);
+    assert_eq!(error_kind(&record), ErrorKind::InvalidRequest);
+    assert_eq!(rig.forge.seen.lock().unwrap().len(), seen);
 }

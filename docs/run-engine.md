@@ -644,8 +644,11 @@ name) and `remote` (default: the current branch's remote, else `origin`).
 - The remote's `url` follows the push rules (HTTPS only, `insteadOf`
   rewrites refused, included configuration refused). The remote's
   `remote.<name>.fetch` must be the mapping `git clone` sets up,
-  `refs/heads/*:refs/remotes/<remote>/*`, with or without `+`; any other
-  mapping is refused before the forge is asked for anything.
+  `refs/heads/*:refs/remotes/<remote>/*`, with or without `+`, and be the
+  remote's only mapping (git would also update what others map to); any
+  other configuration is refused before the forge is asked for anything.
+  Submodule entries in fetched trees are kept as commit ids; the submodules'
+  own commits are not fetched, as git does not fetch them here either.
 - Shallow repositories, partial clones (`extensions.partialClone` or
   `remote.<name>.promisor`) and a `reference-transaction` hook are refused;
   `user.name` and `user.email` must be set for the reflog.

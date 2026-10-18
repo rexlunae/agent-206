@@ -138,7 +138,7 @@ pub enum RemoteError {
     #[error("the remote has no branch named {branch}")]
     NoRemoteBranch { branch: String },
     #[error(
-        "remote {0} does not map its branches to remote-tracking branches as `git clone` does (refs/heads/*:refs/remotes/{0}/*), which is the only mapping this tool follows"
+        "remote {0} does not map its branches to remote-tracking branches as `git clone` does (refs/heads/*:refs/remotes/{0}/*), as its only fetch mapping, which is all this tool follows"
     )]
     Refspec(String),
     #[error("the repository is shallow, so its history cannot be completed by a fetch here")]
@@ -188,6 +188,8 @@ impl crate::error::Classified for RemoteError {
             },
             Self::Vault(_) | Self::NotPaired | Self::BrokerTooOld => ErrorKind::Unavailable,
             Self::Broker(_) | Self::Gateway(_) => return None,
+            // The server answered in git's protocol and refused.
+            Self::Wire(WireError::Server(_)) => ErrorKind::Provider,
             Self::UnexpectedReply | Self::Wire(_) => ErrorKind::Protocol,
             Self::Status { .. } | Self::Unpack(_) | Self::Unreported(_) => ErrorKind::Provider,
             Self::Pack(PackError::Git(_) | PackError::Compress(_)) => ErrorKind::Storage,

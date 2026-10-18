@@ -56,13 +56,35 @@ pub struct Objects {
 /// skipped; of the others, each tree entry is skipped where it is unchanged
 /// from a parent, so a push of a few commits reads only what they changed.
 /// Objects the server already has elsewhere may still be sent.
-/// `interrupt` stops the walk when raised.
+/// `interrupt` stops the walk when raised. A submodule entry is refused:
+/// its commit lives in another repository, so a push cannot send it.
 pub fn objects(
     repo: &gix::Repository,
     tip: ObjectId,
     known: impl IntoIterator<Item = ObjectId>,
     limits: Limits,
     interrupt: &AtomicBool,
+) -> Result<Objects, PackError> {
+    reachable(repo, tip, known, limits, interrupt, Gitlinks::Refuse)
+}
+
+/// What to do with a submodule entry (a gitlink) in a tree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Gitlinks {
+    /// Fail with [`PackError::Submodule`], as a push must.
+    Refuse,
+    /// Leave it out: the superproject only records the commit's id.
+    Skip,
+}
+
+/// [`objects`], with the choice of how submodule entries are treated.
+pub(crate) fn reachable(
+    repo: &gix::Repository,
+    tip: ObjectId,
+    known: impl IntoIterator<Item = ObjectId>,
+    limits: Limits,
+    interrupt: &AtomicBool,
+    gitlinks: Gitlinks,
 ) -> Result<Objects, PackError> {
     let hidden: Vec<ObjectId> = known.into_iter().filter(|id| repo.has_object(id)).collect();
     let walk = repo.rev_walk([tip]).with_hidden(hidden).all()?;
@@ -80,6 +102,7 @@ pub fn objects(
         seen: commits.iter().copied().collect(),
         limit: limits.objects,
         interrupt,
+        gitlinks,
     };
     if chosen.ids.len() > chosen.limit {
         return Err(PackError::TooManyObjects(chosen.limit));
@@ -106,6 +129,7 @@ struct Chosen<'a> {
     seen: HashSet<ObjectId>,
     limit: usize,
     interrupt: &'a AtomicBool,
+    gitlinks: Gitlinks,
 }
 impl Chosen<'_> {
     /// Add `id` unless already chosen; `true` if it was new.
@@ -154,7 +178,10 @@ fn added(
                     .collect();
                 added(repo, id, &bases, chosen)?;
             }
-            EntryKind::Commit => return Err(PackError::Submodule),
+            EntryKind::Commit => match chosen.gitlinks {
+                Gitlinks::Refuse => return Err(PackError::Submodule),
+                Gitlinks::Skip => {}
+            },
             EntryKind::Blob | EntryKind::BlobExecutable | EntryKind::Link => {
                 chosen.add(id)?;
             }

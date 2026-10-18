@@ -138,14 +138,20 @@ pub(super) fn remote_name(
 }
 
 /// The current branch's short name.
-pub(super) fn current_branch(repo: &gix::Repository) -> Result<String, RemoteError> {
-    repo.head_name()
+fn current_branch(repo: &gix::Repository) -> Result<String, RemoteError> {
+    head_branch(repo)?.ok_or_else(|| host(unsupported("HEAD is not on a branch; name the branch")))
+}
+
+/// The current branch's short name, or `None` when HEAD is detached. A
+/// HEAD that cannot be read is an error.
+pub(super) fn head_branch(repo: &gix::Repository) -> Result<Option<String>, RemoteError> {
+    Ok(repo
+        .head_name()
         .map_err(|e| host(git_failure("head", &e)))?
         .and_then(|name| {
             name.category_and_short_name()
                 .map(|(_, short)| short.to_string())
-        })
-        .ok_or_else(|| host(unsupported("HEAD is not on a branch; name the branch")))
+        }))
 }
 
 /// An HTTPS repository URL (or loopback HTTP, for a forge on this computer)

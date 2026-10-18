@@ -3,7 +3,8 @@
 //! commits this repository has, the server's answer with its pack, and
 //! storing and checking that pack.
 use crate::{
-    Advertisement, Limits, PackError, WireError, objects,
+    Advertisement, Limits, PackError, WireError,
+    pack::{Gitlinks, reachable},
     pkt::{self, Reader},
     wire::{clean, object_id},
 };
@@ -212,7 +213,8 @@ pub fn store_pack(
 /// Check that every object `tip` reaches is present, walking back until
 /// commits reachable from `known` (which were complete before the fetch).
 /// `repo` must have been opened after the pack was stored. A missing
-/// object is [`PackError::Incomplete`].
+/// object is [`PackError::Incomplete`]. Submodule commits are not checked:
+/// they belong to other repositories, and git does not fetch them here.
 pub fn check_complete(
     repo: &gix::Repository,
     tip: ObjectId,
@@ -223,7 +225,7 @@ pub fn check_complete(
     if !repo.has_object(tip) {
         return Err(PackError::Incomplete);
     }
-    let reached = match objects(repo, tip, known, limits, interrupt) {
+    let reached = match reachable(repo, tip, known, limits, interrupt, Gitlinks::Skip) {
         Ok(reached) => reached,
         // Reading a commit or tree that is not there.
         Err(PackError::Git(_)) => return Err(PackError::Incomplete),
@@ -239,7 +241,7 @@ pub fn check_complete(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::write_pack;
+    use crate::{objects, write_pack};
     use gix::{hash::Kind, objs::tree::EntryKind};
 
     const ROOMY: Limits = Limits {
@@ -450,6 +452,49 @@ mod tests {
             check_complete(&reopened, id(), [], ROOMY, &RUNNING),
             Err(PackError::Incomplete)
         ));
+    }
+
+    #[test]
+    fn a_fetched_submodule_entry_needs_only_its_commit_id() {
+        let (_source_dir, source, parent) = repository();
+        // A commit whose tree records a submodule at a commit this
+        // repository does not have.
+        let base = source.find_commit(parent).unwrap().tree_id().unwrap();
+        let mut tree = source.edit_tree(base).unwrap();
+        tree.upsert("vendor/library", EntryKind::Commit, id())
+            .unwrap();
+        let tree = tree.write().unwrap().detach();
+        let signature = gix::actor::Signature {
+            name: "n".into(),
+            email: "n@example.invalid".into(),
+            time: gix::date::Time::new(2_000_000, 0),
+        };
+        let tip = source
+            .write_object(&gix::objs::Commit {
+                tree,
+                parents: [parent].into_iter().collect(),
+                author: signature.clone(),
+                committer: signature,
+                encoding: None,
+                message: text().into(),
+                extra_headers: vec![],
+            })
+            .unwrap()
+            .detach();
+        // A push still refuses it.
+        assert!(matches!(
+            objects(&source, tip, [], ROOMY, &RUNNING),
+            Err(PackError::Submodule)
+        ));
+        let all = reachable(&source, tip, [], ROOMY, &RUNNING, Gitlinks::Skip)
+            .unwrap()
+            .ids;
+        let pack = write_pack(&source, &all, ROOMY, &RUNNING).unwrap();
+        let (_dir, target, _) = repository();
+        let stored = store_pack(&target, &pack, ROOMY, &RUNNING).unwrap();
+        let target = gix::open(target.path()).unwrap();
+        check_complete(&target, tip, [], ROOMY, &RUNNING).unwrap();
+        stored.release().unwrap();
     }
 
     #[test]

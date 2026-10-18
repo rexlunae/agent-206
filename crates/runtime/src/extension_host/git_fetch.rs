@@ -10,7 +10,7 @@ use super::{
     git_branch::branch_name,
     git_commit::has_hooks,
     git_push::{
-        MAX_ANCESTRY, ancestor, current_branch, host, peeled, remote_name, remote_url, settings,
+        MAX_ANCESTRY, ancestor, head_branch, host, peeled, remote_name, remote_url, settings,
     },
 };
 use crate::git_remote::RemoteError;
@@ -78,7 +78,7 @@ pub(crate) fn target(
     }
     // The remote-tracking branch's reflog records who fetched.
     settings.identity().map_err(host)?;
-    let current = current_branch(&repo).ok();
+    let current = head_branch(&repo)?;
     let remote = remote_name(&settings, current.as_deref().unwrap_or_default(), remote)?;
     if settings
         .string("extensions.partialClone")
@@ -112,15 +112,14 @@ pub(crate) fn target(
         }
     };
     branch_name(&branch).ok_or(RemoteError::BranchName)?;
-    // Only the mapping `git clone` sets up is followed.
+    // Only the mapping `git clone` sets up is followed, and only when it is
+    // the remote's one mapping: git would also update what others map to.
     let mapping = format!("refs/heads/*:refs/remotes/{remote}/*");
     let refspecs = settings.strings(&format!("remote.{remote}.fetch"));
-    let force = if refspecs.iter().any(|spec| *spec == format!("+{mapping}")) {
-        true
-    } else if refspecs.iter().any(|spec| *spec == mapping) {
-        false
-    } else {
-        return Err(RemoteError::Refspec(remote));
+    let force = match refspecs.as_slice() {
+        [spec] if *spec == format!("+{mapping}") => true,
+        [spec] if *spec == mapping => false,
+        _ => return Err(RemoteError::Refspec(remote)),
     };
     let configured = settings
         .string(&format!("remote.{remote}.url"))
@@ -134,7 +133,9 @@ pub(crate) fn target(
     let previous = peeled(&repo, &tracking).map_err(host)?;
     let mut tips: Vec<ObjectId> = previous.into_iter().collect();
     tips.extend(peeled(&repo, &format!("refs/heads/{branch}")).map_err(host)?);
-    tips.extend(repo.head_id().ok().map(|id| id.detach()));
+    // An unborn HEAD has no commit; a HEAD that cannot be read fails.
+    let head = repo.head().map_err(|e| host(git_failure("head", &e)))?;
+    tips.extend(head.id().map(|id| id.detach()));
     tips.sort();
     tips.dedup();
     let haves = haves(&repo, &tips, interrupt)?;
@@ -268,7 +269,14 @@ fn record(
     a206_git_push::check_complete(&repo, tip, target.tips.iter().copied(), limits, interrupt)?;
     let forced = match target.previous {
         None => false,
-        Some(previous) if previous == tip => return Ok(false),
+        // Nothing to write, as long as nothing else moved it meanwhile.
+        Some(previous) if previous == tip => {
+            return if peeled(&repo, &target.tracking()).map_err(host)? == Some(previous) {
+                Ok(false)
+            } else {
+                Err(RemoteError::TrackingMoved(target.tracking()))
+            };
+        }
         Some(previous) => {
             match ancestor(&repo, previous, tip, MAX_ANCESTRY, interrupt).map_err(host)? {
                 Some(true) => false,
