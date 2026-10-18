@@ -1,5 +1,5 @@
-//! The one git write host call: commit named working-tree files on top of
-//! `HEAD`, like `git commit --only`. Nothing the repository or the user
+//! Git commits: of named working-tree files on top of `HEAD`, like
+//! `git commit --only`, or of what is staged, like `git commit`. Nothing the repository or the user
 //! configures runs. Where git would run something or protect the commit in a
 //! way gitoxide cannot (signing, hooks, clean filters, line-ending
 //! conversion), the commit is refused rather than made without it.
@@ -182,10 +182,18 @@ pub(super) enum Change {
     Remove,
 }
 
+/// What a commit records.
+pub(super) enum Selection<'a> {
+    /// The working-tree content of exactly these paths, on top of `HEAD`.
+    Paths(&'a [String]),
+    /// Everything the index holds, like a plain `git commit`.
+    Staged,
+}
+
 pub(super) fn commit(
     root: PathBuf,
     message: &str,
-    paths: &[String],
+    selection: Selection<'_>,
     user: &UserGit,
     interrupt: &AtomicBool,
 ) -> Result<HostReply, HostFailure> {
@@ -195,17 +203,23 @@ pub(super) fn commit(
             "the commit message must be 1 to 16 KiB of text",
         ));
     }
-    if paths.is_empty() || paths.len() > MAX_COMMIT_PATHS {
-        return Err(failure(
-            HostErrorCode::Invalid,
-            "name 1 to 100 paths to commit",
-        ));
-    }
-    let mut named = BTreeSet::new();
-    for path in paths {
-        workspace::check_relative(path)?;
-        named.insert(normalized(path));
-    }
+    let named = match selection {
+        Selection::Paths(paths) => {
+            if paths.is_empty() || paths.len() > MAX_COMMIT_PATHS {
+                return Err(failure(
+                    HostErrorCode::Invalid,
+                    "name 1 to 100 paths to commit",
+                ));
+            }
+            let mut named = BTreeSet::new();
+            for path in paths {
+                workspace::check_relative(path)?;
+                named.insert(normalized(path));
+            }
+            Some(named)
+        }
+        Selection::Staged => None,
+    };
     // Workspace writes cannot change a file between its read and its commit.
     let _writing = workspace::write_lock();
     let repo = open(root.clone(), interrupt)?;
@@ -252,56 +266,21 @@ pub(super) fn commit(
             .detach(),
         None => ObjectId::empty_tree(repo.object_hash()),
     };
-    let mut tree = repo.edit_tree(base).map_err(|e| git_failure("tree", &e))?;
-    let mut files = WorkingFiles::new(&repo, &index, &settings, user)?;
-
-    let mut changes = Vec::new();
-    for path in &named {
-        check(interrupt)?;
-        let path = path.as_bstr();
-        let indexed = index.entry_by_path_and_stage(path, Stage::Unconflicted);
-        if indexed.is_some_and(|e| e.flags.contains(Flags::SKIP_WORKTREE)) {
-            return Err(unsupported(
-                "a path outside the sparse checkout cannot be committed",
-            ));
+    let (new_tree, changes) = match &named {
+        Some(named) => {
+            let files = WorkingFiles::new(&repo, &index, &settings, user)?;
+            named_tree(&repo, &root, &index, files, base, named, interrupt)?
         }
-        let previous = tree.get(path).map(|entry| entry.mode().kind());
-        if matches!(previous, Some(EntryKind::Tree | EntryKind::Commit)) {
-            return Err(unsupported(
-                "directories and submodules cannot be committed; name their files",
-            ));
-        }
-        let known = indexed.is_some() || previous.is_some();
-        if !known && parent_is_file(&tree, &index, path) {
-            return Err(failure(
-                HostErrorCode::Conflict,
-                "a parent of the path is a file in git",
-            ));
-        }
-        let recorded_executable = previous == Some(EntryKind::BlobExecutable)
-            || indexed.is_some_and(|e| e.mode == Mode::FILE_EXECUTABLE);
-        let Some(change) = files.read(&root, path, &named, known, recorded_executable)? else {
-            if !known {
-                return Err(failure(
-                    HostErrorCode::NotFound,
-                    "a named path is neither in the working tree nor tracked",
-                ));
-            }
-            tree.remove(path).map_err(|e| git_failure("tree", &e))?;
-            changes.push((path.to_owned(), Change::Remove));
-            continue;
-        };
-        if let Change::Write { id, mode, .. } = &change {
-            tree.upsert(path, entry_kind(*mode), *id)
-                .map_err(|e| git_failure("tree", &e))?;
-        }
-        changes.push((path.to_owned(), change));
-    }
-    let new_tree = tree.write().map_err(|e| git_failure("tree", &e))?.detach();
+        None => (staged_tree(&repo, &index, interrupt)?, Vec::new()),
+    };
     if new_tree == base {
         return Err(failure(
             HostErrorCode::Invalid,
-            "nothing to commit: the named paths match HEAD",
+            if named.is_some() {
+                "nothing to commit: the named paths match HEAD"
+            } else {
+                "nothing to commit: nothing is staged"
+            },
         ));
     }
 
@@ -343,16 +322,20 @@ pub(super) fn commit(
 
     // Committed: from here on a failure must say so.
     tracing::info!(commit = %id, "extension made a git commit");
-    update_index(&mut index, changes);
-    if !write_index(&index, lock) {
-        tracing::warn!(commit = %id, "committed, but the git index is not updated");
-        return Err(failure(
-            HostErrorCode::Io,
-            &format!(
-                "committed {id}, but the git index could not be updated; \
-                 run `git reset -- <paths>` on the committed paths"
-            ),
-        ));
+    // A commit of what is staged leaves the index as it is; dropping the
+    // lock releases it unchanged.
+    if named.is_some() {
+        update_index(&mut index, changes);
+        if !write_index(&index, lock) {
+            tracing::warn!(commit = %id, "committed, but the git index is not updated");
+            return Err(failure(
+                HostErrorCode::Io,
+                &format!(
+                    "committed {id}, but the git index could not be updated; \
+                     run `git reset -- <paths>` on the committed paths"
+                ),
+            ));
+        }
     }
     Ok(HostReply::Committed(GitCommit {
         id: id.to_string(),
@@ -360,6 +343,93 @@ pub(super) fn commit(
         author: signature.name.to_str_lossy().into_owned(),
         time: signature.time.seconds,
     }))
+}
+
+/// `HEAD`'s tree with the named paths set to their working-tree content,
+/// and the index changes that match it.
+fn named_tree(
+    repo: &gix::Repository,
+    root: &std::path::Path,
+    index: &gix::index::File,
+    mut files: WorkingFiles<'_>,
+    base: ObjectId,
+    named: &BTreeSet<BString>,
+    interrupt: &AtomicBool,
+) -> Result<(ObjectId, Vec<(BString, Change)>), HostFailure> {
+    let mut tree = repo.edit_tree(base).map_err(|e| git_failure("tree", &e))?;
+    let mut changes = Vec::new();
+    for path in named {
+        check(interrupt)?;
+        let path = path.as_bstr();
+        let indexed = index.entry_by_path_and_stage(path, Stage::Unconflicted);
+        if indexed.is_some_and(|e| e.flags.contains(Flags::SKIP_WORKTREE)) {
+            return Err(unsupported(
+                "a path outside the sparse checkout cannot be committed",
+            ));
+        }
+        let previous = tree.get(path).map(|entry| entry.mode().kind());
+        if matches!(previous, Some(EntryKind::Tree | EntryKind::Commit)) {
+            return Err(unsupported(
+                "directories and submodules cannot be committed; name their files",
+            ));
+        }
+        let known = indexed.is_some() || previous.is_some();
+        if !known && parent_is_file(&tree, index, path) {
+            return Err(failure(
+                HostErrorCode::Conflict,
+                "a parent of the path is a file in git",
+            ));
+        }
+        let recorded_executable = previous == Some(EntryKind::BlobExecutable)
+            || indexed.is_some_and(|e| e.mode == Mode::FILE_EXECUTABLE);
+        let Some(change) = files.read(root, path, named, known, recorded_executable)? else {
+            if !known {
+                return Err(failure(
+                    HostErrorCode::NotFound,
+                    "a named path is neither in the working tree nor tracked",
+                ));
+            }
+            tree.remove(path).map_err(|e| git_failure("tree", &e))?;
+            changes.push((path.to_owned(), Change::Remove));
+            continue;
+        };
+        if let Change::Write { id, mode, .. } = &change {
+            tree.upsert(path, entry_kind(*mode), *id)
+                .map_err(|e| git_failure("tree", &e))?;
+        }
+        changes.push((path.to_owned(), change));
+    }
+    Ok((
+        tree.write().map_err(|e| git_failure("tree", &e))?.detach(),
+        changes,
+    ))
+}
+
+/// The tree the index describes, as `git write-tree` writes it.
+fn staged_tree(
+    repo: &gix::Repository,
+    index: &gix::index::File,
+    interrupt: &AtomicBool,
+) -> Result<ObjectId, HostFailure> {
+    let mut tree = repo
+        .edit_tree(ObjectId::empty_tree(repo.object_hash()))
+        .map_err(|e| git_failure("tree", &e))?;
+    for (n, entry) in index.entries().iter().enumerate() {
+        if n % 1024 == 0 {
+            check(interrupt)?;
+        }
+        if entry.flags.contains(Flags::INTENT_TO_ADD) {
+            return Err(unsupported(
+                "a path is only marked to be added (git add -N); stage its content first",
+            ));
+        }
+        let Some(mode) = entry.mode.to_tree_entry_mode() else {
+            return Err(unsupported("the index holds an entry git cannot commit"));
+        };
+        tree.upsert(entry.path(index), mode.kind(), entry.id)
+            .map_err(|e| git_failure("tree", &e))?;
+    }
+    Ok(tree.write().map_err(|e| git_failure("tree", &e))?.detach())
 }
 
 /// `a/b` for any spelling `check_relative` accepts, such as `a//b/`.

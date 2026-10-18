@@ -37,6 +37,20 @@ fn commit(message: &str, paths: &[&str]) -> HostRequest {
         paths: paths.iter().map(|path| (*path).into()).collect(),
     }
 }
+fn commit_staged(message: &str) -> HostRequest {
+    HostRequest::GitCommitStaged {
+        message: message.into(),
+    }
+}
+async fn stage(host: &mut HostCalls, paths: &[&str]) {
+    let reply = host
+        .handle(HostRequest::GitStage {
+            paths: paths.iter().map(|path| (*path).into()).collect(),
+            unstage: false,
+        })
+        .await;
+    assert!(matches!(reply, HostReply::Done), "{reply:?}");
+}
 pub(super) fn writer(store: &Arc<Mutex<Store>>, root: &Path) -> HostCalls {
     workspace_calls(
         store,
@@ -247,7 +261,7 @@ fn an_interrupted_commit_stops_before_committing() {
     let refused = host::commit(
         root.into(),
         "m",
-        &["a.txt".into()],
+        host::Selection::Paths(&["a.txt".into()]),
         &host::UserGit::default(),
         &stopped,
     )
@@ -390,8 +404,14 @@ fn settings_git_would_follow_are_honoured() {
         std::fs::write(root.join(path), unique("text")).unwrap();
         let before = head(root);
         let stop = std::sync::atomic::AtomicBool::new(false);
-        let refused =
-            host::commit(root.clone(), "m", &[path.into()], &settings, &stop).expect_err(case);
+        let refused = host::commit(
+            root.clone(),
+            "m",
+            host::Selection::Paths(&[path.into()]),
+            &settings,
+            &stop,
+        )
+        .expect_err(case);
         assert_eq!(refused.code, expected, "{case}: {}", refused.message);
         assert_eq!(head(root), before, "{case}");
     }
@@ -413,7 +433,7 @@ fn settings_git_would_follow_are_honoured() {
     let made = host::commit(
         root.clone(),
         "m",
-        &["new.log".into()],
+        host::Selection::Paths(&["new.log".into()]),
         &host::UserGit::given(Default::default(), Some(ignore)),
         &stop,
     );
@@ -434,4 +454,139 @@ async fn a_commit_is_refused_without_time_to_report_it() {
         Some(HostErrorCode::Budget)
     );
     assert_eq!(head(root), before);
+}
+
+#[tokio::test]
+async fn committing_what_is_staged_records_the_index_and_leaves_it() {
+    let (dir, store) = store();
+    let root = &project(dir.path());
+    let (name, _) = committable(
+        root,
+        &[
+            ("a.txt", "one\n"),
+            ("b.txt", "two\n"),
+            ("gone.txt", "old\n"),
+        ],
+    );
+    let (staged, later, b, new) = (
+        unique("staged"),
+        unique("later"),
+        unique("b"),
+        unique("new"),
+    );
+    let mut host = writer(&store, root);
+    std::fs::write(root.join("a.txt"), &staged).unwrap();
+    std::fs::create_dir(root.join("sub")).unwrap();
+    std::fs::write(root.join("sub/new.txt"), &new).unwrap();
+    std::fs::remove_file(root.join("gone.txt")).unwrap();
+    stage(&mut host, &["a.txt", "sub/new.txt", "gone.txt"]).await;
+    // Changed after staging, and never staged: neither is committed.
+    std::fs::write(root.join("a.txt"), &later).unwrap();
+    std::fs::write(root.join("b.txt"), &b).unwrap();
+    let before = head(root).unwrap();
+    let index = std::fs::read(root.join(".git/index")).unwrap();
+    let summary = unique("summary");
+
+    let reply = host.handle(commit_staged(&summary)).await;
+    let HostReply::Committed(made) = reply else {
+        panic!("commit failed: {reply:?}");
+    };
+    assert_eq!(
+        (made.summary.as_str(), made.author.as_str()),
+        (summary.as_str(), name.as_str())
+    );
+    let repo = gix::open(root).unwrap();
+    let id = repo.head_id().unwrap().detach();
+    assert_eq!(made.id, id.to_string());
+    assert_eq!(
+        repo.find_commit(id)
+            .unwrap()
+            .parent_ids()
+            .map(gix::Id::detach)
+            .collect::<Vec<_>>(),
+        [before]
+    );
+    assert_eq!(committed(root, "a.txt"), Some(staged));
+    assert_eq!(committed(root, "sub/new.txt"), Some(new));
+    assert_eq!(committed(root, "b.txt").as_deref(), Some("two\n"));
+    assert_eq!(committed(root, "gone.txt"), None);
+    assert_eq!(std::fs::read(root.join(".git/index")).unwrap(), index);
+    assert!(!root.join(".git/index.lock").exists());
+    assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), later);
+    assert_eq!(
+        changes(&mut host).await,
+        [
+            ("a.txt".to_string(), GitArea::Unstaged, GitChange::Modified),
+            ("b.txt".to_string(), GitArea::Unstaged, GitChange::Modified),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_new_repository_commits_what_is_staged() {
+    let (dir, store) = store();
+    let root = &project(dir.path());
+    gix::init(root).unwrap();
+    configure(root, "[user]\n\tname = n\n\temail = n@example.invalid\n");
+    let mut host = writer(&store, root);
+    assert_eq!(
+        code(host.handle(commit_staged("m")).await),
+        Some(HostErrorCode::Invalid),
+        "nothing is staged yet"
+    );
+    let text = unique("text");
+    std::fs::write(root.join("first.txt"), &text).unwrap();
+    stage(&mut host, &["first.txt"]).await;
+    let reply = host.handle(commit_staged(&unique("first"))).await;
+    assert!(matches!(reply, HostReply::Committed(_)), "{reply:?}");
+    let repo = gix::open(root).unwrap();
+    let made = repo.head_commit().unwrap();
+    assert_eq!(made.parent_ids().count(), 0);
+    assert_eq!(committed(root, "first.txt"), Some(text));
+    assert!(changes(&mut host).await.is_empty());
+}
+
+#[tokio::test]
+async fn committing_what_is_staged_is_refused_like_any_commit() {
+    for setup in ["nothing staged", "no grant", "hook", "locked", "no message"] {
+        let (dir, store) = store();
+        let root = &project(dir.path());
+        committable(root, &[("a.txt", "one\n")]);
+        let mut host = writer(&store, root);
+        if setup != "nothing staged" {
+            std::fs::write(root.join("a.txt"), unique("a")).unwrap();
+            stage(&mut host, &["a.txt"]).await;
+        }
+        let mut message = "m";
+        let expected = match setup {
+            "no grant" => {
+                host = workspace_calls(
+                    &store,
+                    Some(root.into()),
+                    &[Capability::GitRead, Capability::WriteWorkspace],
+                );
+                HostErrorCode::Denied
+            }
+            "hook" => {
+                std::fs::write(root.join(".git/hooks/pre-commit"), "").unwrap();
+                HostErrorCode::Unsupported
+            }
+            "locked" => {
+                std::fs::write(root.join(".git/index.lock"), "").unwrap();
+                HostErrorCode::Conflict
+            }
+            "no message" => {
+                message = " \n";
+                HostErrorCode::Invalid
+            }
+            _ => HostErrorCode::Invalid,
+        };
+        let before = head(root);
+        assert_eq!(
+            code(host.handle(commit_staged(message)).await),
+            Some(expected),
+            "{setup}"
+        );
+        assert_eq!(head(root), before, "{setup}");
+    }
 }

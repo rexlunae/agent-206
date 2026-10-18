@@ -276,6 +276,7 @@ unsafe operation.
 | `git_diff { path, staged }` | `git_read` + a project | unified diff of one file (`HEAD`→index when `staged`, else index→working tree; a symbolic link compares its target text), or `binary` | 512 KiB per side (checked before a blob is read), 192 KiB of text, 3 context lines; at most 8,192 input lines combined and 1,000,000 line pairs, otherwise a budget failure |
 | `git_stage { paths, unstage }` | `git_write` + a project | done | 1 to 100 paths, 512 KiB per file and 8 MiB together; the same deadline as `git_commit`; see [Staging](#staging) |
 | `git_commit { message, paths }` | `git_write` + a project | the new commit: id, summary, author name, time | 1 to 100 paths, 16 KiB message, 512 KiB per file and 8 MiB together; 5 s and 3 s before the invocation's deadline, but once the commit is written it is reported, even past that; see [Commits](#commits) |
+| `git_commit_staged { message }` | `git_write` + a project | the new commit, as `git_commit` | 16 KiB message; the same deadline as `git_commit`; see [Commits](#commits) |
 | `fetch { url }` | `network` + a declared host | final status (any, not only 2xx), `Content-Type`, body, whether it was cut, whether a redirect was followed | 512 KiB body; 8 s including redirects; 5 redirects |
 | `state_get { key }` | nothing | the extension's own value | — |
 | `state_put { key, value }` | nothing | done (`value = None` deletes) | 64 keys, 256 KiB per extension |
@@ -309,7 +310,14 @@ made, without following a symbolic link on the way; a symbolic link itself is
 committed as a link. A new path ignored by the repository's or the user's
 excludes is refused, as `git add` would without `--force`.
 
-Where `git commit` would run something or add a protection gitoxide cannot,
+`git_commit_staged` works like a plain `git commit`: it commits the tree the
+index describes on top of `HEAD`, reads no working-tree file, and leaves the
+index and working tree as they are. It is refused as `invalid` when the index
+matches `HEAD`, and as `unsupported` when a path is only marked to be added
+(`git add -N`). In the bundled `git_commit` tool, `staged = true` in place of
+`paths` makes this call.
+
+For both, where `git commit` would run something or add a protection gitoxide cannot,
 the commit is refused as `unsupported` rather than made without it: signed
 commits (`commit.gpgSign`), commit hooks (`pre-commit`, `prepare-commit-msg`,
 `commit-msg`, `post-commit` in `.git/hooks` or `core.hooksPath`), files whose
@@ -428,7 +436,7 @@ Tool text is extension output, never instructions.
 | Domain | Operations | Authority |
 | --- | --- | --- |
 | workspace | Multi-hunk patch | `write_workspace` |
-| git | Commit what is staged, branches, push | `git_write` (push also needs a forge credential handle) |
+| git | Branches, push | `git_write` (push also needs a forge credential handle) |
 | forge | PRs, reviews, checks, logs | adapter-specific scoped credential handle |
 | network | Requests other than `GET`, headers, brokered credentials | `network` + destination + secret handle |
 | downloads | Enqueue, cancel, subscribe | destination and origin grants |

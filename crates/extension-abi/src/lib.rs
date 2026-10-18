@@ -236,6 +236,9 @@ pub enum HostRequest {
     /// removed, the index is updated to match for those paths, and other
     /// staged changes stay staged.
     GitCommit { message: String, paths: Vec<String> },
+    /// Commit everything the index holds on top of `HEAD`, like a plain
+    /// `git commit`. The working tree and the index stay as they are.
+    GitCommitStaged { message: String },
     /// Put the working-tree content of exactly `paths` in the index, like
     /// `git add` (a path missing from the working tree is removed from the
     /// index), or with `unstage`, set them back to `HEAD`, like
