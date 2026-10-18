@@ -130,6 +130,7 @@ fn a_restart_sends_an_interrupted_message_once() {
         last: Some(JobRun::start(started)),
         author: Default::default(),
         history: 0,
+        deliver_to: None,
     };
     let message =
         |text: &str, at: u64| Message::new(Role::User, text.into(), at, CodingBackend::default());
@@ -186,13 +187,22 @@ fn a_restart_sends_an_interrupted_message_once() {
         ..JobRun::start(started)
     });
     jobs.push(settled.clone());
-    jobs.push(job(answered.id, &text, Schedule::At { at: started }, None));
+    let mut answered_job = job(answered.id, &text, Schedule::At { at: started }, None);
+    answered_job.deliver_to = Some(Id::new_v4().to_string());
+    jobs.push(answered_job);
     jobs.push(job(
         unanswered.id,
         &text,
         Schedule::At { at: started },
         None,
     ));
+    // Ended, and was posting its reply when the gateway stopped.
+    let mut posting = settled.clone();
+    posting.last = Some(JobRun {
+        delivery: Some(Delivery::Posting),
+        ..settled.last.clone().unwrap()
+    });
+    jobs.push(posting);
     recover(
         &mut jobs,
         &[complete, interrupted, unsent, answered, unanswered],
@@ -212,9 +222,18 @@ fn a_restart_sends_an_interrupted_message_once() {
     }
     assert_eq!(jobs[5], settled, "a finished run is left alone");
     assert_eq!(outcome(&jobs[6]), JobOutcome::Complete);
+    // Its reply was never posted: posting starts after the end is recorded.
+    assert!(matches!(
+        jobs[6].last.as_ref().unwrap().delivery,
+        Some(Delivery::Failed(ref r)) if r.kind == ErrorKind::Unavailable
+    ));
     assert_eq!(outcome(&jobs[7]), JobOutcome::Failed);
+    assert_eq!(jobs[7].last.as_ref().unwrap().delivery, None);
+    let posting = jobs[8].last.as_ref().unwrap();
+    assert_eq!(posting.outcome, JobOutcome::Complete);
+    assert_eq!(posting.delivery, Some(Delivery::Unrecorded));
     assert!(
-        jobs[6..]
+        jobs[6..8]
             .iter()
             .all(|job| !job.enabled && job.next.is_none())
     );
@@ -240,6 +259,7 @@ fn a_restart_settles_a_heartbeat_by_its_reply() {
         last: Some(JobRun::start(started)),
         author: Default::default(),
         history: 0,
+        deliver_to: None,
     };
     // A conversation that received run `run`'s check, answered with `reply`.
     let conversation = |run: Id, reply: &str| {

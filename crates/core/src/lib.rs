@@ -187,7 +187,9 @@ pub mod mcp;
 pub mod schedule;
 pub use mcp::{McpServerConfig, McpServerState, McpServerStatus, McpToolInfo, ToolPolicy};
 pub use providers::{ProviderApi, ProviderPreset, ProviderPresetList};
-pub use schedule::{Job, JobAuthor, JobKind, JobOutcome, JobRun, Schedule, ScheduleInputError};
+pub use schedule::{
+    Delivery, Job, JobAuthor, JobKind, JobOutcome, JobRun, Schedule, ScheduleInputError,
+};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1438,6 +1440,14 @@ pub enum Command {
     RunJob {
         id: Id,
     },
+    /// Also post each run's reply to a messenger destination, one of
+    /// [`messengers::post_destinations`], or stop with `None` (user
+    /// operation). The destination must still be enabled, and a chat's
+    /// messenger connected, when a run posts.
+    SetJobDelivery {
+        id: Id,
+        to: Option<String>,
+    },
     /// A job's latest runs, newest first: up to
     /// [`schedule::MAX_JOB_RUNS`], kept while the job exists.
     JobRuns {
@@ -1530,6 +1540,7 @@ impl Command {
             Self::RemoveJob { .. } => "remove_job",
             Self::RunJob { .. } => "run_job",
             Self::JobRuns { .. } => "job_runs",
+            Self::SetJobDelivery { .. } => "set_job_delivery",
             Self::Steer { .. } => "steer",
             Self::PauseRun { .. } => "pause_run",
             Self::ResumeRun { .. } => "resume_run",

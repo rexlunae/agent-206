@@ -54,6 +54,11 @@ pub enum ScheduleAction {
     Resume { id: uuid::Uuid },
     /// Run a job now, leaving its schedule as it is.
     Run { id: uuid::Uuid },
+    /// Also post each run's reply to a webhook (by its name) or an allowed
+    /// chat of a messenger that can post (as name/chat); without a
+    /// destination, stop posting. A heartbeat check posts only replies that
+    /// need attention.
+    Deliver { id: uuid::Uuid, to: Option<String> },
     /// List a job's latest runs, newest first, as TOML.
     Runs { id: uuid::Uuid },
     /// Delete a job. Its conversation keeps the messages it sent.
@@ -139,6 +144,7 @@ pub async fn run(client: &Client, action: ScheduleAction) -> Result<()> {
         ScheduleAction::Resume { id } => Command::SetJobEnabled { id, enabled: true },
         ScheduleAction::Run { id } => Command::RunJob { id },
         ScheduleAction::Runs { id } => Command::JobRuns { id },
+        ScheduleAction::Deliver { id, to } => Command::SetJobDelivery { id, to },
         ScheduleAction::Remove { id } => Command::RemoveJob { id },
     };
     match client.call(command).await? {
@@ -162,7 +168,7 @@ mod tests {
 
     #[test]
     fn a_history_prints_every_run_with_its_outcome() {
-        use a206_core::{ErrorKind, ErrorReport, JobOutcome};
+        use a206_core::{Delivery, ErrorKind, ErrorReport, JobOutcome};
         let at = uuid::Uuid::new_v4().as_u128() as u64 % 4_000_000_000;
         let refusal = uuid::Uuid::new_v4().simple().to_string();
         let running = JobRun::start(at);
@@ -171,10 +177,29 @@ mod tests {
             ended: Some(at),
             ..JobRun::start(at)
         };
-        let text = history(vec![running.clone(), refused.clone()]).unwrap();
-        assert_eq!(text.matches("[[runs]]").count(), 2, "{text}");
+        let (parts, unposted) = (
+            2 + uuid::Uuid::new_v4().as_u128() as u64 % 8,
+            uuid::Uuid::new_v4().simple().to_string(),
+        );
+        let posted = JobRun {
+            outcome: JobOutcome::Complete,
+            delivery: Some(Delivery::Sent { parts }),
+            ..JobRun::start(at)
+        };
+        let failed = JobRun {
+            outcome: JobOutcome::Complete,
+            delivery: Some(Delivery::Failed(ErrorReport::new(
+                ErrorKind::NotFound,
+                unposted.clone(),
+            ))),
+            ..JobRun::start(at)
+        };
+        let text = history(vec![running.clone(), refused.clone(), posted, failed]).unwrap();
+        assert_eq!(text.matches("[[runs]]").count(), 4, "{text}");
         assert!(text.contains(&running.id.to_string()), "{text}");
         assert!(text.contains(&refusal), "{text}");
+        assert!(text.contains(&format!("parts = {parts}")), "{text}");
+        assert!(text.contains(&unposted), "{text}");
     }
 
     #[test]
