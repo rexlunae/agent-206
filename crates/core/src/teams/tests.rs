@@ -60,7 +60,7 @@ fn a_team_starts_with_its_coordinators_mode_and_a_permitted_model_only() {
     assert_eq!(requested, parent.grant.capabilities);
 
     // A coordinator naming a model the conversation does not permit, or a
-    // missing coordinator or member profile, starts nothing.
+    // missing coordinator profile, starts nothing.
     let elsewhere = AgentProfiles {
         profiles: vec![
             profile("lead", Some(&self::model())),
@@ -68,11 +68,7 @@ fn a_team_starts_with_its_coordinators_mode_and_a_permitted_model_only() {
         ],
         problems: vec![],
     };
-    let memberless = AgentProfiles {
-        profiles: vec![profile("lead", Some(&model))],
-        problems: vec![],
-    };
-    assert_eq!(start(&team, &parent, &memberless, &[]), None);
+
     assert_eq!(start(&team, &parent, &elsewhere, &[]), None);
     assert_eq!(start(&team, &parent, &AgentProfiles::default(), &[]), None);
 }

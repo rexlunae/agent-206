@@ -126,9 +126,10 @@ impl ThreadTeam {
 /// The `StartTeam` request for `team` on `parent`: the coordinator profile's
 /// mode and model, as a delegated conversation from that profile would ask,
 /// and `parent`'s capabilities for the gateway to narrow. `None` when the
-/// coordinator profile or a member profile is not among the usable
-/// `profiles`, which the gateway would refuse, or the coordinator names no
-/// model `parent` permits.
+/// coordinator profile is not among `profiles` or names no model `parent`
+/// permits. Members are not checked against `profiles`, which is a bounded
+/// listing: the gateway reads each one when the team starts and names any
+/// it cannot use.
 pub fn start(
     team: &AgentTeam,
     parent: &Thread,
@@ -136,9 +137,6 @@ pub fn start(
     providers: &[ProviderConfig],
 ) -> Option<Command> {
     let coordinator = profiles.get(&team.coordinator)?;
-    if team.members.iter().any(|m| profiles.get(m).is_none()) {
-        return None;
-    }
     let (mode, model) = delegation(Some(coordinator), &parent.subagent_models, providers)?;
     Some(Command::StartTeam {
         parent: parent.id,
