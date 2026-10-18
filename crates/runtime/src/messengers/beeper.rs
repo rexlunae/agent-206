@@ -29,11 +29,10 @@ const POLL: Duration = if cfg!(test) {
 } else {
     Duration::from_secs(2)
 };
-/// Chats one page of the chat list returns.
+/// Changed chats one look at the chat list reads. When more changed, every
+/// allowed chat is checked directly, so a burst of activity elsewhere cannot
+/// hide one.
 const CHAT_PAGE: &str = "100";
-/// Pages of changed chats read per poll. Past this every allowed chat is
-/// checked directly, so a burst of activity elsewhere cannot hide one.
-const MAX_CHAT_PAGES: usize = 8;
 /// Pages of one chat's new messages read per poll; the rest wait for the
 /// next.
 const MAX_MESSAGE_PAGES: usize = 8;
@@ -228,7 +227,7 @@ impl Beeper {
         {
             self.committed = Some(pending);
         }
-        let mut current = match self.committed.clone() {
+        let current = match self.committed.clone() {
             Some(state) if Some(state.generation) == since => state,
             _ => {
                 let state = self.start().await?;
@@ -241,26 +240,30 @@ impl Beeper {
                 });
             }
         };
-        loop {
-            let (mut state, events, more) = self.poll(&current).await?;
-            if events.is_empty() {
-                // Nothing to answer: the new position needs no confirmation.
-                self.committed = Some(state.clone());
-                current = state;
-                if !more {
-                    tokio::time::sleep(POLL).await;
-                }
-                continue;
-            }
-            state.generation = self.generation();
+        let (mut state, events, more) = self.poll(&current).await?;
+        if events.is_empty() {
+            // Nothing to answer: the new position needs no confirmation. The
+            // empty batch hands control back, so the gateway checks which
+            // accounts the token reaches before every look.
             let next = Some(state.generation.to_string());
-            self.pending = Some(state);
+            self.committed = Some(state);
+            if !more {
+                tokio::time::sleep(POLL).await;
+            }
             return Ok(Batch {
                 events,
                 complete: true,
                 next,
             });
         }
+        state.generation = self.generation();
+        let next = Some(state.generation.to_string());
+        self.pending = Some(state);
+        Ok(Batch {
+            events,
+            complete: true,
+            next,
+        })
     }
 
     /// The chat list's newest cursor, and where each allowed chat's messages
@@ -285,14 +288,17 @@ impl Beeper {
 
     /// Where `chat`'s messages end, if Beeper has the chat.
     async fn newest(&self, chat: &str) -> Result<Option<String>> {
-        let page: Option<Page<Message>> = self
-            .fetch(
-                HttpMethod::Get,
-                self.url(&["chats", chat, "messages"])?,
-                None,
-            )
-            .await?;
-        Ok(page.and_then(|page| page.newest_cursor))
+        Ok(self.latest(chat).await?.and_then(|page| page.newest_cursor))
+    }
+
+    /// `chat`'s most recent messages, if Beeper has the chat.
+    async fn latest(&self, chat: &str) -> Result<Option<Page<Message>>> {
+        self.fetch(
+            HttpMethod::Get,
+            self.url(&["chats", chat, "messages"])?,
+            None,
+        )
+        .await
     }
 
     /// One look at the chat list from `current`: the state after it, the
@@ -300,32 +306,23 @@ impl Beeper {
     async fn poll(&self, current: &State) -> Result<(State, Vec<(String, Event)>, bool)> {
         let mut state = current.clone();
         let mut changed = BTreeMap::new();
-        let mut overflow = false;
-        for pages in 1.. {
-            let mut url = self.url(&["chats"])?;
-            url.query_pairs_mut().append_pair("limit", CHAT_PAGE);
-            let cursor = state.chats.clone();
-            if let Some(cursor) = &cursor {
-                url.query_pairs_mut()
-                    .append_pair("cursor", cursor)
-                    .append_pair("direction", "after");
-            }
-            let page: Page<Chat> = self.get(url).await?;
-            if let Some(newest) = page.newest_cursor {
-                state.chats = Some(newest);
-            }
-            for chat in page.items {
-                changed.insert(chat.id.clone(), chat);
-            }
-            // Without a cursor this was the most recent page of every chat,
-            // not a list of changes to page through.
-            if !page.has_more || cursor.is_none() {
-                break;
-            }
-            if pages >= MAX_CHAT_PAGES {
-                overflow = true;
-                break;
-            }
+        let mut url = self.url(&["chats"])?;
+        url.query_pairs_mut().append_pair("limit", CHAT_PAGE);
+        if let Some(cursor) = &state.chats {
+            url.query_pairs_mut()
+                .append_pair("cursor", cursor)
+                .append_pair("direction", "after");
+        }
+        let page: Page<Chat> = self.get(url).await?;
+        // Without a cursor this was the most recent page of every chat, not
+        // a list of changes. With one, a full page may have left changed
+        // chats out, whichever end of the changes it holds.
+        let overflow = state.chats.is_some() && page.has_more;
+        if let Some(newest) = page.newest_cursor {
+            state.chats = Some(newest);
+        }
+        for chat in page.items {
+            changed.insert(chat.id.clone(), chat);
         }
         let mut events = Vec::new();
         let mut targets = std::mem::take(&mut state.behind);
@@ -350,19 +347,28 @@ impl Beeper {
             targets.extend(self.allowed.iter().cloned());
         }
         for chat in targets {
-            let Some(cursor) = state.messages.get(&chat).cloned() else {
-                // An allowed chat Beeper did not have when the session
-                // started: mark where it ends, without answering its history.
-                if let Some(cursor) = self.newest(&chat).await? {
-                    state.messages.insert(chat, cursor);
+            let messages = match state.messages.get(&chat).cloned() {
+                Some(cursor) => {
+                    let (cursor, messages, behind) = self.after(&chat, cursor).await?;
+                    state.messages.insert(chat.clone(), cursor);
+                    if behind {
+                        state.behind.insert(chat.clone());
+                    }
+                    messages
                 }
-                continue;
+                // An allowed chat that had no messages when the session
+                // started (Beeper did not have it, or it was empty): all it
+                // holds now arrived since.
+                None => match self.latest(&chat).await? {
+                    Some(page) => {
+                        if let Some(cursor) = page.newest_cursor {
+                            state.messages.insert(chat.clone(), cursor);
+                        }
+                        page.items
+                    }
+                    None => continue,
+                },
             };
-            let (cursor, messages, behind) = self.after(&chat, cursor).await?;
-            state.messages.insert(chat.clone(), cursor);
-            if behind {
-                state.behind.insert(chat.clone());
-            }
             if messages.is_empty() {
                 continue;
             }

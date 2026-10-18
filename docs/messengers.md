@@ -415,8 +415,12 @@ agent206 messenger enable beeper
   while the gateway runs: reading resumes from the last batch the gateway
   finished, and a reply that fails to send is reported, not retried.
   Cursors are held in memory, so messages that arrive while the gateway is
-  stopped are not answered. More than eight pages of changed chats at once
-  makes the next look check every allowed chat directly.
+  stopped are not answered. When more chats changed since the last look than
+  one page of the chat list holds (100), every allowed chat is checked
+  directly. An allowed chat that did not exist, or was empty, when the
+  session started has everything it holds answered once it appears. The
+  gateway checks which accounts the token reaches before every look, so a
+  replaced token starts afresh.
 - **Replies** go to the same chat in parts of at most 4000 characters, at
   most eight (longer replies end with a note that they were cut). Beeper
   converts Markdown to its rich text. End-to-end encryption to the networks

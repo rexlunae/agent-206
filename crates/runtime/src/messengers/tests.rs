@@ -2552,7 +2552,7 @@ async fn signal_waits_for_the_user_when_the_daemon_does_not_serve_the_account() 
 #[derive(Clone, Default)]
 struct BeeperDesktop {
     token: String,
-    accounts: Value,
+    accounts: Arc<Mutex<Value>>,
     state: Arc<Mutex<BeeperChats>>,
     /// Statuses the next sends answer with; then 200.
     send_statuses: Arc<Mutex<VecDeque<u16>>>,
@@ -2573,12 +2573,11 @@ struct BeeperChat {
     messages: Vec<(u64, Value)>,
 }
 
-impl BeeperDesktop {
-    fn chat(&self, id: &str, kind: &str, network: &str, title: &str) {
-        let mut state = self.state.lock().unwrap();
-        state.counter += 1;
-        let activity = state.counter;
-        state.chats.insert(
+impl BeeperChats {
+    fn chat(&mut self, id: &str, kind: &str, network: &str, title: &str) {
+        self.counter += 1;
+        let activity = self.counter;
+        self.chats.insert(
             id.to_owned(),
             BeeperChat {
                 info: json!({"id": id, "accountID": random(), "network": network, "title": title, "type": kind}),
@@ -2588,15 +2587,23 @@ impl BeeperDesktop {
         );
     }
     /// Add `message` (with a fresh id) to `chat`.
-    fn post(&self, chat: &str, mut message: Value) {
-        let mut state = self.state.lock().unwrap();
-        state.counter += 1;
-        let at = state.counter;
+    fn post(&mut self, chat: &str, mut message: Value) {
+        self.counter += 1;
+        let at = self.counter;
         message["id"] = json!(random());
         message["chatID"] = json!(chat);
-        let chat = state.chats.get_mut(chat).unwrap();
+        let chat = self.chats.get_mut(chat).unwrap();
         chat.activity = at;
         chat.messages.push((at, message));
+    }
+}
+
+impl BeeperDesktop {
+    fn chat(&self, id: &str, kind: &str, network: &str, title: &str) {
+        self.state.lock().unwrap().chat(id, kind, network, title);
+    }
+    fn post(&self, chat: &str, message: Value) {
+        self.state.lock().unwrap().post(chat, message);
     }
     fn lists(&self) -> usize {
         self.chat_lists.load(Ordering::SeqCst)
@@ -2623,7 +2630,7 @@ async fn serve_beeper(desktop: BeeperDesktop) -> String {
         if !authorized(&desktop, &headers) {
             return StatusCode::UNAUTHORIZED.into_response();
         }
-        Json(desktop.accounts.clone()).into_response()
+        Json(desktop.accounts.lock().unwrap().clone()).into_response()
     };
     let chats = |State(desktop): State<BeeperDesktop>,
                  headers: HeaderMap,
@@ -2638,7 +2645,10 @@ async fn serve_beeper(desktop: BeeperDesktop) -> String {
             .values()
             .filter(|c| c.activity > after)
             .collect();
+        // The most recent changes first, as Beeper lists chats; a full page
+        // leaves the oldest changes out.
         chats.sort_by_key(|c| std::cmp::Reverse(c.activity));
+        let more = chats.len() > limit;
         chats.truncate(limit);
         let newest = chats.first().map_or(after, |c| c.activity);
         let items: Vec<_> = chats
@@ -2651,7 +2661,7 @@ async fn serve_beeper(desktop: BeeperDesktop) -> String {
                 info
             })
             .collect();
-        Json(json!({"items": items, "hasMore": false, "newestCursor": format!("c{newest}")}))
+        Json(json!({"items": items, "hasMore": more, "newestCursor": format!("c{newest}")}))
     };
     let chat = |State(desktop): State<BeeperDesktop>, Path(id): Path<String>| async move {
         let state = desktop.state.lock().unwrap();
@@ -2729,7 +2739,9 @@ async fn beeper_setup() -> (
     let network = random();
     let desktop = BeeperDesktop {
         token: random(),
-        accounts: json!([{"accountID": random(), "network": network, "status": "connected"}]),
+        accounts: Arc::new(Mutex::new(
+            json!([{"accountID": random(), "network": network, "status": "connected"}]),
+        )),
         ..BeeperDesktop::default()
     };
     let origin = serve_beeper(desktop.clone()).await;
@@ -2812,7 +2824,10 @@ async fn beeper_answers_allowed_chats_as_the_user_and_never_history() {
     supervisor.await.unwrap();
 
     let status = host.status(name);
-    let network = desktop.accounts[0]["network"].as_str().unwrap();
+    let network = desktop.accounts.lock().unwrap()[0]["network"]
+        .as_str()
+        .unwrap()
+        .to_owned();
     assert_eq!(status.account, Some(format!("Beeper: {network}")));
     let turns: BTreeSet<_> = host
         .turns
@@ -2912,4 +2927,58 @@ async fn a_rejected_beeper_token_waits_for_the_user() {
         Some(ErrorKind::PermissionDenied)
     );
     assert_eq!(host.connects(name), 1, "not retried");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn beeper_finds_allowed_chats_behind_busy_lists_and_new_chats_and_rechecks_accounts() {
+    let (desktop, origin, _dir, credential, host, _anchor) = beeper_setup().await;
+    let name = "beeper";
+    let (busy, later, friend) = (random(), random(), random());
+    desktop.chat(&busy, "single", "WhatsApp", &random());
+    // `later` is allowed before Beeper has such a chat.
+    let entry = beeper_config(name, &origin, &credential, &[&busy, &later]);
+    let (_desired, receiver) = watch::channel(vec![Desired {
+        config: entry,
+        run: true,
+    }]);
+    let stop = CancellationToken::new();
+    let supervisor = tokio::spawn(supervise(host.clone(), receiver, FAST, stop.clone()));
+    host.until(|h| h.status(name).state == MessengerState::Connected && desktop.lists() >= 2)
+        .await;
+    let (behind, first) = (random(), random());
+    {
+        // At once, so one look sees it all: the allowed chat changes first,
+        // then more chats than one page holds.
+        let mut state = desktop.state.lock().unwrap();
+        state.post(&busy, beeper_text(&friend, &behind));
+        for _ in 0..100 {
+            let other = random();
+            state.chat(&other, "single", "Signal", &random());
+            state.post(&other, beeper_text(&random(), &random()));
+        }
+        // A chat created after the session started, and its first message.
+        state.chat(&later, "single", "iMessage", &random());
+        state.post(&later, beeper_text(&friend, &first));
+    }
+    host.until(|_| desktop.sent.lock().unwrap().len() == 2)
+        .await;
+    // Once nothing is left to answer, another token reaching other accounts
+    // is still noticed.
+    let seen = desktop.lists();
+    host.until(|_| desktop.lists() >= seen + 3).await;
+    let network = random();
+    *desktop.accounts.lock().unwrap() = json!([{"accountID": random(), "network": network}]);
+    host.until(|h| h.status(name).account == Some(format!("Beeper: {network}")))
+        .await;
+    stop.cancel();
+    supervisor.await.unwrap();
+
+    let sent: BTreeSet<_> = desktop.sent.lock().unwrap().iter().cloned().collect();
+    assert_eq!(
+        sent,
+        BTreeSet::from([
+            (busy, format!("reply to {behind}")),
+            (later, format!("reply to {first}")),
+        ])
+    );
 }
