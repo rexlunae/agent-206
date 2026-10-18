@@ -1,9 +1,10 @@
-//! A tiny MCP server used by this crate's tests: it runs under the real
-//! sandbox on platforms that have one. Not part of the shipped application.
-#![forbid(unsafe_code)]
+//! The fixture's tools. Kept apart from `main` so other crates' tests can
+//! serve the same fixture in process (`#[path]`), where no sandbox exists to
+//! launch it under.
 use rmcp::{
-    ServerHandler, ServiceExt,
+    RoleServer, ServerHandler, ServiceExt,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
+    service::RequestContext,
     tool, tool_handler, tool_router,
 };
 
@@ -48,6 +49,16 @@ impl Fixture {
             .map(|_| "connected".to_owned())
             .map_err(|error| error.kind().to_string())
     }
+    #[tool(description = "Open a Unix socket connection, then close it.")]
+    async fn connect_socket(&self, params: Parameters<File>) -> Result<String, String> {
+        #[cfg(unix)]
+        let connected = std::os::unix::net::UnixStream::connect(&params.0.path).map(|_| ());
+        #[cfg(not(unix))]
+        let connected: std::io::Result<()> = Err(std::io::ErrorKind::Unsupported.into());
+        connected
+            .map(|()| "connected".to_owned())
+            .map_err(|error| error.kind().to_string())
+    }
     #[tool(description = "Run a program without arguments and report its exit status.")]
     async fn run(&self, params: Parameters<Program>) -> Result<String, String> {
         std::process::Command::new(&params.0.program)
@@ -66,6 +77,18 @@ impl Fixture {
     async fn wait(&self) -> String {
         std::future::pending().await
     }
+    #[tool(
+        description = "Wait until the client cancels this call, then create the file at `path`."
+    )]
+    async fn wait_cancelled(
+        &self,
+        params: Parameters<File>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<String, String> {
+        context.ct.cancelled().await;
+        std::fs::write(&params.0.path, b"cancelled").map_err(|error| error.kind().to_string())?;
+        Ok(String::new())
+    }
     #[tool(description = "Exit the server process.")]
     async fn exit(&self) -> String {
         std::process::exit(0)
@@ -82,17 +105,20 @@ impl ServerHandler for Fixture {
     }
 }
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() {
+/// Serve the fixture over `transport` until the client disconnects; false
+/// if the session could not start or ended abnormally.
+pub async fn serve<T, E, A>(transport: T) -> bool
+where
+    T: rmcp::transport::IntoTransport<RoleServer, E, A>,
+    E: std::error::Error + Send + Sync + 'static,
+{
     let Ok(service) = (Fixture {
         tool_router: Fixture::tool_router(),
     })
-    .serve((tokio::io::stdin(), tokio::io::stdout()))
+    .serve(transport)
     .await
     else {
-        std::process::exit(2);
+        return false;
     };
-    if service.waiting().await.is_err() {
-        std::process::exit(1);
-    }
+    service.waiting().await.is_ok()
 }

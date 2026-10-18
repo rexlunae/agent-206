@@ -1,5 +1,5 @@
 //! The mount namespace and Landlock allowlist for one runtime launch.
-use crate::{Access, BUBBLEWRAP, Network, Rule, SPEC_VERSION, SandboxError, Spec};
+use crate::{Access, Network, Rule, SPEC_VERSION, SandboxError, Spec};
 use std::{
     ffi::OsString,
     path::{Path, PathBuf},
@@ -94,6 +94,10 @@ pub struct Profile<'a> {
     pub workspace: Option<(&'a Path, bool)>,
     /// Whether programs in `/usr/bin` and `/bin` may run.
     pub execute: bool,
+    /// Further directories the user chose whose programs may run, mounted
+    /// read-only. None may overlap a writable workspace or lie inside a
+    /// hidden path.
+    pub programs: &'a [PathBuf],
     /// Paths that stay invisible even inside a granted directory.
     pub hidden: &'a [PathBuf],
     pub cwd: &'a Path,
@@ -101,6 +105,10 @@ pub struct Profile<'a> {
     /// Pass the runtime's stderr to the gateway once it starts, after
     /// bubblewrap's own diagnostics; otherwise it is discarded.
     pub stderr: bool,
+    /// The pseudo-terminal device the runtime's stdin and stdout are, which
+    /// becomes its controlling terminal; its stderr goes there too. Only
+    /// this terminal and `/dev/tty` are added to what it may open.
+    pub terminal: Option<&'a Path>,
 }
 
 /// The network a runtime may use.
@@ -141,6 +149,10 @@ impl Profile<'_> {
         }
         add(PathBuf::from("/proc"), Access::Read);
         add(PathBuf::from("/dev/null"), Access::Device);
+        if self.terminal.is_some() {
+            // Its own controlling terminal; bubblewrap's `/dev` has no other.
+            add(PathBuf::from("/dev/tty"), Access::Terminal);
+        }
         for device in READ_DEVICES {
             add(PathBuf::from(device), Access::Read);
         }
@@ -168,6 +180,9 @@ impl Profile<'_> {
                 },
             );
         }
+        for program in self.programs {
+            add(program.clone(), Access::Execute);
+        }
         if self.network == NetworkAccess::Host {
             for path in NETWORK_ETC {
                 let path = Path::new(path);
@@ -193,8 +208,45 @@ impl Profile<'_> {
         Ok(rules)
     }
 
+    /// Refuses program directories that would expose a hidden path or
+    /// overlap a writable directory: the private scratch directory or a
+    /// writable workspace. Execute applies to everything beneath a program
+    /// directory, so one containing a writable directory would run whatever
+    /// the command writes there, and one inside it could be rewritten.
+    pub fn check_programs(&self) -> Result<(), SandboxError> {
+        let writable = std::iter::once(self.scratch).chain(
+            self.workspace
+                .filter(|(_, write)| *write)
+                .map(|(workspace, _)| workspace),
+        );
+        let writable: Vec<&Path> = writable.collect();
+        for program in self.programs {
+            if let Some(hidden) = self
+                .hidden
+                .iter()
+                .find(|hidden| program.starts_with(hidden))
+            {
+                return Err(SandboxError::HiddenProgramDirectory {
+                    directory: program.clone(),
+                    hidden: hidden.clone(),
+                });
+            }
+            if let Some(writable) = writable
+                .iter()
+                .find(|writable| program.starts_with(writable) || writable.starts_with(program))
+            {
+                return Err(SandboxError::WritableProgramDirectory {
+                    directory: program.clone(),
+                    writable: writable.to_path_buf(),
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// The helper's specification.
     pub fn spec(&self) -> Result<Spec, SandboxError> {
+        self.check_programs()?;
         Ok(Spec {
             version: SPEC_VERSION,
             executable: self.executable.to_path_buf(),
@@ -208,6 +260,7 @@ impl Profile<'_> {
             },
             status: self.status_socket(),
             stderr: self.stderr,
+            terminal: self.terminal.is_some(),
             rules: self.rules()?,
         })
     }
@@ -215,6 +268,7 @@ impl Profile<'_> {
     /// Bubblewrap's arguments up to and including the helper invocation.
     /// Arguments appended to the returned command go to the runtime.
     pub fn arguments(&self) -> Result<Vec<OsString>, SandboxError> {
+        self.check_programs()?;
         let mut args: Vec<OsString> = [
             "--unshare-all",
             "--die-with-parent",
@@ -261,6 +315,10 @@ impl Profile<'_> {
         for path in etc.chain(network_etc) {
             bind(&mut args, "--ro-bind-try", Path::new(path));
         }
+        // First, so the grants below stay visible inside a broader one.
+        for program in self.programs {
+            bind(&mut args, "--ro-bind", program);
+        }
         bind(&mut args, "--ro-bind", self.root);
         bind(&mut args, "--ro-bind", self.helper);
         bind(&mut args, "--bind", self.scratch);
@@ -276,17 +334,13 @@ impl Profile<'_> {
                 writable.push(workspace);
             }
         }
-        let mounted = [
-            Some(self.root),
-            Some(self.scratch),
-            self.workspace.map(|(w, _)| w),
-        ];
+        let mounted: Vec<&Path> = [self.root, self.scratch]
+            .into_iter()
+            .chain(self.workspace.map(|(w, _)| w))
+            .chain(self.programs.iter().map(PathBuf::as_path))
+            .collect();
         for hidden in self.hidden {
-            if !mounted
-                .iter()
-                .flatten()
-                .any(|base| hidden.starts_with(base))
-            {
+            if !mounted.iter().any(|base| hidden.starts_with(base)) {
                 continue;
             }
             match std::fs::symlink_metadata(hidden) {
@@ -322,10 +376,41 @@ impl Profile<'_> {
     }
 
     /// The bubblewrap command that runs the helper, which starts the runtime.
+    #[cfg(not(target_os = "macos"))]
     pub fn command(&self) -> Result<std::process::Command, SandboxError> {
-        std::fs::metadata(BUBBLEWRAP).map_err(SandboxError::Bubblewrap)?;
-        let mut command = std::process::Command::new(BUBBLEWRAP);
+        std::fs::metadata(crate::BUBBLEWRAP).map_err(SandboxError::Bubblewrap)?;
+        let mut command = std::process::Command::new(crate::BUBBLEWRAP);
         command.args(self.arguments()?);
+        Ok(command)
+    }
+
+    /// The `sandbox-exec` command that starts the runtime under this
+    /// profile's Seatbelt policy, in `cwd`. Without `stderr` the runtime's
+    /// stderr is discarded, as the Linux helper does. With a `terminal` the
+    /// command starts its own session, so it must not be put in a process
+    /// group first.
+    #[cfg(target_os = "macos")]
+    pub fn command(&self) -> Result<std::process::Command, SandboxError> {
+        std::fs::metadata(crate::SANDBOX_EXEC).map_err(SandboxError::SandboxExec)?;
+        // `sandbox-exec` replaces itself with the runtime, so a terminal must
+        // already be the controlling one: this executable's launcher makes
+        // it so, then becomes `sandbox-exec`.
+        let mut command = match self.terminal {
+            Some(_) => {
+                let mut command = std::process::Command::new(self.helper);
+                command.args([crate::TERMINAL_COMMAND, crate::SANDBOX_EXEC]);
+                command
+            }
+            None => std::process::Command::new(crate::SANDBOX_EXEC),
+        };
+        command
+            .arg("-p")
+            .arg(self.seatbelt()?)
+            .arg(self.executable)
+            .current_dir(self.cwd);
+        if !self.stderr {
+            command.stderr(std::process::Stdio::null());
+        }
         Ok(command)
     }
 }
@@ -396,10 +481,12 @@ mod tests {
                 control: &self.control,
                 workspace,
                 execute,
+                programs: &[],
                 hidden,
                 cwd: &self.scratch,
                 network: NetworkAccess::Proxy(1),
                 stderr: false,
+                terminal: None,
             }
         }
     }
@@ -436,6 +523,24 @@ mod tests {
         let none = layout.profile(None, &[], false).rules().unwrap();
         assert!(access(&none, &layout.project).is_empty());
         assert!(access(&none, &bin).is_empty());
+    }
+
+    #[test]
+    fn only_a_terminal_session_may_open_its_controlling_terminal() {
+        let layout = layout();
+        let tty = Path::new("/dev/tty");
+        let piped = layout.profile(None, &[], true);
+        assert!(access(&piped.rules().unwrap(), tty).is_empty());
+        assert!(!piped.spec().unwrap().terminal);
+        let device = layout.scratch.join("pts");
+        let terminal = Profile {
+            terminal: Some(&device),
+            ..piped
+        };
+        assert_eq!(access(&terminal.rules().unwrap(), tty), [Access::Terminal]);
+        // The device itself is not mounted on Linux; the inherited copy is used.
+        assert!(access(&terminal.rules().unwrap(), &device).is_empty());
+        assert!(terminal.spec().unwrap().terminal);
     }
 
     #[test]
@@ -548,5 +653,84 @@ mod tests {
                 .iter()
                 .any(|arg| arg == layout.control.join("proxy.sock").as_os_str())
         );
+    }
+
+    #[test]
+    fn program_directories_are_mounted_read_only_and_executable() {
+        let layout = layout();
+        let tools = layout.root.with_file_name(uuid::Uuid::new_v4().to_string());
+        let state = tools.join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        let hidden = vec![state.clone()];
+        let programs = vec![tools.clone()];
+        let profile = Profile {
+            programs: &programs,
+            ..layout.profile(Some((&layout.project, true)), &hidden, false)
+        };
+        assert_eq!(access(&profile.rules().unwrap(), &tools), [Access::Execute]);
+        let args = profile.arguments().unwrap();
+        let position = |needle: &Path| args.iter().position(|arg| arg == needle.as_os_str());
+        let mount = position(&tools).unwrap();
+        assert_eq!(args[mount - 1], "--ro-bind");
+        // Grant mounts follow, so a broader program directory cannot hide them.
+        assert!(mount < position(&layout.root).unwrap());
+        // A hidden directory inside it is covered like one inside a grant.
+        let cover = position(&state).unwrap();
+        assert!(cover > mount);
+        assert_eq!(args[cover - 1], "--tmpfs");
+        let without = layout
+            .profile(Some((&layout.project, true)), &hidden, false)
+            .arguments()
+            .unwrap();
+        assert!(!without.iter().any(|arg| arg == tools.as_os_str()));
+    }
+
+    #[test]
+    fn program_directories_may_not_expose_hidden_or_writable_paths() {
+        let layout = layout();
+        let hidden = vec![layout.root.with_file_name(uuid::Uuid::new_v4().to_string())];
+        let inside = vec![hidden[0].join("bin")];
+        let profile = Profile {
+            programs: &inside,
+            ..layout.profile(None, &hidden, false)
+        };
+        assert!(matches!(
+            profile.arguments(),
+            Err(SandboxError::HiddenProgramDirectory { .. })
+        ));
+        assert!(matches!(
+            profile.spec(),
+            Err(SandboxError::HiddenProgramDirectory { .. })
+        ));
+        let within = vec![layout.project.join("bin")];
+        let around = vec![layout.project.parent().unwrap().to_path_buf()];
+        for programs in [&within, &around] {
+            let writable = Profile {
+                programs,
+                ..layout.profile(Some((&layout.project, true)), &[], false)
+            };
+            assert!(matches!(
+                writable.arguments(),
+                Err(SandboxError::WritableProgramDirectory { .. })
+            ));
+        }
+        // Nor one around the scratch directory, which is always writable.
+        let scratch = vec![layout.scratch.parent().unwrap().to_path_buf()];
+        assert!(matches!(
+            Profile {
+                programs: &scratch,
+                ..layout.profile(None, &[], false)
+            }
+            .arguments(),
+            Err(SandboxError::WritableProgramDirectory { .. })
+        ));
+        // A read-only workspace cannot rewrite them.
+        std::fs::create_dir(&within[0]).unwrap();
+        Profile {
+            programs: &within,
+            ..layout.profile(Some((&layout.project, false)), &[], false)
+        }
+        .arguments()
+        .unwrap();
     }
 }

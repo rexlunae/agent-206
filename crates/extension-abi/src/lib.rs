@@ -153,16 +153,50 @@ impl From<HostFailure> for GuestError {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HostRequest {
+    /// Restricted to the bundled skills extension and current approval pins.
+    SkillList,
+    /// Read approved instructions or a bounded, relative supporting file.
+    SkillRead { name: String, path: Option<String> },
     /// Read a file, relative to the invocation's workspace.
     ReadFile { path: String },
     /// List a directory, relative to the invocation's workspace.
     ListDirectory { path: String },
     /// Find lines containing `query` (literal, case-sensitive) in UTF-8 files
-    /// under `path`, without following symlinks.
+    /// under `path`, without following symlinks or reading what git ignores
+    /// (`.gitignore` files and `.git/info/exclude`).
     Search {
         path: String,
         query: String,
         max_matches: u32,
+    },
+    /// Find lines matching `pattern` in UTF-8 files under `path`, without
+    /// following symlinks: a literal text unless `regex`, compared without
+    /// letter case when `ignore_case`. With `include`, only files whose path
+    /// matches that glob are searched (see [`HostRequest::Find`]). What git
+    /// ignores is skipped unless `include_ignored`.
+    SearchPattern {
+        path: String,
+        pattern: String,
+        regex: bool,
+        ignore_case: bool,
+        include: Option<String>,
+        max_matches: u32,
+        /// Absent from older guests, which then skip what git ignores.
+        #[serde(default)]
+        include_ignored: bool,
+    },
+    /// Entries under `path` matching a glob, without following symlinks. A
+    /// glob without `/` matches entry names at any depth; one with `/`
+    /// matches the whole path below `path`. `*` stays within one name and
+    /// `**` crosses directories. What git ignores is skipped unless
+    /// `include_ignored`.
+    Find {
+        path: String,
+        glob: String,
+        max_results: u32,
+        /// Absent from older guests, which then skip what git ignores.
+        #[serde(default)]
+        include_ignored: bool,
     },
     /// Write a whole file atomically. Without `overwrite`, an existing file
     /// is refused with [`HostErrorCode::Exists`].
@@ -180,6 +214,16 @@ pub enum HostRequest {
     },
     /// Create a directory and any missing parents.
     CreateDirectory { path: String },
+    /// Apply line-based changes to UTF-8 files: every file is checked
+    /// before any is written, and with `check_only` none is. The reply is
+    /// [`HostReply::Patched`]; a file that cannot be patched or written is
+    /// named in [`PatchResult::failed`]. A request refused as a whole (no
+    /// files, too many, or an invalid or repeated path) is
+    /// [`HostReply::Failed`].
+    PatchFiles {
+        files: Vec<FilePatch>,
+        check_only: bool,
+    },
     /// The branch, `HEAD` and changed paths of the workspace's repository.
     GitStatus,
     /// The most recent commits reachable from `HEAD`, newest first.
@@ -187,6 +231,15 @@ pub enum HostRequest {
     /// A unified diff of one file: `HEAD` against the index when `staged`,
     /// otherwise the index against the working tree.
     GitDiff { path: String, staged: bool },
+    /// Commit the working-tree content of exactly `paths` on top of `HEAD`,
+    /// like `git commit --only`: a path missing from the working tree is
+    /// removed, the index is updated to match for those paths, and other
+    /// staged changes stay staged.
+    GitCommit { message: String, paths: Vec<String> },
+    /// `GET` a credential-free HTTPS URL on the standard port. The host, and
+    /// every redirect's, must be one the manifest declares, and every
+    /// resolved address must be public. No cookies, credentials or proxies.
+    Fetch { url: String },
     /// Read this extension's own persisted state.
     StateGet { key: String },
     /// Replace (`Some`) or delete (`None`) this extension's state entry.
@@ -207,9 +260,14 @@ pub enum HostReply {
     File(ByteBuf),
     Directory(Vec<DirEntry>),
     Matches(SearchResult),
+    Found(FindResult),
     GitStatus(GitStatus),
     Commits(Vec<GitCommit>),
     Diff(GitDiff),
+    /// The commit a [`HostRequest::GitCommit`] made.
+    Committed(GitCommit),
+    Patched(PatchResult),
+    Fetched(FetchResponse),
     State(Option<ByteBuf>),
     Done,
     Failed(HostFailure),
@@ -221,11 +279,90 @@ pub struct DirEntry {
     /// File size in bytes; absent for directories and unknown sizes.
     pub size: Option<u64>,
 }
+/// The final response of a fetch, after redirects. Any status is returned;
+/// a non-2xx status is not a host failure.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FetchResponse {
+    pub status: u16,
+    /// The `Content-Type` header, when present and valid text.
+    pub content_type: Option<String>,
+    pub body: ByteBuf,
+    /// The body was cut at the host's bound.
+    pub truncated: bool,
+    /// A redirect was followed, so the response is from another address
+    /// (which, like the request's, is never returned). Absent from older
+    /// hosts.
+    #[serde(default)]
+    pub redirected: bool,
+}
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SearchResult {
     pub matches: Vec<SearchMatch>,
     /// The search stopped early at a bound; more matches may exist.
     pub truncated: bool,
+}
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FindResult {
+    /// In path order.
+    pub entries: Vec<FoundEntry>,
+    /// The walk stopped early at a bound; more entries may match.
+    pub truncated: bool,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FoundEntry {
+    /// Workspace-relative, `/`-separated.
+    pub path: String,
+    pub kind: EntryKind,
+}
+/// One file's part of a [`HostRequest::PatchFiles`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FilePatch {
+    /// Workspace-relative, `/`-separated; at most once per request.
+    pub path: String,
+    pub change: FileChange,
+    /// Applied in order; they may not overlap.
+    pub hunks: Vec<Hunk>,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileChange {
+    /// The file must not exist; the hunks apply to an empty file.
+    Create,
+    Modify,
+    /// The hunks must remove everything, and the file is deleted.
+    Delete,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Hunk {
+    /// 1-based line where the hunk's old lines start, or 0 when unknown.
+    /// The host applies the hunk where its old lines match nearest to it,
+    /// and refuses a hunk without a position whose old lines match twice.
+    pub old_start: u32,
+    pub lines: Vec<PatchLine>,
+}
+/// A hunk line. Its text ends with `\n` unless it is a file's last line
+/// without one. Old lines match a file's line regardless of `\r\n` or a
+/// missing final newline; added lines take the file's line ending.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PatchLine {
+    Context(String),
+    Remove(String),
+    Add(String),
+}
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PatchResult {
+    /// Files written, in request order; none with `check_only`.
+    pub changed: Vec<String>,
+    /// The file that could not be patched or written. Files not in
+    /// `changed` were left as they were; `changed` is empty unless a write
+    /// failed after other files were already written.
+    pub failed: Option<PatchFailure>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PatchFailure {
+    pub path: String,
+    pub failure: HostFailure,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SearchMatch {
@@ -330,6 +467,11 @@ pub enum HostErrorCode {
     /// This host does not implement the request.
     Unsupported,
     Io,
+    /// The bounded host operation did not finish in time.
+    Timeout,
+    /// The destination could not be reached: DNS, connection, TLS, timeout
+    /// or too many redirects.
+    Network,
     /// A code from a newer host.
     #[serde(other)]
     Other,
@@ -347,6 +489,8 @@ impl HostErrorCode {
             Self::Budget => "budget",
             Self::Unsupported => "unsupported",
             Self::Io => "io",
+            Self::Timeout => "timeout",
+            Self::Network => "network",
             Self::Other => "other",
         }
     }

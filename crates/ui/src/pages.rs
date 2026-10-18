@@ -1,20 +1,13 @@
 pub use crate::extensions::Extensions;
-#[cfg(not(target_arch = "wasm32"))]
 use crate::health::HealthChecks;
 use crate::{PageFrame, State, call, dispatch, error::ErrorNotice, route::Route};
 use a206_core::{Command, DownloadState, ErrorReport, Mode, Reply};
 use fc_dioxus::prelude::*;
 use uuid::Uuid;
-/// The web bridge's gateway, vault and broker live on its server, where
-/// `agent206 doctor` checks them.
-#[cfg(target_arch = "wasm32")]
-#[component]
-fn HealthChecks() -> Element {
-    rsx! {}
-}
 #[component]
 pub fn Overview() -> Element {
     let state = use_context::<State>();
+    let now = crate::messengers::use_catalog_clock(state)();
     let snapshot = state.data.read();
     rsx! { section { class: "a206-page", div { class: "a206-page-inner",
         Card { variant: CardVariant::Feature, as_: CardTag::Div, class: "a206-hero",
@@ -28,7 +21,14 @@ pub fn Overview() -> Element {
                     LinkButton { variant: ButtonVariant::Secondary, href: Route::Gateway {}.to_string(), "Manage gateway" }
                 }
             }
-            Badge { tone: BadgeTone::Accent, "{snapshot.threads.iter().filter(|t| t.state == a206_core::RunState::Running).count()} active responses" }
+            LinkButton { variant: ButtonVariant::Ghost, href: Route::Running {}.to_string(),
+                Badge { tone: BadgeTone::Accent, "{snapshot.threads.iter().filter(|t| t.state == a206_core::RunState::Running).count()} active responses" } }
+        }
+        if crate::welcome::unfinished(&snapshot, now) {
+            Card { variant: CardVariant::Subtle, CardBody { div { class: "a206-row a206-between",
+                div { strong { "Finish setting up." } p { class: "a206-muted", "Connect a model provider, secure the vault and start a conversation, with each step's current state in one checklist." } }
+                LinkButton { variant: ButtonVariant::Primary, href: Route::Welcome {}.to_string(), "Get started" }
+            } } }
         }
         div { class: "a206-grid",
             Metric { label: name!("Conversations"), title: rsx! { "Conversations" }, value: Some(snapshot.threads.len() as f64), display: snapshot.threads.len().to_string(), meta: rsx! { "Your ongoing work" } }
@@ -68,6 +68,7 @@ pub fn Conversations() -> Element {
                 ConversationList { query: query() }
             }
         }
+        Card { CardHeader { CardTitle { "Search messages" } } CardBody { crate::search::MessageSearch {} } }
     } }
 }
 #[component]
@@ -91,7 +92,7 @@ fn ConversationList(
             { let id = thread.id;
               let model = thread.model.as_ref().and_then(|key| snapshot.catalogs.iter().flat_map(|c| &c.models).find(|m| &m.key == key)).map(|m| m.name.as_str()).unwrap_or("Choose a model");
               rsx! { LinkButton { key: "{id}", class: "a206-recent-thread", size: ButtonSize::Sm, variant: ButtonVariant::Ghost,
-                  href: Route::Chat { id, split: None }.to_string(),
+                  href: Route::Chat { id, split: None, message: None }.to_string(),
                   Icon { name: IconName::Sparkles, size: IconSize::Sm }
                   span { class: "a206-nav-title", strong { "{thread.title}" } span { class: "a206-muted", "{model} · {thread.messages.len()} messages" } }
                   Badge { tone: BadgeTone::Accent, "{thread.mode.label()}" }
@@ -114,7 +115,7 @@ pub fn Projects() -> Element {
         div { class: "a206-grid", for project in &state.data.read().projects {
             { let manager = project.manager; rsx! { Card {
                 CardHeader { CardTitle { "{project.name}" } CardSubtitle { "{project.root}" } }
-                CardFooter { LinkButton { variant: ButtonVariant::Secondary, href: Route::Chat { id: manager, split: None }.to_string(), "Open coordinator" } }
+                CardFooter { LinkButton { variant: ButtonVariant::Secondary, href: Route::Chat { id: manager, split: None, message: None }.to_string(), "Open coordinator" } }
             } } }
         } }
     } }
@@ -208,7 +209,7 @@ pub fn Security() -> Element {
 }
 /// Vault setup uses the same state machine on every renderer.
 #[component]
-fn VaultControls() -> Element {
+pub(crate) fn VaultControls() -> Element {
     rsx! { crate::vault::VaultSection {} }
 }
 #[component]

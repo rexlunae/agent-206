@@ -1,18 +1,29 @@
 //! Shared desktop/web/terminal application tree, composed with fc-dioxus.
 #![forbid(unsafe_code)]
+mod activity;
+mod audit;
 mod conversation;
 mod error;
 mod extensions;
-#[cfg(not(target_arch = "wasm32"))]
+mod files;
 mod health;
+mod inbox;
 mod mcp;
 mod messengers;
 mod pages;
+mod palette;
+mod prompts;
 mod route;
+mod running;
+mod schedules;
+mod search;
 mod settings;
 mod skills;
+mod slash;
+mod subagents;
 mod tools;
 mod totp_enrollment;
+mod welcome;
 #[cfg(target_arch = "wasm32")]
 use a206_core::Ignore;
 mod setup;
@@ -39,6 +50,8 @@ fn terminal_mode() -> bool {
         false
     }
 }
+#[cfg(target_arch = "wasm32")]
+mod web_vault;
 use a206_core::{
     Command, ErrorKind, ErrorReport, GatewayAction, GatewayPhase, GatewayReport, Mode, Reply,
     Settings, Snapshot,
@@ -130,7 +143,7 @@ pub(crate) struct State {
     #[cfg(target_arch = "wasm32")]
     pub sign_in: Signal<bool>,
 }
-fn empty_snapshot() -> Snapshot {
+pub(crate) fn empty_snapshot() -> Snapshot {
     Snapshot {
         settings: Settings::default(),
         threads: vec![],
@@ -142,6 +155,8 @@ fn empty_snapshot() -> Snapshot {
         last_event: 0,
         managed_joshua_provider: None,
         mcp_servers: vec![],
+        jobs: vec![],
+        extension_proposals: vec![],
     }
 }
 /// Send a command; a gateway-reported failure arrives as `Err` with its causes.
@@ -411,6 +426,7 @@ pub(crate) fn dispatch(mut state: State, command: Command) {
                     destination = Some(Route::Chat {
                         id: thread.id,
                         split: None,
+                        message: None,
                     });
                 }
                 state.status.set(String::new());
@@ -584,6 +600,7 @@ fn Shell() -> Element {
         navigator: navigator(),
     };
     use_context_provider(|| state);
+    use_context_provider(|| conversation::Drafts(Signal::new(Default::default())));
     use_future(move || async move {
         // The web bridge may not have a gateway yet; it is asked once this
         // browser may use it, before any gateway is polled.
@@ -637,9 +654,42 @@ fn Shell() -> Element {
     let signing_in = sign_in();
     #[cfg(not(target_arch = "wasm32"))]
     let signing_in = false;
+    let mut palette = use_signal(|| false);
+    let route = use_route::<Route>();
+    // The palette reaches workspace pages, which sign-in and setup replace.
+    let navigable = !signing_in && !setup();
+    // Close it when they do, so it does not reappear unasked afterwards.
+    use_effect(move || {
+        #[cfg(target_arch = "wasm32")]
+        let gated = sign_in() || setup();
+        #[cfg(not(target_arch = "wasm32"))]
+        let gated = setup();
+        if gated && *palette.peek() {
+            palette.set(false);
+        }
+    });
     rsx! {
-        div { class: "a206-shell a206-app",
-            Header {}
+        // Focusable so Ctrl+K reaches it wherever in the window focus is.
+        div { class: "a206-shell a206-app", tabindex: "-1",
+            onmounted: move |mounted: MountedEvent| async move {
+                match mounted.data().set_focus(true).await {
+                    Ok(()) => {}
+                    // The terminal renderer has no element focus; there the
+                    // shortcut reaches the shell once the user focuses anything.
+                    Err(MountedError::NotSupported) => {}
+                    Err(error) => {
+                        tracing::warn!(error = &error as &dyn std::error::Error, "could not focus the workspace for keyboard shortcuts");
+                    }
+                }
+            },
+            onkeydown: move |event: KeyboardEvent| {
+                if navigable && palette::opens(&event) {
+                    event.prevent_default();
+                    palette.set(true);
+                }
+            },
+            Header { palette, navigable }
+            if navigable { palette::CommandPalette { open: palette, route } }
             if !status().is_empty() { div { class: "a206-status", role: "status", "{status}" } }
             if let Some(report) = state.outage.read().clone() {
                 div { class: "a206-status", ErrorNotice { report, title: "Gateway unreachable".to_string() } }
@@ -687,7 +737,7 @@ fn GatewaySetupGate() -> Element {
     rsx! { setup::GatewaySetup {} }
 }
 #[component]
-fn Header() -> Element {
+fn Header(palette: Signal<bool>, navigable: bool) -> Element {
     let state = use_context::<State>();
     let route = use_route::<Route>();
     rsx! { header { class: "a206-topbar",
@@ -700,6 +750,10 @@ fn Header() -> Element {
                 availability: if state.navigator.can_go_forward() { Availability::Enabled } else { Availability::Disabled },
                 onclick: move |_| state.navigator.go_forward() }
             Badge { tone: BadgeTone::Accent, "{route.label()}" }
+            Button { size: ButtonSize::Sm, variant: ButtonVariant::Ghost, title: "Go to a page or conversation, or run an action · Ctrl+K",
+                aria_keyshortcuts: "Control+K Meta+K", availability: if navigable { Availability::Enabled } else { Availability::Disabled },
+                onclick: move |_| palette.set(true),
+                Icon { name: IconName::Search, size: IconSize::Sm } "Go to…" }
             LinkButton { size: ButtonSize::Sm, variant: ButtonVariant::Ghost, href: Route::Gateway {}.to_string(), Icon { name: Route::Gateway {}.icon() } "Gateway" }
             LinkButton { size: ButtonSize::Sm, variant: ButtonVariant::Ghost, href: Route::Appearance {}.to_string(), Icon { name: IconName::Settings } "Theme" }
             SignOut {}
@@ -712,10 +766,14 @@ fn Sidebar() -> Element {
     let state = use_context::<State>();
     let route = use_route::<Route>();
     let snapshot = state.data.read();
+    let [primary, workbench, control] = Route::navigation();
+    let waiting = crate::inbox::count(&snapshot);
     rsx! { NavSidebar { class: "a206-sidebar", label: name!("Workspace navigation"), title: rsx! { "Workspace" }, collapsible: false,
         div { class: "a206-nav-group",
-            for item in [Route::Workspace {}, Route::Projects {}, Route::Conversations {}] {
-                LinkButton { variant: ButtonVariant::Ghost, size: ButtonSize::Sm, class: if route == item { "a206-nav-active" } else { "" }, href: item.to_string(), Icon { name: item.icon(), size: IconSize::Sm } "{item.label()}" }
+            for item in primary {
+                LinkButton { variant: ButtonVariant::Ghost, size: ButtonSize::Sm, class: if route == item { "a206-nav-active" } else { "" }, href: item.to_string(), Icon { name: item.icon(), size: IconSize::Sm } "{item.label()}"
+                    if item == (Route::Inbox {}) && waiting > 0 { Badge { tone: BadgeTone::Warning, "{waiting}" } }
+                }
             }
         }
         div { class: "a206-nav-group",
@@ -723,7 +781,7 @@ fn Sidebar() -> Element {
             if snapshot.threads.is_empty() { p { class: "a206-muted", "A fresh start." } }
             for thread in snapshot.threads.iter().rev().take(12) {
                 { let id = thread.id; rsx! {
-                    LinkButton { key: "{id}", size: ButtonSize::Sm, variant: ButtonVariant::Ghost, class: if matches!(route, Route::Chat { id: current, .. } if current == id) { "a206-nav-active" } else { "" }, href: Route::Chat { id, split: None }.to_string(),
+                    LinkButton { key: "{id}", size: ButtonSize::Sm, variant: ButtonVariant::Ghost, class: if matches!(route, Route::Chat { id: current, .. } if current == id) { "a206-nav-active" } else { "" }, href: Route::Chat { id, split: None, message: None }.to_string(),
                         Icon { name: if thread.parent.is_some() { IconName::ArrowEnd } else { IconName::Sparkles }, size: IconSize::Sm } span { class: "a206-nav-title", "{thread.title}" } Badge { tone: BadgeTone::Accent, "{thread.mode.label()}" }
                     }
                 } }
@@ -734,13 +792,13 @@ fn Sidebar() -> Element {
         }
         div { class: "a206-nav-group",
             NavHeading { "Workbench" }
-            for item in [Route::Documents {}, Route::Browser {}, Route::Downloads {}, Route::Extensions {}] {
+            for item in workbench {
                 LinkButton { size: ButtonSize::Sm, variant: ButtonVariant::Ghost, class: if route == item { "a206-nav-active" } else { "" }, href: item.to_string(), Icon { name: item.icon(), size: IconSize::Sm } "{item.label()}" }
             }
         }
         div { class: "a206-sidebar-footer a206-nav-group",
             NavHeading { "Control center" }
-            for item in [Route::Gateway {}, Route::Providers {}, Route::Messengers {}, Route::Joshua {}, Route::Prompts {}, Route::Security {}] {
+            for item in control {
                 LinkButton { size: ButtonSize::Sm, variant: ButtonVariant::Ghost, class: if route == item { "a206-nav-active" } else { "" }, href: item.to_string(), Icon { name: item.icon(), size: IconSize::Sm } "{item.label()}" }
             }
         }

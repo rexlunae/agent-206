@@ -12,7 +12,10 @@ use std::{
     ffi::OsString,
     io::Write,
     net::{Shutdown, TcpListener, TcpStream},
-    os::unix::net::UnixStream,
+    os::{
+        fd::AsFd,
+        unix::{net::UnixStream, process::CommandExt},
+    },
     path::{Path, PathBuf},
     process::ExitCode,
 };
@@ -59,6 +62,17 @@ fn start(
         )),
         Network::None | Network::Host => None,
     };
+    if spec.terminal {
+        // Bubblewrap's new session has no controlling terminal. This helper
+        // leads a session of its own, unless it already leads one, so its
+        // stdin can become that session's terminal.
+        match rustix::process::setsid() {
+            Ok(_) | Err(rustix::io::Errno::PERM) => {}
+            Err(errno) => return Err(SandboxError::Terminal(errno.into())),
+        }
+        rustix::process::ioctl_tiocsctty(std::io::stdin())
+            .map_err(|errno| SandboxError::Terminal(errno.into()))?;
+    }
     restrict(spec)?;
     if let Some((listener, socket)) = listener {
         // Detached: the relay lives exactly as long as this process, which exits
@@ -80,17 +94,43 @@ fn start(
             }
         });
     }
-    std::process::Command::new(&spec.executable)
-        .args(args)
-        // The gateway reads this process's stderr for diagnostics until it is
-        // ready; only a runtime whose stderr the gateway wants writes there.
-        .stderr(if spec.stderr {
+    let mut command = std::process::Command::new(&spec.executable);
+    command.args(args);
+    if spec.terminal {
+        // The terminal is the runtime's stderr too, as in any terminal.
+        let terminal = std::io::stdin()
+            .as_fd()
+            .try_clone_to_owned()
+            .map_err(SandboxError::Terminal)?;
+        command.stderr(terminal).process_group(0);
+    } else {
+        // The gateway reads this process's stderr for diagnostics until it
+        // is ready; only a runtime whose stderr the gateway wants writes there.
+        command.stderr(if spec.stderr {
             std::process::Stdio::inherit()
         } else {
             std::process::Stdio::null()
-        })
-        .spawn()
-        .map_err(SandboxError::Spawn)
+        });
+    }
+    let child = command.spawn().map_err(SandboxError::Spawn)?;
+    if spec.terminal {
+        foreground(&child)?;
+    }
+    Ok(child)
+}
+
+/// Make the runtime's process group the terminal's foreground group, so its
+/// interrupt and suspend keys reach the runtime and not this helper. A
+/// runtime that read the terminal before this was stopped for it; it is
+/// continued.
+fn foreground(child: &std::process::Child) -> Result<(), SandboxError> {
+    let terminal = |errno: rustix::io::Errno| SandboxError::Terminal(errno.into());
+    let group = i32::try_from(child.id())
+        .ok()
+        .and_then(rustix::process::Pid::from_raw)
+        .ok_or_else(|| SandboxError::Terminal(std::io::ErrorKind::InvalidData.into()))?;
+    rustix::termios::tcsetpgrp(std::io::stdin(), group).map_err(terminal)?;
+    rustix::process::kill_process_group(group, rustix::process::Signal::CONT).map_err(terminal)
 }
 
 /// Apply the allowlist to this process. Filesystem rules from the first
@@ -127,6 +167,7 @@ fn restrict(spec: &Spec) -> Result<(), SandboxError> {
             Access::Execute => read | AccessFs::Execute,
             Access::Write => all & !AccessFs::Execute,
             Access::Device => AccessFs::ReadFile | AccessFs::WriteFile,
+            Access::Terminal => AccessFs::ReadFile | AccessFs::WriteFile | AccessFs::IoctlDev,
         };
         let fd = PathFd::new(&rule.path).map_err(|source| SandboxError::LandlockPath {
             path: rule.path.clone(),

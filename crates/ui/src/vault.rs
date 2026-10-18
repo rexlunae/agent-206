@@ -9,6 +9,7 @@
 //! shown as text content so it can be copied into an authenticator app.
 use crate::error::{ErrorNotice, record};
 use crate::vault_backend::{Session, Target, unexpected};
+use crate::welcome::{VaultFacts, VaultProgress, VaultSeen};
 use a206_core::ErrorReport;
 #[cfg(not(target_arch = "wasm32"))]
 use a206_core::GatewayTarget;
@@ -18,7 +19,7 @@ use a206_vault_channel::{
 };
 use fc_dioxus::prelude::*;
 #[cfg(not(target_arch = "wasm32"))]
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// The account name shown in the authenticator app, as the CLI uses by default.
 const TOTP_ACCOUNT: &str = "agent206";
@@ -112,11 +113,27 @@ struct Panel {
     failure: Signal<Option<Failure>>,
     /// A secondary failure that did not undo the main action (pairing after unlock).
     warning: Signal<Option<Failure>>,
+    /// The latest background re-read's failure, until a read succeeds.
+    poll_failure: Signal<Option<Failure>>,
     notice: Signal<Option<&'static str>>,
     busy: Signal<bool>,
     flow: Signal<Flow>,
     held: Signal<Option<WireSecret>>,
     enrollment: Signal<Option<Enrollment>>,
+    /// The Get started checklist, when this panel is on that page.
+    progress: Option<VaultProgress>,
+}
+/// A stopped broker holds no unlocked vault, so its vault reads as locked.
+#[cfg(not(target_arch = "wasm32"))]
+fn stopped(root: &Path) -> BrokerStatus {
+    BrokerStatus {
+        exists: a206_broker::vault_path(root).exists(),
+        unlocked: false,
+        totp_enrolled: None,
+        agent_access: None,
+        step_up_active: false,
+        gateway_paired: None,
+    }
 }
 fn broker_refused(error: &VaultError, expected: BrokerError) -> bool {
     error.code == expected
@@ -160,10 +177,45 @@ impl Panel {
         self.refresh().await;
         self.busy.set(false);
     }
+    fn report(self, seen: VaultSeen) {
+        if let Some(progress) = self.progress {
+            progress.report(seen);
+        }
+    }
+    fn show(mut self, status: BrokerStatus) {
+        self.report(VaultSeen::Facts(VaultFacts {
+            exists: status.exists,
+            unlocked: status.unlocked,
+            totp_enrolled: status.totp_enrolled,
+            paired: status.gateway_paired,
+        }));
+        self.poll_failure.set(None);
+        self.status.set(Some(status));
+    }
+    /// The Get started page's background re-read. It never starts a broker,
+    /// so a deliberate `vault stop` stays stopped, and its failure is shown
+    /// apart from action failures and cleared by the next good read.
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn poll(mut self, root: &Path) {
+        match self.session().status_if_running().await {
+            Ok(found) => self.show(found.unwrap_or_else(|| stopped(root))),
+            Err(error) => {
+                // Offer no action on a state that could not be confirmed.
+                self.report(VaultSeen::Unreadable);
+                self.status.set(None);
+                self.poll_failure.set(Some(failure(
+                    "vault_status",
+                    "Could not re-read the vault state",
+                    &error,
+                )));
+            }
+        }
+    }
     async fn refresh(mut self) {
         match self.session().status().await {
-            Ok(status) => self.status.set(Some(status)),
+            Ok(status) => self.show(status),
             Err(error) => {
+                self.report(VaultSeen::Unreadable);
                 self.status.set(None);
                 let status = failure("vault_status", "Could not read the vault state", &error);
                 let (mut primary, mut secondary) = (self.failure.write(), self.warning.write());
@@ -435,11 +487,13 @@ fn VaultPanel(target: Target) -> Element {
         status: use_signal(|| None),
         failure: use_signal(|| None),
         warning: use_signal(|| None),
+        poll_failure: use_signal(|| None),
         notice: use_signal(|| None),
         busy: use_signal(|| false),
         flow: use_signal(|| Flow::Idle),
         held: use_signal(|| None),
         enrollment: use_signal(|| None),
+        progress: VaultProgress::listener(),
     };
     // Reads only through `peek`, so this runs once, after the first render.
     use_effect(move || panel.check());
@@ -447,14 +501,23 @@ fn VaultPanel(target: Target) -> Element {
     // Refresh without erasing an action's outcome, and serialize with submits
     // because the encrypted channel uses ordered nonces. A failed connection
     // stops polling until the user explicitly retries.
-    use_future(move || async move {
-        let mut panel = panel;
-        loop {
-            futures_timer::Delay::new(std::time::Duration::from_secs(2)).await;
-            if !*panel.busy.peek() && panel.status.peek().is_some() {
-                panel.busy.set(true);
-                panel.refresh().await;
-                panel.busy.set(false);
+    #[cfg(not(target_arch = "wasm32"))]
+    let poll_target = target.clone();
+    use_future(move || {
+        #[cfg(not(target_arch = "wasm32"))]
+        let target = poll_target.clone();
+        async move {
+            let mut panel = panel;
+            loop {
+                futures_timer::Delay::new(crate::welcome::VAULT_POLL).await;
+                if !*panel.busy.peek() && panel.status.peek().is_some() {
+                    panel.busy.set(true);
+                    #[cfg(not(target_arch = "wasm32"))]
+                    panel.poll(&target).await;
+                    #[cfg(target_arch = "wasm32")]
+                    panel.refresh().await;
+                    panel.busy.set(false);
+                }
             }
         }
     });
@@ -509,7 +572,7 @@ fn VaultPanel(target: Target) -> Element {
                         p { "Migration does not activate foreign hooks, extensions, permissions, or model choices." }
                     }
                 }
-            } else if (panel.failure)().is_none() {
+            } else if (panel.failure)().is_none() && (panel.poll_failure)().is_none() {
                 p { class: "a206-muted", role: "status", "Checking the vault…" }
             }
             if let Some(message) = (panel.notice)() {
@@ -519,6 +582,9 @@ fn VaultPanel(target: Target) -> Element {
                 ErrorNotice { report, title }
             }
             if let Some(Failure { title, report }) = (panel.warning)() {
+                ErrorNotice { report, title }
+            }
+            if let Some(Failure { title, report }) = (panel.poll_failure)() {
                 ErrorNotice { report, title }
             }
             match flow {
@@ -736,6 +802,9 @@ pub(crate) fn VaultSection() -> Element {
         };
     }
     rsx! {
+        // Public status/lock remains available before the independent key
+        // verification. No password or authenticator seed uses that API.
+        crate::web_vault::WebVault {}
         Card { variant: CardVariant::Feature,
             CardHeader { CardTitle { "Connect securely to your vault" } Badge { tone: BadgeTone::Warning, "Verification required" } }
             CardBody {

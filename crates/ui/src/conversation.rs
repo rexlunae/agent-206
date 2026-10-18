@@ -1,51 +1,109 @@
-use crate::{State, dispatch, route::Route};
+use crate::{
+    State, dispatch,
+    route::{Columns, Route},
+};
 use a206_core::{
-    Capability, CodingBackend, Command, ErrorKind, ErrorReport, Mode, ModelKey, Reply, Role,
-    RunState, TextAttachment, Thread,
+    Capability, CodingBackend, Command, CompactionTrigger, ErrorKind, ErrorReport,
+    InstructionStatus, Mode, ModelKey, PlanStatus, Reply, Role, RunState, TextAttachment, Thread,
 };
 use fc_dioxus::prelude::*;
-#[cfg(not(target_arch = "wasm32"))]
-use futures_util::StreamExt;
+use std::collections::HashMap;
 use uuid::Uuid;
+/// Scrolls a linked message into view where the renderer can scroll.
+async fn reveal(mounted: MountedEvent) {
+    match mounted.data().scroll_to(ScrollBehavior::Instant).await {
+        Ok(()) => {}
+        // The terminal renderer cannot scroll an element into view; the
+        // message is still marked.
+        Err(MountedError::NotSupported) => {}
+        Err(error) => {
+            tracing::warn!(
+                error = &error as &dyn std::error::Error,
+                "could not scroll to the linked message"
+            );
+        }
+    }
+}
+/// What a composer holds but has not sent.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct Unsent {
+    pub(crate) text: String,
+    pub(crate) attachments: Vec<TextAttachment>,
+}
+/// Unsent drafts by conversation for the life of the client, so adding or
+/// closing a column, which remounts the conversations, or leaving the page
+/// keeps them.
+#[derive(Clone, Copy)]
+pub(crate) struct Drafts(pub(crate) Signal<HashMap<Uuid, Unsent>>);
 #[component]
-pub fn Workspace(id: Uuid, split: Option<Uuid>) -> Element {
+pub fn Workspace(id: Uuid, split: Option<Columns>, message: Option<Uuid>) -> Element {
     let state = use_context::<State>();
     let snapshot = state.data.read();
     let thread = snapshot.threads.iter().find(|t| t.id == id).cloned();
-    let secondary = split
-        .filter(|second| *second != id)
-        .and_then(|second| snapshot.threads.iter().find(|t| t.id == second))
-        .cloned();
-    let visible_split = secondary.as_ref().map(|thread| thread.id);
+    let beside = split.as_ref().map(|c| c.beside(id)).unwrap_or_default();
+    let shown: Vec<Thread> = beside
+        .iter()
+        .filter_map(|other| snapshot.threads.iter().find(|t| t.id == *other))
+        .cloned()
+        .collect();
+    let missing = beside.len() - shown.len();
+    let shown_ids: Vec<Uuid> = shown.iter().map(|t| t.id).collect();
+    // This view with exactly `ids` beside the first conversation.
+    let with = move |ids: Vec<Uuid>| Route::Chat {
+        id,
+        split: Columns::of(ids),
+        message: None,
+    };
+    let can_add = shown.len() + 1 < Columns::MAX_VISIBLE;
     rsx! {
         if let Some(thread) = thread {
             div { class: "a206-chat-header a206-row a206-between",
                 strong { "Conversations" }
                 div { class: "a206-row a206-chat-actions",
-                    NativeSelect { class: "a206-split-selector", size: InputSize::Sm, aria_label: "Open a second conversation", value: visible_split.map(|id| id.to_string()).unwrap_or_default(),
-                        onchange: move |value: String| { state.navigator.push(Route::Chat { id, split: Uuid::parse_str(&value).ok().filter(|second| *second != id) }); },
-                        option { value: "", selected: visible_split.is_none(), "Split view…" }
-                        for other in snapshot.threads.iter().filter(|t| t.id != id) { option { value: "{other.id}", selected: visible_split == Some(other.id), "{other.title}" } }
+                    if can_add {
+                        NativeSelect { class: "a206-split-selector", size: InputSize::Sm, aria_label: "Open another conversation beside this one", value: String::new(),
+                            onchange: {
+                                let shown_ids = shown_ids.clone();
+                                move |value: String| {
+                                    if let Ok(added) = Uuid::parse_str(&value) {
+                                        let mut ids = shown_ids.clone();
+                                        ids.push(added);
+                                        state.navigator.push(with(ids));
+                                    }
+                                }
+                            },
+                            option { value: "", selected: true, if shown.is_empty() { "Split view…" } else { "Add a column…" } }
+                            for other in snapshot.threads.iter().filter(|t| t.id != id && !shown_ids.contains(&t.id)) { option { value: "{other.id}", "{other.title}" } }
+                        }
+                    }
+                    for other in shown.iter() {
+                        LinkButton { key: "{other.id}", size: ButtonSize::Sm, variant: ButtonVariant::Ghost,
+                            href: with(shown_ids.iter().copied().filter(|shown| *shown != other.id).collect()).to_string(),
+                            "Close {other.title}"
+                        }
                     }
                     RenameTitle { key: "{thread.id}:{thread.title}", id: thread.id, initial: thread.title.clone() }
                 }
             }
-            if split.is_some_and(|second| second != id) && secondary.is_none() {
-                Alert { title: rsx! { "Second conversation unavailable" }, "It may have been removed or belong to another gateway.",
-                    LinkButton { href: Route::Chat { id, split: None }.to_string(), variant: ButtonVariant::Ghost, "Close split view" }
+            if missing > 0 {
+                Alert { title: rsx! { if missing == 1 { "A conversation beside this one is unavailable" } else { "{missing} conversations beside this one are unavailable" } },
+                    "It may have been removed or belong to another gateway.",
+                    LinkButton { href: with(shown_ids.clone()).to_string(), variant: ButtonVariant::Ghost, if shown.is_empty() { "Close split view" } else { "Close the unavailable columns" } }
+                }
+            }
+            if message.is_some_and(|message| !thread.messages.iter().any(|m| m.id == message)) {
+                Alert { title: rsx! { "Message unavailable" }, "That message is no longer in this conversation.",
+                    LinkButton { href: Route::Chat { id, split: split.clone(), message: None }.to_string(), variant: ButtonVariant::Ghost, "Show the whole conversation" }
                 }
             }
             div { class: "a206-chat-layout",
-                if let Some(second) = secondary {
-                    Split { key: "columns:{thread.id}", label: name!("Conversation columns"), default_value: 50.0, min: 25.0, max: 75.0,
-                        primary: rsx! { Conversation { key: "{thread.id}", thread } },
-                        secondary: rsx! { Conversation { key: "{second.id}", thread: second } }
-                    }
-                } else {
+                if shown.is_empty() {
                     Split { key: "inspector:{thread.id}", label: name!("Conversation and inspector"), default_value: 73.0, min: 45.0, max: 85.0,
-                        primary: rsx! { Conversation { key: "{thread.id}", thread: thread.clone() } },
+                        primary: rsx! { Conversation { key: "{thread.id}", thread: thread.clone(), target: message } },
                         secondary: rsx! { Inspector { thread } }
                     }
+                } else {
+                    SideBySide { first: thread, target: message, rest: shown }
                 }
             }
         } else if !(state.loaded)() {
@@ -57,19 +115,118 @@ pub fn Workspace(id: Uuid, split: Option<Uuid>) -> Element {
         }
     }
 }
+/// What a conversation's composer offers.
+#[derive(Debug, PartialEq)]
+struct Composer {
+    /// A response is running or being requested: Send becomes Stop.
+    running: bool,
+    /// Enter adds the draft to the running response.
+    steerable: bool,
+}
+/// `sending` is this composer's `Send`, pending until its run ends;
+/// `steering` is a `Steer` it has not yet had answered.
+fn composer(thread: &Thread, sending: bool, steering: bool) -> Composer {
+    let active = thread.state == RunState::Running;
+    Composer {
+        running: active || sending,
+        // A native run takes further messages while it works, including the
+        // run this composer started, one steered message at a time.
+        steerable: active && thread.backend == CodingBackend::Native && !steering,
+    }
+}
+/// `first` and then each of `rest`, side by side in resizable columns that
+/// start with equal shares. `target` is the message to show in `first`.
 #[component]
-fn Conversation(thread: Thread) -> Element {
+fn SideBySide(first: Thread, target: Option<Uuid>, rest: Vec<Thread>) -> Element {
+    let Some((next, after)) = rest.split_first() else {
+        return rsx! { Conversation { key: "{first.id}", thread: first, target } };
+    };
+    // Columns are few, so the count converts to f64 exactly.
+    let share = 100.0 / (rest.len() + 1) as f64;
+    rsx! {
+        Split { key: "columns:{first.id}:{rest.len()}", label: name!("Conversation columns"), default_value: share, min: 15.0, max: 85.0,
+            primary: rsx! { Conversation { key: "{first.id}", thread: first.clone(), target } },
+            secondary: rsx! { SideBySide { first: next.clone(), target: None, rest: after.to_vec() } }
+        }
+    }
+}
+/// What the composer's primary button does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Primary {
+    Send,
+    /// Run the typed slash command, such as `/pause`, even during a run.
+    Run,
+    Stop,
+}
+
+fn primary(running: bool, typed_command: bool) -> Primary {
+    match (running, typed_command) {
+        (_, true) => Primary::Run,
+        (true, false) => Primary::Stop,
+        (false, false) => Primary::Send,
+    }
+}
+
+/// The activity line under a running conversation.
+pub(crate) fn run_status(thread: &Thread) -> (Lifecycle, String) {
+    match (thread.held, thread.paused) {
+        (true, true) => (Lifecycle::Queued, "Paused before its next step".into()),
+        (true, false) => (
+            Lifecycle::Queued,
+            "Waiting: a conversation that delegated this one is paused".into(),
+        ),
+        (false, true) => (Lifecycle::Running, "Pausing after this step…".into()),
+        (false, false) => (
+            Lifecycle::Running,
+            thread
+                .backend_activity
+                .clone()
+                .unwrap_or_else(|| format!("{} is working…", thread.backend.label())),
+        ),
+    }
+}
+/// One conversation; `target` is a message to scroll to and mark.
+#[component]
+fn Conversation(thread: Thread, target: Option<Uuid>) -> Element {
     let mut state = use_context::<State>();
-    let mut draft = use_signal(String::new);
-    let mut attachments = use_signal(Vec::<TextAttachment>::new);
+    let Drafts(mut drafts) = use_context::<Drafts>();
+    let id = thread.id;
+    let mut draft = use_signal(|| {
+        drafts
+            .peek()
+            .get(&id)
+            .map(|u| u.text.clone())
+            .unwrap_or_default()
+    });
+    let mut attachments = use_signal(|| {
+        drafts
+            .peek()
+            .get(&id)
+            .map(|u| u.attachments.clone())
+            .unwrap_or_default()
+    });
+    use_effect(move || {
+        let unsent = Unsent {
+            text: draft(),
+            attachments: attachments(),
+        };
+        let mut all = drafts.write();
+        if unsent == Unsent::default() {
+            all.remove(&id);
+        } else {
+            all.insert(id, unsent);
+        }
+    });
     let mut attachment_error = use_signal(|| None::<ErrorReport>);
+    let mut command_error = use_signal(|| None::<ErrorReport>);
     let mut reading_files = use_signal(|| false);
     let mut file_input_version = use_signal(|| 0_u64);
     let mut submitting = use_signal(|| false);
-    let running = thread.state == RunState::Running || submitting();
+    let mut steering = use_signal(|| false);
+    let Composer { running, steerable } = composer(&thread, submitting(), steering());
+    let steered: Vec<String> = thread.steering.iter().map(|m| m.text.clone()).collect();
     let has_model = thread.model.is_some();
     let selected_model = thread.model.clone();
-    let id = thread.id;
     let allowed_for_mode = thread.subagent_models.clone();
     let allowed_for_model = thread.subagent_models.clone();
     let mode = thread.mode;
@@ -92,8 +249,67 @@ fn Conversation(thread: Thread) -> Element {
             .and_then(|t| t.model.as_ref())
             .map(|k| format!("{}:{}", k.provider, k.model))
     });
+    let can_create = (state.connected)() && state.gateway_busy.read().is_none();
     let mut submit = move || {
-        let text = draft().trim().to_owned();
+        // A slash command runs instead of sending; anything else is a message.
+        // A failed send restores what was typed, so `//new` stays escaped.
+        let typed = draft().trim().to_owned();
+        let text = match crate::slash::parse(&typed) {
+            Ok(crate::slash::Typed::Send(text)) => text,
+            Ok(crate::slash::Typed::Run(slash)) => {
+                // The conversation as the gateway last reported it.
+                let resolved = {
+                    let snapshot = state.data.peek();
+                    snapshot
+                        .threads
+                        .iter()
+                        .find(|t| t.id == id)
+                        .ok_or_else(|| rejected("This conversation is no longer available"))
+                        .and_then(|thread| {
+                            crate::slash::resolve(slash, thread, &snapshot, can_create)
+                        })
+                };
+                match resolved {
+                    Ok(command) => {
+                        draft.set(String::new());
+                        command_error.set(None);
+                        crate::slash::run(state, command);
+                    }
+                    Err(report) => {
+                        crate::error::record("slash_command", &report);
+                        command_error.set(Some(report));
+                    }
+                }
+                return;
+            }
+            Err(report) => {
+                crate::error::record("slash_command", &report);
+                command_error.set(Some(report));
+                return;
+            }
+        };
+        if steerable && !text.is_empty() {
+            steering.set(true);
+            draft.set(String::new());
+            let typed = typed.clone();
+            spawn(async move {
+                match crate::call(Command::Steer {
+                    thread: id,
+                    text: text.clone(),
+                })
+                .await
+                {
+                    Ok(_) => state.error.set(None),
+                    Err(error) => {
+                        draft.set(typed);
+                        state.error.set(Some(error));
+                    }
+                }
+                steering.set(false);
+                crate::refresh(state).await;
+            });
+            return;
+        }
         if !running
             && has_model
             && !reading_files()
@@ -120,7 +336,7 @@ fn Conversation(thread: Thread) -> Element {
                         state.error.set(None);
                     }
                     other => {
-                        draft.set(text);
+                        draft.set(typed);
                         attachments.set(files);
                         state.error.set(Some(match other {
                             Err(error) => error,
@@ -219,6 +435,13 @@ fn Conversation(thread: Thread) -> Element {
             .collect()
     };
     let effort_unavailable = effort_options.is_empty() || running;
+    let commands = crate::slash::suggestions(&draft());
+    // A command needs no model; Send runs it (or says why it cannot run).
+    let typed_command = !matches!(
+        crate::slash::parse(draft().trim()),
+        Ok(crate::slash::Typed::Send(_))
+    );
+    let primary = primary(running, typed_command);
     let tool_count = thread.grant.capabilities.len();
     let availability = if running {
         Availability::Disabled
@@ -241,7 +464,17 @@ fn Conversation(thread: Thread) -> Element {
                 for message in &thread.messages {
                     Message { key: "{message.id}", role: match message.role { Role::User => MessageRole::User, Role::Assistant => MessageRole::Assistant, Role::System => MessageRole::System, Role::Tool => MessageRole::Tool },
                         state: Lifecycle::Complete,
-                        author: rsx! { match message.role { Role::User => "You", Role::Assistant => message.backend.label(), Role::System => "System", Role::Tool => "Tool" } },
+                        author: rsx! { match (&message.role, &message.compaction) { (_, Some(_)) => "Summary of earlier messages", (Role::User, _) => "You", (Role::Assistant, _) => message.backend.label(), (Role::System, _) => "System", (Role::Tool, _) => "Tool" } },
+                        if let Some(compaction) = &message.compaction {
+                            Badge { tone: BadgeTone::Accent,
+                                {format!("{} {} earlier messages", match compaction.trigger { CompactionTrigger::Automatic => "Automatically summarized", CompactionTrigger::Manual => "Summarized" }, compaction.messages)}
+                            }
+                        }
+                        if target == Some(message.id) {
+                            span { onmounted: move |mounted: MountedEvent| async move { reveal(mounted).await },
+                                Badge { tone: BadgeTone::Accent, Icon { name: IconName::Search, size: IconSize::Sm } "Linked message" }
+                            }
+                        }
                         p { class: "a206-message-text", "{message.text}" }
                         for file in &message.attachments { Badge { Icon { name: IconName::File, size: IconSize::Sm } "{file.name} · {file.text.len()} B" } }
                         for call in &message.tool_calls { crate::tools::ToolTrace { key: "{call.id}", call: call.clone() } }
@@ -250,20 +483,45 @@ fn Conversation(thread: Thread) -> Element {
             } }
             }
             for request in &thread.approvals { crate::tools::PendingApproval { key: "{request.id}", thread: id, request: request.clone() } }
-            if running { AgentStatus { state: Lifecycle::Running, label: rsx! { {thread.backend_activity.clone().unwrap_or_else(|| format!("{} is working…", thread.backend.label()))} } } }
+            for question in &thread.prompts { crate::prompts::PendingPrompt { key: "{question.id}", thread: id, question: question.clone() } }
+            if !thread.plan.is_empty() { ThreadPlan { thread: thread.clone() } }
+            if running { {let (state, label) = run_status(&thread); rsx! { AgentStatus { state, label: rsx! { "{label}" } } }} }
             if let Some(report) = thread.error.clone().filter(|_| !running && thread.state == RunState::Failed) {
                 crate::error::ErrorNotice { report, title: "Run failed".to_string() }
             }
         }
         div { class: "a206-composer",
             Card { as_: CardTag::Div, variant: CardVariant::Elevated, class: "a206-compose-surface", role: "group", aria_label: "Message composer",
+                if !commands.is_empty() {
+                    List { class: "a206-slash-commands", aria_label: "Commands · Tab completes the first",
+                        for spec in commands.iter().copied() {
+                            ListItem { key: "{spec.name}", headline: rsx! { "{spec.usage()}" }, supporting: rsx! { "{spec.about}" },
+                                action: ListAction::Button(EventHandler::new(move |_| draft.set(spec.completion()))) }
+                        }
+                    }
+                }
+                if let Some(report) = command_error() { crate::error::ErrorNotice { report, title: "Command not run".to_string(), dismiss: move |_| command_error.set(None) } }
                 div { class: "a206-compose-entry", onkeydown: move |event: KeyboardEvent| {
                     if event.key() == Key::Enter && !event.is_composing() && !event.modifiers().shift() { event.prevent_default(); submit(); }
+                    // Tab completes a command once; with nothing left to add it moves focus as usual.
+                    else if event.key() == Key::Tab && !event.modifiers().shift()
+                        && let Some(completion) = crate::slash::suggestions(&draft()).first().map(|spec| spec.completion()).filter(|c| *c != draft()) {
+                        event.prevent_default();
+                        draft.set(completion);
+                    }
                 },
                 Textarea { class: "a206-compose-input", aria_label: "Message your agent", rows: "1", autosize: true,
-                    placeholder: if has_model { "Describe what you'd like to do…" } else { "Choose a model to start…" },
-                    value: ReadSignal::from(draft), oninput: move |value| draft.set(value), readonly: running,
+                    placeholder: if has_model { "Describe what you'd like to do… (/ for commands)" } else { "Choose a model to start… (/ for commands)" },
+                    value: ReadSignal::from(draft), readonly: running && !steerable,
+                    oninput: move |value| { draft.set(value); if command_error.peek().is_some() { command_error.set(None); } },
                 }
+                }
+                if !steered.is_empty() {
+                    List { class: "a206-steered", aria_label: "Messages waiting for the running response",
+                        for (index, text) in steered.iter().enumerate() {
+                            ListItem { key: "{index}", overline: rsx! { "Read before its next step" }, headline: rsx! { "{text}" } }
+                        }
+                    }
                 }
                 if !attachments.read().is_empty() {
                     div { class: "a206-attachment-chips", aria_label: "Attached text documents",
@@ -345,17 +603,41 @@ fn Conversation(thread: Thread) -> Element {
                         }
                         LinkButton { icon_label: name!("Edit mode prompts"), title: "Edit mode prompts", size: ButtonSize::Sm, variant: ButtonVariant::Ghost,
                             href: Route::Prompts {}.to_string(), Icon { name: IconName::Settings } }
-                        IconButton { icon: if running { IconName::Stop } else { IconName::ArrowUp }, label: if running { name!("Stop response") } else { name!("Send message") },
-                            title: if running { "Stop response" } else { "Send · Enter (Shift+Enter for a new line)" },
+                        if steerable {
+                            IconButton { icon: IconName::Send, label: name!("Add to the running response"),
+                                title: "Add to the running response · Enter",
+                                size: ButtonSize::Sm, variant: ButtonVariant::Ghost,
+                                availability: if draft().trim().is_empty() { Availability::Disabled } else { Availability::Enabled },
+                                onclick: move |_| submit(),
+                            }
+                        }
+                        if crate::running::resumable(&thread) {
+                            IconButton { icon: IconName::Play, label: name!("Resume response"), title: "Resume response",
+                                size: ButtonSize::Sm, variant: ButtonVariant::Ghost,
+                                onclick: move |_| dispatch(state, Command::ResumeRun { thread: id }),
+                            }
+                        }
+                        if crate::running::pausable(&thread) {
+                            IconButton { icon: IconName::Pause, label: name!("Pause response"), title: "Pause before its next step",
+                                size: ButtonSize::Sm, variant: ButtonVariant::Ghost,
+                                onclick: move |_| dispatch(state, Command::PauseRun { thread: id }),
+                            }
+                        }
+                        IconButton { icon: if primary == Primary::Stop { IconName::Stop } else { IconName::ArrowUp },
+                            label: match primary { Primary::Stop => name!("Stop response"), Primary::Run => name!("Run command"), Primary::Send => name!("Send message") },
+                            title: match primary { Primary::Stop => "Stop response", Primary::Run => "Run command · Enter", Primary::Send => "Send · Enter (Shift+Enter for a new line)" },
                             class: "a206-compose-send", size: ButtonSize::Sm, variant: ButtonVariant::Primary,
-                            availability: if running || (has_model && !reading_files() && (!draft().trim().is_empty() || !attachments.read().is_empty())) { Availability::Enabled } else { Availability::Disabled },
-                            onclick: move |_| { if running { dispatch(state, Command::CancelRun { thread: id }); } else { submit(); } }
+                            availability: if running || typed_command || (has_model && !reading_files() && (!draft().trim().is_empty() || !attachments.read().is_empty())) { Availability::Enabled } else { Availability::Disabled },
+                            onclick: move |_| { if primary == Primary::Stop { dispatch(state, Command::CancelRun { thread: id }); } else { submit(); } }
                         }
                     }
                 }
                 Popover { id: details, class: "a206-chat-popover", title: rsx! { "Conversation details" },
                     ThreadFacts { thread: thread.clone() }
+                    ContextControls { thread: thread.clone() }
                     BackendControls { thread: thread.clone() }
+                    // Here too, so split view, which has no inspector, keeps it.
+                    crate::subagents::Subagents { thread: id }
                 }
             }
         }
@@ -374,6 +656,8 @@ fn Inspector(thread: Thread) -> Element {
             Divider {}
             crate::tools::ToolPermissions { thread: id }
         }
+        Divider {}
+        crate::subagents::Subagents { thread: id }
         Divider {}
         h3 { "Subagent models" }
         p { class: "a206-muted", "Choose which models this conversation may delegate to." }
@@ -458,15 +742,18 @@ fn BackendControls(thread: Thread) -> Element {
     rsx! { div { class: "a206-stack",
         h3 { "Agent engine" }
         Select { label: name!("Coding-agent backend"), value: ReadSignal::from(selected), options, availability,
-            onchange: move |value: String| { if let Some(backend) = CodingBackend::ALL.into_iter().find(|kind| kind.label() == value) { dispatch(state, Command::SetBackend { thread: id, backend, capabilities: grants.clone() }); } }
+            // A grant the new backend cannot be held to is dropped, not refused.
+            onchange: move |value: String| { if let Some(backend) = CodingBackend::ALL.into_iter().find(|kind| kind.label() == value) { dispatch(state, Command::SetBackend { thread: id, backend, capabilities: grants.iter().copied().filter(|c| backend.grantable().contains(c)).collect() }); } }
         }
         LinkButton { variant: ButtonVariant::Ghost, size: ButtonSize::Sm, href: Route::Providers {}.to_string(), "Manage connections" }
-        if thread.backend != CodingBackend::Native {
+        if thread.backend == CodingBackend::Native {
+            p { class: "a206-muted", "Tools are off until you grant them here, and each tool still needs your permission in this conversation. The mode limits what can be granted here." }
+        } else {
             p { class: "a206-muted", "Project tools are off until you grant them. External subagents and direct network access are disabled." }
-            if thread.project.is_none() { p { class: "a206-muted", "Open a project coordinator to grant workspace tools." } }
-            for capability in [Capability::ReadWorkspace, Capability::WriteWorkspace, Capability::Execute] {
-                BackendGrant { key: "{capability:?}", thread: id, capability }
-            }
+        }
+        if thread.project.is_none() { p { class: "a206-muted", "Open a project coordinator to grant workspace and git tools." } }
+        for capability in thread.backend.grantable().iter().copied() {
+            BackendGrant { key: "{capability:?}", thread: id, capability }
         }
     } }
 }
@@ -490,22 +777,32 @@ fn BackendGrant(thread: Uuid, capability: Capability) -> Element {
     let snapshot = state.data.read();
     let current = snapshot.threads.iter().find(|t| t.id == thread);
     let enabled = current.is_some_and(|t| {
-        t.project.is_some()
+        (t.project.is_some() || capability == Capability::Network)
             && t.parent.is_none()
             && t.state != RunState::Running
             && t.mode.ceiling().contains(&capability)
     });
-    let label = match capability {
-        Capability::ReadWorkspace => "Read project files",
-        Capability::WriteWorkspace => "Edit project files",
-        Capability::Execute => "Run project commands",
-        _ => "Unavailable",
-    };
+    let label = capability.label();
     rsx! { Checkbox { label: rsx! { "{label}" }, checked: ReadSignal::from(checked), availability: if enabled { Availability::Enabled } else { Availability::Disabled }, onchange: move |allowed| {
         if let Some(current) = state.data.read().threads.iter().find(|t| t.id == thread).cloned() {
             let mut capabilities = current.grant.capabilities;
-            if allowed { capabilities.insert(capability); if capability == Capability::WriteWorkspace { capabilities.insert(Capability::ReadWorkspace); } }
-            else { capabilities.remove(&capability); if capability == Capability::ReadWorkspace { capabilities.clear(); } }
+            // Writing needs reading: granting a write grant adds its read grant,
+            // and withdrawing a read grant withdraws what depends on it.
+            if allowed {
+                capabilities.insert(capability);
+                match capability {
+                    Capability::WriteWorkspace => { capabilities.insert(Capability::ReadWorkspace); }
+                    Capability::GitWrite => { capabilities.insert(Capability::GitRead); }
+                    _ => {}
+                }
+            } else {
+                capabilities.remove(&capability);
+                match capability {
+                    Capability::ReadWorkspace => { capabilities.remove(&Capability::WriteWorkspace); capabilities.remove(&Capability::Execute); }
+                    Capability::GitRead => { capabilities.remove(&Capability::GitWrite); }
+                    _ => {}
+                }
+            }
             dispatch(state, Command::SetBackend { thread, backend: current.backend, capabilities });
         }
     } } }
@@ -574,6 +871,81 @@ fn ThreadFacts(thread: Thread) -> Element {
     } }
 }
 
+/// The checklist the conversation's models keep with `plan_update`.
+#[component]
+fn ThreadPlan(thread: Thread) -> Element {
+    let done = thread
+        .plan
+        .iter()
+        .filter(|step| step.status == PlanStatus::Done)
+        .count();
+    let total = thread.plan.len();
+    rsx! { Card { as_: CardTag::Section, class: "a206-plan", aria_label: "Plan",
+        div { class: "a206-row",
+            strong { "Plan" }
+            span { class: "a206-muted", {format!("{done} of {total} done")} }
+        }
+        Progress { label: name!("Plan steps done"), value: ProgressValue::Of { value: done as f64, max: total as f64 } }
+        ol { class: "a206-plan-steps",
+            for (index, step) in thread.plan.iter().enumerate() {
+                li { key: "{index}", class: "a206-row",
+                    Badge { tone: match step.status { PlanStatus::Done => BadgeTone::Success, PlanStatus::InProgress => BadgeTone::Accent, PlanStatus::Pending => BadgeTone::Neutral },
+                        if step.status == PlanStatus::Done { Icon { name: IconName::Check, size: IconSize::Sm } }
+                        "{step.status.label()}"
+                    }
+                    span { "{step.text}" }
+                }
+            }
+        }
+    } }
+}
+
+/// Compaction and the project instruction files of the latest run.
+#[component]
+fn ContextControls(thread: Thread) -> Element {
+    let state = use_context::<State>();
+    let id = thread.id;
+    let native = thread.backend == CodingBackend::Native;
+    let summaries = thread
+        .messages
+        .iter()
+        .filter(|m| m.compaction.is_some())
+        .count();
+    let availability = if native && thread.state != RunState::Running && thread.model.is_some() {
+        Availability::Enabled
+    } else {
+        Availability::Disabled
+    };
+    rsx! { div { class: "a206-stack",
+        strong { "Context" }
+        if native {
+            p { class: "a206-muted",
+                {format!("Earlier messages are summarized automatically when a request uses more than {}% of the context limit the model's API reports. With no reported limit, only you can compact.", a206_core::COMPACTION_THRESHOLD_PERCENT)}
+            }
+            p { class: "a206-fact-note", {format!("{summaries} summaries in this conversation")} }
+            Button { size: ButtonSize::Sm, variant: ButtonVariant::Secondary, availability,
+                title: "Summarize all but the latest turn with this conversation's model",
+                onclick: move |_| dispatch(state, Command::CompactThread { thread: id }),
+                "Compact earlier messages"
+            }
+        }
+        strong { "Project instructions" }
+        if thread.instructions.is_empty() {
+            span { class: "a206-muted", "None loaded by the latest run" }
+        }
+        for file in &thread.instructions {
+            div { key: "{file.path}", class: "a206-row",
+                Badge { tone: match file.status { InstructionStatus::Included => BadgeTone::Success, InstructionStatus::Truncated => BadgeTone::Warning, InstructionStatus::Skipped => BadgeTone::Neutral },
+                    {match file.status { InstructionStatus::Included => "Included", InstructionStatus::Truncated => "Truncated", InstructionStatus::Skipped => "Skipped" }}
+                }
+                span { "{file.path}" }
+                span { class: "a206-muted", {format!("{} bytes", file.bytes)} }
+                if let Some(report) = &file.error { span { class: "a206-muted", "{report.message}" } }
+            }
+        }
+    } }
+}
+
 #[component]
 fn RenameTitle(id: Uuid, initial: String) -> Element {
     let state = use_context::<State>();
@@ -589,34 +961,14 @@ fn RenameTitle(id: Uuid, initial: String) -> Element {
     }
 }
 
-/// Browser File objects are immutable and report their exact size. The Dioxus
-/// 0.7 web byte_stream implementation casts an ArrayBuffer to Uint8Array and
-/// panics; read_bytes uses FileReader and constructs the typed array correctly.
 async fn read_attachment(
     file: &dioxus::html::FileData,
     remaining: usize,
 ) -> Result<String, ErrorReport> {
-    if file.size() > remaining as u64 {
-        return Err(rejected("Attachments exceed 128 KiB"));
-    }
-    #[cfg(target_arch = "wasm32")]
-    let bytes = file.read_bytes().await.map_err(unreadable)?.to_vec();
-    #[cfg(not(target_arch = "wasm32"))]
-    let bytes = {
-        let mut stream = file.byte_stream();
-        let mut bytes = Vec::new();
-        while let Some(part) = stream.next().await {
-            let part = part.map_err(unreadable)?;
-            if bytes.len() + part.len() > remaining {
-                return Err(rejected("Attachments exceed 128 KiB"));
-            }
-            bytes.extend_from_slice(&part);
-        }
-        bytes
-    };
-    if bytes.len() > remaining {
-        return Err(rejected("Attachments exceed 128 KiB"));
-    }
+    let bytes = crate::files::read_bounded(file, remaining)
+        .await
+        .map_err(unreadable)?
+        .ok_or_else(|| rejected("Attachments exceed 128 KiB"))?;
     let text = String::from_utf8(bytes).map_err(|error| {
         rejected("Use UTF-8 text documents; image, PDF and audio attachments are not supported yet")
             .caused_by(ErrorReport::capture(&error, |_| None))
@@ -635,4 +987,112 @@ fn rejected(message: &str) -> ErrorReport {
 fn unreadable(error: dioxus::CapturedError) -> ErrorReport {
     ErrorReport::new(ErrorKind::Other, "Could not read the attachment")
         .caused_by(ErrorReport::capture(&**error, |_| None))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn a_running_conversation_says_whether_a_pause_holds_it() {
+        let mut thread = Thread::new(Uuid::new_v4().to_string(), Mode::Chat);
+        thread.state = RunState::Running;
+        let working = run_status(&thread);
+        assert_eq!(working.0, Lifecycle::Running);
+        let mut statuses = vec![working.1];
+        for (held, paused) in [(false, true), (true, true), (true, false)] {
+            (thread.held, thread.paused) = (held, paused);
+            let (lifecycle, label) = run_status(&thread);
+            assert_eq!(lifecycle == Lifecycle::Queued, held, "{label}");
+            statuses.push(label);
+        }
+        statuses.sort();
+        statuses.dedup();
+        assert_eq!(statuses.len(), 4, "{statuses:?}");
+    }
+
+    #[test]
+    fn the_composer_steers_the_run_it_started_one_message_at_a_time() {
+        let mut thread = Thread::new(Uuid::new_v4().to_string(), Mode::Chat);
+        let offers = |thread: &Thread, sending, steering| composer(thread, sending, steering);
+        // Before the gateway reports the run, a pending Send only stops.
+        assert_eq!(
+            offers(&thread, true, false),
+            Composer {
+                running: true,
+                steerable: false
+            }
+        );
+        thread.state = RunState::Running;
+        // This composer's own Send stays pending for the whole run.
+        assert_eq!(
+            offers(&thread, true, false),
+            Composer {
+                running: true,
+                steerable: true
+            }
+        );
+        assert_eq!(
+            offers(&thread, false, false),
+            Composer {
+                running: true,
+                steerable: true
+            }
+        );
+        // Until a steered message is accepted, no second one is sent.
+        assert!(!offers(&thread, true, true).steerable);
+        thread.backend = CodingBackend::ALL
+            .into_iter()
+            .find(|b| *b != CodingBackend::Native)
+            .unwrap();
+        assert!(!offers(&thread, false, false).steerable);
+    }
+
+    #[test]
+    fn a_typed_command_runs_from_the_button_even_during_a_run() {
+        // `/pause` typed while a response runs must not stop it.
+        assert_eq!(primary(true, true), Primary::Run);
+        assert_eq!(primary(true, false), Primary::Stop);
+        assert_eq!(primary(false, true), Primary::Run);
+        assert_eq!(primary(false, false), Primary::Send);
+    }
+
+    use a206_core::PlanStep;
+
+    fn render(thread: Thread) -> String {
+        #[derive(Props, Clone, PartialEq)]
+        struct Shown {
+            thread: Thread,
+        }
+        fn root(props: Shown) -> Element {
+            rsx! { ThreadPlan { thread: props.thread } }
+        }
+        let mut dom = VirtualDom::new_with_props(root, Shown { thread });
+        dom.rebuild_in_place();
+        dioxus_ssr::render(&dom)
+    }
+
+    #[test]
+    fn the_plan_shows_each_step_in_order_with_its_status() {
+        let mut thread = Thread::new(Uuid::new_v4().to_string(), Mode::default());
+        let mut statuses = PlanStatus::ALL.to_vec();
+        statuses.push(PlanStatus::Done);
+        thread.plan = statuses
+            .into_iter()
+            .map(|status| PlanStep {
+                text: Uuid::new_v4().simple().to_string(),
+                status,
+            })
+            .collect();
+        let html = render(thread.clone());
+        let at: Vec<_> = thread
+            .plan
+            .iter()
+            .map(|step| html.find(&step.text).unwrap())
+            .collect();
+        assert!(at.windows(2).all(|pair| pair[0] < pair[1]), "{html}");
+        for status in PlanStatus::ALL {
+            assert!(html.contains(status.label()), "{html}");
+        }
+        assert!(html.contains("2 of 4 done"), "{html}");
+    }
 }

@@ -189,6 +189,18 @@ fn print_preview(preview: &Preview) {
                 UnsupportedMessenger::InvalidEndpoint => {
                     "skipped: it names no server, or one that is not an HTTPS origin"
                 }
+                UnsupportedMessenger::PlainTextIrc => {
+                    "skipped: it connects without TLS, which would send its password in the clear"
+                }
+                UnsupportedMessenger::InvalidLogin => {
+                    "skipped: its nickname is not one Agent 206 can sign in with"
+                }
+                UnsupportedMessenger::NoSignalDaemon => {
+                    "skipped: start a signal-cli daemon, then add it with `agent206 messenger add`"
+                }
+                UnsupportedMessenger::ThroughBeeper => {
+                    "skipped: connect this network to Beeper Desktop, then add Beeper with `agent206 messenger add`"
+                }
             },
         };
         println!(
@@ -365,7 +377,7 @@ pub async fn import(root: &Path, remote: Option<String>, source: ImportSource) -
     };
     if !providers.is_empty() || !messengers.is_empty() {
         saved = client
-            .call(Command::SaveSettings(settings))
+            .call(Command::SaveSettings(Box::new(settings)))
             .await
             .map_err(anyhow::Error::from)
             .and_then(|reply| Ok(reply.into_result().map(drop)?));

@@ -9,6 +9,10 @@ use std::collections::BTreeSet;
 
 /// Most tools, panels or parameters one manifest may declare.
 pub const MAX_DECLARATIONS: usize = 64;
+/// Most network destinations one manifest may declare.
+pub const MAX_HOSTS: usize = 32;
+/// The `hosts` entry that allows any public HTTPS host.
+pub const ANY_HOST: &str = "*";
 
 /// Why a manifest was rejected.
 #[derive(Debug, thiserror::Error)]
@@ -32,6 +36,14 @@ pub enum ManifestError {
         item: String,
         capability: Capability,
     },
+    #[error(
+        "the network permission needs declared `hosts`, and `hosts` needs the network permission"
+    )]
+    Hosts,
+    #[error("network host `{0}` is not a lowercase DNS name or `*` alone")]
+    Host(String),
+    #[error("more than {MAX_HOSTS} network hosts")]
+    TooManyHosts,
 }
 
 /// Why a call does not match the manifest's declarations.
@@ -64,6 +76,10 @@ pub struct Manifest {
     pub tools: Vec<ToolSpec>,
     #[serde(default)]
     pub panels: Vec<PanelSpec>,
+    /// Where `network` may connect: exact host names, or `*` alone for any
+    /// public HTTPS host. Shown to the user beside the permission.
+    #[serde(default)]
+    pub hosts: Vec<String>,
 }
 impl Manifest {
     pub fn parse(text: &str) -> Result<Self, ManifestError> {
@@ -117,8 +133,30 @@ impl Manifest {
         for tool in &self.tools {
             names("parameter", tool.params.iter().map(|p| p.name.as_str()))?;
         }
+        self.validate_hosts()
+    }
+    fn validate_hosts(&self) -> Result<(), ManifestError> {
+        if self.capabilities.contains(&Capability::Network) == self.hosts.is_empty() {
+            return Err(ManifestError::Hosts);
+        }
+        if self.hosts.len() > MAX_HOSTS {
+            return Err(ManifestError::TooManyHosts);
+        }
+        let any = self.hosts.iter().any(|host| host == ANY_HOST);
+        let mut seen = BTreeSet::new();
+        for host in &self.hosts {
+            let valid = if any {
+                self.hosts.len() == 1
+            } else {
+                valid_host(host)
+            };
+            if !valid || !seen.insert(host) {
+                return Err(ManifestError::Host(host.clone()));
+            }
+        }
         Ok(())
     }
+
     pub fn tool(&self, name: &str) -> Result<&ToolSpec, ArgError> {
         self.tools
             .iter()
@@ -143,8 +181,38 @@ impl Manifest {
             granted: granted.intersection(&self.capabilities).copied().collect(),
             tools: self.tools.clone(),
             panels: self.panels.clone(),
+            hosts: self.hosts.clone(),
+            source: Default::default(),
         }
     }
+}
+
+/// Whether declared `hosts` let `network` connect to `host` (lowercase, as
+/// URL parsing leaves it).
+pub fn allows_host(hosts: &[String], host: &str) -> bool {
+    hosts
+        .iter()
+        .any(|allowed| allowed == ANY_HOST || allowed == host)
+}
+
+/// A lowercase DNS name: dot-separated labels of letters, digits and
+/// inner hyphens. IP literals and wildcards within a name are refused.
+fn valid_host(host: &str) -> bool {
+    let label = |label: &str| {
+        (1..=63).contains(&label.len())
+            && label
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+    };
+    host.len() <= 253
+        && host.split('.').all(label)
+        && host.contains('.')
+        && !host
+            .rsplit('.')
+            .next()
+            .is_some_and(|tld| tld.bytes().all(|b| b.is_ascii_digit()))
 }
 
 fn names<'a>(
@@ -211,6 +279,45 @@ mod tests {
     #[test]
     fn bundled_manifests_are_valid() {
         assert!(!crate::builtins().unwrap().is_empty());
+    }
+
+    #[test]
+    fn network_destinations_are_declared_exactly() {
+        let network = |hosts: &str| {
+            Manifest::parse(&format!(
+                "id = \"test.ext\"\nname = \"Test\"\ndescription = \"d\"\nversion = \"1\"\nabi = {ABI}\ncapabilities = [\"network\"]\nhosts = {hosts}"
+            ))
+        };
+        let host = format!("h{}.example.org", std::process::id());
+        let parsed = network(&format!("[\"{host}\"]")).unwrap();
+        assert!(allows_host(&parsed.hosts, &host));
+        assert!(!allows_host(&parsed.hosts, &format!("x.{host}")));
+        assert!(allows_host(&network("[\"*\"]").unwrap().hosts, &host));
+        assert_eq!(parsed.summary(false, &BTreeSet::new()).hosts, parsed.hosts);
+        for bad in [
+            "[]".to_string(),
+            format!("[\"{}\"]", host.to_uppercase()),
+            format!("[\"*.{host}\"]"),
+            format!("[\"*\", \"{host}\"]"),
+            format!("[\"{host}\", \"{host}\"]"),
+            "[\"127.0.0.1\"]".into(),
+            "[\"localhost\"]".into(),
+            format!("[\"-{host}\"]"),
+            format!("[\"{host}:443\"]"),
+        ] {
+            assert!(network(&bad).is_err(), "{bad}");
+        }
+        assert!(matches!(
+            manifest(&format!("hosts = [\"{host}\"]")),
+            Err(ManifestError::Hosts)
+        ));
+        let many: Vec<_> = (0..=MAX_HOSTS)
+            .map(|i| format!("\"h{i}.{host}\""))
+            .collect();
+        assert!(matches!(
+            network(&format!("[{}]", many.join(","))),
+            Err(ManifestError::TooManyHosts)
+        ));
     }
 
     #[test]

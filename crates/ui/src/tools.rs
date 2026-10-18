@@ -1,8 +1,8 @@
 //! Tool traces, pending approvals and per-tool permissions in a conversation.
 use crate::{State, dispatch, error::ErrorNotice};
 use a206_core::{
-    ApprovalDecision, ApprovalRequest, Command, ErrorKind, ErrorReport, Reply, ToolCall,
-    ToolCallState, ToolPermission,
+    ApprovalDecision, ApprovalRequest, Command, ErrorKind, ErrorReport, OutputCount,
+    OutputReduction, Reply, ToolCall, ToolCallState, ToolPermission,
 };
 use fc_dioxus::prelude::*;
 use uuid::Uuid;
@@ -43,7 +43,59 @@ pub(crate) fn ToolTrace(call: ToolCall) -> Element {
                 pre { class: "a206-tool-output", "{output}" }
             }
         }
+        if !call.redactions.is_empty() {
+            p { class: "a206-muted", {redaction_note(&call.redactions)} }
+        }
+        if !call.injection.is_empty() {
+            p { class: "a206-muted", {injection_note(&call.injection)} }
+        }
+        if let Some(reduction) = call.reduction.as_ref() {
+            p { class: "a206-muted", {reduction_note(reduction)} }
+        }
     }
+}
+
+/// Which kinds of credential were removed before the model saw a result.
+fn redaction_note(redactions: &[OutputCount]) -> String {
+    let kinds: Vec<String> = redactions
+        .iter()
+        .map(|found| format!("{} × {}", found.name, found.count))
+        .collect();
+    format!(
+        "Credentials removed before the model saw this result: {}",
+        kinds.join(", ")
+    )
+}
+
+/// The kinds of text in a result that read as instructions to the model,
+/// which the model was told came from the tool.
+fn injection_note(found: &[OutputCount]) -> String {
+    let kinds: Vec<String> = found
+        .iter()
+        .map(|found| format!("{} × {}", found.name, found.count))
+        .collect();
+    format!(
+        "This result contains text addressed to the model, marked as tool data for it: {}",
+        kinds.join(", ")
+    )
+}
+
+/// What an output rule did to a result, which is all the model saw of it.
+fn reduction_note(reduction: &OutputReduction) -> String {
+    let layer = if reduction.user_rule {
+        "your"
+    } else {
+        "the built-in"
+    };
+    let counts: String = reduction
+        .counts
+        .iter()
+        .map(|count| format!("; {}: {}", count.name, count.count))
+        .collect();
+    format!(
+        "Shortened for the model by {layer} output rule `{}` from {} bytes{counts}",
+        reduction.rule, reduction.original_bytes
+    )
 }
 
 /// A call waiting for the user. Only this trusted surface can answer it; the
@@ -200,6 +252,9 @@ mod tests {
             output: None,
             error: None,
             signature: None,
+            reduction: None,
+            redactions: Vec::new(),
+            injection: Vec::new(),
         }
     }
     #[test]
@@ -261,6 +316,57 @@ mod tests {
         );
         assert!(html.contains(&output), "{html}");
         assert!(html.contains(Lifecycle::Complete.as_str()), "{html}");
+    }
+    #[test]
+    fn a_result_says_how_it_was_changed_for_the_model() {
+        let mut done = call(ToolCallState::Succeeded);
+        done.output = Some(Uuid::new_v4().to_string());
+        let plain = render(done.clone());
+        assert!(!plain.contains("Shortened"), "{plain}");
+        let (rule, name) = (Uuid::new_v4().to_string(), Uuid::new_v4().to_string());
+        let bytes = Uuid::new_v4().as_u128() as u64;
+        done.reduction = Some(OutputReduction {
+            rule: rule.clone(),
+            user_rule: true,
+            original_bytes: bytes,
+            counts: vec![OutputCount {
+                name: name.clone(),
+                count: 3,
+            }],
+        });
+        let html = render(done.clone());
+        assert!(
+            html.contains(&format!(
+                "Shortened for the model by your output rule `{rule}` from {bytes} bytes; {name}: 3"
+            )),
+            "{html}"
+        );
+        assert!(!html.contains("Credentials removed"), "{html}");
+        let kind = Uuid::new_v4().simple().to_string();
+        done.redactions = vec![OutputCount {
+            name: kind.clone(),
+            count: 2,
+        }];
+        let html = render(done.clone());
+        assert!(
+            html.contains(&format!(
+                "Credentials removed before the model saw this result: {kind} × 2"
+            )),
+            "{html}"
+        );
+        assert!(!html.contains("addressed to the model"), "{html}");
+        let kind = Uuid::new_v4().simple().to_string();
+        done.injection = vec![OutputCount {
+            name: kind.clone(),
+            count: 4,
+        }];
+        let html = render(done);
+        assert!(
+            html.contains(&format!(
+                "This result contains text addressed to the model, marked as tool data for it: {kind} × 4"
+            )),
+            "{html}"
+        );
     }
     #[test]
     fn a_refused_call_shows_its_structured_reason_not_its_output() {

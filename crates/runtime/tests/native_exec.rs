@@ -1,10 +1,11 @@
-//! The native `execute_command` tool through the real OS sandbox. The harness
-//! is custom because on Linux this binary is re-run as the sandbox's helper.
-#[cfg(target_os = "linux")]
+//! The native `execute_command` tool through the real OS sandbox (bubblewrap
+//! and Landlock on Linux, Seatbelt on macOS). The harness is custom because on
+//! Linux this binary is re-run as the sandbox's helper.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use a206_core::{Capability, ErrorKind, Id};
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use a206_runtime::{
-    exec_tool::{ExecHost, MAX_STREAM, NAME},
+    exec_tool::{ExecHost, MAX_INPUT, MAX_PER_THREAD, MAX_STREAM, NAME, PROCESS, PROCESS_WRITE},
     tools::{ToolHost, ToolOutput, ToolRequest, ToolScope},
 };
 
@@ -12,30 +13,47 @@ fn main() -> std::process::ExitCode {
     if let Some(result) = a206_sandbox::dispatch() {
         return result.expect("sandbox helper could not report to the gateway");
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(commands_hold_only_the_conversations_grants());
         runtime.block_on(network_follows_the_grant());
+        runtime.block_on(program_directories_run_read_only());
         runtime.block_on(output_status_and_time_are_bounded());
+        runtime.block_on(background_sessions_follow_their_conversation());
+        runtime.block_on(background_sessions_stop_when_their_grant_is_withdrawn());
+        runtime.block_on(stalled_input_fails_within_its_deadline());
+        runtime.block_on(terminal_sessions_take_keys_and_interrupts());
+        runtime.block_on(background_sessions_end_with_their_host());
         println!("native exec: ok");
     }
     std::process::ExitCode::SUCCESS
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn scope(workspace: Option<&std::path::Path>, capabilities: &[Capability]) -> ToolScope {
     ToolScope {
         thread: Id::new_v4(),
         workspace: workspace.map(Into::into),
         capabilities: capabilities.iter().copied().collect(),
+        programs: vec![],
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 async fn run(
     host: &ExecHost,
     scope: &ToolScope,
+    arguments: serde_json::Value,
+) -> Result<ToolOutput, a206_core::ErrorReport> {
+    call(host, scope, NAME, arguments).await
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+async fn call(
+    host: &ExecHost,
+    scope: &ToolScope,
+    name: &str,
     arguments: serde_json::Value,
 ) -> Result<ToolOutput, a206_core::ErrorReport> {
     let serde_json::Value::Object(arguments) = arguments else {
@@ -45,7 +63,7 @@ async fn run(
         scope,
         ToolRequest {
             call: Id::new_v4().to_string(),
-            name: NAME.into(),
+            name: name.into(),
             arguments,
             approved: true,
         },
@@ -53,14 +71,89 @@ async fn run(
     .await
 }
 
-#[cfg(target_os = "linux")]
+/// Start `command` in the background; returns its session id.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+async fn spawn(host: &ExecHost, scope: &ToolScope, arguments: serde_json::Value) -> String {
+    let mut arguments = arguments;
+    arguments["background"] = true.into();
+    let output = run(host, scope, arguments).await.unwrap();
+    assert!(!output.is_error, "{}", output.text);
+    let id = output
+        .text
+        .split_whitespace()
+        .find_map(|word| word.trim_end_matches(';').parse::<Id>().ok())
+        .unwrap_or_else(|| panic!("no session id in {}", output.text));
+    id.to_string()
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+async fn process(
+    host: &ExecHost,
+    scope: &ToolScope,
+    action: &str,
+    session: &str,
+) -> Result<ToolOutput, a206_core::ErrorReport> {
+    call(
+        host,
+        scope,
+        PROCESS,
+        serde_json::json!({ "action": action, "session": session }),
+    )
+    .await
+}
+
+/// Wait, without polling its output, until the session has finished.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+async fn idle(host: &ExecHost, scope: &ToolScope, session: &str) {
+    for _ in 0..200 {
+        let listed = call(
+            host,
+            scope,
+            PROCESS,
+            serde_json::json!({ "action": "list" }),
+        )
+        .await
+        .unwrap();
+        let line = listed
+            .text
+            .lines()
+            .find(|line| line.starts_with(session))
+            .unwrap_or_else(|| panic!("{session} is not listed: {}", listed.text));
+        if !line.ends_with("  running") {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!("session {session} did not finish")
+}
+
+/// Poll until the session has finished, collecting its output.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+async fn finish(host: &ExecHost, scope: &ToolScope, session: &str) -> ToolOutput {
+    let mut text = String::new();
+    for _ in 0..200 {
+        let output = process(host, scope, "poll", session).await.unwrap();
+        assert!(output.text.len() < 2 * MAX_STREAM, "{}", output.text.len());
+        text.push_str(&output.text);
+        if !output.text.starts_with("running") {
+            return ToolOutput {
+                text,
+                is_error: output.is_error,
+            };
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!("session {session} did not finish: {text}")
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 async fn sh(host: &ExecHost, scope: &ToolScope, command: &str) -> ToolOutput {
     run(host, scope, serde_json::json!({ "command": command }))
         .await
         .unwrap()
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 async fn commands_hold_only_the_conversations_grants() {
     let state = tempfile::tempdir().unwrap();
     let host = ExecHost::new(state.path());
@@ -156,7 +249,90 @@ async fn commands_hold_only_the_conversations_grants() {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+async fn program_directories_run_read_only() {
+    use std::os::unix::fs::PermissionsExt;
+    let state = tempfile::tempdir().unwrap();
+    let host = ExecHost::new(state.path());
+    let tools = tempfile::tempdir().unwrap();
+    let bin = tools.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let (program, marker) = (format!("tool-{}", Id::new_v4()), Id::new_v4().to_string());
+    let script = bin.join(&program);
+    std::fs::write(&script, format!("#!/bin/sh\necho {marker}\n")).unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let without = scope(None, &[Capability::Execute]);
+    let output = sh(&host, &without, &program).await;
+    assert!(output.is_error, "{}", output.text);
+    assert!(!output.text.contains(&marker));
+
+    // Found through PATH by the directory's `bin`, and runnable.
+    let given = ToolScope {
+        programs: vec![tools.path().into()],
+        ..without.clone()
+    };
+    let output = sh(&host, &given, &program).await;
+    assert!(!output.is_error, "{}", output.text);
+    assert!(output.text.contains(&marker), "{}", output.text);
+    let output = sh(
+        &host,
+        &given,
+        &format!("echo x > '{}'", bin.join("new").display()),
+    )
+    .await;
+    assert!(output.is_error, "program directories are read-only");
+    assert!(!bin.join("new").exists());
+
+    // A directory that overlaps a writable project could be rewritten.
+    let project = tempfile::tempdir().unwrap();
+    let inside = project.path().join("bin");
+    std::fs::create_dir(&inside).unwrap();
+    let write = ToolScope {
+        programs: vec![inside.clone()],
+        ..scope(
+            Some(project.path()),
+            &[
+                Capability::Execute,
+                Capability::ReadWorkspace,
+                Capability::WriteWorkspace,
+            ],
+        )
+    };
+    let error = sh_error(&host, &write).await;
+    assert_eq!(error.kind, ErrorKind::Conflict, "{error:?}");
+    // Read access cannot rewrite them.
+    let read = ToolScope {
+        capabilities: [Capability::Execute, Capability::ReadWorkspace].into(),
+        ..write
+    };
+    let output = sh(&host, &read, "true").await;
+    assert!(!output.is_error, "{}", output.text);
+
+    // Nor may one lie inside protected state, or go missing.
+    let nested = state.path().join("tools");
+    std::fs::create_dir(&nested).unwrap();
+    for (programs, kind) in [
+        (nested, ErrorKind::PermissionDenied),
+        (tools.path().join("missing"), ErrorKind::NotFound),
+    ] {
+        let refused = ToolScope {
+            programs: vec![programs],
+            ..given.clone()
+        };
+        let error = sh_error(&host, &refused).await;
+        assert_eq!(error.kind, kind, "{error:?}");
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+async fn sh_error(host: &ExecHost, scope: &ToolScope) -> a206_core::ErrorReport {
+    run(host, scope, serde_json::json!({ "command": "true" }))
+        .await
+        .unwrap_err()
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 async fn network_follows_the_grant() {
     let state = tempfile::tempdir().unwrap();
     let host = ExecHost::new(state.path());
@@ -175,7 +351,7 @@ async fn network_follows_the_grant() {
     assert!(!online.is_error, "{}", online.text);
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 async fn output_status_and_time_are_bounded() {
     let state = tempfile::tempdir().unwrap();
     let host = ExecHost::new(state.path());
@@ -201,6 +377,18 @@ async fn output_status_and_time_are_bounded() {
     assert!(output.text.contains("[stdout cut to"));
     assert!(output.text.contains("preserved-stderr"));
 
+    // A background process left behind cannot keep the call open: it ends
+    // with the shell, well before this timeout.
+    let output = run(
+        &host,
+        &scope,
+        serde_json::json!({ "command": "(sleep 60 &); echo left", "timeout_secs": 30 }),
+    )
+    .await
+    .unwrap();
+    assert!(!output.is_error, "{}", output.text);
+    assert!(output.text.contains("left"));
+
     let error = run(
         &host,
         &scope,
@@ -209,4 +397,402 @@ async fn output_status_and_time_are_bounded() {
     .await
     .unwrap_err();
     assert_eq!(error.kind, ErrorKind::Timeout);
+}
+
+/// Poll until the session's output, from all its polls together, contains
+/// every one of `needles`; returns what was collected.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+async fn shown(host: &ExecHost, scope: &ToolScope, session: &str, needles: &[&str]) -> String {
+    let mut text = String::new();
+    for _ in 0..400 {
+        text.push_str(&process(host, scope, "poll", session).await.unwrap().text);
+        if needles.iter().all(|needle| text.contains(needle)) {
+            return text;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!("{needles:?} never appeared in {text}")
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+async fn terminal_sessions_take_keys_and_interrupts() {
+    let state = tempfile::tempdir().unwrap();
+    let host = ExecHost::new(state.path());
+    let scope = scope(None, &[Capability::Execute]);
+    let marker = Id::new_v4().simple().to_string();
+    let write = |session: &str, arguments: serde_json::Value| {
+        let mut arguments = arguments;
+        arguments["session"] = session.into();
+        call(&host, &scope, PROCESS_WRITE, arguments)
+    };
+
+    // All three streams are the terminal, which is also the controlling
+    // one, at the advertised size.
+    let session = spawn(
+        &host,
+        &scope,
+        serde_json::json!({
+            "command": "test -t 0 && test -t 1 && test -t 2 && echo is-a-$TERM-tty; \
+                        echo via-dev-tty > /dev/tty; echo size-$(stty size < /dev/tty); \
+                        read line; echo got-$line; exec sleep 600",
+            "terminal": true,
+        }),
+    )
+    .await;
+    // The documented 80x24, as rows then columns; `stty` reads it through a
+    // `/dev/tty` opened inside the sandbox.
+    let size = "size-24 80";
+    let text = shown(
+        &host,
+        &scope,
+        &session,
+        &["is-a-dumb-tty", "via-dev-tty", size],
+    )
+    .await;
+    assert!(text.starts_with("running\n--- terminal ---"), "{text}");
+
+    // Text and keys arrive in order; Enter ends the line.
+    let written = write(
+        &session,
+        serde_json::json!({ "data": marker, "keys": ["Enter"] }),
+    )
+    .await
+    .unwrap();
+    assert!(!written.is_error, "{}", written.text);
+    shown(&host, &scope, &session, &[&format!("got-{marker}")]).await;
+
+    // A terminal's input cannot be closed.
+    let error = write(&session, serde_json::json!({ "close": true }))
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind, ErrorKind::Conflict, "{}", error.message);
+
+    // Ctrl-C reaches the command through the terminal's line discipline.
+    write(&session, serde_json::json!({ "keys": ["Ctrl-C"] }))
+        .await
+        .unwrap();
+    idle(&host, &scope, &session).await;
+    let ended = finish(&host, &scope, &session).await;
+    assert!(ended.is_error, "{}", ended.text);
+    // On Linux the sandbox's helper reports the signal as 128 + SIGINT.
+    assert!(
+        ended.text.starts_with("signal: 2 ") || ended.text.starts_with("exit status: 130\n"),
+        "interrupted, not killed: {}",
+        ended.text
+    );
+
+    // A session without a terminal takes text but no keys.
+    let piped = spawn(&host, &scope, serde_json::json!({ "command": "sleep 600" })).await;
+    let error = write(&piped, serde_json::json!({ "keys": ["Ctrl-C"] }))
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind, ErrorKind::Conflict, "{}", error.message);
+    process(&host, &scope, "remove", &piped).await.unwrap();
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+async fn background_sessions_follow_their_conversation() {
+    let state = tempfile::tempdir().unwrap();
+    let host = ExecHost::new(state.path());
+    let scope = scope(None, &[Capability::Execute]);
+    let marker = Id::new_v4().to_string();
+
+    // Input reaches the command, and its output and status come back.
+    let session = spawn(
+        &host,
+        &scope,
+        serde_json::json!({ "command": "read line; echo got:$line; echo late >&2; exit 4" }),
+    )
+    .await;
+    let other = self::scope(None, &[Capability::Execute]);
+    for action in ["poll", "kill", "remove"] {
+        assert_eq!(
+            process(&host, &other, action, &session)
+                .await
+                .unwrap_err()
+                .kind,
+            ErrorKind::NotFound,
+            "another conversation must not reach the session"
+        );
+    }
+    assert_eq!(
+        call(
+            &host,
+            &other,
+            PROCESS,
+            serde_json::json!({ "action": "list" })
+        )
+        .await
+        .unwrap()
+        .text,
+        "No background sessions."
+    );
+    let listed = call(
+        &host,
+        &scope,
+        PROCESS,
+        serde_json::json!({ "action": "list" }),
+    )
+    .await
+    .unwrap();
+    assert!(listed.text.contains(&session), "{}", listed.text);
+    let wrote = call(
+        &host,
+        &scope,
+        PROCESS_WRITE,
+        serde_json::json!({ "session": session, "data": format!("{marker}\n") }),
+    )
+    .await
+    .unwrap();
+    assert!(!wrote.is_error, "{}", wrote.text);
+    let finished = finish(&host, &scope, &session).await;
+    assert!(finished.is_error);
+    assert!(
+        finished.text.contains("exit status: 4"),
+        "{}",
+        finished.text
+    );
+    assert!(finished.text.contains(&format!("got:{marker}")));
+    assert!(finished.text.contains("late"));
+    assert_eq!(
+        call(
+            &host,
+            &scope,
+            PROCESS_WRITE,
+            serde_json::json!({ "session": session, "data": "more" }),
+        )
+        .await
+        .unwrap_err()
+        .kind,
+        ErrorKind::Conflict,
+        "a finished session takes no input"
+    );
+
+    // Output nobody polls stays bounded.
+    let session = spawn(
+        &host,
+        &scope,
+        serde_json::json!({ "command": "yes | head -c 1000000" }),
+    )
+    .await;
+    // Listing does not drain, so the whole output waits for one poll.
+    idle(&host, &scope, &session).await;
+    let polled = process(&host, &scope, "poll", &session).await.unwrap();
+    assert!(polled.text.contains("earlier stdout bytes dropped"));
+    assert!(polled.text.len() < 2 * MAX_STREAM, "{}", polled.text.len());
+
+    // Kill and the timeout both stop a command.
+    let session = spawn(&host, &scope, serde_json::json!({ "command": "sleep 600" })).await;
+    process(&host, &scope, "kill", &session).await.unwrap();
+    assert!(
+        finish(&host, &scope, &session)
+            .await
+            .text
+            .contains("killed")
+    );
+    assert_eq!(
+        process(&host, &scope, "kill", &session)
+            .await
+            .unwrap_err()
+            .kind,
+        ErrorKind::Conflict,
+        "a finished session cannot be stopped again"
+    );
+    let session = spawn(
+        &host,
+        &scope,
+        serde_json::json!({ "command": "sleep 600", "timeout_secs": 1 }),
+    )
+    .await;
+    assert!(
+        finish(&host, &scope, &session)
+            .await
+            .text
+            .contains("timeout")
+    );
+
+    // A conversation's running sessions are capped; finished ones make room.
+    process(&host, &scope, "remove", &session).await.unwrap();
+    let listed = call(
+        &host,
+        &scope,
+        PROCESS,
+        serde_json::json!({ "action": "list" }),
+    )
+    .await
+    .unwrap();
+    let held = listed.text.lines().count();
+    let mut running = Vec::new();
+    for _ in held..MAX_PER_THREAD {
+        running.push(spawn(&host, &scope, serde_json::json!({ "command": "sleep 600" })).await);
+    }
+    // Every slot holds a session; the finished ones give theirs up.
+    for _ in 0..held {
+        running.push(spawn(&host, &scope, serde_json::json!({ "command": "sleep 600" })).await);
+    }
+    let refused = run(
+        &host,
+        &scope,
+        serde_json::json!({ "command": "sleep 600", "background": true }),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(refused.kind, ErrorKind::Conflict);
+    process(&host, &scope, "remove", &running[0]).await.unwrap();
+    spawn(&host, &scope, serde_json::json!({ "command": "true" })).await;
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+async fn background_sessions_stop_when_their_grant_is_withdrawn() {
+    let state = tempfile::tempdir().unwrap();
+    let host = ExecHost::new(state.path());
+    let granted = scope(None, &[Capability::Execute, Capability::Network]);
+    let kept = spawn(
+        &host,
+        &granted,
+        serde_json::json!({ "command": "sleep 600" }),
+    )
+    .await;
+    let other = scope(None, &[Capability::Execute]);
+    let unaffected = spawn(&host, &other, serde_json::json!({ "command": "sleep 600" })).await;
+    // A wider grant, or another conversation's change, leaves it running.
+    let mut wider = granted.clone();
+    wider.capabilities.insert(Capability::ReadWorkspace);
+    host.rescope(&|id| {
+        (id == granted.thread)
+            .then(|| wider.clone())
+            .or(Some(other.clone()))
+    });
+    let polled = process(&host, &granted, "poll", &kept).await.unwrap();
+    assert!(polled.text.starts_with("running"), "{}", polled.text);
+    // Withdrawing Network stops it; the other conversation keeps its own.
+    let mut narrower = granted.clone();
+    narrower.capabilities.remove(&Capability::Network);
+    host.rescope(&|id| {
+        Some(if id == granted.thread {
+            narrower.clone()
+        } else {
+            other.clone()
+        })
+    });
+    let ended = finish(&host, &granted, &kept).await;
+    assert!(ended.is_error);
+    assert!(
+        ended.text.contains("permissions were withdrawn"),
+        "{}",
+        ended.text
+    );
+    let polled = process(&host, &other, "poll", &unaffected).await.unwrap();
+    assert!(polled.text.starts_with("running"), "{}", polled.text);
+    // A conversation that is gone takes its sessions with it.
+    host.rescope(&|_| None);
+    let ended = finish(&host, &other, &unaffected).await;
+    assert!(
+        ended.text.contains("permissions were withdrawn"),
+        "{}",
+        ended.text
+    );
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+async fn stalled_input_fails_within_its_deadline() {
+    let state = tempfile::tempdir().unwrap();
+    let host = ExecHost::new(state.path());
+    let scope = scope(None, &[Capability::Execute]);
+    // The command never reads, so its pipe fills and later writes queue.
+    let session = spawn(&host, &scope, serde_json::json!({ "command": "sleep 600" })).await;
+    let data = "x".repeat(MAX_INPUT);
+    let writes = (0..7).map(|_| {
+        call(
+            &host,
+            &scope,
+            PROCESS_WRITE,
+            serde_json::json!({ "session": session, "data": data }),
+        )
+    });
+    // Each write has its own short deadline, queueing included; this bound
+    // only catches a write that waits for a place in the queue forever.
+    let results = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        futures_util::future::join_all(writes),
+    )
+    .await
+    .expect("a write waited past its deadline");
+    let stalled = results
+        .iter()
+        .filter(|result| matches!(result, Err(error) if error.kind == ErrorKind::Timeout))
+        .count();
+    assert!(stalled >= 5, "{results:?}");
+    // The rest were written; nothing failed another way.
+    assert_eq!(results.iter().filter(|r| r.is_err()).count(), stalled);
+    process(&host, &scope, "kill", &session).await.unwrap();
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+async fn background_sessions_end_with_their_host() {
+    use std::io::Read;
+    let state = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let host = ExecHost::new(state.path());
+    let scope = scope(
+        Some(project.path()),
+        &[
+            Capability::Execute,
+            Capability::ReadWorkspace,
+            Capability::WriteWorkspace,
+        ],
+    );
+    // The command holds the writing end of a FIFO for as long as it runs,
+    // so the reader sees its end as end of file rather than after a delay.
+    // Its child starts before it reports, so the host is not dropped while
+    // the shell is still forking: on macOS a process forked as its group is
+    // killed can escape the kill.
+    let fifo = project.path().join("held");
+    let made = std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .unwrap();
+    assert!(made.success());
+    spawn(
+        &host,
+        &scope,
+        serde_json::json!({ "command": "exec 3> held; sleep 600 & echo started >&3; wait" }),
+    )
+    .await;
+    let (running, started) = tokio::sync::oneshot::channel();
+    let (ended, rest) = tokio::sync::oneshot::channel();
+    // A plain thread, so a failure does not wait for the command to end.
+    std::thread::spawn(move || {
+        let mut held = std::fs::File::open(fifo).unwrap();
+        let mut first = [0u8; 8];
+        held.read_exact(&mut first).unwrap();
+        running.send(first).unwrap();
+        let mut rest = Vec::new();
+        held.read_to_end(&mut rest).unwrap();
+        // The test may have given up already.
+        a206_core::Ignore::ignore(ended.send(rest));
+    });
+    let patience = std::time::Duration::from_secs(60);
+    let first = tokio::time::timeout(patience, started)
+        .await
+        .expect("the command did not start")
+        .unwrap();
+    assert_eq!(&first, b"started\n");
+    drop(host);
+    // The read ends only once nothing of the command is left; the bound
+    // only catches a session that outlives its host.
+    let Ok(rest) = tokio::time::timeout(patience, rest).await else {
+        let processes = std::process::Command::new("ps")
+            .args(["-axo", "pid,ppid,pgid,stat,command"])
+            .output()
+            .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
+            .unwrap_or_default();
+        let left: Vec<_> = processes
+            .lines()
+            .filter(|l| l.contains("sleep 600"))
+            .collect();
+        panic!("a session must not outlive the gateway's host: {left:#?}");
+    };
+    let rest = rest.unwrap();
+    assert!(rest.is_empty());
 }

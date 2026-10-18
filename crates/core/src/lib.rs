@@ -4,15 +4,22 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use uuid::Uuid;
 
+pub mod audit;
+pub mod doctor;
 pub mod error;
 pub mod extension;
 pub mod ignore;
+pub mod prompts;
+pub mod search;
 pub mod tools;
+pub use audit::{AuditBuilder, AuditField, AuditFinding, AuditLocation, AuditReport, AuditRule};
 pub use error::{ErrorKind, ErrorReport};
 pub use ignore::Ignore;
+pub use prompts::{AnswerError, PromptAnswer, PromptOutcome, UserPrompt};
+pub use search::{MessageHit, SearchError};
 pub use tools::{
-    ApprovalDecision, ApprovalOutcome, ApprovalRequest, ToolBudget, ToolCall, ToolCallState,
-    ToolList, ToolOffer, ToolPermission, UnavailableTools,
+    ApprovalDecision, ApprovalOutcome, ApprovalRequest, OutputCount, OutputReduction, ToolBudget,
+    ToolCall, ToolCallState, ToolList, ToolOffer, ToolPermission, UnavailableTools,
 };
 
 pub type Id = Uuid;
@@ -170,8 +177,10 @@ pub use messengers::{
     ChatBinding, MessengerConfig, MessengerKind, MessengerState, MessengerStatus, RefusedChat,
 };
 pub mod mcp;
+pub mod schedule;
 pub use mcp::{McpServerConfig, McpServerState, McpServerStatus, McpToolInfo, ToolPolicy};
 pub use providers::{ProviderApi, ProviderPreset, ProviderPresetList};
+pub use schedule::{Job, JobAuthor, JobKind, JobOutcome, JobRun, Schedule, ScheduleInputError};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -188,6 +197,24 @@ impl CodingBackend {
             Self::Native => "Agent 206",
             Self::Codex => "Codex",
             Self::ClaudeAgent => "Claude Agent",
+        }
+    }
+    /// What the user can grant a conversation on this backend, in display
+    /// order. Agent 206 enforces git and network grants in its own tools; an
+    /// external runtime is confined only by project access and commands, so
+    /// it is never offered a grant it could not be held to.
+    pub fn grantable(self) -> &'static [Capability] {
+        use Capability::*;
+        match self {
+            Self::Native => &[
+                ReadWorkspace,
+                WriteWorkspace,
+                Execute,
+                GitRead,
+                GitWrite,
+                Network,
+            ],
+            Self::Codex | Self::ClaudeAgent => &[ReadWorkspace, WriteWorkspace, Execute],
         }
     }
 }
@@ -265,6 +292,11 @@ pub struct Settings {
     /// the user approved. Any edit to a skill disables it until re-approved.
     #[serde(default)]
     pub enabled_skills: std::collections::BTreeMap<String, String>,
+    /// Absolute directories, beyond `/usr/bin` and `/bin`, whose programs
+    /// sandboxed commands may run read-only, such as a Homebrew prefix or a
+    /// toolchain. The gateway stores them canonicalized.
+    #[serde(default)]
+    pub program_directories: Vec<std::path::PathBuf>,
     pub prompts: Vec<ModePrompt>,
     pub theme_design: String,
     pub theme_palette: Option<String>,
@@ -281,6 +313,7 @@ impl Default for Settings {
             messengers: vec![],
             mcp_servers: vec![],
             enabled_skills: Default::default(),
+            program_directories: vec![],
             prompts: Mode::ALL
                 .into_iter()
                 .map(|mode| ModePrompt {
@@ -328,6 +361,12 @@ pub struct Message {
     /// Tool calls an assistant message requested, with their outcomes.
     #[serde(default)]
     pub tool_calls: Vec<ToolCall>,
+    /// Set on a [`Role::System`] message whose text is a model-written
+    /// summary of every message before it. Native runs send the model the
+    /// latest summary and the messages after it; the earlier messages stay
+    /// in the thread for the user.
+    #[serde(default)]
+    pub compaction: Option<Compaction>,
 }
 impl Message {
     pub fn new(role: Role, text: String, at: u64, backend: CodingBackend) -> Self {
@@ -339,8 +378,65 @@ impl Message {
             at,
             backend,
             tool_calls: vec![],
+            compaction: None,
         }
     }
+}
+/// A policy choice, not a model fact: a native run compacts its earlier
+/// messages before its next request once the previous request's reported
+/// input tokens exceed this percentage of the model's API-reported context
+/// limit. With no reported limit or input count there is no automatic
+/// compaction. RustyClaw uses the same 75%.
+pub const COMPACTION_THRESHOLD_PERCENT: u64 = 75;
+/// Why a conversation's earlier messages were summarized.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactionTrigger {
+    /// The previous model request used more than the gateway's compaction
+    /// threshold of the API-reported context limit.
+    Automatic,
+    /// The user asked for it (`CompactThread`).
+    Manual,
+}
+/// What one compaction summarized and what it cost.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Compaction {
+    pub trigger: CompactionTrigger,
+    /// Messages this summary covers that no earlier summary covered.
+    pub messages: u32,
+    /// The latest summary it folded in, if there was one.
+    pub previous: Option<Id>,
+    /// The last request's input tokens when it started (unknown when the
+    /// provider did not report them).
+    pub input_tokens: Option<u64>,
+    /// The model's API-reported context limit when it started, if known.
+    pub context_limit: Option<u64>,
+    /// The summarization request's own usage.
+    pub usage: Usage,
+}
+/// What happened to one project instruction file a native run looked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InstructionStatus {
+    Included,
+    /// Only the first `bytes` were included.
+    Truncated,
+    /// Not included; `error` says why.
+    Skipped,
+}
+/// Provenance of one project instruction file in a native run's system prompt.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InstructionFile {
+    /// Relative to the project root.
+    pub path: String,
+    pub status: InstructionStatus,
+    /// Bytes included in the prompt.
+    pub bytes: u64,
+    /// The file's size on disk, when it could be read.
+    pub size: Option<u64>,
+    /// SHA-256 of the included text.
+    pub sha256: Option<String>,
+    pub error: Option<ErrorReport>,
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Usage {
@@ -383,11 +479,91 @@ pub struct Thread {
     /// Tool calls of the current run waiting for the user.
     #[serde(default)]
     pub approvals: Vec<ApprovalRequest>,
+    /// Questions the current run asked the user and is waiting on.
+    #[serde(default)]
+    pub prompts: Vec<UserPrompt>,
     /// The messenger chat this thread converses with, if any.
     #[serde(default)]
     pub chat: Option<Box<ChatBinding>>,
+    /// Project instruction files the latest native run looked for, and what
+    /// it did with each. Empty when the run could not read the project.
+    #[serde(default)]
+    pub instructions: Vec<InstructionFile>,
+    /// While a user-requested compaction marks the thread `Running`, the
+    /// state it restores afterwards, so a restart restores it too rather
+    /// than reporting an interrupted run.
+    #[serde(default)]
+    pub compacting: Option<RunState>,
+    /// When the latest pre-compaction memory flush was offered: the summary
+    /// that was then the latest (`None` before the first). A flush is
+    /// offered once for each summary, before the next one is made.
+    #[serde(default)]
+    pub memory_flush: Option<MemoryFlush>,
+    /// Messages sent to the running native run with `Steer`, waiting for the
+    /// run to reach its next round, where they join `messages` in order.
+    #[serde(default)]
+    pub steering: Vec<Message>,
+    /// The user paused this conversation's work with `PauseRun`: its native
+    /// run, and those of its subagents, wait before their next model round
+    /// until `ResumeRun`. Cleared when the conversation's run ends.
+    #[serde(default)]
+    pub paused: bool,
+    /// The native run is waiting before its next model round because this
+    /// conversation or an ancestor is paused.
+    #[serde(default)]
+    pub held: bool,
+    /// The checklist the conversation's models keep with `plan_update`,
+    /// shown to the user beside the conversation. Empty when there is none.
+    #[serde(default)]
+    pub plan: Vec<PlanStep>,
+}
+/// One step of a conversation's plan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanStep {
+    pub text: String,
+    pub status: PlanStatus,
+}
+/// How far a plan step has got.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanStatus {
+    Pending,
+    InProgress,
+    Done,
+}
+impl PlanStatus {
+    pub const ALL: [Self; 3] = [Self::Pending, Self::InProgress, Self::Done];
+    /// The name models and the API use.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::InProgress => "in_progress",
+            Self::Done => "done",
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Pending => "Not started",
+            Self::InProgress => "In progress",
+            Self::Done => "Done",
+        }
+    }
+}
+/// A pre-compaction memory flush offered to a native run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryFlush {
+    /// The latest compaction summary when the flush was offered.
+    pub after: Option<Id>,
 }
 impl Thread {
+    /// The latest compaction summary in the conversation, if any.
+    pub fn latest_compaction(&self) -> Option<Id> {
+        self.messages
+            .iter()
+            .rev()
+            .find(|m| m.compaction.is_some())
+            .map(|m| m.id)
+    }
     pub fn new(title: String, mode: Mode) -> Self {
         Self {
             id: Id::new_v4(),
@@ -409,7 +585,15 @@ impl Thread {
             tool_permissions: BTreeMap::new(),
             tool_budget: ToolBudget::default(),
             approvals: vec![],
+            prompts: vec![],
             chat: None,
+            instructions: vec![],
+            compacting: None,
+            memory_flush: None,
+            steering: vec![],
+            paused: false,
+            held: false,
+            plan: vec![],
         }
     }
 }
@@ -470,6 +654,41 @@ pub struct PluginSummary {
     pub tools: Vec<extension::ToolSpec>,
     #[serde(default)]
     pub panels: Vec<extension::PanelSpec>,
+    /// Where the `network` permission may connect; `*` is any public host.
+    #[serde(default)]
+    pub hosts: Vec<String>,
+    #[serde(default)]
+    pub source: PluginSource,
+}
+/// Largest `plugin.toml` sent with [`Command::InstallExtension`].
+pub const MAX_EXTENSION_MANIFEST: usize = 64 * 1024;
+/// Largest module sent with [`Command::InstallExtension`]; with its manifest
+/// it fits one protocol frame.
+pub const MAX_EXTENSION_MODULE: usize = 3 * 1024 * 1024;
+/// Where an extension's package came from.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PluginSource {
+    /// Compiled into this application.
+    #[default]
+    Bundled,
+    /// Installed by the user. `digest` is the SHA-256 of the stored package,
+    /// which the gateway verifies before every run.
+    Installed { digest: String },
+}
+/// Most packages agents may leave waiting for review at once.
+pub const MAX_EXTENSION_PROPOSALS: usize = 8;
+/// A package an agent prepared, waiting for the user's review. It grants
+/// nothing and never runs; installing it is a user operation, and it arrives
+/// disabled with nothing granted, even when it updates an installed extension.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExtensionProposal {
+    /// SHA-256 of the stored package; pass it to [`Command::InstallProposal`].
+    pub digest: String,
+    /// What the package declares. Text fields are written by its author.
+    pub summary: PluginSummary,
+    /// The conversation whose agent prepared it.
+    pub thread: Id,
+    pub proposed_at: u64,
 }
 /// A skill installed in the gateway's profile, as the user reviews it.
 /// Text fields are written by the skill's author.
@@ -481,9 +700,9 @@ pub struct SkillSummary {
     pub emoji: Option<String>,
     /// Enabled, and unchanged since the user approved it.
     pub enabled: bool,
-    /// Enabled once, but `SKILL.md` changed since; it is not offered until re-enabled.
+    /// Enabled once, but the package changed since; not offered until re-enabled.
     pub changed: bool,
-    /// SHA-256 of `SKILL.md` as it is now; approving requires it.
+    /// Content digest of the package as it is now; approving requires it.
     pub digest: Option<String>,
     /// Requirements this gateway's computer does not meet.
     pub unmet: Vec<String>,
@@ -491,14 +710,29 @@ pub struct SkillSummary {
     pub expects_env: Vec<String>,
     /// Why the skill could not be read.
     pub failure: Option<ErrorReport>,
+    /// What the pre-install audit found in the package, for the user's review.
+    #[serde(default)]
+    pub audit: AuditReport,
 }
-/// The exact `SKILL.md` a user reviews, with the digest that approves it.
+/// The exact package a user reviews, with the digest that approves it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SkillText {
     pub name: String,
     pub text: String,
-    /// SHA-256 of `text`; pass it to [`Command::SetSkillEnabled`].
+    /// Content digest of this package; pass it to [`Command::SetSkillEnabled`].
     pub digest: String,
+    #[serde(default)]
+    pub files: Vec<SkillReviewFile>,
+    #[serde(default)]
+    pub audit: AuditReport,
+}
+/// A supporting file in the exact package snapshot being approved.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillReviewFile {
+    pub path: String,
+    pub bytes: u64,
+    /// Binary content is listed, but never interpreted or executed.
+    pub text: Option<String>,
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Snapshot {
@@ -517,6 +751,12 @@ pub struct Snapshot {
     /// Runtime state of configured MCP servers; never a grant.
     #[serde(default)]
     pub mcp_servers: Vec<McpServerStatus>,
+    /// Scheduled messages.
+    #[serde(default)]
+    pub jobs: Vec<Job>,
+    /// Extension packages agents prepared, waiting for the user.
+    #[serde(default)]
+    pub extension_proposals: Vec<ExtensionProposal>,
 }
 impl Snapshot {
     /// Retire only the connection owned by the managed process, including its model grants.
@@ -550,10 +790,34 @@ pub struct Event {
     pub at: u64,
     pub kind: EventKind,
 }
+/// Most events one [`Command::Activity`] page holds.
+pub const MAX_ACTIVITY: u32 = 100;
+/// Journal events newest first, leaving out [progress
+/// notices](EventKind::is_progress).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ActivityPage {
+    pub events: Vec<Event>,
+    /// Older activity is still journaled before the last event here.
+    pub more: bool,
+}
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum EventKind {
     ThreadChanged {
         id: Id,
+    },
+    /// A conversation was created by the user, a messenger or a delegating
+    /// agent.
+    ThreadCreated {
+        id: Id,
+    },
+    /// A conversation's title changed; the thread has the new one.
+    ThreadRenamed {
+        id: Id,
+    },
+    /// A reply ended; `state` is `Complete`, `Failed` or `Cancelled`.
+    RunEnded {
+        thread: Id,
+        state: RunState,
     },
     CatalogChanged {
         provider: Id,
@@ -586,6 +850,36 @@ pub enum EventKind {
         approval: Id,
         outcome: ApprovalOutcome,
     },
+    /// An agent asked the user a question; it is in the thread.
+    PromptRequested {
+        thread: Id,
+        prompt: Id,
+    },
+    PromptResolved {
+        thread: Id,
+        prompt: Id,
+        outcome: PromptOutcome,
+    },
+    /// A scheduled message was added, changed, ran or was removed.
+    JobChanged {
+        id: Id,
+    },
+}
+
+impl EventKind {
+    /// Notices that only tell clients to re-read something that is still
+    /// changing: conversation updates (sent while replies stream) and
+    /// running-download progress. Activity views leave them out.
+    pub fn is_progress(&self) -> bool {
+        matches!(
+            self,
+            Self::ThreadChanged { .. }
+                | Self::DownloadChanged(Download {
+                    state: DownloadState::Running,
+                    ..
+                })
+        )
+    }
 }
 
 /// A capability the vault broker issues to the gateway for one unlock, so the
@@ -625,7 +919,7 @@ pub enum Command {
     StopJoshua,
     JoshuaStatus,
     Snapshot,
-    SaveSettings(Settings),
+    SaveSettings(Box<Settings>),
     RefreshCatalog {
         provider: Id,
     },
@@ -661,9 +955,26 @@ pub enum Command {
     CancelRun {
         thread: Id,
     },
+    /// Messages in any conversation containing every term of `query`,
+    /// newest first; see [`search::search`].
+    SearchMessages {
+        query: String,
+        limit: u32,
+    },
+    /// Summarize a native conversation's earlier messages now, whatever its
+    /// context usage. Replies with the thread; `CancelRun` stops it.
+    CompactThread {
+        thread: Id,
+    },
     /// The tools this conversation could use and how each is permitted.
     ListTools {
         thread: Id,
+    },
+    /// The newest [`ActivityPage`] of the event journal, or the page before
+    /// sequence `before`; `limit` events, between one and [`MAX_ACTIVITY`].
+    Activity {
+        before: Option<u64>,
+        limit: u32,
     },
     /// Set (or with `None`, clear back to deny) one tool's permission.
     SetToolPermission {
@@ -682,6 +993,12 @@ pub enum Command {
         approval: Id,
         digest: String,
         decision: ApprovalDecision,
+    },
+    /// Answer a question an agent asked in `thread`.
+    AnswerPrompt {
+        thread: Id,
+        prompt: Id,
+        answer: PromptAnswer,
     },
     CreateProject {
         name: String,
@@ -739,6 +1056,28 @@ pub enum Command {
         extension: String,
         enabled: bool,
     },
+    /// Install or update a third-party extension from its `plugin.toml` and
+    /// compiled module (user operation). It arrives disabled with nothing
+    /// granted; an update is disabled again and keeps only the grants its new
+    /// manifest still requests.
+    InstallExtension {
+        manifest: String,
+        #[serde(with = "serde_bytes")]
+        module: Vec<u8>,
+    },
+    /// Remove an installed extension and its stored state (user operation).
+    UninstallExtension {
+        extension: String,
+    },
+    /// Install a package an agent prepared (user operation). It arrives
+    /// disabled with nothing granted, also when it updates an extension.
+    InstallProposal {
+        digest: String,
+    },
+    /// Discard a package an agent prepared, and its files.
+    DismissProposal {
+        digest: String,
+    },
     Shutdown,
     GatewayStatus,
     /// Hand the gateway a vault broker pairing minted by a trusted client.
@@ -776,6 +1115,48 @@ pub enum Command {
         #[serde(default)]
         digest: Option<String>,
     },
+    /// Send `text` (or, for a heartbeat check, `HEARTBEAT.md`) to `thread`
+    /// on `schedule`. The job is enabled.
+    ScheduleJob {
+        name: String,
+        thread: Id,
+        /// The message; empty for a heartbeat check.
+        text: String,
+        schedule: Schedule,
+        #[serde(default)]
+        kind: JobKind,
+    },
+    /// Pause or resume a job; resuming computes its next time from now.
+    SetJobEnabled {
+        id: Id,
+        enabled: bool,
+    },
+    RemoveJob {
+        id: Id,
+    },
+    /// Run a job now, whatever its schedule.
+    RunJob {
+        id: Id,
+    },
+    /// Add a message to `thread`'s running native run. The run reads it
+    /// before its next model request, after any tool calls in progress, and
+    /// continues instead of ending while one waits. Refused when no native
+    /// run is taking messages; send it with `Send` then.
+    Steer {
+        thread: Id,
+        text: String,
+    },
+    /// Hold `thread`'s running native run, and its subagents' runs, before
+    /// their next model round. A round in progress, with its tool calls and
+    /// approvals, finishes first. Refused when no native run is going.
+    PauseRun {
+        thread: Id,
+    },
+    /// Let a paused conversation's runs continue. Refused when it is not
+    /// paused.
+    ResumeRun {
+        thread: Id,
+    },
 }
 impl Command {
     /// A stable operation name for logs and diagnostics; never includes arguments.
@@ -795,10 +1176,14 @@ impl Command {
             Self::SetEffort { .. } => "set_effort",
             Self::Send { .. } => "send",
             Self::CancelRun { .. } => "cancel_run",
+            Self::SearchMessages { .. } => "search_messages",
+            Self::Activity { .. } => "activity",
+            Self::CompactThread { .. } => "compact_thread",
             Self::ListTools { .. } => "list_tools",
             Self::SetToolPermission { .. } => "set_tool_permission",
             Self::SetToolBudget { .. } => "set_tool_budget",
             Self::ResolveApproval { .. } => "resolve_approval",
+            Self::AnswerPrompt { .. } => "answer_prompt",
             Self::CreateProject { .. } => "create_project",
             Self::CreateSubagent { .. } => "create_subagent",
             Self::Events { .. } => "events",
@@ -810,6 +1195,10 @@ impl Command {
             Self::CallTool { .. } => "call_tool",
             Self::GrantExtension { .. } => "grant_extension",
             Self::EnableExtension { .. } => "enable_extension",
+            Self::InstallExtension { .. } => "install_extension",
+            Self::UninstallExtension { .. } => "uninstall_extension",
+            Self::InstallProposal { .. } => "install_proposal",
+            Self::DismissProposal { .. } => "dismiss_proposal",
             Self::Shutdown => "shutdown",
             Self::GatewayStatus => "gateway_status",
             Self::PairBroker { .. } => "pair_broker",
@@ -820,6 +1209,13 @@ impl Command {
             Self::Skills => "skills",
             Self::ReadSkill { .. } => "read_skill",
             Self::SetSkillEnabled { .. } => "set_skill_enabled",
+            Self::ScheduleJob { .. } => "schedule_job",
+            Self::SetJobEnabled { .. } => "set_job_enabled",
+            Self::RemoveJob { .. } => "remove_job",
+            Self::RunJob { .. } => "run_job",
+            Self::Steer { .. } => "steer",
+            Self::PauseRun { .. } => "pause_run",
+            Self::ResumeRun { .. } => "resume_run",
         }
     }
 }
@@ -840,6 +1236,10 @@ pub enum Reply {
     Skills(Vec<SkillSummary>),
     Skill(SkillText),
     Tools(ToolList),
+    Messages(Vec<MessageHit>),
+    Activity(ActivityPage),
+    Extension(Box<PluginSummary>),
+    Job(Box<Job>),
 }
 impl Reply {
     /// Separate a gateway-reported failure from a successful reply.
@@ -1069,6 +1469,46 @@ pub enum SetupReply {
     Status(SetupStatus),
     Probe(GatewayProbe),
     Saved,
+    Error(ErrorReport),
+}
+
+/// The web client's view of the vault on the bridge's computer. Unlocking,
+/// creating and enrolling need the vault password or an enrollment key, which
+/// never pass through a browser, so only reading and locking are offered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VaultRequest {
+    Status,
+    Lock,
+}
+
+/// What the vault broker reports; `None` is unknown (locked, or no broker).
+/// A stopped broker holds no unlocked vault, so its vault reads as locked.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VaultState {
+    pub broker_running: bool,
+    pub exists: bool,
+    pub unlocked: bool,
+    pub totp_enrolled: Option<bool>,
+    pub agent_access: Option<bool>,
+    /// Whether the broker holds a gateway pairing for this unlock; unknown
+    /// while locked or from an older bridge.
+    #[serde(default)]
+    pub gateway_paired: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VaultReply {
+    State(VaultState),
+    /// The vault is locked. Reading its state afterwards may still fail;
+    /// that failure is reported beside the lock, never instead of it.
+    Locked {
+        state: Option<VaultState>,
+        refresh: Option<ErrorReport>,
+    },
+    /// The bridge uses a remote gateway, whose vault lives on that host.
+    Remote {
+        endpoint: String,
+    },
     Error(ErrorReport),
 }
 

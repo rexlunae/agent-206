@@ -686,7 +686,7 @@ async fn only_a_paired_gateway_spends_credentials_and_lock_voids_pairing() {
     );
     assert_eq!(status(&mut a).await.gateway_paired, Some(false));
     let token = pairing(&mut a).await;
-    // A minted token is not evidence that a gateway received or proved it.
+    // A minted capability is not proof that the gateway received it.
     assert_eq!(status(&mut a).await.gateway_paired, Some(false));
     assert_eq!(
         denied(
@@ -1136,7 +1136,7 @@ async fn lock_and_disconnect_stop_a_stream_and_its_upstream_request() {
     assert!(spends(&mut anchor).await);
 }
 
-/// A broker double that greets like `version` and answers a stream request
+/// A broker double that greets like `version` and answers a stream or status request
 /// with `frames`, to check what the client accepts.
 async fn scripted_broker(version: u16, frames: Vec<Reply>) -> tempfile::TempDir {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1161,7 +1161,9 @@ async fn scripted_broker(version: u16, frames: Vec<Reply>) -> tempfile::TempDir 
                     Request::Hello { .. } => vec![Reply::Error(BrokerError::Invalid(
                         InvalidRequest::UnsupportedVersion,
                     ))],
-                    Request::ProviderStream(_) => frames.lock().unwrap().take().unwrap(),
+                    Request::ProviderStream(_) | Request::Status => {
+                        frames.lock().unwrap().take().unwrap()
+                    }
                     _ => vec![Reply::Error(BrokerError::Forbidden)],
                 };
                 for body in replies {
@@ -1176,6 +1178,35 @@ async fn scripted_broker(version: u16, frames: Vec<Reply>) -> tempfile::TempDir 
         }
     });
     dir
+}
+
+#[tokio::test]
+async fn old_pairing_status_is_unknown_until_the_broker_can_report_a_proven_holder() {
+    for version in [7, 8, 9, BROKER_VERSION] {
+        let broker = scripted_broker(
+            version,
+            vec![Reply::Status(BrokerStatus {
+                exists: true,
+                unlocked: true,
+                totp_enrolled: Some(false),
+                agent_access: Some(false),
+                step_up_active: false,
+                gateway_paired: Some(true),
+            })],
+        )
+        .await;
+        let mut client = Client::connect(broker.path(), Role::User).await.unwrap();
+        let observed = status(&mut client).await;
+        assert_eq!(
+            observed.gateway_paired,
+            if version == BROKER_VERSION {
+                Some(true)
+            } else {
+                None
+            }
+        );
+        assert!(observed.exists && observed.unlocked);
+    }
 }
 
 #[tokio::test]
@@ -1403,6 +1434,648 @@ async fn put_requests_carry_their_body_and_the_bearer_token() {
     );
 }
 
+/// What the stand-in socket services saw.
+#[derive(Clone, Default)]
+struct SocketService {
+    token: String,
+    /// Discord's Identify message, then the gateway's reply to the event.
+    received: Arc<Mutex<Vec<String>>>,
+    close_code: u16,
+    origin: Arc<Mutex<String>>,
+}
+
+/// Stand-ins for Discord's `/gateway/bot` and Slack's
+/// `apps.connections.open`, each naming a loopback socket.
+async fn socket_service(token: String) -> SocketService {
+    use axum::{
+        Json, Router,
+        extract::{RawQuery, State, ws::WebSocketUpgrade},
+        http::{HeaderMap, StatusCode},
+        routing::{any, get, post},
+    };
+    use serde_json::json;
+    fn authorized(headers: &HeaderMap, expected: &str) -> bool {
+        headers.get("authorization").and_then(|v| v.to_str().ok()) == Some(expected)
+    }
+    let service = SocketService {
+        token,
+        close_code: 4000 + (uuid::Uuid::new_v4().as_u128() % 900) as u16,
+        ..SocketService::default()
+    };
+    let discord_url = |State(s): State<SocketService>, headers: HeaderMap| async move {
+        if !authorized(&headers, &format!("Bot {}", s.token)) {
+            // An error body echoing the token must never be relayed.
+            return (StatusCode::UNAUTHORIZED, Json(json!({"message": s.token})));
+        }
+        let origin = s.origin.lock().unwrap().replace("http", "ws");
+        (
+            StatusCode::OK,
+            Json(json!({"url": format!("{origin}/discord")})),
+        )
+    };
+    let slack_url = |State(s): State<SocketService>, headers: HeaderMap| async move {
+        if !authorized(&headers, &format!("Bearer {}", s.token)) {
+            return Json(json!({"ok": false, "error": "invalid_auth"}));
+        }
+        let origin = s.origin.lock().unwrap().replace("http", "ws");
+        Json(json!({"ok": true, "url": format!("{origin}/slack?ticket={}", random())}))
+    };
+    let discord = |State(s): State<SocketService>, query: RawQuery, upgrade: WebSocketUpgrade| async move {
+        assert_eq!(query.0.as_deref(), Some("v=10&encoding=json"));
+        upgrade.on_upgrade(move |socket| converse(s, socket, true))
+    };
+    let slack = |State(s): State<SocketService>, upgrade: WebSocketUpgrade| async move {
+        upgrade.on_upgrade(move |socket| converse(s, socket, false))
+    };
+    let app = Router::new()
+        .route("/gateway/bot", get(discord_url))
+        .route("/apps.connections.open", post(slack_url))
+        .route("/discord", any(discord))
+        .route("/slack", any(slack))
+        .with_state(service.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    *service.origin.lock().unwrap() = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    service
+}
+
+async fn recv_text(socket: &mut axum::extract::ws::WebSocket) -> String {
+    loop {
+        if let axum::extract::ws::Message::Text(text) = socket.recv().await.unwrap().unwrap() {
+            return text.as_str().to_owned();
+        }
+    }
+}
+
+/// Greet, record Discord's Identify, send one event, record the reply, and
+/// close with the service's code and a reason that must not be relayed.
+async fn converse(service: SocketService, mut socket: axum::extract::ws::WebSocket, discord: bool) {
+    use axum::extract::ws::{CloseFrame, Message};
+    let hello = if discord {
+        r#"{"op":10,"d":{"heartbeat_interval":45000}}"#
+    } else {
+        r#"{"type":"hello"}"#
+    };
+    socket.send(Message::text(hello)).await.unwrap();
+    if discord {
+        let identify = recv_text(&mut socket).await;
+        service.received.lock().unwrap().push(identify);
+    }
+    let event = format!(r#"{{"event":"{}"}}"#, random());
+    socket.send(Message::text(event)).await.unwrap();
+    let reply = recv_text(&mut socket).await;
+    service.received.lock().unwrap().push(reply);
+    socket
+        .send(Message::Close(Some(CloseFrame {
+            code: service.close_code,
+            reason: service.token.clone().into(),
+        })))
+        .await
+        .unwrap();
+}
+
+fn opened(open: SocketOpen) -> Socket {
+    match open {
+        SocketOpen::Opened(socket) => socket,
+        SocketOpen::Refused { status, code } => panic!("refused: {status} {code:?}"),
+    }
+}
+
+async fn text(socket: &mut Socket) -> String {
+    match tokio::time::timeout(Duration::from_secs(10), socket.next())
+        .await
+        .unwrap()
+        .unwrap()
+    {
+        SocketEvent::Text(text) => text,
+        other => panic!("expected text, got {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sockets_identify_in_the_broker_and_relay_both_ways() {
+    let token = random();
+    let service = socket_service(token.clone()).await;
+    let origin = service.origin.lock().unwrap().clone();
+    let (_dir, root, _task) = start().await;
+    let mut a = user(&root).await;
+    a.call(unlock(&random(), None, true)).await.unwrap();
+    let name = random();
+    a.call(Request::PutCredential {
+        name: name.clone(),
+        meta: meta(vec![origin.clone()]),
+        value: WireValue::Single(WireSecret::new(token.clone())),
+        replace: false,
+    })
+    .await
+    .unwrap();
+    let token_pairing = pairing(&mut a).await;
+    // The first connection to present a pairing anchors it for the test.
+    let mut anchor = Client::connect(&root, Role::Gateway).await.unwrap();
+    anchor
+        .call(Request::GatewayAuth {
+            token: WireSecret::new(token_pairing.expose().to_owned()),
+        })
+        .await
+        .unwrap();
+    let gateway = || async {
+        let mut gateway = Client::connect(&root, Role::Gateway).await.unwrap();
+        gateway
+            .call(Request::GatewayAuth {
+                token: WireSecret::new(token_pairing.expose().to_owned()),
+            })
+            .await
+            .unwrap();
+        gateway
+    };
+    let intents = uuid::Uuid::new_v4().as_u128() as u64 >> 12;
+    let call = |path: &str, scheme| SocketCall {
+        credential: name.clone(),
+        url: format!("{origin}{path}"),
+        scheme,
+    };
+
+    // Discord: Hello is relayed, then the broker identifies with the token.
+    let discord = SocketScheme::DiscordGateway { intents };
+    let mut socket = opened(
+        gateway()
+            .await
+            .socket(call("/gateway/bot", discord.clone()))
+            .await
+            .unwrap(),
+    );
+    let hello = text(&mut socket).await;
+    assert!(hello.contains(r#""op":10"#));
+    let event = text(&mut socket).await;
+    assert!(!event.contains(&token));
+    let reply = random();
+    socket.send(reply.clone()).await.unwrap();
+    let closed = tokio::time::timeout(Duration::from_secs(10), socket.next())
+        .await
+        .unwrap();
+    assert_eq!(
+        closed.unwrap(),
+        SocketEvent::Closed(Some(service.close_code))
+    );
+    assert!(matches!(socket.next().await, Err(ClientError::Closed)));
+    {
+        let received = service.received.lock().unwrap();
+        let identify: serde_json::Value = serde_json::from_str(&received[0]).unwrap();
+        assert_eq!(identify["op"], 2);
+        assert_eq!(identify["d"]["token"], token.as_str());
+        assert_eq!(identify["d"]["intents"], intents);
+        assert_eq!(received[1], reply);
+    }
+
+    // Slack: everything is relayed; the ticketed URL stays in the broker.
+    service.received.lock().unwrap().clear();
+    let slack = SocketScheme::SlackSocketMode;
+    let mut socket = opened(
+        gateway()
+            .await
+            .socket(call("/apps.connections.open", slack.clone()))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(text(&mut socket).await, r#"{"type":"hello"}"#);
+    let event = text(&mut socket).await;
+    assert!(event.starts_with(r#"{"event""#));
+    let reply = random();
+    socket.send(reply.clone()).await.unwrap();
+    assert_eq!(
+        socket.next().await.unwrap(),
+        SocketEvent::Closed(Some(service.close_code))
+    );
+    assert_eq!(*service.received.lock().unwrap(), [reply]);
+
+    // A token the service refuses: statuses and plain codes, never bodies.
+    a.call(Request::PutCredential {
+        name: name.clone(),
+        meta: meta(vec![origin.clone()]),
+        value: WireValue::Single(WireSecret::new(random())),
+        replace: true,
+    })
+    .await
+    .unwrap();
+    let refused = gateway()
+        .await
+        .socket(call("/gateway/bot", discord.clone()))
+        .await
+        .unwrap();
+    assert!(matches!(
+        refused,
+        SocketOpen::Refused {
+            status: 401,
+            code: None
+        }
+    ));
+    let refused = gateway()
+        .await
+        .socket(call("/apps.connections.open", slack.clone()))
+        .await
+        .unwrap();
+    assert!(matches!(
+        refused,
+        SocketOpen::Refused { status: 200, code: Some(code) } if code == "invalid_auth"
+    ));
+
+    // Bound to another origin: denied before anything is sent.
+    let elsewhere = SocketCall {
+        url: "http://127.0.0.1:9/gateway/bot".to_owned(),
+        ..call("/gateway/bot", discord.clone())
+    };
+    let denied_open = gateway().await.socket(elsewhere).await;
+    assert!(matches!(
+        denied_open.map(|_| ()),
+        Err(ClientError::Broker(BrokerError::Denied(_)))
+    ));
+
+    // Only a paired gateway opens sockets, and sends need an open one.
+    let mut u = user(&root).await;
+    let forbidden = u
+        .call(Request::SocketOpen(call("/gateway/bot", discord.clone())))
+        .await;
+    assert_eq!(denied(forbidden), BrokerError::Forbidden);
+    let unpaired = Client::connect(&root, Role::Gateway).await.unwrap();
+    let unpaired = unpaired.socket(call("/gateway/bot", discord.clone())).await;
+    assert!(matches!(
+        unpaired.map(|_| ()),
+        Err(ClientError::Broker(BrokerError::GatewayNotPaired))
+    ));
+    let mut g = gateway().await;
+    let no_socket = g.call(Request::SocketSend { text: random() }).await;
+    assert_eq!(
+        denied(no_socket),
+        BrokerError::Invalid(InvalidRequest::NoSocket)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn locking_the_vault_ends_a_socket_session() {
+    use axum::{
+        Json, Router,
+        extract::ws::WebSocketUpgrade,
+        routing::{any, get},
+    };
+    // A service that greets and then stays silent.
+    let origin = Arc::new(Mutex::new(String::new()));
+    let named = origin.clone();
+    let app = Router::new()
+        .route(
+            "/gateway/bot",
+            get(move || {
+                let url = format!("{}/socket", named.lock().unwrap().replace("http", "ws"));
+                async move { Json(serde_json::json!({ "url": url })) }
+            }),
+        )
+        .route(
+            "/socket",
+            any(|upgrade: WebSocketUpgrade| async move {
+                upgrade.on_upgrade(|mut socket| async move {
+                    let hello = axum::extract::ws::Message::text(r#"{"op":10}"#);
+                    socket.send(hello).await.unwrap();
+                    while let Some(Ok(_)) = socket.recv().await {}
+                })
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    *origin.lock().unwrap() = format!("http://{}", listener.local_addr().unwrap());
+    let origin = origin.lock().unwrap().clone();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let (_dir, root, _task) = start().await;
+    let mut a = user(&root).await;
+    a.call(unlock(&random(), None, true)).await.unwrap();
+    let name = random();
+    a.call(Request::PutCredential {
+        name: name.clone(),
+        meta: meta(vec![origin.clone()]),
+        value: WireValue::Single(WireSecret::new(random())),
+        replace: false,
+    })
+    .await
+    .unwrap();
+    let gateway = paired_gateway(&mut a, &root).await;
+    let mut socket = opened(
+        gateway
+            .socket(SocketCall {
+                credential: name,
+                url: format!("{origin}/gateway/bot"),
+                scheme: SocketScheme::DiscordGateway { intents: 0 },
+            })
+            .await
+            .unwrap(),
+    );
+    assert!(text(&mut socket).await.contains("10"));
+    a.call(Request::Lock).await.unwrap();
+    let ended = tokio::time::timeout(Duration::from_secs(10), socket.next())
+        .await
+        .expect("a lock left the socket open");
+    assert!(matches!(
+        ended,
+        Err(ClientError::Broker(BrokerError::Locked))
+    ));
+}
+
+#[tokio::test]
+async fn sockets_are_never_requested_from_an_older_broker() {
+    let older = scripted_broker(PUT_VERSION, vec![]).await;
+    let client = Client::connect(older.path(), Role::Gateway).await.unwrap();
+    assert_eq!(client.version(), PUT_VERSION);
+    let refused = tokio::time::timeout(
+        Duration::from_secs(10),
+        client.socket(SocketCall {
+            credential: random(),
+            url: random(),
+            scheme: SocketScheme::SlackSocketMode,
+        }),
+    )
+    .await
+    .expect("a socket request was sent to a broker that cannot answer it");
+    assert!(matches!(
+        refused.map(|_| ()),
+        Err(ClientError::SocketUnsupported)
+    ));
+}
+
+/// A stand-in IRC server on loopback. Each connection negotiates `caps`,
+/// accepts SASL PLAIN only with `password`, welcomes the client, delivers
+/// one tagged message, records what the client sends afterwards and closes
+/// after the client's first message.
+struct IrcService {
+    port: u16,
+    /// Every line each connection received, in order.
+    received: Arc<Mutex<Vec<Vec<String>>>>,
+}
+
+async fn irc_service(password: String, caps: &'static str) -> IrcService {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let received = Arc::new(Mutex::new(vec![]));
+    let log = received.clone();
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (password, log) = (password.clone(), log.clone());
+            tokio::spawn(async move {
+                let index = {
+                    let mut log = log.lock().unwrap();
+                    log.push(vec![]);
+                    log.len() - 1
+                };
+                let (reader, mut writer) = stream.into_split();
+                let mut lines = BufReader::new(reader).lines();
+                let mut nick = String::new();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    log.lock().unwrap()[index].push(line.clone());
+                    let mut send = vec![];
+                    if let Some(name) = line.strip_prefix("NICK ") {
+                        nick = name.to_owned();
+                        // Pings during registration are answered by the broker.
+                        send.push(format!("PING :{}", uuid::Uuid::new_v4().simple()));
+                    } else if line == "CAP LS 302" {
+                        send.push(format!(":irc.test CAP * LS :{caps}"));
+                    } else if let Some(request) = line.strip_prefix("CAP REQ :") {
+                        send.push(format!(":irc.test CAP * ACK :{request}"));
+                    } else if line == "AUTHENTICATE PLAIN" {
+                        send.push("AUTHENTICATE +".to_owned());
+                    } else if let Some(payload) = line.strip_prefix("AUTHENTICATE ") {
+                        use base64::Engine;
+                        let plain = base64::engine::general_purpose::STANDARD
+                            .decode(payload)
+                            .unwrap();
+                        let expected = format!("\0{nick}\0{password}");
+                        send.push(if plain == expected.as_bytes() {
+                            format!(":irc.test 903 {nick} :SASL authentication successful")
+                        } else {
+                            format!(":irc.test 904 {nick} :SASL authentication failed")
+                        });
+                    } else if line == "CAP END" {
+                        send.push(format!(":irc.test 001 {nick} :Welcome"));
+                        send.push(format!(
+                            "@account=friend :friend!u@h PRIVMSG {nick} :{}",
+                            uuid::Uuid::new_v4()
+                        ));
+                    } else if line.starts_with("PRIVMSG ") {
+                        break;
+                    }
+                    for line in send {
+                        writer
+                            .write_all(format!("{line}\r\n").as_bytes())
+                            .await
+                            .unwrap();
+                    }
+                }
+            });
+        }
+    });
+    IrcService { port, received }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn irc_sessions_sign_in_with_sasl_in_the_broker_and_relay_lines() {
+    let password = random();
+    let service = irc_service(password.clone(), "sasl=PLAIN account-tag").await;
+    let server = format!("irc://127.0.0.1:{}", service.port);
+    let (_dir, root, _task) = start().await;
+    let mut a = user(&root).await;
+    a.call(unlock(&random(), None, true)).await.unwrap();
+    let name = random();
+    // Destinations name the server as written; the broker binds its origin.
+    a.call(Request::PutCredential {
+        name: name.clone(),
+        meta: meta(vec![format!("{server}/")]),
+        value: WireValue::Single(WireSecret::new(password.clone())),
+        replace: false,
+    })
+    .await
+    .unwrap();
+    let Reply::Credentials { typed, .. } = a.call(Request::Credentials).await.unwrap() else {
+        panic!("expected credentials");
+    };
+    assert_eq!(typed[0].1.destinations, std::slice::from_ref(&server));
+    let token_pairing = pairing(&mut a).await;
+    let mut anchor = Client::connect(&root, Role::Gateway).await.unwrap();
+    anchor
+        .call(Request::GatewayAuth {
+            token: WireSecret::new(token_pairing.expose().to_owned()),
+        })
+        .await
+        .unwrap();
+    let gateway = || async {
+        let mut gateway = Client::connect(&root, Role::Gateway).await.unwrap();
+        gateway
+            .call(Request::GatewayAuth {
+                token: WireSecret::new(token_pairing.expose().to_owned()),
+            })
+            .await
+            .unwrap();
+        gateway
+    };
+    let login = format!("bot{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
+    let call = |login: &str| SocketCall {
+        credential: name.clone(),
+        url: server.clone(),
+        scheme: SocketScheme::IrcSasl {
+            login: login.to_owned(),
+        },
+    };
+
+    // Lines are relayed from the welcome on; sign-in stays in the broker.
+    let mut socket = opened(gateway().await.socket(call(&login)).await.unwrap());
+    let welcome = text(&mut socket).await;
+    assert_eq!(welcome, format!(":irc.test 001 {login} :Welcome"));
+    let message = text(&mut socket).await;
+    assert!(message.starts_with("@account=friend :friend!u@h PRIVMSG"));
+    let reply = format!("PRIVMSG friend :{}", random());
+    socket.send(reply.clone()).await.unwrap();
+    assert_eq!(socket.next().await.unwrap(), SocketEvent::Closed(None));
+    {
+        let received = service.received.lock().unwrap();
+        let lines = &received[0];
+        assert_eq!(
+            lines[..3],
+            [
+                "CAP LS 302".to_owned(),
+                format!("NICK {login}"),
+                format!("USER {login} 0 * :Agent 206")
+            ]
+        );
+        assert!(lines.iter().any(|l| l.starts_with("PONG :")));
+        assert!(lines.contains(&"CAP REQ :sasl account-tag".to_owned()));
+        assert_eq!(lines.last(), Some(&reply));
+        assert!(!lines.iter().any(|l| l.contains(&password)));
+    }
+
+    // A one-line limit: a line ending would let the gateway smuggle a command.
+    let socket = opened(gateway().await.socket(call(&login)).await.unwrap());
+    let mut socket = socket;
+    text(&mut socket).await;
+    socket
+        .send(format!("PRIVMSG friend :x\r\nQUIT :{}", random()))
+        .await
+        .unwrap();
+    loop {
+        match socket.next().await {
+            Ok(SocketEvent::Text(_)) => continue,
+            Err(ClientError::Broker(error)) => {
+                assert_eq!(error, BrokerError::Invalid(InvalidRequest::IrcLine));
+                break;
+            }
+            other => panic!("expected the session to end, got {other:?}"),
+        }
+    }
+
+    // A wrong password is a SASL refusal, not a session.
+    a.call(Request::PutCredential {
+        name: name.clone(),
+        meta: meta(vec![server.clone()]),
+        value: WireValue::Single(WireSecret::new(random())),
+        replace: true,
+    })
+    .await
+    .unwrap();
+    let refused = gateway().await.socket(call(&login)).await.unwrap();
+    assert!(matches!(
+        refused,
+        SocketOpen::Refused { status: 0, code: Some(code) } if code == "sasl_failed"
+    ));
+
+    // The login cannot change a command, and the URL must be an IRC server.
+    let bad_login = gateway().await.socket(call(&format!("{login} :x"))).await;
+    assert!(matches!(
+        bad_login.map(|_| ()),
+        Err(ClientError::Broker(BrokerError::Invalid(
+            InvalidRequest::IrcLogin
+        )))
+    ));
+    let https = SocketCall {
+        url: format!("http://127.0.0.1:{}", service.port),
+        ..call(&login)
+    };
+    assert!(matches!(
+        gateway().await.socket(https).await.map(|_| ()),
+        Err(ClientError::Broker(BrokerError::Invalid(
+            InvalidRequest::IrcServer
+        )))
+    ));
+    let irc_for_web = SocketCall {
+        scheme: SocketScheme::SlackSocketMode,
+        ..call(&login)
+    };
+    assert!(matches!(
+        gateway().await.socket(irc_for_web).await.map(|_| ()),
+        Err(ClientError::Broker(BrokerError::Invalid(
+            InvalidRequest::ProviderUrl
+        )))
+    ));
+
+    // A credential bound to another server is never sent.
+    let elsewhere = SocketCall {
+        url: "irc://127.0.0.1:9".to_owned(),
+        ..call(&login)
+    };
+    assert!(matches!(
+        gateway().await.socket(elsewhere).await.map(|_| ()),
+        Err(ClientError::Broker(BrokerError::Denied(_)))
+    ));
+    assert_eq!(service.received.lock().unwrap().len(), 3);
+
+    // Plain-text IRC is refused off loopback, at binding time too.
+    let insecure = a
+        .call(Request::PutCredential {
+            name: random(),
+            meta: meta(vec![format!(
+                "irc://{}.test",
+                uuid::Uuid::new_v4().simple()
+            )]),
+            value: WireValue::Single(WireSecret::new(random())),
+            replace: false,
+        })
+        .await;
+    assert_eq!(
+        denied(insecure),
+        BrokerError::Invalid(InvalidRequest::Destination)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn irc_servers_without_account_tags_are_refused() {
+    let password = random();
+    let service = irc_service(password.clone(), "sasl").await;
+    let server = format!("irc://127.0.0.1:{}", service.port);
+    let (_dir, root, _task) = start().await;
+    let mut a = user(&root).await;
+    a.call(unlock(&random(), None, true)).await.unwrap();
+    let name = random();
+    a.call(Request::PutCredential {
+        name: name.clone(),
+        meta: meta(vec![server.clone()]),
+        value: WireValue::Single(WireSecret::new(password)),
+        replace: false,
+    })
+    .await
+    .unwrap();
+    let gateway = paired_gateway(&mut a, &root).await;
+    let refused = gateway
+        .socket(SocketCall {
+            credential: name,
+            url: server,
+            scheme: SocketScheme::IrcSasl {
+                login: format!("bot{}", &uuid::Uuid::new_v4().simple().to_string()[..8]),
+            },
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        refused,
+        SocketOpen::Refused { status: 0, code: Some(code) } if code == "account_tag_unavailable"
+    ));
+    // Nothing was authenticated.
+    let received = service.received.lock().unwrap();
+    assert!(!received[0].iter().any(|l| l.starts_with("AUTHENTICATE")));
+}
 async fn secure_open(root: &Path) -> (Client, a206_vault_channel::Channel) {
     use a206_vault_channel::Handshake;
     let mut relay = Client::connect(root, Role::Relay).await.unwrap();

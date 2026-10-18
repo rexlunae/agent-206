@@ -167,6 +167,12 @@ async fn an_incompatible_broker_is_reported_with_its_recovery() {
 
 #[tokio::test]
 async fn legacy_enrollment_cancel_closes_without_sending_an_unknown_opcode() {
+    for version in [7, 8, 9] {
+        legacy_cancel(version).await;
+    }
+}
+
+async fn legacy_cancel(version: u16) {
     use a206_broker::{InvalidRequest, Role};
     use a206_protocol::{Request as Frame, Response};
     use a206_runtime::transport::{read_frame, write_frame};
@@ -176,46 +182,32 @@ async fn legacy_enrollment_cancel_closes_without_sending_an_unknown_opcode() {
     let broker = tokio::spawn(async move {
         for _ in 0..2 {
             let (mut socket, _) = listener.accept().await.unwrap();
-            let first = read_frame::<Frame<Request>>(&mut socket)
+            for requested in (version..=a206_broker::BROKER_VERSION).rev() {
+                let first = read_frame::<Frame<Request>>(&mut socket)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(matches!(
+                    first.body,
+                    Request::Hello {
+                        role: Role::User,
+                        version: actual
+                    } if actual == requested
+                ));
+                write_frame(
+                    &mut socket,
+                    &Response {
+                        id: first.id,
+                        body: if requested == version {
+                            Reply::Ok
+                        } else {
+                            Reply::Error(BrokerError::Invalid(InvalidRequest::UnsupportedVersion))
+                        },
+                    },
+                )
                 .await
-                .unwrap()
                 .unwrap();
-            assert!(matches!(
-                first.body,
-                Request::Hello {
-                    role: Role::User,
-                    version: 8
-                }
-            ));
-            write_frame(
-                &mut socket,
-                &Response {
-                    id: first.id,
-                    body: Reply::Error(BrokerError::Invalid(InvalidRequest::UnsupportedVersion)),
-                },
-            )
-            .await
-            .unwrap();
-            let legacy = read_frame::<Frame<Request>>(&mut socket)
-                .await
-                .unwrap()
-                .unwrap();
-            assert!(matches!(
-                legacy.body,
-                Request::Hello {
-                    role: Role::User,
-                    version: 7
-                }
-            ));
-            write_frame(
-                &mut socket,
-                &Response {
-                    id: legacy.id,
-                    body: Reply::Ok,
-                },
-            )
-            .await
-            .unwrap();
+            }
             assert!(
                 read_frame::<Frame<Request>>(&mut socket)
                     .await

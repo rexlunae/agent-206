@@ -177,6 +177,21 @@ fn offers(sources: Result<Vec<ExtensionTools>, ExtensionError>) -> Offers {
     result
 }
 
+/// The model-facing name of each tool [`ExtensionToolHost`] offers now,
+/// keyed by extension id and tool name, with the failure of any extension
+/// whose tools could not be read.
+pub(crate) fn offered_names(
+    extensions: &ExtensionHost,
+) -> (BTreeMap<(String, String), String>, Vec<UnavailableTools>) {
+    let offers = offers(extensions.tool_sources());
+    let names = offers
+        .tools
+        .into_iter()
+        .map(|(name, offered)| ((offered.extension, offered.spec.name), name))
+        .collect();
+    (names, offers.unavailable)
+}
+
 fn json_type(kind: ParamKind) -> &'static str {
     match kind {
         ParamKind::String => "string",
@@ -280,6 +295,7 @@ impl ToolHost for ExtensionToolHost {
                         // Extensions add no policy of their own; the user's
                         // setting (deny when unset) decides.
                         permission: ToolPermission::Allow,
+                        whole_output: false,
                     })
                     .collect(),
                 unavailable: offers.unavailable,

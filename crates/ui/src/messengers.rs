@@ -12,9 +12,46 @@ use uuid::Uuid;
 #[component]
 pub fn Messengers() -> Element {
     let state = use_context::<State>();
-    // Catalogs expire without the snapshot changing, so the page keeps its
-    // own clock: it wakes at the next expiry (at most a minute away) and
-    // renders the cards with the new time.
+    let now = use_catalog_clock(state)();
+    let snapshot = state.data.read();
+    rsx! { PageFrame { kicker: "Messengers", title: "Talk to a thread from chat.", description: "Each allowed chat gets its own conversation, which runs with that conversation's permissions and model. Bot tokens stay in the vault.",
+        for messenger in &snapshot.settings.messengers {
+            MessengerCard { key: "{messenger.name}", now, config: messenger.clone(), status: snapshot.messengers.iter().find(|s| s.name == messenger.name).cloned().unwrap_or_default() }
+        }
+        AddMessenger {}
+    } }
+}
+
+/// Save settings with the entry named `name` changed by `edit`.
+fn save_messenger(state: State, name: &str, edit: impl FnOnce(&mut MessengerConfig)) {
+    let mut settings = state.data.read().settings.clone();
+    if let Some(entry) = settings.messengers.iter_mut().find(|m| m.name == name) {
+        edit(entry);
+        dispatch(state, Command::SaveSettings(Box::new(settings)));
+    }
+}
+
+fn tone(state: MessengerState) -> BadgeTone {
+    match state {
+        MessengerState::Connected => BadgeTone::Success,
+        MessengerState::Connecting | MessengerState::WaitingForVault => BadgeTone::Info,
+        MessengerState::Failed => BadgeTone::Danger,
+        MessengerState::Stopped => BadgeTone::Neutral,
+    }
+}
+
+/// Seconds since the Unix epoch, for judging catalog freshness. A clock set
+/// before the epoch makes every catalog stale rather than every one fresh.
+pub(crate) fn now() -> u64 {
+    web_time::SystemTime::now()
+        .duration_since(web_time::UNIX_EPOCH)
+        .map_or(u64::MAX, |elapsed| elapsed.as_secs())
+}
+
+/// The time for judging catalog freshness, as a signal. Catalogs expire
+/// without the snapshot changing, so this wakes at the next expiry (at most
+/// a minute away) and components reading it render with the new time.
+pub(crate) fn use_catalog_clock(state: State) -> Signal<u64> {
     let mut clock = use_signal(now);
     use_future(move || async move {
         loop {
@@ -32,45 +69,15 @@ pub fn Messengers() -> Element {
             clock.set(now());
         }
     });
-    let now = clock();
-    let snapshot = state.data.read();
-    rsx! { PageFrame { kicker: "Messengers", title: "Talk to a thread from chat.", description: "Each allowed chat gets its own conversation, which runs with that conversation's permissions and model. Bot tokens stay in the vault.",
-        for messenger in &snapshot.settings.messengers {
-            MessengerCard { key: "{messenger.name}", now, config: messenger.clone(), status: snapshot.messengers.iter().find(|s| s.name == messenger.name).cloned().unwrap_or_default() }
-        }
-        AddMessenger {}
-    } }
-}
-
-/// Save settings with the entry named `name` changed by `edit`.
-fn save_messenger(state: State, name: &str, edit: impl FnOnce(&mut MessengerConfig)) {
-    let mut settings = state.data.read().settings.clone();
-    if let Some(entry) = settings.messengers.iter_mut().find(|m| m.name == name) {
-        edit(entry);
-        dispatch(state, Command::SaveSettings(settings));
-    }
-}
-
-fn tone(state: MessengerState) -> BadgeTone {
-    match state {
-        MessengerState::Connected => BadgeTone::Success,
-        MessengerState::Connecting | MessengerState::WaitingForVault => BadgeTone::Info,
-        MessengerState::Failed => BadgeTone::Danger,
-        MessengerState::Stopped => BadgeTone::Neutral,
-    }
-}
-
-/// Seconds since the Unix epoch, for judging catalog freshness. A clock set
-/// before the epoch makes every catalog stale rather than every one fresh.
-fn now() -> u64 {
-    web_time::SystemTime::now()
-        .duration_since(web_time::UNIX_EPOCH)
-        .map_or(u64::MAX, |elapsed| elapsed.as_secs())
+    clock
 }
 
 /// Models of catalogs that have not expired at `now`: the gateway creates a
 /// chat thread only for one of these.
-fn current_models(snapshot: &Snapshot, now: u64) -> impl Iterator<Item = &a206_core::ModelInfo> {
+pub(crate) fn current_models(
+    snapshot: &Snapshot,
+    now: u64,
+) -> impl Iterator<Item = &a206_core::ModelInfo> {
     snapshot
         .catalogs
         .iter()
@@ -139,7 +146,15 @@ fn MessengerCard(now: u64, config: MessengerConfig, status: MessengerStatus) -> 
                 Badge { tone: tone(status.state), "{status.state.label()}" }
                 if let Some(account) = &status.account { span { class: "a206-muted", "Bot account {account}" } }
             }
-            p { class: "a206-muted", match &config.credential { Some(credential) => format!("Token: vault credential {credential}"), None => "No vault credential chosen; it cannot connect.".to_owned() } }
+            if config.kind.needs_login() {
+                LoginRow { messenger: config.name.clone(), current: config.login.clone() }
+            }
+            if config.kind.needs_credential() {
+                CredentialRow { messenger: config.name.clone(), app: false, current: config.credential.clone() }
+            }
+            if config.kind.needs_app_credential() {
+                CredentialRow { messenger: config.name.clone(), app: true, current: config.app_credential.clone() }
+            }
             Checkbox { label: rsx! { "Enabled" }, checked: ReadSignal::from(enabled), onchange: { let name = name.clone(); move |on: bool| save_messenger(state, &name, |m| m.enabled = on) } }
             if let Some(report) = status.failure.clone() { ErrorNotice { report, title: "Messenger failed".to_string() } }
             div { class: "a206-grid",
@@ -176,9 +191,63 @@ fn MessengerCard(now: u64, config: MessengerConfig, status: MessengerStatus) -> 
             } else {
                 Button { variant: ButtonVariant::Secondary, availability: if config.enabled { Availability::Enabled } else { Availability::Disabled }, onclick: { let name = name.clone(); move |_| dispatch(state, Command::ConnectMessenger { name: name.clone() }) }, "Connect" }
             }
-            Button { variant: ButtonVariant::Ghost, onclick: move |_| { let mut settings = state.data.read().settings.clone(); settings.messengers.retain(|m| m.name != name); dispatch(state, Command::SaveSettings(settings)); }, "Remove messenger" }
+            Button { variant: ButtonVariant::Ghost, onclick: move |_| { let mut settings = state.data.read().settings.clone(); settings.messengers.retain(|m| m.name != name); dispatch(state, Command::SaveSettings(Box::new(settings))); }, "Remove messenger" }
         }
     } }
+}
+
+/// The vault credential an entry uses, or its app-level one when `app`, with
+/// a field to choose another (an imported entry arrives with none).
+#[component]
+fn CredentialRow(messenger: String, app: bool, current: Option<String>) -> Element {
+    let state = use_context::<State>();
+    let mut draft = use_signal(String::new);
+    let ready = !draft().trim().is_empty();
+    let shown = match (&current, app) {
+        (Some(credential), false) => format!("Token: vault credential {credential}"),
+        (Some(credential), true) => format!("App-level token: vault credential {credential}"),
+        (None, false) => "No vault credential chosen; it cannot connect.".to_owned(),
+        (None, true) => "No app-level token chosen; it cannot receive messages.".to_owned(),
+    };
+    let label = if app {
+        "App-level token credential"
+    } else {
+        "Vault credential"
+    };
+    rsx! {
+        p { class: "a206-muted", "{shown}" }
+        div { class: "a206-row",
+            Input { aria_label: label, value: ReadSignal::from(draft), oninput: move |v| draft.set(v), placeholder: "Credential name" }
+            Button { size: ButtonSize::Sm, variant: ButtonVariant::Secondary, availability: if ready { Availability::Enabled } else { Availability::Disabled }, onclick: move |_| {
+                let value = Some(draft().trim().to_owned());
+                save_messenger(state, &messenger, |m| if app { m.app_credential = value } else { m.credential = value });
+                draft.set(String::new());
+            }, if current.is_some() { "Change credential" } else { "Use credential" } }
+        }
+    }
+}
+
+/// The services account an IRC entry signs in as, with a field to change it.
+#[component]
+fn LoginRow(messenger: String, current: Option<String>) -> Element {
+    let state = use_context::<State>();
+    let mut draft = use_signal(String::new);
+    let ready = !draft().trim().is_empty();
+    let shown = match &current {
+        Some(login) => format!("Signs in as {login}"),
+        None => "No login chosen; it cannot connect.".to_owned(),
+    };
+    rsx! {
+        p { class: "a206-muted", "{shown}" }
+        div { class: "a206-row",
+            Input { aria_label: "Login", value: ReadSignal::from(draft), oninput: move |v| draft.set(v), placeholder: "Nickname" }
+            Button { size: ButtonSize::Sm, variant: ButtonVariant::Secondary, availability: if ready { Availability::Enabled } else { Availability::Disabled }, onclick: move |_| {
+                let value = Some(draft().trim().to_owned());
+                save_messenger(state, &messenger, |m| m.login = value);
+                draft.set(String::new());
+            }, if current.is_some() { "Change login" } else { "Use login" } }
+        }
+    }
 }
 
 /// Edit one of an entry's allow-lists: chats, or senders when `senders`.
@@ -186,14 +255,18 @@ fn edit_list(
     state: State,
     messenger: &str,
     senders: bool,
-    edit: impl FnOnce(&mut std::collections::BTreeSet<String>),
+    edit: impl FnOnce(&mut std::collections::BTreeSet<String>, MessengerKind),
 ) {
     save_messenger(state, messenger, |m| {
-        edit(if senders {
-            &mut m.allowed_users
-        } else {
-            &mut m.allowed_chats
-        })
+        let kind = m.kind;
+        edit(
+            if senders {
+                &mut m.allowed_users
+            } else {
+                &mut m.allowed_chats
+            },
+            kind,
+        )
     });
 }
 
@@ -215,14 +288,14 @@ fn AllowList(
         for entry in entries {
             div { key: "{entry}", class: "a206-row a206-between",
                 code { "{entry}" }
-                Button { size: ButtonSize::Sm, variant: ButtonVariant::Ghost, onclick: { let messenger = messenger.clone(); let entry = entry.clone(); move |_| edit_list(state, &messenger, senders, |list| { list.remove(&entry); }) }, "Remove" }
+                Button { size: ButtonSize::Sm, variant: ButtonVariant::Ghost, onclick: { let messenger = messenger.clone(); let entry = entry.clone(); move |_| edit_list(state, &messenger, senders, |list, _| { list.remove(&entry); }) }, "Remove" }
             }
         }
         div { class: "a206-row",
             Input { aria_label: if senders { "Sender id to allow" } else { "Chat id to allow" }, value: ReadSignal::from(draft), oninput: move |v| draft.set(v), placeholder: if senders { "Sender id" } else { "Chat id" } }
             Button { size: ButtonSize::Sm, variant: ButtonVariant::Secondary, availability: if ready { Availability::Enabled } else { Availability::Disabled }, onclick: move |_| {
                 let value = draft().trim().to_owned();
-                edit_list(state, &messenger, senders, |list| { list.insert(value); });
+                edit_list(state, &messenger, senders, |list, kind| { list.insert(kind.fold(&value)); });
                 draft.set(String::new());
             }, if senders { "Allow sender" } else { "Allow chat" } }
         }
@@ -290,18 +363,33 @@ fn AddMessenger() -> Element {
     let mut name = use_signal(String::new);
     let mut kind = use_signal(|| Some(MessengerKind::Telegram.label().to_owned()));
     let mut credential = use_signal(String::new);
+    let mut app_credential = use_signal(String::new);
     let mut endpoint = use_signal(String::new);
+    let mut login = use_signal(String::new);
     let selected = MessengerKind::ALL
         .into_iter()
         .find(|k| Some(k.label()) == kind().as_deref());
     // A federated service has no official server to fall back on.
     let needs_endpoint = selected.is_some_and(|k| k.default_endpoint().is_none());
+    let needs_app = selected.is_some_and(MessengerKind::needs_app_credential);
+    let needs_login = selected.is_some_and(MessengerKind::needs_login);
+    let needs_credential = selected.is_some_and(MessengerKind::needs_credential);
+    let irc = selected.is_some_and(MessengerKind::is_irc);
+    let signal = selected.is_some_and(MessengerKind::is_signal);
     let ready = selected.is_some()
+        && (!needs_login || !login().trim().is_empty())
         && !name().trim().is_empty()
-        && !credential().trim().is_empty()
+        && (!needs_credential || !credential().trim().is_empty())
+        && (!needs_app || !app_credential().trim().is_empty())
         && (!needs_endpoint || !endpoint().trim().is_empty());
-    let endpoint_hint = if needs_endpoint {
+    let endpoint_hint = if irc {
+        "Required: the IRC server, as ircs://host or ircs://host:port. Only TLS is used."
+    } else if signal {
+        "Required: your signal-cli daemon's socket, as unix:///path/to/socket or tcp://127.0.0.1:port. Agent 206 never starts or stops it."
+    } else if needs_endpoint {
         "Required: your homeserver's client API origin, with no path."
+    } else if selected == Some(MessengerKind::Beeper) {
+        "Leave empty for Beeper Desktop on the gateway's computer. Beeper elsewhere needs an https:// origin."
     } else {
         "Leave empty for the service's official API. An origin only, with no path."
     };
@@ -315,18 +403,28 @@ fn AddMessenger() -> Element {
                     options: MessengerKind::ALL.into_iter().map(|k| SelectChoice::new(k.label(), k.label())).collect(),
                     onchange: move |value: String| kind.set(Some(value))
                 } }
-                Field { label: rsx! { "Vault credential" }, hint: rsx! { "The name of the vault entry holding the token, never the token itself." }, Input { value: ReadSignal::from(credential), oninput: move |v| credential.set(v), placeholder: "Credential name" } }
-                Field { label: rsx! { "API endpoint" }, hint: rsx! { "{endpoint_hint}" }, Input { value: ReadSignal::from(endpoint), oninput: move |v| endpoint.set(v), placeholder: selected.and_then(|k| k.default_endpoint()).unwrap_or("https://homeserver.example") } }
+                if needs_credential {
+                    Field { label: rsx! { "Vault credential" }, hint: rsx! { "The name of the vault entry holding the token, never the token itself." }, Input { value: ReadSignal::from(credential), oninput: move |v| credential.set(v), placeholder: "Credential name" } }
+                }
+                if needs_login {
+                    Field { label: rsx! { "Login" }, hint: rsx! { if signal { "The account's phone number (+ and digits), as signal-cli serves it." } else { "The bot's nickname, registered as an account with the network's services." } }, Input { value: ReadSignal::from(login), oninput: move |v| login.set(v), placeholder: if signal { "+15551234567" } else { "Nickname" } } }
+                }
+                if needs_app {
+                    Field { label: rsx! { "App-level token credential" }, hint: rsx! { "The vault entry holding the app-level token the service sends events with." }, Input { value: ReadSignal::from(app_credential), oninput: move |v| app_credential.set(v), placeholder: "Credential name" } }
+                }
+                Field { label: rsx! { if irc { "Server" } else if signal { "signal-cli daemon" } else { "API endpoint" } }, hint: rsx! { "{endpoint_hint}" }, Input { value: ReadSignal::from(endpoint), oninput: move |v| endpoint.set(v), placeholder: selected.and_then(|k| k.default_endpoint()).unwrap_or(if irc { "ircs://irc.example" } else if signal { "unix:///run/user/1000/signal-cli/socket" } else { "https://homeserver.example" }) } }
             }
         }
         CardFooter { Button { variant: ButtonVariant::Primary, availability: if ready { Availability::Enabled } else { Availability::Disabled }, onclick: move |_| {
             let Some(service) = selected else { return };
             let mut entry = MessengerConfig::new(name().trim().to_owned(), service);
-            entry.credential = Some(credential().trim().to_owned());
+            entry.credential = Some(credential().trim().to_owned()).filter(|c| service.needs_credential() && !c.is_empty());
+            entry.app_credential = Some(app_credential().trim().to_owned()).filter(|c| service.needs_app_credential() && !c.is_empty());
             entry.endpoint = Some(endpoint().trim().to_owned()).filter(|e| !e.is_empty());
+            entry.login = Some(login().trim().to_owned()).filter(|l| service.needs_login() && !l.is_empty());
             let mut settings = state.data.read().settings.clone();
             settings.messengers.push(entry);
-            dispatch(state, Command::SaveSettings(settings));
+            dispatch(state, Command::SaveSettings(Box::new(settings)));
         }, "Add messenger" } }
     } }
 }

@@ -5,10 +5,15 @@
 //! the gateway checks the user's per-tool permission, the host's own policy
 //! and the conversation's grant first, and asks the user for `Ask` tools.
 //! Hosts receive no handle to the gateway, the vault or approvals, so a tool
-//! cannot widen its own authority or approve a call.
+//! cannot widen its own authority or approve a call; the subagent tools hold
+//! only a [`Delegator`](crate::gateway::Delegator), which cannot either.
 //!
-//! The WASM extension adapter (`crate::extension_tools`) is registered by
-//! default; the MCP client (`mcp_offers` / `call_mcp_tool`) is planned.
+//! The WASM extension adapter (`crate::extension_tools`), the MCP client
+//! adapter (`crate::mcp_tools`), native command execution
+//! (`crate::exec_tool`), approved skills (`crate::skill_tool`) and subagents
+//! (`crate::delegation_tool`) are registered by default, with `ask_user`
+//! (`crate::prompt_tool`), `extension_propose` (`crate::propose_tool`) and
+//! `extension_list` (`crate::extension_list_tool`).
 use a206_core::{
     Capability, ErrorKind, ErrorReport, Id, Thread, ToolList, ToolOffer, ToolPermission,
     UnavailableTools,
@@ -45,6 +50,10 @@ pub struct ToolSpec {
     /// The host's own policy, for example a user-configured MCP server entry.
     /// The gateway never enforces anything less restrictive than this.
     pub permission: ToolPermission,
+    /// The output is only useful whole (an instruction text, a listing the
+    /// model acts on): a result that does not fit is settled as a failed call
+    /// rather than cut short.
+    pub whole_output: bool,
 }
 
 /// The authority a call runs under.
@@ -56,6 +65,9 @@ pub struct ToolScope {
     /// The conversation's grant within its mode's ceiling. A host must not use
     /// anything outside it, even for tools that declared nothing.
     pub capabilities: BTreeSet<Capability>,
+    /// The directories the user chose whose programs sandboxed commands may
+    /// run, besides `/usr/bin` and `/bin`; canonical, from the settings.
+    pub programs: Vec<PathBuf>,
 }
 
 /// What a host lists for a scope.
@@ -101,6 +113,12 @@ pub trait ToolHost: Send + Sync + 'static {
         scope: &'a ToolScope,
         request: ToolRequest,
     ) -> BoxFuture<'a, Result<ToolOutput, ErrorReport>>;
+    /// Grants changed. A host that keeps work running between calls stops
+    /// whatever a conversation's current scope, from `scope`, no longer
+    /// covers; `None` means the conversation is gone. Called under the
+    /// gateway's state lock, so it returns promptly and never calls back
+    /// into the gateway.
+    fn rescope(&self, _scope: &dyn Fn(Id) -> Option<ToolScope>) {}
 }
 
 /// Why a listed tool is not offered.
@@ -281,6 +299,7 @@ mod tests {
             parameters: serde_json::json!({"type": "object"}),
             capabilities: caps.iter().copied().collect(),
             permission,
+            whole_output: false,
         }
     }
     #[test]
@@ -389,6 +408,7 @@ mod tests {
             thread: Id::new_v4(),
             workspace: None,
             capabilities: BTreeSet::new(),
+            programs: vec![],
         };
         let catalog = catalog(&hosts, &scope).await;
         assert_eq!(catalog.tools.keys().collect::<Vec<_>>(), vec![&own]);

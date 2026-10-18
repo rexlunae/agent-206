@@ -249,6 +249,7 @@ fn write_tool_creates_parents_then_writes() {
 #[test]
 fn search_tool_reports_matches_and_truncation() {
     let (path, text, query) = (unique("src/f"), unique("line"), unique("q"));
+    let include = unique("*.");
     let reply = SearchResult {
         matches: vec![SearchMatch {
             path: path.clone(),
@@ -265,6 +266,9 @@ fn search_tool_reports_matches_and_truncation() {
             &[
                 ("query", Value::Str(query.clone())),
                 ("max_matches", Value::Int(9000)),
+                ("regex", Value::Bool(true)),
+                ("include", Value::Str(include.clone())),
+                ("include_ignored", Value::Bool(true)),
             ],
         ),
         Limits::default(),
@@ -277,10 +281,71 @@ fn search_tool_reports_matches_and_truncation() {
     assert!(output.text.contains("limit"));
     assert_eq!(
         *seen.borrow(),
-        vec![HostRequest::Search {
+        vec![HostRequest::SearchPattern {
             path: ".".into(),
-            query,
+            pattern: query,
+            regex: true,
+            ignore_case: false,
+            include: Some(include),
             max_matches: 500,
+            include_ignored: true,
+        }]
+    );
+}
+
+#[test]
+fn find_tool_lists_entries_and_truncation() {
+    let (file, directory, link) = (unique("src/f"), unique("src/d"), unique("l"));
+    let (glob, within) = (unique("*"), unique("src"));
+    let reply = FindResult {
+        entries: vec![
+            FoundEntry {
+                path: file.clone(),
+                kind: EntryKind::File,
+            },
+            FoundEntry {
+                path: directory.clone(),
+                kind: EntryKind::Directory,
+            },
+            FoundEntry {
+                path: link.clone(),
+                kind: EntryKind::Symlink,
+            },
+        ],
+        truncated: true,
+    };
+    let (bridge, seen) = mock(move |_| HostReply::Found(reply.clone()));
+    let (outcome, _) = engine::run(
+        workspace().wasm,
+        &tool(
+            "find_files",
+            &[
+                ("pattern", Value::Str(glob.clone())),
+                ("path", Value::Str(within.clone())),
+                ("max_results", Value::Int(0)),
+            ],
+        ),
+        Limits::default(),
+        bridge,
+    );
+    let Ok(Outcome::Tool(output)) = outcome else {
+        panic!("expected tool output, got {outcome:?}");
+    };
+    assert!(
+        output
+            .text
+            .starts_with(&format!("{file}\n{directory}/\n{link} (link)\n")),
+        "{}",
+        output.text
+    );
+    assert!(output.text.contains("limit"));
+    assert_eq!(
+        *seen.borrow(),
+        vec![HostRequest::Find {
+            path: within,
+            glob,
+            max_results: 1,
+            include_ignored: false,
         }]
     );
 }
@@ -340,6 +405,68 @@ fn long_diffs_fit_the_outcome_limit() {
     };
     assert!(output.text.starts_with(&format!("--- a/{path}\n")));
     assert!(output.text.ends_with(" bytes]"));
+}
+
+#[test]
+fn web_tool_reports_status_type_and_text() {
+    let builtin = builtin("agent206.web").unwrap().unwrap();
+    let (page, url) = (
+        unique("page"),
+        format!("https://{}.example/a", unique("site")),
+    );
+    let body = page.clone().into_bytes();
+    let (bridge, seen) = mock(move |_| {
+        HostReply::Fetched(FetchResponse {
+            status: 404,
+            content_type: Some("text/plain".into()),
+            body: body.clone().into(),
+            truncated: true,
+            redirected: false,
+        })
+    });
+    let invocation = tool("fetch_url", &[("url", Value::Str(format!("{url}#part")))]);
+    let (outcome, _) = engine::run(builtin.wasm, &invocation, Limits::default(), bridge);
+    let Ok(Outcome::Tool(output)) = outcome else {
+        panic!("expected tool output, got {outcome:?}");
+    };
+    assert_eq!(
+        output.text,
+        format!(
+            "HTTP 404\nContent-Type: text/plain\n\n{page}\n[the response continues; it was cut at a limit]"
+        )
+    );
+    // The fragment never reaches the host call.
+    assert_eq!(*seen.borrow(), vec![HostRequest::Fetch { url }]);
+}
+
+/// A body the host cut inside a multibyte character is still shown as text.
+#[test]
+fn web_tool_keeps_text_cut_mid_character() {
+    let builtin = builtin("agent206.web").unwrap().unwrap();
+    let page = unique("page");
+    let mut body = format!("{page}€").into_bytes();
+    body.pop();
+    let (bridge, _) = mock(move |_| {
+        HostReply::Fetched(FetchResponse {
+            status: 200,
+            content_type: None,
+            body: body.clone().into(),
+            truncated: true,
+            redirected: false,
+        })
+    });
+    let invocation = tool(
+        "fetch_url",
+        &[("url", Value::Str("https://a.example/".into()))],
+    );
+    let (outcome, _) = engine::run(builtin.wasm, &invocation, Limits::default(), bridge);
+    let Ok(Outcome::Tool(output)) = outcome else {
+        panic!("expected tool output, got {outcome:?}");
+    };
+    assert_eq!(
+        output.text,
+        format!("HTTP 200\n\n{page}\n[the response continues; it was cut at a limit]")
+    );
 }
 
 #[test]
@@ -463,6 +590,7 @@ fn worker_relays_host_calls_over_frames() {
     let name = unique("entry");
     let start = worker::Start {
         extension: "agent206.workspace".into(),
+        module: None,
         invocation: tool("list_directory", &[]),
         limits: Limits::default(),
     };
@@ -488,9 +616,53 @@ fn worker_relays_host_calls_over_frames() {
 }
 
 #[test]
+fn worker_runs_a_supplied_module_for_an_unbundled_id() {
+    let workspace = crate::builtin("agent206.workspace").unwrap().unwrap();
+    let name = unique("entry");
+    let start = worker::Start {
+        extension: unique("installed."),
+        module: Some(serde_bytes::ByteBuf::from(workspace.wasm.to_vec())),
+        invocation: tool("list_directory", &[]),
+        limits: Limits::default(),
+    };
+    let mut input = a206_protocol::encode(&start).unwrap();
+    input.extend(
+        a206_protocol::encode(&HostReply::Directory(vec![entry(
+            &name,
+            EntryKind::Directory,
+        )]))
+        .unwrap(),
+    );
+    let output = worker::serve(std::io::Cursor::new(input), Vec::new()).unwrap();
+    let frames: Vec<worker::Frame> = a206_protocol::Decoder::default().feed(&output).unwrap();
+    assert_eq!(
+        frames.last(),
+        Some(&worker::Frame::Done(Ok(Outcome::Tool(ToolOutput {
+            text: format!("{name}/")
+        }))))
+    );
+    // Bytes that are not a module fail as the extension's invalid request.
+    let start = worker::Start {
+        module: Some(serde_bytes::ByteBuf::from(unique("not wasm").into_bytes())),
+        ..start
+    };
+    let output = worker::serve(
+        std::io::Cursor::new(a206_protocol::encode(&start).unwrap()),
+        Vec::new(),
+    )
+    .unwrap();
+    let frames: Vec<worker::Frame> = a206_protocol::Decoder::default().feed(&output).unwrap();
+    let [worker::Frame::Done(Err(report))] = frames.as_slice() else {
+        panic!("expected one failed result, got {frames:?}");
+    };
+    assert_eq!(report.kind, ErrorKind::InvalidRequest);
+}
+
+#[test]
 fn worker_reports_failures_as_structured_values() {
     let start = worker::Start {
         extension: unique("missing."),
+        module: None,
         invocation: panel(None),
         limits: Limits::default(),
     };
@@ -507,6 +679,7 @@ fn worker_reports_failures_as_structured_values() {
     // A channel that closes mid-invocation is a worker error, not a result.
     let truncated = worker::Start {
         extension: "agent206.workspace".into(),
+        module: None,
         invocation: tool("list_directory", &[]),
         limits: Limits::default(),
     };
@@ -520,4 +693,527 @@ fn worker_reports_failures_as_structured_values() {
         panic!("expected a failed result, got {frames:?}");
     };
     assert_eq!(report.kind, ErrorKind::Unavailable);
+}
+
+#[test]
+fn bundled_skill_guest_only_uses_the_scoped_skill_imports() {
+    let builtin = builtin("agent206.skills").unwrap().unwrap();
+    let (bridge, seen) =
+        mock(|_: &HostRequest| HostReply::File(b"complete approved instructions".to_vec().into()));
+    let (result, _) = engine::run(
+        builtin.wasm,
+        &Invocation {
+            abi: ABI,
+            call: Call::Tool {
+                name: "skill_info".into(),
+                args: [("name".into(), Value::Str("notes".into()))].into(),
+            },
+        },
+        Limits::default(),
+        bridge,
+    );
+    assert!(
+        matches!(result.unwrap(), Outcome::Tool(output) if output.text == "complete approved instructions")
+    );
+    assert_eq!(
+        *seen.borrow(),
+        vec![HostRequest::SkillRead {
+            name: "notes".into(),
+            path: None
+        }]
+    );
+}
+
+fn memory() -> Builtin {
+    builtin("agent206.memory").unwrap().unwrap()
+}
+/// A workspace of far more memory notes than one search may read, so the
+/// guest's own bounds stop it; each `ReadFile` returns `text(index)`.
+fn memory_corpus(
+    text: impl Fn(usize) -> String + 'static,
+) -> impl FnMut(&HostRequest) -> HostReply + 'static {
+    const NOTES: usize = 400;
+    move |request| match request {
+        HostRequest::ListDirectory { path } if path == "." => HostReply::Directory(vec![
+            entry("MEMORY.md", EntryKind::File),
+            entry("memory", EntryKind::Directory),
+        ]),
+        HostRequest::ListDirectory { .. } => HostReply::Directory(
+            (0..NOTES)
+                .map(|index| DirEntry {
+                    name: format!("{index:04}.md"),
+                    kind: EntryKind::File,
+                    // Unknown sizes: the guest must bound what it reads itself.
+                    size: None,
+                })
+                .collect(),
+        ),
+        HostRequest::ReadFile { path } => {
+            let index = path
+                .trim_start_matches("memory/")
+                .trim_end_matches(".md")
+                .parse()
+                .unwrap_or(NOTES);
+            HostReply::File(text(index).into_bytes().into())
+        }
+        other => panic!("memory_search sent {other:?}"),
+    }
+}
+
+/// The costliest inputs for the guest's loading and ranking still finish
+/// inside the default fuel, host-call and output limits: the guest's own
+/// work meter stops it first and says how much it searched.
+#[test]
+fn memory_search_at_its_bounds_fits_the_invocation_limits() {
+    // Non-ASCII terms of every length from 1 to 24 characters, so no word
+    // is ruled out by its length and odd-length ASCII words are compared.
+    let query = (1..=24)
+        .map(|n| format!("{}q", "ж".repeat(n - 1)))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let note = |unit: &str, index: usize| unit.repeat(8 * 1024 / unit.len() + index % 3);
+    // Each note about 8 KiB.
+    type Generate = Box<dyn Fn(usize) -> String>;
+    let corpora: Vec<(&str, Generate)> = vec![
+        // The most words per byte.
+        (
+            "short words",
+            Box::new(move |i| note("ab Cd e ij kl mn op q\n", i)),
+        ),
+        // The most lines per byte.
+        ("blank lines", Box::new(move |i| note("\n", i))),
+        // A separator character that is not ASCII between every letter.
+        ("wide separators", Box::new(move |i| note("a—", i))),
+        // Single non-ASCII characters, each its own word.
+        (
+            "distinct characters",
+            Box::new(|i| {
+                (0..2700)
+                    .filter_map(|k| char::from_u32(0xc0 + ((i * 2700 + k) % 0x1f00) as u32))
+                    .flat_map(|c| [c, ' '])
+                    .collect()
+            }),
+        ),
+        // Cyrillic words of the query's lengths, lowercased to compare.
+        (
+            "cased words",
+            Box::new(|i| {
+                (0..900)
+                    .map(|k| "Жжэ".chars().cycle().skip(i + k).take(1 + (i * 7 + k) % 24))
+                    .map(String::from_iter)
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            }),
+        ),
+        (
+            "mixed scripts",
+            Box::new(move |i| note("ÄÖÜ ÆØÅ Ωμέγα Жук 日本 語 ", i)),
+        ),
+    ];
+    for (label, text) in corpora {
+        let (bridge, seen) = mock(memory_corpus(text));
+        let (outcome, _) = engine::run(
+            memory().wasm,
+            &tool(
+                "memory_search",
+                &[
+                    ("query", Value::Str(query.clone())),
+                    ("max_results", Value::Int(20)),
+                ],
+            ),
+            Limits::default(),
+            bridge,
+        );
+        let Ok(Outcome::Tool(output)) = outcome else {
+            panic!("{label}: expected tool output, got {outcome:?}");
+        };
+        assert!(
+            output.text.contains("[stopped at a bound after "),
+            "{label}: {}",
+            output.text
+        );
+        assert!(
+            seen.borrow().iter().all(|r| matches!(
+                r,
+                HostRequest::ListDirectory { .. } | HostRequest::ReadFile { .. }
+            )),
+            "{label}: searching only lists and reads"
+        );
+    }
+}
+
+#[test]
+fn memory_tools_refuse_paths_before_any_host_call() {
+    let note = || ("text", Value::Str(unique("note")));
+    for (name, args) in [
+        (
+            "memory_get",
+            vec![("path", Value::Str(format!("src/{}.md", unique("s"))))],
+        ),
+        (
+            "memory_save",
+            vec![("path", Value::Str("MEMORY.md".into())), note()],
+        ),
+        (
+            "memory_save",
+            vec![
+                ("path", Value::Str(format!("memory/../{}.md", unique("s")))),
+                note(),
+            ],
+        ),
+    ] {
+        let (bridge, seen) = mock(|request| panic!("host call {request:?}"));
+        let (outcome, _) =
+            engine::run(memory().wasm, &tool(name, &args), Limits::default(), bridge);
+        let Ok(Outcome::Failed(error)) = outcome else {
+            panic!("expected a refusal, got {outcome:?}");
+        };
+        assert_eq!(error.code, "not_memory_path");
+        assert!(seen.borrow().is_empty());
+    }
+}
+
+#[test]
+fn memory_save_creates_a_note_through_write_calls() {
+    let path = format!("memory/{}/{}.md", unique("d"), unique("n"));
+    let text = unique("note ");
+    let (bridge, seen) = mock(|request| match request {
+        HostRequest::ReadFile { .. } => HostReply::Failed(HostFailure {
+            code: HostErrorCode::NotFound,
+            message: "no such file or directory".into(),
+        }),
+        _ => HostReply::Done,
+    });
+    let (outcome, _) = engine::run(
+        memory().wasm,
+        &tool(
+            "memory_save",
+            &[
+                ("path", Value::Str(path.clone())),
+                ("text", Value::Str(text.clone())),
+            ],
+        ),
+        Limits::default(),
+        bridge,
+    );
+    assert_eq!(
+        outcome.unwrap(),
+        Outcome::Tool(ToolOutput {
+            text: format!("created {path}, lines 1-1")
+        })
+    );
+    let parent = path.rsplit_once('/').unwrap().0.to_string();
+    assert_eq!(
+        *seen.borrow(),
+        vec![
+            HostRequest::ReadFile { path: path.clone() },
+            HostRequest::CreateDirectory { path: parent },
+            HostRequest::WriteFile {
+                path,
+                contents: format!("{text}\n").into_bytes().into(),
+                overwrite: false,
+            },
+        ]
+    );
+}
+
+#[test]
+fn patch_tool_sends_parsed_files_and_reports_what_was_written() {
+    let (path, old, new) = (unique("src/f"), unique("old"), unique("new"));
+    let diff = format!("--- a/{path}\n+++ b/{path}\n@@ -2 +2 @@\n-{old}\n+{new}\n");
+    let run = |reply: HostReply, check_only: bool| {
+        let (bridge, seen) = mock(move |_| reply.clone());
+        let (outcome, _) = engine::run(
+            workspace().wasm,
+            &tool(
+                "apply_patch",
+                &[
+                    ("patch", Value::Str(diff.clone())),
+                    ("check_only", Value::Bool(check_only)),
+                ],
+            ),
+            Limits::default(),
+            bridge,
+        );
+        (outcome, seen.take())
+    };
+    let expected = |check_only| {
+        vec![HostRequest::PatchFiles {
+            files: vec![FilePatch {
+                path: path.clone(),
+                change: FileChange::Modify,
+                hunks: vec![Hunk {
+                    old_start: 2,
+                    lines: vec![
+                        PatchLine::Remove(format!("{old}\n")),
+                        PatchLine::Add(format!("{new}\n")),
+                    ],
+                }],
+            }],
+            check_only,
+        }]
+    };
+
+    let written = PatchResult {
+        changed: vec![path.clone()],
+        failed: None,
+    };
+    let (outcome, seen) = run(HostReply::Patched(written), false);
+    let Ok(Outcome::Tool(output)) = outcome else {
+        panic!("expected tool output, got {outcome:?}");
+    };
+    assert_eq!(output.text, format!("changed {path} (1 hunk)"));
+    assert_eq!(seen, expected(false));
+
+    let (outcome, seen) = run(HostReply::Patched(PatchResult::default()), true);
+    let Ok(Outcome::Tool(output)) = outcome else {
+        panic!("expected tool output, got {outcome:?}");
+    };
+    assert!(output.text.contains("would") && output.text.contains(&path));
+    assert_eq!(seen, expected(true));
+
+    // A write that fails after another succeeded names both, so a partial
+    // patch is never reported as none or as all.
+    let (earlier, message) = (unique("earlier"), unique("message"));
+    let partial = PatchResult {
+        changed: vec![earlier.clone()],
+        failed: Some(PatchFailure {
+            path: path.clone(),
+            failure: HostFailure {
+                code: HostErrorCode::Io,
+                message: message.clone(),
+            },
+        }),
+    };
+    let (outcome, _) = run(HostReply::Patched(partial), false);
+    let Ok(Outcome::Failed(error)) = outcome else {
+        panic!("expected a failure, got {outcome:?}");
+    };
+    assert_eq!(error.code, HostErrorCode::Io.as_str());
+    for part in [&path, &earlier, &message] {
+        assert!(error.message.contains(part.as_str()), "{}", error.message);
+    }
+}
+
+#[test]
+fn patch_tool_refuses_a_malformed_diff_without_a_host_call() {
+    let (bridge, seen) = mock(|_| HostReply::Done);
+    let (outcome, _) = engine::run(
+        workspace().wasm,
+        &tool(
+            "apply_patch",
+            &[("patch", Value::Str(unique("not a diff")))],
+        ),
+        Limits::default(),
+        bridge,
+    );
+    let Ok(Outcome::Failed(error)) = outcome else {
+        panic!("expected a failure, got {outcome:?}");
+    };
+    assert_eq!(error.code, "invalid_patch");
+    assert!(seen.borrow().is_empty());
+}
+
+fn web_page(body: Vec<u8>, content_type: &str) -> impl FnMut(&HostRequest) -> HostReply + 'static {
+    redirected_page(body, content_type, false)
+}
+fn redirected_page(
+    body: Vec<u8>,
+    content_type: &str,
+    redirected: bool,
+) -> impl FnMut(&HostRequest) -> HostReply + 'static {
+    let content_type = content_type.to_string();
+    move |_| {
+        HostReply::Fetched(FetchResponse {
+            status: 200,
+            content_type: Some(content_type.clone()),
+            body: body.clone().into(),
+            truncated: false,
+            redirected,
+        })
+    }
+}
+
+#[test]
+fn page_reader_returns_readable_markdown_and_metadata() {
+    let builtin = builtin("agent206.web").unwrap().unwrap();
+    let (title, words, script) = (unique("title"), unique("words"), unique("script"));
+    let html = format!(
+        "<html><head><title>{title}</title><meta name=description content=\"{words}\"></head>\
+<body><nav>{script}</nav><main><h1>{title}</h1><p>{words}</p></main><script>{script}</script></body></html>"
+    );
+    let url = format!("https://{}.example/p", unique("h"));
+    let (bridge, seen) = mock(web_page(html.into_bytes(), "text/html; charset=utf-8"));
+    let invocation = tool(
+        "read_web_page",
+        &[
+            ("url", Value::Str(format!("{url}#frag"))),
+            ("include_metadata", Value::Bool(true)),
+        ],
+    );
+    let (outcome, _) = engine::run(builtin.wasm, &invocation, Limits::default(), bridge);
+    let Ok(Outcome::Tool(output)) = outcome else {
+        panic!("expected tool output, got {outcome:?}");
+    };
+    assert_eq!(
+        output.text,
+        format!(
+            "HTTP 200\nContent-Type: text/html; charset=utf-8\nTitle: {title}\nDescription: {words}\n\n# {title}\n\n{words}"
+        )
+    );
+    assert!(!output.text.contains(&script));
+    assert_eq!(*seen.borrow(), vec![HostRequest::Fetch { url }]);
+
+    // Plain text is returned as it is, and `max_bytes` cuts it.
+    let (bridge, _) = mock(web_page(
+        format!("{words}{words}").into_bytes(),
+        "text/plain",
+    ));
+    let invocation = tool(
+        "read_web_page",
+        &[
+            ("url", Value::Str("https://a.example/".into())),
+            ("max_bytes", Value::Int(words.len() as i64)),
+        ],
+    );
+    let (outcome, _) = engine::run(builtin.wasm, &invocation, Limits::default(), bridge);
+    let Ok(Outcome::Tool(output)) = outcome else {
+        panic!("expected tool output, got {outcome:?}");
+    };
+    assert!(output.text.ends_with(&format!(
+        "\n\n{words}\n[the response continues; it was cut at a limit]"
+    )));
+
+    // A limit that falls inside the first character shows no text, but the
+    // page is not called unreadable.
+    let (bridge, _) = mock(web_page("é".repeat(4).into_bytes(), "text/plain"));
+    let invocation = tool(
+        "read_web_page",
+        &[
+            ("url", Value::Str("https://a.example/".into())),
+            ("max_bytes", Value::Int(1)),
+        ],
+    );
+    let (outcome, _) = engine::run(builtin.wasm, &invocation, Limits::default(), bridge);
+    let Ok(Outcome::Tool(output)) = outcome else {
+        panic!("expected tool output, got {outcome:?}");
+    };
+    assert!(
+        output
+            .text
+            .ends_with("\n\n\n[the response continues; it was cut at a limit]"),
+        "{}",
+        output.text
+    );
+
+    // After a redirect the page's own address is unknown, so relative links
+    // keep only their text; absolute ones are still links.
+    let (path, other) = (unique("path"), format!("https://{}.example/", unique("o")));
+    let html = format!("<p><a href=\"/{path}\">rel</a> <a href=\"{other}\">abs</a></p>");
+    for (redirected, expected) in [
+        (
+            false,
+            format!("[rel](https://a.example/{path}) [abs]({other})"),
+        ),
+        (true, format!("rel [abs]({other})")),
+    ] {
+        let (bridge, _) = mock(redirected_page(
+            html.clone().into_bytes(),
+            "text/html",
+            redirected,
+        ));
+        let invocation = tool(
+            "read_web_page",
+            &[("url", Value::Str("https://a.example/".into()))],
+        );
+        let (outcome, _) = engine::run(builtin.wasm, &invocation, Limits::default(), bridge);
+        let Ok(Outcome::Tool(output)) = outcome else {
+            panic!("expected tool output, got {outcome:?}");
+        };
+        assert!(output.text.ends_with(&expected), "{}", output.text);
+    }
+
+    let (bridge, seen) = mock(web_page(Vec::new(), "text/html"));
+    let invocation = tool(
+        "read_web_page",
+        &[
+            ("url", Value::Str("https://a.example/".into())),
+            ("format", Value::Str(unique("pdf"))),
+        ],
+    );
+    let (outcome, _) = engine::run(builtin.wasm, &invocation, Limits::default(), bridge);
+    assert!(
+        matches!(&outcome, Ok(Outcome::Failed(error)) if error.code == "invalid_argument"),
+        "{outcome:?}"
+    );
+    assert!(
+        seen.borrow().is_empty(),
+        "nothing is fetched for a bad argument"
+    );
+}
+
+/// The largest page the host returns is read within the invocation's
+/// default fuel whatever it is made of: extraction meters its own work and
+/// stops with a notice. Each shape stresses a different part of it.
+#[test]
+fn page_reader_reads_the_largest_page_within_its_fuel() {
+    let builtin = builtin("agent206.web").unwrap().unwrap();
+    let repeat = |piece: &str| {
+        let mut html = String::new();
+        while html.len() < 512 * 1024 {
+            html.push_str(piece);
+        }
+        html
+    };
+    let shapes = [
+        repeat(
+            "<li><a href=\"/p?q=1&amp;r=2\" class=\"x y\">a&amp;b &#x263A;</a> <code>c</code></li>\n",
+        ),
+        repeat("<span>x</span>"),
+        repeat("<a href=\"/x\">y</a>"),
+        repeat("<a href=\"../a/./b/../c?d\">y</a>"),
+        repeat("<nav><a href=\"/x\"><ul><li>y</li></ul></a></nav>"),
+        format!(
+            "<a href=\"https://a.example/{}\">t</a> {}",
+            "x".repeat(150_000),
+            repeat("word ")
+        ),
+        format!(
+            "<a href=\"https://a.example/{}\">t</a> {}",
+            "x".repeat(40_000),
+            repeat("word ")
+        ),
+        repeat(&format!("<a href=\"/{}\">t</a>", "x".repeat(2_000))),
+        repeat("plain words of text here and there "),
+        repeat("a&amp;b &lt; "),
+        repeat("<p></p>"),
+        format!("<script>{}", repeat("var x = 1; ")),
+        format!("<!--{}", repeat("a comment ")),
+        format!("<a href=\"{}", repeat("x")),
+        repeat("x"),
+        repeat("& "),
+        repeat("1 < 2 "),
+        repeat("&#x263A;"),
+    ];
+    for (index, html) in shapes.into_iter().enumerate() {
+        for format in ["markdown", "text"] {
+            let (bridge, _) = mock(web_page(html.clone().into_bytes(), "text/html"));
+            let invocation = tool(
+                "read_web_page",
+                &[
+                    ("url", Value::Str("https://a.example/".into())),
+                    ("format", Value::Str(format.into())),
+                ],
+            );
+            let (outcome, _) = engine::run(builtin.wasm, &invocation, Limits::default(), bridge);
+            let Ok(Outcome::Tool(output)) = outcome else {
+                panic!("shape {index}, {format}: expected tool output, got {outcome:?}");
+            };
+            assert!(
+                output.text.ends_with("cut at a limit]"),
+                "shape {index}, {format}: {}",
+                &output.text[output.text.len().saturating_sub(200)..]
+            );
+        }
+    }
 }

@@ -67,6 +67,13 @@ nor decrypted setup requests/replies. The browser still has to trust the applica
 code and its serving origin: encryption does not make compromised JavaScript safe.
 Loopback authorization and remote HTTPS/TOTP sign-in retain their existing guards.
 
+The authenticated `/api/vault` endpoint remains limited to public status and
+locking. Encrypted setup uses `/api/vault/channel` and requires broker protocol
+10 or newer. Versions 8 and 9 provide messenger transports, not encrypted setup;
+the client refuses setup against those versions without sending a password or
+setup opcode. Pairing status from older brokers is unknown because their status
+counts an unredeemed pairing token as a paired gateway.
+
 Only a typed setup subset travels inside the encrypted channel: status,
 create/unlock, lock, step-up, begin/confirm/cancel TOTP, and minting a gateway
 pairing. Reveal, export, grants, provider requests and shutdown are absent. A new

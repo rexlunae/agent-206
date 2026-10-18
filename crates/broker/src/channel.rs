@@ -62,14 +62,7 @@ pub fn code(error: &BrokerError) -> wire::Code {
 pub fn reply(result: Result<Reply, BrokerError>) -> wire::Reply {
     match result {
         Ok(Reply::Ok) => wire::Reply::Ok,
-        Ok(Reply::Status(s)) => wire::Reply::Status(wire::Status {
-            exists: s.exists,
-            unlocked: s.unlocked,
-            totp_enrolled: s.totp_enrolled,
-            agent_access: s.agent_access,
-            step_up_active: s.step_up_active,
-            gateway_paired: s.gateway_paired,
-        }),
+        Ok(Reply::Status(s)) => wire::Reply::Status(status(s)),
         Ok(Reply::TotpEnrollment {
             otpauth_url,
             manual_key,
@@ -122,5 +115,17 @@ pub fn reply(result: Result<Reply, BrokerError>) -> wire::Reply {
             code: wire::Code::Other,
             report: ErrorReport::new(ErrorKind::Protocol, "unexpected vault setup reply"),
         }),
+    }
+}
+
+/// Public setup facts shared by the native and encrypted surfaces.
+pub fn status(s: crate::BrokerStatus) -> wire::Status {
+    wire::Status {
+        exists: s.exists,
+        unlocked: s.unlocked,
+        totp_enrolled: s.totp_enrolled,
+        agent_access: s.agent_access,
+        step_up_active: s.step_up_active,
+        gateway_paired: s.gateway_paired,
     }
 }

@@ -9,6 +9,10 @@ mod doctor_cli;
 mod extension_cli;
 #[cfg(not(target_arch = "wasm32"))]
 mod messenger_cli;
+#[cfg(not(target_arch = "wasm32"))]
+mod running_cli;
+#[cfg(not(target_arch = "wasm32"))]
+mod schedule_cli;
 #[cfg(all(unix, not(target_arch = "wasm32")))]
 mod setup_cli;
 #[cfg(all(unix, not(target_arch = "wasm32")))]
@@ -17,7 +21,7 @@ mod vault_cli;
 mod native {
     use a206_core::{
         ApprovalDecision, ApprovalRequest, BackendConfig, Capability, CodingBackend, Command, Mode,
-        ProviderPreset, Reply, ToolBudget, ToolPermission,
+        PromptAnswer, ProviderPreset, Reply, ToolBudget, ToolPermission,
     };
     use clap::{Parser, Subcommand};
     use std::path::PathBuf;
@@ -121,6 +125,13 @@ mod native {
             #[command(subcommand)]
             command: crate::messenger_cli::MessengerAction,
         },
+        /// Send messages to a conversation at set times.
+        Schedule {
+            #[command(subcommand)]
+            command: crate::schedule_cli::ScheduleAction,
+        },
+        /// Show every conversation with a response in progress.
+        Running,
         /// Show gateway and workspace status without starting a service.
         Status,
         /// Export the current workspace snapshot as TOML.
@@ -136,7 +147,27 @@ mod native {
             thread: uuid::Uuid,
             text: String,
         },
+        /// Add a message to a conversation's running native run; it is read
+        /// before the run's next model request.
+        Steer {
+            thread: uuid::Uuid,
+            text: String,
+        },
+        /// Hold a conversation's native run, and its subagents', before
+        /// their next model round.
+        Pause {
+            thread: uuid::Uuid,
+        },
+        /// Let a paused conversation's runs continue.
+        Resume {
+            thread: uuid::Uuid,
+        },
         Cancel {
+            thread: uuid::Uuid,
+        },
+        /// Summarize a conversation's earlier messages now, keeping its
+        /// latest turn; `cancel THREAD` stops it.
+        Compact {
             thread: uuid::Uuid,
         },
         /// Inspect and set a conversation's tool permissions and budget.
@@ -149,6 +180,15 @@ mod native {
             #[command(subcommand)]
             command: ApprovalAction,
         },
+        /// Show the checklist a conversation's models keep with `plan_update`.
+        Plan {
+            thread: uuid::Uuid,
+        },
+        /// Answer questions agents asked with `ask_user`.
+        Prompts {
+            #[command(subcommand)]
+            command: PromptAction,
+        },
         /// Export settings as TOML, or apply a reviewed TOML configuration.
         Settings {
             #[arg(long)]
@@ -156,6 +196,21 @@ mod native {
         },
         RefreshModels {
             provider: uuid::Uuid,
+        },
+        /// Gateway activity newest first, without conversation and download
+        /// progress notices; pass the last `sequence` printed as --before for
+        /// the next page.
+        Activity {
+            #[arg(long)]
+            before: Option<u64>,
+            #[arg(long, default_value_t = 20)]
+            limit: u32,
+        },
+        /// Find messages containing every word of QUERY, newest first.
+        Search {
+            query: String,
+            #[arg(long, default_value_t = 20)]
+            limit: u32,
         },
         Project {
             name: String,
@@ -230,13 +285,16 @@ mod native {
             tool: String,
             permission: String,
         },
-        /// Limit model rounds and tool calls per run.
+        /// Limit model rounds, tool calls and, optionally, tokens per run.
         Budget {
             thread: uuid::Uuid,
             #[arg(long)]
             rounds: u32,
             #[arg(long)]
             tool_calls: u32,
+            /// Input plus output tokens per run, as the provider reports them.
+            #[arg(long)]
+            tokens: Option<u64>,
         },
     }
     #[derive(Subcommand)]
@@ -254,6 +312,28 @@ mod native {
             thread: uuid::Uuid,
             approval: uuid::Uuid,
             digest: String,
+        },
+    }
+    #[derive(Subcommand)]
+    enum PromptAction {
+        /// Show the questions waiting for this conversation's user.
+        List { thread: uuid::Uuid },
+        /// Pick a suggested answer; CHOICE counts from 1 in the listed order.
+        Choose {
+            thread: uuid::Uuid,
+            prompt: uuid::Uuid,
+            choice: std::num::NonZeroU32,
+        },
+        /// Answer in your own words, if the question allows it.
+        Answer {
+            thread: uuid::Uuid,
+            prompt: uuid::Uuid,
+            text: String,
+        },
+        /// Tell the agent you will not answer.
+        Decline {
+            thread: uuid::Uuid,
+            prompt: uuid::Uuid,
         },
     }
     fn permission(value: &str) -> anyhow::Result<Option<ToolPermission>> {
@@ -348,6 +428,15 @@ mod native {
             write: bool,
             #[arg(long)]
             execute: bool,
+            /// Agent 206 backend only: read git history (git status, log, diff).
+            #[arg(long)]
+            git_read: bool,
+            /// Agent 206 backend only: commit (implies --git-read).
+            #[arg(long)]
+            git_write: bool,
+            /// Agent 206 backend only: fetch from the network; commands may use it too.
+            #[arg(long)]
+            network: bool,
         },
     }
     fn backend_kind(value: &str) -> anyhow::Result<CodingBackend> {
@@ -387,7 +476,7 @@ mod native {
                 anyhow::anyhow!("no MCP server named {name}; add it with settings --apply")
             })?
             .enabled = enabled;
-        Ok(Command::SaveSettings(settings))
+        Ok(Command::SaveSettings(Box::new(settings)))
     }
     fn default_root() -> anyhow::Result<PathBuf> {
         Ok(PathBuf::from(
@@ -680,6 +769,12 @@ mod native {
                 if let Action::Messenger { command } = action {
                     return crate::messenger_cli::run(&client, command).await;
                 }
+                if let Action::Schedule { command } = action {
+                    return crate::schedule_cli::run(&client, command).await;
+                }
+                if let Action::Running = action {
+                    return crate::running_cli::run(&client).await;
+                }
                 let command = match action {
                     Action::Providers {
                         command: ProviderAction::Presets,
@@ -730,7 +825,7 @@ mod native {
                         }
                         provider.credential = credential;
                         settings.providers.push(provider);
-                        Command::SaveSettings(settings)
+                        Command::SaveSettings(Box::new(settings))
                     }
                     Action::Backend {
                         command:
@@ -754,7 +849,7 @@ mod native {
                             runtime_root,
                             adapter_script,
                         });
-                        Command::SaveSettings(settings)
+                        Command::SaveSettings(Box::new(settings))
                     }
                     Action::Backend {
                         command:
@@ -764,12 +859,18 @@ mod native {
                                 read,
                                 write,
                                 execute,
+                                git_read,
+                                git_write,
+                                network,
                             },
                     } => {
                         let capabilities = [
                             (read || write, Capability::ReadWorkspace),
                             (write, Capability::WriteWorkspace),
                             (execute, Capability::Execute),
+                            (git_read || git_write, Capability::GitRead),
+                            (git_write, Capability::GitWrite),
+                            (network, Capability::Network),
                         ]
                         .into_iter()
                         .filter_map(|(allowed, capability)| allowed.then_some(capability))
@@ -799,8 +900,31 @@ mod native {
                             match client.call(Command::ReadSkill { name }).await? {
                                 Reply::Skill(skill) => {
                                     print!("{}", skill.text);
+                                    for file in &skill.files {
+                                        println!("\n--- {} ({} bytes) ---", file.path, file.bytes);
+                                        match &file.text {
+                                            Some(text) => println!("{text}"),
+                                            None => println!("Binary content: not inspected by the text audit."),
+                                        }
+                                    }
+                                    let audit = &skill.audit;
+                                    if !audit.is_clean() {
+                                        eprintln!("\nCheck before approving; the audit matched:");
+                                        for finding in &audit.findings {
+                                            if let a206_core::AuditLocation::Line(line) =
+                                                finding.location
+                                            {
+                                                eprintln!("  line {line}: {}", finding.rule.label());
+                                            } else if let a206_core::AuditLocation::File { path, line } = &finding.location {
+                                                eprintln!("  {path}{}: {}", line.map(|line| format!(":{line}")).unwrap_or_default(), finding.rule.label());
+                                            }
+                                        }
+                                        if audit.more > 0 {
+                                            eprintln!("  and {} more", audit.more);
+                                        }
+                                    }
                                     eprintln!(
-                                        "\nTo approve exactly this text: agent206 skills enable {} --digest {}",
+                                        "\nTo approve exactly this package: agent206 skills enable {} --digest {}",
                                         skill.name, skill.digest
                                     );
                                     return Ok(());
@@ -876,7 +1000,11 @@ mod native {
                         text,
                         attachments: vec![],
                     },
+                    Action::Steer { thread, text } => Command::Steer { thread, text },
+                    Action::Pause { thread } => Command::PauseRun { thread },
+                    Action::Resume { thread } => Command::ResumeRun { thread },
                     Action::Cancel { thread } => Command::CancelRun { thread },
+                    Action::Compact { thread } => Command::CompactThread { thread },
                     Action::Tools { command } => match command {
                         ToolAction::List { thread } => Command::ListTools { thread },
                         ToolAction::Permit {
@@ -892,11 +1020,35 @@ mod native {
                             thread,
                             rounds,
                             tool_calls,
+                            tokens,
                         } => Command::SetToolBudget {
                             thread,
-                            budget: ToolBudget { rounds, tool_calls },
+                            budget: ToolBudget {
+                                rounds,
+                                tool_calls,
+                                tokens,
+                            },
                         },
                     },
+                    Action::Plan { thread } => {
+                        let Reply::Snapshot(snapshot) = client.call(Command::Snapshot).await? else {
+                            anyhow::bail!("failed to read the conversation");
+                        };
+                        let thread = snapshot
+                            .threads
+                            .into_iter()
+                            .find(|t| t.id == thread)
+                            .ok_or_else(|| anyhow::anyhow!("conversation not found"))?;
+                        #[derive(serde::Serialize)]
+                        struct Plan {
+                            steps: Vec<a206_core::PlanStep>,
+                        }
+                        print!(
+                            "{}",
+                            toml::to_string_pretty(&Plan { steps: thread.plan })?
+                        );
+                        return Ok(());
+                    }
                     Action::Approvals { command } => match command {
                         ApprovalAction::List { thread } => {
                             let Reply::Snapshot(snapshot) = client.call(Command::Snapshot).await?
@@ -941,8 +1093,57 @@ mod native {
                             decision: ApprovalDecision::Deny,
                         },
                     },
+                    Action::Prompts { command } => match command {
+                        PromptAction::List { thread } => {
+                            let Reply::Snapshot(snapshot) = client.call(Command::Snapshot).await?
+                            else {
+                                anyhow::bail!("failed to read the conversation");
+                            };
+                            let thread = snapshot
+                                .threads
+                                .into_iter()
+                                .find(|t| t.id == thread)
+                                .ok_or_else(|| anyhow::anyhow!("conversation not found"))?;
+                            #[derive(serde::Serialize)]
+                            struct Pending {
+                                prompts: Vec<a206_core::UserPrompt>,
+                            }
+                            print!(
+                                "{}",
+                                toml::to_string_pretty(&Pending {
+                                    prompts: thread.prompts
+                                })?
+                            );
+                            return Ok(());
+                        }
+                        PromptAction::Choose {
+                            thread,
+                            prompt,
+                            choice,
+                        } => Command::AnswerPrompt {
+                            thread,
+                            prompt,
+                            answer: PromptAnswer::Choice {
+                                index: choice.get() - 1,
+                            },
+                        },
+                        PromptAction::Answer {
+                            thread,
+                            prompt,
+                            text,
+                        } => Command::AnswerPrompt {
+                            thread,
+                            prompt,
+                            answer: PromptAnswer::Text { text },
+                        },
+                        PromptAction::Decline { thread, prompt } => Command::AnswerPrompt {
+                            thread,
+                            prompt,
+                            answer: PromptAnswer::Decline,
+                        },
+                    },
                     Action::Settings { apply: Some(path) } => {
-                        Command::SaveSettings(toml::from_str(&std::fs::read_to_string(path)?)?)
+                        Command::SaveSettings(Box::new(toml::from_str(&std::fs::read_to_string(path)?)?))
                     }
                     Action::Settings { apply: None } => {
                         if let Reply::Snapshot(snapshot) = client.call(Command::Snapshot).await? {
@@ -953,6 +1154,8 @@ mod native {
                         }
                     }
                     Action::RefreshModels { provider } => Command::RefreshCatalog { provider },
+                    Action::Search { query, limit } => Command::SearchMessages { query, limit },
+                    Action::Activity { before, limit } => Command::Activity { before, limit },
                     Action::Project { name, root } => Command::CreateProject {
                         name,
                         root: root.to_string_lossy().into_owned(),
@@ -980,14 +1183,43 @@ mod native {
                                 else {
                                     anyhow::bail!("could not read extensions");
                                 };
+                                /// A listed package with what the pre-install
+                                /// audit found in its text; bundled ones have none.
+                                #[derive(serde::Serialize)]
+                                struct Audited<T> {
+                                    #[serde(flatten)]
+                                    item: T,
+                                    #[serde(skip_serializing_if = "Option::is_none")]
+                                    audit: Option<a206_core::AuditReport>,
+                                }
                                 #[derive(serde::Serialize)]
                                 struct Extensions {
-                                    extensions: Vec<a206_core::PluginSummary>,
+                                    extensions: Vec<Audited<a206_core::PluginSummary>>,
+                                    #[serde(skip_serializing_if = "Vec::is_empty")]
+                                    proposals: Vec<Audited<a206_core::ExtensionProposal>>,
                                 }
+                                let extensions = snapshot
+                                    .plugins
+                                    .into_iter()
+                                    .map(|item| Audited {
+                                        audit: (item.source != a206_core::PluginSource::Bundled)
+                                            .then(|| a206_audit::plugin(&item)),
+                                        item,
+                                    })
+                                    .collect();
+                                let proposals = snapshot
+                                    .extension_proposals
+                                    .into_iter()
+                                    .map(|item| Audited {
+                                        audit: Some(a206_audit::plugin(&item.summary)),
+                                        item,
+                                    })
+                                    .collect();
                                 print!(
                                     "{}",
                                     toml::to_string_pretty(&Extensions {
-                                        extensions: snapshot.plugins
+                                        extensions,
+                                        proposals,
                                     })?
                                 );
                                 return Ok(());
@@ -1001,6 +1233,14 @@ mod native {
                     Reply::Text(text) => println!("{text}"),
                     Reply::Panel(view) => println!("{}", crate::extension_cli::render(&view)),
                     Reply::Ok => println!("OK"),
+                    Reply::Messages(hits) => {
+                        #[derive(serde::Serialize)]
+                        struct Hits {
+                            hits: Vec<a206_core::MessageHit>,
+                        }
+                        print!("{}", toml::to_string_pretty(&Hits { hits })?);
+                    }
+                    Reply::Activity(page) => print!("{}", toml::to_string_pretty(&page)?),
                     reply => println!("{}", toml::to_string_pretty(&reply)?),
                 }
                 Ok(())

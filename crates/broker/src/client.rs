@@ -14,8 +14,12 @@ pub enum ClientError {
     Closed,
     #[error("the running vault broker is too old to stream provider responses")]
     StreamUnsupported,
+    #[error("the running vault broker is too old to open sockets")]
+    SocketUnsupported,
     #[error("the vault broker sent an invalid provider stream")]
     Stream(#[from] StreamViolation),
+    #[error("a socket message is larger than the vault broker relays")]
+    SocketMessage,
     #[error(transparent)]
     Broker(#[from] BrokerError),
 }
@@ -140,7 +144,15 @@ impl Client {
     /// Send one request. A broker error reply becomes `ClientError::Broker`.
     pub async fn call(&mut self, body: Request) -> Result<Reply, ClientError> {
         let id = self.send(body).await?;
-        self.recv(id).await
+        let mut reply = self.recv(id).await?;
+        if self.version < SETUP_CHANNEL_VERSION
+            && let Reply::Status(status) = &mut reply
+        {
+            // Older brokers counted minting a capability as paired, without
+            // proof of receipt by a gateway. That fact is unknown to us.
+            status.gateway_paired = None;
+        }
+        Ok(reply)
     }
 
     /// Start a streamed provider call and wait for the upstream status.
@@ -225,5 +237,98 @@ impl ProviderStream<'_> {
     fn violation(&mut self, violation: StreamViolation) -> ClientError {
         self.ended = true;
         violation.into()
+    }
+}
+
+impl Client {
+    /// Open a WebSocket or IRC session through the broker. The connection
+    /// carries only this session from then on, so it is consumed. Refused
+    /// with [`ClientError::SocketUnsupported`] before anything is sent when
+    /// the broker predates sockets, or IRC for an IRC session.
+    pub async fn socket(mut self, call: SocketCall) -> Result<SocketOpen, ClientError> {
+        let needed = match call.scheme {
+            SocketScheme::IrcSasl { .. } => IRC_VERSION,
+            SocketScheme::DiscordGateway { .. } | SocketScheme::SlackSocketMode => SOCKET_VERSION,
+        };
+        if self.version < needed {
+            return Err(ClientError::SocketUnsupported);
+        }
+        let id = self.send(Request::SocketOpen(call)).await?;
+        match self.recv(id).await? {
+            Reply::SocketOpened => Ok(SocketOpen::Opened(Socket {
+                client: self,
+                id,
+                seq: 0,
+                ended: false,
+            })),
+            Reply::SocketRefused { status, code } => Ok(SocketOpen::Refused { status, code }),
+            _ => Err(StreamViolation::Unexpected.into()),
+        }
+    }
+}
+
+/// The outcome of [`Client::socket`].
+pub enum SocketOpen {
+    Opened(Socket),
+    /// The service refused to name a socket (see `Reply::SocketRefused`).
+    Refused {
+        status: u16,
+        code: Option<String>,
+    },
+}
+
+/// Something an open socket delivered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SocketEvent {
+    Text(String),
+    /// The service closed the socket, with its close code if it sent one.
+    Closed(Option<u16>),
+}
+
+/// A WebSocket session relayed by the broker.
+pub struct Socket {
+    client: Client,
+    id: uuid::Uuid,
+    seq: u64,
+    ended: bool,
+}
+
+impl Socket {
+    /// The next upstream message, or `Closed` once. After `Closed` or an
+    /// error the session is over, and later calls report
+    /// [`ClientError::Closed`]. Cancel-safe: a dropped call loses nothing.
+    pub async fn next(&mut self) -> Result<SocketEvent, ClientError> {
+        if self.ended {
+            return Err(ClientError::Closed);
+        }
+        let reply = self.client.recv(self.id).await;
+        let event = match reply {
+            Ok(Reply::SocketFrame { seq, text }) if seq == self.seq => {
+                if text.len() > MAX_SOCKET_MESSAGE {
+                    Err(StreamViolation::BodyTooLarge.into())
+                } else {
+                    self.seq += 1;
+                    return Ok(SocketEvent::Text(text));
+                }
+            }
+            Ok(Reply::SocketFrame { .. }) => Err(StreamViolation::OutOfOrder.into()),
+            Ok(Reply::SocketClosed { code }) => Ok(SocketEvent::Closed(code)),
+            Ok(_) => Err(StreamViolation::Unexpected.into()),
+            Err(error) => Err(error),
+        };
+        self.ended = true;
+        event
+    }
+
+    /// Send one text message upstream. Not cancel-safe: a dropped call may
+    /// leave part of a frame written, after which the socket must be dropped.
+    pub async fn send(&mut self, text: String) -> Result<(), ClientError> {
+        if text.len() > MAX_SOCKET_MESSAGE {
+            return Err(ClientError::SocketMessage);
+        }
+        self.client
+            .send(Request::SocketSend { text })
+            .await
+            .map(drop)
     }
 }

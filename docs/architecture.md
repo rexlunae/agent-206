@@ -71,8 +71,11 @@ environment, no WASI, only the ABI host imports, bounded fuel/memory/output, and
 parent timeout. On Linux the worker is also confined by `a206-sandbox`
 (`runtime::sandbox::Confined`): bubblewrap namespaces with no network, a mount view
 of the system libraries, this executable and an empty private directory, and a
-Landlock allowlist that leaves nothing executable but this executable. A missing
-layer fails the call. On macOS the worker is still only interpreter-sandboxed and
+Landlock allowlist that leaves nothing executable but this executable. On macOS
+the same profile becomes a Seatbelt policy applied by `sandbox-exec` before the
+worker starts: system libraries, this executable and the private directory only,
+no network and nothing else to execute. A missing layer or `sandbox-exec` fails
+the call. On Windows the worker is still only interpreter-sandboxed and
 process-separated. Only the bundled capability-free
 extension can be launched in this build.
 

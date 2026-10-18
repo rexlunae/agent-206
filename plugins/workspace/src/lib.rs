@@ -1,9 +1,12 @@
 //! Bundled workspace extension. Every file access is a host call that the
 //! gateway authorizes against the caller's `read_workspace` grant.
 use a206_extension_sdk::{
-    Args, DirEntry, EntryKind, Extension, Field, GuestError, Node, Tone, ToolOutput, UiEvent, View,
-    bool_arg, excerpt, host, int_arg, string_arg,
+    Args, DirEntry, EntryKind, Extension, Field, FileChange, FilePatch, GuestError, Node,
+    PatchResult, SearchOptions, Tone, ToolOutput, UiEvent, View, bool_arg, excerpt, host, int_arg,
+    string_arg,
 };
+
+mod patch;
 
 struct Workspace;
 a206_extension_sdk::export!(Workspace);
@@ -13,6 +16,7 @@ const SHOW_HIDDEN: &str = "show_hidden";
 const TOGGLE_HIDDEN: &str = "toggle-hidden";
 const README_LINES: usize = 40;
 const DEFAULT_MATCHES: i64 = 100;
+const DEFAULT_FOUND: i64 = 200;
 
 impl Extension for Workspace {
     fn tool(name: &str, args: &Args) -> Result<ToolOutput, GuestError> {
@@ -36,7 +40,13 @@ impl Extension for Workspace {
                 let path = string_arg(args, "path")?.unwrap_or(".");
                 let max = int_arg(args, "max_matches")?.unwrap_or(DEFAULT_MATCHES);
                 let max = u32::try_from(max.clamp(1, 500)).unwrap_or(1);
-                let found = host::search(path, query, max)?;
+                let options = SearchOptions {
+                    regex: bool_arg(args, "regex")?.unwrap_or(false),
+                    ignore_case: bool_arg(args, "ignore_case")?.unwrap_or(false),
+                    include: string_arg(args, "include")?,
+                    include_ignored: bool_arg(args, "include_ignored")?.unwrap_or(false),
+                };
+                let found = host::search_pattern(path, query, options, max)?;
                 let mut lines: Vec<String> = found
                     .matches
                     .iter()
@@ -47,6 +57,32 @@ impl Extension for Workspace {
                 }
                 if found.truncated {
                     lines.push("[more matches may exist; the search stopped at a limit]".into());
+                }
+                Ok(ToolOutput {
+                    text: excerpt(lines.join("\n")),
+                })
+            }
+            "find_files" => {
+                let pattern = required(args, "pattern")?;
+                let path = string_arg(args, "path")?.unwrap_or(".");
+                let max = int_arg(args, "max_results")?.unwrap_or(DEFAULT_FOUND);
+                let max = u32::try_from(max.clamp(1, 1000)).unwrap_or(1);
+                let ignored = bool_arg(args, "include_ignored")?.unwrap_or(false);
+                let found = host::find_including(path, pattern, ignored, max)?;
+                let mut lines: Vec<String> = found
+                    .entries
+                    .iter()
+                    .map(|entry| match entry.kind {
+                        EntryKind::Directory => format!("{}/", entry.path),
+                        EntryKind::Symlink => format!("{} (link)", entry.path),
+                        _ => entry.path.clone(),
+                    })
+                    .collect();
+                if lines.is_empty() {
+                    lines.push("nothing matches".into());
+                }
+                if found.truncated {
+                    lines.push("[more entries may match; the walk stopped at a limit]".into());
                 }
                 Ok(ToolOutput {
                     text: excerpt(lines.join("\n")),
@@ -76,6 +112,13 @@ impl Extension for Workspace {
                 Ok(ToolOutput {
                     text: format!("edited {path}"),
                 })
+            }
+            "apply_patch" => {
+                let files = patch::parse(required(args, "patch")?)
+                    .map_err(|error| GuestError::new("invalid_patch", error.to_string()))?;
+                let check_only = bool_arg(args, "check_only")?.unwrap_or(false);
+                let result = host::patch_files(files.clone(), check_only)?;
+                patched(&files, result, check_only).map(|text| ToolOutput { text })
             }
             _ => Err(GuestError::new("unknown_tool", format!("no tool `{name}`"))),
         }
@@ -148,6 +191,49 @@ impl Extension for Workspace {
         }
         Ok(View { nodes })
     }
+}
+
+/// What a patch did, or why it stopped: a failure says which files were
+/// already written, so the agent never takes a partial patch for none.
+fn patched(
+    files: &[FilePatch],
+    result: PatchResult,
+    check_only: bool,
+) -> Result<String, GuestError> {
+    let describe = |file: &FilePatch| {
+        let (create, change, delete) = if check_only {
+            ("create", "change", "delete")
+        } else {
+            ("created", "changed", "deleted")
+        };
+        match (file.change, file.hunks.len()) {
+            (FileChange::Create, _) => format!("{create} {}", file.path),
+            (FileChange::Modify, 1) => format!("{change} {} (1 hunk)", file.path),
+            (FileChange::Modify, hunks) => format!("{change} {} ({hunks} hunks)", file.path),
+            (FileChange::Delete, _) => format!("{delete} {}", file.path),
+        }
+    };
+    if let Some(failed) = result.failed {
+        let written = if result.changed.is_empty() {
+            "No file was changed.".to_string()
+        } else {
+            format!(
+                "Already changed: {}. The files after {} were not changed.",
+                result.changed.join(", "),
+                failed.path
+            )
+        };
+        return Err(GuestError::new(
+            failed.failure.code.as_str(),
+            format!("{}: {} {written}", failed.path, failed.failure.message),
+        ));
+    }
+    let done: Vec<String> = files.iter().map(describe).collect();
+    Ok(if check_only {
+        format!("the patch applies and would: {}", done.join("; "))
+    } else {
+        done.join("; ")
+    })
 }
 
 fn sort(entries: &mut [DirEntry]) {

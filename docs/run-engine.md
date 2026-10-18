@@ -52,6 +52,44 @@ after the report is logged, so tool output never reaches the logs. Budget exhaus
 with a `PermissionDenied` report; cancellation leaves it `Cancelled`. A gateway
 restart cancels unfinished calls and drops pending approvals.
 
+### Pausing a run
+
+`PauseRun { thread }` holds a conversation's native run, and the native runs of
+every conversation it delegated to, before their next model round, the same
+boundary steered messages join at (composer Pause, the command palette or
+`agent206 pause THREAD`). A round already under way finishes first: its reply,
+tool calls and approvals are not interrupted. A round looks for a pause when it
+starts, before an automatic compaction, and last just before its model request,
+so a pause made while the round lists its tools or compacts still holds that
+request; one made after the request is sent holds the round after it. While a
+run waits, its
+conversation is marked `held`, so clients show it as paused, or as waiting on a
+paused parent. `ResumeRun` lets it continue; `CancelRun` still ends it. A pause
+is refused with a conflict when no native run is going (a manual compaction is
+not one), and is lifted when the
+run ends or the gateway restarts. Agents cannot pause or resume runs.
+
+### Steering a run
+
+`Steer { thread, text }` adds a message to a native run while it works, from the
+composer (Enter while the response runs), `agent206 steer THREAD TEXT` or a
+parent's `subagent_send`. It is refused with a conflict when the conversation
+has no native run taking messages (none is going, it is ending, or it belongs to
+another coding engine) and is sized like `Send`, room for its reply included.
+The message waits in `Thread::steering` and joins the conversation as an
+ordinary user message at the start of the next round: after the cancellation and
+storage checks and before the compaction check, so it is counted and never
+summarized away, and never between a reply and its tool results. A run whose
+model has just answered without tool calls continues for a message waiting then,
+within its round budget. The run stops taking messages in the same critical
+section in which it finds none waiting, so a message is either answered or
+refused. Messages left when a run fails or is cancelled, or when the gateway
+restarts, stay in the conversation after its outcome (a failure's report
+included) rather than being dropped. A message steered while the run's last
+round answers cannot be answered within the round budget, so the run fails
+with the typed round-budget error and the message follows it. A run whose start
+cannot be saved is withdrawn, so it takes no messages and cannot be cancelled.
+
 ## Permissions
 
 `Thread::tool_permissions` holds the user's Allow/Ask/Deny per model-facing tool
@@ -64,15 +102,22 @@ ceiling. A delegated conversation cannot be set above its parent, and a parent
 narrowed later narrows its descendants at their next decision.
 
 Withdrawn authority also stops work in flight. `SetToolPermission`,
-`ConfigureThread`, `SetBackend`, `GrantExtension` and `EnableExtension` wake
-every run, which re-decides its running call and its pending approval against
-the conversation and its ancestors, and lists the tools again to confirm the
-call's host still offers that tool with the same capabilities (an extension
-the user disabled or ungranted no longer does). A running call that is no
+`ConfigureThread`, `SetBackend`, `GrantExtension`, `EnableExtension`,
+`DisconnectMcpServer` and a `SaveSettings` that changes, disables or removes an
+MCP server entry wake every run, which re-decides its running call and its
+pending approval against the conversation and its ancestors, and lists the tools
+again to confirm the call's host still offers that tool with the same
+capabilities (an extension the user disabled or ungranted, or an MCP server the
+user disconnected or disabled, no longer does). A running call that is no
 longer permitted (Deny, or Ask for a call the user did not approve, or a tool
 its host withdrew) is dropped, which stops it, and is settled `Denied` with a
-`PermissionDenied` report; a pending approval whose tool is now denied ends with
-`ApprovalResolved { outcome: Revoked }`. The run continues with the refusal as
+`PermissionDenied` report. Withdrawing a host can end its call before the run
+sees the change (a disconnected server's session closes), so these commands
+signal before they stop any work, and a call that fails while a change is still
+unseen is checked the same way before its failure is recorded: if the tool is
+no longer permitted, the withdrawal is reported. A call that fails with no
+change pending (a server that crashed) keeps its own failure. A pending approval
+whose tool is now denied ends with `ApprovalResolved { outcome: Revoked }`. The run continues with the refusal as
 that call's result.
 
 `Thread::tool_budget` limits model rounds per run (at least one) and tool calls
@@ -80,6 +125,21 @@ decided per run; both are capped at 256 and a delegated conversation cannot be
 set above its parent. The budget enforced at each check is, for rounds and for
 calls independently, the smallest of the conversation's and every ancestor's
 current budget.
+
+`ToolBudget::tokens` optionally limits a run's model tokens: input plus output
+as the provider reports them, summed over every request of the run, automatic
+summaries included (what the run is billed for, not what the context holds).
+The smallest limit along the delegation chain applies, and a delegated
+conversation needs a limit no higher than its parent's whenever the parent has
+one, so a parent's token budget bounds each subagent. A run is checked after
+each request and again, against the current limit, before each further round:
+when no further request fits (`used ≥ limit`), its pending calls are stopped
+and it fails with `PermissionDenied` (`RunError::Tokens`), so a limit lowered
+while a call runs or waits for approval stops the next request. A final reply
+that crosses a known limit still completes. With a limit set, usage a provider
+leaves unknown fails the run (`RunError::UsageUnknown`), even after a final
+reply, which is kept, instead of letting it run or end unmeasured. CLI: `tools budget THREAD --rounds R --tool-calls C
+[--tokens T]`.
 
 Commands: `ListTools`, `SetToolPermission`, `SetToolBudget`, `ResolveApproval`.
 CLI: `agent206 tools list|permit|budget` and `agent206 approvals list|approve|deny`.
@@ -123,7 +183,10 @@ pub trait ToolHost: Send + Sync + 'static {
 Hosts are added with `Gateway::with_tool_host`. Names are model-facing and
 namespaced by the host (1–64 of `[A-Za-z0-9_-]`); a name two hosts offer is
 offered by neither. Schemas must be object schemas (32 KiB at most). Results are
-capped at 64 KiB with a declared truncation. Dropping a `call` future cancels the
+capped at 64 KiB, or at the conversation's remaining storage, with a declared
+truncation. A tool whose `ToolSpec::whole_output` is set (output only useful
+complete, such as instruction text) is instead settled `Failed` with a
+`Storage` report when its output does not fit, and none of it is kept. Dropping a `call` future cancels the
 call, so a host must stop the work it started. A host failure is an `ErrorReport`
 so its kind and causes survive the process boundary.
 
@@ -133,8 +196,9 @@ exact call.
 
 ### Native exec
 
-`ExecHost` (`crates/runtime/src/exec_tool.rs`) is registered by `Gateway::open`
-and offers one tool, `execute_command`.
+`ExecHost` (`crates/runtime/src/exec_tool/`) is registered by `Gateway::open`
+and offers `execute_command`, plus `process` and `process_write` for
+background sessions.
 
 - **Policy.** The spec declares only `Execute` and the host policy is `Ask`, so
   the tool is offered only to conversations granted Execute and every call
@@ -143,29 +207,119 @@ and offers one tool, `execute_command`.
   and Execute before starting anything, even on a direct call.
 - **Arguments.** `command` (run with `sh -c`, 1 byte to 16 KiB, no NUL),
   optional `working_dir` relative to the project root (no `..`, absolute paths
-  or symlinks leading out) and `timeout_secs` (1–600, default 30). Anything
-  else, including unknown keys, is `InvalidRequest` before anything starts.
-- **Sandbox.** On Linux the command runs under `a206-sandbox` (bubblewrap
-  namespaces plus Landlock inside), with `/usr/bin` and `/bin` executable. The
+  or symlinks leading out), `timeout_secs` (1–600, default 30) and
+  `background` (then 1–3600, default 600). Anything else, including unknown
+  keys, is `InvalidRequest` before anything starts.
+- **Sandbox.** The command runs under `a206-sandbox`: bubblewrap namespaces
+  plus Landlock inside on Linux, a generated Seatbelt policy applied by
+  `sandbox-exec` on macOS. Both come from one profile, with `/usr/bin` and
+  `/bin` executable, plus the program directories the user chose (below). The
   project is mounted only with `ReadWorkspace` and is writable only with
   `WriteWorkspace`; the host network is shared only with `Network`; gateway
   state and the credential stores under `$HOME` stay hidden even inside the
   project. A project equal to or inside protected state is refused. Without project access the command starts in an empty private
-  directory. The environment holds only a private `HOME`, `TMPDIR`, a fixed
-  `PATH` (`/usr/bin:/bin`) and `LANG`; stdin is empty.
+  directory. The environment holds only a private `HOME`, `TMPDIR`, `PATH`
+  (each program directory's `bin`, or the directory itself without one, then
+  `/usr/bin:/bin`) and `LANG`; a foreground command's stdin is empty.
+- **Program directories** (`exec_tool/programs.rs`). The user lists extra
+  directories, such as a Homebrew prefix or a toolchain, in the gateway
+  setting `program_directories` (the Modes settings page or
+  `agent206 settings --apply`). Saving checks each is an absolute, existing
+  directory, not inside gateway state or a hidden credential store, not
+  containing the home directory or gateway state, without `:` (it separates
+  `PATH` entries), and listed once, then stores it canonicalized. Entries
+  already saved are kept as they are, so a toolchain that is gone for now
+  does not block unrelated settings edits. Each command checks them again as it starts and
+  mounts them read-only and executable, with hidden paths inside them
+  covered as in a project, and mounted before the grants so a broader one
+  cannot hide them. A directory that overlaps a writable project or the
+  command's private scratch directory in either direction is refused with
+  `Conflict` (the command could write programs and run them); a read-only
+  project inside one is allowed. Removing a
+  directory stops background sessions that were given it. MCP servers and
+  external backends do not get them.
 - **Results.** The text is the exit status, then stdout and stderr, each cut
   to `MAX_STREAM` UTF-8 bytes after lossy conversion, with a marker; the rest is read and dropped so a
   chatty command cannot stall. A non-zero exit is `is_error`. A command still
   running at its timeout is killed and reported as a `Timeout` error.
   The deadline includes sandbox startup and readiness, as well as execution.
-- **Cancellation.** Dropping the call kills the sandbox's process group; the
-  sandbox's PID namespace ends with it, taking every descendant along.
-- **Other platforms.** The tool is not offered; the listing reports
+- **Cancellation.** Dropping the call kills the sandbox's process group; on
+  Linux the sandbox's PID namespace ends with it, taking every descendant
+  along. macOS has no PID namespace, so the group is also killed as soon as
+  the shell exits; a process that leaves the group with `setsid`, or one
+  being forked at the moment the group is killed, can outlive the call
+  there, still confined by the same policy.
+- **Background sessions** (`exec_tool/sessions.rs`). With `background` the
+  call returns a session id once the sandbox is up (a sandbox failure still
+  reaches the call), and the command keeps running under the same profile
+  until it exits, is killed, reaches its timeout or the host is dropped with
+  the gateway. Its stdin is a pipe only in this mode. A session belongs to the
+  conversation that started it: any other conversation, a subagent included,
+  gets `NotFound` for it, as for an unknown id. `process` (Execute, host
+  policy Allow) lists sessions by id and status (not command text, which may
+  hold what the conversation should not see again) and polls, kills or
+  removes one; `poll` drains the output written since the last poll, keeping
+  at most `MAX_STREAM` unread bytes per stream and counting what it drops.
+  Each stream's text in one poll stays within `MAX_STREAM` even when invalid
+  UTF-8 is replaced; what does not fit waits for the next poll. A failure to
+  read a stream is reported by every later poll as an error. `process_write`
+  (Execute, host policy Ask, so every input is approved like a command)
+  writes at most 64 KiB and optionally closes stdin. One 5 s deadline covers
+  queueing and writing; past it the call is a `Timeout`, the input is
+  withdrawn (a part already written stays written, as the error says), and
+  a finished session is a `Conflict`. A conversation holds at most 8 sessions
+  and the host 64; a new one removes the conversation's oldest finished
+  session only once its own sandbox has started, never a running one or
+  another conversation's output, and is otherwise refused with `Conflict`.
+  When the user changes a conversation's mode or backend grants, the gateway
+  asks every tool host to rescope (`ToolHost::rescope`): a session whose
+  sandbox holds a capability (Execute, ReadWorkspace, WriteWorkspace,
+  Network) or project the conversation, or one of its ancestors, no longer
+  grants is stopped and reported as such, and a command still starting is
+  stopped with `PermissionDenied`. Because a call runs with the scope taken
+  when it started, the gateway rescopes again when a call returns after
+  policy changed during it.
+- **Terminal sessions.** `background` with `terminal: true` runs the command
+  on a pseudo-terminal the gateway opens (`exec_tool/terminal.rs`, 80x24,
+  `TERM=dumb`): its stdin, stdout and stderr are the terminal, which is also
+  its controlling terminal, so programs that need a terminal run and the
+  line discipline turns Ctrl-C and Ctrl-Z into signals for the command's
+  process group. On Linux the sandbox helper starts its own session inside
+  bubblewrap's, takes the terminal as controlling terminal and hands the
+  foreground to the command's group (`a206-sandbox` `helper.rs`); bubblewrap
+  and the helper still report setup failures on a separate pipe, shown in a
+  poll as `sandbox` output only when there is any. On macOS a launcher in
+  this executable starts the session and takes the terminal before it
+  becomes `sandbox-exec` (`terminal.rs`); the Seatbelt policy adds only that
+  terminal device and `/dev/tty`, and Landlock on Linux adds only `/dev/tty`,
+  with the device-control right so a program can configure the terminal it
+  opens there.
+  `poll` returns the terminal's output, echoed input included, as one
+  `terminal` stream with the same bounds. `process_write` then also takes
+  `keys`, a list of at most 256 key names sent after `data` (Enter as a
+  carriage return, Tab, Escape, Space, Backspace, Delete, Insert, arrows,
+  Home, End, PageUp, PageDown, F1–F12, Ctrl-A–Z and Ctrl-@ [ \ ] ^ _, names
+  as in RustyClaw's `send_keys`); an unknown name is refused rather than
+  typed as text. Keys sent to a session without a terminal, and `close` on
+  one with a terminal (send Ctrl-D instead), are `Conflict`. On macOS the
+  terminal's controlling side is opened without close-on-exec and marked
+  so immediately after, so a program the gateway starts in that instant can
+  inherit it; Linux opens it close-on-exec.
+- **Other platforms.** Windows does not offer these tools; the listing reports
   `native exec` unavailable rather than run commands unconfined.
 
 Tests: `crates/runtime/tests/native_exec.rs` drives the host through the real
-sandbox (grants, hidden state, symlinked working directories, network, exit
-status, output and time bounds); the test binary doubles as the helper.
+sandbox on Linux and macOS CI (grants, hidden state, symlinked working
+directories, network, exit status, output and time bounds, leftover
+background processes; background sessions' input, output, ownership, kill,
+timeout, limits, input deadlines, stopping on a withdrawn grant and end
+with their host; terminal sessions' terminal streams, size read through a `/dev/tty`
+opened in the sandbox,
+text and keys, refused close and Ctrl-C interrupting the command, checked
+to fail when the command's group is not given the foreground; on Linux the
+test binary doubles as
+the helper), and
+`crates/sandbox/src/seatbelt.rs` tests the macOS policy text on every platform.
 
 ### WASM extensions
 
@@ -219,20 +373,367 @@ status, output and time bounds); the test binary doubles as the helper.
 Tests: `crates/runtime/src/extension_tools/tests.rs` (listing, naming,
 conversion, checks before the worker) and `crates/runtime/tests/extension_tools.rs`
 (native runs through the real worker; the test binary doubles as the worker).
+`crates/runtime/tests/memory_tools.rs` does the same for the bundled memory
+extension: nothing offered or callable without the user's grant, search and
+get confined to memory files, and saving only with the separate write grant.
 
-### Adapters still to write
+### Subagents
 
-- MCP client (PR #16): `list` maps `Gateway::mcp_offers(thread)` to specs named
-  `mcp__<server>__<tool>` with the server's per-tool policy as
-  `ToolSpec::permission` and the server's declared capabilities as
-  `ToolSpec::capabilities`, and `unavailable` servers to `UnavailableTools`.
-  `call` passes `Approval::Approved` when `request.approved` and flattens
-  `a206_mcp::ToolOutput` content blocks to text, keeping `is_error`.
+`crate::delegation_tool` offers `subagent_spawn`, `subagent_send`,
+`subagent_list`, `subagent_status`, `subagent_wait` and `subagent_cancel`
+(RustyClaw's `sessions_spawn/send/list/history/kill`). They are listed only to
+conversations the user gave subagent models, and, like every tool, are denied
+until the user permits them on that conversation.
 
-It needs only the gateway handle it wraps; the run engine is unchanged.
+- A subagent is an ordinary delegated thread created through `CreateSubagent`:
+  its model must be in the caller's subagent model set (default: the caller's
+  own model when permitted, or the only permitted one), and its grant is the
+  caller's grant ∩ the requested capabilities ∩ its mode's ceiling.
+- It starts with the caller's tool permissions except the subagent tools, and
+  no subagent models, so it cannot delegate further unless the user configures
+  that. Decisions still take the minimum along the delegation chain, so a later
+  change to the parent's permissions or budget applies to the child at once.
+- A model addresses only its own conversation's direct subagents. A conversation
+  descended from 3 others cannot spawn, and at most 8 of a conversation's
+  subagents run at once.
+- `subagent_send` to a subagent whose run is going steers it (`Steer`);
+  otherwise `subagent_spawn` and `subagent_send` start the run in the background through
+  `Send`, so it is admitted, journaled and shown like any other run, approvals
+  included; a message the gateway refuses is reported by `subagent_status`.
+  `subagent_wait` waits at most 600 seconds and is cancel-safe; it follows a
+  run the user started in the subagent's thread too, re-reading it every
+  250 ms.
+- `CancelRun` cancels the thread's run and the runs of every thread delegated
+  from it, whoever started them. A subagent run is reserved under its parent's
+  run token before `subagent_spawn`/`subagent_send` returns, and only that
+  tool's own `Send` admits the run with it (other messages to the subagent
+  neither take nor drop it). Cancelling the parent therefore also cancels a
+  subagent whose run has not been admitted yet.
+
+The host holds a `Delegator`, not the gateway: it can create, message, cancel
+and read subagents and nothing that changes a grant, permission or approval. The
+delegator reaches the gateway's tool hosts through a weak link, so the hosts
+holding it never keep a closed gateway alive. A gateway that gains a tool host
+(`with_tool_host`) gets subagent tools bound to its own host list, so its other
+clones keep theirs. Tests: `crates/runtime/tests/tool_loop.rs` (spawn,
+inherited permissions, wait, cascading cancel, refusals, steering),
+`delegation_tool/tests.rs` and `gateway/delegation/tests.rs` (reservations,
+clones, waiting on user-started runs).
+
+### MCP servers
+
+`McpToolHost` (`crates/runtime/src/mcp_tools.rs`) is registered by `Gateway::open`
+after the extension host. It holds only the gateway's MCP client (server sessions
+and the state they report to), not the gateway: no approvals, runs or vault.
+
+- **Listing.** The tools of every enabled server the user has not disconnected
+  that the conversation may use: `a206_mcp::server_callable` (enabled, the
+  thread's grant covers every capability the server holds, a workspace server is
+  bound to the thread's project) and the server's capabilities within
+  `scope.capabilities`. Other servers are neither listed nor started; one that is
+  starts on first use. A server that fails to start, or whose session ends, is
+  reported in `unavailable` (source `mcp__<server>`) with its start failure as
+  the cause, and the other servers' tools are still listed. If the servers
+  cannot be read at all, the source is `mcp`.
+- **Names.** `mcp__<server>__<tool>`, every character of the tool name outside
+  `[A-Za-z0-9_-]` written as `_`. Server names never contain `_`, so the server is
+  unambiguous; a name that two tools of one server would share is offered for
+  neither (`Conflict` per claimant), and an empty tool name or a name over 64
+  characters is refused (`InvalidRequest`); names are never truncated.
+- **Spec.** The server's JSON Schema (an unparsable one is reported as
+  `Protocol`); the description, else the title; the server's capabilities as
+  `ToolSpec::capabilities`; the entry's per-tool policy (Ask unless configured) as
+  `ToolSpec::permission`. Deny tools are listed so the user sees them, with an
+  effective Deny, and are never offered to a model. Description and schema are
+  untrusted server text, bounded by the catalog checks.
+- **Calls.** Routed by the server's live session under its current entry (a call
+  never starts a server); the host refuses a server capability outside
+  `scope.capabilities` (`PermissionDenied`), then calls `Gateway::call_mcp_tool`,
+  which authorizes the call against the thread's current grant, project and the
+  entry's policy (`Approval::Approved` only when `request.approved`) and is the
+  single enforcement point for MCP authority. Failures stay structured
+  (`GatewayError::Mcp` reports, for example `NotConnected` → `Unavailable`).
+- **Results.** Text blocks are joined with newlines; image, audio, binary resource
+  and link blocks are described, not inlined; structured JSON is used only when a
+  result has no content. An `isError` result is `ToolOutput { is_error: true }`,
+  which the run engine records as a failed call with the tool's text as the
+  report's cause.
+- **Cancellation.** Dropping the call future (run cancelled, authority
+  withdrawn) drops the session request, which sends the server an MCP
+  `notifications/cancelled`; the server's eventual reply is discarded. Losing the
+  thread's authority mid-call also cancels it at the server (`McpError::Revoked`),
+  and changing the server's entry stops its session.
+
+Native-run tests launch no server: the fixture binary belongs to `a206-mcp`, and
+on Linux the launching binary must also serve as the sandbox helper. They serve the
+Rust fixture (`crates/mcp/src/bin/a206-mcp-fixture/server.rs`) in process and attach
+its session with `Gateway::attach_mcp_session`, which exists only with the
+runtime's `test-support` feature (enabled for the runtime's own tests). Tests:
+`crates/runtime/src/mcp_tools/tests.rs` (naming, specs, results, calls through the
+gateway, the scope ceiling, cancellation) and `crates/runtime/tests/mcp_tools.rs`
+(native runs).
+
+## Questions for the user (`ask_user`)
+
+`runtime/src/prompt_tool.rs` is a gateway-internal `ToolHost` offering one tool,
+`ask_user`, with `question` (required), up to 8 distinct `choices` and
+`allow_other` (default true; false needs choices). It uses no capability and,
+like every tool, is denied until the user permits it in a conversation. A call
+pushes a `UserPrompt` onto the thread and journals `PromptRequested`, then waits
+while the call shows as Running. Only `Command::AnswerPrompt { thread, prompt,
+answer }` answers it: the thread must match, the answer (`Choice { index }`,
+`Text`, or `Decline`) must fit the question (`UserPrompt::check`, shared with the
+clients), and a question is answered once. The model receives
+`{"answer": text}`, `{"declined": true}`, or, if the call ends unanswered,
+`{"declined": true, "expired": true}`; it never sees the question's id. Dropping
+the call (cancel, permission withdrawn) withdraws the question with
+`PromptResolved { outcome: Expired }`, and a restart clears pending questions.
+An answer approves nothing. Clients: the conversation's question card
+(`ui/src/prompts.rs`, desktop/web/TUI) and `agent206 prompts`.
+
+## Plans (`plan_update`)
+
+`runtime/src/plan_tool.rs` is a gateway-internal `ToolHost` offering
+`plan_update`, after RustyClaw's `todo` tool. Its one argument, `steps`, is the
+whole checklist in order: up to 50 steps, each `{text, status}` with 1–500 bytes
+of text (trimmed) and a status of `pending`, `in_progress` or `done`. A call
+replaces `Thread::plan` and journals `ThreadChanged`; an empty list clears it.
+A malformed call fails as `InvalidRequest` and leaves the plan as it was, and a
+plan is changed only when the call's result still fits above the run's storage reserve; otherwise the call fails as history full and the plan stays as it was.
+The result is the plan with `done` and `total` counts. Replacing the whole
+plan means a model never edits a step it has not seen. The plan uses no
+capability, grants nothing, and like every tool is denied until the user permits
+it.
+
+The plan stays with the conversation across runs, restarts and compaction. The
+system prompt does not repeat it while a successful `plan_update` remains in the
+history the model receives, so updates do not change the prompt. Once a
+compaction has summarized every such call away, each round's system prompt adds
+a "Current plan" section with the steps and statuses, for as long as the tool is
+offered. Clients: a plan card above the composer in the shared conversation view
+(`ui/src/conversation.rs`, desktop/web/TUI) and `agent206 plan THREAD`.
+
+## Output rules
+
+Before a tool result reaches the model, the run engine passes it through the
+output rules (`crates/output-rules`, after RustyClaw's `tokenjuice`; format in
+[output-rules.md](output-rules.md)). The first matching rule may drop noise
+lines, strip terminal escapes, fold blank runs and keep only the start and end
+of very long output; the reduced text ends with a line naming the rule and how
+many lines it kept. Rules match on the tool name and, for a call with a string
+`command` argument, the program and arguments of the command whose output the
+line produces. Both successful and tool-reported failed results are reduced;
+results only useful whole (`ToolSpec::whole_output`) never are.
+
+The reduced text is the call's `output`: it is what the model and the user see,
+and the original is not kept. `ToolCall::reduction` records the rule, whether
+it is the user's, the original size and the rule's counts, and the tool trace
+says "Shortened for the model by …". Rules ship with the application for
+`execute_command` (git status and diff, cargo, npm/pnpm/yarn installs, ls); the
+user adds, replaces or turns them off with TOML files in the gateway state
+directory's `output-rules/`. Workspace files cannot change what a model sees.
+The rules are read when a run starts; a file that cannot be read or parsed
+fails the run before the model is asked, with the file and the parser's cause
+in the error.
+
+## Credentials in tool results
+
+Before the output rules run, every tool result is passed through
+`crates/leak-scan` (after RustyClaw's `LeakDetector`), which replaces text
+shaped like a credential with `[redacted <kind>]`. The kinds are provider API
+keys (Anthropic, OpenAI, Google, SendGrid, Stripe), AWS access keys, GitHub
+and GitLab tokens, Slack, Telegram and Discord bot tokens, private-key blocks
+(removed whole, to the end of the text when the block is cut off), bearer
+tokens, JWTs and passwords in URLs (only the password: `postgres://user:[redacted
+url_password]@host`). This applies to successful results, failures a tool
+reports, every link of a host failure's report, and whole-output results too,
+so the removed text reaches neither the model nor the stored conversation.
+`ToolCall::redactions` records each kind and how often it was removed, never
+the text, and the tool trace says "Credentials removed before the model saw
+this result". Output rules then see only the cleaned text, and a result a
+rule changed is scanned again, since a rule can join a credential's parts (by
+stripping terminal escapes from inside it).
+
+Matching is by shape, so this is defense in depth: a secret that looks like
+ordinary text is not found, and nothing here replaces keeping credentials in
+the vault. Removal cannot be turned off. The arguments a model writes are not
+scanned (it can only repeat what it already saw), and neither are project
+instruction files, user messages or attachments.
+
+## Text addressed to the model in tool results
+
+A web page, a file or a server's reply can carry text written for the model
+reading it. Every tool result (successful, reported failure or host
+failure, whole-output results included) is checked by `crates/injection-scan`
+(after RustyClaw's `PromptGuard`). Invisible Unicode tag characters go
+first, before credentials are looked for, since they can split a credential
+or a phrase so neither is recognised. Once the result is bounded, the text
+the model will read is scanned for phrases that address the reader: overriding earlier
+instructions ("ignore all previous instructions"), reassigning its role
+("from now on you are", "your new task is"), chat-template turn markers
+(`<|im_start|>`, `[INST]`, `<<SYS>>`), requests for its prompt or
+credentials ("print your system prompt", "send your API keys") and tool-call
+markup. The removed tag characters, which spell out text only a model
+reads, are reported as `hidden_text`; the emoji subdivision flags that use
+them are kept. Text cut off by the output limit is not reported. Nothing else is removed and no result is blocked: when the model
+reads a flagged result it starts with a note naming the kinds and the tool
+and saying to treat the text as data, not instructions. The stored output
+stays the tool's own text, `ToolCall::injection` records each kind and how
+often it was found, and the tool trace says "This result contains text
+addressed to the model". Compaction summaries see the same note.
+
+Matching is by phrase, so it is advisory: wording that avoids the phrases is
+not found, and a document that quotes them is flagged too. It does not
+replace the permission model, which is what keeps a misled model from acting
+beyond its grants.
+
+## Tool-call markup in reply text
+
+Some models write a tool call into their reply text (`<tool_call>…</tool_call>`,
+`<function_calls>`, `<tool_use>`, `<|tool_call|>` and the like) instead of
+using the provider's tool-call channel. Such a call never runs, so native
+replies pass through a streaming filter (`runtime/src/markup.rs`, after
+RustyClaw's `StreamSanitizer`) that removes each block, tags included, before
+clients or the stored conversation see it. A tag split across deltas is still
+found: text that could begin a tag is held until the next delta decides it,
+and held text that never became a tag is the stream's last delta. A block
+the stream never closes is dropped. Markup inside fenced code blocks (closed
+only by a line of nothing but the fence) and inline code (a backtick run
+matched later on its line within 4 KiB of the tag) is left alone, since a reply that explains tool
+calls quotes it there. A reply that held nothing but such markup fails with "the model
+wrote its tool call as text instead of calling the tool" instead of appearing
+empty, and each removal is logged with the number of blocks.
+
+## Context
+
+### Project instruction files
+
+At the start of each native run the gateway reads instruction files from the
+project root when the conversation may read its project: `ReadWorkspace` is in its
+grant within its mode's ceiling and in every ancestor's (the same intersection
+tools get, `ToolScope::capabilities`). Otherwise nothing is read. The reviewed
+list, in prompt order, is `AGENTS.md`, `CLAUDE.md`, `SOUL.md`, `IDENTITY.md`,
+`TOOLS.md` (`crates/runtime/src/instructions.rs`). RustyClaw's `USER.md`,
+`MEMORY.md`, `HEARTBEAT.md` and daily memory files are personal or scheduling state
+and are not read into the prompt; a conversation the user lets use the bundled
+`agent206.memory` tools can search and read `MEMORY.md` and `memory/` on demand.
+
+- Files are opened through cap-std from the project root: absolute paths, `..` and
+  symlinks that leave the project are refused; a symlink within the project is
+  followed. Only regular files are read (FIFOs are opened non-blocking and
+  refused), and only up to the per-file limit: the text included must be UTF-8
+  without NUL, while bytes past the limit are never read or checked.
+- Each file contributes at most 32 KiB and all of them 64 KiB, cut on a character
+  boundary with a note in the prompt; a file whose content repeats an included one
+  (for example `CLAUDE.md` linked to `AGENTS.md`) is skipped.
+- They follow the mode prompt under a "Project instructions" heading that says they
+  cannot grant permissions. They are read once per run.
+- `Thread::instructions` records every file found: `Included`, `Truncated` (with
+  the reason as a report) or `Skipped` (with a structured `ErrorReport`: outside the
+  project, not regular, not text, duplicate, total limit used), its included bytes,
+  size and the SHA-256 of the included text. Missing files are not listed. The
+  desktop/TUI context popover shows it.
+
+### Compaction
+
+`crates/runtime/src/gateway/compaction.rs`. A compaction summarizes a conversation's
+older turns (a turn starts at a user message) with the conversation's own model and
+effort, through `provider::complete` like any request: same broker, credential
+binding and stream checks, no tools offered. The summarizing model gets a text
+transcript (each message at most 8 KiB, tool arguments and results 2 KiB, the whole
+transcript 256 KiB with the earliest messages left out first and said so), with the
+previous summary first.
+
+- **Automatic.** Before each model request of a native run, if the previous
+  request's provider-reported input tokens exceed `COMPACTION_THRESHOLD_PERCENT`
+  (75, a policy choice shared with RustyClaw, not a model fact) of the model's
+  API-reported `ModelInfo::context_limit`, the run compacts everything before the
+  current and the previous turn. Before the first round "previous" is the last
+  request of the previous run. An unknown limit or input count never triggers it.
+  When only those two turns are in context there is nothing to compact and the
+  request is sent as it is (a single turn larger than the window is not reduced).
+- **Manual.** `Command::CompactThread { thread }` compacts a native conversation
+  that is not running, keeping its latest turn, whatever its context usage or
+  limit. It marks the thread `Running` (so `Send` waits and `CancelRun` stops it)
+  with the previous state saved in `Thread::compacting`, restores that state
+  afterwards, or on the next start if the gateway stopped meanwhile, and replies
+  with the thread. Nothing to
+  compact is a `Conflict` before any request. CLI: `agent206 compact THREAD`.
+- **Result.** The summary is inserted as a `Role::System` message with
+  `Message::compaction` (trigger, messages covered, previous summary, input tokens
+  and context limit at the time, the summary request's usage) just before the first
+  kept turn. The covered messages stay in the thread for the user. A model request
+  carries only the latest summary and the messages after it: the summary, after a
+  fixed preamble, is prefixed to the first following user message (so every
+  protocol keeps a user-first, alternating history and the summary never gets
+  system-prompt authority). Since a call and its result live on one assistant
+  message and cuts fall only before user messages, every tool call keeps its
+  result in OpenAI, Anthropic and Gemini form. `Thread::usage` becomes unknown
+  until the next request reports it.
+- **Accounting.** An automatic compaction's usage is added to `Thread::run_usage`;
+  it does not count against the round budget.
+- **Failure and cancellation.** Nothing changes until the summary is complete. A
+  failed summary (`CompactionError::Summary`, with the provider failure as its
+  cause), an empty one, or a conversation that changed meanwhile leaves the history
+  intact: an automatic compaction fails the run with that report, a manual one
+  replies with it. Cancellation (`CancelRun`, shutdown) abandons the summary
+  request and leaves the run `Cancelled` or the manual compaction failed with
+  `Cancelled`.
+- **Memory flush** (`gateway/memory_flush.rs`). When an automatic compaction is
+  due and the round would offer the bundled `memory_save` tool (extension enabled
+  and granted, the conversation's permission not Deny), the gateway first sends one
+  round with the full context and a flush instruction added to that round's system
+  prompt: save lasting notes with `memory_save` (suggesting `memory/YYYY-MM-DD.md`
+  in the gateway's local date), then continue with the user's request. The user's
+  turn is kept; the model answers in the same run. Saves go through the ordinary
+  tool path, so an `Ask` permission asks the user. The compaction then happens
+  before the next round, or at the start of the next run if the model just
+  answered. The flush is offered once per summary: `Thread::memory_flush` records
+  the latest summary when a flush round completes, so restarts and later runs do
+  not repeat it, while a failed or cancelled flush round is offered again. It is
+  offered only when the compaction would summarize at least one turn and the budget
+  leaves a tool call for the save and a round to answer in. The tools offered are
+  listed again after a compaction. Manual compaction has no
+  flush. Follows RustyClaw's `memory_flush.rs`, but triggers at the compaction
+  threshold instead of a fixed token count before it.
+- Compaction does not reduce the conversation's stored size.
+
+Tests: `crates/runtime/tests/context.rs` (scripted OpenAI, Anthropic and Gemini
+streams) and unit tests in `compaction.rs`, `memory_flush.rs` and `instructions.rs`.
+
+## Retrying model requests
+
+`crates/runtime/src/retry.rs`. A model request (a round or a compaction summary) is
+repeated only while nothing of its response has arrived. That covers a connection
+failure or timeout (made directly, or reported by the vault broker for a
+credentialed request), and an HTTP 408, 429, 500, 502, 503, 504 or 529 refusal. Once any
+response bytes are received, the failure is final, so no text or tool call is
+streamed twice. Any other status is also final. A retry repeats the identical
+request to the same provider, model and credential binding: there is no fallback
+to another model or account.
+
+`RetryPolicy::DEFAULT` makes 4 attempts. Its backoff starts at 250 ms, doubles up
+to 8 s and is spread by ±20%, never past the 8 s cap. A `Retry-After` in seconds from a direct
+(uncredentialed) provider is honoured up to 30 s; brokered requests don't carry
+the header, so they use the backoff. These are policy choices, not provider facts.
+While a native round waits to retry, the conversation's activity line says why and
+which attempt comes next, for example "The provider answered HTTP 503; retrying
+(attempt 2 of 4)". The line is cleared when the round ends. `CancelRun` ends the
+wait at once. When the attempts run out, the run fails with the last attempt's
+structured error. Follows RustyClaw's `retry/policy.rs`; auth-profile failover is
+not carried over.
+
+Tests: `crates/runtime/tests/retries.rs` (scripted OpenAI, Anthropic and Gemini
+providers: refusals, attempts, final statuses, broken connections, cancellation)
+and unit tests in `retry.rs`.
 
 ## Not implemented
 
-Leaked tool-markup filtering, schema type coercion and repeat-call warnings from
-RustyClaw's healing; Anthropic thinking-block replay alongside tool results;
-`ask_user` prompts; retries; parallel tool execution.
+Schema type coercion and repeat-call warnings from RustyClaw's healing;
+running a tool call that was written as text; Anthropic thinking-block replay alongside tool results;
+parallel tool execution; RustyClaw's project-layer output rules
+(`<workspace>/.tokenjuice/rules/`) and a way to list or edit output rules from
+the GUI or CLI; credential scanning of instruction files, attachments and
+outbound requests, and user-defined credential shapes; scanning user
+messages, messenger messages, instruction files and attachments for text
+addressed to the model, and blocking or quarantining flagged results.

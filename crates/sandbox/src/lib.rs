@@ -1,6 +1,6 @@
-//! OS isolation for external agent runtimes on Linux.
+//! OS isolation for external agent runtimes and commands on Linux and macOS.
 //!
-//! Two independent layers confine a runtime, and both are required:
+//! On Linux two independent layers confine a runtime, and both are required:
 //!
 //! 1. **Bubblewrap** gives it new user, PID, IPC, UTS, cgroup and network
 //!    namespaces and a mount namespace that holds only the system libraries,
@@ -14,6 +14,11 @@
 //! relays each connection over a Unix socket to the gateway, so the runtime
 //! reaches that proxy and nothing else. Without a proxy it has no network at
 //! all. Only a runtime the user granted network access shares the host's.
+//!
+//! On macOS a [`Profile`] becomes one Seatbelt policy that `sandbox-exec`
+//! applies before the runtime starts (see `seatbelt.rs`), with the same
+//! filesystem grants and hidden paths. A runtime with a credential proxy may
+//! reach that loopback port and nothing else.
 //!
 //! Nothing here downgrades: a missing bubblewrap, a kernel without Landlock or a
 //! policy the layers cannot express is an error, never a weaker sandbox.
@@ -33,10 +38,14 @@ mod gateway;
 mod helper;
 #[cfg(unix)]
 mod profile;
+#[cfg(unix)]
+mod seatbelt;
+#[cfg(target_os = "macos")]
+mod terminal;
 
 #[cfg(unix)]
 pub use elf::interpreter;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub use gateway::Control;
 pub use gateway::StartError;
 #[cfg(unix)]
@@ -44,11 +53,17 @@ pub use profile::{HIDDEN_HOME_PATHS, NetworkAccess, Profile, hidden_home_paths};
 
 /// First argument that turns a process into the in-sandbox helper.
 pub const HELPER_COMMAND: &str = "__a206-sandbox-helper";
+/// First argument that turns a process into the macOS launcher that makes
+/// its stdin its controlling terminal and then runs the rest of its
+/// arguments; see [`Profile::command`].
+pub const TERMINAL_COMMAND: &str = "__a206-sandbox-terminal";
 /// Version of [`Spec`] and [`Status`]; the helper and the gateway are the same
 /// executable, so a mismatch means a corrupted or foreign invocation.
-pub const SPEC_VERSION: u32 = 4;
+pub const SPEC_VERSION: u32 = 5;
 /// Bubblewrap is resolved from this fixed system path, never from `PATH`.
 pub const BUBBLEWRAP: &str = "/usr/bin/bwrap";
+/// macOS's Seatbelt launcher, likewise from its fixed system path.
+pub const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 /// Largest status message the gateway accepts from a helper.
 pub const MAX_STATUS: u64 = 64 * 1024;
 
@@ -63,6 +78,9 @@ pub enum Access {
     Write,
     /// Read and write an existing device such as `/dev/null`.
     Device,
+    /// Read, write and control a terminal device: `Device` plus its ioctls,
+    /// which programs use to configure a terminal they open.
+    Terminal,
 }
 
 /// One Landlock allowlist entry, as a path inside the sandbox.
@@ -103,6 +121,9 @@ pub struct Spec {
     pub status: PathBuf,
     /// Whether the runtime keeps the helper's stderr; otherwise it is null.
     pub stderr: bool,
+    /// The helper's stdin is a terminal that becomes the runtime's
+    /// controlling terminal, and its stdout and stderr.
+    pub terminal: bool,
     pub rules: Vec<Rule>,
 }
 
@@ -140,6 +161,10 @@ pub enum Status {
 pub enum SandboxError {
     #[error("Linux isolation requires bubblewrap at {BUBBLEWRAP}; install the bubblewrap package")]
     Bubblewrap(#[source] std::io::Error),
+    #[error("macOS isolation requires {SANDBOX_EXEC}")]
+    SandboxExec(#[source] std::io::Error),
+    #[error("{} cannot be named in a sandbox policy; use a UTF-8 path without control characters", path.display())]
+    Path { path: PathBuf },
     #[error("could not inspect {} for the sandbox", path.display())]
     Inspect {
         path: PathBuf,
@@ -151,6 +176,21 @@ pub enum SandboxError {
         path.display()
     )]
     Exposed { path: PathBuf },
+    #[error(
+        "program directory {} lies inside {}, which must stay hidden; choose another directory",
+        directory.display(),
+        hidden.display()
+    )]
+    HiddenProgramDirectory { directory: PathBuf, hidden: PathBuf },
+    #[error(
+        "program directory {} overlaps the writable directory {}; programs there could be written by the command",
+        directory.display(),
+        writable.display()
+    )]
+    WritableProgramDirectory {
+        directory: PathBuf,
+        writable: PathBuf,
+    },
     #[error("could not encode the sandbox specification")]
     Encode(#[source] rmp_serde::encode::Error),
     #[error("sandbox specification is not valid base64")]
@@ -185,7 +225,15 @@ pub enum SandboxError {
     Spawn(#[source] std::io::Error),
     #[error("could not wait for the runtime inside the sandbox")]
     Wait(#[source] std::io::Error),
-    #[error("OS isolation for external runtimes is only implemented for Linux here")]
+    #[error("could not make the terminal the runtime's controlling terminal")]
+    Terminal(#[source] std::io::Error),
+    #[error("could not start {}", program.to_string_lossy())]
+    Launch {
+        program: std::ffi::OsString,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("OS isolation for external runtimes is only implemented for Linux and macOS")]
     Unsupported,
 }
 
@@ -193,8 +241,14 @@ impl SandboxError {
     /// The client-facing kind; `None` defers to the I/O cause.
     pub fn kind(&self) -> Option<ErrorKind> {
         Some(match self {
-            Self::Bubblewrap(_) | Self::NotEnforced | Self::Unsupported => ErrorKind::Unavailable,
-            Self::Exposed { .. } => ErrorKind::PermissionDenied,
+            Self::Bubblewrap(_) | Self::SandboxExec(_) | Self::NotEnforced | Self::Unsupported => {
+                ErrorKind::Unavailable
+            }
+            Self::Exposed { .. } | Self::HiddenProgramDirectory { .. } => {
+                ErrorKind::PermissionDenied
+            }
+            Self::WritableProgramDirectory { .. } => ErrorKind::Conflict,
+            Self::Path { .. } => ErrorKind::InvalidRequest,
             Self::Inspect { .. } => return None,
             Self::Encode(_)
             | Self::Base64(_)
@@ -204,9 +258,12 @@ impl SandboxError {
             | Self::NonUtf8Argument => ErrorKind::Protocol,
             #[cfg(target_os = "linux")]
             Self::Landlock(_) | Self::LandlockPath { .. } => ErrorKind::Unavailable,
-            Self::Listen(_) | Self::Report(_) | Self::Spawn(_) | Self::Wait(_) => {
-                ErrorKind::Internal
-            }
+            Self::Listen(_)
+            | Self::Report(_)
+            | Self::Spawn(_)
+            | Self::Wait(_)
+            | Self::Terminal(_)
+            | Self::Launch { .. } => ErrorKind::Internal,
         })
     }
     /// Capture this error and its causes for the gateway.
@@ -217,15 +274,24 @@ impl SandboxError {
     }
 }
 
-/// Run the in-sandbox helper when this process was started as one.
+/// Run the in-sandbox helper, or the macOS terminal launcher, when this
+/// process was started as one.
 ///
 /// Every binary that hosts a gateway calls this first, before it starts
 /// threads, and exits with the returned code. `None` means this is not a
 /// helper invocation. An error is returned only when it could not also be
-/// reported to the gateway, for the binary to print.
+/// reported to the gateway, for the binary to print; the launcher's errors
+/// are all returned, and its stderr is the command's terminal.
 pub fn dispatch() -> Option<Result<std::process::ExitCode, SandboxError>> {
     let mut args = std::env::args_os().skip(1);
-    if args.next()? != HELPER_COMMAND {
+    let command = args.next()?;
+    if command == TERMINAL_COMMAND {
+        #[cfg(target_os = "macos")]
+        return Some(terminal::run(args));
+        #[cfg(not(target_os = "macos"))]
+        return Some(Err(SandboxError::Unsupported));
+    }
+    if command != HELPER_COMMAND {
         return None;
     }
     #[cfg(target_os = "linux")]

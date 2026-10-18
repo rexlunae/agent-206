@@ -116,6 +116,8 @@ impl Store {
                 managed_joshua_provider: None,
                 messengers: vec![],
                 mcp_servers: vec![],
+                jobs: vec![],
+                extension_proposals: vec![],
             }
         };
         let mut store = Self {
@@ -142,9 +144,20 @@ impl Store {
                 ..Default::default()
             })
             .collect();
+        // Before interrupted runs are marked failed, which it reads.
+        crate::schedule::recover(&mut store.state.jobs, &store.state.threads);
         for thread in &mut store.state.threads {
-            // No run survives a restart, so neither do its approvals or calls.
+            // No run survives a restart, so neither do its approvals,
+            // questions or calls.
             thread.approvals.clear();
+            thread.prompts.clear();
+            // Messages steered to the interrupted run stay in the
+            // conversation, after it.
+            let mut steered = std::mem::take(&mut thread.steering);
+            thread.messages.append(&mut steered);
+            // Nor does a pause, which held a run.
+            thread.paused = false;
+            thread.held = false;
             for call in thread.messages.iter_mut().flat_map(|m| &mut m.tool_calls) {
                 if !call.state.is_final() {
                     let report = a206_core::ErrorReport::new(
@@ -156,7 +169,11 @@ impl Store {
                     call.error = Some(report);
                 }
             }
-            if thread.state == RunState::Running {
+            // An interrupted compaction is not a run: the previous run's
+            // outcome stays.
+            if let Some(prior) = thread.compacting.take() {
+                thread.state = prior;
+            } else if thread.state == RunState::Running {
                 thread.state = RunState::Failed;
                 thread.error = Some(a206_core::ErrorReport::new(
                     a206_core::ErrorKind::Unavailable,
@@ -236,6 +253,32 @@ impl Store {
         let rows = stmt.query_map([after], |row| row.get::<_, Vec<u8>>(0))?;
         rows.map(|r| Ok(rmp_serde::from_slice(&r?)?)).collect()
     }
+    /// See [`Command::Activity`](a206_core::Command::Activity). Only the
+    /// retained journal is read, so the oldest page ends where the journal does.
+    pub fn activity(&self, before: Option<u64>, limit: u32) -> Result<ActivityPage> {
+        // A page always holds at least one event, so a page that says older
+        // activity remains also carries the cursor to reach it.
+        let limit = usize::try_from(limit.clamp(1, MAX_ACTIVITY)).unwrap_or(1);
+        let before = before.unwrap_or(self.state.last_event.saturating_add(1));
+        let mut stmt = self
+            .db
+            .prepare("SELECT payload FROM events WHERE seq < ?1 ORDER BY seq DESC")?;
+        let mut rows = stmt.query([before])?;
+        let mut events = Vec::with_capacity(limit);
+        let mut more = false;
+        while let Some(row) = rows.next()? {
+            let event: Event = rmp_serde::from_slice(&row.get::<_, Vec<u8>>(0)?)?;
+            if event.kind.is_progress() {
+                continue;
+            }
+            if events.len() == limit {
+                more = true;
+                break;
+            }
+            events.push(event);
+        }
+        Ok(ActivityPage { events, more })
+    }
     /// A duplicate pending request is indeterminate, never silently executed a second time.
     pub fn begin(&mut self, id: Id, command: &Command) -> Result<Option<Reply>> {
         let body = rmp_serde::to_vec_named(command)?;
@@ -286,6 +329,14 @@ impl Store {
                 |row| row.get(0),
             )
             .optional()?)
+    }
+    /// Forget everything an extension stored.
+    pub fn clear_extension_state(&mut self, extension: &str) -> Result<()> {
+        self.db.execute(
+            "DELETE FROM extension_state WHERE extension=?1",
+            params![extension],
+        )?;
+        Ok(())
     }
     /// Replace or delete one entry, refusing writes past `quota`.
     pub fn put_extension_state(
@@ -347,24 +398,62 @@ pub enum StatePut {
 
 /// Summaries of the bundled extensions, keeping the user's enable choice and
 /// only those grants the current manifest still requests: an update never
-/// inherits a newly requested capability.
+/// inherits a newly requested capability. Installed extensions follow
+/// unchanged, unless a bundled one now has their id.
 fn bundled_plugins(previous: &[PluginSummary]) -> Result<Vec<PluginSummary>> {
-    Ok(a206_extensions::builtins()
-        .map_err(StoreError::Builtin)?
+    let builtins = a206_extensions::builtins().map_err(StoreError::Builtin)?;
+    let mut plugins: Vec<PluginSummary> = builtins
         .iter()
         .map(|builtin| {
-            let earlier = previous.iter().find(|p| p.id == builtin.manifest.id);
+            let earlier = previous.iter().find(|p| {
+                p.id == builtin.manifest.id && p.source == a206_core::PluginSource::Bundled
+            });
             builtin.manifest.summary(
                 earlier.is_none_or(|p| p.enabled),
                 &earlier.map(|p| p.granted.clone()).unwrap_or_default(),
             )
         })
-        .collect())
+        .collect();
+    let installed: Vec<PluginSummary> = previous
+        .iter()
+        .filter(|p| {
+            matches!(p.source, a206_core::PluginSource::Installed { .. })
+                && !plugins.iter().any(|b| b.id == p.id)
+        })
+        .cloned()
+        .collect();
+    plugins.extend(installed);
+    Ok(plugins)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn reopening_keeps_installed_extensions_but_not_over_bundled_ids() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = Store::open(directory.path()).unwrap();
+        let bundled = store.state.plugins[0].clone();
+        let installed = |id: &str| PluginSummary {
+            id: id.into(),
+            enabled: true,
+            source: a206_core::PluginSource::Installed {
+                digest: Id::new_v4().simple().to_string(),
+            },
+            ..bundled.clone()
+        };
+        let kept = installed(&format!("test.{}", Id::new_v4().simple()));
+        // A bundled extension that now has an installed extension's id wins.
+        store.state.plugins.push(kept.clone());
+        store.state.plugins.push(installed(&bundled.id));
+        store.persist(None).unwrap();
+        drop(store);
+        let restored = Store::open(directory.path()).unwrap();
+        let plugins = &restored.state.plugins;
+        assert!(plugins.contains(&kept));
+        assert_eq!(plugins.iter().filter(|p| p.id == bundled.id).count(), 1);
+        assert!(plugins.contains(&bundled));
+    }
     #[test]
     fn restart_retires_only_the_owned_joshua_connection() {
         let directory = tempfile::tempdir().unwrap();
@@ -388,8 +477,34 @@ mod tests {
         assert_eq!(restored.state.settings.revision, 1);
     }
     #[test]
-    fn restart_expires_approvals_and_cancels_unfinished_tool_calls() {
-        use a206_core::{ApprovalRequest, Message, Mode, Role, Thread, ToolCall, ToolCallState};
+    fn restart_keeps_messages_steered_to_an_interrupted_run_after_it_and_lifts_its_pause() {
+        use a206_core::{CodingBackend, Message, Mode, Role, Thread};
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = Store::open(directory.path()).unwrap();
+        let mut thread = Thread::new(Id::new_v4().to_string(), Mode::Chat);
+        thread.state = RunState::Running;
+        let message = |text: String| Message::new(Role::User, text, 0, CodingBackend::Native);
+        let earlier = message(Id::new_v4().to_string());
+        let steered = message(Id::new_v4().to_string());
+        thread.messages.push(earlier.clone());
+        thread.steering.push(steered.clone());
+        (thread.paused, thread.held) = (true, true);
+        let id = thread.id;
+        store.state.threads.push(thread);
+        store.persist(None).unwrap();
+        drop(store);
+        let restored = Store::open(directory.path()).unwrap();
+        let thread = restored.thread(id).unwrap();
+        assert_eq!(thread.state, RunState::Failed);
+        assert!(thread.steering.is_empty());
+        assert_eq!(thread.messages, vec![earlier, steered]);
+        assert!(!thread.paused && !thread.held);
+    }
+    #[test]
+    fn restart_expires_approvals_and_questions_and_cancels_unfinished_tool_calls() {
+        use a206_core::{
+            ApprovalRequest, Message, Mode, Role, Thread, ToolCall, ToolCallState, UserPrompt,
+        };
         let directory = tempfile::tempdir().unwrap();
         let mut store = Store::open(directory.path()).unwrap();
         let mut thread = Thread::new(Id::new_v4().to_string(), Mode::Chat);
@@ -405,6 +520,9 @@ mod tests {
             output: None,
             error: None,
             signature: None,
+            reduction: None,
+            redactions: Vec::new(),
+            injection: Vec::new(),
         };
         message.tool_calls = vec![
             call(ToolCallState::AwaitingApproval),
@@ -421,6 +539,14 @@ mod tests {
             capabilities: Default::default(),
             requested_at: 0,
         });
+        thread.prompts.push(UserPrompt {
+            id: Id::new_v4(),
+            call: Id::new_v4().to_string(),
+            question: Id::new_v4().to_string(),
+            choices: vec![],
+            other: true,
+            requested_at: 0,
+        });
         thread.messages.push(message);
         thread.state = RunState::Running;
         let id = thread.id;
@@ -430,6 +556,7 @@ mod tests {
         let restored = Store::open(directory.path()).unwrap();
         let thread = restored.thread(id).unwrap();
         assert!(thread.approvals.is_empty());
+        assert!(thread.prompts.is_empty());
         let states: Vec<_> = thread.messages[0]
             .tool_calls
             .iter()
@@ -440,6 +567,45 @@ mod tests {
             vec![ToolCallState::Cancelled, ToolCallState::Succeeded]
         );
         assert!(thread.messages[0].tool_calls[0].error.is_some());
+    }
+    #[test]
+    fn restart_during_a_compaction_restores_the_previous_run_state() {
+        use a206_core::{Mode, Thread};
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = Store::open(directory.path()).unwrap();
+        let report =
+            a206_core::ErrorReport::new(a206_core::ErrorKind::Storage, Id::new_v4().to_string());
+        let mut ids = vec![];
+        // A compaction of a completed and of a failed conversation, and a run.
+        for (prior, compacting) in [
+            (RunState::Complete, true),
+            (RunState::Failed, true),
+            (RunState::Complete, false),
+        ] {
+            let mut thread = Thread::new(Id::new_v4().to_string(), Mode::Chat);
+            thread.state = RunState::Running;
+            if compacting {
+                thread.compacting = Some(prior.clone());
+                thread.error = (prior == RunState::Failed).then(|| report.clone());
+            }
+            ids.push(thread.id);
+            store.state.threads.push(thread);
+        }
+        store.persist(None).unwrap();
+        drop(store);
+        let restored = Store::open(directory.path()).unwrap();
+        let state = |i: usize| restored.thread(ids[i]).unwrap();
+        assert_eq!(state(0).state, RunState::Complete);
+        assert_eq!(state(0).error, None);
+        assert_eq!(state(0).compacting, None);
+        assert_eq!(state(1).state, RunState::Failed);
+        assert_eq!(state(1).error, Some(report));
+        // A run in progress is still reported as interrupted.
+        assert_eq!(state(2).state, RunState::Failed);
+        assert_eq!(
+            state(2).error.as_ref().unwrap().kind,
+            a206_core::ErrorKind::Unavailable
+        );
     }
     #[test]
     fn pending_replays_reference_their_request() {

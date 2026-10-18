@@ -7,7 +7,10 @@ use crate::{
     PREVIEW_VERSION, Preview, ProviderAction, ProviderImport, Result, Tool, Unsupported,
     UnsupportedMessenger, UnsupportedProvider, VaultPlan, VaultProtection, VaultSource,
 };
-use a206_core::messengers::{MAX_ALLOWED_CHATS, valid_field, valid_name};
+use a206_core::messengers::{
+    IRCS_PORT, IrcServer, MAX_ALLOWED_CHATS, irc_lowercase, valid_field, valid_irc_channel,
+    valid_irc_nick, valid_name,
+};
 use a206_core::{MessengerKind, ProviderApi, ProviderPreset, Settings};
 use serde::Deserialize;
 use serde::de::IgnoredAny;
@@ -55,7 +58,7 @@ struct Config {
 
 /// The fields of a RustyClaw `[[messengers]]` entry this importer uses. Its
 /// secrets (tokens, passwords, app passwords) are not deserialized; `token`,
-/// `access_token` and `password` are only checked for presence.
+/// `access_token`, `password` and `app_token` are only checked for presence.
 #[derive(Deserialize)]
 struct Messenger {
     #[serde(default)]
@@ -70,9 +73,23 @@ struct Messenger {
     access_token: Option<IgnoredAny>,
     #[serde(default)]
     password: Option<IgnoredAny>,
+    /// Slack's app-level token for Socket Mode.
+    #[serde(default)]
+    app_token: Option<IgnoredAny>,
     /// Matrix homeserver URL.
     #[serde(default)]
     homeserver: Option<String>,
+    /// IRC server host name, port, nickname, channels and whether TLS is on.
+    #[serde(default)]
+    server: Option<String>,
+    #[serde(default)]
+    port: Option<u16>,
+    #[serde(default)]
+    nick: Option<String>,
+    #[serde(default)]
+    irc_channels: Vec<String>,
+    #[serde(default)]
+    use_tls: Option<bool>,
     #[serde(default)]
     allowed_chats: Vec<String>,
     #[serde(default)]
@@ -199,6 +216,10 @@ fn messenger_kind(id: &str) -> Option<MessengerKind> {
     match id {
         "telegram" => Some(MessengerKind::Telegram),
         "matrix" => Some(MessengerKind::Matrix),
+        "discord" => Some(MessengerKind::Discord),
+        "slack" => Some(MessengerKind::Slack),
+        "irc" => Some(MessengerKind::Irc),
+        "signal" => Some(MessengerKind::Signal),
         _ => None,
     }
 }
@@ -252,14 +273,41 @@ fn plan_messengers(settings: &Settings, source: Vec<Messenger>) -> Vec<Messenger
                 }
             }
             claimed.insert(name.clone());
-            let allowed_chats: BTreeSet<String> = messenger.allowed_chats.into_iter().collect();
-            let allowed_users: BTreeSet<String> = messenger.allowed_users.into_iter().collect();
-            let valid = |ids: &BTreeSet<String>| {
-                ids.len() <= MAX_ALLOWED_CHATS && ids.iter().all(|id| valid_field(id))
+            let irc = kind.is_some_and(MessengerKind::is_irc);
+            let mut allowed_chats: BTreeSet<String> = messenger.allowed_chats.into_iter().collect();
+            let mut allowed_users: BTreeSet<String> = messenger.allowed_users.into_iter().collect();
+            if irc {
+                // Channels it joined are allowed chats here, which still
+                // answer only listed senders. Names fold as IRC compares them;
+                // listed nicknames become the services accounts of that name.
+                allowed_chats.extend(messenger.irc_channels);
+                allowed_chats = allowed_chats.iter().map(|c| irc_lowercase(c)).collect();
+                allowed_users = allowed_users.iter().map(|u| irc_lowercase(u)).collect();
+            }
+            let valid = |ids: &BTreeSet<String>, users: bool| {
+                ids.len() <= MAX_ALLOWED_CHATS
+                    && ids.iter().all(|id| match (irc, users) {
+                        (false, _) => valid_field(id),
+                        (true, true) => valid_irc_nick(id),
+                        (true, false) => valid_irc_channel(id) || valid_irc_nick(id),
+                    })
             };
+            // RustyClaw's own default nickname when it names none.
+            let login = irc.then(|| messenger.nick.unwrap_or_else(|| "RustyClaw".to_owned()));
             // A federated service's server, as the origin the gateway would
             // accept; other kinds keep their official endpoint.
             let endpoint = match kind {
+                Some(MessengerKind::Irc) => match (messenger.server, messenger.use_tls) {
+                    (Some(server), Some(true)) => IrcServer::parse(&format!(
+                        "ircs://{server}:{}",
+                        messenger.port.unwrap_or(IRCS_PORT)
+                    ))
+                    .map(|server| Some(server.origin()))
+                    .map_err(|_| UnsupportedMessenger::InvalidEndpoint),
+                    (Some(_), _) => Err(UnsupportedMessenger::PlainTextIrc),
+                    (None, _) => Err(UnsupportedMessenger::InvalidEndpoint),
+                },
+                Some(MessengerKind::Signal) => Err(UnsupportedMessenger::NoSignalDaemon),
                 Some(kind) if kind.default_endpoint().is_none() => messenger
                     .homeserver
                     .as_deref()
@@ -270,11 +318,22 @@ fn plan_messengers(settings: &Settings, source: Vec<Messenger>) -> Vec<Messenger
                 _ => Ok(None),
             };
             let unsupported = if kind.is_none() {
-                Some(UnsupportedMessenger::UnknownKind)
+                Some(
+                    if matches!(
+                        messenger.messenger_type.as_str(),
+                        "whatsapp" | "imessage" | "google_chat"
+                    ) {
+                        UnsupportedMessenger::ThroughBeeper
+                    } else {
+                        UnsupportedMessenger::UnknownKind
+                    },
+                )
             } else if messenger.config_path.is_some() {
                 Some(UnsupportedMessenger::ExternalConfig)
-            } else if !valid(&allowed_chats) || !valid(&allowed_users) {
+            } else if !valid(&allowed_chats, false) || !valid(&allowed_users, true) {
                 Some(UnsupportedMessenger::InvalidChats)
+            } else if login.as_deref().is_some_and(|login| !valid_irc_nick(login)) {
+                Some(UnsupportedMessenger::InvalidLogin)
             } else {
                 endpoint.as_ref().err().copied()
             };
@@ -288,6 +347,7 @@ fn plan_messengers(settings: &Settings, source: Vec<Messenger>) -> Vec<Messenger
                 name,
                 kind,
                 endpoint: endpoint.ok().flatten(),
+                login: login.filter(|_| unsupported.is_none()),
                 // Ids the gateway would refuse are not repeated in the preview.
                 allowed_chats: if unsupported.is_some() {
                     BTreeSet::new()
@@ -301,7 +361,8 @@ fn plan_messengers(settings: &Settings, source: Vec<Messenger>) -> Vec<Messenger
                 },
                 token_left_behind: messenger.token.is_some()
                     || messenger.access_token.is_some()
-                    || messenger.password.is_some(),
+                    || messenger.password.is_some()
+                    || messenger.app_token.is_some(),
                 action,
             }
         })
@@ -826,6 +887,220 @@ homeserver = "https://{host}/matrix"
             home.allowed_chats,
             BTreeSet::from([format!("!{room}:{host}")])
         );
+    }
+
+    #[test]
+    fn discord_bots_arrive_disabled_on_the_official_api_without_their_token() {
+        let (token, channel, user) = (random(), random(), random());
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            &dir.path().join("config.toml"),
+            &format!(
+                r#"
+[[messengers]]
+name = "guild"
+messenger_type = "discord"
+enabled = true
+token = "{token}"
+allowed_chats = ["{channel}"]
+allowed_users = ["{user}"]
+"#
+            ),
+        );
+        let mut settings = Settings::default();
+        let preview = preview(dir.path(), &settings, None).unwrap();
+        let [guild] = &preview.messengers[..] else {
+            panic!("{:?}", preview.messengers)
+        };
+        assert_eq!(guild.action, MessengerAction::Add);
+        assert_eq!(guild.kind, Some(MessengerKind::Discord));
+        assert!(guild.token_left_behind);
+        assert!(!toml::to_string(&preview).unwrap().contains(&token));
+        assert_eq!(preview.apply_messengers(&mut settings), ["guild"]);
+        let guild = &settings.messengers[0];
+        assert!(!guild.enabled && guild.credential.is_none());
+        assert_eq!(guild.endpoint(), MessengerKind::Discord.default_endpoint());
+        assert_eq!(guild.allowed_chats, BTreeSet::from([channel]));
+        assert_eq!(guild.allowed_users, BTreeSet::from([user]));
+    }
+
+    #[test]
+    fn slack_apps_arrive_disabled_without_either_token() {
+        let (token, app_token, channel) = (random(), random(), random());
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            &dir.path().join("config.toml"),
+            &format!(
+                r#"
+[[messengers]]
+name = "workspace"
+messenger_type = "slack"
+enabled = true
+token = "{token}"
+app_token = "{app_token}"
+allowed_chats = ["{channel}"]
+"#
+            ),
+        );
+        let mut settings = Settings::default();
+        let preview = preview(dir.path(), &settings, None).unwrap();
+        let [workspace] = &preview.messengers[..] else {
+            panic!("{:?}", preview.messengers)
+        };
+        assert_eq!(workspace.kind, Some(MessengerKind::Slack));
+        assert!(workspace.token_left_behind);
+        let text = toml::to_string(&preview).unwrap();
+        assert!(!text.contains(&token) && !text.contains(&app_token));
+        assert_eq!(preview.apply_messengers(&mut settings), ["workspace"]);
+        let workspace = &settings.messengers[0];
+        assert!(!workspace.enabled);
+        assert!(workspace.credential.is_none() && workspace.app_credential.is_none());
+        assert_eq!(workspace.allowed_chats, BTreeSet::from([channel]));
+    }
+
+    #[test]
+    fn irc_accounts_arrive_over_tls_with_folded_names_and_no_password() {
+        let (password, host) = (random(), format!("{}.test", uuid::Uuid::new_v4().simple()));
+        let nick = format!("bot{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            &dir.path().join("config.toml"),
+            &format!(
+                r##"
+[[messengers]]
+name = "network"
+messenger_type = "irc"
+server = "{host}"
+nick = "{nick}"
+password = "{password}"
+use_tls = true
+irc_channels = ["#Rust"]
+allowed_users = ["Friend"]
+
+[[messengers]]
+name = "plain"
+messenger_type = "irc"
+server = "{host}"
+port = 6667
+
+[[messengers]]
+name = "odd"
+messenger_type = "irc"
+server = "{host}"
+use_tls = true
+nick = "not a nick"
+"##
+            ),
+        );
+        let mut settings = Settings::default();
+        let preview = preview(dir.path(), &settings, None).unwrap();
+        let [network, plain, odd] = &preview.messengers[..] else {
+            panic!("{:?}", preview.messengers)
+        };
+        assert_eq!(network.kind, Some(MessengerKind::Irc));
+        assert!(network.token_left_behind);
+        assert!(!toml::to_string(&preview).unwrap().contains(&password));
+        assert_eq!(
+            plain.action,
+            MessengerAction::Unsupported {
+                reason: UnsupportedMessenger::PlainTextIrc
+            }
+        );
+        assert_eq!(
+            odd.action,
+            MessengerAction::Unsupported {
+                reason: UnsupportedMessenger::InvalidLogin
+            }
+        );
+        assert_eq!(preview.apply_messengers(&mut settings), ["network"]);
+        let network = &settings.messengers[0];
+        assert!(!network.enabled && network.credential.is_none());
+        assert_eq!(
+            network.endpoint.as_deref(),
+            Some(format!("ircs://{host}:6697").as_str())
+        );
+        assert_eq!(network.login.as_deref(), Some(nick.as_str()));
+        assert_eq!(network.allowed_chats, BTreeSet::from(["#rust".to_owned()]));
+        assert_eq!(network.allowed_users, BTreeSet::from(["friend".to_owned()]));
+    }
+
+    #[test]
+    fn networks_reached_through_beeper_say_so_and_others_are_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = String::new();
+        for kind in ["whatsapp", "imessage", "google_chat", "teams"] {
+            config.push_str(&format!(
+                "[[messengers]]\nname = \"{kind}\"\nmessenger_type = \"{kind}\"\n"
+            ));
+        }
+        write(&dir.path().join("config.toml"), &config);
+        let mut settings = Settings::default();
+        let preview = preview(dir.path(), &settings, None).unwrap();
+        let reasons: Vec<_> = preview
+            .messengers
+            .iter()
+            .map(|m| (m.source_kind.as_str(), m.kind, m.action.clone()))
+            .collect();
+        let unsupported = |reason| MessengerAction::Unsupported { reason };
+        assert_eq!(
+            reasons,
+            [
+                (
+                    "whatsapp",
+                    None,
+                    unsupported(UnsupportedMessenger::ThroughBeeper)
+                ),
+                (
+                    "imessage",
+                    None,
+                    unsupported(UnsupportedMessenger::ThroughBeeper)
+                ),
+                (
+                    "google_chat",
+                    None,
+                    unsupported(UnsupportedMessenger::ThroughBeeper)
+                ),
+                (
+                    "teams",
+                    None,
+                    unsupported(UnsupportedMessenger::UnknownKind)
+                ),
+            ]
+        );
+        assert!(preview.apply_messengers(&mut settings).is_empty());
+    }
+
+    #[test]
+    fn signal_accounts_are_reported_because_no_daemon_is_named() {
+        let phone = format!("+1{}", &uuid::Uuid::new_v4().as_u128().to_string()[..10]);
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            &dir.path().join("config.toml"),
+            &format!(
+                r##"
+[[messengers]]
+name = "phone"
+messenger_type = "signal"
+phone = "{phone}"
+allowed_users = ["{phone}"]
+"##
+            ),
+        );
+        let mut settings = Settings::default();
+        let preview = preview(dir.path(), &settings, None).unwrap();
+        let [phone_entry] = &preview.messengers[..] else {
+            panic!("{:?}", preview.messengers)
+        };
+        assert_eq!(phone_entry.kind, Some(MessengerKind::Signal));
+        assert_eq!(
+            phone_entry.action,
+            MessengerAction::Unsupported {
+                reason: UnsupportedMessenger::NoSignalDaemon
+            }
+        );
+        assert!(phone_entry.allowed_users.is_empty() && phone_entry.login.is_none());
+        assert!(preview.apply_messengers(&mut settings).is_empty());
+        assert!(settings.messengers.is_empty());
     }
 
     #[test]

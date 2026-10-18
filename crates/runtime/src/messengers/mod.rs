@@ -8,10 +8,17 @@
 //! through [`Host::converse`], under that thread's mode, grants and approvals.
 //! A person in an allowed chat can therefore do whatever the user could do
 //! by typing into that thread, and nothing more.
+mod beeper;
+mod discord;
+mod irc;
+mod listener;
 mod matrix;
+mod signal;
+mod slack;
 mod telegram;
 
 use a206_broker::{AuthScheme, HttpMethod, ProviderCall, Reply as BrokerReply, Request, Role};
+use a206_broker::{SocketCall, SocketOpen, SocketScheme};
 use a206_core::{BrokerPairing, ChatBinding, ErrorKind, Id, MessengerConfig, MessengerKind};
 use a206_core::{MessengerState, MessengerStatus};
 use std::collections::{BTreeMap, BTreeSet};
@@ -34,8 +41,43 @@ pub enum MessengerError {
     SyncGap { service: &'static str },
     #[error("the messenger has no vault credential; add its token and bind it to {origin}")]
     NoCredential { origin: String },
+    #[error(
+        "the messenger has no app-level token; store it in the vault bound to {origin} and set it as the app credential"
+    )]
+    NoAppCredential { origin: String },
     #[error("{service} has no official server; set the messenger's endpoint to yours")]
     NoEndpoint { service: &'static str },
+    #[error("the IRC server is not allowed")]
+    IrcServer(#[source] a206_core::messengers::IrcServerError),
+    #[error(
+        "the messenger has no login; set it to the account it signs in as (IRC: the registered nickname; Signal: the number signal-cli serves)"
+    )]
+    NoLogin,
+    #[error("the signal-cli daemon endpoint is not allowed")]
+    SignalDaemon(#[source] a206_core::messengers::SignalDaemonError),
+    #[error("could not reach the signal-cli daemon; start it, or check the messenger's endpoint")]
+    SignalUnreachable {
+        #[source]
+        source: std::io::Error,
+    },
+    #[error(
+        "the signal-cli daemon does not serve {account}; register or link it there, and run the daemon without -a so it serves every account"
+    )]
+    SignalAccount { account: String },
+    #[error("signal-cli refused the request ({code}: {message})")]
+    SignalRefused { code: i64, message: String },
+    #[error("signal-cli did not answer in time")]
+    SignalTimeout,
+    #[error("{service} sent a message larger than Agent 206 reads")]
+    TooLarge { service: &'static str },
+    #[error(
+        "the IRC server does not offer SASL sign-in and account tags, which Agent 206 needs to know who sent each message ({code})"
+    )]
+    IrcCapabilities { code: String },
+    #[error(
+        "{chat} is no longer online under the nickname it wrote from, so the reply was not sent"
+    )]
+    RecipientGone { chat: String },
     #[error("the messenger endpoint is not allowed")]
     Endpoint(#[source] a206_core::providers::EndpointError),
     #[error("a messenger endpoint is an origin, without a path")]
@@ -68,10 +110,31 @@ pub enum MessengerError {
     Refused { service: &'static str },
     #[error("{service} did not identify the bot account")]
     NoAccountId { service: &'static str },
+    #[error("Beeper Desktop has no chat accounts connected yet; add one in Beeper")]
+    BeeperNoAccounts,
     #[error(
         "room {chat} is end-to-end encrypted, which Agent 206 does not support yet; it neither reads nor answers there"
     )]
     EncryptedRoom { chat: String },
+    #[error("{service} closed the connection{}", code.map(|code| format!(" with code {code}")).unwrap_or_default())]
+    SocketClosed {
+        service: &'static str,
+        code: Option<u16>,
+    },
+    #[error("the {service} connection ended unexpectedly")]
+    SocketEnded { service: &'static str },
+    #[error("{service} stopped acknowledging heartbeats")]
+    HeartbeatMissed { service: &'static str },
+    #[error("{service} asked the bot to reconnect")]
+    Reconnect { service: &'static str },
+    #[error("too many {service} messages were waiting; reconnecting")]
+    Backlog { service: &'static str },
+    #[error(
+        "Discord refused the bot's intents; turn on the Message Content intent for the bot in the Discord developer portal"
+    )]
+    DiscordIntents,
+    #[error("{service} refused the connection ({code})")]
+    Rejected { service: &'static str, code: String },
     #[error("choose a model for this messenger before allowing chats")]
     NoModel,
     #[error("the thread could not answer the message")]
@@ -86,7 +149,12 @@ impl crate::error::Classified for MessengerError {
         Some(match self {
             Self::SyncBudget { .. } | Self::SyncGap { .. } => ErrorKind::Protocol,
             Self::NoCredential { .. }
+            | Self::NoAppCredential { .. }
             | Self::NoEndpoint { .. }
+            | Self::IrcServer(_)
+            | Self::SignalDaemon(_)
+            | Self::SignalAccount { .. }
+            | Self::NoLogin
             | Self::NoModel
             | Self::Endpoint(_)
             | Self::EndpointPath => ErrorKind::InvalidRequest,
@@ -99,6 +167,19 @@ impl crate::error::Classified for MessengerError {
             // Answering in plain text there would downgrade the room.
             Self::Unauthorized { .. } | Self::EncryptedRoom { .. } => ErrorKind::PermissionDenied,
             Self::PollingConflict { .. } => ErrorKind::Conflict,
+            Self::SocketClosed { .. }
+            | Self::SocketEnded { .. }
+            | Self::HeartbeatMissed { .. }
+            | Self::Reconnect { .. }
+            | Self::Backlog { .. } => ErrorKind::Unavailable,
+            Self::DiscordIntents => ErrorKind::PermissionDenied,
+            Self::Rejected { .. } | Self::IrcCapabilities { .. } => ErrorKind::Provider,
+            Self::RecipientGone { .. }
+            | Self::SignalUnreachable { .. }
+            | Self::SignalTimeout
+            | Self::BeeperNoAccounts => ErrorKind::Unavailable,
+            Self::SignalRefused { .. } => ErrorKind::Provider,
+            Self::TooLarge { .. } => ErrorKind::Protocol,
             Self::Status { .. } | Self::Refused { .. } => ErrorKind::Provider,
             Self::Conversation(error) => return crate::error::classify(error.as_ref()),
             Self::Turn(report) => report.kind,
@@ -112,18 +193,27 @@ impl MessengerError {
         matches!(
             self,
             Self::NoCredential { .. }
+                | Self::NoAppCredential { .. }
                 | Self::NoEndpoint { .. }
+                | Self::IrcServer(_)
+                | Self::SignalDaemon(_)
+                | Self::SignalAccount { .. }
+                | Self::NoLogin
+                | Self::IrcCapabilities { .. }
                 | Self::Endpoint(_)
                 | Self::EndpointPath
                 | Self::BrokerTooOld
                 | Self::Unauthorized { .. }
                 | Self::PollingConflict { .. }
+                | Self::DiscordIntents
                 // The stored credential is missing, refused for this
                 // destination or not a bot token: the same one will fail again.
                 | Self::Broker(ClientError::Broker(
                     BrokerError::NotFound
                         | BrokerError::Denied(_)
-                        | BrokerError::Upstream(UpstreamFailure::InvalidBotToken)
+                        | BrokerError::Upstream(
+                            UpstreamFailure::InvalidBotToken | UpstreamFailure::InvalidPassword
+                        )
                 ))
         )
     }
@@ -197,13 +287,44 @@ pub(crate) struct Account {
 enum Adapter {
     Telegram(telegram::Telegram),
     Matrix(matrix::Matrix),
+    Discord(discord::Discord),
+    Slack(slack::Slack),
+    Irc(irc::Irc),
+    Signal(signal::Signal),
+    Beeper(beeper::Beeper),
 }
 impl Adapter {
+    /// The adapter for `config`. Kinds that spend a vault credential talk
+    /// through the broker; Signal talks to the user's own signal-cli.
+    fn open(root: PathBuf, pairing: BrokerPairing, config: &MessengerConfig) -> Result<Self> {
+        if config.kind.is_signal() {
+            return Ok(Self::Signal(signal::Signal::new(
+                config.endpoint(),
+                config.login.clone(),
+            )));
+        }
+        Ok(Self::new(config, Api::new(root, pairing, config)?))
+    }
     fn new(config: &MessengerConfig, api: Api) -> Self {
         match config.kind {
             MessengerKind::Telegram => Self::Telegram(telegram::Telegram::new(api)),
             MessengerKind::Matrix => {
                 Self::Matrix(matrix::Matrix::new(api, config.allowed_chats.clone()))
+            }
+            MessengerKind::Discord => {
+                Self::Discord(discord::Discord::new(api, config.allowed_chats.clone()))
+            }
+            MessengerKind::Slack => Self::Slack(slack::Slack::new(api)),
+            MessengerKind::Irc => Self::Irc(irc::Irc::new(
+                api,
+                config.login.clone(),
+                config.allowed_chats.clone(),
+            )),
+            MessengerKind::Signal => {
+                Self::Signal(signal::Signal::new(config.endpoint(), config.login.clone()))
+            }
+            MessengerKind::Beeper => {
+                Self::Beeper(beeper::Beeper::new(api, config.allowed_chats.clone()))
             }
         }
     }
@@ -212,6 +333,11 @@ impl Adapter {
         match self {
             Self::Telegram(adapter) => adapter.connect().await,
             Self::Matrix(adapter) => adapter.connect().await,
+            Self::Discord(adapter) => adapter.connect().await,
+            Self::Slack(adapter) => adapter.connect().await,
+            Self::Irc(adapter) => adapter.connect().await,
+            Self::Signal(adapter) => adapter.connect().await,
+            Self::Beeper(adapter) => adapter.connect().await,
         }
     }
     /// Wait for the next batch after `cursor`.
@@ -219,27 +345,49 @@ impl Adapter {
         match self {
             Self::Telegram(adapter) => adapter.receive(cursor).await,
             Self::Matrix(adapter) => adapter.receive(cursor).await,
+            Self::Discord(adapter) => adapter.receive(cursor).await,
+            Self::Slack(adapter) => adapter.receive(cursor).await,
+            Self::Irc(adapter) => adapter.receive(cursor).await,
+            Self::Signal(adapter) => adapter.receive(cursor).await,
+            Self::Beeper(adapter) => adapter.receive(cursor).await,
         }
     }
     /// Fails with [`MessengerError::EncryptedRoom`] if an answer could not be
     /// sent to `chat` as it is now.
     async fn check_chat(&self, chat: &str) -> Result<()> {
         match self {
-            Self::Telegram(_) => Ok(()),
+            Self::Telegram(_)
+            | Self::Discord(_)
+            | Self::Slack(_)
+            | Self::Irc(_)
+            | Self::Signal(_)
+            | Self::Beeper(_) => Ok(()),
             Self::Matrix(adapter) => adapter.check_room(chat).await,
         }
     }
     async fn join(&self, chat: &str) -> Result<()> {
         match self {
-            // Telegram adds bots to chats itself and reports no invitations.
-            Self::Telegram(_) => Ok(()),
+            // Telegram, Discord and Slack add bots to chats themselves, and
+            // signal-cli and Beeper join groups for the account; none report
+            // invitations here.
+            Self::Telegram(_)
+            | Self::Discord(_)
+            | Self::Slack(_)
+            | Self::Signal(_)
+            | Self::Beeper(_) => Ok(()),
             Self::Matrix(adapter) => adapter.join(chat).await,
+            Self::Irc(adapter) => adapter.join(chat).await,
         }
     }
     async fn send(&self, chat: &str, text: &str) -> Result<()> {
         match self {
             Self::Telegram(adapter) => adapter.send(chat, text).await,
             Self::Matrix(adapter) => adapter.send(chat, text).await,
+            Self::Discord(adapter) => adapter.send(chat, text).await,
+            Self::Slack(adapter) => adapter.send(chat, text).await,
+            Self::Irc(adapter) => adapter.send(chat, text).await,
+            Self::Signal(adapter) => adapter.send(chat, text).await,
+            Self::Beeper(adapter) => adapter.send(chat, text).await,
         }
     }
 }
@@ -382,9 +530,7 @@ async fn run<H: Host>(
     let span = tracing::info_span!("messenger", messenger = %name);
     let work = async {
         let mut delay = backoff.initial;
-        // Updates up to here are handled; kept across sessions so a retry
-        // does not ask the service to deliver them again.
-        let mut cursor = None;
+        let mut carried = Carried::default();
         let mut pairings = host.pairings();
         loop {
             // Mark the pairing in hand as seen, so waiting below wakes only
@@ -398,7 +544,7 @@ async fn run<H: Host>(
                 continue;
             };
             host.update(&name, |s| s.state = MessengerState::Connecting);
-            let result = session(&host, &config, pairing, &mut delay, &mut cursor, backoff).await;
+            let result = session(&host, &config, pairing, &mut delay, &mut carried, backoff).await;
             let Err(error) = result else { return };
             let report = crate::error::handle("messenger", &error);
             host.update(&name, |s| {
@@ -454,6 +600,17 @@ impl Cursor {
     }
 }
 
+/// What one messenger's sessions hand on to the next.
+#[derive(Default)]
+struct Carried {
+    /// Updates up to here are handled; kept across sessions so a retry
+    /// does not ask the service to deliver them again.
+    cursor: Option<Cursor>,
+    /// The adapter, while the pairing it was made for is current, so a
+    /// socket's queued events survive a failed account check or reply.
+    adapter: Option<(BrokerPairing, Adapter)>,
+}
+
 /// Connect and serve until an error. Resets `delay` once connected and marks
 /// each event handled as its handling starts, so a message is handled at
 /// most once while the gateway runs, even if its batch arrives again.
@@ -467,11 +624,18 @@ async fn session<H: Host>(
     config: &MessengerConfig,
     pairing: BrokerPairing,
     delay: &mut Duration,
-    cursor: &mut Option<Cursor>,
+    carried: &mut Carried,
     backoff: Backoff,
 ) -> Result<()> {
-    let api = Api::new(host.root(), pairing, config)?;
-    let mut adapter = Adapter::new(config, api);
+    let Carried { cursor, adapter } = carried;
+    let adapter = match adapter.take() {
+        Some((current, kept)) if current == pairing => adapter.insert((current, kept)),
+        _ => {
+            let opened = Adapter::open(host.root(), pairing.clone(), config)?;
+            adapter.insert((pairing, opened))
+        }
+    };
+    let adapter = &mut adapter.1;
     let mut account = adapter.connect().await?;
     host.update(&config.name, |s| {
         s.state = MessengerState::Connected;
@@ -497,7 +661,7 @@ async fn session<H: Host>(
         let batch = adapter.receive(position.next.as_deref()).await?;
         for (key, event) in batch.events {
             if position.handled.insert(key) {
-                deliver(host, config, &adapter, event).await?;
+                deliver(host, config, adapter, event).await?;
             }
         }
         if batch.complete {
@@ -609,8 +773,11 @@ async fn deliver<H: Host>(
         }
     };
     match sent {
-        // The chat became encrypted during the turn.
-        Err(error) if encrypted(&error) => {
+        // The chat became encrypted during the turn, or the person it was
+        // for no longer holds the nickname: report it and keep listening.
+        Err(error)
+            if encrypted(&error) || matches!(error, MessengerError::RecipientGone { .. }) =>
+        {
             report(host, config, &error);
             Ok(())
         }
@@ -649,33 +816,79 @@ fn split(text: &str, limit: usize) -> Vec<&str> {
     parts
 }
 
+/// Said at the end of a reply that was cut to a service's part limit.
+const CUT_SHORT: &str = "\n(reply cut short; read the rest in Agent 206)";
+
+/// `text` in non-blank parts of at most `limit` UTF-16 units, at most
+/// `most` of them; a reply cut at that count ends by saying so, so a
+/// partial answer is never sent as if it were whole.
+fn bounded_parts(text: &str, limit: usize, most: usize) -> Vec<String> {
+    let mut parts: Vec<String> = split(text, limit)
+        .into_iter()
+        .filter(|part| !part.trim().is_empty())
+        .map(str::to_owned)
+        .collect();
+    if parts.len() > most {
+        parts.truncate(most);
+        let last = parts.pop().unwrap_or_default();
+        let kept = split(&last, limit - CUT_SHORT.encode_utf16().count())
+            .into_iter()
+            .next()
+            .unwrap_or_default();
+        parts.push(format!("{kept}{CUT_SHORT}"));
+    }
+    parts
+}
+
 /// Destination-bound requests through the vault broker for one messenger.
+#[derive(Clone)]
 pub(crate) struct Api {
+    service: &'static str,
     root: PathBuf,
     pairing: BrokerPairing,
     credential: String,
+    /// The app-level token's credential, for kinds that receive with one.
+    app_credential: Option<String>,
     base: url::Url,
+    /// The exact destination the credentials are bound to.
+    origin: String,
 }
 impl Api {
     fn new(root: PathBuf, pairing: BrokerPairing, config: &MessengerConfig) -> Result<Self> {
         let endpoint = config.endpoint().ok_or(MessengerError::NoEndpoint {
             service: config.kind.label(),
         })?;
-        let base = a206_core::providers::base_url(endpoint).map_err(MessengerError::Endpoint)?;
-        if base.path() != "/" {
-            return Err(MessengerError::EndpointPath);
-        }
+        let (base, origin) = if config.kind.is_irc() {
+            let server = a206_core::messengers::IrcServer::parse(endpoint)
+                .map_err(MessengerError::IrcServer)?;
+            let origin = server.origin();
+            let base = url::Url::parse(&origin).map_err(|_| {
+                MessengerError::IrcServer(a206_core::messengers::IrcServerError::Shape)
+            })?;
+            (base, origin)
+        } else {
+            let base =
+                a206_core::providers::base_url(endpoint).map_err(MessengerError::Endpoint)?;
+            if base.path() != "/" {
+                return Err(MessengerError::EndpointPath);
+            }
+            let origin = base.origin().ascii_serialization();
+            (base, origin)
+        };
         let credential = config
             .credential
             .clone()
             .ok_or_else(|| MessengerError::NoCredential {
-                origin: base.origin().ascii_serialization(),
+                origin: origin.clone(),
             })?;
         Ok(Self {
+            service: config.kind.label(),
             root,
             pairing,
             credential,
+            app_credential: config.app_credential.clone(),
             base,
+            origin,
         })
     }
     /// `relative` resolved under the endpoint, refusing anything that would
@@ -711,22 +924,15 @@ impl Api {
         url: url::Url,
         body: Option<Vec<u8>>,
     ) -> Result<(u16, Vec<u8>)> {
-        let mut client = a206_broker::Client::connect(&self.root, Role::Gateway)
-            .await
-            .map_err(MessengerError::VaultUnavailable)?;
         let needed = match method {
             HttpMethod::Put => a206_broker::PUT_VERSION,
             HttpMethod::Get | HttpMethod::Post => a206_broker::MESSENGER_VERSION,
         };
-        if client.version() < needed {
-            return Err(MessengerError::BrokerTooOld);
-        }
-        client
-            .call(Request::GatewayAuth {
-                token: a206_broker::WireSecret::new(self.pairing.expose().to_owned()),
-            })
-            .await
-            .map_err(MessengerError::Broker)?;
+        let needed = match auth {
+            AuthScheme::DiscordBot => needed.max(a206_broker::SOCKET_VERSION),
+            _ => needed,
+        };
+        let mut client = self.client(needed).await?;
         let reply = client
             .call(Request::Provider(ProviderCall {
                 credential: self.credential.clone(),
@@ -743,7 +949,95 @@ impl Api {
             _ => Err(MessengerError::UnexpectedReply),
         }
     }
+
+    /// A paired gateway connection to a broker that speaks `needed`.
+    async fn client(&self, needed: u16) -> Result<a206_broker::Client> {
+        let mut client = a206_broker::Client::connect(&self.root, Role::Gateway)
+            .await
+            .map_err(MessengerError::VaultUnavailable)?;
+        if client.version() < needed {
+            return Err(MessengerError::BrokerTooOld);
+        }
+        client
+            .call(Request::GatewayAuth {
+                token: a206_broker::WireSecret::new(self.pairing.expose().to_owned()),
+            })
+            .await
+            .map_err(MessengerError::Broker)?;
+        Ok(client)
+    }
+
+    /// Open a WebSocket session named by `url`, with the credential (or,
+    /// for `app`, the app-level one) spent by the broker as `scheme` says.
+    async fn socket(
+        &self,
+        scheme: SocketScheme,
+        url: url::Url,
+        app: bool,
+    ) -> Result<a206_broker::Socket> {
+        let credential = if app {
+            self.app_credential
+                .clone()
+                .ok_or_else(|| MessengerError::NoAppCredential {
+                    origin: self.origin.clone(),
+                })?
+        } else {
+            self.credential.clone()
+        };
+        let needed = match scheme {
+            SocketScheme::IrcSasl { .. } => a206_broker::IRC_VERSION,
+            SocketScheme::DiscordGateway { .. } | SocketScheme::SlackSocketMode => {
+                a206_broker::SOCKET_VERSION
+            }
+        };
+        let client = self.client(needed).await?;
+        let opened = client
+            .socket(SocketCall {
+                credential,
+                url: url.to_string(),
+                scheme,
+            })
+            .await
+            .map_err(MessengerError::Broker)?;
+        let service = self.service;
+        match opened {
+            SocketOpen::Opened(socket) => Ok(socket),
+            SocketOpen::Refused {
+                status: 401 | 403, ..
+            } => Err(MessengerError::Unauthorized { service }),
+            SocketOpen::Refused {
+                code: Some(code), ..
+            } if UNAUTHORIZED_CODES.contains(&code.as_str()) => {
+                Err(MessengerError::Unauthorized { service })
+            }
+            SocketOpen::Refused {
+                code: Some(code), ..
+            } if IRC_CAPABILITY_CODES.contains(&code.as_str()) => {
+                Err(MessengerError::IrcCapabilities { code })
+            }
+            SocketOpen::Refused {
+                code: Some(code), ..
+            } => Err(MessengerError::Rejected { service, code }),
+            SocketOpen::Refused { status, code: None } => {
+                Err(MessengerError::Status { service, status })
+            }
+        }
+    }
 }
+
+/// Error codes that mean the stored token is wrong for the request: Slack's,
+/// and the broker's for a refused IRC sign-in.
+const UNAUTHORIZED_CODES: [&str; 7] = [
+    "invalid_auth",
+    "not_authed",
+    "account_inactive",
+    "token_revoked",
+    "token_expired",
+    "not_allowed_token_type",
+    "sasl_failed",
+];
+/// The broker's codes for an IRC server without the sign-in Agent 206 needs.
+const IRC_CAPABILITY_CODES: [&str; 2] = ["sasl_unavailable", "account_tag_unavailable"];
 
 #[cfg(test)]
 mod tests;

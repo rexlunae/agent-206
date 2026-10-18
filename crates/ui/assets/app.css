@@ -25,6 +25,8 @@ body { max-inline-size: none; inline-size: 100%; padding: 0; background: var(--f
 .a206-row { display: flex; gap: var(--fc-space-3); align-items: center; flex-wrap: wrap; }
 .a206-between { justify-content: space-between; }
 .a206-stack { display: flex; flex-direction: column; gap: var(--fc-space-4); }
+.a206-plan { display: flex; flex-direction: column; gap: var(--fc-space-2); }
+.a206-plan-steps { display: flex; flex-direction: column; gap: var(--fc-space-2); margin: 0; padding-inline-start: 0; list-style: none; }
 .a206-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 230px), 1fr)); gap: var(--fc-space-4); }
 .a206-hero { padding-block: var(--fc-space-6); display: grid; gap: var(--fc-space-6); align-items: center; padding: var(--fc-space-5); grid-template-columns: 1fr auto; }
 .a206-orbit { inline-size: 152px; aspect-ratio: 1; color: var(--fc-color-accent-text); opacity: .75; }
@@ -73,6 +75,7 @@ body { max-inline-size: none; inline-size: 100%; padding: 0; background: var(--f
 .a206-status { padding: var(--fc-space-2) var(--fc-space-4); background: var(--fc-color-bg-muted); font-size: .8rem; }
 .a206-error-causes { margin-block: var(--fc-space-1) 0; padding-inline-start: var(--fc-space-4); }
 .a206-document { white-space: pre-wrap; overflow-wrap: anywhere; font-family: var(--fc-font-family-mono, monospace); font-size: .85rem; line-height: 1.7; }
+.a206-prompt-choices { display: flex; flex-wrap: wrap; gap: var(--fc-space-2); margin-block-end: var(--fc-space-3); }
 .a206-tool-output { margin: 0; max-block-size: 16rem; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; padding: var(--fc-space-2); border: 1px solid var(--fc-color-border-subtle); border-radius: var(--fc-radius-md, .375rem); background: var(--fc-color-bg-muted); font-family: var(--fc-font-family-mono, monospace); font-size: .8rem; }
 .a206-grow { flex: 1; }
 .a206-gateway-copy { color: var(--fc-theme-feature-fg, var(--fc-color-text-default)); }
@@ -123,3 +126,9 @@ body { max-inline-size: none; inline-size: 100%; padding: 0; background: var(--f
 .a206-secret-text { overflow-wrap: anywhere; user-select: all; }
 /* Authenticator QR data stays black on white for scanners in every theme. */
 .a206-totp-qr { display: block; inline-size: min(16rem, 100%); block-size: auto; aspect-ratio: 1; margin-block: var(--fc-space-4); shape-rendering: crispEdges; forced-color-adjust: none; }
+.a206-quote { margin: 0; padding-inline-start: var(--fc-space-3); border-inline-start: 2px solid var(--fc-color-border-subtle); white-space: pre-wrap; }
+/* The shell takes focus only so Ctrl+K reaches it; it is not a control. */
+.a206-shell:focus { outline: none; }
+.a206-palette-results { max-block-size: min(60vh, 28rem); overflow-y: auto; }
+.a206-palette-current { background: var(--fc-color-accent-bg-subtle); color: var(--fc-color-accent-text); border-radius: var(--fc-radius-md); }
+.a206-slash-commands { max-block-size: 14rem; overflow-y: auto; }

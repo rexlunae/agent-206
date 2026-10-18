@@ -14,14 +14,15 @@ use zeroize::Zeroizing;
 ///
 /// Version 4 adds [`Request::ProviderStream`], version 5
 /// [`Request::ImportVault`], version 6 [`AuthScheme::TelegramBot`] and
-/// version 7 [`HttpMethod::Put`], and version 8 the encrypted browser setup
-/// channel, relay role and explicit TOTP cancellation. A broker accepts greetings from
+/// version 7 [`HttpMethod::Put`], version 8 [`Request::SocketOpen`] with
+/// [`AuthScheme::DiscordBot`], version 9 [`SocketScheme::IrcSasl`], and version
+/// 10 encrypted setup channels and TOTP cancellation. A broker accepts greetings from
 /// [`MIN_BROKER_VERSION`] up to this version, and a client falls back to the
 /// newest version an older broker accepts (see `Client::version`), so streams
 /// are only requested from brokers that understand them.
-pub const BROKER_VERSION: u16 = 8;
+pub const BROKER_VERSION: u16 = 10;
 /// The oldest protocol version this broker still serves and this client still
-/// speaks. Versions 3 to 8 differ only by the requests, roles and schemes they add.
+/// speaks. Versions 3 to 10 differ only by the requests, roles and schemes they add.
 pub const MIN_BROKER_VERSION: u16 = 3;
 /// The first version that serves [`Request::ProviderStream`].
 pub const STREAM_VERSION: u16 = 4;
@@ -32,6 +33,20 @@ pub const MESSENGER_VERSION: u16 = 6;
 /// The first version that sends [`HttpMethod::Put`] (Matrix sends messages
 /// with it).
 pub const PUT_VERSION: u16 = 7;
+/// The first version that opens WebSocket sessions ([`Request::SocketOpen`])
+/// and attaches Discord bot tokens ([`AuthScheme::DiscordBot`]).
+pub const SOCKET_VERSION: u16 = 8;
+/// The first version that opens IRC sessions ([`SocketScheme::IrcSasl`]).
+pub const IRC_VERSION: u16 = 9;
+/// First version with authenticated encrypted setup and explicit TOTP cancellation.
+pub const SETUP_CHANNEL_VERSION: u16 = 10;
+/// Longest IRC line the gateway may send, without its CR LF (RFC 1459's
+/// 512 bytes, less the line ending).
+pub const MAX_IRC_LINE: usize = 510;
+/// Largest text message relayed in either direction of a socket session.
+/// Larger upstream messages end the session; the rest of the frame is
+/// reserved for the envelope.
+pub const MAX_SOCKET_MESSAGE: usize = 2 * 1024 * 1024;
 /// Largest response body slice carried by one [`Reply::ProviderChunk`]. Small
 /// frames keep a stream responsive and bound what either side buffers.
 pub const MAX_STREAM_CHUNK: usize = 64 * 1024;
@@ -191,6 +206,47 @@ pub enum AuthScheme {
     /// `/bot…` prefixed to the request path (Telegram Bot API). Since
     /// [`MESSENGER_VERSION`].
     TelegramBot,
+    /// `Authorization: Bot …` (Discord). Since [`SOCKET_VERSION`].
+    DiscordBot,
+}
+
+/// How the broker opens an authenticated WebSocket session. The service is
+/// first asked, with the credential, where to connect; the socket URL it
+/// answers with (which may itself carry a session ticket) never leaves the
+/// broker. Since [`SOCKET_VERSION`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SocketScheme {
+    /// `GET` the call's URL (Discord's `/gateway/bot`) with
+    /// [`AuthScheme::DiscordBot`] and connect to the `url` it names, with
+    /// Discord's version and JSON encoding. The service's first message
+    /// (Hello) is relayed, then the broker sends the Identify message that
+    /// carries the token, with these gateway intents.
+    DiscordGateway { intents: u64 },
+    /// `POST` the call's URL (Slack's `apps.connections.open`) with the
+    /// app-level token as a bearer, and connect to the `url` it names.
+    SlackSocketMode,
+    /// Connect to the IRC server the call's URL names (`ircs://host:port`,
+    /// or `irc://` on loopback), over TLS unless on loopback. The broker
+    /// requests the `sasl` and `account-tag` capabilities (and
+    /// `message-tags` when offered), registers with `login` as nickname,
+    /// and signs in to that services account with SASL PLAIN, the credential
+    /// being its password. Lines are relayed only once sign-in succeeded:
+    /// each frame is one line without its line ending, and each
+    /// `SocketSend` is one line of at most [`MAX_IRC_LINE`] bytes that the
+    /// broker ends with CR LF. A refusal has status 0 and one of the codes
+    /// `sasl_unavailable`, `account_tag_unavailable`, `sasl_failed`,
+    /// `nick_in_use` or `registration_failed`. Since [`IRC_VERSION`].
+    IrcSasl { login: String },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SocketCall {
+    pub credential: String,
+    /// The HTTPS (or loopback HTTP) URL that names the socket, or the IRC
+    /// server for [`SocketScheme::IrcSasl`]. The credential must be bound to
+    /// its origin (for IRC, `ircs://host:port`).
+    pub url: String,
+    pub scheme: SocketScheme,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -312,6 +368,20 @@ pub enum Request {
     /// A lock, pairing replacement or pairing void ends it with an `Error`; a
     /// closed connection abandons the upstream request.
     ProviderStream(ProviderCall),
+    /// Gateway role, version 8: open a WebSocket session for the rest of
+    /// this connection. The broker answers with `SocketOpened` or
+    /// `SocketRefused`, then relays each upstream text message as a
+    /// `SocketFrame` numbered from 0, until `SocketClosed` or an `Error`
+    /// ends the session. A lock, pairing replacement or pairing void ends it
+    /// with an `Error`; a closed connection closes the socket. The broker
+    /// sends WebSocket pings and ends a session that stays silent too long.
+    SocketOpen(SocketCall),
+    /// Send one text message on this connection's open socket; at most
+    /// [`MAX_SOCKET_MESSAGE`] bytes. Never answered on its own id: a failure
+    /// ends the session with an `Error` on the `SocketOpen` id.
+    SocketSend {
+        text: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -382,7 +452,9 @@ pub enum InvalidRequest {
     Name,
     #[error("credential value does not match its kind")]
     KindMismatch,
-    #[error("destinations must be HTTPS (or loopback HTTP) URLs without embedded credentials")]
+    #[error(
+        "destinations must be HTTPS (or loopback HTTP) URLs, or ircs:// servers, without embedded credentials"
+    )]
     Destination,
     #[error("at most 16 destinations may be bound")]
     TooManyDestinations,
@@ -398,6 +470,18 @@ pub enum InvalidRequest {
     TotpNotEnrolled,
     #[error("the two-factor enrollment expired; start again")]
     EnrollmentExpired,
+    #[error("this connection has no open socket")]
+    NoSocket,
+    #[error("this connection carries a socket session and takes no other requests")]
+    SocketBusy,
+    #[error("a socket message is larger than the vault broker relays")]
+    SocketMessage,
+    #[error("IRC servers are ircs:// (or loopback irc://) URLs without credentials or paths")]
+    IrcServer,
+    #[error("an IRC login must be a valid nickname")]
+    IrcLogin,
+    #[error("an IRC message must be one line of at most 510 bytes without NUL")]
+    IrcLine,
     #[error(
         "the vault to import must be an absolute path to a readable regular file of at most 16 MiB"
     )]
@@ -428,6 +512,12 @@ pub enum UpstreamFailure {
     InvalidHeader,
     #[error("the stored credential is not a valid bot token")]
     InvalidBotToken,
+    #[error("the stored credential cannot be sent as an IRC account password")]
+    InvalidPassword,
+    #[error("the service named a socket URL that is not allowed")]
+    SocketUrl,
+    #[error("the service broke its socket protocol")]
+    SocketProtocol,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -474,6 +564,25 @@ pub enum Reply {
     ProviderEnd {
         chunks: u64,
         bytes: u64,
+    },
+    /// The socket is connected; frames follow.
+    SocketOpened,
+    /// The service refused to name a socket: its HTTP status, and for Slack
+    /// the error code it reported (lowercase letters, digits and
+    /// underscores only; anything else is dropped). The session is over.
+    SocketRefused {
+        status: u16,
+        code: Option<String>,
+    },
+    /// One upstream text message. `seq` counts frames from 0 without gaps.
+    SocketFrame {
+        seq: u64,
+        text: String,
+    },
+    /// The service closed the socket, with its close code if it sent one.
+    /// Close reasons are not relayed. The session is over.
+    SocketClosed {
+        code: Option<u16>,
     },
     Error(BrokerError),
 }

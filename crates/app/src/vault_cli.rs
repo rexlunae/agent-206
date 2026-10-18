@@ -363,7 +363,7 @@ pub fn run(root: &Path, action: VaultAction) -> Result<()> {
         match action {
             VaultAction::Broker | VaultAction::Stop => unreachable!(),
             VaultAction::ChannelKey => {
-                if client.version() < 8 {
+                if client.version() < a206_broker::SETUP_CHANNEL_VERSION {
                     bail!("the running vault broker does not support encrypted web setup; run `agent206 vault stop`, then retry");
                 }
                 let Reply::ChannelKey(key) = client.call(Request::ChannelKey).await? else {

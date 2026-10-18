@@ -7,8 +7,8 @@ no code Agent 206 runs and they never add permissions. A model following a skill
 still works within its thread's grants.
 
 Status: **experimental**. Listing, review and approval work in the CLI and the
-desktop/TUI Extensions page. The run engine that shows skills to models is not
-merged yet.
+desktop/TUI Extensions page. Native runs reach approved skills through the
+`skill_list` and `skill_info` tools.
 
 ## Installing
 
@@ -37,19 +37,39 @@ environment, so credentials must come through the vault.
 
 ## Approval
 
-Installed skills start **off**. Approval names the text the user reviewed:
-`agent206 skills show NAME` prints `SKILL.md` and its SHA-256 digest, and
+Installed skills start **off**. Approval names the package the user reviewed:
+`agent206 skills show NAME` prints `SKILL.md`, supporting text files and the package digest, and
 `agent206 skills enable NAME --digest HEX` approves it; on the Extensions page,
-**Review** opens the text and **Approve this text and enable** approves what is
-shown. If the file changed after that review, approval is refused. The digest is
+**Review** opens the package and **Approve this package and enable** approves what is
+shown. If any file changed after that review, approval is refused. The digest is
 recorded in `settings.toml` (`enabled_skills`); saving settings never changes
 it, so approval stays a separate user operation. Any later edit makes the skill
 "changed": it is withheld from models until the user reviews and enables it
 again. A skill that fails to parse is listed with its error, never silently
-dropped. Installing or editing a skill changes files only, so the page's
+dropped.
+
+Each listed skill carries a **pre-install audit** of its whole `SKILL.md`
+(`a206-audit`, the same rules as for extension packages): matches such as a
+downloaded script piped into a shell, a reverse shell, credential file paths,
+instructions to ignore the system prompt or keep something from the user,
+invisible characters, key-like values or decoded commands are reported by line
+on the skill's card, in `skills list` and after `skills show`. Findings advise
+the review; approval works the same either way, and a clean report proves
+nothing. Supporting text files are audited too, with relative paths and line
+numbers; binary or NUL-containing files are explicitly flagged as uninspected.
+The review includes each file's path, size and text where readable, without
+executing any content. Installing or editing a skill changes files only, so the page's
 **Refresh** re-reads the folder.
 
-Bounds: 256 skill folders, 256 KiB per `SKILL.md`, 1 MiB per supporting file.
+Bounds: 256 skill folders, 256 KiB per `SKILL.md`, 1 MiB per supporting file,
+128 entries per package, 16 directory levels and 2 MiB total. Symlinks, special
+files and unrepresentable paths refuse the entire package rather than producing
+a partial audit. Hidden supporting files are included. Approval pins sorted,
+length-framed paths and file bytes; adding, removing, renaming or editing a file
+withdraws approval. Existing standalone `SKILL.md` approvals remain valid;
+packages with supporting files need review again after this upgrade. Model file
+reads serve the digest-checked snapshot, without reopening a file after checking
+its approval. Pattern matching remains advisory and is not a malware scanner.
 Supporting files are read only by relative path inside the skill; absolute paths,
 `..` and symlinks are refused, and files are opened without following symlinks
 at any step, so a link swapped in during a read cannot reach outside the skill.
@@ -57,19 +77,40 @@ A program requirement is met only by an executable file on `PATH`.
 
 CLI: `agent206 skills list | show NAME | enable NAME --digest HEX | disable NAME`.
 
-## Run engine interface
+## Model access
 
-Gateway methods (`crates/runtime/src/gateway/skills.rs`):
+Native runs get two tools, named as in RustyClaw, from the bundled
+`agent206.skills` WASM extension. `crates/runtime/src/skill_tool.rs` adapts the
+manifest and retains those names; it does not execute the tools natively:
 
-- `skill_index(thread)` returns the model-facing `<available_skills>` block for
-  the system prompt (names and descriptions escaped); `skill_offers(thread)`
-  returns the same list as data.
-- `skill_instructions(thread, name)` returns the Markdown body, re-checking at
-  read time that this exact version is approved.
-- `skill_file(thread, name, path)` returns a bounded supporting file.
+- `skill_list` returns the `<available_skills>` block: names and descriptions of
+  approved, unchanged skills, escaped as author text.
+- `skill_info` takes `name` and an optional `path`, and returns the skill's
+  Markdown body or one UTF-8 supporting file.
 
-Failures are `GatewayError::Skill(SkillError)`: `Disabled` and `Changed` are
-permission denials, malformed skills are invalid requests.
+Both are offered only while at least one approved skill exists. They declare no
+capability, since a skill adds instructions and never authority, and like every
+tool they stay denied in a conversation until the user permits them there. Each
+call re-reads the file and checks it against its approval, so an edit withdraws
+it at once. A result longer than the tool output limit (64 KiB) is refused
+rather than cut, because a cut skill would be followed as if it were whole.
+The complete index has the same bound. At settlement the run engine also checks
+the conversation’s actual remaining output space; a complete result that cannot
+fit becomes a typed storage failure, with none of the partial instructions.
+
+Skill host imports are restricted to this builtin and current approval pins.
+They confer no general filesystem access. Disabling the builtin withdraws its
+tools too. Every invocation uses the standard WASM worker process, fuel/memory
+bounds, timeout and cancellation. File reads run off the async executor in a
+shared pool capped at two outstanding operations. A stalled OS filesystem call
+cannot be forcibly interrupted; a cancelled caller discards its result and
+kills its WASM worker, while the read retains its pool permit until it exits.
+Read/queue waits expire after ten seconds. Directory failures are surfaced even
+when there are no approval pins.
+
+The gateway methods `skill_index`, `skill_offers`, `skill_instructions` and
+`skill_file` share the same checks. Failures are typed: `Disabled` and `Changed`
+are permission denials; malformed skills and arguments are invalid requests.
 
 ## Not yet implemented
 

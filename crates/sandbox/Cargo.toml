@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Linux OS isolation for external agent runtimes: bubblewrap namespaces with Landlock inside"
+description = "OS isolation for external agent runtimes and commands: bubblewrap with Landlock on Linux, Seatbelt on macOS"
 [dependencies]
 a206-core.workspace = true
 serde.workspace = true
@@ -13,6 +13,9 @@ thiserror.workspace = true
 tracing.workspace = true
 tokio.workspace = true
 base64 = "0.22"
+[target.'cfg(unix)'.dependencies]
+# Safe wrappers for the session and terminal calls the launcher and helper make.
+rustix = { version = "1", features = ["process", "termios"] }
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = "0.4.4"
 [dev-dependencies]

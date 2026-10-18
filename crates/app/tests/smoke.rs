@@ -246,10 +246,107 @@ async fn extension_smoke(app: &App) -> Result<()> {
         "git status outside a repository: {}",
         String::from_utf8_lossy(&status.stderr)
     );
+    // The web extension's fetch goes through the gateway's SSRF guard: a
+    // loopback address is refused before any connection, with or without
+    // the grant, and the client hears the reason.
+    let fetch = [
+        "extension",
+        "tool",
+        "agent206.web",
+        "fetch_url",
+        "--args",
+        "url = \"https://127.0.0.1/\"",
+    ];
+    let ungranted = capture(app.command(&fetch)).await?;
+    ensure!(
+        !ungranted.status.success()
+            && String::from_utf8_lossy(&ungranted.stderr).contains("Use the network"),
+        "fetch without the network grant: {}",
+        String::from_utf8_lossy(&ungranted.stderr)
+    );
+    app.cli(&[
+        "extension",
+        "grant",
+        "agent206.web",
+        "--capability",
+        "network",
+    ])
+    .await?;
+    let private = capture(app.command(&fetch)).await?;
+    ensure!(
+        !private.status.success()
+            && String::from_utf8_lossy(&private.stderr).contains("private, reserved or local"),
+        "fetch of a loopback address: {}",
+        String::from_utf8_lossy(&private.stderr)
+    );
     app.cli(&["extension", "grant", id]).await?;
     ensure!(
         !capture(app.command(&panel)).await?.status.success(),
         "revoking a grant had no effect"
+    );
+    installed_extension_smoke(app, &project, &body).await
+}
+
+/// A third-party package over the wire: it arrives disabled, runs once the
+/// user enables and grants it, and is gone after uninstalling.
+async fn installed_extension_smoke(app: &App, project: &str, body: &str) -> Result<()> {
+    let bundled = "agent206.workspace";
+    let id = format!("test.{}", uuid::Uuid::new_v4().simple());
+    let package = tempfile::tempdir()?;
+    let (manifest, module) = (
+        package.path().join("plugin.toml"),
+        package.path().join("module.wasm"),
+    );
+    std::fs::write(
+        &manifest,
+        include_str!("../../../plugins/workspace/plugin.toml").replacen(
+            &format!("id = \"{bundled}\""),
+            &format!("id = \"{id}\""),
+            1,
+        ),
+    )?;
+    let builtin = a206_extensions::builtin(bundled)?.context("bundled workspace extension")?;
+    std::fs::write(&module, builtin.wasm)?;
+    let install = [
+        "extension",
+        "install",
+        manifest.to_str().context("manifest path")?,
+        module.to_str().context("module path")?,
+    ];
+    let Reply::Extension(summary) = toml::from_str(&app.cli(&install).await?)? else {
+        anyhow::bail!("expected the installed extension");
+    };
+    ensure!(
+        summary.id == id && !summary.enabled && summary.granted.is_empty(),
+        "an installed extension arrived usable: {summary:?}"
+    );
+    let read = [
+        "extension",
+        "tool",
+        &id,
+        "read_text_file",
+        "--project",
+        project,
+        "--args",
+        "path = \"notes.txt\"",
+    ];
+    ensure!(
+        !capture(app.command(&read)).await?.status.success(),
+        "a disabled installed extension ran"
+    );
+    app.cli(&["extension", "enable", &id]).await?;
+    app.cli(&["extension", "grant", &id, "--capability", "read_workspace"])
+        .await?;
+    ensure!(
+        app.cli(&read).await?.trim() == body,
+        "the installed extension's output did not round-trip"
+    );
+    app.cli(&["extension", "uninstall", &id]).await?;
+    let gone = capture(app.command(&read)).await?;
+    ensure!(
+        !gone.status.success() && String::from_utf8_lossy(&gone.stderr).contains("not installed"),
+        "an uninstalled extension still ran: {}",
+        String::from_utf8_lossy(&gone.stderr)
     );
     Ok(())
 }
@@ -263,6 +360,15 @@ async fn protocol_smoke() -> Result<()> {
         anyhow::bail!("expected thread");
     };
     let thread_id = thread.id.to_string();
+    // The CLI reaches the gateway's compaction and reports its refusal.
+    let compact = capture(app.command(&["compact", &thread_id])).await?;
+    ensure!(
+        !compact.status.success(),
+        "compacted a conversation with no model"
+    );
+    let stderr = String::from_utf8_lossy(&compact.stderr);
+    ensure!(stderr.contains("select a model"), "{stderr}");
+    ensure!(app.snapshot().await?.threads[0].messages.is_empty());
     extension_smoke(&app).await?;
     let mut acp = Peer::start(&app, &["acp", &thread_id])?;
     let init = result(

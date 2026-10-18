@@ -10,6 +10,7 @@ publish = false
 crate-type = ["cdylib"]
 [dependencies]
 a206-extension-sdk = { path = "../../crates/extension-sdk" }
+thiserror.workspace = true
 # See crates/extension-sdk/Cargo.toml: only the SDK's export macro needs unsafe attributes.
 [lints.rust]
 unsafe_code = "deny"

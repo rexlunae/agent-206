@@ -86,6 +86,10 @@ pub(crate) fn classify(error: &(dyn Error + 'static)) -> Option<ErrorKind> {
         crate::connection::ConnectionError,
         crate::control::ControlError,
         crate::exec_tool::ExecError,
+        crate::exec_tool::programs::ProgramsError,
+        crate::prompt_tool::PromptError,
+        crate::extension_list_tool::ListError,
+        crate::propose_tool::ProposeError,
         crate::gateway::GatewayError,
         crate::joshua::JoshuaError,
         crate::messengers::MessengerError,
@@ -101,6 +105,8 @@ pub(crate) fn classify(error: &(dyn Error + 'static)) -> Option<ErrorKind> {
         crate::tools::OfferError,
         crate::gateway::RunError,
         crate::gateway::ToolError,
+        crate::gateway::CompactionError,
+        crate::instructions::InstructionError,
         crate::transport::FrameError,
         crate::transport::LaunchError,
         crate::transport::SshEndpointError,
@@ -111,10 +117,20 @@ pub(crate) fn classify(error: &(dyn Error + 'static)) -> Option<ErrorKind> {
         a206_broker::BrokerError,
         a206_broker::ClientError,
         crate::extension_host::ExtensionError,
+        crate::extension_host::packages::PackageError,
         crate::extension_tools::ExtensionToolError,
+        crate::mcp_tools::McpToolError,
+        crate::skill_tool::SkillToolError,
+        crate::delegation_tool::DelegationToolError,
+        crate::gateway::DelegatorError,
+        crate::schedule::ScheduleError,
+        crate::schedule_tool::ScheduleToolError,
+        crate::plan_tool::PlanToolError,
         a206_extensions::abi::HostFailure,
         a206_mcp::McpError,
         a206_skills::SkillError,
+        a206_output_rules::RulesError,
+        a206_output_rules::PatternError,
         a206_protocol::Error,
         a206_sandbox::SandboxError,
         a206_sandbox::StartError,
@@ -166,6 +182,7 @@ impl Classified for a206_mcp::McpError {
             | ListingTooLarge { .. }
             | OutputTooLarge { .. } => ErrorKind::Protocol,
             Timeout(_) => ErrorKind::Timeout,
+            Abandoned => ErrorKind::Cancelled,
             Disabled
             | ToolDenied
             | ApprovalRequired
@@ -182,13 +199,36 @@ impl Classified for a206_skills::SkillError {
         Some(match self {
             Directory(_) | Read(_) => return None,
             NotFound => ErrorKind::NotFound,
-            Name | Path | TooMany { .. } | TooLarge { .. } | FileTooLarge { .. } => {
+            Name | Path | PackageLimit | TooMany { .. } | TooLarge { .. } | FileTooLarge { .. } => {
                 ErrorKind::InvalidRequest
             }
             NotText(_) | NoFrontmatter | Frontmatter(_) | Metadata(_) | NameMismatch
             | Unreviewed => ErrorKind::InvalidRequest,
             Disabled | Changed => ErrorKind::PermissionDenied,
         })
+    }
+}
+
+impl Classified for a206_output_rules::RulesError {
+    fn kind(&self) -> Option<ErrorKind> {
+        use a206_output_rules::RulesError::*;
+        Some(match self {
+            // Absent and unreadable files need different recovery; the I/O cause decides.
+            Directory { .. } | Read { .. } => return None,
+            TooLarge { .. }
+            | Parse { .. }
+            | MissingId { .. }
+            | TooLong { .. }
+            | Summary { .. }
+            | Pattern { .. }
+            | Duplicate { .. }
+            | TooMany => ErrorKind::InvalidRequest,
+        })
+    }
+}
+impl Classified for a206_output_rules::PatternError {
+    fn kind(&self) -> Option<ErrorKind> {
+        Some(ErrorKind::InvalidRequest)
     }
 }
 
@@ -235,7 +275,8 @@ impl Classified for a206_broker::ClientError {
             C::Io(_) | C::Closed => Some(ErrorKind::Unavailable),
             C::Protocol(_) | C::Stream(_) => Some(ErrorKind::Protocol),
             // The provider layer falls back before this can reach a client.
-            C::StreamUnsupported => Some(ErrorKind::Unavailable),
+            C::StreamUnsupported | C::SocketUnsupported => Some(ErrorKind::Unavailable),
+            C::SocketMessage => Some(ErrorKind::InvalidRequest),
             // `transparent` hides the reply from the chain, so classify it here.
             C::Broker(reply) => reply.kind(),
         }

@@ -51,6 +51,14 @@ mod imp {
                 _ => Err(unexpected()),
             }
         }
+        /// Observe a running broker without undoing a deliberate stop.
+        pub async fn status_if_running(&self) -> Result<Option<Status>, Failure> {
+            self.0
+                .status_if_running()
+                .await
+                .map(|value| value.map(a206_broker::channel::status))
+                .map_err(failure)
+        }
         pub async fn pair_gateway(&self) -> Result<(), Failure> {
             self.0.pair_gateway().await.map_err(failure)
         }
@@ -81,7 +89,7 @@ mod imp {
         }
     }
     async fn relay(request: RelayRequest) -> Result<RelayReply, Failure> {
-        match crate::web_request("/api/vault", request)
+        match crate::web_request("/api/vault/channel", request)
             .await
             .map_err(|report| Failure {
                 code: Code::Other,

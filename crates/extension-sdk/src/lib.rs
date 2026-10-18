@@ -167,6 +167,18 @@ pub mod __private {
 }
 
 /// Host calls. Each one is authorized by the gateway for this invocation.
+/// How [`host::search_pattern`] matches. The default is a literal,
+/// case-sensitive text in every file.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SearchOptions<'a> {
+    pub regex: bool,
+    pub ignore_case: bool,
+    /// Search only files whose path matches this glob.
+    pub include: Option<&'a str>,
+    /// Also search what git ignores.
+    pub include_ignored: bool,
+}
+
 pub mod host {
     use super::*;
     use serde_bytes::ByteBuf;
@@ -221,6 +233,24 @@ pub mod host {
         }
     }
 
+    /// Read the complete approved skill index. The host restricts this import
+    /// to the skills builtin; other extensions receive Denied.
+    pub fn skill_list() -> Result<String, HostFailure> {
+        skill_text(HostRequest::SkillList)
+    }
+    /// Read an approved skill or one supporting file without workspace authority.
+    pub fn skill_read(name: &str, path: Option<&str>) -> Result<String, HostFailure> {
+        skill_text(HostRequest::SkillRead {
+            name: name.into(),
+            path: path.map(str::to_owned),
+        })
+    }
+    fn skill_text(request: HostRequest) -> Result<String, HostFailure> {
+        match call(&request)? {
+            HostReply::File(bytes) => String::from_utf8(bytes.into_vec()).map_err(|_| unexpected()),
+            _ => Err(unexpected()),
+        }
+    }
     /// Read a file relative to the invocation's workspace.
     pub fn read_file(path: &str) -> Result<Vec<u8>, HostFailure> {
         match call(&HostRequest::ReadFile { path: path.into() })? {
@@ -246,6 +276,49 @@ pub mod host {
             _ => Err(unexpected()),
         }
     }
+    /// Lines matching `pattern` in UTF-8 files under `path`; see
+    /// [`HostRequest::SearchPattern`].
+    pub fn search_pattern(
+        path: &str,
+        pattern: &str,
+        options: SearchOptions<'_>,
+        max_matches: u32,
+    ) -> Result<SearchResult, HostFailure> {
+        match call(&HostRequest::SearchPattern {
+            path: path.into(),
+            pattern: pattern.into(),
+            regex: options.regex,
+            ignore_case: options.ignore_case,
+            include: options.include.map(Into::into),
+            max_matches,
+            include_ignored: options.include_ignored,
+        })? {
+            HostReply::Matches(result) => Ok(result),
+            _ => Err(unexpected()),
+        }
+    }
+    /// Entries under `path` matching `glob` that git does not ignore; see
+    /// [`HostRequest::Find`].
+    pub fn find(path: &str, glob: &str, max_results: u32) -> Result<FindResult, HostFailure> {
+        find_including(path, glob, false, max_results)
+    }
+    /// [`find`], also returning what git ignores when `include_ignored`.
+    pub fn find_including(
+        path: &str,
+        glob: &str,
+        include_ignored: bool,
+        max_results: u32,
+    ) -> Result<FindResult, HostFailure> {
+        match call(&HostRequest::Find {
+            path: path.into(),
+            glob: glob.into(),
+            max_results,
+            include_ignored,
+        })? {
+            HostReply::Found(result) => Ok(result),
+            _ => Err(unexpected()),
+        }
+    }
     /// Write a whole file atomically; `overwrite` allows replacing one.
     pub fn write_file(path: &str, contents: &[u8], overwrite: bool) -> Result<(), HostFailure> {
         done(call(&HostRequest::WriteFile {
@@ -261,6 +334,16 @@ pub mod host {
             old: old.into(),
             new: new.into(),
         })?)
+    }
+    /// Apply `files` together; see [`HostRequest::PatchFiles`].
+    pub fn patch_files(
+        files: Vec<FilePatch>,
+        check_only: bool,
+    ) -> Result<PatchResult, HostFailure> {
+        match call(&HostRequest::PatchFiles { files, check_only })? {
+            HostReply::Patched(result) => Ok(result),
+            _ => Err(unexpected()),
+        }
     }
     /// Create a directory and any missing parents.
     pub fn create_directory(path: &str) -> Result<(), HostFailure> {
@@ -287,6 +370,24 @@ pub mod host {
             staged,
         })? {
             HostReply::Diff(diff) => Ok(diff),
+            _ => Err(unexpected()),
+        }
+    }
+    /// Commit the working-tree content of exactly `paths` on top of `HEAD`.
+    pub fn git_commit(message: &str, paths: &[&str]) -> Result<GitCommit, HostFailure> {
+        match call(&HostRequest::GitCommit {
+            message: message.into(),
+            paths: paths.iter().map(|path| (*path).into()).collect(),
+        })? {
+            HostReply::Committed(commit) => Ok(commit),
+            _ => Err(unexpected()),
+        }
+    }
+    /// `GET` a public HTTPS URL on a host the manifest declares. Any final
+    /// status is a response, not a failure.
+    pub fn fetch(url: &str) -> Result<FetchResponse, HostFailure> {
+        match call(&HostRequest::Fetch { url: url.into() })? {
+            HostReply::Fetched(response) => Ok(response),
             _ => Err(unexpected()),
         }
     }

@@ -3,12 +3,15 @@ use a206_core::{
     Capability, Command,
     extension::{Args, Node, UiEvent, Value, View},
 };
+use a206_runtime::extension_host::packages;
+use anyhow::Context;
 use clap::Subcommand;
 use serde::{Deserialize, de::IntoDeserializer};
 
 #[derive(Subcommand)]
 pub enum ExtensionAction {
-    /// List installed extensions with their tools, panels and grants.
+    /// List installed extensions with their tools, panels and grants, and
+    /// packages agents prepared for review.
     List,
     /// Replace the capabilities granted to an extension; none revokes all.
     Grant {
@@ -21,6 +24,25 @@ pub enum ExtensionAction {
     },
     Disable {
         id: String,
+    },
+    /// Install or update an extension from its `plugin.toml` and compiled
+    /// WASM module. It arrives disabled with nothing granted.
+    Install {
+        manifest: std::path::PathBuf,
+        module: std::path::PathBuf,
+    },
+    /// Remove an installed extension and everything it stored.
+    Uninstall {
+        id: String,
+    },
+    /// Install a package an agent prepared, by the digest `list` shows. It
+    /// arrives disabled with nothing granted, also when it is an update.
+    InstallProposal {
+        digest: String,
+    },
+    /// Discard a package an agent prepared.
+    Dismiss {
+        digest: String,
     },
     /// Render a panel as text, optionally after pressing one of its buttons.
     Panel {
@@ -62,6 +84,18 @@ pub fn command(action: ExtensionAction) -> anyhow::Result<Option<Command>> {
             extension: id,
             enabled: false,
         },
+        ExtensionAction::Install { manifest, module } => {
+            let manifest = std::fs::read_to_string(&manifest)
+                .with_context(|| format!("could not read {}", manifest.display()))?;
+            let module = std::fs::read(&module)
+                .with_context(|| format!("could not read {}", module.display()))?;
+            // Refuse here what the gateway would, before sending megabytes.
+            packages::prepare(manifest.clone(), module.clone())?;
+            Command::InstallExtension { manifest, module }
+        }
+        ExtensionAction::Uninstall { id } => Command::UninstallExtension { extension: id },
+        ExtensionAction::InstallProposal { digest } => Command::InstallProposal { digest },
+        ExtensionAction::Dismiss { digest } => Command::DismissProposal { digest },
         ExtensionAction::Panel {
             id,
             panel,

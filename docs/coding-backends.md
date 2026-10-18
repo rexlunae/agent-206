@@ -98,11 +98,28 @@ agent206 backend select "$THREAD_ID" codex
 # Explicit project permissions, within the current mode's ceiling:
 agent206 backend select "$PROJECT_THREAD_ID" codex --read --write --execute
 agent206 backend select "$THREAD_ID" native
+# Agent 206's own engine can also be granted git (Code mode) or the network
+# (Research mode):
+agent206 backend select "$PROJECT_THREAD_ID" native --read --git-read --git-write
+agent206 backend select "$RESEARCH_THREAD_ID" native --network
 ```
+
+Agent 206's native engine also offers "Read git history", "Change git history"
+(which requires reading it) and "Use the network". These grants are enforced by
+its own tools: bundled and installed extensions reach git and the network only
+through host calls the gateway checks against them. The mode still caps each
+grant: no built-in mode holds both "Run project commands" and "Use the network"
+(Code has commands, Research has the network), so native project commands run
+without network access. External backends are never
+offered them, since their runtimes are confined only by project access and
+commands; switching a conversation to one drops those grants. Git grants need a
+project; the network grant does not. Each tool still needs the user's
+permission in the conversation, and extensions also need their own grant.
 
 ## Current boundaries and limits
 
-The macOS implementation uses Seatbelt. On Linux (`crates/sandbox`), bubblewrap
+On macOS `crates/sandbox` generates a Seatbelt policy from the same profile
+(`seatbelt.rs`) and starts the runtime with `sandbox-exec`. On Linux, bubblewrap
 places the runtime in new user, PID, IPC, UTS, cgroup and network namespaces with a
 mount namespace holding only system libraries, the installation, scratch space and
 the granted project; Landlock then confines reads, writes and execution to the same

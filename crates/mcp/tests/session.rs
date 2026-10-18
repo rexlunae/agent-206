@@ -26,12 +26,14 @@ async fn lists_and_calls_tools() {
         names,
         [
             "connect",
+            "connect_socket",
             "echo",
             "exit",
             "flood",
             "read_file",
             "run",
-            "wait"
+            "wait",
+            "wait_cancelled"
         ]
     );
     let echo = session.tools().iter().find(|t| t.name == "echo").unwrap();
@@ -103,6 +105,39 @@ async fn a_revoked_call_is_cancelled_and_the_session_stays_usable() {
         .unwrap();
     assert_eq!(output.content, [Content::Text(text)]);
     assert!(!session.is_closed());
+}
+
+#[tokio::test]
+async fn dropping_a_call_cancels_it_at_the_server() {
+    let (session, _child) = direct(Limits::default()).await.unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let marker = scratch.path().join(uuid::Uuid::new_v4().to_string());
+    let path = marker.to_str().unwrap();
+    let call = session.call(
+        "wait_cancelled",
+        arguments(serde_json::json!({ "path": path })),
+        None,
+    );
+    // One session sends in order, so once a later call is answered the
+    // server has received this one.
+    let text = uuid::Uuid::new_v4().to_string();
+    let echo = session.call("echo", arguments(serde_json::json!({ "text": text })), None);
+    let mut call = Box::pin(call);
+    tokio::select! {
+        biased;
+        _ = &mut call => panic!("the call waits for cancellation"),
+        output = echo => assert_eq!(output.unwrap().content, [Content::Text(text)]),
+    }
+    drop(call);
+    // The server's handler runs only when it receives the cancellation.
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while !marker.exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the server is told the call was cancelled");
+    assert!(!session.is_closed(), "the session stays usable");
 }
 
 #[tokio::test]

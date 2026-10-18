@@ -1,6 +1,6 @@
 //! Native protocol contracts against a live API with generated model facts.
 use a206_core::*;
-use a206_runtime::{backends::Progress, provider};
+use a206_runtime::{backends::Progress, provider, retry::RetryPolicy};
 use axum::{
     Json, Router,
     extract::{Query, State},
@@ -229,6 +229,7 @@ async fn paginates_native_catalogs_and_dispatches_protocol_specific_text() {
             at: provider::now(),
             backend: CodingBackend::Native,
             tool_calls: vec![],
+            compaction: None,
         });
         if protocol == ProviderApi::Anthropic {
             thread.effort = Some(api.effort.clone());
@@ -236,10 +237,20 @@ async fn paginates_native_catalogs_and_dispatches_protocol_specific_text() {
         }
         let prompt = Id::new_v4().to_string();
         let (progress, mut deltas) = tokio::sync::mpsc::channel(64);
-        let provider::Turn { text, usage, .. } =
-            provider::complete(&config, broker, &thread, &prompt, model, &[], &progress)
-                .await
-                .unwrap();
+        let provider::Turn { text, usage, .. } = provider::complete(
+            &config,
+            broker,
+            provider::Ask {
+                thread: &thread,
+                prompt: &prompt,
+                info: model,
+                tools: &[],
+            },
+            &progress,
+            &RetryPolicy::NONE,
+        )
+        .await
+        .unwrap();
         assert_eq!(text, api.text);
         let mut streamed = String::new();
         while let Ok(update) = deltas.try_recv() {
@@ -395,7 +406,10 @@ async fn gateway_needs_a_verified_pairing_and_never_persists_it() {
         credential: Some(credential),
         api: ProviderApi::Anthropic,
     });
-    assert_eq!(run(Command::SaveSettings(settings)).await, Reply::Ok);
+    assert_eq!(
+        run(Command::SaveSettings(Box::new(settings))).await,
+        Reply::Ok
+    );
     let refresh = || Command::RefreshCatalog { provider };
     assert!(matches!(
         run(refresh()).await,
@@ -660,6 +674,7 @@ fn conversation(info: &ModelInfo) -> Thread {
         at: provider::now(),
         backend: CodingBackend::Native,
         tool_calls: vec![],
+        compaction: None,
     });
     thread
 }
@@ -739,9 +754,20 @@ fn spawn_complete(
             pairing: pairing.as_ref(),
         };
         let prompt = Id::new_v4().to_string();
-        provider::complete(&config, broker, &thread, &prompt, &info, &[], &progress)
-            .await
-            .map(|turn| (turn.text, turn.usage))
+        provider::complete(
+            &config,
+            broker,
+            provider::Ask {
+                thread: &thread,
+                prompt: &prompt,
+                info: &info,
+                tools: &[],
+            },
+            &progress,
+            &RetryPolicy::NONE,
+        )
+        .await
+        .map(|turn| (turn.text, turn.usage))
     });
     (task, deltas)
 }
@@ -809,6 +835,60 @@ async fn deltas_are_published_in_order_while_the_stream_is_open() {
             assert!(usage.cost.is_none());
             assert!(deltas.try_recv().is_err(), "no delta beyond the reply");
         }
+    }
+}
+#[tokio::test]
+async fn tool_call_markup_written_as_text_is_removed_from_the_reply() {
+    for api in PROTOCOLS {
+        let mut rig = Rig::new(api, false).await;
+        let info = model_info(api, rig.config.id);
+        let (intro, outro) = (Id::new_v4().to_string(), Id::new_v4().to_string());
+        let call = format!("{{\"name\": \"{}\"}}", Id::new_v4());
+        // The open tag is split across deltas, and the reply ends in text that
+        // could have begun one.
+        let chunks = [
+            format!("{intro}<tool_"),
+            format!("call>{call}</tool_call> `<tool_call>` {outro} <"),
+        ];
+        let (task, mut deltas) = spawn_complete(&rig, &info);
+        let opened = rig.requests.recv().await.unwrap();
+        let identity = Id::new_v4().as_u128();
+        let (input, output) = (
+            (identity % 1000) as u64 + 1,
+            (identity >> 64) as u64 % 1000 + 1,
+        );
+        send_split(&opened.feed, &opening_events(api, input)).await;
+        for chunk in &chunks {
+            send_split(&opened.feed, &text_event(api, chunk)).await;
+        }
+        send_split(&opened.feed, &closing_events(api, input, output)).await;
+        drop(opened.feed);
+        let (text, _) = task.await.unwrap().unwrap();
+        assert_eq!(text, format!("{intro} `<tool_call>` {outro} <"), "{api:?}");
+        let mut streamed = String::new();
+        while let Ok(Progress::Delta(delta)) = deltas.try_recv() {
+            streamed.push_str(&delta);
+        }
+        assert!(!streamed.contains(&call), "{api:?}: {streamed}");
+        // The held `<` is the last delta.
+        assert_eq!(streamed, text, "{api:?}");
+
+        // A reply that was nothing but a leaked call is a failed reply.
+        let (task, _deltas) = spawn_complete(&rig, &info);
+        let opened = rig.requests.recv().await.unwrap();
+        send_split(&opened.feed, &opening_events(api, input)).await;
+        send_split(
+            &opened.feed,
+            &text_event(api, &format!("<tool_call>{call}</tool_call>\n")),
+        )
+        .await;
+        send_split(&opened.feed, &closing_events(api, input, output)).await;
+        drop(opened.feed);
+        let error = task.await.unwrap().unwrap_err();
+        assert!(
+            matches!(error, provider::ProviderError::Malformed(why) if why.contains("tool call as text")),
+            "{api:?}: {error:?}"
+        );
     }
 }
 #[tokio::test]
@@ -970,7 +1050,10 @@ async fn the_gateway_journals_streamed_text_and_reports_partial_failures() {
         credential: None,
         api: ProviderApi::OpenAi,
     });
-    assert_eq!(run(Command::SaveSettings(settings)).await, Reply::Ok);
+    assert_eq!(
+        run(Command::SaveSettings(Box::new(settings))).await,
+        Reply::Ok
+    );
     let Reply::Catalog(catalog) = run(Command::RefreshCatalog { provider }).await else {
         panic!("catalog refresh failed");
     };
@@ -1117,6 +1200,22 @@ async fn the_gateway_journals_streamed_text_and_reports_partial_failures() {
     assert_eq!(cancelled.state, RunState::Cancelled);
     assert_eq!(cancelled.messages.last().unwrap().text, partial);
     upstream_closed(&opened.feed, "cancellation").await;
+
+    // Each run's end is journaled once, with how it ended.
+    let Reply::Events(events) = run(Command::Events { after: cursor }).await else {
+        panic!("events unavailable");
+    };
+    let ended: Vec<_> = events
+        .into_iter()
+        .filter_map(|e| match e.kind {
+            EventKind::RunEnded { thread, state } if thread == id => Some(state),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        ended,
+        [RunState::Complete, RunState::Failed, RunState::Cancelled]
+    );
 }
 /// A broker from before streaming answers in one buffered reply; the gateway
 /// greets it with its own version, never sends it a stream request, and
@@ -1200,9 +1299,20 @@ async fn an_older_broker_is_used_without_streaming() {
     let thread = conversation(&info);
     let provider::Turn {
         text: got, usage, ..
-    } = provider::complete(&config, broker, &thread, "", &info, &[], &progress)
-        .await
-        .unwrap();
+    } = provider::complete(
+        &config,
+        broker,
+        provider::Ask {
+            thread: &thread,
+            prompt: "",
+            info: &info,
+            tools: &[],
+        },
+        &progress,
+        &RetryPolicy::NONE,
+    )
+    .await
+    .unwrap();
     assert_eq!(got, text);
     assert_eq!(next_delta(&mut deltas).await, text);
     assert_eq!(usage.input_tokens, Some(input));
@@ -1215,4 +1325,69 @@ async fn an_older_broker_is_used_without_streaming() {
         .collect();
     expected.extend(["pair".into(), "provider".into()]);
     assert_eq!(seen, expected);
+}
+
+/// A credentialed request whose connection the broker could not open is
+/// retried like a direct one, and the broker's typed failure is returned
+/// once the attempts run out.
+#[tokio::test]
+async fn brokered_connection_failures_are_retried() {
+    // Port 0 can never be listened on, so every connection is refused.
+    let origin = "http://127.0.0.1:0".to_owned();
+    let (dir, credential, pairing) = start_broker(&origin, &Id::new_v4().to_string()).await;
+    let _anchor = provider::verify_pairing(dir.path(), &pairing)
+        .await
+        .unwrap();
+    let api = ProviderApi::OpenAi;
+    let config = ProviderConfig {
+        id: Id::new_v4(),
+        label: Id::new_v4().to_string(),
+        base_url: format!("{origin}/v1"),
+        credential: Some(credential),
+        api,
+    };
+    let info = model_info(api, config.id);
+    let thread = conversation(&info);
+    let (progress, mut notices) = tokio::sync::mpsc::channel(64);
+    let retry = RetryPolicy {
+        attempts: 2,
+        base: std::time::Duration::ZERO,
+        max: std::time::Duration::ZERO,
+        max_retry_after: std::time::Duration::ZERO,
+    };
+    let error = provider::complete(
+        &config,
+        provider::Broker {
+            root: dir.path(),
+            pairing: Some(&pairing),
+        },
+        provider::Ask {
+            thread: &thread,
+            prompt: "",
+            info: &info,
+            tools: &[],
+        },
+        &progress,
+        &retry,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            provider::ProviderError::Broker(a206_broker::ClientError::Broker(
+                a206_broker::BrokerError::Upstream(a206_broker::UpstreamFailure::Connect)
+            ))
+        ),
+        "{error:?}"
+    );
+    drop(progress);
+    let mut retries = vec![];
+    while let Some(notice) = notices.recv().await {
+        if let Progress::Activity(text) = notice {
+            retries.push(text);
+        }
+    }
+    assert_eq!(retries.len(), 1, "{retries:?}");
+    assert!(retries[0].contains("2 of 2"), "{retries:?}");
 }

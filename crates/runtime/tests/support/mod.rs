@@ -28,11 +28,23 @@ pub const PATIENCE: Duration = Duration::from_secs(10);
 pub struct Opened {
     pub body: Value,
     pub feed: mpsc::Sender<Vec<u8>>,
+    /// A refusing status and `Retry-After` seconds; dropped unsent, the
+    /// response is a `200` stream of what `feed` carries.
+    pub refusal: tokio::sync::oneshot::Sender<(u16, Option<u64>)>,
 }
 impl Opened {
     pub async fn respond(self, events: String) {
         self.feed.send(events.into_bytes()).await.unwrap();
         // Dropping the feed ends the response body.
+    }
+    /// Send `events`, then break the connection.
+    pub async fn abort_after(self, events: String) {
+        self.feed.send(events.into_bytes()).await.unwrap();
+        self.feed.send(vec![]).await.unwrap();
+    }
+    /// Answer with `status` and no body.
+    pub fn refuse(self, status: u16, retry_after: Option<u64>) {
+        self.refusal.send((status, retry_after)).unwrap();
     }
 }
 #[derive(Clone)]
@@ -50,14 +62,31 @@ pub async fn handle(
         return Json(api.catalog).into_response();
     }
     let (feed, pieces) = mpsc::channel::<Vec<u8>>(8);
+    let (refusal, refused) = tokio::sync::oneshot::channel();
     let opened = Opened {
         body: serde_json::from_slice(&body).unwrap(),
         feed,
+        refusal,
     };
     api.opened.send(opened).await.unwrap();
+    if let Ok((status, retry_after)) = refused.await {
+        let mut response = axum::http::StatusCode::from_u16(status)
+            .unwrap()
+            .into_response();
+        if let Some(seconds) = retry_after {
+            response
+                .headers_mut()
+                .insert("retry-after", seconds.to_string().parse().unwrap());
+        }
+        return response;
+    }
     let body = futures_util::stream::unfold(pieces, |mut pieces| async move {
         let piece = pieces.recv().await?;
-        Some((Ok::<_, std::io::Error>(piece), pieces))
+        // An empty piece breaks the connection mid-response.
+        if piece.is_empty() {
+            return Some((Err(std::io::Error::other("aborted")), pieces));
+        }
+        Some((Ok(piece), pieces))
     });
     (
         [("content-type", "text/event-stream")],
@@ -89,6 +118,52 @@ pub fn text_response(api: ProviderApi, text: &str) -> String {
             None,
             json!({"candidates": [{"content": {"parts": [{"text": text}]}, "finishReason": "STOP"}]}),
         ),
+    }
+}
+/// A complete text response whose usage reports `input` input tokens.
+pub fn text_response_reporting(api: ProviderApi, text: &str, input: u64) -> String {
+    match api {
+        ProviderApi::OpenAi => [
+            sse(
+                None,
+                json!({"choices": [{"index": 0, "delta": {"content": text}}]}),
+            ),
+            sse(
+                None,
+                json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}),
+            ),
+            sse(
+                None,
+                json!({"choices": [], "usage": {"prompt_tokens": input, "completion_tokens": 1}}),
+            ),
+            "data: [DONE]\n\n".into(),
+        ]
+        .concat(),
+        ProviderApi::Anthropic => text_response(api, text)
+            .replace("\"input_tokens\":1", &format!("\"input_tokens\":{input}")),
+        ProviderApi::Gemini => sse(
+            None,
+            json!({"candidates": [{"content": {"parts": [{"text": text}]}, "finishReason": "STOP"}],
+                "usageMetadata": {"promptTokenCount": input, "candidatesTokenCount": 1}}),
+        ),
+    }
+}
+/// The messages (or Gemini contents) a request carries.
+pub fn history_of(api: ProviderApi, body: &Value) -> Vec<Value> {
+    match api {
+        ProviderApi::Gemini => body["contents"].as_array().unwrap().clone(),
+        _ => body["messages"].as_array().unwrap().clone(),
+    }
+}
+/// The system prompt a request carries.
+pub fn system_of(api: ProviderApi, body: &Value) -> String {
+    match api {
+        ProviderApi::OpenAi => body["messages"][0]["content"].as_str().unwrap().to_owned(),
+        ProviderApi::Anthropic => body["system"].as_str().unwrap().to_owned(),
+        ProviderApi::Gemini => body["systemInstruction"]["parts"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_owned(),
     }
 }
 /// A tool call as the model sends it: ID, tool name, raw argument text.
@@ -257,12 +332,33 @@ pub fn error_kind(call: &ToolCall) -> ErrorKind {
 /// A scripted provider of `api` serving one generated model, configured in
 /// `gateway`. Returns the model and the requests the provider receives.
 pub async fn connect(gateway: &Gateway, api: ProviderApi) -> (ModelKey, mpsc::Receiver<Opened>) {
+    connect_reporting(gateway, api, None).await
+}
+/// Like [`connect`], with the models API reporting `context_limit` (in the
+/// protocol's own field) when given.
+pub async fn connect_reporting(
+    gateway: &Gateway,
+    api: ProviderApi,
+    context_limit: Option<u64>,
+) -> (ModelKey, mpsc::Receiver<Opened>) {
     let model = nonce();
-    let catalog = match api {
+    let mut item = match api {
         ProviderApi::Gemini => {
-            json!({"models": [{"name": format!("models/{model}"), "supportedGenerationMethods": ["generateContent"]}]})
+            json!({"name": format!("models/{model}"), "supportedGenerationMethods": ["generateContent"]})
         }
-        _ => json!({"data": [{"id": model}]}),
+        _ => json!({"id": model}),
+    };
+    if let Some(limit) = context_limit {
+        let field = match api {
+            ProviderApi::OpenAi => "context_length",
+            ProviderApi::Anthropic => "max_input_tokens",
+            ProviderApi::Gemini => "inputTokenLimit",
+        };
+        item[field] = json!(limit);
+    }
+    let catalog = match api {
+        ProviderApi::Gemini => json!({"models": [item]}),
+        _ => json!({"data": [item]}),
     };
     let (opened, requests) = mpsc::channel(8);
     let router = Router::new()
@@ -284,7 +380,7 @@ pub async fn connect(gateway: &Gateway, api: ProviderApi) -> (ModelKey, mpsc::Re
         api,
     });
     assert_eq!(
-        request(gateway, Command::SaveSettings(settings)).await,
+        request(gateway, Command::SaveSettings(Box::new(settings))).await,
         Reply::Ok
     );
     let Reply::Catalog(catalog) = request(gateway, Command::RefreshCatalog { provider }).await

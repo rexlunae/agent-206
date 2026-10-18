@@ -43,6 +43,12 @@ pub struct ToolBudget {
     pub rounds: u32,
     /// Tool calls the gateway decides on per run, across all rounds.
     pub tool_calls: u32,
+    /// Model tokens per run: input plus output as the provider reports them,
+    /// summed over every request of the run, summaries included. `None` sets
+    /// no limit. Where one applies, a run whose provider leaves its usage
+    /// unknown stops rather than running unmeasured.
+    #[serde(default)]
+    pub tokens: Option<u64>,
 }
 impl ToolBudget {
     /// The largest budget the gateway accepts for either limit.
@@ -53,6 +59,7 @@ impl Default for ToolBudget {
         Self {
             rounds: 8,
             tool_calls: 32,
+            tokens: None,
         }
     }
 }
@@ -117,6 +124,41 @@ pub struct ToolCall {
     /// conversation is sent back to the same provider.
     #[serde(default)]
     pub signature: Option<String>,
+    /// How an output rule reduced `output` before the model saw it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reduction: Option<OutputReduction>,
+    /// Credentials removed from the result before the model saw it, by
+    /// kind. The removed text is not kept.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub redactions: Vec<OutputCount>,
+    /// Text in the result that reads as instructions to the model, by kind.
+    /// Hidden characters are removed; the rest is kept, and the model is
+    /// told it came from the tool.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub injection: Vec<OutputCount>,
+}
+
+/// How an output rule reduced a tool result. The reduced text is the call's
+/// `output`; the original is not kept.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutputReduction {
+    /// The id of the rule that applied.
+    pub rule: String,
+    /// The rule came from the user's output rules rather than shipping with
+    /// the application.
+    pub user_rule: bool,
+    /// The size of the result before the rule applied.
+    pub original_bytes: u64,
+    /// The rule's named counts over the lines the model is shown.
+    #[serde(default)]
+    pub counts: Vec<OutputCount>,
+}
+
+/// One named count an output rule reported.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutputCount {
+    pub name: String,
+    pub count: u64,
 }
 
 /// A pending request for the user to approve one tool call. It is bound to

@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/vault-channel", "crates/core", "crates/protocol", "crates/vault", "crates/broker", "crates/import", "crates/extension-abi", "crates/extension-sdk", "crates/extensions", "crates/sandbox", "crates/mcp", "crates/skills", "plugins/workspace", "plugins/git", "crates/runtime", "crates/ui", "crates/app"]
+members = ["crates/vault-channel", "crates/core", "crates/audit", "crates/protocol", "crates/vault", "crates/broker", "crates/import", "crates/extension-abi", "crates/extension-sdk", "crates/extensions", "crates/sandbox", "crates/mcp", "crates/skills", "crates/output-rules", "crates/leak-scan", "crates/injection-scan", "plugins/workspace", "plugins/git", "plugins/skills", "plugins/web", "plugins/memory", "crates/runtime", "crates/ui", "crates/app"]
 default-members = ["crates/app"]
 resolver = "3"
 
@@ -12,6 +12,7 @@ license = "MIT"
 [workspace.dependencies]
 a206-vault-channel = { path = "crates/vault-channel" }
 a206-core = { path = "crates/core" }
+a206-audit = { path = "crates/audit" }
 a206-protocol = { path = "crates/protocol" }
 a206-vault = { path = "crates/vault" }
 a206-broker = { path = "crates/broker" }
@@ -21,6 +22,9 @@ a206-extensions = { path = "crates/extensions" }
 a206-mcp = { path = "crates/mcp" }
 a206-sandbox = { path = "crates/sandbox" }
 a206-skills = { path = "crates/skills" }
+a206-output-rules = { path = "crates/output-rules" }
+a206-leak-scan = { path = "crates/leak-scan" }
+a206-injection-scan = { path = "crates/injection-scan" }
 a206-runtime = { path = "crates/runtime" }
 a206-ui = { path = "crates/ui" }
 serde = { version = "1", features = ["derive"] }
@@ -32,6 +36,7 @@ anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "ansi", "std"] }
 uuid = { version = "1", features = ["v4", "serde", "js"] }
+globset = { version = "0.4.20", default-features = false }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "io-std", "sync", "time", "fs", "net"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 futures-util = { version = "0.3", features = ["sink"] }

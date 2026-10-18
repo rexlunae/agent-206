@@ -11,7 +11,11 @@ a206-protocol.workspace = true
 a206-extensions.workspace = true
 a206-mcp.workspace = true
 a206-skills.workspace = true
+a206-output-rules.workspace = true
+a206-leak-scan.workspace = true
+a206-injection-scan.workspace = true
 a206-vault.workspace = true
+http = "1"
 a206-broker.workspace = true
 a206-sandbox.workspace = true
 serde.workspace = true
@@ -32,6 +36,8 @@ thiserror.workspace = true
 zeroize.workspace = true
 fs2 = "0.4"
 cap-std = "4"
+globset.workspace = true
+regex = "1"
 cap-fs-ext = "4"
 # Pure-Rust git: no hooks, filters or other repository-configured programs run.
 gix = { version = "0.89", default-features = false, features = ["status", "blob-diff", "sha1", "parallel"] }
@@ -40,21 +46,34 @@ axum-server = { version = "0.8", features = ["tls-rustls-no-provider"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
 time = "0.3"
+# Cron expressions, evaluated in IANA time zones through jiff.
+croner = { version = "4.0.1", default-features = false, features = ["jiff"] }
+jiff = "0.2"
 tower-http = { version = "0.6", features = ["fs", "set-header"] }
 tower = { version = "0.5", features = ["util"] }
 rmcp = { version = "3.5", features = ["transport-io"] }
 rusqlite = { version = "0.37", features = ["bundled"] }
 agent-client-protocol = { version = "3.3", features = ["stdio"] }
 tempfile.workspace = true
+serde_bytes = "0.11"
 [target.'cfg(unix)'.dependencies]
 async-io = "2"
 nix = { version = "0.31", features = ["signal", "process", "fs", "user"] }
+rustix = { version = "1", features = ["pty", "termios", "fs"] }
+[features]
+# Test-only gateway hooks (attaching an in-process MCP session). Enabled for
+# this crate's own tests below; the application never enables it.
+test-support = []
 [dev-dependencies]
+a206-runtime = { path = ".", features = ["test-support"] }
 totp-rs = { version = "5.7", default-features = false }
 tracing-subscriber.workspace = true
 tempfile.workspace = true
 a206-broker.workspace = true
 a206-vault.workspace = true
+http = "1"
+tokio = { workspace = true, features = ["test-util"] }
+axum = { version = "0.8", features = ["ws"] }
 [[test]]
 name = "native_exec"
 harness = false
@@ -65,6 +84,10 @@ harness = false
 # Its own `main` also serves as the extension worker the gateway starts.
 [[test]]
 name = "extension_tools"
+harness = false
+# Likewise the worker for the bundled memory extension.
+[[test]]
+name = "memory_tools"
 harness = false
 [lints]
 workspace = true

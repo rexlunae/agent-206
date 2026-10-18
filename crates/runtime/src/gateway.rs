@@ -15,15 +15,27 @@ use std::{
     sync::{Arc, Mutex, MutexGuard},
 };
 use tokio::io::AsyncWriteExt;
+mod compaction;
 mod mcp_servers;
+mod memory_flush;
 mod run;
 /// Snapshot bytes a user message needs beyond its text and attachments.
 const MESSAGE_OVERHEAD: usize = 4096;
 mod messengers;
+pub use compaction::{CompactionError, THRESHOLD_PERCENT as COMPACTION_THRESHOLD_PERCENT};
+pub(crate) use mcp_servers::McpClient;
 pub use mcp_servers::{McpOffer, McpOffers};
-pub use run::{RunError, ToolError};
+pub use run::{OUTPUT_RULES, RunError, ToolError};
+mod delegation;
+mod plans;
+mod schedules;
+pub use plans::Plans;
+mod pause;
 mod skills;
-pub use skills::SkillOffer;
+mod steering;
+pub use crate::skill_tool::SkillOffer;
+pub use delegation::{Caller, Child, Delegator, DelegatorError, Reservation};
+pub use schedules::{Jobs, MAX_AGENT_JOBS};
 
 /// Streamed reply text that is not final yet. It is published as the
 /// thread's assistant message at most every [`PartialReply::INTERVAL`], so a
@@ -75,6 +87,7 @@ impl PartialReply {
                 at: now(),
                 backend: thread.backend,
                 tool_calls: vec![],
+                compaction: None,
             });
         }
     }
@@ -99,6 +112,7 @@ impl PartialReply {
                 at: now(),
                 backend: thread.backend,
                 tool_calls: vec![],
+                compaction: None,
             });
         }
         self.apply(thread);
@@ -139,6 +153,10 @@ pub enum GatewayError {
     Provider(#[from] provider::ProviderError),
     #[error(transparent)]
     Endpoint(#[from] provider::EndpointError),
+    #[error("the IRC server is not allowed")]
+    IrcServer(#[source] a206_core::messengers::IrcServerError),
+    #[error("the signal-cli daemon endpoint is not allowed")]
+    SignalDaemon(#[source] a206_core::messengers::SignalDaemonError),
     #[error(transparent)]
     Presets(#[from] provider::PresetError),
     #[error(transparent)]
@@ -154,9 +172,23 @@ pub enum GatewayError {
     #[error(transparent)]
     Skill(#[from] a206_skills::SkillError),
     #[error(transparent)]
+    OutputRules(#[from] a206_output_rules::RulesError),
+    #[error(transparent)]
+    Prompt(#[from] crate::prompt_tool::PromptError),
+    #[error(transparent)]
+    Programs(#[from] crate::exec_tool::programs::ProgramsError),
+    #[error(transparent)]
+    Schedule(#[from] crate::schedule::ScheduleError),
+    #[error("HEARTBEAT.md could not be read")]
+    Heartbeat(#[source] crate::instructions::InstructionError),
+    #[error(transparent)]
+    Search(#[from] a206_core::SearchError),
+    #[error(transparent)]
     Frame(#[from] transport::FrameError),
     #[error(transparent)]
     Run(#[from] run::RunError),
+    #[error(transparent)]
+    Compaction(#[from] compaction::CompactionError),
     #[error("state could not be encoded")]
     Encode(#[from] rmp_serde::encode::Error),
     #[error("settings could not be encoded")]
@@ -198,7 +230,11 @@ impl crate::error::Classified for GatewayError {
     fn kind(&self) -> Option<ErrorKind> {
         use crate::error::classify;
         Some(match self {
-            Self::Invalid(_) | Self::DownloadUrl(_) => ErrorKind::InvalidRequest,
+            Self::Invalid(_)
+            | Self::DownloadUrl(_)
+            | Self::Search(_)
+            | Self::IrcServer(_)
+            | Self::SignalDaemon(_) => ErrorKind::InvalidRequest,
             Self::NotFound(_) => ErrorKind::NotFound,
             Self::Conflict(_) => ErrorKind::Conflict,
             Self::Denied(_) => ErrorKind::PermissionDenied,
@@ -228,8 +264,14 @@ impl crate::error::Classified for GatewayError {
             Self::Extension(error) => return classify(error),
             Self::Mcp(error) => return classify(error),
             Self::Skill(error) => return classify(error),
+            Self::OutputRules(error) => return classify(error),
+            Self::Prompt(error) => return classify(error),
+            Self::Programs(error) => return classify(error),
+            Self::Schedule(error) => return classify(error),
+            Self::Heartbeat(error) => return classify(error),
             Self::Frame(error) => return classify(error),
             Self::Run(error) => return classify(error),
+            Self::Compaction(error) => return classify(error),
             // The cause's own kind (missing, denied, invalid data) is the useful one.
             Self::Receipt(_)
             | Self::Workspace(_)
@@ -304,6 +346,11 @@ pub struct Gateway {
     extensions: crate::extension_host::ExtensionHost,
     downloads: Arc<Mutex<BTreeMap<Id, tokio_util::sync::CancellationToken>>>,
     running: Arc<Mutex<BTreeMap<Id, tokio_util::sync::CancellationToken>>>,
+    /// Native runs taking `Steer` messages; changed under the store lock.
+    accepting: Arc<Mutex<BTreeSet<Id>>>,
+    /// Bumped whenever a conversation is paused or resumed, so paused runs
+    /// look again.
+    pauses: Arc<tokio::sync::watch::Sender<u64>>,
     /// Held only in memory: a restart needs a fresh pairing from the user.
     pairing: Arc<Mutex<Option<Paired>>>,
     /// Orders PairBroker commands, so a slow older verification never
@@ -313,8 +360,12 @@ pub struct Gateway {
     refreshed: Arc<Mutex<BTreeMap<Id, u64>>>,
     paired: Arc<tokio::sync::Notify>,
     tool_hosts: Arc<Vec<Arc<dyn crate::tools::ToolHost>>>,
+    /// How model requests are retried.
+    retry: crate::retry::RetryPolicy,
     /// Runs waiting for the user, by approval ID. Only `ResolveApproval` answers them.
     approvals: Arc<Mutex<BTreeMap<Id, run::Waiter>>>,
+    /// Questions `ask_user` calls are waiting on. Only `AnswerPrompt` answers them.
+    prompts: Arc<crate::prompt_tool::Prompts>,
     /// Bumped whenever a tool permission, grant or mode changes, so running
     /// tool calls and approval waits re-check their authority at once.
     policy: Arc<tokio::sync::watch::Sender<u64>>,
@@ -324,7 +375,13 @@ pub struct Gateway {
     messengers: tokio::sync::watch::Sender<Vec<crate::messengers::Desired>>,
     /// Messengers the user disconnected; they connect again only on request.
     messengers_stopped: Arc<Mutex<BTreeSet<String>>>,
-    mcp: Arc<mcp_servers::McpServers>,
+    mcp: McpClient,
+    /// This gateway's subagent tools and the hosts their subagents run with.
+    delegation: delegation::Binding,
+    /// Runs the subagent tools reserved before starting them, by subagent.
+    reserved: delegation::Reserved,
+    /// Wakes the scheduler when a job is added or changed.
+    jobs_changed: Arc<tokio::sync::Notify>,
 }
 /// The broker pairing this gateway holds, with the connection that anchors it.
 struct Paired {
@@ -334,6 +391,21 @@ struct Paired {
 }
 /// Minimum seconds between automatic refreshes of one stale catalog.
 const REFRESH_RETRY: u64 = 300;
+/// What the request journal keeps of a command: an installed module is
+/// recorded by its SHA-256 rather than copied, which still tells a retry
+/// apart from a different request reusing its id.
+fn journal_form(command: &Command) -> std::borrow::Cow<'_, Command> {
+    match command {
+        Command::InstallExtension { manifest, module } => {
+            std::borrow::Cow::Owned(Command::InstallExtension {
+                manifest: manifest.clone(),
+                module: Sha256::digest(module).to_vec(),
+            })
+        }
+        command => std::borrow::Cow::Borrowed(command),
+    }
+}
+
 impl Gateway {
     pub fn open(root: &Path) -> Result<Self, StoreError> {
         let mut store = Store::open(root)?;
@@ -366,7 +438,24 @@ impl Gateway {
         let extension_tools: Arc<dyn crate::tools::ToolHost> = Arc::new(
             crate::extension_tools::ExtensionToolHost::new(extensions.clone()),
         );
-        Ok(Self {
+        // Proposing grants nothing; installing a proposal is a user operation.
+        let propose_tools: Arc<dyn crate::tools::ToolHost> =
+            Arc::new(crate::propose_tool::ProposeHost::new(extensions.clone()));
+        // So are tools of enabled MCP servers the conversation may use. The
+        // host holds only the MCP client, not this gateway.
+        let mcp = McpClient::new(store.clone());
+        let mcp_tools: Arc<dyn crate::tools::ToolHost> =
+            Arc::new(crate::mcp_tools::McpToolHost::new(mcp.clone()));
+        let prompts = Arc::new(crate::prompt_tool::Prompts::new(store.clone()));
+        // Approved skills; each conversation still denies the tools until the
+        // user permits them.
+        let skill_tools: Arc<dyn crate::tools::ToolHost> =
+            Arc::new(crate::skill_tool::SkillToolHost::new(store.clone(), root));
+        // Listing reads what the Extensions page shows and changes nothing.
+        let list_tools: Arc<dyn crate::tools::ToolHost> = Arc::new(
+            crate::extension_list_tool::ListHost::new(extensions.clone(), skill_tools.clone()),
+        );
+        let mut gateway = Self {
             admission: Arc::new(Mutex::new(Admission::default())),
             shutdown_committed: Arc::new(tokio::sync::Mutex::new(false)),
             started: std::time::Instant::now(),
@@ -376,21 +465,44 @@ impl Gateway {
             store,
             downloads: Arc::new(Mutex::new(BTreeMap::new())),
             running: Arc::new(Mutex::new(BTreeMap::new())),
+            accepting: Arc::new(Mutex::new(BTreeSet::new())),
+            pauses: Arc::new(tokio::sync::watch::Sender::new(0)),
             pairing: Arc::new(Mutex::new(None)),
             pair_requests: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             refreshed: Arc::new(Mutex::new(BTreeMap::new())),
             paired: Arc::new(tokio::sync::Notify::new()),
+            retry: crate::retry::RetryPolicy::DEFAULT,
             tool_hosts: Arc::new(vec![
                 extension_tools,
+                mcp_tools,
                 Arc::new(crate::exec_tool::ExecHost::new(root)),
+                Arc::new(crate::prompt_tool::PromptHost::new(prompts.clone())),
+                skill_tools,
+                propose_tools,
+                list_tools,
             ]),
             approvals: Arc::new(Mutex::new(BTreeMap::new())),
+            prompts,
             policy: Arc::new(tokio::sync::watch::Sender::new(0)),
             pairings: tokio::sync::watch::Sender::new(0),
             messengers: tokio::sync::watch::Sender::new(desired),
             messengers_stopped: Arc::new(Mutex::new(BTreeSet::new())),
-            mcp: Arc::default(),
-        })
+            mcp,
+            delegation: Default::default(),
+            reserved: Arc::default(),
+            jobs_changed: Arc::default(),
+        };
+        // Schedule tools; each conversation still denies them until the user
+        // permits them, and each new job waits for the user's approval.
+        let schedule_tools = Arc::new(crate::schedule_tool::ScheduleHost::new(gateway.jobs()));
+        Arc::make_mut(&mut gateway.tool_hosts).push(schedule_tools);
+        // The plan tool, denied in each conversation until the user permits it.
+        let plan_tools = Arc::new(crate::plan_tool::PlanHost::new(gateway.plans()));
+        Arc::make_mut(&mut gateway.tool_hosts).push(plan_tools);
+        // Subagent tools; each conversation still denies them until the user
+        // permits them, and they are offered only with subagent models.
+        gateway.bind_delegation();
+        Ok(gateway)
     }
     fn pairing(&self) -> Result<Option<BrokerPairing>> {
         Ok(self
@@ -529,12 +641,15 @@ impl Gateway {
                 | Command::Skills
                 | Command::ReadSkill { .. }
                 | Command::ListTools { .. }
+                // Read-only; its reply copies message text.
+                | Command::SearchMessages { .. }
+                | Command::Activity { .. }
                 // Never journal a pairing: request bodies are persisted.
                 | Command::PairBroker { .. }
         );
         let begin = if mutation {
             self.lock()
-                .and_then(|mut store| Ok(store.begin(id, &request.body)?))
+                .and_then(|mut store| Ok(store.begin(id, &journal_form(&request.body))?))
         } else {
             Ok(None)
         };
@@ -709,7 +824,17 @@ impl Gateway {
                         GatewayError::Invalid("each mode needs exactly one prompt"),
                     )?;
                 }
+                let home = std::env::var_os("HOME").map(PathBuf::from);
                 let mut store = self.lock()?;
+                let mut hidden = a206_sandbox::hidden_home_paths();
+                hidden.push(store.root.clone());
+                settings.program_directories = crate::exec_tool::programs::validate(
+                    &settings.program_directories,
+                    &store.state.settings.program_directories,
+                    &hidden,
+                    home.as_deref(),
+                    &store.root,
+                )?;
                 check(
                     settings.revision == store.state.settings.revision,
                     GatewayError::Conflict(
@@ -776,11 +901,13 @@ impl Gateway {
                 });
                 store.state.messengers =
                     Self::messenger_statuses(&store.state.messengers, &settings.messengers);
-                let previous = std::mem::replace(&mut store.state.settings, settings);
+                let previous = std::mem::replace(&mut store.state.settings, *settings);
                 store.state.mcp_servers = mcp_servers;
                 store.persist(Some(EventKind::SettingsChanged))?;
                 self.stop_changed_mcp(&previous.mcp_servers, &store.state.settings.mcp_servers)?;
                 drop(store);
+                // Background commands given a directory that was removed stop.
+                self.grants_changed()?;
                 self.publish_messengers()?;
                 Ok(Reply::Ok)
             }
@@ -821,7 +948,7 @@ impl Gateway {
                 let thread = Thread::new(title, mode);
                 let mut store = self.lock()?;
                 store.state.threads.push(thread.clone());
-                store.persist(Some(EventKind::ThreadChanged { id: thread.id }))?;
+                store.persist(Some(EventKind::ThreadCreated { id: thread.id }))?;
                 Ok(Reply::Thread(Box::new(thread)))
             }
             Command::SetSubagentModel { id, model, allowed } => {
@@ -859,7 +986,7 @@ impl Gateway {
                 )?;
                 let mut store = self.lock()?;
                 store.thread_mut(id)?.title = title;
-                store.persist(Some(EventKind::ThreadChanged { id }))?;
+                store.persist(Some(EventKind::ThreadRenamed { id }))?;
                 Ok(Reply::Ok)
             }
             Command::ConfigureThread {
@@ -899,7 +1026,9 @@ impl Gateway {
                     .collect();
                 let thread = thread.clone();
                 store.persist(Some(EventKind::ThreadChanged { id }))?;
+                drop(store);
                 self.policy_changed();
+                self.grants_changed()?;
                 Ok(Reply::Thread(Box::new(thread)))
             }
             Command::SetEffort { thread: id, effort } => {
@@ -929,14 +1058,8 @@ impl Gateway {
                     thread.parent.is_none(),
                     GatewayError::Denied("delegated threads cannot change backend grants"),
                 )?;
-                let supported: BTreeSet<_> = [
-                    Capability::ReadWorkspace,
-                    Capability::WriteWorkspace,
-                    Capability::Execute,
-                ]
-                .into();
                 check(
-                    capabilities.is_subset(&supported)
+                    capabilities.iter().all(|c| backend.grantable().contains(c))
                         && capabilities.is_subset(&thread.mode.ceiling()),
                     GatewayError::Denied("backend capability is unavailable in this mode"),
                 )?;
@@ -946,7 +1069,14 @@ impl Gateway {
                     GatewayError::Invalid("write access also requires read access"),
                 )?;
                 check(
-                    capabilities.is_empty() || thread.project.is_some(),
+                    !capabilities.contains(&Capability::GitWrite)
+                        || capabilities.contains(&Capability::GitRead),
+                    GatewayError::Invalid("changing git history also requires reading it"),
+                )?;
+                // Only the network reaches beyond the project.
+                check(
+                    capabilities.iter().all(|c| *c == Capability::Network)
+                        || thread.project.is_some(),
                     GatewayError::Invalid("associate a project before granting workspace tools"),
                 )?;
                 if backend != CodingBackend::Native {
@@ -965,7 +1095,9 @@ impl Gateway {
                 thread.backend_activity = None;
                 thread.grant.capabilities = capabilities;
                 store.persist(Some(EventKind::ThreadChanged { id }))?;
+                drop(store);
                 self.policy_changed();
+                self.grants_changed()?;
                 Ok(Reply::Ok)
             }
             Command::Send {
@@ -999,8 +1131,7 @@ impl Gateway {
                         && text.len() <= 128 * 1024,
                     GatewayError::Invalid("message must be 1–131072 bytes"),
                 )?;
-                let token = tokio_util::sync::CancellationToken::new();
-                let (config, thread, prompt, info, backend, workspace, root) = {
+                let (token, config, thread, prompt, info, backend, workspace, root) = {
                     let mut store = self.lock()?;
                     // Admit the message only with room for it and for the
                     // run's first round, which applies the same bound, so an
@@ -1016,33 +1147,7 @@ impl Gateway {
                         current.state != RunState::Running,
                         GatewayError::Conflict("thread is already running"),
                     )?;
-                    let key = current.model.as_ref().ok_or(GatewayError::Invalid(
-                        "connect a provider and select a model first",
-                    ))?;
-                    validate_model(&store.state, key)?;
-                    validate_effort(&store.state, Some(key), current.effort.as_deref())?;
-                    let info = store
-                        .state
-                        .catalogs
-                        .iter()
-                        .flat_map(|c| &c.models)
-                        .find(|m| &m.key == key)
-                        .cloned()
-                        .ok_or(GatewayError::Conflict("model metadata missing"))?;
-                    if let Some(parent) = current.parent {
-                        check(
-                            store.thread(parent)?.subagent_models.contains(key),
-                            GatewayError::Denied("parent revoked this subagent model"),
-                        )?;
-                    }
-                    let config = store
-                        .state
-                        .settings
-                        .providers
-                        .iter()
-                        .find(|p| p.id == key.provider)
-                        .cloned()
-                        .ok_or(GatewayError::NotFound("provider not configured"))?;
+                    let (config, info) = native_model(&store.state, current)?;
                     let prompt = store
                         .state
                         .settings
@@ -1079,6 +1184,7 @@ impl Gateway {
                         at: now(),
                         backend: thread.backend,
                         tool_calls: vec![],
+                        compaction: None,
                     });
                     thread.state = RunState::Running;
                     thread.backend_activity = None;
@@ -1086,12 +1192,21 @@ impl Gateway {
                     // The previous run's cost is not this run's.
                     thread.run_usage = None;
                     let copy = thread.clone();
-                    self.running
-                        .lock()
-                        .map_err(poisoned("run"))?
-                        .insert(id, token.clone());
-                    store.persist(Some(EventKind::ThreadChanged { id }))?;
-                    (config, copy, prompt, info, backend, workspace, root)
+                    // A subagent run its parent reserved is cancelled with it.
+                    let token = delegation::admit(self, id)?;
+                    let admitted = (|| -> Result<()> {
+                        if backend.is_none() {
+                            self.open_steering(id)?;
+                        }
+                        store.persist(Some(EventKind::ThreadChanged { id }))?;
+                        Ok(())
+                    })();
+                    if let Err(error) = admitted {
+                        // The thread stays as last saved: no run to cancel or steer.
+                        self.withdraw(id);
+                        return Err(error);
+                    }
+                    (token, config, copy, prompt, info, backend, workspace, root)
                 };
                 let Some(backend) = backend else {
                     let ended = self
@@ -1118,8 +1233,17 @@ impl Gateway {
                         run::Ended::Failed(error) => fail_run(thread, id, &error),
                         run::Ended::Cancelled => thread.state = RunState::Cancelled,
                     }
+                    // After the outcome: the run never read these.
+                    self.settle_steering(thread)?;
+                    // A pause holds a run; with the run over there is
+                    // nothing left to hold.
+                    thread.paused = false;
+                    thread.held = false;
                     let thread = thread.clone();
-                    store.persist(Some(EventKind::ThreadChanged { id }))?;
+                    store.persist(Some(EventKind::RunEnded {
+                        thread: id,
+                        state: thread.state.clone(),
+                    }))?;
                     return Ok(Reply::Thread(Box::new(thread)));
                 };
                 let (sender, mut progress) = tokio::sync::mpsc::channel(32);
@@ -1197,9 +1321,24 @@ impl Gateway {
                     }
                 }
                 let thread = thread.clone();
-                store.persist(Some(EventKind::ThreadChanged { id }))?;
+                store.persist(Some(EventKind::RunEnded {
+                    thread: id,
+                    state: thread.state.clone(),
+                }))?;
                 Ok(Reply::Thread(Box::new(thread)))
             }
+            Command::SearchMessages { query, limit } => {
+                let store = self.store.lock().map_err(poisoned("store"))?;
+                Ok(Reply::Messages(a206_core::search::search(
+                    &store.state.threads,
+                    &query,
+                    limit,
+                )?))
+            }
+            Command::Activity { before, limit } => {
+                Ok(Reply::Activity(self.lock()?.activity(before, limit)?))
+            }
+            Command::CompactThread { thread } => self.compact_thread(thread).await,
             Command::ListTools { thread } => self.list_tools(thread).await,
             Command::SetToolPermission {
                 thread,
@@ -1213,14 +1352,15 @@ impl Gateway {
                 digest,
                 decision,
             } => self.resolve_approval(thread, approval, &digest, decision),
-            Command::CancelRun { thread } => {
-                let running = self.running.lock().map_err(poisoned("run"))?;
-                let token = running
-                    .get(&thread)
-                    .ok_or(GatewayError::NotFound("thread is not running"))?;
-                token.cancel();
+            Command::AnswerPrompt {
+                thread,
+                prompt,
+                answer,
+            } => {
+                self.prompts.answer(thread, prompt, answer)?;
                 Ok(Reply::Ok)
             }
+            Command::CancelRun { thread } => delegation::cancel_run(self, thread),
             Command::CreateProject { name, root } => {
                 check(
                     !name.trim().is_empty(),
@@ -1273,7 +1413,7 @@ impl Gateway {
                     &mode.ceiling(),
                 );
                 store.state.threads.push(thread.clone());
-                store.persist(Some(EventKind::ThreadChanged { id: thread.id }))?;
+                store.persist(Some(EventKind::ThreadCreated { id: thread.id }))?;
                 Ok(Reply::Thread(Box::new(thread)))
             }
             Command::Download {
@@ -1424,6 +1564,41 @@ impl Gateway {
                 self.policy_changed();
                 Ok(Reply::Ok)
             }
+            Command::InstallExtension { manifest, module } => {
+                let summary = self.extensions.install(manifest, module).await?;
+                self.policy_changed();
+                Ok(Reply::Extension(Box::new(summary)))
+            }
+            Command::UninstallExtension { extension } => {
+                self.extensions.uninstall(extension).await?;
+                // Running calls and approval waits re-check their tool.
+                self.policy_changed();
+                Ok(Reply::Ok)
+            }
+            Command::ScheduleJob {
+                name,
+                thread,
+                text,
+                schedule,
+                kind,
+            } => self
+                .schedule_job(name, thread, text, kind, schedule, JobAuthor::User)
+                .map(|job| Reply::Job(Box::new(job))),
+            Command::SetJobEnabled { id, enabled } => self.set_job_enabled(id, enabled),
+            Command::RemoveJob { id } => self.remove_job(id),
+            Command::RunJob { id } => self.run_job(id),
+            Command::Steer { thread, text } => self.steer(thread, text),
+            Command::PauseRun { thread } => self.set_paused(thread, true),
+            Command::ResumeRun { thread } => self.set_paused(thread, false),
+            Command::InstallProposal { digest } => {
+                let summary = self.extensions.install_proposal(digest).await?;
+                self.policy_changed();
+                Ok(Reply::Extension(Box::new(summary)))
+            }
+            Command::DismissProposal { digest } => {
+                self.extensions.dismiss_proposal(digest).await?;
+                Ok(Reply::Ok)
+            }
             Command::Skills => Ok(Reply::Skills(self.skills()?)),
             Command::ReadSkill { name } => Ok(Reply::Skill(self.read_skill(&name)?)),
             Command::SetSkillEnabled {
@@ -1507,16 +1682,7 @@ impl Gateway {
         &self.extensions
     }
     fn project_root(&self, id: Id) -> Result<PathBuf> {
-        Ok(self
-            .lock()?
-            .state
-            .projects
-            .iter()
-            .find(|p| p.id == id)
-            .ok_or(GatewayError::NotFound("project not found"))?
-            .root
-            .clone()
-            .into())
+        project_root(&*self.lock()?, id)
     }
     async fn start_download(
         &self,
@@ -1750,6 +1916,41 @@ fn fail_run(thread: &mut Thread, id: Id, error: &(dyn std::error::Error + 'stati
     ));
     thread.error = Some(report);
 }
+/// The provider account and API-reported model metadata a thread's next
+/// model request uses, after checking the model is still permitted.
+fn native_model(snapshot: &Snapshot, thread: &Thread) -> Result<(ProviderConfig, ModelInfo)> {
+    let key = thread.model.as_ref().ok_or(GatewayError::Invalid(
+        "connect a provider and select a model first",
+    ))?;
+    validate_model(snapshot, key)?;
+    validate_effort(snapshot, Some(key), thread.effort.as_deref())?;
+    let info = snapshot
+        .catalogs
+        .iter()
+        .flat_map(|c| &c.models)
+        .find(|m| &m.key == key)
+        .cloned()
+        .ok_or(GatewayError::Conflict("model metadata missing"))?;
+    if let Some(parent) = thread.parent {
+        let parent = snapshot
+            .threads
+            .iter()
+            .find(|t| t.id == parent)
+            .ok_or(GatewayError::NotFound("thread not found"))?;
+        check(
+            parent.subagent_models.contains(key),
+            GatewayError::Denied("parent revoked this subagent model"),
+        )?;
+    }
+    let config = snapshot
+        .settings
+        .providers
+        .iter()
+        .find(|p| p.id == key.provider)
+        .cloned()
+        .ok_or(GatewayError::NotFound("provider not configured"))?;
+    Ok((config, info))
+}
 fn validate_model(snapshot: &Snapshot, key: &ModelKey) -> Result<()> {
     check(
         snapshot
@@ -1837,6 +2038,19 @@ fn validate_effort(
     Ok(())
 }
 
+/// The root directory of project `id`.
+fn project_root(store: &Store, id: Id) -> Result<PathBuf> {
+    Ok(store
+        .state
+        .projects
+        .iter()
+        .find(|p| p.id == id)
+        .ok_or(GatewayError::NotFound("project not found"))?
+        .root
+        .clone()
+        .into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1866,6 +2080,191 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn message_search_reads_live_state_and_refuses_empty_queries() {
+        let directory = tempfile::tempdir().unwrap();
+        let gateway = Gateway::open(directory.path()).unwrap();
+        let term = Id::new_v4().simple().to_string();
+        let add = |at| {
+            let mut store = gateway.lock().unwrap();
+            let mut thread = Thread::new(Id::new_v4().to_string(), Mode::Chat);
+            thread.messages.push(a206_core::Message::new(
+                a206_core::Role::Assistant,
+                format!("{} {term}", Id::new_v4()),
+                at,
+                thread.backend,
+            ));
+            store.state.threads.push(thread);
+            store.persist(None).unwrap();
+        };
+        add(1);
+        let id = Id::new_v4();
+        let search = || {
+            gateway.request(Request {
+                id,
+                body: Command::SearchMessages {
+                    query: term.to_uppercase(),
+                    limit: a206_core::search::MAX_HITS,
+                },
+            })
+        };
+        let Reply::Messages(first) = search().await.body else {
+            panic!("search failed");
+        };
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].matched, term);
+        // Searches are not journaled: the same request ID sees new messages.
+        add(2);
+        let Reply::Messages(second) = search().await.body else {
+            panic!("search failed");
+        };
+        assert_eq!(second.iter().map(|hit| hit.at).collect::<Vec<_>>(), [2, 1]);
+        let request = Id::new_v4();
+        let reply = gateway
+            .request(Request {
+                id: request,
+                body: Command::SearchMessages {
+                    query: " ".into(),
+                    limit: 1,
+                },
+            })
+            .await
+            .body;
+        assert!(
+            matches!(reply, Reply::Error(ref report)
+                if report.kind == ErrorKind::InvalidRequest && report.correlation == Some(request)),
+            "{reply:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn activity_pages_newest_first_without_progress_notices() {
+        let directory = tempfile::tempdir().unwrap();
+        let gateway = Gateway::open(directory.path()).unwrap();
+        let names: Vec<String> = (0..5).map(|_| Id::new_v4().to_string()).collect();
+        {
+            let mut store = gateway.lock().unwrap();
+            for name in &names {
+                store
+                    .persist(Some(EventKind::ExtensionChanged { id: name.clone() }))
+                    .unwrap();
+                store
+                    .persist(Some(EventKind::ThreadChanged { id: Id::new_v4() }))
+                    .unwrap();
+                store
+                    .persist(Some(EventKind::DownloadChanged(Download {
+                        id: Id::new_v4(),
+                        name: Id::new_v4().to_string(),
+                        source: String::new(),
+                        received: 0,
+                        total: None,
+                        state: DownloadState::Running,
+                        error: None,
+                        sha256: None,
+                        failure: None,
+                    })))
+                    .unwrap();
+            }
+        }
+        let gateway = &gateway;
+        let page = |before| async move {
+            let Reply::Activity(page) = gateway
+                .request(Request {
+                    id: Id::new_v4(),
+                    body: Command::Activity { before, limit: 2 },
+                })
+                .await
+                .body
+            else {
+                panic!("activity failed");
+            };
+            page
+        };
+        let mut seen = Vec::new();
+        let mut before = None;
+        loop {
+            let current = page(before).await;
+            assert!(current.events.len() <= 2);
+            for event in &current.events {
+                let EventKind::ExtensionChanged { id } = &event.kind else {
+                    panic!("progress notice in activity: {event:?}");
+                };
+                seen.push(id.clone());
+            }
+            if !current.more {
+                break;
+            }
+            before = current.events.last().map(|event| event.sequence);
+        }
+        assert_eq!(seen, names.iter().rev().cloned().collect::<Vec<_>>());
+        // A zero limit still returns the cursor its `more` promises.
+        let Reply::Activity(zero) = gateway
+            .request(Request {
+                id: Id::new_v4(),
+                body: Command::Activity {
+                    before: None,
+                    limit: 0,
+                },
+            })
+            .await
+            .body
+        else {
+            panic!("activity failed");
+        };
+        assert!(zero.more && zero.events.len() == 1);
+    }
+
+    #[tokio::test]
+    async fn creating_and_renaming_a_conversation_are_activity() {
+        let directory = tempfile::tempdir().unwrap();
+        let gateway = Gateway::open(directory.path()).unwrap();
+        let run = |body| {
+            let gateway = &gateway;
+            async move {
+                gateway
+                    .request(Request {
+                        id: Id::new_v4(),
+                        body,
+                    })
+                    .await
+                    .body
+            }
+        };
+        let Reply::Thread(thread) = run(Command::CreateThread {
+            title: Id::new_v4().to_string(),
+            mode: Mode::Chat,
+        })
+        .await
+        else {
+            panic!("create failed");
+        };
+        let id = thread.id;
+        assert_eq!(
+            run(Command::RenameThread {
+                id,
+                title: Id::new_v4().to_string(),
+            })
+            .await,
+            Reply::Ok
+        );
+        let Reply::Activity(page) = run(Command::Activity {
+            before: None,
+            limit: 10,
+        })
+        .await
+        else {
+            panic!("activity failed");
+        };
+        let kinds: Vec<_> = page.events.into_iter().map(|event| event.kind).collect();
+        assert_eq!(
+            kinds,
+            [
+                EventKind::ThreadRenamed { id },
+                EventKind::ThreadCreated { id }
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn managed_joshua_connection_cannot_be_repointed_or_removed() {
         let directory = tempfile::tempdir().unwrap();
         let gateway = Gateway::open(directory.path()).unwrap();
@@ -1882,7 +2281,7 @@ mod tests {
             gateway
                 .request(Request {
                     id: Id::new_v4(),
-                    body: Command::SaveSettings(rename)
+                    body: Command::SaveSettings(Box::new(rename))
                 })
                 .await
                 .body,
@@ -1902,7 +2301,7 @@ mod tests {
             let reply = gateway
                 .request(Request {
                     id: request,
-                    body: Command::SaveSettings(settings),
+                    body: Command::SaveSettings(Box::new(settings)),
                 })
                 .await
                 .body;
@@ -1915,6 +2314,42 @@ mod tests {
             );
             assert_eq!(gateway.snapshot().unwrap(), before);
         }
+    }
+    #[tokio::test]
+    async fn program_directories_are_saved_canonically_or_refused_intact() {
+        let directory = tempfile::tempdir().unwrap();
+        let gateway = Gateway::open(directory.path()).unwrap();
+        let tools = tempfile::tempdir().unwrap();
+        let alias = tools.path().with_extension(Id::new_v4().to_string());
+        std::os::unix::fs::symlink(tools.path(), &alias).unwrap();
+        let save = |settings: Settings| {
+            gateway.request(Request {
+                id: Id::new_v4(),
+                body: Command::SaveSettings(Box::new(settings)),
+            })
+        };
+        let mut settings = gateway.snapshot().unwrap().settings;
+        settings.program_directories = vec![alias.clone()];
+        assert_eq!(save(settings).await.body, Reply::Ok);
+        let saved = gateway.snapshot().unwrap();
+        assert_eq!(
+            saved.settings.program_directories,
+            [std::fs::canonicalize(tools.path()).unwrap()]
+        );
+        // Gateway state cannot be offered to commands; nothing changes.
+        let mut settings = saved.settings.clone();
+        settings
+            .program_directories
+            .push(directory.path().join("."));
+        let reply = save(settings).await.body;
+        assert!(
+            matches!(reply, Reply::Error(ref report)
+                if report.kind == ErrorKind::PermissionDenied
+                    && report.message.contains("program directory")),
+            "{reply:?}"
+        );
+        assert_eq!(gateway.snapshot().unwrap(), saved);
+        std::fs::remove_file(alias).unwrap();
     }
     #[tokio::test]
     async fn partial_downloads_are_cleaned_on_errors_cancellation_and_publication() {
