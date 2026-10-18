@@ -444,6 +444,7 @@ async fn a_pattern_search_matches_by_regex_or_case_and_chosen_files() {
             ignore_case,
             include: include.map(Into::into),
             max_matches: 10,
+            include_ignored: false,
         };
     let found = |reply| match reply {
         HostReply::Matches(found) => found
@@ -538,6 +539,7 @@ async fn find_matches_names_or_paths_without_following_links() {
         path: path.into(),
         glob: glob.into(),
         max_results,
+        include_ignored: false,
     };
     let found = |reply| match reply {
         HostReply::Found(found) => (
@@ -602,6 +604,148 @@ async fn find_matches_names_or_paths_without_following_links() {
 }
 
 #[tokio::test]
+async fn walks_skip_what_git_ignores_unless_asked() {
+    let (dir, store) = store();
+    let root = dir.path().join("project");
+    let n = uuid::Uuid::new_v4().simple().to_string();
+    for directory in [".git/info", "build/sub", "src/gen", "src/deep"] {
+        std::fs::create_dir_all(root.join(directory)).unwrap();
+    }
+    let rules = [
+        (".git/info/exclude", format!("*.{n}.local\n")),
+        // A directory rule, a pattern, and an exception to it.
+        (".gitignore", format!("build/\n*.{n}\n!keep.{n}\n")),
+        // Relative to `src/`, and re-including what the root ignores.
+        ("src/.gitignore", format!("/gen/\n!src.{n}\n")),
+    ];
+    for (path, text) in &rules {
+        std::fs::write(root.join(path), text).unwrap();
+    }
+    let files = [
+        format!("a.{n}"),
+        format!("keep.{n}"),
+        format!("x.{n}.local"),
+        "build/out".to_string(),
+        "src/gen/code".to_string(),
+        format!("src/src.{n}"),
+        format!("src/deep/d.{n}"),
+        "src/deep/gen".to_string(),
+    ];
+    for path in &files {
+        std::fs::write(root.join(path), &n).unwrap();
+    }
+    // An ignore file that is a link is not read, as in git.
+    #[cfg(unix)]
+    {
+        std::fs::write(dir.path().join("rules"), "*\n").unwrap();
+        std::os::unix::fs::symlink(dir.path().join("rules"), root.join("src/deep/.gitignore"))
+            .unwrap();
+    }
+    let mut host = workspace_calls(&store, Some(root.clone()), &[Capability::ReadWorkspace]);
+    let find = |path: &str, include_ignored| HostRequest::Find {
+        path: path.into(),
+        glob: "*".into(),
+        max_results: 100,
+        include_ignored,
+    };
+    let files_found = |reply| match reply {
+        HostReply::Found(found) => found
+            .entries
+            .into_iter()
+            .filter(|e| e.kind != EntryKind::Directory && !e.path.ends_with(".gitignore"))
+            .map(|e| e.path)
+            .collect::<Vec<_>>(),
+        other => panic!("find failed: {other:?}"),
+    };
+    let kept = [
+        format!("keep.{n}"),
+        "src/deep/gen".to_string(),
+        format!("src/src.{n}"),
+    ];
+    assert_eq!(files_found(host.handle(find(".", false)).await), kept);
+    // Started below the root, the rules above still apply.
+    assert_eq!(
+        files_found(host.handle(find("src/deep", false)).await),
+        ["src/deep/gen"]
+    );
+    // Started in an ignored directory, or below one, it finds nothing.
+    for path in ["build", "build/sub", "src/gen"] {
+        assert!(files_found(host.handle(find(path, false)).await).is_empty());
+    }
+    assert_eq!(
+        files_found(host.handle(find("src/gen", true)).await),
+        ["src/gen/code"]
+    );
+    let mut all = files.to_vec();
+    all.sort();
+    assert_eq!(files_found(host.handle(find(".", true)).await), all);
+    // Searches skip the same files.
+    let search = |include_ignored| HostRequest::SearchPattern {
+        path: ".".into(),
+        pattern: n.clone(),
+        regex: false,
+        ignore_case: false,
+        include: None,
+        max_matches: 100,
+        include_ignored,
+    };
+    let searched = |reply| match reply {
+        HostReply::Matches(found) => found
+            .matches
+            .into_iter()
+            .map(|m| m.path)
+            .filter(|path| !path.ends_with(".gitignore") && !path.contains(".git/"))
+            .collect::<Vec<_>>(),
+        other => panic!("search failed: {other:?}"),
+    };
+    assert_eq!(searched(host.handle(search(false)).await), kept);
+    assert_eq!(searched(host.handle(search(true)).await), all);
+}
+
+#[tokio::test]
+async fn ignore_files_are_bounded() {
+    use crate::extension_host::workspace::{MAX_IGNORE_LINE, MAX_IGNORE_RULES};
+    let (dir, store) = store();
+    let root = dir.path().join("project");
+    std::fs::create_dir_all(root.join("sub")).unwrap();
+    let n = uuid::Uuid::new_v4().simple().to_string();
+    std::fs::write(root.join(format!("{n}.txt")), &n).unwrap();
+    let mut host = workspace_calls(&store, Some(root.clone()), &[Capability::ReadWorkspace]);
+    let find = |path: &str, include_ignored| HostRequest::Find {
+        path: path.into(),
+        glob: "*".into(),
+        max_results: 100,
+        include_ignored,
+    };
+    let rules = |count: usize| (0..count).map(|i| format!("{n}-{i}\n")).collect::<String>();
+    // The rules in force add up across directories.
+    std::fs::write(root.join(".gitignore"), rules(MAX_IGNORE_RULES / 2)).unwrap();
+    std::fs::write(root.join("sub/.gitignore"), rules(MAX_IGNORE_RULES / 2)).unwrap();
+    assert!(matches!(
+        host.handle(find(".", false)).await,
+        HostReply::Found(_)
+    ));
+    std::fs::write(root.join("sub/.gitignore"), rules(MAX_IGNORE_RULES / 2 + 1)).unwrap();
+    for path in [".", "sub"] {
+        assert_eq!(
+            code(host.handle(find(path, false)).await),
+            Some(HostErrorCode::TooLarge)
+        );
+    }
+    std::fs::remove_file(root.join("sub/.gitignore")).unwrap();
+    std::fs::write(root.join(".gitignore"), "x".repeat(MAX_IGNORE_LINE + 1)).unwrap();
+    assert_eq!(
+        code(host.handle(find(".", false)).await),
+        Some(HostErrorCode::TooLarge)
+    );
+    // Taking ignored files too reads no ignore file.
+    assert!(matches!(
+        host.handle(find(".", true)).await,
+        HostReply::Found(_)
+    ));
+}
+
+#[tokio::test]
 async fn walks_return_whole_paths_in_byte_order() {
     let (dir, store) = store();
     let root = dir.path().join("project");
@@ -618,6 +762,7 @@ async fn walks_return_whole_paths_in_byte_order() {
             path: ".".into(),
             glob: "*".into(),
             max_results: 10,
+            include_ignored: false,
         })
         .await
     else {
@@ -667,6 +812,7 @@ async fn long_paths_end_a_find_before_its_reply_outgrows_the_worker_bound() {
             path: ".".into(),
             glob: "*.rs".into(),
             max_results: workspace::MAX_FOUND,
+            include_ignored: false,
         })
         .await;
     let encoded = rmp_serde::to_vec_named(&reply).unwrap().len();
@@ -692,6 +838,7 @@ async fn a_directory_past_the_entry_bound_is_refused_not_cut() {
         path: path.into(),
         glob: "0".into(),
         max_results: 1,
+        include_ignored: false,
     };
     // Reached from the root, the walk stops before it, with nothing cut.
     let HostReply::Found(found) = host.handle(find(".")).await else {

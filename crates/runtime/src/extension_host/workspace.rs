@@ -32,6 +32,11 @@ pub const MAX_WALK_ENTRIES: usize = 100_000;
 /// reply bound; [`ENTRY_OVERHEAD`] is the most framing one result adds.
 pub const MAX_RESULT_BYTES: usize = 768 * 1024;
 const ENTRY_OVERHEAD: usize = 64;
+/// Ignore rules in force at once in a walk, and the longest one: every
+/// entry is matched against each rule in force, so both bound the work a
+/// repository's ignore files can cause.
+pub const MAX_IGNORE_RULES: usize = 4_096;
+pub const MAX_IGNORE_LINE: usize = 4096;
 
 fn io_failure(error: &std::io::Error) -> HostFailure {
     use std::io::ErrorKind as Io;
@@ -146,7 +151,8 @@ pub(super) fn list_directory(root: PathBuf, path: &str) -> Result<HostReply, Hos
 }
 
 /// Bounded, deterministic (name-ordered) search that never follows symlinks
-/// and skips `.git`, files over [`MAX_FILE`] and files that are not UTF-8.
+/// and skips `.git`, what git ignores, files over [`MAX_FILE`] and files
+/// that are not UTF-8.
 pub(super) fn search(
     root: PathBuf,
     path: &str,
@@ -162,6 +168,8 @@ pub(super) struct Pattern<'a> {
     pub regex: bool,
     pub ignore_case: bool,
     pub include: Option<&'a str>,
+    /// Also search what `.gitignore` and `.git/info/exclude` ignore.
+    pub include_ignored: bool,
 }
 
 /// [`search`] with a regular expression or letter-case-blind text, and an
@@ -206,60 +214,57 @@ pub(super) fn search_pattern(
     let limit = max_matches.clamp(1, MAX_MATCHES) as usize;
     let (mut files, mut bytes, mut reply) = (0, 0u64, 0);
     let mut result = SearchResult::default();
-    let mut walk = Walk::default();
-    let flow = walk.walk(
-        &open_directory(root, path)?,
-        "",
-        0,
-        &mut |directory, entry| {
-            use std::ops::ControlFlow::{Break, Continue};
-            if entry.kind != EntryKind::File
-                || include
-                    .as_ref()
-                    .is_some_and(|glob| !glob.is_match(entry.below))
-            {
-                return Ok(Continue(()));
+    let (mut walk, start) = Walk::over(root, path, !options.include_ignored)?;
+    let flow = walk.walk(&start, "", 0, &mut |directory, entry| {
+        use std::ops::ControlFlow::{Break, Continue};
+        if entry.kind != EntryKind::File
+            || include
+                .as_ref()
+                .is_some_and(|glob| !glob.is_match(entry.below))
+        {
+            return Ok(Continue(()));
+        }
+        if files == MAX_SEARCH_FILES || bytes >= MAX_SEARCH_BYTES {
+            return Ok(Break(()));
+        }
+        files += 1;
+        let Some(contents) = read_bounded(open_regular(directory, entry.name)?)? else {
+            return Ok(Continue(()));
+        };
+        bytes += contents.len() as u64;
+        let Ok(text) = String::from_utf8(contents) else {
+            return Ok(Continue(()));
+        };
+        for (index, line) in text.lines().enumerate() {
+            if !lines.is_match(line) {
+                continue;
             }
-            if files == MAX_SEARCH_FILES || bytes >= MAX_SEARCH_BYTES {
+            let found = SearchMatch {
+                path: format!("{prefix}{}", entry.below),
+                line: u32::try_from(index + 1).unwrap_or(u32::MAX),
+                text: super::bounded(line, MAX_MATCH_TEXT).to_string(),
+            };
+            let size = found.path.len() + found.text.len() + ENTRY_OVERHEAD;
+            if result.matches.len() == limit || reply + size > MAX_RESULT_BYTES {
                 return Ok(Break(()));
             }
-            files += 1;
-            let Some(contents) = read_bounded(open_regular(directory, entry.name)?)? else {
-                return Ok(Continue(()));
-            };
-            bytes += contents.len() as u64;
-            let Ok(text) = String::from_utf8(contents) else {
-                return Ok(Continue(()));
-            };
-            for (index, line) in text.lines().enumerate() {
-                if !lines.is_match(line) {
-                    continue;
-                }
-                let found = SearchMatch {
-                    path: format!("{prefix}{}", entry.below),
-                    line: u32::try_from(index + 1).unwrap_or(u32::MAX),
-                    text: super::bounded(line, MAX_MATCH_TEXT).to_string(),
-                };
-                let size = found.path.len() + found.text.len() + ENTRY_OVERHEAD;
-                if result.matches.len() == limit || reply + size > MAX_RESULT_BYTES {
-                    return Ok(Break(()));
-                }
-                reply += size;
-                result.matches.push(found);
-            }
-            Ok(Continue(()))
-        },
-    )?;
+            reply += size;
+            result.matches.push(found);
+        }
+        Ok(Continue(()))
+    })?;
     // A bound was reached: the result is complete up to that point.
     result.truncated = flow.is_break();
     Ok(HostReply::Matches(result))
 }
 
-/// Entries under `path` whose path matches `pattern`, in path order.
+/// Entries under `path` whose path matches `pattern`, in path order, and
+/// unless `include_ignored`, not ignored by git.
 pub(super) fn find(
     root: PathBuf,
     path: &str,
     pattern: &str,
+    include_ignored: bool,
     max_results: u32,
 ) -> Result<HostReply, HostFailure> {
     let matcher = glob(pattern)?;
@@ -267,8 +272,8 @@ pub(super) fn find(
     let limit = max_results.clamp(1, MAX_FOUND) as usize;
     let mut reply = 0;
     let mut result = FindResult::default();
-    let mut walk = Walk::default();
-    let flow = walk.walk(&open_directory(root, path)?, "", 0, &mut |_, entry| {
+    let (mut walk, start) = Walk::over(root, path, !include_ignored)?;
+    let flow = walk.walk(&start, "", 0, &mut |_, entry| {
         use std::ops::ControlFlow::{Break, Continue};
         if !matcher.is_match(entry.below) {
             return Ok(Continue(()));
@@ -352,6 +357,8 @@ struct Walk {
     /// Directory entries read so far, and how many the walk may read.
     entries: usize,
     limit: usize,
+    /// What git ignores here, when the walk skips it.
+    ignores: Option<Ignores>,
 }
 impl Default for Walk {
     fn default() -> Self {
@@ -359,7 +366,106 @@ impl Default for Walk {
             directories: 0,
             entries: 0,
             limit: MAX_WALK_ENTRIES,
+            ignores: None,
         }
+    }
+}
+
+/// The ignore rules git applies in a walk: `.git/info/exclude`, then every
+/// `.gitignore` from the workspace root down to the directory being walked,
+/// the deepest deciding first. A global `core.excludesFile` lies outside the
+/// workspace and is not read.
+struct Ignores {
+    rules: gix::ignore::Search,
+    /// Where the walk started, relative to the workspace: `""` or `dir/`.
+    start: String,
+    /// The start, or a directory above it, is ignored: git excludes
+    /// everything below an ignored directory, so the walk finds nothing.
+    start_ignored: bool,
+}
+impl Ignores {
+    /// The rules in force at `path` (workspace-relative), from the
+    /// workspace root down to its parent; the walk adds `path`'s own.
+    fn above(workspace: &Dir, path: &str) -> Result<Self, HostFailure> {
+        let mut ignores = Self {
+            rules: gix::ignore::Search::default(),
+            start: String::new(),
+            start_ignored: false,
+        };
+        if workspace
+            .symlink_metadata(".git")
+            .is_ok_and(|metadata| metadata.is_dir())
+        {
+            ignores.add(
+                &workspace.open_dir(".git").map_err(|e| io_failure(&e))?,
+                "info/exclude",
+                "",
+            )?;
+        }
+        let mut directory = workspace.try_clone().map_err(|e| io_failure(&e))?;
+        for name in path.split('/').filter(|name| !name.is_empty()) {
+            ignores.add(&directory, ".gitignore", &ignores.start.clone())?;
+            if ignores.ignores(name, true) {
+                ignores.start_ignored = true;
+                break;
+            }
+            directory = directory.open_dir(name).map_err(|e| io_failure(&e))?;
+            ignores.start.push_str(name);
+            ignores.start.push('/');
+        }
+        Ok(ignores)
+    }
+    /// Add the rules in `file` of `directory`, which is `at` in the
+    /// workspace. A missing file, or one that is not a regular file (git
+    /// does not follow a symlinked `.gitignore`), adds none.
+    fn add(&mut self, directory: &Dir, file: &str, at: &str) -> Result<(), HostFailure> {
+        match directory.symlink_metadata(file) {
+            Ok(metadata) if metadata.is_file() => {}
+            Ok(_) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(io_failure(&error)),
+        }
+        let bytes = read_bounded(open_regular(directory, file)?)?
+            .ok_or_else(|| failure(HostErrorCode::TooLarge, "an ignore file exceeds 512 KiB"))?;
+        if bytes
+            .split(|&byte| byte == b'\n')
+            .any(|line| line.len() > MAX_IGNORE_LINE)
+        {
+            return Err(failure(
+                HostErrorCode::TooLarge,
+                "an ignore rule is longer than 4 KiB",
+            ));
+        }
+        // The source names only where the rules apply: patterns in
+        // `dir/.gitignore` are relative to `dir/`.
+        let source = PathBuf::from(format!("{at}.gitignore"));
+        let list = gix::glob::search::pattern::List::from_bytes(
+            &bytes,
+            source,
+            Some(Path::new("")),
+            gix::ignore::search::Ignore::default(),
+        )
+        .map_err(|e| io_failure(&e))?;
+        let in_force = self.rules.patterns.iter().map(|list| list.patterns.len());
+        if in_force.sum::<usize>() + list.patterns.len() > MAX_IGNORE_RULES {
+            return Err(failure(
+                HostErrorCode::TooLarge,
+                "more than 4,096 ignore rules apply here",
+            ));
+        }
+        self.rules.patterns.push(list);
+        Ok(())
+    }
+    /// Whether git ignores `below` (relative to where the walk started).
+    fn ignores(&self, below: &str, is_dir: bool) -> bool {
+        let path = [self.start.as_str(), below].concat();
+        self.rules
+            .pattern_matching_relative_path(
+                path.as_str().into(),
+                Some(is_dir),
+                gix::glob::pattern::Case::Sensitive,
+            )
+            .is_some_and(|found| !found.pattern.is_negative())
     }
 }
 /// One step of a directory's walk.
@@ -379,7 +485,69 @@ impl Step {
     }
 }
 impl Walk {
+    /// A walk of `path` in the workspace at `root`, and that directory;
+    /// with `respect_ignores`, it skips what git ignores.
+    fn over(root: PathBuf, path: &str, respect_ignores: bool) -> Result<(Self, Dir), HostFailure> {
+        let workspace = open_workspace(root)?;
+        // Lexically, as the ignore rules are matched: `a/../b` is `b`.
+        let mut names = Vec::new();
+        for name in path.split('/') {
+            match name {
+                "" | "." => {}
+                ".." => {
+                    names.pop().ok_or_else(|| {
+                        failure(HostErrorCode::Invalid, "the path is outside the workspace")
+                    })?;
+                }
+                name => names.push(name),
+            }
+        }
+        let path = names.join("/");
+        let start = if path.is_empty() {
+            workspace.try_clone().map_err(|e| io_failure(&e))?
+        } else {
+            workspace.open_dir(&path).map_err(|e| io_failure(&e))?
+        };
+        let ignores = respect_ignores
+            .then(|| Ignores::above(&workspace, &path))
+            .transpose()?;
+
+        let walk = Self {
+            ignores,
+            ..Self::default()
+        };
+        Ok((walk, start))
+    }
+
     fn walk(
+        &mut self,
+        directory: &Dir,
+        prefix: &str,
+        depth: usize,
+        visit: &mut Visit<'_>,
+    ) -> Result<std::ops::ControlFlow<()>, HostFailure> {
+        // The directory's own rules apply below it, and only there.
+        let rules = match &mut self.ignores {
+            // Git excludes everything below an ignored directory.
+            Some(ignores) if ignores.start_ignored => {
+                return Ok(std::ops::ControlFlow::Continue(()));
+            }
+            Some(ignores) => {
+                let at = [ignores.start.as_str(), prefix].concat();
+                let before = ignores.rules.patterns.len();
+                ignores.add(directory, ".gitignore", &at)?;
+                Some(before)
+            }
+            None => None,
+        };
+        let flow = self.walk_entries(directory, prefix, depth, visit);
+        if let (Some(ignores), Some(before)) = (&mut self.ignores, rules) {
+            ignores.rules.patterns.truncate(before);
+        }
+        flow
+    }
+
+    fn walk_entries(
         &mut self,
         directory: &Dir,
         prefix: &str,
@@ -410,6 +578,11 @@ impl Walk {
             let entry = entry.map_err(|e| io_failure(&e))?;
             let kind = kind(entry.file_type().map_err(|e| io_failure(&e))?);
             let name = entry.file_name().to_string_lossy().into_owned();
+            if self.ignores.as_ref().is_some_and(|ignores| {
+                ignores.ignores(&[prefix, &name].concat(), kind == EntryKind::Directory)
+            }) {
+                continue;
+            }
             if kind == EntryKind::Directory {
                 if is_git(&name) {
                     continue;

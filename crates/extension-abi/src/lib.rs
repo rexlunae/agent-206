@@ -162,7 +162,8 @@ pub enum HostRequest {
     /// List a directory, relative to the invocation's workspace.
     ListDirectory { path: String },
     /// Find lines containing `query` (literal, case-sensitive) in UTF-8 files
-    /// under `path`, without following symlinks.
+    /// under `path`, without following symlinks or reading what git ignores
+    /// (`.gitignore` files and `.git/info/exclude`).
     Search {
         path: String,
         query: String,
@@ -171,7 +172,8 @@ pub enum HostRequest {
     /// Find lines matching `pattern` in UTF-8 files under `path`, without
     /// following symlinks: a literal text unless `regex`, compared without
     /// letter case when `ignore_case`. With `include`, only files whose path
-    /// matches that glob are searched (see [`HostRequest::Find`]).
+    /// matches that glob are searched (see [`HostRequest::Find`]). What git
+    /// ignores is skipped unless `include_ignored`.
     SearchPattern {
         path: String,
         pattern: String,
@@ -179,15 +181,22 @@ pub enum HostRequest {
         ignore_case: bool,
         include: Option<String>,
         max_matches: u32,
+        /// Absent from older guests, which then skip what git ignores.
+        #[serde(default)]
+        include_ignored: bool,
     },
     /// Entries under `path` matching a glob, without following symlinks. A
     /// glob without `/` matches entry names at any depth; one with `/`
     /// matches the whole path below `path`. `*` stays within one name and
-    /// `**` crosses directories.
+    /// `**` crosses directories. What git ignores is skipped unless
+    /// `include_ignored`.
     Find {
         path: String,
         glob: String,
         max_results: u32,
+        /// Absent from older guests, which then skip what git ignores.
+        #[serde(default)]
+        include_ignored: bool,
     },
     /// Write a whole file atomically. Without `overwrite`, an existing file
     /// is refused with [`HostErrorCode::Exists`].
