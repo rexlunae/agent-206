@@ -552,9 +552,8 @@ participant cannot approve their own request.
 
 - WhatsApp, Google Chat and iMessage on their own (they are reached through
   Beeper), and Teams conversations (webhooks only post to a channel).
-- Posting to IRC and Signal chats with `send_message`, a test
-  send to a chat from the Messengers page (the CLI's `--chat` does it), and
-  webhook delivery of scheduled messages' replies.
+- A test send to a chat from the Messengers page (the CLI's `--chat` does
+  it), and webhook delivery of scheduled messages' replies.
 - Beeper attachments, reactions and replies to a specific message, the
   experimental WebSocket event stream, and remembering cursors across
   restarts.
