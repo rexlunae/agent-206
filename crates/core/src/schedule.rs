@@ -116,6 +116,10 @@ pub struct JobRun {
     /// run whose end the gateway did not see (it was stopped meanwhile).
     #[serde(default)]
     pub ended: Option<u64>,
+    /// Whether the run's reply was posted to the job's
+    /// [`Job::deliver_to`]; `None` when there was nothing to post.
+    #[serde(default)]
+    pub delivery: Option<Delivery>,
 }
 impl JobRun {
     /// A run starting at `at`.
@@ -125,8 +129,21 @@ impl JobRun {
             at,
             outcome: JobOutcome::Running,
             ended: None,
+            delivery: None,
         }
     }
+}
+
+/// How posting a run's reply to a messenger went. Only a run that completes
+/// with a reply posts it; a heartbeat check posts only when something needs
+/// attention.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum Delivery {
+    /// Posted, in this many parts.
+    Sent { parts: u64 },
+    /// Not posted, or only partly: the destination was withdrawn or
+    /// disconnected, or the service refused it.
+    Failed(ErrorReport),
 }
 
 /// Most runs of one job the gateway keeps in its history.
@@ -158,6 +175,11 @@ pub struct Job {
     /// every other change.
     #[serde(default)]
     pub history: u64,
+    /// A messenger destination each run's reply is also posted to, as
+    /// [`crate::messengers::post_destinations`] names it; set only by the
+    /// user, with [`crate::Command::SetJobDelivery`].
+    #[serde(default)]
+    pub deliver_to: Option<String>,
 }
 
 /// Why a time or interval someone typed for a schedule cannot be used.

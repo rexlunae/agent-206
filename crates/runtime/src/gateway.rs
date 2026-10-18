@@ -1835,6 +1835,7 @@ impl Gateway {
             Command::RemoveJob { id } => self.remove_job(id),
             Command::RunJob { id } => self.run_job(id),
             Command::JobRuns { id } => self.job_runs(id),
+            Command::SetJobDelivery { id, to } => self.set_job_delivery(id, to),
             Command::Steer { thread, text } => self.steer(thread, text),
             Command::PauseRun { thread } => self.set_paused(thread, true),
             Command::ResumeRun { thread } => self.set_paused(thread, false),

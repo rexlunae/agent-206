@@ -130,6 +130,7 @@ fn a_restart_sends_an_interrupted_message_once() {
         last: Some(JobRun::start(started)),
         author: Default::default(),
         history: 0,
+        deliver_to: None,
     };
     let message =
         |text: &str, at: u64| Message::new(Role::User, text.into(), at, CodingBackend::default());
@@ -240,6 +241,7 @@ fn a_restart_settles_a_heartbeat_by_its_reply() {
         last: Some(JobRun::start(started)),
         author: Default::default(),
         history: 0,
+        deliver_to: None,
     };
     // A conversation that received run `run`'s check, answered with `reply`.
     let conversation = |run: Id, reply: &str| {

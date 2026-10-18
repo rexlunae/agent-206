@@ -3,8 +3,9 @@
 //! authority of its own and runs under its conversation's permissions.
 use crate::{PageFrame, State, call, dispatch, error::ErrorNotice, route::Route};
 use a206_core::{
-    Command, ErrorKind, ErrorReport, Job, JobAuthor, JobKind, JobOutcome, JobRun, Reply, Schedule,
-    ScheduleInputError, Snapshot,
+    Command, Delivery, ErrorKind, ErrorReport, Job, JobAuthor, JobKind, JobOutcome, JobRun, Reply,
+    Schedule, ScheduleInputError, Snapshot,
+    messengers::post_destinations,
     schedule::{MAX_JOB_RUNS, format_interval, parse_interval, parse_local},
 };
 use fc_dioxus::prelude::*;
@@ -70,6 +71,36 @@ fn outcome(outcome: &JobOutcome, kind: JobKind) -> (BadgeTone, &'static str) {
     }
 }
 
+/// How posting a run's reply went, in words.
+fn delivery(delivery: &Delivery) -> (BadgeTone, String) {
+    match delivery {
+        Delivery::Sent { parts: 1 } => (BadgeTone::Success, "Reply posted".to_owned()),
+        Delivery::Sent { parts } => (BadgeTone::Success, format!("Reply posted in {parts} parts")),
+        Delivery::Failed(_) => (BadgeTone::Warning, "Reply not posted".to_owned()),
+    }
+}
+
+/// The value the "Post replies to" field uses for no destination.
+const NOWHERE: &str = "";
+
+/// Choices for where a job's replies are posted: nowhere, each destination
+/// configured now, and the job's current one if it no longer is.
+fn delivery_choices(destinations: &[String], current: Option<&str>) -> Vec<SelectChoice> {
+    let mut choices = vec![SelectChoice::new(NOWHERE, "Nowhere")];
+    choices.extend(
+        destinations
+            .iter()
+            .map(|to| SelectChoice::new(to.clone(), to.clone())),
+    );
+    if let Some(current) = current.filter(|c| !destinations.iter().any(|d| d == c)) {
+        choices.push(SelectChoice::new(
+            current,
+            format!("{current} (no longer configured)"),
+        ));
+    }
+    choices
+}
+
 fn title(snapshot: &Snapshot, thread: Uuid) -> Option<String> {
     snapshot
         .threads
@@ -85,21 +116,32 @@ pub fn Schedules() -> Element {
     let mut jobs: Vec<&Job> = snapshot.jobs.iter().collect();
     // Soonest first; paused and finished jobs after every pending one.
     jobs.sort_by_key(|job| (job.next.is_none(), job.next, job.name.clone()));
+    let destinations = post_destinations(&snapshot.settings.messengers);
     rsx! { PageFrame { kicker: "Workbench", title: "Messages on a schedule.", description: "Send a conversation a message, or a heartbeat check of its HEARTBEAT.md, once, on an interval or on a cron schedule. Each one runs as if you typed it, with that conversation's permissions at the time.",
         if jobs.is_empty() { EmptyState { compact: true, title: rsx! { "Nothing scheduled" }, body: rsx! { "Scheduled messages appear here, whether you add them or a conversation's model does with your approval." } } }
         for job in jobs {
-            JobCard { key: "{job.id}", job: job.clone(), conversation: title(&snapshot, job.thread) }
+            JobCard { key: "{job.id}", job: job.clone(), conversation: title(&snapshot, job.thread), destinations: destinations.clone() }
         }
         AddJob {}
     } }
 }
 
 #[component]
-fn JobCard(job: Job, conversation: Option<String>) -> Element {
+fn JobCard(job: Job, conversation: Option<String>, destinations: Vec<String>) -> Element {
     let state = use_context::<State>();
     let zone = TimeZone::system();
     let id = job.id;
     let mut history = use_signal(|| false);
+    let deliver_to = job.deliver_to.clone();
+    let delivery_value = use_memo(use_reactive!(|deliver_to| Some(
+        deliver_to.unwrap_or_else(|| NOWHERE.to_owned())
+    )));
+    let choices = delivery_choices(&destinations, job.deliver_to.as_deref());
+    let replies = if job.kind == JobKind::Heartbeat {
+        "Post replies that need attention to"
+    } else {
+        "Post replies to"
+    };
     let author = match job.author {
         JobAuthor::User => "Added by you",
         JobAuthor::Agent { .. } => "Added by the conversation's model, with your approval",
@@ -130,6 +172,12 @@ fn JobCard(job: Job, conversation: Option<String>) -> Element {
                     div { class: "a206-row", span { class: "a206-muted", "Latest run {show_time(last.at, &zone)}" } Badge { tone, "{label}" } }
                 } }
                 if let JobOutcome::Refused(report) = &last.outcome { ErrorNotice { report: report.clone(), title: "The latest run was not sent".to_string() } }
+                if let Some(Delivery::Failed(report)) = &last.delivery { ErrorNotice { report: report.clone(), title: "The latest reply was not posted".to_string() } }
+            }
+            Field { label: rsx! { "{replies}" }, hint: rsx! { "A webhook, or an allowed chat of a connected messenger, from Messengers. Each completed run's reply is also posted there." },
+                Select { label: name!("Messenger the replies are posted to"), value: ReadSignal::from(delivery_value), options: choices,
+                    onchange: move |to: String| dispatch(state, Command::SetJobDelivery { id, to: Some(to).filter(|to| to != NOWHERE) })
+                }
             }
             if history() { JobHistory { job: job.clone() } }
         }
@@ -213,9 +261,11 @@ fn RunList(runs: Vec<JobRun>, kind: JobKind) -> Element {
                             span { "{show_time(run.at, &zone)}" }
                             Badge { tone, "{label}" }
                             if let Some(ended) = run.ended { span { class: "a206-muted", "took {format_interval(ended.saturating_sub(run.at))}" } }
+                            if let Some(posted) = &run.delivery { { let (tone, label) = delivery(posted); rsx! { Badge { tone, "{label}" } } } }
                         }
                     } }
                     if let JobOutcome::Refused(report) = &run.outcome { ErrorNotice { report: report.clone(), title: "Not sent".to_string() } }
+                    if let Some(Delivery::Failed(report)) = &run.delivery { ErrorNotice { report: report.clone(), title: "Reply not posted".to_string() } }
                 }
             }
         }
