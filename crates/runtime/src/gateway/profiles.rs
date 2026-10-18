@@ -45,6 +45,7 @@ impl Gateway {
                 profile,
                 mode,
                 &model,
+                &parent_thread.subagent_models,
                 &store.state.settings.providers,
                 requested,
             )?,

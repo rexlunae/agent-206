@@ -124,32 +124,37 @@ pub fn load(dir: &Path) -> Result<AgentProfiles, ProfileError> {
         }
         Err(source) => return Err(directory(source)),
     };
-    let mut files = Vec::new();
+    let mut files = BTreeSet::new();
+    let mut excess = false;
     for entry in entries {
         let path = entry.map_err(directory)?.path();
         if path.extension().is_some_and(|e| e == "toml") {
-            files.push(path);
+            files.insert(path);
+            if files.len() > MAX_PROFILES {
+                files.pop_last();
+                excess = true;
+            }
         }
     }
-    files.sort();
     let mut loaded = AgentProfiles::default();
-    for (index, path) in files.iter().enumerate() {
+    for path in &files {
         let file = path
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let read = if index >= MAX_PROFILES {
-            Err(ProfileError::TooMany)
-        } else {
-            read(path)
-        };
-        match read {
+        match read(path) {
             Ok(profile) => loaded.profiles.push(profile),
             Err(error) => loaded.problems.push(ProfileProblem {
                 file,
                 error: crate::error::report(&error),
             }),
         }
+    }
+    if excess {
+        loaded.problems.push(ProfileProblem {
+            file: String::from("Additional profile files"),
+            error: crate::error::report(&ProfileError::TooMany),
+        });
     }
     Ok(loaded)
 }
@@ -269,6 +274,7 @@ pub fn admit(
     profile: &AgentProfile,
     mode: Mode,
     key: &ModelKey,
+    permitted: &BTreeSet<ModelKey>,
     providers: &[ProviderConfig],
     requested: BTreeSet<Capability>,
 ) -> Result<BTreeSet<Capability>, ProfileError> {
@@ -279,10 +285,12 @@ pub fn admit(
             requested: mode,
         });
     }
-    if !profile.names(key, providers) {
+    if let Some(expected) = model(profile, permitted, providers)?
+        && &expected != key
+    {
         return Err(ProfileError::ModelMismatch {
             profile: profile.id.clone(),
-            model: profile.model.clone().unwrap_or_default(),
+            model: expected.model,
         });
     }
     Ok(match &profile.capabilities {

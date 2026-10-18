@@ -110,18 +110,57 @@ fn a_profile_only_narrows_and_names_a_model_only_among_permitted_ones() {
     );
 
     let asked = BTreeSet::from([Capability::ReadWorkspace, Capability::Execute]);
+    for key in [&chosen, &twin] {
+        assert!(matches!(
+            admit(&profile, Mode::Plan, key, &both, &providers, asked.clone()),
+            Err(ProfileError::AmbiguousModel { .. })
+        ));
+    }
     assert_eq!(
-        admit(&profile, Mode::Plan, &chosen, &providers, asked.clone()).unwrap(),
+        admit(
+            &profile,
+            Mode::Plan,
+            &chosen,
+            &permitted,
+            &providers,
+            asked.clone()
+        )
+        .unwrap(),
         [Capability::ReadWorkspace].into()
     );
     assert!(matches!(
-        admit(&profile, Mode::Code, &chosen, &providers, asked.clone()),
+        admit(
+            &profile,
+            Mode::Code,
+            &chosen,
+            &permitted,
+            &providers,
+            asked.clone()
+        ),
         Err(ProfileError::Mode { .. })
     ));
     assert!(matches!(
-        admit(&profile, Mode::Plan, &other, &providers, asked),
+        admit(&profile, Mode::Plan, &other, &permitted, &providers, asked),
         Err(ProfileError::ModelMismatch { .. })
     ));
+}
+
+#[test]
+fn excess_files_produce_one_bounded_problem_and_a_sendable_listing() {
+    let dir = tempfile::tempdir().unwrap();
+    for index in (0..200).rev() {
+        std::fs::write(
+            dir.path().join(format!("p{index:03}.toml")),
+            "name = 'Profile'",
+        )
+        .unwrap();
+    }
+    let loaded = load(dir.path()).unwrap();
+    assert_eq!(loaded.profiles.len(), 64);
+    assert_eq!(loaded.problems.len(), 1);
+    assert_eq!(loaded.profiles[0].id, "p000");
+    assert_eq!(loaded.profiles.last().unwrap().id, "p063");
+    assert!(a206_protocol::encode(&a206_core::Reply::AgentProfiles(loaded)).is_ok());
 }
 
 #[test]

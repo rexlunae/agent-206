@@ -10,10 +10,26 @@ use std::collections::BTreeSet;
 use uuid::Uuid;
 
 async fn load() -> Result<AgentProfiles, ErrorReport> {
-    match call(Command::AgentProfiles).await? {
+    decode_profiles(call(Command::AgentProfiles).await?)
+}
+fn decode_profiles(reply: Reply) -> Result<AgentProfiles, ErrorReport> {
+    match reply {
         Reply::AgentProfiles(profiles) => Ok(profiles),
         Reply::Error(report) => Err(report),
-        _ => Ok(AgentProfiles::default()),
+        _ => Err(ErrorReport::new(
+            a206_core::ErrorKind::Protocol,
+            "gateway did not list agent profiles",
+        )),
+    }
+}
+fn selected<'a>(
+    listed: &'a AgentProfiles,
+    chosen: Option<&str>,
+) -> Result<Option<&'a AgentProfile>, ErrorReport> {
+    match chosen {
+        None => Ok(None),
+        Some(id) => listed.get(id).map(Some).ok_or_else(|| ErrorReport::new(
+            a206_core::ErrorKind::NotFound, format!("Selected profile {id} is unavailable. Choose another profile or explicitly choose No profile."))),
     }
 }
 
@@ -26,9 +42,13 @@ pub(crate) fn delegation(
     providers: &[ProviderConfig],
 ) -> Option<(Mode, ModelKey)> {
     let mode = profile.and_then(|p| p.mode).unwrap_or(Mode::Plan);
-    let model = permitted
+    let mut matching = permitted
         .iter()
-        .find(|key| profile.is_none_or(|p| p.names(key, providers)))?;
+        .filter(|key| profile.is_none_or(|p| p.names(key, providers)));
+    let model = matching.next()?;
+    if profile.is_some_and(|p| p.model.is_some()) && matching.next().is_some() {
+        return None;
+    }
     Some((mode, model.clone()))
 }
 
@@ -112,9 +132,17 @@ pub(crate) fn Delegate(thread: Uuid) -> Element {
         return rsx! {};
     };
     let listed = profiles();
-    let profile = chosen().and_then(|id| listed.get(&id).cloned());
-    let request = delegation(profile.as_ref(), &permitted, &snapshot.settings.providers);
-    let choices: Vec<SelectChoice> = std::iter::once(SelectChoice::new("", "No profile"))
+    let selected_id = chosen();
+    let (profile, selection_failure) = match selected(&listed, selected_id.as_deref()) {
+        Ok(profile) => (profile.cloned(), None),
+        Err(report) => (None, Some(report)),
+    };
+    let request = if selection_failure.is_none() {
+        delegation(profile.as_ref(), &permitted, &snapshot.settings.providers)
+    } else {
+        None
+    };
+    let mut choices: Vec<SelectChoice> = std::iter::once(SelectChoice::new("", "No profile"))
         .chain(
             listed
                 .profiles
@@ -122,21 +150,27 @@ pub(crate) fn Delegate(thread: Uuid) -> Element {
                 .map(|p| SelectChoice::new(p.id.clone(), p.name.clone())),
         )
         .collect();
+    if selection_failure.is_some()
+        && let Some(id) = &selected_id
+    {
+        choices.push(SelectChoice::new(id.clone(), format!("{id} (unavailable)")));
+    }
     let title = profile
         .as_ref()
         .map(|p| p.name.clone())
         .unwrap_or_else(|| "Delegated task".into());
-    let id = profile.as_ref().map(|p| p.id.clone());
+    let id = selected_id;
     rsx! { div { class: "a206-stack",
         if let Some(report) = failure() { ErrorNotice { report, title: "Agent profiles unavailable".to_string(), dismiss: move |_| failure.set(None) } }
-        if !listed.profiles.is_empty() {
+        if let Some(report) = selection_failure { ErrorNotice { report, title: "Selected profile unavailable".to_string() } }
+        if !listed.profiles.is_empty() || id.is_some() {
             Field { label: rsx! { "Agent profile" },
                 Select { label: name!("Agent profile for the delegated conversation"), value: ReadSignal::from(chosen), options: choices,
                     onchange: move |id: String| chosen.set((!id.is_empty()).then_some(id)) }
             }
         }
         if profile.is_some() && request.is_none() {
-            p { class: "a206-muted", "This profile's model is not one of this conversation's subagent models." }
+            p { class: "a206-muted", "This profile must match exactly one permitted model connection. Check its model and connection settings." }
         }
         Button { size: ButtonSize::Sm, variant: ButtonVariant::Secondary, disabled: request.is_none(), onclick: move |_| {
             if let Some((mode, model)) = request.clone() {

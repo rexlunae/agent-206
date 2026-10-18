@@ -42,8 +42,8 @@ user permitted for the delegating conversation's subagents.
 
 ## What a profile can and cannot do
 
-A profile only narrows. Starting a subagent from one (`CreateSubagent` with
-`profile`, used by the desktop/web/TUI and by `subagent_spawn`):
+A profile only narrows. Starting a subagent from one (`CreateProfileSubagent`,
+used by the desktop/web/TUI and by `subagent_spawn`):
 
 - The subagent's mode must be the profile's `mode`, when it names one.
 - Its model must be the profile's `model` (and `connection`), when it names one,
