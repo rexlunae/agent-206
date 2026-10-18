@@ -545,6 +545,7 @@ pub enum UpstreamFailure {
 pub enum Reply {
     Ok,
     VaultImportReview(a206_vault_channel::ImportReview),
+    VaultImportApplied(a206_vault_channel::ImportApplied),
     ChannelKey(Vec<u8>),
     ChannelOpened(#[serde(with = "serde_bytes")] Vec<u8>),
     ChannelMessage(#[serde(with = "serde_bytes")] Vec<u8>),

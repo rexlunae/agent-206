@@ -27,6 +27,7 @@ const MAX_NAME: usize = 256;
 const MAX_DESTINATIONS: usize = 16;
 
 struct Shared {
+    root: std::path::PathBuf,
     identity: a206_vault_channel::Identity,
     vault: Mutex<Vault>,
     throttle: AuthThrottle<()>,
@@ -395,18 +396,15 @@ fn handle(shared: &Shared, session: &mut Session, request: Request) -> Handled {
                 .filter(|held| held.id == review)
                 .cloned()
                 .ok_or(BrokerError::ImportReviewUnavailable)?;
-            let identity = a206_vault::ImportIdentity {
-                bytes: held.bytes,
-                sha256: held.sha256,
-            };
+            let source = held.source.clone();
             import::apply(
                 shared,
                 session,
-                &held.source,
+                &source,
                 &password,
                 totp.as_ref().map(WireSecret::expose),
                 now,
-                Some(identity),
+                Some(held),
             )
         }
         Request::CancelVaultImport { version } => {
@@ -1248,6 +1246,7 @@ pub async fn serve(root: &Path) -> std::io::Result<()> {
     let listener = tokio::net::UnixListener::bind(&path)?;
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
     let shared = Arc::new(Shared {
+        root: root.to_owned(),
         identity: a206_vault_channel::Identity::generate().map_err(std::io::Error::other)?,
         vault: Mutex::new(Vault::locked(crate::vault_path(root))),
         throttle: AuthThrottle::default(),

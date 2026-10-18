@@ -22,6 +22,14 @@ pub struct ImportReview {
     pub bytes: u64,
     pub sha256: [u8; 32],
 }
+/// Confirmed copy, with receipt failure kept as an explicit partial result.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImportApplied {
+    pub version: u16,
+    pub review: ImportReview,
+    pub receipt: Option<std::path::PathBuf>,
+    pub receipt_error: Option<ErrorReport>,
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -158,6 +166,7 @@ pub struct Status {
 pub enum Reply {
     Ok,
     VaultImportReview(ImportReview),
+    VaultImportApplied(ImportApplied),
     Status(Status),
     TotpEnrollment {
         otpauth_url: Secret,

@@ -11,7 +11,7 @@ implemented structure for finished agent execution or security parity.
 | Rust architecture | Small Rust workspace, typed shared commands, forbidden application unsafe, pinned dependencies | Further extraction as capabilities grow; measured build/runtime budgets |
 | Desktop | Native macOS app bundle, shared fc-dioxus interface, automatic local gateway startup, shared lifecycle controls | Windows named pipes; Linux desktop packaging and hardware validation |
 | Gateway lifecycle | Shared Gateway page and controller, status from the actual process, start/stop/restart/reconnect, durable deliberate-stop marker, cleanup before acknowledgement, bounded control receipts; web uses an authenticated user-only binary endpoint | Remote SSH acceptance, stronger cross-process lifecycle coordination, encrypted enrollment and authentication; running is not security readiness |
-| Initial setup/import | `agent206 setup` resumes first-run setup on the existing flows (gateway target, vault create/unlock, optional TOTP enrollment, pairing) and ends with the health report; the desktop, TUI and web Get started page shows those steps plus a provider and a first conversation, and below them optional project, messenger and skill steps kept out of the count, each from what the gateway, vault broker and snapshot report now (unknown stays unknown), with the vault card embedded; its step logic and first render are unit-tested, not yet clicked through in a running app; The shared `/settings/import` page and CLI review/apply commands select individual providers and disabled messengers, refuse stale source/target reviews, and report receipt-write partial failures; `agent206 import rustyclaw` previews through an isolated read-only source reader (Seatbelt on macOS; bubblewrap plus Landlock on Linux), with bounded MessagePack, a deadline, minimized target data and redacted parser diagnostics; `--apply` adds missing provider accounts and disabled messenger entries through the revision-checked settings API, copies a password vault in through the broker (`ImportVault`: encrypted copy, password and enrolled TOTP verified on the copy, never merged or replacing a vault, source untouched) and writes an owner-only receipt; MCP servers, tool permissions, skills and plaintext tokens (messenger tokens included) are counted or reported and left inactive; tested in the import crate, the broker, an actual sandboxed reader/probe and through the real binary against a real gateway | GUI vault migration, key-file vaults, conversations/workspace instructions/memory, rollback command, adapters for Cline, Claude Code, Codex, DeepSeek Harness and others; interactive vault import is exercised only in broker tests (it needs a terminal) |
+| Initial setup/import | Shared Get started and Security use gateway/broker state for setup. Settings import has isolated source reading, per-item GUI/CLI review/apply, source/target guards and explicit receipt partial results. Broker-held password-vault review/apply/cancel is available in Security and `vault import FILE [--apply]`, with native/encrypted requests, password/TOTP checks, source identity guards, no overwrite and private receipts. The older setup import delegates its vault category to the same broker operations. Other grants/hooks/plugins stay inactive; credentials never pass through gateway settings | Native desktop/TUI interaction; remote SSH vault controls; key files; conversations/instructions/memory; rollback; other reviewed adapters |
 | Messengers | Telegram through the Bot API, Matrix through a homeserver's client API (no end-to-end encryption; never sends to an encrypted room) Discord through a Gateway WebSocket the vault broker opens and identifies, Slack through Socket Mode the broker opens (broker v8), IRC over TLS with SASL sign-in performed by the broker (broker v9; senders are services accounts), Signal through a signal-cli daemon the user runs on a local socket (it keeps the account keys; senders are ACIs), and Beeper Desktop's local API (WhatsApp, iMessage, Google Chat and other networks Beeper connects, answered as the user; chat list polled, only allowed chats read), run by the gateway while it is paired with an unlocked vault; the broker spends the bot or access token, or the IRC account password, for the bound origin only; entries start disabled and allow no chat, and groups need listed senders; refused chats and senders, account and structured failures are in the status; allowed chats get one thread each and ordinary `Send` turns; `messenger` CLI, TOML settings, a shared desktop/web/TUI Messengers page and RustyClaw import; tested against a stand-in Bot API, a stand-in homeserver and a stand-in Discord API and Gateway a stand-in Slack Web API and Socket Mode, a stand-in IRC server with a real broker, a stand-in signal-cli daemon and a stand-in Beeper Desktop with a real broker, and through the gateway's settings API (docs/messengers.md) | Messengers page render-tested only (not clicked through in a running app), other services, Discord session resume, Slack thread replies, attachments, persisted poll offset (Telegram delivery is at least once across restarts; Matrix answers nothing sent while the gateway was stopped), Matrix encryption, IRC networks without `account-tag`, not tested against the real Telegram, Matrix, Discord or Slack services, a real IRC network, a real signal-cli or a real Beeper Desktop |
 | CLI | Headless build, system status, nested gateway lifecycle/status, setup, doctor, import (RustyClaw), messengers, chat, projects, settings, catalog refresh, downloads, text documents, Git status, vault, ACP/MCP, renderer entry points and ui alias | Full RustyClaw-compatible command families in docs/cli.md; doctor repairs, more import adapters and remaining parity |
 | Gateway setup | Clients connect only after first-time setup (the desktop, TUI and web setup screen or `gateway setup`) saves a local or SSH target in `connection.toml`; unknown SSH hosts require fingerprint confirmation into the profile's own known_hosts; changed keys are refused; typed `ConnectionError`s are traced and shown; the web bridge's setup endpoint is tested for bearer checks, unsafe endpoints and damaged saved setups, and web SSH setup was checked in headless Chromium against a local OpenSSH server | Gateway enrollment (vault/TOTP) is a separate gate; the web bridge's sign-in for other devices is single-user (the vault owner's authenticator), with in-memory sessions |
@@ -162,7 +162,7 @@ added with a receipt. No vault or real credentials were created or imported.
 Gateway tests additionally cover target revision changes, invalid selections,
 replayed application and receipt-write partial failures; CLI tests exercise the
 same commands through the real binary. Desktop/TUI interactive acceptance,
-browser receipt-failure acceptance, GUI vault migration and other source
+browser receipt-failure acceptance, remote SSH vault migration and other source
 adapters remain pending. Existing provider labels, endpoints, protocols and vault
 references can be edited on Connections or through `settings --apply`.
 See [imports.md](imports.md).
@@ -187,8 +187,8 @@ verification precedes secret inputs. The panel supports create/unlock/lock,
 step-up, begin/confirm/cancel TOTP and pairing, with actual broker state and
 separate pairing failures. First-run gateway selection opens Security. Native and
 web use the same typed setup subset and broker rules. See
-[web-vault-setup.md](web-vault-setup.md). Remote SSH vault setup, GUI vault
-migration, key-file workflows and modern vault-envelope migration remain pending.
+[web-vault-setup.md](web-vault-setup.md). Remote SSH vault setup and migration,
+key-file workflows and modern vault-envelope migration remain pending.
 The shared settings import review/apply screen is described above; the existing
 RustyClaw terminal vault import remains available.
 ## Supporting-file review update (2026-10-17)
@@ -246,7 +246,18 @@ staging; TOTP retries recheck it. The existing private-copy authentication,
 policy preservation and target no-replace behavior are shared with legacy
 import. Tests cover equal-length source changes, size identity mismatches,
 nonfiles/symlinks/oversized sources, wrong passwords, enrolled TOTP/replay,
-unchanged source bytes and refusal to replace existing targets. This primitive
-is not connected to the broker, CLI or GUI yet. Broker-held review tokens,
-versioned encrypted setup integration, UI review/apply and vault rollback
-remain pending; no new migration control is advertised.
+unchanged source bytes and refusal to replace existing targets. Broker v11 now
+holds reviews per connection and exposes schema-v1 preview/apply/cancel through
+native and encrypted setup channels. Security/Get started use these operations,
+as do `vault import FILE [--apply]` and the vault category of the older setup
+import command. Old peers are refused without an unreviewed fallback.
+
+Vault migration confirms the copy separately from receipt durability and
+gateway pairing. Broker-written TOML receipts carry source identity, not secret
+values; a failed receipt is an explicit partial result with structured causes.
+Tests cover connection scoping, cancellation/replacement/lock invalidation,
+source and target changes, factor enforcement, native/encrypted policy denials,
+old peers, private receipts and receipt failure after copy. UI tests cover
+version/input gating and preserving partial failures. Live web acceptance is
+pending; native desktop/TUI interaction, remote SSH migration, key-file support
+and rollback remain unverified or planned.

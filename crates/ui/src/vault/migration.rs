@@ -1,11 +1,22 @@
 //! Migration uses the same private broker session as enrollment. Event handlers
 //! belong to the parent panel so removing this child cannot hide its outcome.
 use super::*;
-use a206_vault_channel::{IMPORT_REVIEW_VERSION, ImportReview};
+use a206_vault_channel::{IMPORT_REVIEW_VERSION, ImportApplied, ImportReview};
 
 fn reviewed(reply: Reply) -> Result<ImportReview, VaultError> {
     match reply {
         Reply::VaultImportReview(review) if review.version == IMPORT_REVIEW_VERSION => Ok(review),
+        Reply::Error(error) => Err(error),
+        _ => Err(unexpected()),
+    }
+}
+fn applied(reply: Reply, expected: &ImportReview) -> Result<ImportApplied, VaultError> {
+    match reply {
+        Reply::VaultImportApplied(applied)
+            if applied.version == IMPORT_REVIEW_VERSION && applied.review == *expected =>
+        {
+            Ok(applied)
+        }
         Reply::Error(error) => Err(error),
         _ => Err(unexpected()),
     }
@@ -45,7 +56,7 @@ impl Panel {
                 .session()
                 .call(Request::ReviewVaultImport {
                     version: IMPORT_REVIEW_VERSION,
-                    source: source.trim().into(),
+                    source: source.into(),
                 })
                 .await
                 .and_then(reviewed)
@@ -80,13 +91,12 @@ impl Panel {
                     totp: code,
                 })
                 .await
+                .and_then(|reply| applied(reply, &review))
             {
-                Ok(Reply::Ok) => self.after_unlock(true).await,
-                Ok(_) => self.fail(
-                    "vault_import",
-                    "Vault import was not confirmed",
-                    &unexpected(),
-                ),
+                Ok(applied) => {
+                    self.import_result.set(Some(applied));
+                    self.after_unlock(true).await;
+                }
                 Err(error) => {
                     if error.code == BrokerError::TotpRequired {
                         self.import_totp.set(true);
@@ -153,12 +163,12 @@ pub(super) fn Migration(
     let needs_code = (panel.import_totp)();
     let enabled = can_apply(review.as_ref(), &password(), &code(), needs_code, busy);
     rsx! { Disclosure { summary: rsx! { "Import a RustyClaw vault" },
-        p { "Import a whole password-protected vault before creating a new one. The source stays in place. Password, authenticator enrollment, credential policies and disabled flags are preserved. An existing vault is never replaced or merged. Key-file vaults are not supported yet." }
+        p { "Import a whole password-protected vault before creating a new one. The source stays in place. Password, authenticator enrollment, credential policies, agent-access setting and disabled flags are preserved. An existing vault is never replaced or merged. Key-file vaults are not supported yet." }
         if let Some(review) = review {
             DescriptionList {
                 DescriptionItem { term: rsx! { "Source on broker host" }, code { "{review.source.display()}" } }
                 DescriptionItem { term: rsx! { "Bytes" }, "{review.bytes}" }
-                DescriptionItem { term: rsx! { "SHA-256" }, code { class: "a206-number", {review.sha256.iter().map(|b| format!("{b:02x}")).collect::<String>()} } }
+                DescriptionItem { term: rsx! { "Source SHA-256" }, code { class: "a206-number", {review.sha256.iter().map(|b| format!("{b:02x}")).collect::<String>()} } }
             }
             p { class: "a206-muted", "This identifies the file; its password and any enrolled authenticator are verified on a private copy when imported. A source edit or lost connection requires another preview. Connections and tool grants are not imported here." }
             Field { label: rsx! { "Source vault password" }, Input { r#type: InputType::Password, autocomplete: "current-password", availability: availability.clone(), value: ReadSignal::from(password), oninput: move |v| password.set(v) } }
@@ -213,5 +223,38 @@ mod tests {
         assert!(!retryable(&error(BrokerError::ImportSourceChanged)));
         assert!(!retryable(&error(BrokerError::ImportReviewUnavailable)));
         assert!(retryable(&error(BrokerError::TotpRequired)));
+    }
+    #[test]
+    fn confirmed_partial_results_keep_receipt_causes_and_match_the_review() {
+        let review = ImportReview {
+            version: IMPORT_REVIEW_VERSION,
+            id: a206_core::Id::new_v4(),
+            source: "/source".into(),
+            bytes: 1,
+            sha256: [0; 32],
+        };
+        let error =
+            a206_core::ErrorReport::new(a206_core::ErrorKind::Storage, "Receipt unconfirmed")
+                .caused_by(a206_core::ErrorReport::new(
+                    a206_core::ErrorKind::Storage,
+                    "Directory refused",
+                ))
+                .with_correlation(review.id);
+        let result = ImportApplied {
+            version: IMPORT_REVIEW_VERSION,
+            review: review.clone(),
+            receipt: None,
+            receipt_error: Some(error.clone()),
+        };
+        assert_eq!(
+            applied(Reply::VaultImportApplied(result.clone()), &review)
+                .unwrap()
+                .receipt_error,
+            Some(error)
+        );
+        let mut other = review.clone();
+        other.id = a206_core::Id::new_v4();
+        assert!(applied(Reply::VaultImportApplied(result), &other).is_err());
+        assert!(applied(Reply::Ok, &review).is_err());
     }
 }

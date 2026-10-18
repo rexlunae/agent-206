@@ -123,6 +123,7 @@ struct Panel {
     enrollment: Signal<Option<Enrollment>>,
     import_review: Signal<Option<a206_vault_channel::ImportReview>>,
     import_totp: Signal<bool>,
+    import_result: Signal<Option<a206_vault_channel::ImportApplied>>,
     /// The Get started checklist, when this panel is on that page.
     progress: Option<VaultProgress>,
 }
@@ -178,6 +179,7 @@ impl Panel {
         self.failure.set(None);
         self.warning.set(None);
         self.notice.set(None);
+        self.import_result.set(None);
         true
     }
     fn fail(mut self, operation: &'static str, title: &str, error: &VaultError) {
@@ -518,6 +520,7 @@ fn VaultPanel(target: Target) -> Element {
         enrollment: use_signal(|| None),
         import_review: use_signal(|| None),
         import_totp: use_signal(|| false),
+        import_result: use_signal(|| None),
         progress: VaultProgress::listener(),
     };
     // Reads only through `peek`, so this runs once, after the first render.
@@ -602,6 +605,10 @@ fn VaultPanel(target: Target) -> Element {
             }
             if let Some(message) = (panel.notice)() {
                 Alert { tone: AlertTone::Success, urgency: Urgency::Polite, "{message}" }
+            }
+            if let Some(applied) = (panel.import_result)() {
+                if let Some(path) = applied.receipt { p { class: "a206-muted", "Vault import receipt: {path.display()}" } }
+                if let Some(report) = applied.receipt_error { ErrorNotice { report, title: "Vault imported; receipt not confirmed".to_string() } }
             }
             if let Some(Failure { title, report }) = (panel.failure)() {
                 ErrorNotice { report, title }

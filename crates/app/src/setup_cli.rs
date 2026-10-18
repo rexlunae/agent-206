@@ -2,7 +2,6 @@
 //! gateway setup, vault broker requests and settings API as the desktop and
 //! terminal clients. Every security decision stays with the broker.
 use crate::vault_cli;
-use a206_broker::{BrokerError, ClientError, Reply as BrokerReply, Request, WireSecret};
 use a206_core::{Command, GatewayAction, GatewayPhase, GatewayTarget, Reply};
 use a206_import::{
     InactiveCategory, MessengerAction, Preview, ProviderAction, Receipt, Unsupported,
@@ -266,58 +265,7 @@ fn print_preview(preview: &Preview) {
 /// it has two-factor enrolled, a code from its authenticator.
 async fn import_vault(root: &Path, source: &Path) -> Result<()> {
     let mut client = vault_cli::connect(root).await?;
-    if client.version() < a206_broker::REVIEWED_IMPORT_VERSION {
-        bail!(
-            "the running vault broker predates reviewed vault import; stop it with `agent206 vault stop` and rerun the import"
-        );
-    }
-    let version = a206_broker::IMPORT_REVIEW_SCHEMA_VERSION;
-    let BrokerReply::VaultImportReview(review) = client
-        .call(Request::ReviewVaultImport {
-            version,
-            source: source.to_owned(),
-        })
-        .await?
-    else {
-        bail!("vault broker did not return an import review");
-    };
-    if review.version != version {
-        bail!("unsupported vault import review; update the vault broker before retrying");
-    }
-    let digest: String = review
-        .sha256
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
-    println!(
-        "Vault source: {} · {} bytes · SHA-256 {digest}",
-        review.source.display(),
-        review.bytes
-    );
-    let password = vault_cli::hidden("Password of the RustyClaw vault: ")?;
-    let request = |totp: Option<String>| Request::ApplyVaultImport {
-        version,
-        review: review.id,
-        password: WireSecret::new(password.expose().to_owned()),
-        totp: totp.map(WireSecret::new),
-    };
-    match client.call(request(None)).await {
-        Err(ClientError::Broker(BrokerError::TotpRequired)) => {
-            let code = rpassword::prompt_password("Authenticator code for that vault: ")?;
-            client.call(request(Some(code))).await?;
-        }
-        result => {
-            result?;
-        }
-    }
-    if let BrokerReply::Credentials { typed, legacy } = client.call(Request::Credentials).await? {
-        println!(
-            "Vault imported and unlocked: {} typed credentials, {} untyped entries. It keeps its RustyClaw password and two-factor setting.",
-            typed.len(),
-            legacy.len()
-        );
-    }
-    vault_cli::pair_if_running(&mut client, root).await
+    vault_cli::import_reviewed(&mut client, root, source, true).await
 }
 
 pub async fn import(root: &Path, remote: Option<String>, source: ImportSource) -> Result<()> {

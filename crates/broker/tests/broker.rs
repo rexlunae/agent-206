@@ -2401,10 +2401,25 @@ async fn reviewed_migration_is_connection_bound_revocable_and_source_guarded() {
         denied(a.call(migration_apply(review.id, &random())).await),
         BrokerError::AuthenticationFailed
     );
-    assert!(matches!(
-        a.call(migration_apply(review.id, &password)).await.unwrap(),
-        Reply::Ok
-    ));
+    let Reply::VaultImportApplied(applied) =
+        a.call(migration_apply(review.id, &password)).await.unwrap()
+    else {
+        panic!("missing confirmed import")
+    };
+    assert_eq!(applied.review, review);
+    assert!(applied.receipt_error.is_none());
+    let path = applied.receipt.unwrap();
+    let text = std::fs::read_to_string(&path).unwrap();
+    let receipt: toml::Value = toml::from_str(&text).unwrap();
+    assert_eq!(receipt["source"].as_str(), source.to_str());
+    assert_eq!(receipt["id"].as_str(), Some(review.id.to_string().as_str()));
+    assert!(!text.contains(&password));
+    assert!(!text.contains(&value));
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
     assert_eq!(
         denied(a.call(migration_apply(review.id, &password)).await),
         BrokerError::ImportReviewUnavailable
@@ -2517,7 +2532,9 @@ async fn encrypted_reviewed_migration_checks_sources_without_exposing_credential
     else {
         panic!()
     };
-    assert!(matches!(channel.open::<R>(&bytes).unwrap(), R::Ok));
+    assert!(
+        matches!(channel.open::<R>(&bytes).unwrap(), R::VaultImportApplied(applied) if applied.review == review && applied.receipt_error.is_none())
+    );
     assert_eq!(std::fs::read(&source).unwrap(), original);
     assert_eq!(std::fs::read(vault_path(&root)).unwrap(), original);
     user(&root).await.call(Request::Shutdown).await.unwrap();
@@ -2563,6 +2580,32 @@ async fn reviewed_migration_cannot_replace_a_target_created_after_review() {
     );
     assert_eq!(std::fs::read(vault_path(&root)).unwrap(), target_before);
     assert_eq!(std::fs::read(&source).unwrap(), source_before);
+    a.call(Request::Shutdown).await.unwrap();
+    task.await.unwrap();
+}
+
+#[tokio::test]
+async fn reviewed_migration_reports_confirmed_copy_and_failed_receipt_separately() {
+    let (_dir, root, task) = start().await;
+    let (_source_dir, source, password, _) = migration_source();
+    let original = std::fs::read(&source).unwrap();
+    let mut a = user(&root).await;
+    let review = migration_review(&mut a, &source).await;
+    std::fs::write(root.join("vault/imports"), "block receipt directory").unwrap();
+    let Reply::VaultImportApplied(applied) =
+        a.call(migration_apply(review.id, &password)).await.unwrap()
+    else {
+        panic!("partial result missing")
+    };
+    assert_eq!(applied.review, review);
+    assert!(applied.receipt.is_none());
+    let error = applied.receipt_error.unwrap();
+    assert_eq!(error.kind, a206_core::ErrorKind::Storage);
+    assert_eq!(error.correlation, Some(review.id));
+    assert!(error.causes().count() >= 2);
+    assert!(status(&mut a).await.unlocked);
+    assert_eq!(std::fs::read(vault_path(&root)).unwrap(), original);
+    assert_eq!(std::fs::read(&source).unwrap(), original);
     a.call(Request::Shutdown).await.unwrap();
     task.await.unwrap();
 }

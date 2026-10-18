@@ -80,6 +80,7 @@ pub fn reply(result: Result<Reply, BrokerError>) -> wire::Reply {
     match result {
         Ok(Reply::Ok) => wire::Reply::Ok,
         Ok(Reply::VaultImportReview(review)) => wire::Reply::VaultImportReview(review),
+        Ok(Reply::VaultImportApplied(applied)) => wire::Reply::VaultImportApplied(applied),
         Ok(Reply::Status(s)) => wire::Reply::Status(status(s)),
         Ok(Reply::TotpEnrollment {
             otpauth_url,

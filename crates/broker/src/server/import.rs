@@ -3,6 +3,7 @@ use super::*;
 use a206_vault::{ImportIdentity, ReviewedImportError};
 use a206_vault_channel::{IMPORT_REVIEW_VERSION, ImportReview};
 use std::path::PathBuf;
+mod receipt;
 
 pub(super) fn version(session: &Session, version: u16) -> Result<(), BrokerError> {
     if session.version < REVIEWED_IMPORT_VERSION || version != IMPORT_REVIEW_VERSION {
@@ -38,7 +39,7 @@ pub(super) fn apply(
     password: &WireSecret,
     totp: Option<&str>,
     now: Instant,
-    identity: Option<ImportIdentity>,
+    review: Option<ImportReview>,
 ) -> Handled {
     shared
         .throttle
@@ -49,8 +50,17 @@ pub(super) fn apply(
     source(path)?;
     let mut vault = shared.vault();
     let secret = Secret::new(password.expose().to_owned());
-    let result = match identity {
-        Some(identity) => vault.import_reviewed(path, identity, &secret, totp, unix_now()),
+    let result = match &review {
+        Some(review) => vault.import_reviewed(
+            path,
+            ImportIdentity {
+                bytes: review.bytes,
+                sha256: review.sha256,
+            },
+            &secret,
+            totp,
+            unix_now(),
+        ),
         None => vault
             .import(path, &secret, totp, unix_now())
             .map_err(ReviewedImportError::from),
@@ -76,5 +86,11 @@ pub(super) fn apply(
     drop(vault);
     shared.throttle.success(&());
     session.step_up.grant(now, generation);
-    ok()
+    match review {
+        Some(review) => Ok(Outcome::Reply(Reply::VaultImportApplied(receipt::record(
+            &shared.root,
+            review,
+        )))),
+        None => ok(), // Legacy clients retain their original reply contract.
+    }
 }

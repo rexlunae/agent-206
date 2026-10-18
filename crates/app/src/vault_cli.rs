@@ -3,12 +3,20 @@
 use a206_broker::{BrokerError, Client, ClientError, Reply, Request, WireSecret, WireValue};
 use a206_runtime::vault;
 use a206_vault::{AccessPolicy, CredentialKind, CredentialMeta};
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use clap::{Subcommand, ValueEnum};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Subcommand)]
 pub enum VaultAction {
+    /// Preview a whole password vault on this computer; --apply authenticates
+    /// and imports the reviewed bytes without starting a gateway.
+    Import {
+        /// Absolute source vault file, not a directory.
+        source: PathBuf,
+        #[arg(long)]
+        apply: bool,
+    },
     /// Create a new encrypted vault and unlock it.
     Init,
     /// Show the public broker key to verify browser vault setup.
@@ -361,6 +369,7 @@ pub fn run(root: &Path, action: VaultAction) -> Result<()> {
         }
         let mut client = connect(root).await?;
         match action {
+            VaultAction::Import { source, apply } => import_reviewed(&mut client, root, &source, apply).await?,
             VaultAction::Broker | VaultAction::Stop => unreachable!(),
             VaultAction::ChannelKey => {
                 if client.version() < a206_broker::SETUP_CHANNEL_VERSION {
@@ -586,4 +595,82 @@ pub fn run(root: &Path, action: VaultAction) -> Result<()> {
         }
         Ok(())
     })
+}
+
+pub(crate) async fn import_reviewed(
+    client: &mut Client,
+    root: &Path,
+    source: &Path,
+    apply: bool,
+) -> Result<()> {
+    if client.version() < a206_broker::REVIEWED_IMPORT_VERSION {
+        bail!(
+            "the running vault broker predates reviewed vault import; stop it with `agent206 vault stop` and rerun the import"
+        );
+    }
+    let version = a206_broker::IMPORT_REVIEW_SCHEMA_VERSION;
+    let Reply::VaultImportReview(review) = client
+        .call(Request::ReviewVaultImport {
+            version,
+            source: source.to_owned(),
+        })
+        .await?
+    else {
+        bail!("vault broker did not return an import review");
+    };
+    if review.version != version {
+        bail!("unsupported vault import review; update the vault broker before retrying");
+    }
+    let digest: String = review
+        .sha256
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    println!(
+        "Vault source: {} · {} bytes · SHA-256 {digest}",
+        review.source.display(),
+        review.bytes
+    );
+    if !apply {
+        println!("Not imported. Use --apply to preview again and import after authentication.");
+        return Ok(());
+    }
+    let password = hidden("Password of the RustyClaw vault: ")?;
+    let request = |totp: Option<String>| Request::ApplyVaultImport {
+        version,
+        review: review.id,
+        password: WireSecret::new(password.expose().to_owned()),
+        totp: totp.map(WireSecret::new),
+    };
+    let applied = match client.call(request(None)).await {
+        Err(ClientError::Broker(BrokerError::TotpRequired)) => {
+            let code = rpassword::prompt_password("Authenticator code for that vault: ")?;
+            client.call(request(Some(code))).await?
+        }
+        result => result?,
+    };
+    let Reply::VaultImportApplied(applied) = applied else {
+        bail!("Vault import was not confirmed; check vault status before retrying");
+    };
+    if applied.version != version || applied.review != review {
+        bail!(
+            "Vault import reply did not match the reviewed source; check vault status before retrying"
+        );
+    }
+    if let Reply::Credentials { typed, legacy } = client.call(Request::Credentials).await? {
+        println!(
+            "Vault imported and unlocked: {} typed credentials, {} untyped entries. It keeps its RustyClaw password and two-factor setting.",
+            typed.len(),
+            legacy.len()
+        );
+    }
+    if let Some(path) = applied.receipt {
+        println!("Vault import receipt: {}", path.display());
+    }
+    if let Some(error) = applied.receipt_error {
+        return Err(anyhow::Error::new(error).context("Vault imported and unlocked, but its receipt could not be confirmed; remaining import steps were not applied"));
+    }
+    pair_if_running(client, root)
+        .await
+        .context("Vault imported and unlocked, but gateway pairing did not complete")
 }
