@@ -46,6 +46,9 @@ pub(crate) fn ToolTrace(call: ToolCall) -> Element {
         if !call.redactions.is_empty() {
             p { class: "a206-muted", {redaction_note(&call.redactions)} }
         }
+        if !call.injection.is_empty() {
+            p { class: "a206-muted", {injection_note(&call.injection)} }
+        }
         if let Some(reduction) = call.reduction.as_ref() {
             p { class: "a206-muted", {reduction_note(reduction)} }
         }
@@ -60,6 +63,19 @@ fn redaction_note(redactions: &[OutputCount]) -> String {
         .collect();
     format!(
         "Credentials removed before the model saw this result: {}",
+        kinds.join(", ")
+    )
+}
+
+/// The kinds of text in a result that read as instructions to the model,
+/// which the model was told came from the tool.
+fn injection_note(found: &[OutputCount]) -> String {
+    let kinds: Vec<String> = found
+        .iter()
+        .map(|found| format!("{} × {}", found.name, found.count))
+        .collect();
+    format!(
+        "This result contains text addressed to the model, marked as tool data for it: {}",
         kinds.join(", ")
     )
 }
@@ -238,6 +254,7 @@ mod tests {
             signature: None,
             reduction: None,
             redactions: Vec::new(),
+            injection: Vec::new(),
         }
     }
     #[test]
@@ -330,10 +347,23 @@ mod tests {
             name: kind.clone(),
             count: 2,
         }];
-        let html = render(done);
+        let html = render(done.clone());
         assert!(
             html.contains(&format!(
                 "Credentials removed before the model saw this result: {kind} × 2"
+            )),
+            "{html}"
+        );
+        assert!(!html.contains("addressed to the model"), "{html}");
+        let kind = Uuid::new_v4().simple().to_string();
+        done.injection = vec![OutputCount {
+            name: kind.clone(),
+            count: 4,
+        }];
+        let html = render(done);
+        assert!(
+            html.contains(&format!(
+                "This result contains text addressed to the model, marked as tool data for it: {kind} × 4"
             )),
             "{html}"
         );
