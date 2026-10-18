@@ -226,7 +226,12 @@ fn print_preview(preview: &Preview) {
         if messenger.action != MessengerAction::Add {
             continue;
         }
-        if messenger.allowed_chats.is_empty() {
+        if let (Some(format), Some(endpoint)) = (messenger.format, &messenger.endpoint) {
+            println!(
+                "    a webhook that only sends, as {}; store its whole URL in the vault, bound to {endpoint}",
+                format.label()
+            );
+        } else if messenger.allowed_chats.is_empty() {
             println!("    no chat is allowed until you allow one");
         } else {
             println!(
@@ -252,7 +257,7 @@ fn print_preview(preview: &Preview) {
         }
         if messenger.token_left_behind {
             println!(
-                "    its token was stored in plain text and stays behind; add it to the vault yourself"
+                "    its token, password or webhook URL was stored in plain text and stays behind; add it to the vault yourself"
             );
         }
     }

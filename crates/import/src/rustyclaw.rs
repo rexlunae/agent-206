@@ -1,7 +1,9 @@
 //! RustyClaw (reference `481a428c`) installation reader: `config.toml`, the
 //! SecureStore vault under `credentials/` and the workspace. Only the fields
 //! below are read; values that may hold secrets (messenger tokens, registry
-//! tokens, MCP commands) are counted with `IgnoredAny` and never kept.
+//! tokens, MCP commands) are counted with `IgnoredAny` and never kept. Of a
+//! messenger's webhook URL, which is itself the credential, only the origin
+//! is kept.
 use crate::{
     ImportError, Inactive, InactiveCategory, MAX_CONFIG_BYTES, MessengerAction, MessengerImport,
     PREVIEW_VERSION, Preview, ProviderAction, ProviderImport, Result, Tool, Unsupported,
@@ -11,7 +13,7 @@ use a206_core::messengers::{
     IRCS_PORT, IrcServer, MAX_ALLOWED_CHATS, irc_lowercase, valid_field, valid_irc_channel,
     valid_irc_nick, valid_name,
 };
-use a206_core::{MessengerKind, ProviderApi, ProviderPreset, Settings};
+use a206_core::{MessengerKind, ProviderApi, ProviderPreset, Settings, WebhookFormat};
 use serde::Deserialize;
 use serde::de::IgnoredAny;
 use std::collections::{BTreeMap, BTreeSet};
@@ -58,7 +60,8 @@ struct Config {
 
 /// The fields of a RustyClaw `[[messengers]]` entry this importer uses. Its
 /// secrets (tokens, passwords, app passwords) are not deserialized; `token`,
-/// `access_token`, `password` and `app_token` are only checked for presence.
+/// `access_token`, `password`, `app_token` and `app_password` are only
+/// checked for presence, and `webhook_url` is reduced to its origin.
 #[derive(Deserialize)]
 struct Messenger {
     #[serde(default)]
@@ -76,6 +79,18 @@ struct Messenger {
     /// Slack's app-level token for Socket Mode.
     #[serde(default)]
     app_token: Option<IgnoredAny>,
+    /// A generic, Teams or Google Chat incoming webhook.
+    #[serde(default, deserialize_with = "webhook_origin")]
+    webhook_url: Option<WebhookUrl>,
+    /// Teams Bot Framework sign-in, which RustyClaw prefers to a webhook.
+    #[serde(default)]
+    app_id: Option<IgnoredAny>,
+    #[serde(default)]
+    app_password: Option<IgnoredAny>,
+    /// A Google Chat service account key file, which RustyClaw prefers to a
+    /// webhook.
+    #[serde(default)]
+    credentials_path: Option<IgnoredAny>,
     /// Matrix homeserver URL.
     #[serde(default)]
     homeserver: Option<String>,
@@ -94,6 +109,29 @@ struct Messenger {
     allowed_chats: Vec<String>,
     #[serde(default)]
     allowed_users: Vec<String>,
+}
+
+/// What is kept of a webhook URL: the origin a webhook messenger would use
+/// as its endpoint, or that it has none the gateway accepts.
+enum WebhookUrl {
+    Origin(String),
+    Unusable,
+}
+
+/// Read a webhook URL and keep only its origin. The URL itself is the
+/// credential (its path holds the secret), so it goes no further than here.
+fn webhook_origin<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<WebhookUrl>, D::Error> {
+    let url = String::deserialize(deserializer)?;
+    let origin = url::Url::parse(&url)
+        .ok()
+        .filter(|url| url.username().is_empty() && url.password().is_none())
+        .map(|url| url.origin().ascii_serialization())
+        .filter(|origin| a206_core::providers::base_url(origin).is_ok());
+    Ok(Some(
+        origin.map_or(WebhookUrl::Unusable, WebhookUrl::Origin),
+    ))
 }
 
 #[derive(Default, Deserialize)]
@@ -261,7 +299,28 @@ fn plan_messengers(settings: &Settings, source: Vec<Messenger>) -> Vec<Messenger
     source
         .into_iter()
         .map(|messenger| {
-            let kind = messenger_kind(&messenger.messenger_type);
+            // RustyClaw's Teams and Google Chat entries post through a
+            // webhook when one is set and no bot or service account is.
+            let webhook = messenger.webhook_url.is_some();
+            let format = match messenger.messenger_type.as_str() {
+                "webhook" => Some(WebhookFormat::Text),
+                "teams"
+                    if webhook
+                        && messenger.app_id.is_none()
+                        && messenger.app_password.is_none() =>
+                {
+                    Some(WebhookFormat::Teams)
+                }
+                "google_chat" if webhook && messenger.credentials_path.is_none() => {
+                    Some(WebhookFormat::Text)
+                }
+                _ => None,
+            };
+            let kind = if format.is_some() {
+                Some(MessengerKind::Webhook)
+            } else {
+                messenger_kind(&messenger.messenger_type)
+            };
             let fallback = base_name(&messenger.messenger_type, "messenger");
             let base = base_name(&messenger.name, &fallback);
             let mut action = MessengerAction::Add;
@@ -286,6 +345,11 @@ fn plan_messengers(settings: &Settings, source: Vec<Messenger>) -> Vec<Messenger
             let irc = kind.is_some_and(MessengerKind::is_irc);
             let mut allowed_chats: BTreeSet<String> = messenger.allowed_chats.into_iter().collect();
             let mut allowed_users: BTreeSet<String> = messenger.allowed_users.into_iter().collect();
+            if format.is_some() {
+                // A webhook only sends; it has no chats or senders to allow.
+                allowed_chats.clear();
+                allowed_users.clear();
+            }
             if irc {
                 // Channels it joined are allowed chats here, which still
                 // answer only listed senders. Names fold as IRC compares them;
@@ -318,6 +382,10 @@ fn plan_messengers(settings: &Settings, source: Vec<Messenger>) -> Vec<Messenger
                     (None, _) => Err(UnsupportedMessenger::InvalidEndpoint),
                 },
                 Some(MessengerKind::Signal) => Err(UnsupportedMessenger::NoSignalDaemon),
+                Some(MessengerKind::Webhook) => match &messenger.webhook_url {
+                    Some(WebhookUrl::Origin(origin)) => Ok(Some(origin.clone())),
+                    Some(WebhookUrl::Unusable) | None => Err(UnsupportedMessenger::InvalidEndpoint),
+                },
                 Some(kind) if kind.default_endpoint().is_none() => messenger
                     .homeserver
                     .as_deref()
@@ -358,6 +426,7 @@ fn plan_messengers(settings: &Settings, source: Vec<Messenger>) -> Vec<Messenger
                 kind,
                 endpoint: endpoint.ok().flatten(),
                 login: login.filter(|_| unsupported.is_none()),
+                format: format.filter(|_| unsupported.is_none()),
                 // Ids the gateway would refuse are not repeated in the preview.
                 allowed_chats: if unsupported.is_some() {
                     BTreeSet::new()
@@ -372,7 +441,9 @@ fn plan_messengers(settings: &Settings, source: Vec<Messenger>) -> Vec<Messenger
                 token_left_behind: messenger.token.is_some()
                     || messenger.access_token.is_some()
                     || messenger.password.is_some()
-                    || messenger.app_token.is_some(),
+                    || messenger.app_token.is_some()
+                    || messenger.app_password.is_some()
+                    || webhook,
                 action,
             }
         })
@@ -953,6 +1024,166 @@ allowed_users = ["{user}"]
         assert_eq!(guild.endpoint(), MessengerKind::Discord.default_endpoint());
         assert_eq!(guild.allowed_chats, BTreeSet::from([channel]));
         assert_eq!(guild.allowed_users, BTreeSet::from([user]));
+    }
+
+    #[test]
+    fn webhooks_arrive_disabled_with_only_their_origin() {
+        let (secret, key, host) = (random(), random(), format!("h{}.example", random()));
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            &dir.path().join("config.toml"),
+            &format!(
+                r#"
+[[messengers]]
+name = "alerts"
+messenger_type = "webhook"
+webhook_url = "https://{host}/hooks/{secret}"
+allowed_chats = ["{key}"]
+
+[[messengers]]
+name = "team"
+messenger_type = "teams"
+webhook_url = "https://teams.{host}/workflows/{secret}"
+
+[[messengers]]
+name = "space"
+messenger_type = "google_chat"
+webhook_url = "https://chat.{host}:8443/v1/spaces/{key}/messages?key={key}&token={secret}"
+
+[[messengers]]
+name = "bot"
+messenger_type = "teams"
+app_id = "{key}"
+app_password = "{secret}"
+webhook_url = "https://teams.{host}/workflows/{secret}"
+
+[[messengers]]
+name = "service"
+messenger_type = "google_chat"
+credentials_path = "key.json"
+webhook_url = "https://chat.{host}/v1/spaces/{key}/messages?token={secret}"
+
+[[messengers]]
+name = "plain"
+messenger_type = "webhook"
+webhook_url = "http://{host}/hooks/{secret}"
+
+[[messengers]]
+name = "signed"
+messenger_type = "webhook"
+webhook_url = "https://{key}:{secret}@{host}/hooks"
+
+[[messengers]]
+name = "missing"
+messenger_type = "webhook"
+"#
+            ),
+        );
+        let mut settings = Settings::default();
+        let preview = preview(dir.path(), &settings, None).unwrap();
+        for encoded in [
+            toml::to_string(&preview).unwrap().into_bytes(),
+            rmp_serde::to_vec_named(&preview).unwrap(),
+        ] {
+            assert!(!String::from_utf8_lossy(&encoded).contains(&secret));
+        }
+        let unsupported = |reason| MessengerAction::Unsupported { reason };
+        let found: Vec<_> = preview
+            .messengers
+            .iter()
+            .map(|m| {
+                (
+                    m.name.as_str(),
+                    m.kind,
+                    m.format,
+                    m.endpoint.clone(),
+                    m.action.clone(),
+                )
+            })
+            .collect();
+        let webhook = Some(MessengerKind::Webhook);
+        assert_eq!(
+            found,
+            [
+                (
+                    "alerts",
+                    webhook,
+                    Some(WebhookFormat::Text),
+                    Some(format!("https://{host}")),
+                    MessengerAction::Add
+                ),
+                (
+                    "team",
+                    webhook,
+                    Some(WebhookFormat::Teams),
+                    Some(format!("https://teams.{host}")),
+                    MessengerAction::Add
+                ),
+                (
+                    "space",
+                    webhook,
+                    Some(WebhookFormat::Text),
+                    Some(format!("https://chat.{host}:8443")),
+                    MessengerAction::Add
+                ),
+                (
+                    "bot",
+                    None,
+                    None,
+                    None,
+                    unsupported(UnsupportedMessenger::UnknownKind)
+                ),
+                (
+                    "service",
+                    None,
+                    None,
+                    None,
+                    unsupported(UnsupportedMessenger::ThroughBeeper)
+                ),
+                (
+                    "plain",
+                    webhook,
+                    None,
+                    None,
+                    unsupported(UnsupportedMessenger::InvalidEndpoint)
+                ),
+                (
+                    "signed",
+                    webhook,
+                    None,
+                    None,
+                    unsupported(UnsupportedMessenger::InvalidEndpoint)
+                ),
+                (
+                    "missing",
+                    webhook,
+                    None,
+                    None,
+                    unsupported(UnsupportedMessenger::InvalidEndpoint)
+                ),
+            ]
+        );
+        assert!(preview.messengers[..7].iter().all(|m| m.token_left_behind));
+        assert!(!preview.messengers[7].token_left_behind);
+        assert!(
+            preview
+                .messengers
+                .iter()
+                .all(|m| m.allowed_chats.is_empty())
+        );
+        assert_eq!(
+            preview.apply_messengers(&mut settings),
+            ["alerts", "team", "space"]
+        );
+        for messenger in &settings.messengers {
+            assert!(!messenger.enabled && messenger.credential.is_none());
+            assert!(messenger.allowed_chats.is_empty());
+        }
+        assert_eq!(settings.messengers[1].format, WebhookFormat::Teams);
+        assert_eq!(
+            settings.messengers[2].endpoint.as_deref(),
+            Some(format!("https://chat.{host}:8443").as_str())
+        );
     }
 
     #[test]

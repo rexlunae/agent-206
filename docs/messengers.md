@@ -470,6 +470,15 @@ agent206 messenger enable team-hook
   longer one is refused whole rather than cut. A part that fails stops the
   rest, and the error says how many were delivered. The last failure is shown
   on the Messengers page until a send succeeds.
+- **Importing from RustyClaw.** RustyClaw `webhook` entries, and `teams` and
+  `google_chat` entries that post through a `webhook_url` (not a Bot
+  Framework app or a service account), become disabled webhook messengers in
+  the `text` format (Teams: `teams`). Only the URL's origin is read and kept,
+  as the endpoint; the URL itself stays behind, and you store it in the vault
+  bound to that origin. A URL that is not HTTPS (or loopback HTTP), or that
+  carries a user name or password, is reported and skipped. RustyClaw's
+  Teams webhooks may be the retired Office 365 connectors; a Teams entry
+  needs a Workflows webhook URL.
 
 ## Posting to chats
 
@@ -522,9 +531,8 @@ participant cannot approve their own request.
 - WhatsApp, Google Chat and iMessage on their own (they are reached through
   Beeper), and Teams conversations (webhooks only post to a channel).
 - Posting to IRC and Signal chats with `send_message`, a test
-  send from the Messengers page or CLI, webhook delivery of scheduled
-  messages' replies, and importing RustyClaw webhook entries (reported as an
-  unknown kind, since their URL is the secret).
+  send from the Messengers page or CLI, and webhook delivery of scheduled
+  messages' replies.
 - Beeper attachments, reactions and replies to a specific message, the
   experimental WebSocket event stream, and remembering cursors across
   restarts.

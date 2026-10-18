@@ -1,5 +1,5 @@
 //! Reviewed import data shared by clients and the gateway. No source I/O.
-use crate::{Id, MessengerConfig, MessengerKind, ProviderConfig, Settings};
+use crate::{Id, MessengerConfig, MessengerKind, ProviderConfig, Settings, WebhookFormat};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeSet, path::PathBuf};
 pub const PREVIEW_VERSION: u32 = 1;
@@ -201,6 +201,10 @@ pub struct MessengerImport {
     /// The nickname an IRC account signed in with, carried over as the login.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub login: Option<String>,
+    /// The body a webhook entry posts, by the service its URL belongs to.
+    /// Only webhooks have one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format: Option<WebhookFormat>,
     /// Chats the source allowed; carried over as this entry's allow-list.
     #[serde(default)]
     pub allowed_chats: BTreeSet<String>,
@@ -208,8 +212,9 @@ pub struct MessengerImport {
     /// users still holds.
     #[serde(default)]
     pub allowed_users: BTreeSet<String>,
-    /// The source kept a token or password in its configuration in plain
-    /// text. It is not read; the user stores a token in the vault.
+    /// The source kept a token, password or webhook URL in its
+    /// configuration in plain text. It is not read (of a webhook URL, only
+    /// the origin is); the user stores it in the vault.
     #[serde(default)]
     pub token_left_behind: bool,
     pub action: MessengerAction,
@@ -349,6 +354,9 @@ impl Preview {
             let mut config = MessengerConfig::new(import.name.clone(), kind);
             config.endpoint = import.endpoint.clone();
             config.login = import.login.clone();
+            if let Some(format) = import.format {
+                config.format = format;
+            }
             config.allowed_chats = import.allowed_chats.clone();
             config.allowed_users = import.allowed_users.clone();
             added.push(config.name.clone());
