@@ -81,6 +81,7 @@ fn update(state: ToolCallState) -> Message {
         signature: None,
         reduction: None,
         redactions: Vec::new(),
+        injection: Vec::new(),
     });
     message
 }

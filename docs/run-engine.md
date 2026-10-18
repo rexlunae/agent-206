@@ -560,6 +560,33 @@ the vault. Removal cannot be turned off. The arguments a model writes are not
 scanned (it can only repeat what it already saw), and neither are project
 instruction files, user messages or attachments.
 
+## Text addressed to the model in tool results
+
+A web page, a file or a server's reply can carry text written for the model
+reading it. Every tool result (successful, reported failure or host
+failure, whole-output results included) is checked by `crates/injection-scan`
+(after RustyClaw's `PromptGuard`). Invisible Unicode tag characters go
+first, before credentials are looked for, since they can split a credential
+or a phrase so neither is recognised. Once the result is bounded, the text
+the model will read is scanned for phrases that address the reader: overriding earlier
+instructions ("ignore all previous instructions"), reassigning its role
+("from now on you are", "your new task is"), chat-template turn markers
+(`<|im_start|>`, `[INST]`, `<<SYS>>`), requests for its prompt or
+credentials ("print your system prompt", "send your API keys") and tool-call
+markup. The removed tag characters, which spell out text only a model
+reads, are reported as `hidden_text`; the emoji subdivision flags that use
+them are kept. Text cut off by the output limit is not reported. Nothing else is removed and no result is blocked: when the model
+reads a flagged result it starts with a note naming the kinds and the tool
+and saying to treat the text as data, not instructions. The stored output
+stays the tool's own text, `ToolCall::injection` records each kind and how
+often it was found, and the tool trace says "This result contains text
+addressed to the model". Compaction summaries see the same note.
+
+Matching is by phrase, so it is advisory: wording that avoids the phrases is
+not found, and a document that quotes them is flagged too. It does not
+replace the permission model, which is what keeps a misled model from acting
+beyond its grants.
+
 ## Tool-call markup in reply text
 
 Some models write a tool call into their reply text (`<tool_call>…</tool_call>`,
@@ -707,4 +734,6 @@ running a tool call that was written as text; Anthropic thinking-block replay al
 parallel tool execution; RustyClaw's project-layer output rules
 (`<workspace>/.tokenjuice/rules/`) and a way to list or edit output rules from
 the GUI or CLI; credential scanning of instruction files, attachments and
-outbound requests, and user-defined credential shapes.
+outbound requests, and user-defined credential shapes; scanning user
+messages, messenger messages, instruction files and attachments for text
+addressed to the model, and blocking or quarantining flagged results.

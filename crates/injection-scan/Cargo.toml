@@ -1,0 +1,11 @@
+[package]
+name = "a206-injection-scan"
+description = "Detection of text in tool results that addresses the model as instructions"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+[dependencies]
+regex = "1"
+[lints]
+workspace = true
