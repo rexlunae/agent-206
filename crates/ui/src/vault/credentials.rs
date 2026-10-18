@@ -252,6 +252,26 @@ mod tests {
         page.next = None;
         page.version += 1;
         assert!(!valid_page(&page));
+        page.version = CREDENTIALS_SCHEMA_VERSION;
+        let meta = a206_vault_channel::CredentialMeta {
+            label: uuid::Uuid::new_v4().to_string(),
+            kind: CredentialKind::ApiKey,
+            policy: AccessPolicy::WithApproval,
+            description: None,
+            disabled: false,
+            destinations: vec![],
+        };
+        let first = format!("a-{}", uuid::Uuid::new_v4());
+        let last = format!("z-{}", uuid::Uuid::new_v4());
+        page.total = 2;
+        page.entries = vec![(last.clone(), meta.clone()), (first.clone(), meta.clone())];
+        assert!(!valid_page(&page));
+        page.entries = vec![(first.clone(), meta.clone()), (last.clone(), meta)];
+        assert!(valid_page(&page));
+        page.next = Some(first);
+        assert!(!valid_page(&page));
+        page.next = Some(last);
+        assert!(valid_page(&page));
     }
     #[test]
     fn empty_scopes_are_shown_locked_and_always_keeps_other_restrictions() {

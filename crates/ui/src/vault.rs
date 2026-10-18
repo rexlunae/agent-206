@@ -201,8 +201,7 @@ impl Panel {
     }
     fn show(mut self, status: BrokerStatus) {
         if !status.unlocked {
-            self.credential_page.set(None);
-            self.key_editor.set(false);
+            self.forget_credentials();
         }
         self.report(VaultSeen::Facts(VaultFacts {
             exists: status.exists,
@@ -212,6 +211,10 @@ impl Panel {
         }));
         self.poll_failure.set(None);
         self.status.set(Some(status));
+    }
+    fn forget_credentials(mut self) {
+        self.credential_page.set(None);
+        self.key_editor.set(false);
     }
     /// The Get started page's background re-read. It never starts a broker,
     /// so a deliberate `vault stop` stays stopped, and its failure is shown
@@ -224,6 +227,7 @@ impl Panel {
                 // Offer no action on a state that could not be confirmed.
                 self.report(VaultSeen::Unreadable);
                 self.status.set(None);
+                self.forget_credentials();
                 self.poll_failure.set(Some(failure(
                     "vault_status",
                     "Could not re-read the vault state",
@@ -238,6 +242,7 @@ impl Panel {
             Err(error) => {
                 self.report(VaultSeen::Unreadable);
                 self.status.set(None);
+                self.forget_credentials();
                 let status = failure("vault_status", "Could not read the vault state", &error);
                 let (mut primary, mut secondary) = (self.failure.write(), self.warning.write());
                 keep_both(&mut primary, &mut secondary, status);

@@ -116,17 +116,22 @@ mod imp {
     mod tests {
         use super::*;
         #[test]
-        fn native_import_failure_keeps_the_logged_reference_at_the_display_root() {
+        fn native_structured_failures_keep_the_logged_reference_at_the_display_root() {
             let report = a206_core::ErrorReport::new(a206_core::ErrorKind::Storage, "partial copy")
                 .with_correlation(uuid::Uuid::new_v4())
                 .caused_by(a206_core::ErrorReport::new(
                     a206_core::ErrorKind::PermissionDenied,
                     "denied",
                 ));
-            let error = a206_runtime::vault::VaultError::Broker(a206_broker::ClientError::Broker(
+            for error in [
                 a206_broker::BrokerError::ImportFailure(report.clone()),
-            ));
-            assert_eq!(failure(error).report, report);
+                a206_broker::BrokerError::Channel(report.clone()),
+            ] {
+                let error = a206_runtime::vault::VaultError::Broker(
+                    a206_broker::ClientError::Broker(error),
+                );
+                assert_eq!(failure(error).report, report);
+            }
         }
     }
 }
