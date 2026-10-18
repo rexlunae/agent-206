@@ -13,6 +13,7 @@ pub fn Providers() -> Element {
     let mut api = use_signal(|| ProviderApi::OpenAi.label().to_owned());
     let api_value = use_memo(move || Some(api()));
     let mut credential = use_signal(String::new);
+    let mut editing = use_signal(|| None::<Uuid>);
     let presets = state.data.read().settings.provider_presets.effective();
     let selected = presets
         .iter()
@@ -44,6 +45,9 @@ pub fn Providers() -> Element {
               rsx! { Card { key: "{provider_id}",
                 CardHeader { CardTitle { "{provider.label}" } CardSubtitle { "{provider.base_url}" } }
                 CardBody {
+                    if editing() == Some(provider_id) {
+                        crate::connections::ConnectionEditor { key: "{provider_id}:{state.gateway_generation}", initial: snapshot.settings.clone(), provider: provider_id, onclose: move |_| editing.set(None) }
+                    }
                     div { class: "a206-row", Badge { "{provider.api.label()}" } if provider.credential.is_some() { Badge { "Vault broker required" } } }
                     if let Some(catalog) = catalog {
                         div { class: "a206-row", Badge { "{catalog.models.len()} models" } span { class: "a206-muted", "Last refreshed: {catalog.fetched_at} · expires: {catalog.expires_at}" } }
@@ -55,6 +59,7 @@ pub fn Providers() -> Element {
                     } else { p { class: "a206-muted", "No catalog fetched yet." } }
                 }
                 CardFooter {
+                    Button { variant: ButtonVariant::Secondary, onclick: move |_| editing.set(Some(provider_id)), "Edit connection" }
                     Button { variant: ButtonVariant::Secondary, onclick: move |_| dispatch(state, Command::RefreshCatalog { provider: provider_id }), "Refresh models" }
                     Button { variant: ButtonVariant::Ghost, onclick: move |_| { let mut settings = state.data.read().settings.clone(); settings.providers.retain(|p| p.id != provider_id); dispatch(state, Command::SaveSettings(Box::new(settings))); }, "Remove connection" }
                 }

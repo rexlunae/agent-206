@@ -149,7 +149,7 @@ invocations and relays gateway-authorized host calls (`a206/docs/plugin-api.md`)
 
 | RustyClaw capability | Agent 206 status | How it should land |
 | --- | --- | --- |
-| API-key providers OpenAI/Anthropic/Google/xAI/DeepSeek/OpenRouter/custom (`providers/mod.rs`, `custom.rs`) | partial: presets + OpenAI-compat/Anthropic/Gemini protocols (`core/src/providers.rs`), credentialed dispatch now runs through the broker for bound origins (`a206/crates/runtime/src/provider.rs`) | External backends and Copilot device flow still pending |
+| API-key providers OpenAI/Anthropic/Google/xAI/DeepSeek/OpenRouter/custom (`providers/mod.rs`, `custom.rs`) | partial: presets + OpenAI-compat/Anthropic/Gemini protocols (`core/src/providers.rs`), credentialed dispatch now runs through the broker for bound origins (`a206/crates/runtime/src/provider.rs`); shared Connections editor and CLI settings apply update existing account names, endpoints, protocols and vault references with revision checks | External backends and Copilot device flow still pending |
 | GitHub Copilot OAuth device flow + session token (`providers/device_flow.rs`, desktop `device_flow.rs`) | missing | Broker-run device flow, token stored in vault |
 | `refresh-token` / OpenClaw OAuth import (`rustyclaw-cli/src/commands/refresh_token.rs`) | missing | Import adapter via broker only |
 | Model registry/`model_*` tools, defaults (`models/registry.rs`, `defaults.rs`, `tools/model_tools.rs`) | present in a206's form: API-discovered catalog, provenance/expiry (`provider.rs` catalog) | Static defaults intentionally not ported |

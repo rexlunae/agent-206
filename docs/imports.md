@@ -52,8 +52,9 @@ Settings reviews omit free-form source provider IDs, labels, model text and
 credential references inside the isolated reader, before its first reply.
 Labels come from trusted target presets or a generated item number; source
 messenger display names and unknown service text are omitted too. Renaming
-custom connections and assigning their vault references currently requires
-the `settings --apply` CLI; existing account editing in the GUI remains a gap.
+custom connections and assigning their vault references is available through
+Edit connection on Connections, or the `settings --apply` CLI. Both use the
+same revision-checked settings command; neither operation grants vault access.
 Review schema v2 is checked before GUI/CLI presentation; unversioned development
 replies are refused with an update action. Rejected URLs are omitted
 from previews because they can contain inline passwords or signed tokens.
