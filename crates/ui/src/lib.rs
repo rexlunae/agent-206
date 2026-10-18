@@ -2,6 +2,7 @@
 #![forbid(unsafe_code)]
 mod activity;
 mod audit;
+mod budgets;
 mod conversation;
 mod error;
 mod extensions;

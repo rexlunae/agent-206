@@ -53,6 +53,18 @@ pub struct ToolBudget {
 impl ToolBudget {
     /// The largest budget the gateway accepts for either limit.
     pub const MAX: u32 = 256;
+
+    /// Apply another conversation's ceiling without widening either limit.
+    pub fn intersect(self, other: Self) -> Self {
+        Self {
+            rounds: self.rounds.min(other.rounds),
+            tool_calls: self.tool_calls.min(other.tool_calls),
+            tokens: match (self.tokens, other.tokens) {
+                (Some(left), Some(right)) => Some(left.min(right)),
+                (finite, None) | (None, finite) => finite,
+            },
+        }
+    }
 }
 impl Default for ToolBudget {
     fn default() -> Self {

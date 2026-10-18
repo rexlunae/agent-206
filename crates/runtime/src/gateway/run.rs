@@ -224,20 +224,11 @@ pub(super) fn lineage(store: &Store, id: Id) -> Result<Vec<&Thread>> {
 /// The budget a run enforces: for rounds and for calls independently, the
 /// smallest of the thread's and every ancestor's current budget.
 fn effective_budget(store: &Store, id: Id) -> Result<ToolBudget> {
-    let lineage = lineage(store, id)?;
-    Ok(ToolBudget {
-        rounds: lineage
-            .iter()
-            .map(|t| t.tool_budget.rounds)
-            .min()
-            .unwrap_or(0),
-        tool_calls: lineage
-            .iter()
-            .map(|t| t.tool_budget.tool_calls)
-            .min()
-            .unwrap_or(0),
-        tokens: lineage.iter().filter_map(|t| t.tool_budget.tokens).min(),
-    })
+    Ok(lineage(store, id)?
+        .iter()
+        .fold(store.thread(id)?.tool_budget, |budget, thread| {
+            budget.intersect(thread.tool_budget)
+        }))
 }
 fn view(store: &Store, id: Id) -> Result<View> {
     let mut lineage = lineage(store, id)?.into_iter().cloned();
@@ -390,7 +381,12 @@ impl Gateway {
             _ => Ok(false),
         }
     }
-    pub(super) fn set_tool_budget(&self, id: Id, budget: ToolBudget) -> Result<Reply> {
+    pub(super) fn set_tool_budget(
+        &self,
+        id: Id,
+        budget: ToolBudget,
+        expected: Option<ToolBudget>,
+    ) -> Result<Reply> {
         check(
             (1..=ToolBudget::MAX).contains(&budget.rounds)
                 && budget.tool_calls <= ToolBudget::MAX
@@ -400,6 +396,11 @@ impl Gateway {
             ),
         )?;
         let mut store = self.lock()?;
+        let previous = store.thread(id)?.tool_budget;
+        check(
+            expected.is_none_or(|expected| expected == previous),
+            GatewayError::Conflict("run limits changed; reload before saving"),
+        )?;
         if let Some(parent) = store.thread(id)?.parent {
             let parent = store.thread(parent)?.tool_budget;
             check(
