@@ -78,15 +78,6 @@ fn count(node: &Node) -> usize {
     1 + node.below.iter().map(count).sum::<usize>()
 }
 
-/// Conversations with approvals or questions waiting on the user.
-fn waiting(snapshot: &Snapshot) -> Vec<&Thread> {
-    snapshot
-        .threads
-        .iter()
-        .filter(|t| !t.approvals.is_empty() || !t.prompts.is_empty())
-        .collect()
-}
-
 fn plural(n: usize, one: &str, many: &str) -> String {
     format!("{n} {}", if n == 1 { one } else { many })
 }
@@ -118,7 +109,10 @@ pub fn Running() -> Element {
     let connected = (state.connected)();
     let snapshot = state.data.read();
     let trees = running(&snapshot);
-    let waiting: Vec<Thread> = waiting(&snapshot).into_iter().cloned().collect();
+    let waiting: Vec<Thread> = crate::inbox::waiting(&snapshot)
+        .into_iter()
+        .cloned()
+        .collect();
     let scheduled: Vec<Job> = snapshot
         .jobs
         .iter()
@@ -156,6 +150,7 @@ pub fn Running() -> Element {
                             meta: rsx! { Badge { tone: BadgeTone::Warning, "{asks(&thread)}" } } }
                     }
                 } }
+                CardFooter { LinkButton { variant: ButtonVariant::Ghost, href: Route::Inbox {}.to_string(), "Answer them all on one page" } }
             }
         }
         if trees.is_empty() {
