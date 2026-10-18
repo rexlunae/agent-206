@@ -2123,6 +2123,105 @@ async fn subagents_run_their_task_with_no_more_than_their_parents_permissions() 
 }
 
 #[tokio::test]
+async fn a_subagent_started_from_a_profile_takes_its_mode_model_and_instructions() {
+    let api = ProviderApi::OpenAi;
+    let mut rig = rig(api, vec![], None).await;
+    for tool in [subagents::SPAWN, subagents::WAIT] {
+        rig.permit(tool, ToolPermission::Allow).await;
+    }
+    let profiles = rig._state.path().join(a206_core::profiles::DIRECTORY);
+    std::fs::create_dir(&profiles).unwrap();
+    let id = "reviewer";
+    let instructions = nonce();
+    let description = nonce();
+    std::fs::write(
+        profiles.join(format!("{id}.toml")),
+        format!(
+            "name = \"Reviewer\"\ndescription = \"{description}\"\nmode = \"plan\"\nmodel = \"{}\"\ninstructions = \"{instructions}\"",
+            rig.model.model
+        ),
+    )
+    .unwrap();
+    std::fs::write(profiles.join("broken.toml"), "name = ").unwrap();
+
+    let task = rig.send();
+    let first = rig.next_request().await;
+    // The model is offered the usable profiles, with what each is for.
+    let offered = first.body.to_string();
+    assert!(offered.contains(&description), "{offered}");
+    assert!(!offered.contains("broken"));
+    let conflicting = Call::new(
+        subagents::SPAWN,
+        json!({"task": nonce(), "profile": id, "mode": "code"}),
+    );
+    let unknown = Call::new(
+        subagents::SPAWN,
+        json!({"task": nonce(), "profile": "broken"}),
+    );
+    let spawn = Call::new(subagents::SPAWN, json!({"task": nonce(), "profile": id}));
+    first
+        .respond(calls_response(
+            api,
+            &[conflicting.clone(), unknown.clone(), spawn.clone()],
+            &nonce(),
+        ))
+        .await;
+    let (parent, child) = parent_and_child(&mut rig, api, &spawn.id).await;
+    // The profile's instructions join the subagent's prompt, not the parent's.
+    assert!(child.body.to_string().contains(&instructions));
+    assert!(!parent.body.to_string().contains(&instructions));
+    child.respond(text_response(api, &nonce())).await;
+    let spawned = result_json(api, &parent.body, &spawn.id);
+    assert_eq!(spawned["profile"], id);
+    assert_eq!(spawned["mode"], "plan");
+    parent.respond(text_response(api, &nonce())).await;
+    let thread = finished(task).await;
+    let calls = calls_of(&thread);
+    assert_eq!(error_kind(&calls[0]), ErrorKind::InvalidRequest);
+    assert_eq!(error_kind(&calls[1]), ErrorKind::InvalidRequest);
+
+    let child: Id = spawned["thread"].as_str().unwrap().parse().unwrap();
+    let child = thread_of(&rig, child);
+    assert_eq!(child.mode, Mode::Plan);
+    assert_eq!(child.model.as_ref(), Some(&rig.model));
+    let profile = child.profile.expect("the subagent records its profile");
+    assert_eq!(
+        (profile.id.as_str(), profile.instructions.as_str()),
+        (id, instructions.as_str())
+    );
+    let subagents: Vec<_> = rig
+        .gateway
+        .snapshot()
+        .unwrap()
+        .threads
+        .into_iter()
+        .filter(|t| t.parent == Some(rig.thread))
+        .collect();
+    assert_eq!(subagents.len(), 1, "refused requests created nothing");
+
+    // The same checks hold for a client's CreateSubagent.
+    let refused = rig
+        .run(Command::CreateProfileSubagent {
+            parent: rig.thread,
+            title: nonce(),
+            mode: Mode::Code,
+            model: rig.model.clone(),
+            requested: Default::default(),
+            profile: id.into(),
+        })
+        .await;
+    let Reply::Error(report) = refused else {
+        panic!("a mode other than the profile's was accepted: {refused:?}");
+    };
+    assert_eq!(report.kind, ErrorKind::InvalidRequest);
+    let Reply::AgentProfiles(listed) = rig.run(Command::AgentProfiles).await else {
+        panic!("profiles unavailable");
+    };
+    assert_eq!(listed.profiles.len(), 1);
+    assert_eq!(listed.problems[0].file, "broken.toml");
+}
+
+#[tokio::test]
 async fn cancelling_a_run_cancels_its_subagents() {
     let api = ProviderApi::OpenAi;
     let mut rig = rig(api, vec![], None).await;

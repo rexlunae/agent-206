@@ -15,12 +15,12 @@
 //! cancel and read subagents, and nothing that changes a grant, a permission
 //! or an approval. A model addresses only its own conversation's subagents.
 use crate::{
-    gateway::{Caller, Child, Delegator, Reservation},
+    gateway::{Caller, Child, Delegator, Reservation, Spawn},
     tools::{self, ToolHost, ToolListing, ToolOutput, ToolRequest, ToolScope, ToolSpec},
 };
 use a206_core::{
-    Capability, ErrorKind, ErrorReport, Id, Mode, ModelKey, RunState, ToolPermission,
-    UnavailableTools,
+    AgentProfiles, Capability, ErrorKind, ErrorReport, Id, Mode, ModelKey, RunState,
+    ToolPermission, UnavailableTools,
 };
 use futures_util::future::BoxFuture;
 use serde_json::{Map, Value, json};
@@ -58,6 +58,10 @@ const DEFAULT_WAIT: u64 = 60;
 const POLL: Duration = Duration::from_millis(250);
 /// Longest title derived from a task.
 const TITLE: usize = 80;
+/// The source named when agent profiles cannot be listed.
+pub const PROFILES: &str = "agent profiles";
+/// Longest profile summary offered to the model.
+const SUMMARY: usize = 200;
 
 /// Why a subagent tool call failed.
 #[derive(Debug, thiserror::Error)]
@@ -216,7 +220,7 @@ impl DelegationHost {
         Ok(())
     }
 
-    fn specs(caller: &Caller) -> Vec<ToolSpec> {
+    fn specs(caller: &Caller, profiles: &AgentProfiles) -> Vec<ToolSpec> {
         let thread = json!({"type": "string", "description": "The subagent's ID, as subagent_spawn or subagent_list returned it."});
         let modes: Vec<Value> = Mode::ALL.iter().map(|m| json!(m)).collect();
         let capabilities: Vec<Value> = caller.capabilities.iter().map(|c| json!(c)).collect();
@@ -224,6 +228,35 @@ impl DelegationHost {
             .into_values()
             .map(Value::String)
             .collect();
+        let mut spawn = json!({
+            "task": {"type": "string", "description": "Complete instructions for the subagent."},
+            "title": {"type": "string", "description": "A short name for the subagent's conversation."},
+            "mode": {"type": "string", "enum": modes, "description": "The subagent's mode; defaults to the profile's, else yours."},
+            "model": {"type": "string", "enum": models, "description": "Defaults to the profile's model, else your model when it is permitted for subagents."},
+            "capabilities": {"type": "array", "items": {"type": "string", "enum": capabilities}, "description": "Capabilities to give it; defaults to all of yours its mode and profile allow."}
+        });
+        if !profiles.profiles.is_empty() {
+            let ids: Vec<Value> = profiles.profiles.iter().map(|p| json!(p.id)).collect();
+            let summaries: Vec<String> = profiles
+                .profiles
+                .iter()
+                .map(|p| {
+                    let summary = match &p.description {
+                        Some(description) => format!("{}: {description}", p.name),
+                        None => p.name.clone(),
+                    };
+                    format!("- {}: {}", p.id, truncate(&summary, SUMMARY))
+                })
+                .collect();
+            spawn["profile"] = json!({
+                "type": "string",
+                "enum": ids,
+                "description": format!(
+                    "Start from one of the user's agent profiles, which sets its mode, model, capabilities and extra instructions:\n{}",
+                    summaries.join("\n")
+                ),
+            });
+        }
         let spec = |name: &str, description: &str, parameters: Value| ToolSpec {
             name: name.into(),
             description: description.into(),
@@ -238,13 +271,7 @@ impl DelegationHost {
                 "Start a subagent: a separate conversation that works on `task` in the background while you continue. It sees only the task, not this conversation, so include everything it needs. Its permissions are at most yours. Check on it with subagent_wait or subagent_status.",
                 json!({
                     "type": "object",
-                    "properties": {
-                        "task": {"type": "string", "description": "Complete instructions for the subagent."},
-                        "title": {"type": "string", "description": "A short name for the subagent's conversation."},
-                        "mode": {"type": "string", "enum": modes, "description": "The subagent's mode; defaults to yours."},
-                        "model": {"type": "string", "enum": models, "description": "Defaults to your model when it is permitted for subagents."},
-                        "capabilities": {"type": "array", "items": {"type": "string", "enum": capabilities}, "description": "Capabilities to give it; defaults to all of yours its mode allows."}
-                    },
+                    "properties": spawn,
                     "required": ["task"],
                     "additionalProperties": false
                 }),
@@ -307,7 +334,7 @@ impl DelegationHost {
             SPAWN => {
                 check_keys(
                     arguments,
-                    &["task", "title", "mode", "model", "capabilities"],
+                    &["task", "title", "mode", "model", "capabilities", "profile"],
                 )
                 .map_err(fail)?;
                 let task = text(arguments, "task")
@@ -317,9 +344,13 @@ impl DelegationHost {
                     Some(title) => title,
                     None => title_of(&task),
                 };
+                let profile = match text(arguments, "profile").map_err(fail)? {
+                    Some(id) => Some(self.delegator.profile(id).await?),
+                    None => None,
+                };
                 let mode = match text(arguments, "mode").map_err(fail)? {
                     Some(mode) => parse(&mode).ok_or(DelegationToolError::Mode(mode)),
-                    None => Ok(caller.mode),
+                    None => Ok(profile.as_ref().and_then(|p| p.mode).unwrap_or(caller.mode)),
                 }
                 .map_err(fail)?;
                 let requested = match arguments.get("capabilities") {
@@ -335,8 +366,17 @@ impl DelegationHost {
                     Some(_) => Err(DelegationToolError::Type("capabilities")),
                 }
                 .map_err(fail)?;
-                let model =
-                    choose_model(&caller, text(arguments, "model").map_err(fail)?).map_err(fail)?;
+                let named = text(arguments, "model").map_err(fail)?;
+                let from_profile = match (&named, &profile) {
+                    (None, Some(profile)) => self
+                        .delegator
+                        .profile_model(profile, &caller.subagent_models)?,
+                    _ => None,
+                };
+                let model = match from_profile {
+                    Some(model) => model,
+                    None => choose_model(&caller, named).map_err(fail)?,
+                };
                 if caller.ancestors >= MAX_DEPTH {
                     return Err(fail(DelegationToolError::TooDeep { limit: MAX_DEPTH }));
                 }
@@ -345,7 +385,17 @@ impl DelegationHost {
                 }
                 let child = self
                     .delegator
-                    .create(scope.thread, title, mode, model, requested, &ALL)
+                    .create(
+                        scope.thread,
+                        Spawn {
+                            title,
+                            mode,
+                            model,
+                            requested,
+                            profile: profile.map(|p| p.id),
+                        },
+                        &ALL,
+                    )
                     .await?;
                 self.start(scope.thread, child.id, task)?;
                 Ok(json!({
@@ -354,6 +404,7 @@ impl DelegationHost {
                     "mode": child.mode,
                     "model": child.model.as_ref().map(|m| &m.model),
                     "capabilities": child.capabilities,
+                    "profile": child.profile,
                     "state": "running",
                 }))
             }
@@ -386,6 +437,7 @@ impl DelegationHost {
                                 "thread": child.id,
                                 "title": child.title,
                                 "mode": child.mode,
+                                "profile": child.profile,
                                 "state": self.state(child),
                             })
                         })
@@ -618,10 +670,27 @@ impl ToolHost for DelegationHost {
         Box::pin(async move {
             match self.delegator.family(scope.thread) {
                 Ok((caller, _)) if caller.subagent_models.is_empty() => ToolListing::default(),
-                Ok((caller, _)) => ToolListing {
-                    tools: Self::specs(&caller),
-                    unavailable: vec![],
-                },
+                Ok((caller, _)) => {
+                    // Without its profiles the tools still work; the model
+                    // and the user see why no profile is offered.
+                    let (profiles, unavailable) = match self.delegator.profiles().await {
+                        Ok(profiles) => (profiles, vec![]),
+                        Err(report) => {
+                            crate::error::record("list_agent_profiles", &report);
+                            (
+                                AgentProfiles::default(),
+                                vec![UnavailableTools {
+                                    source: PROFILES.into(),
+                                    error: report,
+                                }],
+                            )
+                        }
+                    };
+                    ToolListing {
+                        tools: Self::specs(&caller, &profiles),
+                        unavailable,
+                    }
+                }
                 Err(report) => {
                     crate::error::record("list_subagent_tools", &report);
                     ToolListing {

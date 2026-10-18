@@ -261,7 +261,7 @@ fn skipped(path: &str, size: Option<u64>, error: ErrorReport) -> InstructionFile
     }
 }
 
-fn hex(bytes: &[u8]) -> String {
+pub(crate) fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 

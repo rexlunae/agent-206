@@ -10,6 +10,8 @@ mod extension_cli;
 #[cfg(not(target_arch = "wasm32"))]
 mod messenger_cli;
 #[cfg(not(target_arch = "wasm32"))]
+mod profiles_cli;
+#[cfg(not(target_arch = "wasm32"))]
 mod running_cli;
 #[cfg(not(target_arch = "wasm32"))]
 mod schedule_cli;
@@ -132,6 +134,9 @@ mod native {
         },
         /// Show every conversation with a response in progress.
         Running,
+        /// Show the agent profiles subagents can start from, and any profile
+        /// file that could not be used.
+        Profiles,
         /// Show gateway and workspace status without starting a service.
         Status,
         /// Export the current workspace snapshot as TOML.
@@ -774,6 +779,9 @@ mod native {
                 }
                 if let Action::Running = action {
                     return crate::running_cli::run(&client).await;
+                }
+                if let Action::Profiles = action {
+                    return crate::profiles_cli::run(&client).await;
                 }
                 let command = match action {
                     Action::Providers {

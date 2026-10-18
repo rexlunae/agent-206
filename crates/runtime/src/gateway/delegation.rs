@@ -94,6 +94,8 @@ pub struct Child {
     pub reply: Option<String>,
     /// Tool calls waiting for the user's approval.
     pub approvals: usize,
+    /// The ID of the agent profile it was started from.
+    pub profile: Option<String>,
 }
 impl Child {
     fn of(thread: &Thread) -> Self {
@@ -112,8 +114,20 @@ impl Child {
                 .find(|m| m.role == Role::Assistant)
                 .map(|m| m.text.clone()),
             approvals: thread.approvals.len(),
+            profile: thread.profile.as_ref().map(|p| p.id.clone()),
         }
     }
+}
+
+/// The subagent [`Delegator::create`] asks for, as `CreateSubagent` takes it.
+#[derive(Debug, Clone)]
+pub struct Spawn {
+    pub title: String,
+    pub mode: Mode,
+    pub model: ModelKey,
+    pub requested: BTreeSet<Capability>,
+    /// The agent profile to start from.
+    pub profile: Option<String>,
 }
 
 /// Starts and supervises subagents for the subagent tools.
@@ -222,6 +236,34 @@ impl Delegator {
         }
     }
 
+    /// The user's agent profiles, as their files are now.
+    pub async fn profiles(&self) -> Result<AgentProfiles, ErrorReport> {
+        self.base
+            .agent_profiles()
+            .await
+            .map_err(|e| crate::error::report(&DelegatorError::from(e)))
+    }
+    /// The user's agent profile `id`, as its file is now.
+    pub async fn profile(&self, id: String) -> Result<AgentProfile, ErrorReport> {
+        self.base
+            .agent_profile(id)
+            .await
+            .map_err(|e| crate::error::report(&DelegatorError::from(e)))
+    }
+    /// The model of `permitted` that `profile` names, if it names one.
+    pub fn profile_model(
+        &self,
+        profile: &AgentProfile,
+        permitted: &BTreeSet<ModelKey>,
+    ) -> Result<Option<ModelKey>, ErrorReport> {
+        let store = self
+            .base
+            .lock()
+            .map_err(|e| crate::error::report(&DelegatorError::from(e)))?;
+        crate::agent_profiles::model(profile, permitted, &store.state.settings.providers)
+            .map_err(|e| crate::error::report(&e))
+    }
+
     /// `caller` and its direct subagents.
     pub fn family(&self, caller: Id) -> Result<(Caller, Vec<Child>), ErrorReport> {
         self.read_family(caller)
@@ -266,21 +308,27 @@ impl Delegator {
     pub async fn create(
         &self,
         caller: Id,
-        title: String,
-        mode: Mode,
-        model: ModelKey,
-        requested: BTreeSet<Capability>,
+        spawn: Spawn,
         withheld: &[&str],
     ) -> Result<Child, ErrorReport> {
-        let reply = self
-            .request(Command::CreateSubagent {
+        let command = match spawn.profile {
+            Some(profile) => Command::CreateProfileSubagent {
                 parent: caller,
-                title,
-                mode,
-                model,
-                requested,
-            })
-            .await?;
+                title: spawn.title,
+                mode: spawn.mode,
+                model: spawn.model,
+                requested: spawn.requested,
+                profile,
+            },
+            None => Command::CreateSubagent {
+                parent: caller,
+                title: spawn.title,
+                mode: spawn.mode,
+                model: spawn.model,
+                requested: spawn.requested,
+            },
+        };
+        let reply = self.request(command).await?;
         let Reply::Thread(thread) = reply else {
             return Err(crate::error::report(&GatewayError::Invalid(
                 "unexpected reply to CreateSubagent",

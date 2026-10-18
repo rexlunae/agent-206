@@ -31,10 +31,11 @@ mod plans;
 mod schedules;
 pub use plans::Plans;
 mod pause;
+mod profiles;
 mod skills;
 mod steering;
 pub use crate::skill_tool::SkillOffer;
-pub use delegation::{Caller, Child, Delegator, DelegatorError, Reservation};
+pub use delegation::{Caller, Child, Delegator, DelegatorError, Reservation, Spawn};
 pub use schedules::{Jobs, MAX_AGENT_JOBS};
 
 /// Streamed reply text that is not final yet. It is published as the
@@ -172,6 +173,8 @@ pub enum GatewayError {
     #[error(transparent)]
     Skill(#[from] a206_skills::SkillError),
     #[error(transparent)]
+    Profile(#[from] crate::agent_profiles::ProfileError),
+    #[error(transparent)]
     OutputRules(#[from] a206_output_rules::RulesError),
     #[error(transparent)]
     Prompt(#[from] crate::prompt_tool::PromptError),
@@ -264,6 +267,7 @@ impl crate::error::Classified for GatewayError {
             Self::Extension(error) => return classify(error),
             Self::Mcp(error) => return classify(error),
             Self::Skill(error) => return classify(error),
+            Self::Profile(error) => return classify(error),
             Self::OutputRules(error) => return classify(error),
             Self::Prompt(error) => return classify(error),
             Self::Programs(error) => return classify(error),
@@ -282,6 +286,17 @@ impl crate::error::Classified for GatewayError {
     }
 }
 type Result<T, E = GatewayError> = std::result::Result<T, E>;
+/// The mode prompt, followed by the instructions of the agent profile the
+/// conversation was started from.
+fn with_profile(prompt: String, profile: Option<&ThreadProfile>) -> String {
+    match profile.filter(|p| !p.instructions.is_empty()) {
+        Some(profile) => format!(
+            "{prompt}\n\n## Agent profile: {}\n\n{}",
+            profile.name, profile.instructions
+        ),
+        None => prompt,
+    }
+}
 fn poisoned<T>(lock: &'static str) -> impl FnOnce(T) -> GatewayError {
     move |_| GatewayError::Poisoned { lock }
 }
@@ -639,6 +654,7 @@ impl Gateway {
                 | Command::OpenPanel { .. }
                 | Command::CallTool { .. }
                 | Command::Skills
+                | Command::AgentProfiles
                 | Command::ReadSkill { .. }
                 | Command::ListTools { .. }
                 // Read-only; its reply copies message text.
@@ -1156,6 +1172,7 @@ impl Gateway {
                         .find(|p| p.mode == current.mode)
                         .map(|p| p.prompt.clone())
                         .ok_or(GatewayError::Invalid("mode prompt missing"))?;
+                    let prompt = with_profile(prompt, current.profile.as_deref());
                     let backend = if current.backend == CodingBackend::Native {
                         None
                     } else {
@@ -1398,28 +1415,37 @@ impl Gateway {
                 model,
                 requested,
             } => {
-                let mut store = self.lock()?;
-                validate_model(&store.state, &model)?;
-                let parent_thread = store.thread(parent)?.clone();
-                check(
-                    parent_thread.subagent_models.contains(&model),
-                    GatewayError::Denied("model is not permitted for this thread's subagents"),
-                )?;
-                let mut thread = Thread::new(title, mode);
-                thread.project = parent_thread.project;
-                thread.parent = Some(parent);
-                thread.model = Some(model.clone());
-                thread.grant = parent_thread.grant.attenuate(
-                    mode,
-                    &Grant {
-                        capabilities: requested,
-                        models: [model].into(),
+                self.create_subagent(
+                    parent,
+                    Spawn {
+                        title,
+                        mode,
+                        model,
+                        requested,
+                        profile: None,
                     },
-                    &mode.ceiling(),
-                );
-                store.state.threads.push(thread.clone());
-                store.persist(Some(EventKind::ThreadCreated { id: thread.id }))?;
-                Ok(Reply::Thread(Box::new(thread)))
+                )
+                .await
+            }
+            Command::CreateProfileSubagent {
+                parent,
+                title,
+                mode,
+                model,
+                requested,
+                profile,
+            } => {
+                self.create_subagent(
+                    parent,
+                    Spawn {
+                        title,
+                        mode,
+                        model,
+                        requested,
+                        profile: Some(profile),
+                    },
+                )
+                .await
             }
             Command::Download {
                 url,
@@ -1605,6 +1631,7 @@ impl Gateway {
                 Ok(Reply::Ok)
             }
             Command::Skills => Ok(Reply::Skills(self.skills()?)),
+            Command::AgentProfiles => Ok(Reply::AgentProfiles(self.agent_profiles().await?)),
             Command::ReadSkill { name } => Ok(Reply::Skill(self.read_skill(&name)?)),
             Command::SetSkillEnabled {
                 name,
