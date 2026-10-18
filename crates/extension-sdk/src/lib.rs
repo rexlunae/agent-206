@@ -381,6 +381,14 @@ pub mod host {
             _ => Err(unexpected()),
         }
     }
+    /// Switch to the local branch `name`, changing the working tree and
+    /// index to its commit.
+    pub fn git_switch_branch(name: &str) -> Result<GitBranch, HostFailure> {
+        match call(&HostRequest::GitSwitchBranch { name: name.into() })? {
+            HostReply::Branch(branch) => Ok(branch),
+            _ => Err(unexpected()),
+        }
+    }
     /// A unified diff of one file, staged or unstaged.
     pub fn git_diff(path: &str, staged: bool) -> Result<GitDiff, HostFailure> {
         match call(&HostRequest::GitDiff {

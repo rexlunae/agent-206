@@ -195,7 +195,7 @@ fn nests(repo: &gix::Repository, name: &str) -> Result<bool, HostFailure> {
 }
 
 /// `refs/heads/<name>`, for a name `git branch` accepts.
-fn branch_name(name: &str) -> Option<FullName> {
+pub(super) fn branch_name(name: &str) -> Option<FullName> {
     if name.is_empty() || name.starts_with('-') || name == "HEAD" {
         return None;
     }
