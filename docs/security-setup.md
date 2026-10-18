@@ -160,4 +160,5 @@ read/reveal operation is added to the UI channel. Older/unknown peers are refuse
 before a new secret-bearing request is sealed; no plaintext fallback exists.
 Native and encrypted broker integration tests cover authentication/role denials,
 overwrite refusal, origin validation, byte/count bounds and metadata without values.
-Advanced entry/editing, agent-use approvals and remote vault controls remain pending.
+GUI editing, SSH-key/form/payment entry, agent-use approvals and remote vault
+controls remain pending; the CLI supports other entry kinds and policy edits.

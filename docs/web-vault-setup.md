@@ -60,8 +60,10 @@ confirmed, refresh metadata before retrying: the write may have committed.
 
 These controls require broker v14 and refuse older brokers before sending the
 new requests. Generic setup still works with v10, and migration with v11.
-Values, advanced entry kinds, policy/destination edits, legacy adoption,
-agent-access changes, deletion and TOTP removal remain trusted CLI operations.
+Reveal, policy/destination edits, legacy adoption, agent-access changes, deletion
+and TOTP removal remain trusted CLI operations. The CLI also offers token, login,
+passkey, note and other entry kinds; this panel adds API keys only. SSH-key, form
+and payment entry are still unavailable in both clients.
 
 ## Optional migration
 

@@ -284,9 +284,10 @@ origins, never values. Broker v14 enforces step-up, fixed per-use approval and
 atomic refusal to overwrite; global agent access is unchanged. Pages contain at
 most 50 entries and 48 KiB encoded, with explicit errors for oversized metadata.
 Native/encrypted integration tests cover the new operations and compatibility
-refusal; desktop/TUI interactive acceptance is still pending. Advanced credential
-kinds, edits, legacy adoption, removal, reveal and global access changes remain CLI
-operations. Agent credential-use approval and remote SSH vault controls are pending.
+refusal; desktop/TUI interactive acceptance is still pending. Other CLI-supported
+entry kinds, edits, legacy adoption, removal, reveal and global access changes
+remain CLI operations. SSH-key, form and payment entry remain unavailable.
+Agent credential-use approval and remote SSH vault controls are pending.
 
 Release-web acceptance used a disposable encrypted password vault: private
 metadata loaded, locked skill scopes and disabled flags were shown, a synthetic
