@@ -10,6 +10,7 @@
 use a206_core::AuditReport;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::{
     io::Read,
     path::{Component, Path},
@@ -51,6 +52,8 @@ pub enum SkillError {
     Path,
     #[error("skill file exceeds {limit} bytes")]
     FileTooLarge { limit: u64 },
+    #[error("skill packages allow at most 128 entries, 16 directory levels and 2 MiB total")]
+    PackageLimit,
     #[error("approve a skill by the digest of the text you reviewed")]
     Unreviewed,
     #[error("this skill is not enabled")]
@@ -69,11 +72,13 @@ pub struct Skill {
     pub requires: Requirements,
     /// Markdown after the frontmatter.
     pub instructions: String,
-    /// SHA-256 of the whole `SKILL.md`, in lowercase hex; approval pins it.
+    /// Package content digest in lowercase hex; approval pins it.
     pub digest: String,
-    /// What the pre-install audit found in the whole `SKILL.md`. Advice for
+    /// What the pre-install audit found in the package. Advice for
     /// the user's review; it neither approves nor blocks the skill.
     pub audit: AuditReport,
+    /// Supporting files from the same bounded snapshot as the approved digest.
+    pub files: BTreeMap<String, Vec<u8>>,
 }
 
 /// What the skill says it needs. Unmet requirements are reported, not enforced:
@@ -228,6 +233,7 @@ pub fn parse(text: &str, directory: &str) -> Result<Skill, SkillError> {
         instructions: without_leading_blank_lines(instructions).to_owned(),
         digest,
         audit: a206_audit::text(text),
+        files: BTreeMap::new(),
     })
 }
 
@@ -263,8 +269,9 @@ pub struct Entry {
     pub skill: Result<Skill, SkillError>,
 }
 
-/// Read every skill under `root` (`<root>/<name>/SKILL.md`). A missing root
-/// has no skills; a directory that fails to parse is reported, not skipped.
+/// Read every skill's metadata and audit under `root`. Supporting bytes are
+/// discarded after auditing; use [`load`] for a complete review snapshot.
+/// A missing root has no skills; a parse failure is reported, not skipped.
 pub fn scan(root: &Path) -> Result<Vec<Entry>, SkillError> {
     let entries = match std::fs::read_dir(root) {
         Ok(entries) => entries,
@@ -285,7 +292,11 @@ pub fn scan(root: &Path) -> Result<Vec<Entry>, SkillError> {
         if found.len() == MAX_SKILLS {
             return Err(SkillError::TooMany { limit: MAX_SKILLS });
         }
-        let skill = load(root, &directory).map(|(skill, _)| skill);
+        let skill = load(root, &directory).map(|(mut skill, _)| {
+            // Listings must not retain up to 256 complete 2-MiB packages.
+            skill.files.clear();
+            skill
+        });
         found.push(Entry { directory, skill });
     }
     found.sort_by(|a, b| a.directory.cmp(&b.directory));
@@ -310,7 +321,9 @@ pub fn load(root: &Path, name: &str) -> Result<(Skill, String), SkillError> {
             },
         })?;
     let text = std::str::from_utf8(&bytes).map_err(SkillError::NotText)?;
-    Ok((parse(text, name)?, text.to_owned()))
+    let mut skill = parse(text, name)?;
+    package::inspect(root, name, &bytes, &mut skill)?;
+    Ok((skill, text.to_owned()))
 }
 
 /// Read a supporting file of skill `name` by its path relative to the skill.
@@ -335,6 +348,32 @@ pub fn read_file(root: &Path, name: &str, relative: &str) -> Result<Vec<u8>, Ski
             limit: MAX_FILE_BYTES,
         },
     })
+}
+
+/// Serve bytes from the package snapshot whose digest the user approved.
+/// Never re-open a supporting file after checking a different snapshot.
+pub fn read_approved_file(
+    root: &Path,
+    name: &str,
+    relative: &str,
+    digest: &str,
+) -> Result<Vec<u8>, SkillError> {
+    if relative.is_empty()
+        || relative.contains('\\')
+        || !Path::new(relative)
+            .components()
+            .all(|c| matches!(c, Component::Normal(_)))
+    {
+        return Err(SkillError::Path);
+    }
+    let (mut skill, text) = load(root, name)?;
+    if skill.digest != digest {
+        return Err(SkillError::Changed);
+    }
+    if relative == "SKILL.md" {
+        return Ok(text.into_bytes());
+    }
+    skill.files.remove(relative).ok_or(SkillError::NotFound)
 }
 
 /// Refuse a symlink at the skill directory or any component of `relative`
@@ -368,7 +407,7 @@ enum Bounded {
 /// component, so nothing outside the skill can be read even if the tree
 /// changes while it is read.
 fn read_bounded(root: &Path, name: &str, relative: &Path, limit: u64) -> Result<Vec<u8>, Bounded> {
-    use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
+    use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt, OpenOptionsSyncExt};
     let open = || -> std::io::Result<std::fs::File> {
         let mut dir = cap_std::fs::Dir::open_ambient_dir(root, cap_std::ambient_authority())?
             .open_dir_nofollow(name)?;
@@ -376,7 +415,7 @@ fn read_bounded(root: &Path, name: &str, relative: &Path, limit: u64) -> Result<
         while let Some(component) = components.next() {
             if components.peek().is_none() {
                 let mut options = cap_std::fs::OpenOptions::new();
-                options.read(true).follow(FollowSymlinks::No);
+                options.read(true).follow(FollowSymlinks::No).nonblock(true);
                 return Ok(dir.open_with(component, &options)?.into_std());
             }
             dir = dir.open_dir_nofollow(component)?;
@@ -384,6 +423,9 @@ fn read_bounded(root: &Path, name: &str, relative: &Path, limit: u64) -> Result<
         Err(std::io::ErrorKind::InvalidInput.into())
     };
     let file = open().map_err(Bounded::Io)?;
+    if !file.metadata().map_err(Bounded::Io)?.is_file() {
+        return Err(Bounded::Io(std::io::ErrorKind::InvalidInput.into()));
+    }
     let mut bytes = vec![];
     file.take(limit + 1)
         .read_to_end(&mut bytes)
@@ -422,5 +464,6 @@ fn escape(text: &str) -> String {
         .replace('"', "&quot;")
 }
 
+mod package;
 #[cfg(test)]
 mod tests;

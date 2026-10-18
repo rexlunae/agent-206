@@ -118,8 +118,13 @@ pub(crate) fn read(
             let skill = approved(root, pins, &name)?;
             match text(&request.arguments, "path")? {
                 None => skill.instructions,
-                Some(path) => String::from_utf8(a206_skills::read_file(root, &name, &path)?)
-                    .map_err(SkillToolError::NotText)?,
+                Some(path) => String::from_utf8(a206_skills::read_approved_file(
+                    root,
+                    &name,
+                    &path,
+                    &skill.digest,
+                )?)
+                .map_err(SkillToolError::NotText)?,
             }
         }
         other => return Err(SkillToolError::UnknownTool(other.into())),

@@ -114,6 +114,22 @@ async fn supporting_files_and_arguments_are_checked() {
     std::fs::write(dir.join("blob.bin"), [0xff, 0xfe]).unwrap();
 
     let read = |path: &str| call(&host, INFO, json!({"name": "notes", "path": path}));
+    assert_eq!(
+        read("ref.md").await.unwrap_err().kind,
+        ErrorKind::PermissionDenied,
+        "adding a supporting file withdraws the old instruction-only approval"
+    );
+    let digest = a206_skills::load(&profile.path().join("skills"), "notes")
+        .unwrap()
+        .0
+        .digest;
+    store
+        .lock()
+        .unwrap()
+        .state
+        .settings
+        .enabled_skills
+        .insert("notes".into(), digest);
     assert_eq!(read("ref.md").await.unwrap().text, text);
     for (path, kind) in [
         ("../notes/ref.md", ErrorKind::InvalidRequest),
