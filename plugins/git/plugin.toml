@@ -1,7 +1,7 @@
 id = "agent206.git"
 name = "Git"
 description = "Shows the status, history and diffs of a project's git repository and stages or commits named files, without running anything the repository configures."
-version = "0.2.0"
+version = "0.3.0"
 abi = 2
 capabilities = ["git_read", "git_write"]
 
@@ -38,7 +38,7 @@ description = "Diff the staged change instead of the unstaged one. Defaults to f
 
 [[tools]]
 name = "git_commit"
-description = "Commit the current working-tree content of exactly the named files on top of HEAD, like `git commit --only`. A named file that no longer exists is removed. Other staged changes stay staged. Refused when the repository signs commits, has commit hooks, is mid-merge or has no user.name and user.email."
+description = "Commit the current working-tree content of exactly the named files on top of HEAD, like `git commit --only`; a named file that no longer exists is removed and other staged changes stay staged. Or, with staged, commit everything that is staged, like a plain `git commit`. Refused when the repository signs commits, has commit hooks, is mid-merge or has no user.name and user.email."
 capabilities = ["git_write"]
 
 [[tools.params]]
@@ -50,8 +50,12 @@ required = true
 [[tools.params]]
 name = "paths"
 type = "string"
-description = "Files to commit, one per line, relative to the repository root."
-required = true
+description = "Files to commit, one per line, relative to the repository root. Required unless staged is true."
+
+[[tools.params]]
+name = "staged"
+type = "boolean"
+description = "Commit what is staged instead of named files. Defaults to false."
 
 [[tools]]
 name = "git_stage"
