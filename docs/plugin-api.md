@@ -343,8 +343,10 @@ always reaches the guest; with less time left the call fails with `budget`.
 
 `git_create_branch` works like `git branch <name> [<start>]`: it writes the
 new reference `refs/heads/<name>` and its reflog entry, and leaves the working
-tree, the index and `HEAD` as they are. The name must be one git accepts and
-not exist yet (`conflict`). `start` is a local branch name or a full commit id
+tree, the index and `HEAD` as they are. The name must be one git accepts,
+nest at most 20 folders deep (a gitoxide limit; `invalid` beyond it), and not
+exist yet, be the current (even unborn) branch, or nest with an existing branch
+as `a` and `a/b` would (all `conflict`). `start` is a local branch name or a full commit id
 and defaults to `HEAD`; revision expressions such as `HEAD~1` and abbreviated
 ids are not evaluated (`not_found`), and an unborn `HEAD` with no `start` is
 `invalid`. The reflog records `user.name` and `user.email`, which are required

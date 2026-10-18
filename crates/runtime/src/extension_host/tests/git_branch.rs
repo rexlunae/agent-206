@@ -133,6 +133,77 @@ async fn refused_branches_create_nothing() {
         );
     }
     assert_eq!(branches(&mut host).await.len(), 1);
+
+    // Branches that would nest with an existing one, either way round.
+    let parent = unique("p");
+    assert!(matches!(
+        host.handle(create(&parent, None)).await,
+        HostReply::Branch(_)
+    ));
+    for name in [format!("{parent}/child"), existing.clone() + "/x"] {
+        assert_eq!(
+            code(host.handle(create(&name, None)).await),
+            Some(HostErrorCode::Conflict),
+            "{name}"
+        );
+    }
+    let nested = format!("{}/leaf", unique("folder"));
+    assert!(matches!(
+        host.handle(create(&nested, None)).await,
+        HostReply::Branch(_)
+    ));
+    let folder = nested.split('/').next().unwrap().to_string();
+    assert_eq!(
+        code(host.handle(create(&folder, None)).await),
+        Some(HostErrorCode::Conflict)
+    );
+    assert_eq!(branches(&mut host).await.len(), 3);
+}
+
+#[tokio::test]
+async fn long_nested_names_are_accepted_to_a_depth() {
+    use crate::extension_host::git_branch::MAX_BRANCH_FOLDERS;
+    let (dir, store) = store();
+    let root = &project(dir.path());
+    branchable(root);
+    let mut host = writer(&store, root);
+    // Longer than 255 bytes in all, as git allows.
+    let folder = unique("f");
+    let deepest = format!(
+        "{}{}",
+        format!("{folder}/").repeat(MAX_BRANCH_FOLDERS),
+        unique("b")
+    );
+    assert!(deepest.len() > 255);
+    let reply = host.handle(create(&deepest, None)).await;
+    assert!(matches!(reply, HostReply::Branch(_)), "{reply:?}");
+    let deeper = format!("{}{}", "a/".repeat(MAX_BRANCH_FOLDERS + 1), unique("b"));
+    assert_eq!(
+        code(host.handle(create(&deeper, None)).await),
+        Some(HostErrorCode::Invalid)
+    );
+    assert_eq!(branches(&mut host).await.len(), 2);
+}
+
+#[tokio::test]
+async fn an_unborn_current_branch_is_not_given_a_commit() {
+    let (dir, store) = store();
+    let root = &project(dir.path());
+    branchable(root);
+    let mut host = writer(&store, root);
+    let main = branches(&mut host).await[0].name.clone();
+    let orphan = unique("orphan");
+    std::fs::write(
+        root.join(".git/HEAD"),
+        format!("ref: refs/heads/{orphan}\n"),
+    )
+    .unwrap();
+    assert_eq!(
+        code(host.handle(create(&orphan, Some(&main))).await),
+        Some(HostErrorCode::Conflict)
+    );
+    assert_eq!(head(root), None);
+    assert_eq!(branches(&mut host).await.len(), 1);
 }
 
 #[tokio::test]

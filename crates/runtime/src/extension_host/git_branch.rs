@@ -20,6 +20,9 @@ use std::{path::PathBuf, sync::atomic::AtomicBool};
 
 /// Most branches one listing returns.
 pub const MAX_BRANCHES: usize = 500;
+/// Most folders a branch name nests in. Git has no such limit, but
+/// gitoxide creates at most 25 missing directories for one reference.
+pub const MAX_BRANCH_FOLDERS: usize = 20;
 /// The hook git runs when a reference changes. Its presence refuses the call.
 const REFERENCE_HOOKS: [&str; 1] = ["reference-transaction"];
 
@@ -64,6 +67,12 @@ pub(super) fn create(
     user: impl FnOnce() -> Result<UserGit, HostFailure>,
     interrupt: &AtomicBool,
 ) -> Result<HostReply, HostFailure> {
+    if name.matches('/').count() > MAX_BRANCH_FOLDERS {
+        return Err(failure(
+            HostErrorCode::Invalid,
+            "a branch name may nest at most 20 folders deep",
+        ));
+    }
     let full = branch_name(name).ok_or_else(|| {
         failure(
             HostErrorCode::Invalid,
@@ -79,6 +88,15 @@ pub(super) fn create(
         ));
     }
     let (committer, email) = settings.identity()?;
+    let head = repo.head().map_err(|e| git_failure("head", &e))?;
+    // An unborn current branch has no reference yet, but creating it would
+    // give `HEAD` a commit.
+    if head.referent_name() == Some(full.as_ref()) {
+        return Err(failure(
+            HostErrorCode::Conflict,
+            "the branch is the current branch",
+        ));
+    }
     let id = match start {
         None => repo
             .head_id()
@@ -101,6 +119,12 @@ pub(super) fn create(
             "the branch already exists",
         ));
     }
+    if nests(&repo, name)? {
+        return Err(failure(
+            HostErrorCode::Conflict,
+            "a branch named like a folder of this one, or inside it, exists",
+        ));
+    }
     // The last point at which the call can stop without creating the branch.
     check(interrupt)?;
     let signature = gix::actor::Signature {
@@ -119,19 +143,23 @@ pub(super) fn create(
             expected: PreviousValue::MustNotExist,
             new: Target::Object(id),
         },
-        name: full,
+        name: full.clone(),
         deref: false,
     };
     if let Err(error) = repo.edit_references_as([edit], Some(signature.to_ref(&mut time))) {
+        // Another process may have created it in between; anything else is
+        // a write failure.
+        let exists = matches!(repo.try_find_reference(&full), Ok(Some(_)));
         tracing::warn!(
             error = &error as &dyn std::error::Error,
+            exists,
             "extension branch creation failed"
         );
-        // Another process creating it in between loses nothing.
-        return Err(failure(
-            HostErrorCode::Conflict,
-            "the branch could not be created; it may have been created meanwhile",
-        ));
+        return Err(if exists {
+            failure(HostErrorCode::Conflict, "the branch already exists")
+        } else {
+            failure(HostErrorCode::Io, "the branch could not be written")
+        });
     }
     tracing::info!(commit = %id, "extension created a git branch");
     Ok(HostReply::Branch(GitBranch {
@@ -141,9 +169,30 @@ pub(super) fn create(
     }))
 }
 
+/// Whether a branch is a parent folder of `name`, or `name` is a folder of
+/// branches: git stores both as paths, so they cannot exist together.
+fn nests(repo: &gix::Repository, name: &str) -> Result<bool, HostFailure> {
+    for (end, _) in name.match_indices('/') {
+        let parent = format!("refs/heads/{}", &name[..end]);
+        if repo
+            .try_find_reference(parent.as_str())
+            .map_err(|e| git_failure("branches", &e))?
+            .is_some()
+        {
+            return Ok(true);
+        }
+    }
+    let references = repo.references().map_err(|e| git_failure("branches", &e))?;
+    let below = format!("refs/heads/{name}/");
+    let mut inside = references
+        .prefixed(below.as_str())
+        .map_err(|e| git_failure("branches", &e))?;
+    Ok(inside.next().is_some())
+}
+
 /// `refs/heads/<name>`, for a name `git branch` accepts.
 fn branch_name(name: &str) -> Option<FullName> {
-    if name.is_empty() || name.starts_with('-') || name == "HEAD" || name.len() > 255 {
+    if name.is_empty() || name.starts_with('-') || name == "HEAD" {
         return None;
     }
     FullName::try_from(format!("refs/heads/{name}")).ok()
