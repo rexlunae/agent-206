@@ -9,10 +9,6 @@ use a206_core::{BrokerPairing, MessengerConfig, WebhookFormat};
 use serde_json::{Value, json};
 use std::path::PathBuf;
 
-/// Most parts one message is sent in; a longer message is refused whole
-/// rather than cut.
-pub const MAX_PARTS: usize = 8;
-
 /// Longest part, in UTF-16 units, each format takes: Discord's 2,000
 /// character content limit, and for the others the 4,000 characters Slack
 /// recommends, which is also within Google Chat's and Teams' limits.
@@ -25,21 +21,7 @@ pub fn part_limit(format: WebhookFormat) -> usize {
 
 /// `text` as the parts it is sent in, or why it cannot be sent.
 pub fn parts(format: WebhookFormat, text: &str) -> Result<Vec<String>> {
-    let limit = part_limit(format);
-    let parts: Vec<String> = super::split(text, limit)
-        .into_iter()
-        .filter(|part| !part.trim().is_empty())
-        .map(str::to_owned)
-        .collect();
-    if parts.is_empty() {
-        return Err(MessengerError::EmptyMessage);
-    }
-    if parts.len() > MAX_PARTS {
-        return Err(MessengerError::MessageTooLong {
-            most: limit * MAX_PARTS,
-        });
-    }
-    Ok(parts)
+    super::sent_parts(text, part_limit(format))
 }
 
 /// The request body for one part.
@@ -64,10 +46,7 @@ fn body(format: WebhookFormat, text: &str) -> Value {
 }
 
 /// Send `text` to the webhook `config` names, in order; the number of parts
-/// sent. `withdrawn` is asked before each part: once the user has disabled,
-/// disconnected or changed the webhook, nothing more is sent. A part that
-/// fails or is withheld stops the rest, and the error says how many were
-/// already delivered.
+/// sent. See [`super::send_in_parts`] for `withdrawn` and partial failures.
 pub async fn send(
     root: PathBuf,
     pairing: BrokerPairing,
@@ -77,55 +56,34 @@ pub async fn send(
 ) -> Result<usize> {
     let parts = parts(config.format, text)?;
     let api = Api::new(root, pairing, config)?;
-    let total = parts.len();
-    for (sent, part) in parts.iter().enumerate() {
-        let delivered = async {
-            if withdrawn() {
-                return Err(MessengerError::Withdrawn {
-                    name: config.name.clone(),
-                });
+    let api = &api;
+    super::send_in_parts(&config.name, parts, withdrawn, |part| async move {
+        let body = serde_json::to_vec(&body(config.format, &part)).map_err(|source| {
+            MessengerError::Malformed {
+                service: api.service,
+                source,
             }
-            let body = serde_json::to_vec(&body(config.format, part)).map_err(|source| {
-                MessengerError::Malformed {
-                    service: api.service,
-                    source,
-                }
-            })?;
-            let (status, _) = api
-                .call(
-                    AuthScheme::WebhookUrl,
-                    HttpMethod::Post,
-                    api.base.clone(),
-                    Some(body),
-                )
-                .await?;
-            if !(200..300).contains(&status) {
-                return Err(match status {
-                    401 | 403 | 404 => MessengerError::Unauthorized {
-                        service: api.service,
-                    },
-                    status => MessengerError::Status {
-                        service: api.service,
-                        status,
-                    },
-                });
-            }
-            Ok(())
+        })?;
+        let (status, _) = api
+            .call(
+                AuthScheme::WebhookUrl,
+                HttpMethod::Post,
+                api.base.clone(),
+                Some(body),
+            )
+            .await?;
+        match status {
+            200..=299 => Ok(()),
+            401 | 403 | 404 => Err(MessengerError::Unauthorized {
+                service: api.service,
+            }),
+            status => Err(MessengerError::Status {
+                service: api.service,
+                status,
+            }),
         }
-        .await;
-        if let Err(error) = delivered {
-            return Err(if sent == 0 {
-                error
-            } else {
-                MessengerError::PartlySent {
-                    sent,
-                    total,
-                    source: Box::new(error),
-                }
-            });
-        }
-    }
-    Ok(total)
+    })
+    .await
 }
 
 #[cfg(test)]
@@ -151,13 +109,13 @@ mod tests {
     fn long_messages_split_and_too_long_or_blank_ones_are_refused_whole() {
         for format in WebhookFormat::ALL {
             let limit = part_limit(format);
-            let fits = "x".repeat(limit * MAX_PARTS);
+            let fits = "x".repeat(limit * crate::messengers::MAX_SENT_PARTS);
             let sent = parts(format, &fits).unwrap();
-            assert_eq!(sent.len(), MAX_PARTS);
+            assert_eq!(sent.len(), crate::messengers::MAX_SENT_PARTS);
             assert_eq!(sent.concat(), fits);
             assert!(matches!(
                 parts(format, &format!("{fits}x")),
-                Err(MessengerError::MessageTooLong { most }) if most == limit * MAX_PARTS
+                Err(MessengerError::MessageTooLong { most }) if most == limit * crate::messengers::MAX_SENT_PARTS
             ));
             assert!(matches!(
                 parts(format, " \n "),

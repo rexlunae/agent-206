@@ -531,13 +531,18 @@ offered. Clients: a plan card above the composer in the shared conversation view
 ## Messages out (`send_message`)
 
 `runtime/src/message_tool.rs` offers `send_message`, after RustyClaw's
-`message` tool, while the user has an enabled webhook messenger they have not
-disconnected. Its arguments are `destination`, the webhook's entry name (an
-enum of the current names), and `text`. The host's policy is Ask, so even a
+`message` tool, while the user has an enabled webhook messenger, or an
+allowed chat of an enabled Telegram, Matrix, Discord, Slack or Beeper
+messenger, that they have not disconnected. Its arguments are `destination`,
+a webhook's entry name or `name/chat` for a chat (an enum of the current
+destinations; the gateway checks the destination again when sending), and
+`text`. The host's policy is Ask, so even a
 conversation that permits the tool approves each call, and the host refuses
 any call the user did not approve. The result names the destination and the
-number of parts sent; the webhook URL never appears in the listing, the
-result or the conversation. See [messengers.md](messengers.md#webhooks).
+number of parts sent; the webhook URL or bot token never appears in the
+listing, the result or the conversation. See
+[messengers.md](messengers.md#webhooks) and
+[posting to chats](messengers.md#posting-to-chats).
 
 ## Output rules
 

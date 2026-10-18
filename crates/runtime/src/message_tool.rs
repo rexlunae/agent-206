@@ -57,11 +57,11 @@ impl MessageHost {
     fn spec(destinations: Vec<String>) -> ToolSpec {
         ToolSpec {
             name: SEND.into(),
-            description: "Send a message to one of the user's webhooks, such as a team chat channel. It is posted as it is, outside this conversation, and the user approves each call. Long messages are sent in a few parts, leaving out any part that would hold only whitespace; a message too long for the webhook is refused whole.".into(),
+            description: "Send a message to one of the user's webhooks, such as a team chat channel, or to a chat the user allowed on one of their messengers (named `messenger/chat`). It is posted as it is, outside this conversation, and the user approves each call. Long messages are sent in a few parts, leaving out any part that would hold only whitespace; a message too long for the destination is refused whole.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "destination": {"type": "string", "enum": destinations, "description": "The webhook, by the name the user gave it."},
+                    "destination": {"type": "string", "enum": destinations, "description": "A webhook by the name the user gave it, or `messenger/chat` for an allowed chat of a messenger."},
                     "text": {"type": "string", "description": "The message, as plain text."}
                 },
                 "required": ["destination", "text"],
@@ -110,12 +110,7 @@ fn text<'a>(args: &'a Map<String, Value>, name: &'static str) -> Result<&'a str,
 impl ToolHost for MessageHost {
     fn list<'a>(&'a self, _scope: &'a ToolScope) -> BoxFuture<'a, ToolListing> {
         Box::pin(async move {
-            let destinations: Vec<String> = self
-                .outbox
-                .destinations()
-                .into_iter()
-                .map(|(name, _)| name)
-                .collect();
+            let destinations = self.outbox.destinations();
             ToolListing {
                 tools: if destinations.is_empty() {
                     vec![]

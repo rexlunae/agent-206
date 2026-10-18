@@ -1,6 +1,7 @@
-//! A model posts to a webhook messenger with `send_message`: only after the
-//! user approves that exact call, through the vault broker, which alone holds
-//! the webhook URL. Every identifier, text and key is generated at runtime.
+//! A model posts to a webhook or an allowed messenger chat with
+//! `send_message`: only after the user approves that exact call, through the
+//! vault broker, which alone holds the webhook URL or bot token. Every
+//! identifier, text and key is generated at runtime.
 mod support;
 
 use a206_core::*;
@@ -150,8 +151,22 @@ async fn setup(api: ProviderApi) -> Setup {
         request(&gateway, Command::PairBroker { pairing }).await,
         Reply::Ok
     );
+    let thread = conversation(&gateway, model).await;
+    Setup {
+        gateway,
+        state,
+        hooks,
+        hook,
+        key,
+        requests,
+        thread,
+    }
+}
+
+/// A conversation with `model` that permits `send_message`.
+async fn conversation(gateway: &Gateway, model: ModelKey) -> Id {
     let Reply::Thread(thread) = request(
-        &gateway,
+        gateway,
         Command::CreateThread {
             title: nonce(),
             mode: Mode::Chat,
@@ -162,7 +177,7 @@ async fn setup(api: ProviderApi) -> Setup {
         panic!("thread created");
     };
     let configured = request(
-        &gateway,
+        gateway,
         Command::ConfigureThread {
             id: thread.id,
             mode: Mode::Chat,
@@ -175,7 +190,7 @@ async fn setup(api: ProviderApi) -> Setup {
     // Allowing the tool on the conversation still leaves each call to the user.
     let tool = a206_runtime::message_tool::SEND;
     let permitted = request(
-        &gateway,
+        gateway,
         Command::SetToolPermission {
             thread: thread.id,
             tool: tool.into(),
@@ -184,15 +199,7 @@ async fn setup(api: ProviderApi) -> Setup {
     )
     .await;
     assert_eq!(permitted, Reply::Ok);
-    Setup {
-        gateway,
-        state,
-        hooks,
-        hook,
-        key,
-        requests,
-        thread: thread.id,
-    }
+    thread.id
 }
 
 #[tokio::test]
@@ -355,4 +362,147 @@ async fn a_webhook_withdrawn_mid_message_gets_no_more_of_it() {
     assert_eq!(finished(task).await.state, RunState::Complete);
     assert_eq!(hooks.received.lock().unwrap().len(), 1);
     assert!(result.contains("1 of 2 parts"), "{result}");
+}
+
+type Posted = Arc<Mutex<Vec<(String, Value)>>>;
+
+/// A Telegram Bot API stand-in: names the bot, has no updates, and records
+/// what each sendMessage carried under the path segment holding the token.
+async fn serve_bot() -> (String, Posted) {
+    use axum::routing::{any, get};
+    let posted = Posted::default();
+    let me = json!({"ok": true, "result": {"id": std::process::id(), "username": nonce()}});
+    let router =
+        Router::new()
+            .route("/{bot}/getMe", get(move || async move { Json(me) }))
+            .route(
+                "/{bot}/getUpdates",
+                any(|| async {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    Json(json!({"ok": true, "result": []}))
+                }),
+            )
+            .route(
+                "/{bot}/sendMessage",
+                post(
+                    |State(posted): State<Posted>,
+                     Path(bot): Path<String>,
+                     Json(body): Json<Value>| async move {
+                        posted.lock().unwrap().push((bot, body));
+                        Json(json!({"ok": true, "result": {"message_id": 1}}))
+                    },
+                ),
+            )
+            .with_state(posted.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    // Detached: the server lives as long as the test's runtime.
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    (origin, posted)
+}
+
+#[tokio::test]
+async fn a_model_posts_only_to_allowed_chats_of_a_running_messenger() {
+    let api = ProviderApi::OpenAi;
+    let (origin, posted) = serve_bot().await;
+    let token = format!("{}:{}", std::process::id(), nonce().replace('-', "_"));
+    let (state, credential, pairing) = broker(&origin, &token).await;
+    let gateway = Gateway::open(state.path()).unwrap();
+    let (model, mut requests) = connect(&gateway, api).await;
+    let (bot, chat, other) = (format!("t-{}", nonce()), nonce(), nonce());
+    let mut settings = gateway.snapshot().unwrap().settings;
+    settings.messengers.push(MessengerConfig {
+        enabled: true,
+        credential: Some(credential),
+        endpoint: Some(origin.clone()),
+        allowed_chats: [chat.clone()].into(),
+        ..MessengerConfig::new(bot.clone(), MessengerKind::Telegram)
+    });
+    assert_eq!(
+        request(&gateway, Command::SaveSettings(Box::new(settings))).await,
+        Reply::Ok
+    );
+    assert_eq!(
+        request(&gateway, Command::PairBroker { pairing }).await,
+        Reply::Ok
+    );
+    let thread = conversation(&gateway, model).await;
+    let tool = a206_runtime::message_tool::SEND;
+    let resolve = |asked: ApprovalRequest| Command::ResolveApproval {
+        thread,
+        approval: asked.id,
+        digest: asked.digest,
+        decision: ApprovalDecision::Approve,
+    };
+
+    // Only the allowed chat is offered.
+    let task = send(&gateway, thread);
+    let first = next_request(&mut requests).await;
+    assert!(offered(api, &first.body).contains(&tool.to_owned()));
+    let body = first.body.to_string();
+    assert!(body.contains(&format!("{bot}/{chat}")));
+    assert!(!body.contains(&other));
+    let mut seen = vec![body];
+
+    // A chat the user never allowed is refused even once the user approves.
+    let stray = Call::new(
+        tool,
+        json!({"destination": format!("{bot}/{other}"), "text": nonce()}),
+    );
+    first
+        .respond(calls_response(api, std::slice::from_ref(&stray), &nonce()))
+        .await;
+    let asked = approval(&gateway, thread).await;
+    assert_eq!(request(&gateway, resolve(asked)).await, Reply::Ok);
+    let second = next_request(&mut requests).await;
+    let refused = result_for(api, &second.body, &stray.id).unwrap();
+    assert!(
+        refused.contains("not an enabled webhook or an allowed chat"),
+        "{refused}"
+    );
+    seen.push(second.body.to_string());
+    assert!(
+        posted.lock().unwrap().is_empty(),
+        "posted to a chat not allowed"
+    );
+
+    // The allowed chat gets the approved text, and only it.
+    let text = nonce();
+    let sent = Call::new(
+        tool,
+        json!({"destination": format!("{bot}/{chat}"), "text": text}),
+    );
+    second
+        .respond(calls_response(api, std::slice::from_ref(&sent), &nonce()))
+        .await;
+    let asked = approval(&gateway, thread).await;
+    assert!(asked.arguments.contains(&text));
+    assert_eq!(request(&gateway, resolve(asked)).await, Reply::Ok);
+    let third = next_request(&mut requests).await;
+    let result = result_for(api, &third.body, &sent.id).unwrap();
+    assert!(result.contains("\"parts\":1"), "{result}");
+    seen.push(third.body.to_string());
+    third.respond(text_response(api, &nonce())).await;
+    assert_eq!(finished(task).await.state, RunState::Complete);
+    let delivered = posted.lock().unwrap().clone();
+    let [(path, body)] = delivered.as_slice() else {
+        panic!("one message: {delivered:?}");
+    };
+    assert_eq!(path, &format!("bot{token}"));
+    assert_eq!(body["chat_id"], chat);
+    assert_eq!(body["text"], text);
+    for body in &seen {
+        assert!(!body.contains(&token));
+    }
+
+    // Once the user disconnects the messenger, its chats are not offered.
+    assert_eq!(
+        request(&gateway, Command::DisconnectMessenger { name: bot.clone() }).await,
+        Reply::Ok
+    );
+    let task = send(&gateway, thread);
+    let next = next_request(&mut requests).await;
+    assert!(!offered(api, &next.body).contains(&tool.to_owned()));
+    next.respond(text_response(api, &nonce())).await;
+    assert_eq!(finished(task).await.state, RunState::Complete);
 }

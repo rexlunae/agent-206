@@ -14,7 +14,7 @@ const SERVICE: &str = "Telegram";
 /// Seconds Telegram holds a poll open; well inside the broker's timeout.
 const POLL_SECONDS: u32 = 25;
 /// Telegram's limit for one message, in UTF-16 code units.
-const MAX_MESSAGE_UNITS: usize = 4096;
+pub(super) const MAX_MESSAGE_UNITS: usize = 4096;
 
 pub(crate) struct Telegram {
     api: Api,

@@ -37,7 +37,7 @@ const CHAT_PAGE: &str = "100";
 /// next.
 const MAX_MESSAGE_PAGES: usize = 8;
 /// Parts a long reply is split into, in UTF-16 code units.
-const MAX_MESSAGE: usize = 4000;
+pub(super) const MAX_MESSAGE: usize = 4000;
 const MAX_PARTS: usize = 8;
 
 pub(crate) struct Beeper {

@@ -368,37 +368,60 @@ impl Gateway {
     }
 }
 impl Outbox {
-    /// The webhooks a model may post to: enabled and not disconnected by the
-    /// user, by name, with their format.
-    pub fn destinations(&self) -> Vec<(String, WebhookFormat)> {
-        self.base
-            .messengers
-            .borrow()
-            .iter()
-            .filter(|entry| entry.run && entry.config.kind.is_send_only())
-            .map(|entry| (entry.config.name.clone(), entry.config.format))
-            .collect()
+    /// Where a model may post: each webhook by its name, and each allowed
+    /// chat of a messenger that can post outside a reply as `name/chat`.
+    /// Only messengers that are enabled and not disconnected by the user
+    /// are listed. Messenger names never contain `/`.
+    pub fn destinations(&self) -> Vec<String> {
+        let mut destinations = vec![];
+        for entry in self.base.messengers.borrow().iter().filter(|e| e.run) {
+            let config = &entry.config;
+            if config.kind.is_send_only() {
+                destinations.push(config.name.clone());
+            } else if crate::messengers::chat_part_limit(config.kind).is_some() {
+                destinations.extend(
+                    config
+                        .allowed_chats
+                        .iter()
+                        .map(|chat| format!("{}/{chat}", config.name)),
+                );
+            }
+        }
+        destinations
     }
 
-    /// Send `text` to the webhook `name`; the number of parts sent. The
-    /// messenger's status shows the outcome, so a failure is also visible on
-    /// the Messengers page.
-    pub async fn send(&self, name: &str, text: &str) -> Result<usize, MessengerError> {
+    /// Send `text` to `destination`, one of [`Self::destinations`]; the
+    /// number of parts sent. A failure is also recorded in the messenger's
+    /// status, so it is visible on the Messengers page.
+    pub async fn send(&self, destination: &str, text: &str) -> Result<usize, MessengerError> {
+        let (name, chat) = match destination.split_once('/') {
+            Some((name, chat)) => (name, Some(chat)),
+            None => (destination, None),
+        };
         let config = self
             .base
             .messengers
             .borrow()
             .iter()
             .find(|entry| {
-                entry.run && entry.config.kind.is_send_only() && entry.config.name == name
+                let config = &entry.config;
+                entry.run
+                    && config.name == name
+                    && match chat {
+                        None => config.kind.is_send_only(),
+                        Some(chat) => {
+                            crate::messengers::chat_part_limit(config.kind).is_some()
+                                && config.allowed_chats.contains(chat)
+                        }
+                    }
             })
             .map(|entry| entry.config.clone())
-            .ok_or_else(|| MessengerError::NoWebhook {
-                name: name.to_owned(),
+            .ok_or_else(|| MessengerError::NoDestination {
+                destination: destination.to_owned(),
             })?;
         let pairing = Host::pairing(&self.base).ok_or(MessengerError::NoPairing)?;
-        // The user may withdraw the webhook while a long message is going
-        // out; the parts still to send then stay unsent.
+        // The user may withdraw the messenger, or the chat, while a long
+        // message is going out; the parts still to send then stay unsent.
         let current = self.base.messengers.subscribe();
         let withdrawn = || {
             !current
@@ -406,19 +429,21 @@ impl Outbox {
                 .iter()
                 .any(|entry| entry.run && entry.config == config)
         };
-        let result = crate::messengers::webhook::send(
-            Host::root(&self.base),
-            pairing,
-            &config,
-            text,
-            withdrawn,
-        )
-        .await;
+        let root = Host::root(&self.base);
+        let result = match chat {
+            None => crate::messengers::webhook::send(root, pairing, &config, text, withdrawn).await,
+            Some(chat) => {
+                crate::messengers::post(root, pairing, &config, chat, text, withdrawn).await
+            }
+        };
         match &result {
-            Ok(_) => self.base.update(name, |status| {
+            // A webhook's only state is whether its last message went out;
+            // a chat messenger's state is its connection, left as it is.
+            Ok(_) if chat.is_none() => self.base.update(name, |status| {
                 status.state = MessengerState::Ready;
                 status.failure = None;
             }),
+            Ok(_) => {}
             Err(error) => {
                 let report = crate::error::handle("messenger", error);
                 self.base
