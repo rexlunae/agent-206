@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/core", "crates/audit", "crates/protocol", "crates/vault", "crates/broker", "crates/import", "crates/extension-abi", "crates/extension-sdk", "crates/extensions", "crates/sandbox", "crates/mcp", "crates/skills", "crates/output-rules", "crates/leak-scan", "crates/injection-scan", "plugins/workspace", "plugins/git", "plugins/skills", "plugins/web", "plugins/memory", "crates/runtime", "crates/ui", "crates/app"]
+members = ["crates/vault-channel", "crates/core", "crates/audit", "crates/protocol", "crates/vault", "crates/broker", "crates/import", "crates/extension-abi", "crates/extension-sdk", "crates/extensions", "crates/sandbox", "crates/mcp", "crates/skills", "crates/output-rules", "crates/leak-scan", "crates/injection-scan", "plugins/workspace", "plugins/git", "plugins/skills", "plugins/web", "plugins/memory", "crates/runtime", "crates/ui", "crates/app"]
 default-members = ["crates/app"]
 resolver = "3"
 
@@ -10,6 +10,7 @@ rust-version = "1.97"
 license = "MIT"
 
 [workspace.dependencies]
+a206-vault-channel = { path = "crates/vault-channel" }
 a206-core = { path = "crates/core" }
 a206-audit = { path = "crates/audit" }
 a206-protocol = { path = "crates/protocol" }
@@ -45,7 +46,7 @@ sha2 = "0.10"
 tempfile = "3"
 dioxus = { version = "=0.7.9", default-features = false, features = ["lib"] }
 dioxus-ssr = "=0.7.9"
-fc-dioxus = { git = "https://github.com/rexlunae/fc-dioxus", rev = "1b5eee0a54a13b19ac02f3c93d43c65d8f662a2e" }
+fc-dioxus = { git = "https://github.com/rexlunae/fc-dioxus", rev = "8349dc00bfe4e4831857239c9208d0e3e3dbc7a8" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

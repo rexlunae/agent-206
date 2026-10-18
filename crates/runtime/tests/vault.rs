@@ -164,3 +164,67 @@ async fn an_incompatible_broker_is_reported_with_its_recovery() {
     assert!(report.causes().next().is_some(), "{report:?}");
     old.await.unwrap();
 }
+
+#[tokio::test]
+async fn legacy_enrollment_cancel_closes_without_sending_an_unknown_opcode() {
+    for version in [7, 8, 9] {
+        legacy_cancel(version).await;
+    }
+}
+
+async fn legacy_cancel(version: u16) {
+    use a206_broker::{InvalidRequest, Role};
+    use a206_protocol::{Request as Frame, Response};
+    use a206_runtime::transport::{read_frame, write_frame};
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("vault")).unwrap();
+    let listener = tokio::net::UnixListener::bind(a206_broker::socket_path(dir.path())).unwrap();
+    let broker = tokio::spawn(async move {
+        for _ in 0..2 {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            for requested in (version..=a206_broker::BROKER_VERSION).rev() {
+                let first = read_frame::<Frame<Request>>(&mut socket)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(matches!(
+                    first.body,
+                    Request::Hello {
+                        role: Role::User,
+                        version: actual
+                    } if actual == requested
+                ));
+                write_frame(
+                    &mut socket,
+                    &Response {
+                        id: first.id,
+                        body: if requested == version {
+                            Reply::Ok
+                        } else {
+                            Reply::Error(BrokerError::Invalid(InvalidRequest::UnsupportedVersion))
+                        },
+                    },
+                )
+                .await
+                .unwrap();
+            }
+            assert!(
+                read_frame::<Frame<Request>>(&mut socket)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    });
+    let session = Session::open(dir.path().to_owned());
+    for _ in 0..2 {
+        assert!(matches!(
+            session.call(Request::CancelTotp).await.unwrap(),
+            Reply::Ok
+        ));
+    }
+    tokio::time::timeout(Duration::from_secs(5), broker)
+        .await
+        .unwrap()
+        .unwrap();
+}

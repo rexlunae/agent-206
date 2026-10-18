@@ -23,6 +23,7 @@ mod skills;
 mod slash;
 mod subagents;
 mod tools;
+mod totp_enrollment;
 mod welcome;
 #[cfg(target_arch = "wasm32")]
 use a206_core::Ignore;
@@ -31,8 +32,25 @@ mod setup;
 mod sign_in;
 #[cfg(target_arch = "wasm32")]
 use sign_in::SignOut;
-#[cfg(not(target_arch = "wasm32"))]
 mod vault;
+mod vault_backend;
+#[cfg(not(target_arch = "wasm32"))]
+static TERMINAL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Select the text alternative for a renderer without SVG support.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn configure_terminal() {
+    TERMINAL.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+fn terminal_mode() -> bool {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        TERMINAL.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        false
+    }
+}
 #[cfg(target_arch = "wasm32")]
 mod web_vault;
 use a206_core::{

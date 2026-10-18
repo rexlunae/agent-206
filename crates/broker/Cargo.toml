@@ -5,8 +5,9 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 [dependencies]
-a206-core.workspace = true
+a206-vault-channel.workspace = true
 a206-protocol.workspace = true
+a206-core.workspace = true
 a206-vault.workspace = true
 serde.workspace = true
 serde_bytes = "0.11"

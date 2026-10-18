@@ -8,6 +8,9 @@ license.workspace = true
 default = []
 web = ["dioxus/web", "fc-dioxus/web"]
 [dependencies]
+a206-vault-channel.workspace = true
+zeroize.workspace = true
+qrcode = { version = "0.14", default-features = false }
 a206-core.workspace = true
 a206-audit.workspace = true
 a206-protocol.workspace = true
@@ -32,6 +35,7 @@ wasm-bindgen = "0.2"
 web-sys = { version = "0.3", features = ["Window", "Location", "Storage", "History"] }
 reqwest = { version = "0.12", default-features = false }
 [dev-dependencies]
+rqrr = { version = "0.11", default-features = false }
 dioxus-ssr.workspace = true
 [lints]
 workspace = true

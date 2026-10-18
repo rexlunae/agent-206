@@ -53,3 +53,8 @@ RustyClaw aliases should be added only when semantics match. Never translate its
 WebSocket endpoint flags into an unverified SSH connection, import static curated
 model defaults, activate foreign hooks/plugins, or claim unsupported setup/auth
 commands work. Test actual CLI workflows and policy denials with the real binary.
+
+`agent206 [--data-dir PATH] vault channel-key` prints the current broker's public
+identity key for the web Security page. Verify it through a trusted terminal
+before entering a vault password in the browser. It is public and changes when
+the broker restarts. See [web vault setup](web-vault-setup.md).

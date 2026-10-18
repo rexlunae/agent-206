@@ -566,6 +566,7 @@ mod native {
                 #[cfg(feature = "tui")]
                 {
                     a206_ui::configure(root, args.remote);
+                    a206_ui::configure_terminal();
                     dioxus_tui::launch(a206_ui::App)
                 }
                 #[cfg(not(feature = "tui"))]

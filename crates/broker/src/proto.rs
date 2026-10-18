@@ -15,13 +15,14 @@ use zeroize::Zeroizing;
 /// Version 4 adds [`Request::ProviderStream`], version 5
 /// [`Request::ImportVault`], version 6 [`AuthScheme::TelegramBot`] and
 /// version 7 [`HttpMethod::Put`], version 8 [`Request::SocketOpen`] with
-/// [`AuthScheme::DiscordBot`] and version 9 [`SocketScheme::IrcSasl`]. A broker accepts greetings from
+/// [`AuthScheme::DiscordBot`], version 9 [`SocketScheme::IrcSasl`], and version
+/// 10 encrypted setup channels and TOTP cancellation. A broker accepts greetings from
 /// [`MIN_BROKER_VERSION`] up to this version, and a client falls back to the
 /// newest version an older broker accepts (see `Client::version`), so streams
 /// are only requested from brokers that understand them.
-pub const BROKER_VERSION: u16 = 9;
+pub const BROKER_VERSION: u16 = 10;
 /// The oldest protocol version this broker still serves and this client still
-/// speaks. Versions 3 to 9 differ only by the requests and schemes they add.
+/// speaks. Versions 3 to 10 differ only by the requests, roles and schemes they add.
 pub const MIN_BROKER_VERSION: u16 = 3;
 /// The first version that serves [`Request::ProviderStream`].
 pub const STREAM_VERSION: u16 = 4;
@@ -37,6 +38,8 @@ pub const PUT_VERSION: u16 = 7;
 pub const SOCKET_VERSION: u16 = 8;
 /// The first version that opens IRC sessions ([`SocketScheme::IrcSasl`]).
 pub const IRC_VERSION: u16 = 9;
+/// First version with authenticated encrypted setup and explicit TOTP cancellation.
+pub const SETUP_CHANNEL_VERSION: u16 = 10;
 /// Longest IRC line the gateway may send, without its CR LF (RFC 1459's
 /// 512 bytes, less the line ending).
 pub const MAX_IRC_LINE: usize = 510;
@@ -90,6 +93,8 @@ impl<'de> Deserialize<'de> for WireSecret {
 pub enum Role {
     User,
     Gateway,
+    /// Carries only authenticated ciphertext for the browser setup surface.
+    Relay,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -273,6 +278,15 @@ pub enum Request {
         version: u16,
     },
     Status,
+    ChannelKey,
+    OpenChannel {
+        #[serde(with = "serde_bytes")]
+        first: Vec<u8>,
+    },
+    ChannelMessage {
+        #[serde(with = "serde_bytes")]
+        bytes: Vec<u8>,
+    },
     /// Adopt an existing password-protected SecureStore vault (such as
     /// RustyClaw's) as this profile's vault when none exists yet. The broker
     /// copies the encrypted file and opens only its copy; the source is never
@@ -303,6 +317,7 @@ pub enum Request {
     ConfirmTotp {
         code: String,
     },
+    CancelTotp,
     /// Needs both factors: the vault password and a current code.
     RemoveTotp {
         password: WireSecret,
@@ -377,7 +392,7 @@ pub struct BrokerStatus {
     pub totp_enrolled: Option<bool>,
     pub agent_access: Option<bool>,
     pub step_up_active: bool,
-    /// Whether a gateway pairing is current for this unlock; unknown while
+    /// Whether a gateway has claimed a current pairing for this unlock; unknown while
     /// locked or from an older broker. Locking voids every pairing.
     #[serde(default)]
     pub gateway_paired: Option<bool>,
@@ -387,6 +402,8 @@ pub struct BrokerStatus {
 /// is flattened to a string before it reaches the client or tracing.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
 pub enum BrokerError {
+    #[error("encrypted vault channel failed")]
+    Channel(#[source] a206_core::ErrorReport),
     #[error("the vault is locked")]
     Locked,
     #[error("no vault exists yet; create one first")]
@@ -506,6 +523,9 @@ pub enum UpstreamFailure {
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Reply {
     Ok,
+    ChannelKey(Vec<u8>),
+    ChannelOpened(#[serde(with = "serde_bytes")] Vec<u8>),
+    ChannelMessage(#[serde(with = "serde_bytes")] Vec<u8>),
     Status(BrokerStatus),
     TotpEnrollment {
         otpauth_url: WireSecret,
