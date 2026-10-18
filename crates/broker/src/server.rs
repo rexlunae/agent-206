@@ -125,6 +125,11 @@ struct Outbound {
     /// Ask for a JSON response (`Accept: application/json`).
     accept_json: bool,
     body: Option<Vec<u8>>,
+    /// Sent as the body's `Content-Type`.
+    content_type: &'static str,
+    /// For a git call, the `Content-Type` a successful response must have;
+    /// it is also sent as `Accept`.
+    expect: Option<&'static str>,
     cancel: CancellationToken,
     /// Relay the body as it arrives (`Request::ProviderStream`).
     stream: bool,
@@ -357,7 +362,8 @@ fn handle(shared: &Shared, session: &mut Session, request: Request) -> Handled {
             | Request::Provider(_)
             | Request::ProviderStream(_)
             | Request::SocketOpen(_)
-            | Request::SocketSend { .. },
+            | Request::SocketSend { .. }
+            | Request::GitReceivePack(_),
         ) => {}
         (Role::Gateway, _)
         | (
@@ -366,7 +372,8 @@ fn handle(shared: &Shared, session: &mut Session, request: Request) -> Handled {
             | Request::Provider(_)
             | Request::ProviderStream(_)
             | Request::SocketOpen(_)
-            | Request::SocketSend { .. },
+            | Request::SocketSend { .. }
+            | Request::GitReceivePack(_),
         ) => {
             return Err(BrokerError::Forbidden);
         }
@@ -771,6 +778,7 @@ fn handle(shared: &Shared, session: &mut Session, request: Request) -> Handled {
         Request::SocketOpen(call) => socket(shared, session, call),
         // A connection carrying a socket never reaches here with one.
         Request::SocketSend { .. } => Err(BrokerError::Invalid(InvalidRequest::NoSocket)),
+        Request::GitReceivePack(call) => git(shared, session, call),
     }
 }
 
@@ -889,8 +897,80 @@ fn provider(shared: &Shared, session: &Session, call: ProviderCall, stream: bool
         anthropic_version: call.anthropic_version,
         accept_json: call.auth == AuthScheme::SubscriptionToken,
         body: call.body,
+        content_type: "application/json",
+        expect: None,
         cancel,
         stream,
+    })))
+}
+
+/// Validate one round of a git push and attach the token, as HTTP Basic
+/// authentication, for the repository's exact origin.
+fn git(shared: &Shared, session: &Session, call: GitCall) -> Handled {
+    use base64::Engine as _;
+    let (vault, epoch) = paired(shared, session)?;
+    let invalid = || BrokerError::Invalid(InvalidRequest::GitRepository);
+    let mut url = request_url(&call.repository).map_err(|_| invalid())?;
+    if url.query().is_some() || !url.username().is_empty() || url.password().is_some() {
+        return Err(invalid());
+    }
+    let username = &call.username;
+    if username.is_empty()
+        || username.chars().count() > 256
+        || username.chars().any(|c| c == ':' || c.is_control())
+    {
+        return Err(BrokerError::Invalid(InvalidRequest::GitUsername));
+    }
+    if call
+        .request
+        .as_ref()
+        .is_some_and(|b| b.len() > MAX_PROVIDER_BODY)
+    {
+        return Err(BrokerError::Invalid(InvalidRequest::ProviderBody));
+    }
+    let origin = url.origin().ascii_serialization();
+    let cancel = shared.in_flight(epoch);
+    let value = vault
+        .use_for_destination(&call.credential, &origin, |s| {
+            let pair = Zeroizing::new(s.expose(|token| format!("{username}:{token}")));
+            Zeroizing::new(format!(
+                "Basic {}",
+                base64::engine::general_purpose::STANDARD.encode(pair.as_bytes())
+            ))
+        })
+        .map_err(vault_error)?;
+    drop(vault);
+    let base = url.path().trim_end_matches('/').to_owned();
+    let (method, expect, content_type) = match call.request {
+        None => {
+            url.set_path(&format!("{base}/info/refs"));
+            url.set_query(Some("service=git-receive-pack"));
+            (
+                HttpMethod::Get,
+                "application/x-git-receive-pack-advertisement",
+                "application/json",
+            )
+        }
+        Some(_) => {
+            url.set_path(&format!("{base}/git-receive-pack"));
+            (
+                HttpMethod::Post,
+                "application/x-git-receive-pack-result",
+                "application/x-git-receive-pack-request",
+            )
+        }
+    };
+    Ok(Outcome::Send(Box::new(Outbound {
+        method,
+        url,
+        header: Some(("authorization", value)),
+        anthropic_version: None,
+        accept_json: false,
+        body: call.request,
+        content_type,
+        expect: Some(expect),
+        cancel,
+        stream: false,
     })))
 }
 
@@ -923,6 +1003,9 @@ fn webhook_url(called: &url::Url, stored: &str) -> Result<url::Url, BrokerError>
     }
     Ok(url)
 }
+
+/// The user agent of git calls.
+const GIT_AGENT: &str = concat!("git/agent206-", env!("CARGO_PKG_VERSION"));
 
 fn http_client() -> reqwest::ClientBuilder {
     reqwest::Client::builder()
@@ -985,15 +1068,22 @@ async fn request(http: &reqwest::Client, out: Outbound) -> Result<reqwest::Respo
     if out.accept_json {
         request = request.header(reqwest::header::ACCEPT, "application/json");
     }
+    if let Some(expect) = out.expect {
+        // Some forges serve git only to clients that name themselves git.
+        request = request
+            .header(reqwest::header::ACCEPT, expect)
+            .header(reqwest::header::USER_AGENT, GIT_AGENT);
+    }
     if let Some(body) = out.body {
         request = request
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .header(reqwest::header::CONTENT_TYPE, out.content_type)
             .body(body);
     }
     request.send().await.map_err(upstream)
 }
 
 async fn transmit(http: &reqwest::Client, out: Outbound) -> Result<Reply, BrokerError> {
+    let expect = out.expect;
     let response = request(http, out).await?;
     let status = response.status().as_u16();
     // Never relay upstream error bodies: they can echo credentials or prompts.
@@ -1002,6 +1092,18 @@ async fn transmit(http: &reqwest::Client, out: Outbound) -> Result<Reply, Broker
             status,
             body: vec![],
         });
+    }
+    // A sign-in page or a dumb HTTP server is not git's answer.
+    if let Some(expect) = expect {
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.split(';').next())
+            .map(str::trim);
+        if content_type != Some(expect) {
+            return Err(BrokerError::Upstream(UpstreamFailure::NotGit));
+        }
     }
     let mut stream = response.bytes_stream();
     let mut body = vec![];

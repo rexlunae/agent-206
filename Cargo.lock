@@ -96,6 +96,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "a206-git-push"
+version = "0.1.0"
+dependencies = [
+ "gix",
+ "gix-pack",
+ "tempfile",
+ "thiserror 2.0.21",
+ "uuid",
+]
+
+[[package]]
 name = "a206-import"
 version = "0.1.0"
 dependencies = [
@@ -212,6 +223,7 @@ dependencies = [
  "a206-broker",
  "a206-core",
  "a206-extensions",
+ "a206-git-push",
  "a206-import",
  "a206-injection-scan",
  "a206-leak-scan",
@@ -234,6 +246,7 @@ dependencies = [
  "fs2",
  "futures-util",
  "gix",
+ "gix-pack",
  "globset",
  "http",
  "jiff",
@@ -4423,10 +4436,12 @@ dependencies = [
  "gix-object",
  "gix-parallel",
  "gix-path",
+ "gix-tempfile",
  "gix-trace",
  "gix-utils",
  "gix-zlib",
  "memmap2",
+ "parking_lot",
  "smallvec",
 ]
 

@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/vault-channel", "crates/core", "crates/audit", "crates/protocol", "crates/vault", "crates/broker", "crates/import", "crates/extension-abi", "crates/extension-sdk", "crates/extensions", "crates/sandbox", "crates/mcp", "crates/skills", "crates/output-rules", "crates/leak-scan", "crates/injection-scan", "plugins/workspace", "plugins/git", "plugins/skills", "plugins/web", "plugins/memory", "crates/runtime", "crates/ui", "crates/app"]
+members = ["crates/vault-channel", "crates/core", "crates/audit", "crates/protocol", "crates/vault", "crates/broker", "crates/import", "crates/extension-abi", "crates/extension-sdk", "crates/extensions", "crates/sandbox", "crates/mcp", "crates/skills", "crates/output-rules", "crates/leak-scan", "crates/injection-scan", "crates/git-push", "plugins/workspace", "plugins/git", "plugins/skills", "plugins/web", "plugins/memory", "crates/runtime", "crates/ui", "crates/app"]
 default-members = ["crates/app"]
 resolver = "3"
 
@@ -25,6 +25,7 @@ a206-skills = { path = "crates/skills" }
 a206-output-rules = { path = "crates/output-rules" }
 a206-leak-scan = { path = "crates/leak-scan" }
 a206-injection-scan = { path = "crates/injection-scan" }
+a206-git-push = { path = "crates/git-push" }
 a206-runtime = { path = "crates/runtime" }
 a206-ui = { path = "crates/ui" }
 serde = { version = "1", features = ["derive"] }

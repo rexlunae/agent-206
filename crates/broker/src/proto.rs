@@ -18,16 +18,16 @@ use zeroize::Zeroizing;
 /// version 7 [`HttpMethod::Put`], version 8 [`Request::SocketOpen`] with
 /// [`AuthScheme::DiscordBot`], version 9 [`SocketScheme::IrcSasl`], and version
 /// 10 encrypted setup channels and TOTP cancellation, 11 reviewed vault
-/// imports, 12 [`AuthScheme::WebhookUrl`] and 13 [`AuthScheme::SubscriptionToken`].
-/// A broker accepts greetings from
+/// imports, 12 [`AuthScheme::WebhookUrl`], 13 [`Request::GitReceivePack`] and
+/// 14 [`AuthScheme::SubscriptionToken`]. A broker accepts greetings from
 /// [`MIN_BROKER_VERSION`] up to this version, and a client falls back to the
 /// newest version an older broker accepts (see `Client::version`), so streams
 /// are only requested from brokers that understand them.
-pub const BROKER_VERSION: u16 = 13;
+pub const BROKER_VERSION: u16 = 14;
 /// First version with connection-held source reviews and guarded vault import.
 pub use a206_vault_channel::REVIEWED_IMPORT_BROKER_VERSION as REVIEWED_IMPORT_VERSION;
 /// The oldest protocol version this broker still serves and this client still
-/// speaks. Versions 3 to 13 differ only by the requests, roles and schemes they add.
+/// speaks. Versions 3 to 14 differ only by the requests, roles and schemes they add.
 pub const MIN_BROKER_VERSION: u16 = 3;
 /// The first version that serves [`Request::ProviderStream`].
 pub const STREAM_VERSION: u16 = 4;
@@ -48,9 +48,12 @@ pub const SETUP_CHANNEL_VERSION: u16 = 10;
 /// The first version that sends to webhook URLs held in the vault
 /// ([`AuthScheme::WebhookUrl`]).
 pub const WEBHOOK_VERSION: u16 = 12;
+/// The first version that pushes over git's smart HTTP protocol
+/// ([`Request::GitReceivePack`]).
+pub const GIT_VERSION: u16 = 13;
 /// The first version that attaches web search keys
 /// ([`AuthScheme::SubscriptionToken`]).
-pub const SEARCH_VERSION: u16 = 13;
+pub const SEARCH_VERSION: u16 = 14;
 /// Longest IRC line the gateway may send, without its CR LF (RFC 1459's
 /// 512 bytes, less the line ending).
 pub const MAX_IRC_LINE: usize = 510;
@@ -290,6 +293,28 @@ pub struct ProviderCall {
     pub body: Option<Vec<u8>>,
 }
 
+/// One round of a push over git's smart HTTP protocol, to the
+/// `git-receive-pack` service of a repository. The credential, a token, is
+/// sent as the password of HTTP Basic authentication; forges each expect a
+/// particular username with it, which is not secret. Since [`GIT_VERSION`].
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GitCall {
+    pub credential: String,
+    pub username: String,
+    /// The repository URL as a git remote names it: HTTPS (or loopback
+    /// HTTP), without credentials, a query or a fragment. The credential
+    /// must be bound to its origin.
+    pub repository: String,
+    /// `None` asks for the repository's references
+    /// (`GET <repository>/info/refs?service=git-receive-pack`); `Some`
+    /// sends the update commands and pack
+    /// (`POST <repository>/git-receive-pack`). A successful reply is the
+    /// service's own answer; any other content type is refused as
+    /// [`UpstreamFailure::NotGit`].
+    #[serde(with = "serde_bytes")]
+    pub request: Option<Vec<u8>>,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Request {
     ReviewVaultImport {
@@ -415,6 +440,9 @@ pub enum Request {
     SocketSend {
         text: String,
     },
+    /// Gateway role, version 13: one round of a git push. Answered with
+    /// `Provider`, whose body is empty for an unsuccessful status.
+    GitReceivePack(GitCall),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -524,6 +552,12 @@ pub enum InvalidRequest {
     #[error("a webhook call names only the webhook's origin, without a path or query")]
     WebhookPath,
     #[error(
+        "git repositories are HTTPS (or loopback HTTP) URLs without credentials, a query or a fragment"
+    )]
+    GitRepository,
+    #[error("a git username must be 1 to 256 characters without a colon or control characters")]
+    GitUsername,
+    #[error(
         "the vault to import must be an absolute path to a readable regular file of at most 16 MiB"
     )]
     ImportSource,
@@ -561,6 +595,8 @@ pub enum UpstreamFailure {
     SocketUrl,
     #[error("the service broke its socket protocol")]
     SocketProtocol,
+    #[error("the server did not answer as a git smart HTTP service")]
+    NotGit,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

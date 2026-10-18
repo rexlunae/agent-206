@@ -468,12 +468,17 @@ ceiling: Some(thread grant) })` after the conversation permits the tool.
 Provider JSON arguments convert kind for kind to `a206_core::extension::Args`.
 Tool text is extension output, never instructions.
 
+Pushing is not a host call. It is the native `git_push` tool
+([run-engine.md](run-engine.md#pushing-git-branches-git_push)), because it needs
+the vault broker, an approval of each call and more time than an extension
+invocation has.
+
 ## Planned
 
 | Domain | Operations | Authority |
 | --- | --- | --- |
 | workspace | Multi-hunk patch | `write_workspace` |
-| git | Push, switching with changes carried over, creating symbolic links | `git_write` (push also needs a forge credential handle) |
+| git | Switching with changes carried over, creating symbolic links | `git_write` |
 | forge | PRs, reviews, checks, logs | adapter-specific scoped credential handle |
 | network | Requests other than `GET`, headers, brokered credentials | `network` + destination + secret handle |
 | downloads | Enqueue, cancel, subscribe | destination and origin grants |

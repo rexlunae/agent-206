@@ -14,6 +14,7 @@ pub mod extension_host;
 pub mod extension_list_tool;
 pub mod extension_tools;
 pub mod gateway;
+pub mod git_push;
 pub mod images;
 pub mod imports;
 pub mod instructions;
