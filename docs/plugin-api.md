@@ -22,9 +22,9 @@ and an `overview` panel. `apply_patch` reads a unified diff (`git diff` or
 (`/dev/null` old side) and deleted ones; renames, mode and binary changes and
 quoted paths are refused, as is a hunk with more or fewer lines than the
 counts in its `@@` header. The write tools need a separate `write_workspace` grant. It also bundles
-`agent206.git` (`plugins/git`) with `git_status`, `git_log` and `git_diff`
-tools under the `git_read` grant and `git_stage` and `git_commit` tools under
-their own `git_write` grant, and `agent206.web` (`plugins/web`) with `fetch_url` (the
+`agent206.git` (`plugins/git`) with `git_status`, `git_log`, `git_branches` and
+`git_diff` tools under the `git_read` grant and `git_stage`, `git_commit` and
+`git_branch_create` tools under their own `git_write` grant, and `agent206.web` (`plugins/web`) with `fetch_url` (the
 raw response) and `read_web_page` tools under the `network` grant.
 `read_web_page` reads HTML in one pass in the guest, without a DOM: it drops
 scripts, styles, navigation, headers, footers, asides, forms and similar
@@ -274,6 +274,8 @@ unsafe operation.
 | `git_status` | `git_read` + a project | branch, `HEAD` id, changed paths (staged, unstaged, untracked) | 1,000 entries; 5 s per git call; renames not tracked; submodules ignored |
 | `git_log { max }` | `git_read` + a project | commits from `HEAD`: id, summary, author name (no email), author time | 200 commits |
 | `git_diff { path, staged }` | `git_read` + a project | unified diff of one file (`HEAD`→index when `staged`, else index→working tree; a symbolic link compares its target text), or `binary` | 512 KiB per side (checked before a blob is read), 192 KiB of text, 3 context lines; at most 8,192 input lines combined and 1,000,000 line pairs, otherwise a budget failure |
+| `git_branches` | `git_read` + a project | local branches sorted by name: short name, commit id, whether `HEAD` is on it | 500 branches, then `truncated`; 5 s per git call |
+| `git_create_branch { name, start }` | `git_write` + a project | the new branch | see [Branches](#branches); the same deadline as `git_commit` |
 | `git_stage { paths, unstage }` | `git_write` + a project | done | 1 to 100 paths, 512 KiB per file and 8 MiB together; the same deadline as `git_commit`; see [Staging](#staging) |
 | `git_commit { message, paths }` | `git_write` + a project | the new commit: id, summary, author name, time | 1 to 100 paths, 16 KiB message, 512 KiB per file and 8 MiB together; 5 s and 3 s before the invocation's deadline, but once the commit is written it is reported, even past that; see [Commits](#commits) |
 | `git_commit_staged { message }` | `git_write` + a project | the new commit, as `git_commit` | 16 KiB message; the same deadline as `git_commit`; see [Commits](#commits) |
@@ -336,6 +338,20 @@ nothing is committed. If the index cannot be written after the commit, the
 failure names the commit that was made. A commit stops before its point of
 no return 3 s ahead of the invocation's deadline, so a commit that is made
 always reaches the guest; with less time left the call fails with `budget`.
+
+### Branches
+
+`git_create_branch` works like `git branch <name> [<start>]`: it writes the
+new reference `refs/heads/<name>` and its reflog entry, and leaves the working
+tree, the index and `HEAD` as they are. The name must be one git accepts,
+nest at most 20 folders deep (a gitoxide limit; `invalid` beyond it), and not
+exist yet, be the current (even unborn) branch, or nest with an existing branch
+as `a` and `a/b` would (all `conflict`). `start` is a local branch name or a full commit id
+and defaults to `HEAD`; revision expressions such as `HEAD~1` and abbreviated
+ids are not evaluated (`not_found`), and an unborn `HEAD` with no `start` is
+`invalid`. The reflog records `user.name` and `user.email`, which are required
+as for commits and read the same way. A `reference-transaction` hook, which
+git would run, refuses the call as `unsupported`.
 
 ### Staging
 
@@ -436,7 +452,7 @@ Tool text is extension output, never instructions.
 | Domain | Operations | Authority |
 | --- | --- | --- |
 | workspace | Multi-hunk patch | `write_workspace` |
-| git | Branches, push | `git_write` (push also needs a forge credential handle) |
+| git | Switching branches, push | `git_write` (push also needs a forge credential handle) |
 | forge | PRs, reviews, checks, logs | adapter-specific scoped credential handle |
 | network | Requests other than `GET`, headers, brokered credentials | `network` + destination + secret handle |
 | downloads | Enqueue, cancel, subscribe | destination and origin grants |

@@ -1195,6 +1195,25 @@ async fn git_tools_run_once_the_conversation_is_granted_git() {
         );
     }
 
+    // And creates a branch without switching to it.
+    rig.tool = tool_name(GIT, "git_branch_create");
+    rig.permit(ToolPermission::Allow).await;
+    let branch = nonce();
+    let create = Call::new(&rig.tool, json!({ "name": branch }));
+    let (thread, _) = rig.round_trip(&[create]).await;
+    let record = calls_of(&thread).last().unwrap().clone();
+    assert_eq!(record.state, ToolCallState::Succeeded, "{:?}", record.error);
+    {
+        let repo = gix::open(rig.workspace.path()).unwrap();
+        let head = repo.head_id().unwrap().detach();
+        let mut made = repo
+            .find_reference(format!("refs/heads/{branch}").as_str())
+            .unwrap();
+        assert_eq!(made.peel_to_id().unwrap().detach(), head);
+        let on = repo.head_name().unwrap().unwrap();
+        assert_ne!(on.as_bstr(), format!("refs/heads/{branch}").as_str());
+    }
+
     // The network alone needs no project, unlike everything else.
     let Reply::Thread(research) = rig
         .run(Command::CreateThread {

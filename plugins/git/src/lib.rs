@@ -62,6 +62,31 @@ impl Extension for Git {
                         .join("\n")
                 }
             }
+            "git_branches" => {
+                let listing = host::git_branches()?;
+                let mut lines: Vec<String> = listing
+                    .branches
+                    .iter()
+                    .map(|b| {
+                        let mark = if b.current { "*" } else { " " };
+                        format!("{mark} {} {}", b.name, short(&b.commit))
+                    })
+                    .collect();
+                if lines.is_empty() {
+                    lines.push("no branches yet".into());
+                }
+                if listing.truncated {
+                    lines.push("[more branches exist; the listing stopped at a limit]".into());
+                }
+                lines.join("\n")
+            }
+            "git_branch_create" => {
+                let name = string_arg(args, "name")?
+                    .ok_or_else(|| GuestError::new("invalid_argument", "`name` is required"))?;
+                let start = string_arg(args, "start")?.filter(|start| !start.is_empty());
+                let branch = host::git_create_branch(name, start)?;
+                format!("created {} at {}", branch.name, short(&branch.commit))
+            }
             "git_diff" => {
                 let path = string_arg(args, "path")?
                     .ok_or_else(|| GuestError::new("invalid_argument", "`path` is required"))?;

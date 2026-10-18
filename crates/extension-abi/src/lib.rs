@@ -239,6 +239,16 @@ pub enum HostRequest {
     /// Commit everything the index holds on top of `HEAD`, like a plain
     /// `git commit`. The working tree and the index stay as they are.
     GitCommitStaged { message: String },
+    /// The repository's local branches, by name.
+    GitBranches,
+    /// Create the local branch `name` at `start` (a local branch or a full
+    /// commit id; `HEAD` when absent) without switching to it, like
+    /// `git branch <name> [<start>]`.
+    GitCreateBranch {
+        name: String,
+        #[serde(default)]
+        start: Option<String>,
+    },
     /// Put the working-tree content of exactly `paths` in the index, like
     /// `git add` (a path missing from the working tree is removed from the
     /// index), or with `unstage`, set them back to `HEAD`, like
@@ -278,6 +288,9 @@ pub enum HostReply {
     Diff(GitDiff),
     /// The commit a [`HostRequest::GitCommit`] made.
     Committed(GitCommit),
+    Branches(GitBranches),
+    /// The branch a [`HostRequest::GitCreateBranch`] made.
+    Branch(GitBranch),
     Patched(PatchResult),
     Fetched(FetchResponse),
     State(Option<ByteBuf>),
@@ -433,6 +446,22 @@ pub struct GitCommit {
     pub author: String,
     /// Author time, seconds since the Unix epoch.
     pub time: i64,
+}
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitBranches {
+    /// Sorted by name.
+    pub branches: Vec<GitBranch>,
+    /// More branches exist than were listed.
+    pub truncated: bool,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitBranch {
+    /// The short name, such as `main` for `refs/heads/main`.
+    pub name: String,
+    /// Full hexadecimal id of the commit it points at.
+    pub commit: String,
+    /// `HEAD` is on this branch.
+    pub current: bool,
 }
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GitDiff {
