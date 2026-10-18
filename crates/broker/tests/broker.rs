@@ -17,12 +17,29 @@ async fn start() -> (tempfile::TempDir, PathBuf, tokio::task::JoinHandle<()>) {
     let root = dir.path().to_owned();
     let serving = root.clone();
     let task = tokio::spawn(async move { serve(&serving).await.unwrap() });
-    for _ in 0..200 {
-        if socket_path(&root).exists() {
-            break;
+    // A Unix socket's filesystem entry can appear before bind/listen has
+    // finished. Wait for a successful greeting, not just the entry's existence.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match Client::connect(&root, Role::User).await {
+                Ok(client) => {
+                    drop(client);
+                    break;
+                }
+                Err(ClientError::Io(error))
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                    ) =>
+                {
+                    tokio::task::yield_now().await;
+                }
+                Err(error) => panic!("broker startup failed: {error:?}"),
+            }
         }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    })
+    .await
+    .expect("broker did not become ready");
     (dir, root, task)
 }
 
