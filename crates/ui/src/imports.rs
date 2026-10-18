@@ -79,7 +79,7 @@ pub(crate) fn Imports() -> Element {
         }
         if let Some(report) = failure() { ErrorNotice { report, title: "Import preview unavailable".to_string() } }
         if let Some(value) = review() { ReviewPanel { key: "{value.id}", review: value } }
-        Alert { title: rsx! { "Credentials and other tools" }, "This screen imports selected connection settings and supported disabled messengers. It does not import vaults, plaintext credentials, grants, hooks, plugins or MCP servers. Review a password-protected RustyClaw vault separately on Security or with `agent206 vault import`. Cline, Codex, DeepSeek Harness and other adapters are still planned." }
+        Alert { title: rsx! { "Credentials and other tools" }, "This screen imports selected connection settings and supported disabled messengers. It does not import vaults, plaintext credentials, grants, hooks, plugins or MCP servers. Review a password-protected RustyClaw vault separately on Security or with `agent206 vault import`. Codex conversations and instructions, and Cline, DeepSeek Harness and other adapters, are still planned." }
     } }
 }
 
