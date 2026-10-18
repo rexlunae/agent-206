@@ -687,7 +687,10 @@ async fn a_trigger_check_does_not_start_while_the_last_one_runs() {
     job_mut(&mut g.lock().unwrap().state, created.id)
         .unwrap()
         .schedule = Schedule::In { seconds };
-    assert_eq!(g.run_due_jobs(due).unwrap(), Some(due + DEFERRED_RECHECK));
+    // The scheduler neither spins on the past-due time nor waits longer
+    // than the shortest interval a schedule may have to look again.
+    let wake = g.run_due_jobs(due).unwrap().unwrap();
+    assert!(due < wake && wake <= due + schedule::MIN_INTERVAL, "{wake}");
     let deferred = job(&g, created.id);
     assert_eq!(deferred.last, Some(running.clone()));
     assert!(deferred.enabled);
