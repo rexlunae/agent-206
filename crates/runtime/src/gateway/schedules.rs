@@ -176,6 +176,12 @@ impl Gateway {
         let at = now();
         let mut store = self.lock()?;
         let job = job_mut(&mut store.state, id)?;
+        check(
+            !still_checking(job),
+            GatewayError::Conflict(
+                "this trigger check is still running; run it again once it ends",
+            ),
+        )?;
         job.last = Some(JobRun::start(at));
         let job = job.clone();
         store.persist(Some(EventKind::JobChanged { id }))?;
@@ -188,7 +194,7 @@ impl Gateway {
     /// Returns when the next job is due.
     pub fn run_due_jobs(&self, now: u64) -> Result<Option<u64>> {
         let mut store = self.lock()?;
-        let mut due = vec![];
+        let (mut due, mut skipped) = (vec![], vec![]);
         for job in store
             .state
             .jobs
@@ -197,6 +203,13 @@ impl Gateway {
         {
             // Only one run per wake, however many times passed since the last.
             match schedule::next_after(&job.schedule, now) {
+                // A check still running covers this time too: two checks
+                // of one job would each judge from the same cursor.
+                Ok(next) if still_checking(job) => {
+                    job.next = next;
+                    job.enabled = next.is_some();
+                    skipped.push(job.id);
+                }
                 Ok(next) => {
                     job.next = next;
                     job.enabled = next.is_some();
@@ -220,8 +233,8 @@ impl Gateway {
                 }
             }
         }
-        for job in &due {
-            store.persist(Some(EventKind::JobChanged { id: job.id }))?;
+        for id in due.iter().map(|job| job.id).chain(skipped) {
+            store.persist(Some(EventKind::JobChanged { id }))?;
         }
         let next = store
             .state
@@ -601,6 +614,15 @@ impl Jobs {
 }
 
 /// How a job's run ended, from its conversation once the run returned.
+/// Whether `job` is a trigger check whose latest run has not ended.
+fn still_checking(job: &Job) -> bool {
+    matches!(job.kind, JobKind::Trigger { .. })
+        && job
+            .last
+            .as_ref()
+            .is_some_and(|last| last.outcome == JobOutcome::Running)
+}
+
 fn ended(kind: &JobKind, thread: &Thread) -> JobOutcome {
     match thread.state {
         // Messages steered too late for the run follow its reply.

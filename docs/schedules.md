@@ -75,9 +75,11 @@ replaces the long-running process, so nothing runs between checks.
   only once the run's message was accepted (or the run was quiet), so a
   report the conversation refused, for example because it was busy, is
   reported again by the next check. It is written together with the run's
-  outcome, and only while that run is the job's latest, so a restart cannot
-  repeat a check already recorded and an older check that ends late cannot
-  replace what a newer one kept. Each host call of the check is held to the
+  outcome, so a restart cannot repeat a check already recorded. Checks of one
+  job never overlap: while one runs (including while the conversation answers
+  its report), a time that comes due is passed over and "Run now" is refused
+  with a conflict, so each check starts from the cursor the one before it
+  kept. Each host call of the check is held to the
   conversation's grant as it stands at that call, so withdrawing it stops a
   check already running. Removing the job removes it.
 

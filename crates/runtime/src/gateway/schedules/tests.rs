@@ -649,3 +649,35 @@ async fn only_configured_post_destinations_are_accepted() {
     };
     assert_eq!(kind(send(&g, missing).await), ErrorKind::NotFound);
 }
+
+#[tokio::test]
+async fn a_trigger_check_does_not_start_while_the_last_one_runs() {
+    let state = tempfile::tempdir().unwrap();
+    let g = Gateway::open(state.path()).unwrap();
+    let thread = thread(&g).await;
+    let seconds = schedule::MIN_INTERVAL + arbitrary() % 1000;
+    let Reply::Job(created) = schedule(&g, thread, every(seconds)).await else {
+        panic!("job scheduled");
+    };
+    let running = JobRun::start(arbitrary());
+    {
+        let mut store = g.lock().unwrap();
+        let job = job_mut(&mut store.state, created.id).unwrap();
+        job.kind = a206_core::JobKind::Trigger {
+            extension: nonce(),
+            trigger: nonce(),
+            args: Default::default(),
+        };
+        job.last = Some(running.clone());
+    }
+    assert_eq!(
+        kind(send(&g, Command::RunJob { id: created.id }).await),
+        ErrorKind::Conflict
+    );
+    // A time that comes due meanwhile is passed over, not run beside it.
+    let first = created.next.unwrap();
+    assert_eq!(g.run_due_jobs(first).unwrap(), Some(first + seconds));
+    let after = job(&g, created.id);
+    assert_eq!(after.last, Some(running));
+    assert_eq!(after.next, Some(first + seconds));
+}
