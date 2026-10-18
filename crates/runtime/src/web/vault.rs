@@ -77,66 +77,6 @@ async fn connect(root: &std::path::Path) -> Result<Client, crate::vault::VaultEr
     Ok(Client::connect(root, Role::Relay).await?)
 }
 
-#[cfg(test)]
-mod compatibility_tests {
-    use super::*;
-    use crate::transport::{read_frame, write_frame};
-    use a206_broker::{BrokerError, InvalidRequest};
-    use a206_protocol::{Request as Frame, Response};
-
-    #[tokio::test]
-    async fn messenger_versions_cannot_open_a_setup_relay() {
-        for version in [8, 9] {
-            let dir = tempfile::tempdir().unwrap();
-            std::fs::create_dir_all(dir.path().join("vault")).unwrap();
-            let listener =
-                tokio::net::UnixListener::bind(a206_broker::socket_path(dir.path())).unwrap();
-            let broker = tokio::spawn(async move {
-                let (mut socket, _) = listener.accept().await.unwrap();
-                for offered in (version..=a206_broker::BROKER_VERSION).rev() {
-                    let frame = read_frame::<Frame<BrokerRequest>>(&mut socket)
-                        .await
-                        .unwrap()
-                        .unwrap();
-                    assert!(matches!(
-                        frame.body,
-                        BrokerRequest::Hello {
-                            role: Role::User,
-                            version: actual
-                        } if actual == offered
-                    ));
-                    write_frame(
-                        &mut socket,
-                        &Response {
-                            id: frame.id,
-                            body: if offered == version {
-                                BrokerReply::Ok
-                            } else {
-                                BrokerReply::Error(BrokerError::Invalid(
-                                    InvalidRequest::UnsupportedVersion,
-                                ))
-                            },
-                        },
-                    )
-                    .await
-                    .unwrap();
-                }
-                // Refusal must happen before opening a Relay socket or sending setup opcodes.
-                assert!(
-                    read_frame::<Frame<BrokerRequest>>(&mut socket)
-                        .await
-                        .unwrap()
-                        .is_none()
-                );
-            });
-            assert!(matches!(
-                connect(dir.path()).await,
-                Err(crate::vault::VaultError::ChannelUnsupported)
-            ));
-            broker.await.unwrap();
-        }
-    }
-}
 async fn exchange(
     state: &Web,
     owner: String,
@@ -236,6 +176,67 @@ async fn exchange(
                 channels.remove(&session);
             }
             Ok(RelayReply::Closed)
+        }
+    }
+}
+
+#[cfg(test)]
+mod compatibility_tests {
+    use super::*;
+    use crate::transport::{read_frame, write_frame};
+    use a206_broker::{BrokerError, InvalidRequest};
+    use a206_protocol::{Request as Frame, Response};
+
+    #[tokio::test]
+    async fn messenger_versions_cannot_open_a_setup_relay() {
+        for version in [8, 9] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(dir.path().join("vault")).unwrap();
+            let listener =
+                tokio::net::UnixListener::bind(a206_broker::socket_path(dir.path())).unwrap();
+            let broker = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                for offered in (version..=a206_broker::BROKER_VERSION).rev() {
+                    let frame = read_frame::<Frame<BrokerRequest>>(&mut socket)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert!(matches!(
+                        frame.body,
+                        BrokerRequest::Hello {
+                            role: Role::User,
+                            version: actual
+                        } if actual == offered
+                    ));
+                    write_frame(
+                        &mut socket,
+                        &Response {
+                            id: frame.id,
+                            body: if offered == version {
+                                BrokerReply::Ok
+                            } else {
+                                BrokerReply::Error(BrokerError::Invalid(
+                                    InvalidRequest::UnsupportedVersion,
+                                ))
+                            },
+                        },
+                    )
+                    .await
+                    .unwrap();
+                }
+                // Refusal must happen before opening a Relay socket or sending setup opcodes.
+                assert!(
+                    read_frame::<Frame<BrokerRequest>>(&mut socket)
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+            });
+            assert!(matches!(
+                connect(dir.path()).await,
+                Err(crate::vault::VaultError::ChannelUnsupported)
+            ));
+            broker.await.unwrap();
         }
     }
 }
