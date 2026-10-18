@@ -49,6 +49,9 @@ pub(crate) fn ToolTrace(call: ToolCall) -> Element {
         if !call.injection.is_empty() {
             p { class: "a206-muted", {injection_note(&call.injection)} }
         }
+        if let Some(count) = call.repeated {
+            p { class: "a206-muted", "The same call, with the same arguments, {count} times in a row; the model was told." }
+        }
         if let Some(reduction) = call.reduction.as_ref() {
             p { class: "a206-muted", {reduction_note(reduction)} }
         }
@@ -255,6 +258,7 @@ mod tests {
             reduction: None,
             redactions: Vec::new(),
             injection: Vec::new(),
+            repeated: None,
         }
     }
     #[test]
@@ -355,6 +359,17 @@ mod tests {
             "{html}"
         );
         assert!(!html.contains("addressed to the model"), "{html}");
+        assert!(!html.contains("times in a row"), "{html}");
+        let count = Uuid::new_v4().as_u128() as u32;
+        let mut repeated = done.clone();
+        repeated.repeated = Some(count);
+        let html = render(repeated);
+        assert!(
+            html.contains(&format!(
+                "The same call, with the same arguments, {count} times in a row; the model was told."
+            )),
+            "{html}"
+        );
         let kind = Uuid::new_v4().simple().to_string();
         done.injection = vec![OutputCount {
             name: kind.clone(),

@@ -1815,6 +1815,62 @@ async fn a_credential_an_output_rule_joins_is_removed_too() {
     );
 }
 
+// ── Argument types and repeated calls ───────────────────────────────────────
+
+#[tokio::test]
+async fn arguments_take_their_declared_types_and_repeats_are_reported() {
+    let api = ProviderApi::OpenAi;
+    let name = nonce();
+    let mut spec = tool(&name, ToolPermission::Allow, &[]);
+    spec.parameters = json!({"type": "object", "properties": {
+        "count": {"type": "integer"}, "label": {"type": "string"},
+    }});
+    let mut rig = rig(api, vec![spec], None).await;
+    rig.permit(&name, ToolPermission::Allow).await;
+    let count = u32::from_str_radix(&nonce()[..6], 16).unwrap();
+    let task = rig.send();
+    let mut ids = vec![];
+    // The model sends a string for the integer and a number for the string,
+    // the same way each round.
+    let threshold = a206_runtime::tool_calls::REPEAT_THRESHOLD as usize;
+    let mut request = rig.next_request().await;
+    for round in 0..threshold {
+        let call = Call::new(&name, json!({"count": count.to_string(), "label": count}));
+        ids.push(call.id.clone());
+        request.respond(calls_response(api, &[call], "")).await;
+        let (_, ran) = tokio::time::timeout(PATIENCE, rig.calls.recv())
+            .await
+            .unwrap_or_else(wait("the tool to run"))
+            .unwrap();
+        assert_eq!(
+            Value::Object(ran.arguments.clone()),
+            json!({"count": count, "label": count.to_string()}),
+            "round {round}"
+        );
+        request = rig.next_request().await;
+        let seen = result_for(api, &request.body, ids.last().unwrap()).unwrap();
+        let noted = seen.contains("times in a row");
+        assert_eq!(noted, round + 1 == threshold, "round {round}: {seen}");
+        if noted {
+            assert!(seen.contains(&format!("made {threshold} times")), "{seen}");
+        }
+    }
+    request.respond(text_response(api, &nonce())).await;
+    let thread = finished(task).await;
+    assert_eq!(thread.state, RunState::Complete, "{:?}", thread.error);
+    let recorded = calls_of(&thread);
+    assert_eq!(recorded.len(), threshold);
+    for (n, call) in recorded.iter().enumerate() {
+        assert!(call.healed, "{n}");
+        assert_eq!(
+            call.arguments,
+            json!({"count": count, "label": count.to_string()}).to_string()
+        );
+        let expected = (n + 1 >= threshold).then_some(threshold as u32);
+        assert_eq!(call.repeated, expected, "{n}");
+    }
+}
+
 // ── Text addressed to the model ─────────────────────────────────────────────
 
 #[tokio::test]

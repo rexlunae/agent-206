@@ -469,6 +469,7 @@ impl Gateway {
         );
         let mut total: Option<Usage> = None;
         let mut calls_used = 0;
+        let mut repeats = tool_calls::Repeats::default();
         let mut round = 0;
         // The previous request's input tokens: before the first round, the
         // last request of the previous run.
@@ -639,7 +640,8 @@ impl Gateway {
                 }
                 continue;
             }
-            let parsed = self.record_calls(run.thread, message, turn.calls)?;
+            let parsed =
+                self.record_calls(run.thread, message, turn.calls, &catalog, &mut repeats)?;
             // Re-read at each check: a parent may lower its budget mid-run.
             let budget = effective_budget(&*self.lock()?, run.thread)?;
             // Calls are only worth running if another request can follow.
@@ -798,11 +800,15 @@ impl Gateway {
     /// Attach the response's calls to its message. Calls whose arguments are
     /// unusable or that repeat an earlier call are settled here; the rest are
     /// returned with their arguments, in order, for a decision.
+    /// Arguments are converted to the scalar types the tool declares, and
+    /// a call repeating the run's previous calls is counted.
     fn record_calls(
         &self,
         id: Id,
         message: Id,
         calls: Vec<tool_calls::StreamedCall>,
+        catalog: &tools::Catalog,
+        repeats: &mut tool_calls::Repeats,
     ) -> Result<Vec<(String, Option<tool_calls::Arguments>)>> {
         let mut records = vec![];
         let mut decisions = vec![];
@@ -814,7 +820,12 @@ impl Gateway {
                 _ => (format!("call_{}", Id::new_v4().simple()), true),
             };
             seen_ids.insert(id.clone());
-            let parsed = tool_calls::parse_arguments(&streamed.arguments);
+            let parsed = tool_calls::parse_arguments(&streamed.arguments).map(|arguments| {
+                match catalog.tools.get(&streamed.name) {
+                    Some(routed) => tool_calls::coerce(arguments, &routed.spec.parameters),
+                    None => arguments,
+                }
+            });
             let (arguments, healed) = match &parsed {
                 Ok(arguments) => (arguments.text.clone(), arguments.healed),
                 Err(_) => (streamed.arguments.clone(), false),
@@ -833,6 +844,7 @@ impl Gateway {
                 reduction: None,
                 redactions: Vec::new(),
                 injection: Vec::new(),
+                repeated: None,
             };
             let usable = match parsed {
                 Err(error) => {
@@ -847,7 +859,10 @@ impl Gateway {
                     settle(&mut record, ToolCallState::Skipped, &ToolError::Duplicate);
                     None
                 }
-                Ok(arguments) => Some(arguments),
+                Ok(arguments) => {
+                    record.repeated = repeats.observe(&record.digest);
+                    Some(arguments)
+                }
             };
             decisions.push((id, usable));
             records.push(record);
@@ -1497,6 +1512,7 @@ mod output_tests {
             reduction: None,
             redactions: Vec::new(),
             injection: Vec::new(),
+            repeated: None,
         }
     }
     #[test]

@@ -1,10 +1,11 @@
 //! Tool calls assembled from streamed provider responses, and the repairs the
 //! run engine applies before deciding on them.
 //!
-//! Argument healing and in-response de-duplication are adapted from
-//! RustyClaw's `tool_healing.rs` (MIT, see NOTICE). Only repairs that cannot
-//! change what a call means are kept: a code fence or prose around the
-//! object, and trailing commas. Truncated arguments are *not* completed, since
+//! Argument healing, schema type coercion, in-response de-duplication and
+//! repeat-call warnings are adapted from RustyClaw's `tool_healing.rs` (MIT,
+//! see NOTICE). Only repairs that cannot change what a call means are kept:
+//! a code fence or prose around the object, trailing commas, and a scalar
+//! written as another type its declared type converts from exactly. Truncated arguments are *not* completed, since
 //! closing a cut-off value would run a different call than the model intended
 //! (for example writing half a file); they are reported back to the model.
 use a206_core::ErrorKind;
@@ -281,6 +282,87 @@ fn strip_trailing_commas(input: &str) -> String {
     out
 }
 
+/// Convert top-level argument values to the scalar type the tool's schema
+/// declares for them, when the conversion is exact: a number or boolean
+/// where a string is declared, `"7"` where an integer is, `"0.5"` where a
+/// number is, and `"true"`/`"false"` where a boolean is. Anything else is
+/// left for the tool to report. Converted arguments are healed, so the
+/// approval and the trace show the text that runs.
+pub fn coerce(arguments: Arguments, schema: &Value) -> Arguments {
+    let Some(properties) = schema.get("properties").and_then(Value::as_object) else {
+        return arguments;
+    };
+    let Arguments {
+        mut object, healed, ..
+    } = arguments;
+    let mut changed = false;
+    for (key, value) in object.iter_mut() {
+        let Some(declared) = properties
+            .get(key)
+            .and_then(|property| property.get("type"))
+            .and_then(Value::as_str)
+        else {
+            continue;
+        };
+        if let Some(converted) = convert(declared, value) {
+            tracing::info!(parameter = %key, declared, "converted a tool argument to its declared type");
+            *value = converted;
+            changed = true;
+        }
+    }
+    finish(object, healed || changed)
+}
+fn convert(declared: &str, value: &Value) -> Option<Value> {
+    match (declared, value) {
+        ("string", Value::Number(number)) => Some(Value::String(number.to_string())),
+        ("string", Value::Bool(flag)) => Some(Value::String(flag.to_string())),
+        ("integer", Value::String(text)) => text
+            .trim()
+            .parse::<i64>()
+            .ok()
+            .map(|n| Value::Number(n.into())),
+        ("number", Value::String(text)) => text
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .and_then(serde_json::Number::from_f64)
+            .map(Value::Number),
+        ("boolean", Value::String(text)) => match text.trim() {
+            "true" => Some(Value::Bool(true)),
+            "false" => Some(Value::Bool(false)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Consecutive identical calls at which [`Repeats::observe`] starts
+/// reporting them.
+pub const REPEAT_THRESHOLD: u32 = 5;
+
+/// Counts consecutive identical calls (same tool, same argument text)
+/// across the rounds of one run. A call that keeps repeating with the same
+/// result is reported to the model, never blocked: polling a process or
+/// rerunning tests repeats legitimately.
+#[derive(Debug, Default)]
+pub struct Repeats {
+    last: Option<String>,
+    count: u32,
+}
+impl Repeats {
+    /// Record a call by its digest; the run length once it reaches
+    /// [`REPEAT_THRESHOLD`].
+    pub fn observe(&mut self, digest: &str) -> Option<u32> {
+        if self.last.as_deref() == Some(digest) {
+            self.count = self.count.saturating_add(1);
+        } else {
+            self.last = Some(digest.to_owned());
+            self.count = 1;
+        }
+        (self.count >= REPEAT_THRESHOLD).then_some(self.count)
+    }
+}
+
 /// What an approval is bound to: this tool with exactly this argument text.
 pub fn digest(tool: &str, arguments: &str) -> String {
     let mut hash = Sha256::new();
@@ -296,6 +378,58 @@ pub fn digest(tool: &str, arguments: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+    #[test]
+    fn scalars_convert_only_to_their_declared_type_and_only_exactly() {
+        let schema = json!({"properties": {
+            "path": {"type": "string"}, "line": {"type": "integer"},
+            "ratio": {"type": "number"}, "deep": {"type": "boolean"},
+            "free": {}, "either": {"type": ["string", "null"]},
+        }});
+        let line = uuid::Uuid::new_v4().as_u128() as u32;
+        let raw = json!({"path": line, "line": format!(" {line} "), "ratio": "0.5",
+            "deep": "true", "free": 3, "either": 4, "extra": "7"});
+        let parsed = parse_arguments(&raw.to_string()).unwrap();
+        assert!(!parsed.healed);
+        let coerced = coerce(parsed, &schema);
+        assert!(coerced.healed);
+        assert_eq!(
+            Value::Object(coerced.object.clone()),
+            json!({"path": line.to_string(), "line": line, "ratio": 0.5, "deep": true,
+                "free": 3, "either": 4, "extra": "7"})
+        );
+        assert_eq!(
+            coerced.text,
+            serde_json::to_string(&coerced.object).unwrap()
+        );
+        // Values that do not convert exactly, or already match, stay as they
+        // are and are not marked healed.
+        for raw in [
+            json!({"line": "several", "ratio": "NaN", "deep": "yes"}),
+            json!({"line": "1.5"}),
+            json!({"path": "a", "line": 3, "deep": false}),
+        ] {
+            let parsed = parse_arguments(&raw.to_string()).unwrap();
+            let coerced = coerce(parsed.clone(), &schema);
+            assert_eq!(coerced, parsed, "{raw}");
+        }
+        // Already-healed arguments stay healed; no schema, no change.
+        let healed = parse_arguments(r#"{"line": 1,}"#).unwrap();
+        assert!(coerce(healed.clone(), &schema).healed);
+        assert_eq!(coerce(healed.clone(), &json!({})), healed);
+    }
+    #[test]
+    fn repeats_are_reported_from_the_threshold_and_reset_by_another_call() {
+        let (same, other) = (digest(&key(), "{}"), digest(&key(), "{}"));
+        let mut repeats = Repeats::default();
+        for n in 1..REPEAT_THRESHOLD {
+            assert_eq!(repeats.observe(&same), None, "{n}");
+        }
+        assert_eq!(repeats.observe(&same), Some(REPEAT_THRESHOLD));
+        assert_eq!(repeats.observe(&same), Some(REPEAT_THRESHOLD + 1));
+        assert_eq!(repeats.observe(&other), None);
+        assert_eq!(repeats.observe(&same), None);
+    }
     fn key() -> String {
         uuid::Uuid::new_v4().simple().to_string()
     }
