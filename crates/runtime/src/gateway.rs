@@ -662,6 +662,7 @@ impl Gateway {
                 | Command::Skills
                 | Command::AgentProfiles
                 | Command::PreviewImport { .. }
+                | Command::PreviewSourceImport { .. }
                 | Command::ReadSkill { .. }
                 | Command::ListTools { .. }
                 // Read-only; its reply copies message text.
@@ -942,7 +943,13 @@ impl Gateway {
             }
             Command::Events { after } => Ok(Reply::Events(self.lock()?.events(after)?)),
             Command::SaveSettings(settings) => self.save_settings(settings),
-            Command::PreviewImport { source } => self.preview_import(&source).await,
+            Command::PreviewImport { source } => {
+                self.preview_import(a206_core::imports::Tool::RustyClaw, &source)
+                    .await
+            }
+            Command::PreviewSourceImport { tool, source } => {
+                self.preview_import(tool, &source).await
+            }
             Command::ApplyImport { review, selection } => {
                 self.apply_import(review, selection).await
             }

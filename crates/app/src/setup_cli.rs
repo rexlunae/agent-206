@@ -14,6 +14,8 @@ use std::path::{Path, PathBuf};
 
 #[derive(Subcommand)]
 pub enum ImportSource {
+    /// Review one Claude Code settings.json scope on the gateway host.
+    ReviewClaudeCode { path: PathBuf },
     /// Review RustyClaw settings on the gateway host, without changing them.
     ReviewRustyclaw { path: PathBuf },
     /// Apply selected zero-based item indices from a held gateway review.
@@ -104,6 +106,11 @@ pub async fn secure(root: &Path, skip_totp: bool) -> Result<()> {
 fn inactive(category: InactiveCategory) -> &'static str {
     use InactiveCategory::*;
     match category {
+        Environment => "environment settings (not inherited)",
+        Hooks => "hooks (never run)",
+        Plugins => "plugins and marketplaces (not enabled)",
+        Credentials => "credentials and helpers (not read or run)",
+        ModelSelection => "model choices (not bound)",
         Messengers => "messenger accounts (and their tokens)",
         McpServers => "MCP servers (commands are never run on import)",
         ToolPermissions => "per-tool permissions (no grant is given instead)",
@@ -270,6 +277,17 @@ async fn import_vault(root: &Path, source: &Path) -> Result<()> {
 
 pub async fn import(root: &Path, remote: Option<String>, source: ImportSource) -> Result<()> {
     let (path, apply, skip_vault, skip_providers, skip_messengers, toml) = match source {
+        ImportSource::ReviewClaudeCode { path } => {
+            return review_command(
+                root,
+                remote,
+                Command::PreviewSourceImport {
+                    tool: a206_import::Tool::ClaudeCode,
+                    source: path,
+                },
+            )
+            .await;
+        }
         ImportSource::ReviewRustyclaw { path } => {
             return review_command(root, remote, Command::PreviewImport { source: path }).await;
         }
@@ -450,6 +468,11 @@ pub async fn import(root: &Path, remote: Option<String>, source: ImportSource) -
 }
 
 async fn review_command(root: &Path, remote: Option<String>, command: Command) -> Result<()> {
+    let expected_tool = match &command {
+        Command::PreviewImport { .. } => Some(a206_core::imports::Tool::RustyClaw),
+        Command::PreviewSourceImport { tool, .. } => Some(*tool),
+        _ => None,
+    };
     let target = a206_runtime::connection::require(root, remote)?;
     let client = a206_runtime::control::GatewayController::attach(
         root.to_owned(),
@@ -458,9 +481,12 @@ async fn review_command(root: &Path, remote: Option<String>, command: Command) -
     let reply = client.call(command).await?.into_result()?;
     match reply {
         Reply::ImportPreview(review) => {
-            if review.version != a206_core::imports::REVIEW_VERSION {
+            if review.version != a206_core::imports::REVIEW_VERSION
+                || review.preview.version != a206_core::imports::PREVIEW_VERSION
+                || expected_tool != Some(review.preview.tool)
+            {
                 bail!(
-                    "gateway import review version is unsupported; update the gateway and preview again"
+                    "gateway import review version or source tool is unsupported; update the gateway and preview again"
                 );
             }
             print!("{}", toml::to_string_pretty(&review)?);

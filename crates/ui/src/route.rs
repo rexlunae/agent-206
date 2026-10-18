@@ -304,7 +304,9 @@ pub(crate) mod tests {
         assert_eq!(history.current_route(), "/settings/import");
         assert!(html.contains("<h1>Import</h1>"));
         assert!(html.contains("Preview import"));
-        assert!(html.contains("Installation directory"));
+        assert!(html.contains("Settings directory"));
+        assert!(html.contains("Import source tool"));
+        assert!(html.contains("RustyClaw"));
         assert!(html.contains("gateway host"));
     }
 

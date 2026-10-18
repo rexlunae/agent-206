@@ -8,12 +8,13 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 pub const READER_COMMAND: &str = "__a206-import-reader";
-const VERSION: u32 = 2;
+const VERSION: u32 = 3;
 const DEADLINE: std::time::Duration = std::time::Duration::from_secs(15);
 
 #[derive(Serialize, Deserialize)]
 struct ReadRequest {
     version: u32,
+    tool: a206_import::Tool,
     source: PathBuf,
     settings: Settings,
     vault_exists: Option<bool>,
@@ -154,7 +155,8 @@ impl crate::error::Classified for ImportError {
             Self::NotDirectory { .. }
             | Self::NotRegular { .. }
             | Self::TooLarge { .. }
-            | Self::Config { .. } => ErrorKind::InvalidRequest,
+            | Self::Config { .. }
+            | Self::JsonConfig { .. } => ErrorKind::InvalidRequest,
             Self::Read { .. } | Self::Receipt { .. } => return None,
             Self::EncodeReceipt(_) => ErrorKind::Storage,
         })
@@ -168,15 +170,31 @@ pub async fn preview(
     settings: &Settings,
     vault_exists: Option<bool>,
 ) -> Result<Preview, ReaderError> {
-    preview_with(source, settings, vault_exists, Exposure::Terminal).await
+    preview_with(
+        a206_import::Tool::RustyClaw,
+        source,
+        settings,
+        vault_exists,
+        Exposure::Terminal,
+    )
+    .await
 }
 
 /// Settings-only review: no source labels, model text or credential references.
 pub async fn preview_settings(source: &Path, settings: &Settings) -> Result<Preview, ReaderError> {
-    preview_with(source, settings, None, Exposure::SettingsReview).await
+    preview_settings_for(a206_import::Tool::RustyClaw, source, settings).await
+}
+
+pub async fn preview_settings_for(
+    tool: a206_import::Tool,
+    source: &Path,
+    settings: &Settings,
+) -> Result<Preview, ReaderError> {
+    preview_with(tool, source, settings, None, Exposure::SettingsReview).await
 }
 
 async fn preview_with(
+    tool: a206_import::Tool,
     source: &Path,
     settings: &Settings,
     vault_exists: Option<bool>,
@@ -197,6 +215,7 @@ async fn preview_with(
             id: uuid::Uuid::new_v4(),
             body: ReadRequest {
                 version: VERSION,
+                tool,
                 source: source.clone(),
                 settings: target_settings(settings),
                 vault_exists,
@@ -246,7 +265,7 @@ async fn preview_with(
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
-        let _ = (source, settings, vault_exists, exposure);
+        let _ = (tool, source, settings, vault_exists, exposure);
         Err(ReaderError::Unsupported)
     }
 }
@@ -267,11 +286,16 @@ async fn serve_io(
         })
         .with_correlation(request.id))
     } else {
-        a206_import::rustyclaw::preview(
-            &request.body.source,
-            &request.body.settings,
-            request.body.vault_exists,
-        )
+        match request.body.tool {
+            a206_import::Tool::RustyClaw => a206_import::rustyclaw::preview(
+                &request.body.source,
+                &request.body.settings,
+                request.body.vault_exists,
+            ),
+            a206_import::Tool::ClaudeCode => {
+                a206_import::claude_code::preview(&request.body.source, &request.body.settings)
+            }
+        }
         .map_err(|error| crate::error::correlated("import.preview", request.id, &error))
         .and_then(|preview| {
             protect(preview, request.body.exposure, &request.body.settings).map_err(|error| {
@@ -327,6 +351,7 @@ mod tests {
             id: uuid::Uuid::new_v4(),
             body: ReadRequest {
                 version: VERSION + 1,
+                tool: a206_import::Tool::RustyClaw,
                 source: PathBuf::from("/not-an-installation"),
                 settings: Settings::default(),
                 vault_exists: None,
