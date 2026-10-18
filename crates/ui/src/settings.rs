@@ -88,6 +88,7 @@ pub fn Prompts() -> Element {
     let state = use_context::<State>();
     rsx! { PageFrame { kicker: "Agent behavior", title: "The right mode for the work.", description: "Prompts guide behavior. Tool permissions are enforced separately at the gateway.",
         for mode in Mode::ALL { PromptEditor { key: "{mode.label()}", mode, initial: state.data.read().settings.prompts.iter().find(|p| p.mode == mode).map(|p| p.prompt.clone()).unwrap_or_default() } }
+        crate::profiles::AgentProfilesCard {}
         ProgramDirectories {}
     } }
 }

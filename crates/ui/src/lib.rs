@@ -11,6 +11,7 @@ mod mcp;
 mod messengers;
 mod pages;
 mod palette;
+mod profiles;
 mod prompts;
 mod route;
 mod running;

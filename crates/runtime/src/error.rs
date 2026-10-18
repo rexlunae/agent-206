@@ -80,6 +80,7 @@ pub(crate) fn classify(error: &(dyn Error + 'static)) -> Option<ErrorKind> {
         )*};
     }
     classified!(
+        crate::agent_profiles::ProfileError,
         crate::backends::BackendError,
         crate::backends::proxy::ProxyError,
         crate::client::ClientError,

@@ -9,12 +9,14 @@ pub mod doctor;
 pub mod error;
 pub mod extension;
 pub mod ignore;
+pub mod profiles;
 pub mod prompts;
 pub mod search;
 pub mod tools;
 pub use audit::{AuditBuilder, AuditField, AuditFinding, AuditLocation, AuditReport, AuditRule};
 pub use error::{ErrorKind, ErrorReport};
 pub use ignore::Ignore;
+pub use profiles::{AgentProfile, AgentProfiles, ProfileProblem, ThreadProfile};
 pub use prompts::{AnswerError, PromptAnswer, PromptOutcome, UserPrompt};
 pub use search::{MessageHit, SearchError};
 pub use tools::{
@@ -516,6 +518,9 @@ pub struct Thread {
     /// shown to the user beside the conversation. Empty when there is none.
     #[serde(default)]
     pub plan: Vec<PlanStep>,
+    /// The agent profile this subagent was started from, if any.
+    #[serde(default)]
+    pub profile: Option<Box<ThreadProfile>>,
 }
 /// One step of a conversation's plan.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -594,6 +599,7 @@ impl Thread {
             paused: false,
             held: false,
             plan: vec![],
+            profile: None,
         }
     }
 }
@@ -998,6 +1004,11 @@ pub enum Command {
         mode: Mode,
         model: ModelKey,
         requested: BTreeSet<Capability>,
+        /// Start from this agent profile: its mode and model must match,
+        /// its capabilities narrow `requested`, and its instructions join
+        /// the subagent's prompt.
+        #[serde(default)]
+        profile: Option<String>,
     },
     Events {
         after: u64,
@@ -1090,6 +1101,8 @@ pub enum Command {
     },
     /// List skills installed in the gateway's profile.
     Skills,
+    /// The agent profiles in the gateway's profile directory.
+    AgentProfiles,
     /// The full `SKILL.md` of one skill, for review.
     ReadSkill {
         name: String,
@@ -1195,6 +1208,7 @@ impl Command {
             Self::ConnectMcpServer { .. } => "connect_mcp_server",
             Self::DisconnectMcpServer { .. } => "disconnect_mcp_server",
             Self::Skills => "skills",
+            Self::AgentProfiles => "agent_profiles",
             Self::ReadSkill { .. } => "read_skill",
             Self::SetSkillEnabled { .. } => "set_skill_enabled",
             Self::ScheduleJob { .. } => "schedule_job",
@@ -1222,6 +1236,7 @@ pub enum Reply {
     Error(ErrorReport),
     Gateway(GatewayInfo),
     Skills(Vec<SkillSummary>),
+    AgentProfiles(AgentProfiles),
     Skill(SkillText),
     Tools(ToolList),
     Messages(Vec<MessageHit>),

@@ -859,6 +859,7 @@ async fn instruction_files_load_only_with_the_grant_to_read_the_project() {
                 mode: Mode::Plan,
                 model: rig.model.clone(),
                 requested: [Capability::ReadWorkspace].into(),
+                profile: None,
             })
             .await
         else {

@@ -354,6 +354,7 @@ async fn discovers_models_from_api_then_sends_and_persists_a_conversation() {
             mode: Mode::Code,
             model: catalog.models[0].key.clone(),
             requested: [Capability::Execute, Capability::Network].into(),
+            profile: None,
         },
     )
     .await

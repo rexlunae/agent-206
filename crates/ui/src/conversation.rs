@@ -666,11 +666,7 @@ fn Inspector(thread: Thread) -> Element {
             SubagentModel { key: "{model.key.provider}:{model.key.model}", thread: id, model: model.clone() }
         }
         if !thread.subagent_models.is_empty() {
-            Button { size: ButtonSize::Sm, variant: ButtonVariant::Secondary, onclick: move |_| {
-                if let Some(model) = state.data.read().threads.iter().find(|t| t.id == id).and_then(|t| t.subagent_models.first()).cloned() {
-                    dispatch(state, Command::CreateSubagent { parent: id, title: "Delegated task".into(), mode: Mode::Plan, model, requested: Default::default() });
-                }
-            }, "Create delegated conversation" }
+            crate::profiles::Delegate { thread: id }
         }
     } }
 }
@@ -848,6 +844,7 @@ fn ThreadFacts(thread: Thread) -> Element {
     rsx! { div { class: "a206-thread-facts",
         dl { class: "a206-fact-grid",
             dt { "Agent engine" } dd { "{thread.backend.label()}" }
+            if let Some(profile) = &thread.profile { dt { "Agent profile" } dd { "{profile.name}" } }
             if let Some(activity) = &thread.backend_activity { dt { "Last operation" } dd { "{activity}" } }
             dt { "Context used" } dd { {pct.map(|p| format!("{p:.1}%")).unwrap_or_else(|| "Not reported".into())} }
             dt { "Context limit" } dd { "{number(limit)}" }
