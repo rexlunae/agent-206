@@ -158,16 +158,15 @@ fn start_commit(repo: &gix::Repository, start: &str) -> Result<ObjectId, HostFai
             "the start is neither a local branch nor a full commit id",
         )
     };
-    if let Some(branch) = branch_name(start) {
-        if let Some(mut reference) = repo
+    if let Some(branch) = branch_name(start)
+        && let Some(mut reference) = repo
             .try_find_reference(&branch)
             .map_err(|e| git_failure("branches", &e))?
-        {
-            return Ok(reference
-                .peel_to_commit()
-                .map_err(|e| git_failure("branches", &e))?
-                .id);
-        }
+    {
+        return Ok(reference
+            .peel_to_commit()
+            .map_err(|e| git_failure("branches", &e))?
+            .id);
     }
     let id = ObjectId::from_hex(start.as_bytes()).map_err(|_| not_found())?;
     match repo.try_find_object(id) {
