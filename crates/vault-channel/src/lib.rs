@@ -10,6 +10,8 @@ const PATTERN: &str = "Noise_NK_25519_ChaChaPoly_SHA256";
 const PROLOGUE: &[u8] = b"Agent206 vault setup v1";
 pub const MAX_MESSAGE: usize = 65535;
 pub const IMPORT_REVIEW_VERSION: u16 = 1;
+/// First broker protocol that implements connection-owned reviewed imports.
+pub const REVIEWED_IMPORT_BROKER_VERSION: u16 = 11;
 
 /// Public identity of a source held privately by this broker connection.
 /// This describes file bytes, not decrypted contents or format validity.
@@ -234,6 +236,10 @@ pub enum RelayRequest {
 pub enum RelayReply {
     Key(Vec<u8>),
     Opened {
+        /// Negotiated for this specific socket. Older web relays omit it;
+        /// absence permits legacy setup but never reviewed migration.
+        #[serde(default)]
+        broker_version: u16,
         session: String,
         #[serde(with = "serde_bytes")]
         response: Vec<u8>,
@@ -245,6 +251,30 @@ pub enum RelayReply {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn older_relay_open_reply_does_not_claim_migration_support() {
+        #[derive(Serialize)]
+        enum Older {
+            Opened { session: String, response: Vec<u8> },
+        }
+        let session = a206_core::Id::new_v4().to_string();
+        let bytes = rmp_serde::to_vec_named(&Older::Opened {
+            session: session.clone(),
+            response: vec![1, 2, 3],
+        })
+        .unwrap();
+        let RelayReply::Opened {
+            broker_version,
+            session: actual,
+            response,
+        } = rmp_serde::from_slice(&bytes).unwrap()
+        else {
+            panic!("missing open reply")
+        };
+        assert_eq!(broker_version, 0);
+        assert_eq!(actual, session);
+        assert_eq!(response, vec![1, 2, 3]);
+    }
     fn pair() -> (Channel, Channel) {
         let identity = Identity::generate().unwrap();
         let (hello, first) = Handshake::start(&identity.public).unwrap();

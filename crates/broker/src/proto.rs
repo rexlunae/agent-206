@@ -24,7 +24,7 @@ use zeroize::Zeroizing;
 /// are only requested from brokers that understand them.
 pub const BROKER_VERSION: u16 = 11;
 /// First version with connection-held source reviews and guarded vault import.
-pub const REVIEWED_IMPORT_VERSION: u16 = 11;
+pub use a206_vault_channel::REVIEWED_IMPORT_BROKER_VERSION as REVIEWED_IMPORT_VERSION;
 /// The oldest protocol version this broker still serves and this client still
 /// speaks. Versions 3 to 11 differ only by the requests, roles and schemes they add.
 pub const MIN_BROKER_VERSION: u16 = 3;

@@ -53,9 +53,11 @@ agent206 --data-dir <profile-directory> import rustyclaw <source-directory>
 Review the preview and use `--apply` only for the categories you intend to import.
 The command runs on the gateway host and uses the isolated broker for encrypted
 vault adoption. It never replaces an existing vault. See [imports.md](imports.md)
-for policy preservation, supported categories and partial-failure behavior. A GUI
-import review/apply screen and adapters for other tools remain planned; this web
-flow does not invoke foreign commands or import grants implicitly.
+for policy preservation, supported categories and partial-failure behavior. Security
+and Get started also offer reviewed whole-vault migration, described below;
+the Import settings page separately reviews selected connection settings.
+Adapters for other tools remain planned. Neither flow invokes foreign commands
+or imports grants implicitly.
 
 ## Channel and trust boundary
 
@@ -143,7 +145,11 @@ The result shows actual vault/pairing state and an owner-only TOML receipt path.
 A receipt or pairing failure is shown beside the confirmed copy. If the request
 was interrupted, check vault status before retrying: a sent copy may have
 committed. Cancel clears an unapplied review; it is not rollback. Broker v11 is
-required, with no fallback to an older unreviewed import. Remote SSH migration,
+required for migration, with no fallback to an older unreviewed import. Existing
+unlock/enrollment controls still work with v10. The relay reports the negotiated
+version of the channel's socket; missing or older version metadata refuses
+migration before sending a reviewed request, with instructions to stop the old
+broker and retry. Remote SSH migration,
 key-file migration and rollback remain pending.
 
 The equivalent terminal flow on the broker host is `agent206 vault import FILE`

@@ -670,7 +670,105 @@ pub(crate) async fn import_reviewed(
     if let Some(error) = applied.receipt_error {
         return Err(anyhow::Error::new(error).context("Vault imported and unlocked, but its receipt could not be confirmed; remaining import steps were not applied"));
     }
-    pair_if_running(client, root)
+    pair_import_if_running(client, root)
         .await
         .context("Vault imported and unlocked, but gateway pairing did not complete")
+}
+
+async fn pair_import_if_running(client: &mut Client, root: &Path) -> Result<()> {
+    if vault::gateway_running(root).await {
+        vault::pair_gateway(client, root).await?;
+        println!("Gateway paired with the vault");
+    } else {
+        println!("After starting the gateway, run `agent206 vault pair` so it can use credentials");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod import_tests {
+    use super::*;
+    use a206_protocol::{Request as Frame, Response};
+    use a206_runtime::transport::{read_frame, write_frame};
+    #[tokio::test]
+    async fn imported_vault_pairing_failure_propagates() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir(root.join("vault")).unwrap();
+        let broker = tokio::net::UnixListener::bind(a206_broker::socket_path(root)).unwrap();
+        let gateway = tokio::net::UnixListener::bind(root.join("gateway.sock")).unwrap();
+        let broker_task = tokio::spawn(async move {
+            let (mut socket, _) = broker.accept().await.unwrap();
+            let greeting = read_frame::<Frame<Request>>(&mut socket)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(matches!(greeting.body, Request::Hello { .. }));
+            write_frame(
+                &mut socket,
+                &Response {
+                    id: greeting.id,
+                    body: Reply::Ok,
+                },
+            )
+            .await
+            .unwrap();
+            let pairing = read_frame::<Frame<Request>>(&mut socket)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(matches!(pairing.body, Request::PairGateway));
+            write_frame(
+                &mut socket,
+                &Response {
+                    id: pairing.id,
+                    body: Reply::GatewayPairing {
+                        token: WireSecret::new(uuid::Uuid::new_v4().to_string()),
+                    },
+                },
+            )
+            .await
+            .unwrap();
+        });
+        let report = a206_core::ErrorReport::new(
+            a206_core::ErrorKind::PermissionDenied,
+            "test gateway refuses pairing",
+        )
+        .with_correlation(uuid::Uuid::new_v4());
+        let sent = report.clone();
+        let gateway_task = tokio::spawn(async move {
+            // The first socket is the non-starting liveness probe.
+            drop(gateway.accept().await.unwrap());
+            let (mut socket, _) = gateway.accept().await.unwrap();
+            let request = read_frame::<Frame<a206_core::Command>>(&mut socket)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(matches!(
+                request.body,
+                a206_core::Command::PairBroker { .. }
+            ));
+            write_frame(
+                &mut socket,
+                &Response {
+                    id: request.id,
+                    body: a206_core::Reply::Error(sent),
+                },
+            )
+            .await
+            .unwrap();
+        });
+        let mut client = Client::connect(root, a206_broker::Role::User)
+            .await
+            .unwrap();
+        let error = pair_import_if_running(&mut client, root).await.unwrap_err();
+        let Some(vault::VaultError::PairingRefused(actual)) =
+            error.downcast_ref::<vault::VaultError>()
+        else {
+            panic!("lost pairing failure: {error:?}")
+        };
+        assert_eq!(actual, &report);
+        broker_task.await.unwrap();
+        gateway_task.await.unwrap();
+    }
 }
