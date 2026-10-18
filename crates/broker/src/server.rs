@@ -855,6 +855,9 @@ fn provider(shared: &Shared, session: &Session, call: ProviderCall, stream: bool
     {
         return Err(BrokerError::Invalid(InvalidRequest::ProviderBody));
     }
+    if call.auth == AuthScheme::WebhookUrl && (url.path() != "/" || url.query().is_some()) {
+        return Err(BrokerError::Invalid(InvalidRequest::WebhookPath));
+    }
     let origin = url.origin().ascii_serialization();
     // The epoch was read with the pairing check, so a later lock,
     // replacement or void always cancels this send.
@@ -874,6 +877,7 @@ fn provider(shared: &Shared, session: &Session, call: ProviderCall, stream: bool
         AuthScheme::ApiKeyHeader => (url, Some(("x-api-key", value))),
         AuthScheme::GoogleApiKey => (url, Some(("x-goog-api-key", value))),
         AuthScheme::TelegramBot => (telegram_url(url, &value)?, None),
+        AuthScheme::WebhookUrl => (webhook_url(&url, &value)?, None),
     };
     Ok(Outcome::Send(Box::new(Outbound {
         method: call.method,
@@ -900,6 +904,19 @@ fn telegram_url(mut url: url::Url, token: &str) -> Result<url::Url, BrokerError>
     }
     let path = format!("/bot{token}{}", url.path());
     url.set_path(&path);
+    Ok(url)
+}
+
+/// A webhook credential is the whole URL to send to. It must be one the
+/// broker would accept as a request URL, on the origin the call named (which
+/// the credential is bound to), so a stored URL cannot redirect the request
+/// elsewhere. Like a Telegram URL, it lives only until the request is sent.
+fn webhook_url(called: &url::Url, stored: &str) -> Result<url::Url, BrokerError> {
+    let invalid = || BrokerError::Upstream(UpstreamFailure::InvalidWebhookUrl);
+    let url = request_url(stored).map_err(|_| invalid())?;
+    if url.origin() != called.origin() {
+        return Err(invalid());
+    }
     Ok(url)
 }
 

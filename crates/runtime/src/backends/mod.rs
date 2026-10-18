@@ -141,6 +141,14 @@ pub enum Progress {
     Text(String),
     /// Text appended to the reply (native provider streams).
     Delta(String),
+    /// Reasoning text appended to the reply's reasoning (native provider
+    /// streams), shown apart from the reply and never sent to a model.
+    /// `shortened` is set once reasoning beyond the kept limit was dropped,
+    /// with whatever part of this delta still fit.
+    Reasoning {
+        text: String,
+        shortened: bool,
+    },
     Activity(String),
 }
 pub fn validate_config(config: &BackendConfig) -> Result<()> {

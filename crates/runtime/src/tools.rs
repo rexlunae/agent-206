@@ -13,7 +13,8 @@
 //! (`crate::exec_tool`), approved skills (`crate::skill_tool`) and subagents
 //! (`crate::delegation_tool`) are registered by default, with `ask_user`
 //! (`crate::prompt_tool`), `extension_propose` (`crate::propose_tool`) and
-//! `extension_list` (`crate::extension_list_tool`).
+//! `extension_list` (`crate::extension_list_tool`); the gateway adds the
+//! schedule, plan and `send_message` (`crate::message_tool`) tools.
 use a206_core::{
     Capability, ErrorKind, ErrorReport, Id, Thread, ToolList, ToolOffer, ToolPermission,
     UnavailableTools,

@@ -36,7 +36,7 @@ async fn unsafe_entries_are_refused_and_saved_ones_start_stopped() {
             ..Settings::default()
         }
     };
-    let cases: [fn(&mut MessengerConfig); 8] = [
+    let cases: [fn(&mut MessengerConfig); 10] = [
         // A Matrix homeserver is never assumed.
         |c| c.kind = MessengerKind::Matrix,
         |c| c.name = c.name.to_uppercase(),
@@ -53,6 +53,14 @@ async fn unsafe_entries_are_refused_and_saved_ones_start_stopped() {
         },
         |c| {
             c.allowed_chats.insert(String::new());
+        },
+        // A webhook's origin is the user's to name.
+        |c| c.kind = MessengerKind::Webhook,
+        // A webhook only sends, so it allows no chat.
+        |c| {
+            c.kind = MessengerKind::Webhook;
+            c.endpoint = Some(format!("https://{}.example", Id::new_v4()));
+            c.allowed_chats.insert(Id::new_v4().to_string());
         },
     ];
     for change in cases {

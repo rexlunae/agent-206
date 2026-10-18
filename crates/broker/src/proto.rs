@@ -17,16 +17,16 @@ use zeroize::Zeroizing;
 /// [`Request::ImportVault`], version 6 [`AuthScheme::TelegramBot`] and
 /// version 7 [`HttpMethod::Put`], version 8 [`Request::SocketOpen`] with
 /// [`AuthScheme::DiscordBot`], version 9 [`SocketScheme::IrcSasl`], and version
-/// 10 encrypted setup channels and TOTP cancellation, and 11 reviewed vault
-/// imports. A broker accepts greetings from
+/// 10 encrypted setup channels and TOTP cancellation, 11 reviewed vault
+/// imports and 12 [`AuthScheme::WebhookUrl`]. A broker accepts greetings from
 /// [`MIN_BROKER_VERSION`] up to this version, and a client falls back to the
 /// newest version an older broker accepts (see `Client::version`), so streams
 /// are only requested from brokers that understand them.
-pub const BROKER_VERSION: u16 = 11;
+pub const BROKER_VERSION: u16 = 12;
 /// First version with connection-held source reviews and guarded vault import.
 pub use a206_vault_channel::REVIEWED_IMPORT_BROKER_VERSION as REVIEWED_IMPORT_VERSION;
 /// The oldest protocol version this broker still serves and this client still
-/// speaks. Versions 3 to 11 differ only by the requests, roles and schemes they add.
+/// speaks. Versions 3 to 12 differ only by the requests, roles and schemes they add.
 pub const MIN_BROKER_VERSION: u16 = 3;
 /// The first version that serves [`Request::ProviderStream`].
 pub const STREAM_VERSION: u16 = 4;
@@ -44,6 +44,9 @@ pub const SOCKET_VERSION: u16 = 8;
 pub const IRC_VERSION: u16 = 9;
 /// First version with authenticated encrypted setup and explicit TOTP cancellation.
 pub const SETUP_CHANNEL_VERSION: u16 = 10;
+/// The first version that sends to webhook URLs held in the vault
+/// ([`AuthScheme::WebhookUrl`]).
+pub const WEBHOOK_VERSION: u16 = 12;
 /// Longest IRC line the gateway may send, without its CR LF (RFC 1459's
 /// 512 bytes, less the line ending).
 pub const MAX_IRC_LINE: usize = 510;
@@ -212,6 +215,12 @@ pub enum AuthScheme {
     TelegramBot,
     /// `Authorization: Bot …` (Discord). Since [`SOCKET_VERSION`].
     DiscordBot,
+    /// The credential is a whole webhook URL, whose path and query carry its
+    /// key (Slack, Discord, Google Chat and Teams incoming webhooks). The
+    /// call names only the URL's origin, with an empty path and no query; the
+    /// broker sends to the stored URL, which must be on that same origin.
+    /// Since [`WEBHOOK_VERSION`].
+    WebhookUrl,
 }
 
 /// How the broker opens an authenticated WebSocket session. The service is
@@ -505,6 +514,8 @@ pub enum InvalidRequest {
     IrcLogin,
     #[error("an IRC message must be one line of at most 510 bytes without NUL")]
     IrcLine,
+    #[error("a webhook call names only the webhook's origin, without a path or query")]
+    WebhookPath,
     #[error(
         "the vault to import must be an absolute path to a readable regular file of at most 16 MiB"
     )]
@@ -537,6 +548,8 @@ pub enum UpstreamFailure {
     InvalidBotToken,
     #[error("the stored credential cannot be sent as an IRC account password")]
     InvalidPassword,
+    #[error("the stored credential is not a webhook URL on the origin it is bound to")]
+    InvalidWebhookUrl,
     #[error("the service named a socket URL that is not allowed")]
     SocketUrl,
     #[error("the service broke its socket protocol")]

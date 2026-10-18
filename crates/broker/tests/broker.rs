@@ -1394,6 +1394,110 @@ async fn telegram_tokens_go_in_the_path_and_odd_tokens_are_refused() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn webhook_urls_stay_in_the_vault_and_must_stay_on_their_origin() {
+    use axum::{
+        Router,
+        body::Bytes,
+        extract::{Path as UrlPath, RawQuery},
+        http::HeaderMap,
+        routing::post,
+    };
+    type Seen = (String, Option<String>, bool, Vec<u8>);
+    let seen = Arc::new(Mutex::new(Vec::<Seen>::new()));
+    let app = {
+        let seen = seen.clone();
+        Router::new().route(
+            "/hooks/{key}",
+            post(
+                move |UrlPath(key): UrlPath<String>,
+                      RawQuery(query): RawQuery,
+                      headers: HeaderMap,
+                      body: Bytes| {
+                    let seen = seen.clone();
+                    async move {
+                        let header = headers.contains_key("authorization");
+                        seen.lock()
+                            .unwrap()
+                            .push((key, query, header, body.to_vec()));
+                        "ok"
+                    }
+                },
+            ),
+        )
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    // Another origin: the same host on a port nothing listens on.
+    let elsewhere = {
+        let unused = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        format!("http://{}", unused.local_addr().unwrap())
+    };
+
+    let (_dir, root, _task) = start().await;
+    let mut a = user(&root).await;
+    a.call(unlock(&random(), None, true)).await.unwrap();
+    let (key, query) = (random(), random());
+    let (good, away, odd) = (random(), random(), random());
+    for (name, value) in [
+        (&good, format!("{origin}/hooks/{key}?thread={query}")),
+        (&away, format!("{elsewhere}/hooks/{key}")),
+        (&odd, random()),
+    ] {
+        a.call(Request::PutCredential {
+            name: name.clone(),
+            meta: meta(vec![origin.clone()]),
+            value: WireValue::Single(WireSecret::new(value)),
+            replace: false,
+        })
+        .await
+        .unwrap();
+    }
+    let mut gateway = paired_gateway(&mut a, &root).await;
+    let body = random().into_bytes();
+    let call = |credential: &str, url: String| {
+        Request::Provider(ProviderCall {
+            credential: credential.to_owned(),
+            method: HttpMethod::Post,
+            url,
+            auth: AuthScheme::WebhookUrl,
+            anthropic_version: None,
+            body: Some(body.clone()),
+        })
+    };
+    assert!(matches!(
+        gateway.call(call(&good, origin.clone())).await.unwrap(),
+        Reply::Provider { status: 200, .. }
+    ));
+    assert_eq!(
+        *seen.lock().unwrap(),
+        [(
+            key.clone(),
+            Some(format!("thread={query}")),
+            false,
+            body.clone()
+        )]
+    );
+    // The gateway names only the origin: a path or query of its own is
+    // refused, so it cannot steer where the stored URL leads.
+    for url in [format!("{origin}/hooks/{key}"), format!("{origin}/?x=1")] {
+        assert_eq!(
+            denied(gateway.call(call(&good, url)).await),
+            BrokerError::Invalid(InvalidRequest::WebhookPath)
+        );
+    }
+    // A stored URL on another origin, or a value that is no URL, is never
+    // sent anywhere.
+    for credential in [&away, &odd] {
+        assert_eq!(
+            denied(gateway.call(call(credential, origin.clone())).await),
+            BrokerError::Upstream(UpstreamFailure::InvalidWebhookUrl)
+        );
+    }
+    assert_eq!(seen.lock().unwrap().len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn put_requests_carry_their_body_and_the_bearer_token() {
     use axum::{Router, body::Bytes, http::HeaderMap, routing::put};
     let seen = Arc::new(Mutex::new(Vec::<(Option<String>, Vec<u8>)>::new()));
