@@ -1,0 +1,17 @@
+[package]
+name = "a206-git-push"
+description = "Git smart HTTP push messages and the packs they carry"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+[dependencies]
+gix = { version = "0.89", default-features = false, features = ["sha1"] }
+thiserror.workspace = true
+[dev-dependencies]
+# An independent reader of the packs written here.
+gix-pack = { version = "0.76", default-features = false, features = ["streaming-input", "sha1"] }
+tempfile.workspace = true
+uuid.workspace = true
+[lints]
+workspace = true

@@ -1220,7 +1220,7 @@ async fn run_git(
     }
 }
 /// Raises a scan's interrupt flag when set or dropped.
-struct Interrupt(Arc<std::sync::atomic::AtomicBool>);
+pub(crate) struct Interrupt(pub(crate) Arc<std::sync::atomic::AtomicBool>);
 impl Interrupt {
     fn set(&self) {
         self.0.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1235,6 +1235,7 @@ mod fetch;
 mod git;
 mod git_branch;
 mod git_commit;
+pub(crate) mod git_push;
 mod git_stage;
 mod git_switch;
 pub mod packages;
