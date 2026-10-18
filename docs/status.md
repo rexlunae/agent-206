@@ -258,6 +258,8 @@ values; a failed receipt is an explicit partial result with structured causes.
 Tests cover connection scoping, cancellation/replacement/lock invalidation,
 source and target changes, factor enforcement, native/encrypted policy denials,
 old peers, private receipts and receipt failure after copy. UI tests cover
-version/input gating and preserving partial failures. Live web acceptance is
-pending; native desktop/TUI interaction, remote SSH migration, key-file support
+version/input gating and preserving partial failures. Release web acceptance with
+a disposable encrypted source verified source-change refusal, required source
+TOTP, cleared password inputs, successful import/pairing, a private receipt and
+unchanged source bytes. Native desktop/TUI interaction, remote SSH migration, key-file support
 and rollback remain unverified or planned.
