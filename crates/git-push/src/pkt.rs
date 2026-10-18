@@ -8,11 +8,14 @@ pub const MAX_PACKET: usize = 65520;
 /// One data packet, or `None` for a flush packet.
 pub type Packet<'a> = Option<&'a [u8]>;
 
-/// Append `payload` as one data packet.
-pub fn data(out: &mut Vec<u8>, payload: &[u8]) {
-    debug_assert!(payload.len() + 4 <= MAX_PACKET);
+/// Append `payload` as one data packet, refused if it does not fit in one.
+pub fn data(out: &mut Vec<u8>, payload: &[u8]) -> Result<(), WireError> {
+    if payload.len() + 4 > MAX_PACKET {
+        return Err(WireError::TooLong(MAX_PACKET));
+    }
     out.extend_from_slice(format!("{:04x}", payload.len() + 4).as_bytes());
     out.extend_from_slice(payload);
+    Ok(())
 }
 
 pub fn flush(out: &mut Vec<u8>) {
@@ -69,7 +72,7 @@ mod tests {
     fn packets_round_trip_and_malformed_lengths_are_refused() {
         let payload = uuid::Uuid::new_v4().to_string();
         let mut body = vec![];
-        data(&mut body, payload.as_bytes());
+        data(&mut body, payload.as_bytes()).unwrap();
         flush(&mut body);
         let mut reader = Reader::new(&body);
         assert_eq!(reader.next().unwrap(), Some(payload.as_bytes()));

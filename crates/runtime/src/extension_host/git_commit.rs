@@ -101,28 +101,47 @@ pub(super) struct Settings {
     user: gix::config::File,
     home: Option<PathBuf>,
 }
+/// The repository's own configuration, its includes not yet followed.
+fn local_config(repo: &gix::Repository) -> Result<gix::config::File, HostFailure> {
+    let failed = |e: &(dyn std::error::Error + 'static)| git_failure("config", e);
+    let git_dir = repo.git_dir();
+    let read = |name: &str, source| {
+        let path = git_dir.join(name);
+        if path.is_file() {
+            gix::config::File::from_path_no_includes(path, source).map_err(|e| failed(&e))
+        } else {
+            Ok(gix::config::File::default())
+        }
+    };
+    let mut repository = read("config", gix::config::Source::Local)?;
+    // Extension-scoped settings only apply when the repository opts in.
+    if repository
+        .boolean("extensions.worktreeConfig")
+        .unwrap_or(Some(true))
+        .unwrap_or(false)
+    {
+        let worktree = read("config.worktree", gix::config::Source::Worktree)?;
+        repository.append(worktree).map_err(|e| failed(&e))?;
+    }
+    Ok(repository)
+}
+
+/// Whether the repository's own configuration includes other files, which
+/// the project chooses and which may lie outside it.
+pub(super) fn includes_files(repo: &gix::Repository) -> Result<bool, HostFailure> {
+    let repository = local_config(repo)?;
+    Ok(["include", "includeIf"].iter().any(|name| {
+        repository
+            .sections_by_name(name)
+            .is_some_and(|mut sections| sections.next().is_some())
+    }))
+}
+
 impl Settings {
     pub(super) fn resolve(repo: &gix::Repository, user: &UserGit) -> Result<Self, HostFailure> {
         let failed = |e: &(dyn std::error::Error + 'static)| git_failure("config", e);
         let git_dir = repo.git_dir();
-        let read = |name: &str, source| {
-            let path = git_dir.join(name);
-            if path.is_file() {
-                gix::config::File::from_path_no_includes(path, source).map_err(|e| failed(&e))
-            } else {
-                Ok(gix::config::File::default())
-            }
-        };
-        let mut repository = read("config", gix::config::Source::Local)?;
-        // Extension-scoped settings only apply when the repository opts in.
-        if repository
-            .boolean("extensions.worktreeConfig")
-            .unwrap_or(Some(true))
-            .unwrap_or(false)
-        {
-            let worktree = read("config.worktree", gix::config::Source::Worktree)?;
-            repository.append(worktree).map_err(|e| failed(&e))?;
-        }
+        let mut repository = local_config(repo)?;
         let head = repo.head_name().map_err(|e| failed(&e))?;
         let mut options = gix::config::file::includes::Options::follow(
             gix::config::path::interpolate::Context {

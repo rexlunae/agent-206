@@ -576,6 +576,10 @@ the same name on the remote, like `git push <remote> <branch>`:
   password, query or fragment; ssh remotes are refused. A remote URL that a
   `url.*.insteadOf` or `pushInsteadOf` setting would rewrite is refused rather
   than pushed to the unrewritten URL.
+- Settings come from the repository's own configuration, then the user's
+  (including the files the user's configuration includes). A repository whose
+  configuration includes other files (`include` or `includeIf`) is refused:
+  the project chooses those paths and they may lie outside it.
 - A repository with a `pre-push` or `reference-transaction` hook is refused,
   and `user.name` and `user.email` must be set: the remote-tracking branch's
   reflog records them.
@@ -589,13 +593,18 @@ the same name on the remote, like `git push <remote> <branch>`:
   result says `up_to_date`.
 - The pack (crate `a206-git-push`) holds the new commits and the trees and
   blobs they change, whole and compressed, with no deltas. It must fit one
-  broker message: about 4 MiB, at most 10,000 commits and 100,000 objects.
-  Larger pushes are refused; push them from a terminal.
+  broker message: about 4 MiB, at most 10,000 commits and 100,000 objects,
+  and no single object over 16 times that size before compression (each
+  object is read whole). Compression stops as soon as the pack would be too
+  large. Larger pushes are refused; push them from a terminal. Cancelling the
+  run stops choosing and packing objects.
 - The server's report decides the outcome. A refused update (a protected
   branch, for example) fails with the server's reason, cleaned of control
   characters and shortened. After a successful update the gateway moves
-  `refs/remotes/<remote>/<branch>`; if that fails, the error says the push
-  itself happened.
+  `refs/remotes/<remote>/<branch>` forward only: if it already points at a
+  commit the pushed one does not descend from (a later push finished first),
+  it is left there and the result's `tracking_branch` says so. If the update
+  fails, the error says the push itself happened.
 
 The token never reaches the gateway, the model, the conversation or a log.
 Cancelling a call after the pack was sent may leave the server updated. Not

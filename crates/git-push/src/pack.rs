@@ -2,6 +2,7 @@
 use gix::{ObjectId, objs::tree::EntryKind};
 use std::collections::HashSet;
 use std::io::Write as _;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// How much one push may send.
 #[derive(Debug, Clone, Copy)]
@@ -10,6 +11,8 @@ pub struct Limits {
     pub objects: usize,
     /// Pack bytes, header and checksum included.
     pub bytes: usize,
+    /// The largest object, before compression. Each object is read whole.
+    pub object: usize,
 }
 
 /// Why the objects of a push could not be chosen or packed.
@@ -21,6 +24,10 @@ pub enum PackError {
     TooManyObjects(usize),
     #[error("the push would send more than {0} bytes")]
     TooLarge(usize),
+    #[error("the push includes an object larger than {0} bytes")]
+    ObjectTooLarge(usize),
+    #[error("the push was cancelled")]
+    Interrupted,
     #[error("the commits to push include a submodule, which cannot be pushed with them")]
     Submodule,
     #[error("the repository could not be read")]
@@ -43,16 +50,19 @@ pub struct Objects {
 /// skipped; of the others, each tree entry is skipped where it is unchanged
 /// from a parent, so a push of a few commits reads only what they changed.
 /// Objects the server already has elsewhere may still be sent.
+/// `interrupt` stops the walk when raised.
 pub fn objects(
     repo: &gix::Repository,
     tip: ObjectId,
     known: impl IntoIterator<Item = ObjectId>,
     limits: Limits,
+    interrupt: &AtomicBool,
 ) -> Result<Objects, PackError> {
     let hidden: Vec<ObjectId> = known.into_iter().filter(|id| repo.has_object(id)).collect();
     let walk = repo.rev_walk([tip]).with_hidden(hidden).all()?;
     let mut commits = vec![];
     for info in walk {
+        check(interrupt)?;
         let info = info?;
         if commits.len() == limits.commits {
             return Err(PackError::TooManyCommits(limits.commits));
@@ -63,6 +73,7 @@ pub fn objects(
         ids: commits.clone(),
         seen: commits.iter().copied().collect(),
         limit: limits.objects,
+        interrupt,
     };
     if chosen.ids.len() > chosen.limit {
         return Err(PackError::TooManyObjects(chosen.limit));
@@ -84,12 +95,13 @@ pub fn objects(
     })
 }
 
-struct Chosen {
+struct Chosen<'a> {
     ids: Vec<ObjectId>,
     seen: HashSet<ObjectId>,
     limit: usize,
+    interrupt: &'a AtomicBool,
 }
-impl Chosen {
+impl Chosen<'_> {
     /// Add `id` unless already chosen; `true` if it was new.
     fn add(&mut self, id: ObjectId) -> Result<bool, PackError> {
         if !self.seen.insert(id) {
@@ -109,8 +121,9 @@ fn added(
     repo: &gix::Repository,
     tree: ObjectId,
     bases: &[ObjectId],
-    chosen: &mut Chosen,
+    chosen: &mut Chosen<'_>,
 ) -> Result<(), PackError> {
+    check(chosen.interrupt)?;
     if bases.contains(&tree) || !chosen.add(tree)? {
         return Ok(());
     }
@@ -144,6 +157,13 @@ fn added(
     Ok(())
 }
 
+fn check(interrupt: &AtomicBool) -> Result<(), PackError> {
+    if interrupt.load(Ordering::Relaxed) {
+        return Err(PackError::Interrupted);
+    }
+    Ok(())
+}
+
 type Entries = Vec<(Vec<u8>, EntryKind, ObjectId)>;
 
 fn entries(repo: &gix::Repository, tree: ObjectId) -> Result<Entries, PackError> {
@@ -162,13 +182,17 @@ fn entries(repo: &gix::Repository, tree: ObjectId) -> Result<Entries, PackError>
         .collect())
 }
 
-/// A version 2 pack of `ids`, each object whole and compressed, of at most
-/// `max` bytes.
+/// A version 2 pack of `ids`, each object whole and compressed, within
+/// `limits.bytes` and `limits.object`. An object's size is checked before it
+/// is read, and compression stops as soon as the pack would be too large.
+/// `interrupt` stops the writing when raised.
 pub fn write_pack(
     repo: &gix::Repository,
     ids: &[ObjectId],
-    max: usize,
+    limits: Limits,
+    interrupt: &AtomicBool,
 ) -> Result<Vec<u8>, PackError> {
+    let max = limits.bytes;
     let too_large = || PackError::TooLarge(max);
     let count = u32::try_from(ids.len()).map_err(|_| too_large())?;
     let mut pack = Vec::new();
@@ -176,7 +200,13 @@ pub fn write_pack(
     pack.extend_from_slice(&2u32.to_be_bytes());
     pack.extend_from_slice(&count.to_be_bytes());
     let checksum = repo.object_hash().len_in_bytes();
+    let room = max.checked_sub(checksum).ok_or_else(too_large)?;
     for id in ids {
+        check(interrupt)?;
+        let size = usize::try_from(repo.find_header(*id)?.size()).unwrap_or(usize::MAX);
+        if size > limits.object {
+            return Err(PackError::ObjectTooLarge(limits.object));
+        }
         let object = repo.find_object(*id)?;
         let kind = match object.kind {
             gix::object::Kind::Commit => 1u8,
@@ -195,15 +225,24 @@ pub fn write_pack(
             size >>= 7;
         }
         pack.push(byte);
-        let mut deflate =
-            gix::zlib::stream::deflate::Write::new(Vec::new(), gix::zlib::Compression::DEFAULT);
-        deflate
-            .write_all(&object.data)
-            .and_then(|()| deflate.flush())
-            .map_err(PackError::Compress)?;
-        pack.extend_from_slice(&deflate.into_inner());
-        if pack.len() + checksum > max {
+        if pack.len() > room {
             return Err(too_large());
+        }
+        let mut deflate = gix::zlib::stream::deflate::Write::new(
+            Bounded {
+                out: &mut pack,
+                room,
+                full: false,
+            },
+            gix::zlib::Compression::DEFAULT,
+        );
+        let written = deflate
+            .write_all(&object.data)
+            .and_then(|()| deflate.flush());
+        let full = deflate.into_inner().full;
+        match written {
+            Err(_) if full => return Err(too_large()),
+            written => written.map_err(PackError::Compress)?,
         }
     }
     let mut hasher = gix::hash::hasher(repo.object_hash());
@@ -211,6 +250,27 @@ pub fn write_pack(
     let digest = hasher.try_finalize()?;
     pack.extend_from_slice(digest.as_bytes());
     Ok(pack)
+}
+
+/// Appends to a pack, refusing any write past `room` bytes.
+struct Bounded<'a> {
+    out: &'a mut Vec<u8>,
+    room: usize,
+    /// Set when a write was refused for lack of room.
+    full: bool,
+}
+impl std::io::Write for Bounded<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.out.len().saturating_add(buf.len()) > self.room {
+            self.full = true;
+            return Err(std::io::ErrorKind::WriteZero.into());
+        }
+        self.out.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -222,7 +282,9 @@ mod tests {
         commits: 100,
         objects: 1_000,
         bytes: 1 << 20,
+        object: 1 << 20,
     };
+    static RUNNING: AtomicBool = AtomicBool::new(false);
 
     fn text() -> String {
         uuid::Uuid::new_v4().to_string()
@@ -299,7 +361,7 @@ mod tests {
         let second = commit(&repo, second_tree, &[first]);
         let unknown = commit(&repo, first_tree, &[]);
 
-        let chosen = objects(&repo, second, [first], ROOMY).unwrap();
+        let chosen = objects(&repo, second, [first], ROOMY, &RUNNING).unwrap();
         assert_eq!(chosen.commits, 1);
         let chosen = chosen.ids;
         assert_eq!(chosen[0], second, "commits come first");
@@ -317,7 +379,9 @@ mod tests {
         // everything is sent.
         let hex = format!("{}{}", text(), text()).replace('-', "");
         let missing = ObjectId::from_hex(&hex.as_bytes()[..40]).unwrap();
-        let everything = objects(&repo, second, [missing], ROOMY).unwrap().ids;
+        let everything = objects(&repo, second, [missing], ROOMY, &RUNNING)
+            .unwrap()
+            .ids;
         assert_eq!(
             set(&everything),
             set(&[
@@ -335,13 +399,13 @@ mod tests {
         );
         // Nothing is new once the server has the tip.
         assert!(
-            objects(&repo, second, [second], ROOMY)
+            objects(&repo, second, [second], ROOMY, &RUNNING)
                 .unwrap()
                 .ids
                 .is_empty()
         );
         assert!(
-            !objects(&repo, unknown, [second], ROOMY)
+            !objects(&repo, unknown, [second], ROOMY, &RUNNING)
                 .unwrap()
                 .ids
                 .is_empty()
@@ -362,8 +426,8 @@ mod tests {
         let first = commit(&repo, base, &[]);
         let next = tree(&repo, &[("big", &text(), EntryKind::Blob)]);
         let second = commit(&repo, next, &[first]);
-        let chosen = objects(&repo, second, [], ROOMY).unwrap().ids;
-        let pack = write_pack(&repo, &chosen, ROOMY.bytes).unwrap();
+        let chosen = objects(&repo, second, [], ROOMY, &RUNNING).unwrap().ids;
+        let pack = write_pack(&repo, &chosen, ROOMY, &RUNNING).unwrap();
 
         let (_server_dir, server) = repository();
         let directory = server.objects.store_ref().path().join("pack");
@@ -385,7 +449,7 @@ mod tests {
             assert_eq!((sent.kind, &sent.data), (original.kind, &original.data));
         }
         // An empty pack is still a valid pack.
-        let empty = write_pack(&repo, &[], ROOMY.bytes).unwrap();
+        let empty = write_pack(&repo, &[], ROOMY, &RUNNING).unwrap();
         assert_eq!(&empty[..12], b"PACK\0\0\0\x02\0\0\0\0");
         assert_eq!(empty.len(), 12 + repo.object_hash().len_in_bytes());
     }
@@ -403,31 +467,77 @@ mod tests {
             commits,
             objects,
             bytes,
+            object: 1 << 20,
         };
         assert!(matches!(
-            objects(&repo, second, [], limits(1, 100, 1 << 20)),
+            objects(&repo, second, [], limits(1, 100, 1 << 20), &RUNNING),
             Err(PackError::TooManyCommits(1))
         ));
-        assert!(objects(&repo, second, [], limits(2, 100, 1 << 20)).is_ok());
+        assert!(objects(&repo, second, [], limits(2, 100, 1 << 20), &RUNNING).is_ok());
         assert!(matches!(
-            objects(&repo, second, [], limits(2, 5, 1 << 20)),
+            objects(&repo, second, [], limits(2, 5, 1 << 20), &RUNNING),
             Err(PackError::TooManyObjects(5))
         ));
-        let all = objects(&repo, second, [], limits(2, 6, 1 << 20))
+        let all = objects(&repo, second, [], limits(2, 6, 1 << 20), &RUNNING)
             .unwrap()
             .ids;
-        let size = write_pack(&repo, &all, 1 << 20).unwrap().len();
-        assert!(write_pack(&repo, &all, size).is_ok());
+        let size = write_pack(&repo, &all, ROOMY, &RUNNING).unwrap().len();
+        assert!(write_pack(&repo, &all, limits(2, 6, size), &RUNNING).is_ok());
         assert!(matches!(
-            write_pack(&repo, &all, size - 1),
+            write_pack(&repo, &all, limits(2, 6, size - 1), &RUNNING),
             Err(PackError::TooLarge(_))
+        ));
+
+        // An object larger than allowed is refused before it is read, and
+        // one that fits is refused once its compressed form would not.
+        let big = text().repeat(100);
+        let large = commit(
+            &repo,
+            tree(&repo, &[("a", &big, EntryKind::Blob)]),
+            &[second],
+        );
+        let sent = objects(&repo, large, [second], ROOMY, &RUNNING)
+            .unwrap()
+            .ids;
+        let small_objects = Limits {
+            object: big.len() - 1,
+            ..ROOMY
+        };
+        assert!(matches!(
+            write_pack(&repo, &sent, small_objects, &RUNNING),
+            Err(PackError::ObjectTooLarge(_))
+        ));
+        let exact = Limits {
+            object: big.len(),
+            ..ROOMY
+        };
+        assert!(write_pack(&repo, &sent, exact, &RUNNING).is_ok());
+        assert!(matches!(
+            write_pack(&repo, &sent, limits(3, 100, 64), &RUNNING),
+            Err(PackError::TooLarge(64))
         ));
 
         let module = tree(&repo, &[("module", &first.to_string(), EntryKind::Commit)]);
         let with_module = commit(&repo, module, &[second]);
         assert!(matches!(
-            objects(&repo, with_module, [second], ROOMY),
+            objects(&repo, with_module, [second], ROOMY, &RUNNING),
             Err(PackError::Submodule)
+        ));
+    }
+
+    #[test]
+    fn a_raised_interrupt_stops_choosing_and_packing() {
+        let (_dir, repo) = repository();
+        let tip = commit(&repo, tree(&repo, &[("a", &text(), EntryKind::Blob)]), &[]);
+        let stopped = AtomicBool::new(true);
+        assert!(matches!(
+            objects(&repo, tip, [], ROOMY, &stopped),
+            Err(PackError::Interrupted)
+        ));
+        let ids = objects(&repo, tip, [], ROOMY, &RUNNING).unwrap().ids;
+        assert!(matches!(
+            write_pack(&repo, &ids, ROOMY, &stopped),
+            Err(PackError::Interrupted)
         ));
     }
 }

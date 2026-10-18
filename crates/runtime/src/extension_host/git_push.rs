@@ -6,7 +6,7 @@
 use super::{
     git::{check, git_failure, open, unsupported},
     git_branch::branch_name,
-    git_commit::{Settings, UserGit, has_hooks},
+    git_commit::{Settings, UserGit, has_hooks, includes_files},
 };
 use crate::git_push::PushError;
 use a206_extensions::abi::{HostErrorCode, HostFailure};
@@ -24,6 +24,9 @@ use std::{path::PathBuf, sync::atomic::AtomicBool};
 const PUSH_HOOKS: [&str; 2] = ["pre-push", "reference-transaction"];
 /// Most commits a fast-forward check walks back from the pushed commit.
 const MAX_ANCESTRY: usize = 100_000;
+/// How often a remote-tracking branch update is retried after another update
+/// changed the branch first.
+const TRACKING_ATTEMPTS: usize = 3;
 
 /// A branch to push and where to.
 #[derive(Debug, Clone)]
@@ -48,6 +51,19 @@ fn host(error: HostFailure) -> PushError {
     PushError::Repository(error)
 }
 
+/// The settings a push follows: the repository's own, then the user's
+/// (with the includes the user wrote). A push is refused when the
+/// repository's configuration includes other files: the project chooses
+/// them, they may lie outside it, and git would follow them.
+fn settings(repo: &gix::Repository) -> Result<Settings, HostFailure> {
+    if includes_files(repo)? {
+        return Err(unsupported(
+            "the repository's git configuration includes other files, which this push does not read",
+        ));
+    }
+    Settings::resolve(repo, &UserGit::load()?)
+}
+
 /// Resolve `branch` (default: the current one) and `remote` (default: the
 /// branch's configured remote, else `origin`) in the project at `root`.
 pub(crate) fn target(
@@ -57,8 +73,7 @@ pub(crate) fn target(
     interrupt: &AtomicBool,
 ) -> Result<PushTarget, PushError> {
     let repo = open(root, interrupt).map_err(host)?;
-    let user = UserGit::load().map_err(host)?;
-    let settings = Settings::resolve(&repo, &user).map_err(host)?;
+    let settings = settings(&repo).map_err(host)?;
     if has_hooks(&repo, &settings, &PUSH_HOOKS) {
         return Err(host(unsupported(
             "the repository has a pre-push or reference-transaction hook, which git would run",
@@ -166,25 +181,24 @@ pub(crate) fn pack(
     let old = advertised
         .get(&target.reference())
         .unwrap_or_else(|| ObjectId::null(target.hash));
+    let repo = open(root, interrupt).map_err(host)?;
+    // Checked before anything else: a branch that moved since it was
+    // resolved is not up to date merely because the server has its old tip.
+    if peeled(&repo, &target.reference()).map_err(host)? != Some(target.tip) {
+        return Err(PushError::Moved(target.branch.clone()));
+    }
     if old == target.tip {
         return Ok(None);
     }
-    let repo = open(root, interrupt).map_err(host)?;
-    let current = repo
-        .try_find_reference(target.reference().as_str())
-        .map_err(|e| host(git_failure("branches", &e)))?
-        .and_then(|mut reference| reference.peel_to_id().ok())
-        .map(|id| id.detach());
-    if current != Some(target.tip) {
-        return Err(PushError::Moved(target.branch.clone()));
+    if !old.is_null() {
+        match ancestor(&repo, old, target.tip, interrupt).map_err(host)? {
+            Some(true) => {}
+            Some(false) => return Err(PushError::NotFastForward(target.branch.clone())),
+            None => return Err(PushError::History),
+        }
     }
-    if !old.is_null() && !ancestor(&repo, old, target.tip, interrupt)? {
-        return Err(PushError::NotFastForward(target.branch.clone()));
-    }
-    check(interrupt).map_err(host)?;
-    let chosen = a206_git_push::objects(&repo, target.tip, advertised.known(), limits)?;
-    check(interrupt).map_err(host)?;
-    let pack = a206_git_push::write_pack(&repo, &chosen.ids, limits.bytes)?;
+    let chosen = a206_git_push::objects(&repo, target.tip, advertised.known(), limits, interrupt)?;
+    let pack = a206_git_push::write_pack(&repo, &chosen.ids, limits, interrupt)?;
     Ok(Some(Packed {
         old,
         pack,
@@ -193,45 +207,66 @@ pub(crate) fn pack(
     }))
 }
 
-/// Whether `old` is `tip` or one of its ancestors. A commit the repository
-/// lacks is not.
+/// The commit `reference` points at, if it exists.
+fn peeled(repo: &gix::Repository, reference: &str) -> Result<Option<ObjectId>, HostFailure> {
+    Ok(repo
+        .try_find_reference(reference)
+        .map_err(|e| git_failure("branches", &e))?
+        .and_then(|mut reference| reference.peel_to_id().ok())
+        .map(|id| id.detach()))
+}
+
+/// Whether `old` is `tip` or one of its ancestors, or `None` when that
+/// takes more than [`MAX_ANCESTRY`] commits to tell. A commit the
+/// repository lacks is not.
 fn ancestor(
     repo: &gix::Repository,
     old: ObjectId,
     tip: ObjectId,
     interrupt: &AtomicBool,
-) -> Result<bool, PushError> {
+) -> Result<Option<bool>, HostFailure> {
     if !repo.has_object(old) {
-        return Ok(false);
+        return Ok(Some(false));
     }
     let walk = repo
         .rev_walk([tip])
         .all()
-        .map_err(|e| host(git_failure("log", &e)))?;
+        .map_err(|e| git_failure("log", &e))?;
     for (seen, info) in walk.enumerate() {
         if seen == MAX_ANCESTRY {
-            return Err(PushError::History);
+            return Ok(None);
         }
         if seen % 1024 == 0 {
-            check(interrupt).map_err(host)?;
+            check(interrupt)?;
         }
-        if info.map_err(|e| host(git_failure("log", &e)))?.id == old {
-            return Ok(true);
+        if info.map_err(|e| git_failure("log", &e))?.id == old {
+            return Ok(Some(true));
         }
     }
-    Ok(false)
+    Ok(Some(false))
+}
+
+/// What became of the remote-tracking branch after a push.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Tracked {
+    /// It now points at the pushed commit.
+    Updated,
+    /// It already pointed at a commit the pushed one does not descend from,
+    /// such as one a later push or fetch recorded, and was left there.
+    Kept,
 }
 
 /// Point the remote-tracking branch at what the server now has, as git does
-/// after a push.
-pub(crate) fn record(root: PathBuf, target: &PushTarget) -> Result<(), HostFailure> {
+/// after a push. Only moves it forward: the update is refused if the branch
+/// changed after it was read, so two pushes finishing out of order cannot
+/// rewind it.
+pub(crate) fn record(root: PathBuf, target: &PushTarget) -> Result<Tracked, HostFailure> {
     let never = AtomicBool::new(false);
     let repo = open(root, &never)?;
-    let user = UserGit::load()?;
-    let settings = Settings::resolve(&repo, &user)?;
+    let settings = settings(&repo)?;
     let (name, email) = settings.identity()?;
     let tracking = format!("refs/remotes/{}/{}", target.remote, target.branch);
-    let full = tracking.as_str().try_into().map_err(|_| HostFailure {
+    let full: gix::refs::FullName = tracking.as_str().try_into().map_err(|_| HostFailure {
         code: HostErrorCode::Invalid,
         message: "the remote-tracking branch name is not valid".into(),
     })?;
@@ -240,23 +275,40 @@ pub(crate) fn record(root: PathBuf, target: &PushTarget) -> Result<(), HostFailu
         email,
         time: gix::date::Time::now_local_or_utc(),
     };
-    let mut time = Default::default();
-    let edit = RefEdit {
-        change: Change::Update {
-            log: LogChange {
-                mode: RefLog::AndReference,
-                force_create_reflog: false,
-                message: "update by push".into(),
+    let mut attempt = 0;
+    loop {
+        let current = peeled(&repo, &tracking)?;
+        let expected = match current {
+            None => PreviousValue::MustNotExist,
+            Some(current) if current == target.tip => return Ok(Tracked::Updated),
+            Some(current) => match ancestor(&repo, current, target.tip, &never)? {
+                Some(true) => PreviousValue::MustExistAndMatch(Target::Object(current)),
+                Some(false) | None => return Ok(Tracked::Kept),
             },
-            expected: PreviousValue::Any,
-            new: Target::Object(target.tip),
-        },
-        name: full,
-        deref: false,
-    };
-    repo.edit_references_as([edit], Some(signature.to_ref(&mut time)))
-        .map(drop)
-        .map_err(|e| git_failure("push", &e))
+        };
+        let edit = RefEdit {
+            change: Change::Update {
+                log: LogChange {
+                    mode: RefLog::AndReference,
+                    force_create_reflog: false,
+                    message: "update by push".into(),
+                },
+                expected,
+                new: Target::Object(target.tip),
+            },
+            name: full.clone(),
+            deref: false,
+        };
+        let mut time = Default::default();
+        match repo.edit_references_as([edit], Some(signature.to_ref(&mut time))) {
+            Ok(_) => return Ok(Tracked::Updated),
+            // Another update got there first: decide again from its value.
+            Err(_) if attempt < TRACKING_ATTEMPTS && peeled(&repo, &tracking)? != current => {
+                attempt += 1;
+            }
+            Err(e) => return Err(git_failure("push", &e)),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -300,6 +352,41 @@ mod tests {
         std::fs::write(path, text).unwrap();
         dir
     }
+    /// A new commit on the current branch, whose parent is its tip.
+    fn advance(dir: &tempfile::TempDir) -> ObjectId {
+        let repo = gix::open(dir.path()).unwrap();
+        let parent = repo.head_id().unwrap().detach();
+        let tree = repo.head_tree_id().unwrap().detach();
+        let signature = gix::actor::Signature {
+            name: "n".into(),
+            email: "n@example.invalid".into(),
+            time: gix::date::Time::new(2_000_000, 0),
+        };
+        let (mut a, mut b) = Default::default();
+        repo.commit_as(
+            signature.to_ref(&mut a),
+            signature.to_ref(&mut b),
+            "HEAD",
+            nonce(),
+            tree,
+            [parent],
+        )
+        .unwrap()
+        .detach()
+    }
+    fn advertising(target: &PushTarget, tip: ObjectId) -> Advertisement {
+        Advertisement {
+            refs: vec![(target.reference(), tip)],
+            haves: vec![],
+            capabilities: vec!["report-status".into()],
+        }
+    }
+    const ROOMY: Limits = Limits {
+        commits: 100,
+        objects: 1_000,
+        bytes: 1 << 20,
+        object: 1 << 20,
+    };
     fn target_of(
         dir: &tempfile::TempDir,
         branch: Option<&str>,
@@ -410,5 +497,80 @@ mod tests {
                 ..
             }))
         ));
+    }
+
+    #[test]
+    fn a_branch_that_moved_is_never_reported_up_to_date() {
+        let host = format!("{}.example", nonce());
+        let dir = project(&format!(
+            "[remote \"origin\"]\n\turl = https://{host}/a.git\n"
+        ));
+        let resolved = target_of(&dir, None, None).unwrap();
+        let never = AtomicBool::new(false);
+        let server = advertising(&resolved, resolved.tip);
+        assert!(
+            pack(dir.path().into(), &resolved, &server, ROOMY, &never)
+                .unwrap()
+                .is_none()
+        );
+        // A commit made after the branch was resolved: the server having the
+        // old tip does not make the branch up to date.
+        advance(&dir);
+        assert!(matches!(
+            pack(dir.path().into(), &resolved, &server, ROOMY, &never),
+            Err(PushError::Moved(_))
+        ));
+    }
+
+    #[test]
+    fn the_remote_tracking_branch_only_moves_forward() {
+        let host = format!("{}.example", nonce());
+        let dir = project(&format!(
+            "[remote \"origin\"]\n\turl = https://{host}/a.git\n"
+        ));
+        let first = target_of(&dir, None, None).unwrap();
+        advance(&dir);
+        let second = target_of(&dir, None, None).unwrap();
+        let tracking = format!("refs/remotes/origin/{}", first.branch);
+        let at = || {
+            let repo = gix::open(dir.path()).unwrap();
+            peeled(&repo, &tracking).unwrap()
+        };
+        assert_eq!(at(), None);
+        assert_eq!(record(dir.path().into(), &first).unwrap(), Tracked::Updated);
+        assert_eq!(at(), Some(first.tip));
+        assert_eq!(
+            record(dir.path().into(), &second).unwrap(),
+            Tracked::Updated
+        );
+        assert_eq!(at(), Some(second.tip));
+        // The earlier push finishing last does not rewind it.
+        assert_eq!(record(dir.path().into(), &first).unwrap(), Tracked::Kept);
+        assert_eq!(at(), Some(second.tip));
+    }
+
+    #[test]
+    fn a_repository_whose_configuration_includes_files_is_not_pushed() {
+        let host = format!("{}.example", nonce());
+        let outside = tempfile::tempdir().unwrap();
+        let included = outside.path().join("config");
+        std::fs::write(
+            &included,
+            format!("[remote \"origin\"]\n\turl = https://{host}/a.git\n"),
+        )
+        .unwrap();
+        for section in ["include", "includeIf \"gitdir:/\""] {
+            let dir = project(&format!("[{section}]\n\tpath = {}\n", included.display()));
+            assert!(
+                matches!(
+                    target_of(&dir, None, None),
+                    Err(PushError::Repository(HostFailure {
+                        code: HostErrorCode::Unsupported,
+                        ..
+                    }))
+                ),
+                "{section}"
+            );
+        }
     }
 }

@@ -15,6 +15,8 @@ pub enum WireError {
     ObjectFormat { remote: String, local: String },
     #[error("the server does not report the outcome of a push (report-status)")]
     NoReportStatus,
+    #[error("the push command is longer than a {0}-byte packet; use a shorter branch name")]
+    TooLong(usize),
 }
 
 /// The references a server holds, as it advertises them before a push.
@@ -180,7 +182,7 @@ impl Update {
             capabilities.join(" ")
         );
         let mut out = Vec::with_capacity(command.len() + 8 + pack.len());
-        pkt::data(&mut out, command.as_bytes());
+        pkt::data(&mut out, command.as_bytes())?;
         pkt::flush(&mut out);
         out.extend_from_slice(pack);
         Ok(out)
@@ -270,7 +272,7 @@ mod tests {
         let mut out = vec![];
         for line in lines {
             match line {
-                Some(line) => pkt::data(&mut out, line),
+                Some(line) => pkt::data(&mut out, line).unwrap(),
                 None => pkt::flush(&mut out),
             }
         }
@@ -405,6 +407,21 @@ mod tests {
         assert!(matches!(
             update.request(&advertised, &pack),
             Err(WireError::NoReportStatus)
+        ));
+
+        // A name too long for one packet is refused, not framed wrongly.
+        advertised.capabilities = vec!["report-status".into()];
+        let fits =
+            pkt::MAX_PACKET - format!("{} {} \0report-status\n", update.old, update.new).len() - 4;
+        let name = |len: usize| Update {
+            name: "x".repeat(len),
+            ..update.clone()
+        };
+        let request = name(fits).request(&advertised, &pack).unwrap();
+        assert_eq!(&request[..4], format!("{:04x}", pkt::MAX_PACKET).as_bytes());
+        assert!(matches!(
+            name(fits + 1).request(&advertised, &pack),
+            Err(WireError::TooLong(pkt::MAX_PACKET))
         ));
     }
 

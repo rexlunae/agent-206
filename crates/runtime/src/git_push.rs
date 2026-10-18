@@ -13,7 +13,10 @@
 //! Cancelling a call is not always safe: once the pack is sent, the server
 //! may update its branch even though the call reports nothing.
 use crate::{
-    extension_host::git_push::{self as repository, PushTarget},
+    extension_host::{
+        Interrupt,
+        git_push::{self as repository, PushTarget, Tracked},
+    },
     gateway::Pushes,
     tools::{ToolHost, ToolListing, ToolOutput, ToolRequest, ToolScope, ToolSpec},
 };
@@ -22,7 +25,10 @@ use a206_extensions::abi::{HostErrorCode, HostFailure};
 use a206_git_push::{Limits, PackError, Update, WireError};
 use futures_util::future::BoxFuture;
 use serde_json::{Map, Value, json};
-use std::{path::PathBuf, sync::atomic::AtomicBool};
+use std::{
+    path::PathBuf,
+    sync::{Arc, atomic::AtomicBool},
+};
 
 /// Pushes a branch to a remote.
 pub const PUSH: &str = "git_push";
@@ -33,6 +39,9 @@ pub const LIMITS: Limits = Limits {
     commits: 10_000,
     objects: 100_000,
     bytes: a206_broker::MAX_PROVIDER_BODY - 4096,
+    // Each object is read whole; one this large would have to shrink
+    // sixteenfold to fit the pack.
+    object: (a206_broker::MAX_PROVIDER_BODY - 4096) * 16,
 };
 
 /// Why a push was refused or failed.
@@ -154,6 +163,7 @@ impl crate::error::Classified for PushError {
             Self::UnexpectedReply | Self::Wire(_) => ErrorKind::Protocol,
             Self::Status { .. } | Self::Unpack(_) | Self::Unreported(_) => ErrorKind::Provider,
             Self::Pack(PackError::Git(_) | PackError::Compress(_)) => ErrorKind::Storage,
+            Self::Pack(PackError::Interrupted) => ErrorKind::Cancelled,
             Self::Pack(_) => ErrorKind::InvalidRequest,
             Self::Moved(_) | Self::NotFastForward(_) | Self::Rejected { .. } => ErrorKind::Conflict,
             Self::Tracking { .. } => ErrorKind::Storage,
@@ -211,12 +221,12 @@ impl PushHost {
         let branch = text(args, "branch")?;
         let remote = text(args, "remote")?;
         let root = scope.workspace.clone().ok_or(PushError::NoProject)?;
+        // Dropping this future (a cancelled run) stops the repository work.
+        let interrupt = Arc::new(AtomicBool::new(false));
+        let _stop = Interrupt(Arc::clone(&interrupt));
         let target = blocking({
-            let root = root.clone();
-            move || {
-                let never = AtomicBool::new(false);
-                repository::target(root, branch.as_deref(), remote.as_deref(), &never)
-            }
+            let (root, interrupt) = (root.clone(), Arc::clone(&interrupt));
+            move || repository::target(root, branch.as_deref(), remote.as_deref(), &interrupt)
         })
         .await?;
         let origin = target.url.origin().ascii_serialization();
@@ -240,8 +250,7 @@ impl PushHost {
         let packed = blocking({
             let target = target.clone();
             move || {
-                let never = AtomicBool::new(false);
-                repository::pack(root, &target, &advertised, LIMITS, &never)
+                repository::pack(root, &target, &advertised, LIMITS, &interrupt)
                     .map(|packed| (packed, advertised))
             }
         })
@@ -280,7 +289,7 @@ impl PushHost {
             "git_push updated a remote branch"
         );
         let workspace = scope.workspace.clone().ok_or(PushError::NoProject)?;
-        record(workspace, &target).await?;
+        let tracking = record(workspace, &target).await?;
         Ok(json!({
             "branch": target.branch,
             "remote": target.remote,
@@ -289,12 +298,16 @@ impl PushHost {
             "commits": packed.commits,
             "objects": packed.objects,
             "bytes": packed.pack.len(),
+            "tracking_branch": match tracking {
+                Tracked::Updated => "updated",
+                Tracked::Kept => "left at a newer commit",
+            },
         }))
     }
 }
 
 /// Update the remote-tracking branch; the push itself already happened.
-async fn record(root: PathBuf, target: &PushTarget) -> Result<(), PushError> {
+async fn record(root: PathBuf, target: &PushTarget) -> Result<Tracked, PushError> {
     let recorded = {
         let target = target.clone();
         tokio::task::spawn_blocking(move || repository::record(root, &target))
