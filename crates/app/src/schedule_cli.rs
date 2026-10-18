@@ -1,7 +1,7 @@
 //! `agent206 schedule`: messages the gateway sends to a conversation at set
 //! times. Each run is an ordinary message under the conversation's grants.
 use a206_core::{
-    Command, Job, JobKind, Reply, Schedule,
+    Command, Job, JobKind, JobRun, Reply, Schedule,
     schedule::{parse_instant, parse_interval},
 };
 use a206_runtime::client::Client;
@@ -54,6 +54,8 @@ pub enum ScheduleAction {
     Resume { id: uuid::Uuid },
     /// Run a job now, leaving its schedule as it is.
     Run { id: uuid::Uuid },
+    /// List a job's latest runs, newest first, as TOML.
+    Runs { id: uuid::Uuid },
     /// Delete a job. Its conversation keeps the messages it sent.
     Remove { id: uuid::Uuid },
 }
@@ -85,6 +87,15 @@ fn schedule(
 fn print(job: &Job) -> Result<()> {
     print!("{}", toml::to_string_pretty(job)?);
     Ok(())
+}
+
+/// A job's runs as TOML.
+fn history(runs: Vec<JobRun>) -> Result<String> {
+    #[derive(serde::Serialize)]
+    struct History {
+        runs: Vec<JobRun>,
+    }
+    Ok(toml::to_string_pretty(&History { runs })?)
 }
 
 pub async fn run(client: &Client, action: ScheduleAction) -> Result<()> {
@@ -127,10 +138,15 @@ pub async fn run(client: &Client, action: ScheduleAction) -> Result<()> {
         ScheduleAction::Pause { id } => Command::SetJobEnabled { id, enabled: false },
         ScheduleAction::Resume { id } => Command::SetJobEnabled { id, enabled: true },
         ScheduleAction::Run { id } => Command::RunJob { id },
+        ScheduleAction::Runs { id } => Command::JobRuns { id },
         ScheduleAction::Remove { id } => Command::RemoveJob { id },
     };
     match client.call(command).await? {
         Reply::Job(job) => print(&job),
+        Reply::JobRuns(runs) => {
+            print!("{}", history(runs)?);
+            Ok(())
+        }
         Reply::Ok => {
             println!("OK");
             Ok(())
@@ -143,6 +159,23 @@ pub async fn run(client: &Client, action: ScheduleAction) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_history_prints_every_run_with_its_outcome() {
+        use a206_core::{ErrorKind, ErrorReport, JobOutcome};
+        let at = uuid::Uuid::new_v4().as_u128() as u64 % 4_000_000_000;
+        let refusal = uuid::Uuid::new_v4().simple().to_string();
+        let running = JobRun::start(at);
+        let refused = JobRun {
+            outcome: JobOutcome::Refused(ErrorReport::new(ErrorKind::Conflict, refusal.clone())),
+            ended: Some(at),
+            ..JobRun::start(at)
+        };
+        let text = history(vec![running.clone(), refused.clone()]).unwrap();
+        assert_eq!(text.matches("[[runs]]").count(), 2, "{text}");
+        assert!(text.contains(&running.id.to_string()), "{text}");
+        assert!(text.contains(&refusal), "{text}");
+    }
 
     #[test]
     fn exactly_one_schedule_is_accepted() {
