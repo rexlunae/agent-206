@@ -30,6 +30,9 @@ const MAX_TEXT: usize = 128 * 1024;
 /// Longest the scheduler sleeps without re-reading the clock, so a changed
 /// system clock or time zone is noticed.
 const RECHECK: u64 = 3600;
+/// Seconds before a job whose schedule failed while its trigger check ran is
+/// looked at again.
+const DEFERRED_RECHECK: u64 = 60;
 
 impl Gateway {
     pub(super) fn schedule_job(
@@ -194,7 +197,7 @@ impl Gateway {
     /// Returns when the next job is due.
     pub fn run_due_jobs(&self, now: u64) -> Result<Option<u64>> {
         let mut store = self.lock()?;
-        let (mut due, mut skipped) = (vec![], vec![]);
+        let (mut due, mut skipped, mut deferred) = (vec![], vec![], u64::MAX);
         for job in store
             .state
             .jobs
@@ -215,6 +218,12 @@ impl Gateway {
                     job.enabled = next.is_some();
                     job.last = Some(JobRun::start(now));
                     due.push(job.clone());
+                }
+                // Recorded once the check ends: the refusal would replace
+                // its run as the latest, and let another check start beside
+                // it. Until then the job is looked at again shortly.
+                Err(_) if still_checking(job) => {
+                    deferred = deferred.min(now.saturating_add(DEFERRED_RECHECK));
                 }
                 // A schedule that stopped resolving (a time zone removed from
                 // the system) is paused with the reason, never retried blindly.
@@ -242,6 +251,8 @@ impl Gateway {
             .iter()
             .filter(|job| job.enabled)
             .filter_map(|job| job.next)
+            .filter(|next| *next > now)
+            .chain((deferred < u64::MAX).then_some(deferred))
             .min();
         drop(store);
         for job in &due {
@@ -613,7 +624,6 @@ impl Jobs {
     }
 }
 
-/// How a job's run ended, from its conversation once the run returned.
 /// Whether `job` is a trigger check whose latest run has not ended.
 fn still_checking(job: &Job) -> bool {
     matches!(job.kind, JobKind::Trigger { .. })
@@ -623,6 +633,7 @@ fn still_checking(job: &Job) -> bool {
             .is_some_and(|last| last.outcome == JobOutcome::Running)
 }
 
+/// How a job's run ended, from its conversation once the run returned.
 fn ended(kind: &JobKind, thread: &Thread) -> JobOutcome {
     match thread.state {
         // Messages steered too late for the run follow its reply.

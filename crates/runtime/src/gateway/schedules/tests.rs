@@ -678,6 +678,35 @@ async fn a_trigger_check_does_not_start_while_the_last_one_runs() {
     let first = created.next.unwrap();
     assert_eq!(g.run_due_jobs(first).unwrap(), Some(first + seconds));
     let after = job(&g, created.id);
-    assert_eq!(after.last, Some(running));
+    assert_eq!(after.last, Some(running.clone()));
     assert_eq!(after.next, Some(first + seconds));
+
+    // A schedule that stops resolving meanwhile is refused only once the
+    // check has ended, so the refusal never stands in for a running check.
+    let due = first + seconds;
+    job_mut(&mut g.lock().unwrap().state, created.id)
+        .unwrap()
+        .schedule = Schedule::In { seconds };
+    assert_eq!(g.run_due_jobs(due).unwrap(), Some(due + DEFERRED_RECHECK));
+    let deferred = job(&g, created.id);
+    assert_eq!(deferred.last, Some(running.clone()));
+    assert!(deferred.enabled);
+    assert_eq!(
+        kind(send(&g, Command::RunJob { id: created.id }).await),
+        ErrorKind::Conflict
+    );
+    job_mut(&mut g.lock().unwrap().state, created.id)
+        .unwrap()
+        .last = Some(JobRun {
+        outcome: JobOutcome::Quiet,
+        ended: Some(due),
+        ..running
+    });
+    assert_eq!(g.run_due_jobs(due).unwrap(), None);
+    let refused = job(&g, created.id);
+    assert!(!refused.enabled);
+    assert!(matches!(
+        refused.last.map(|run| run.outcome),
+        Some(JobOutcome::Refused(_))
+    ));
 }
