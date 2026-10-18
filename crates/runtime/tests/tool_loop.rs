@@ -2239,6 +2239,141 @@ async fn a_subagent_started_from_a_profile_takes_its_mode_model_and_instructions
 }
 
 #[tokio::test]
+async fn a_team_coordinator_delegates_only_to_its_member_profiles() {
+    let api = ProviderApi::OpenAi;
+    let mut rig = rig(api, vec![], None).await;
+    for tool in [subagents::SPAWN, subagents::WAIT] {
+        rig.permit(tool, ToolPermission::Allow).await;
+    }
+    let root = rig._state.path();
+    let profiles = root.join(a206_core::profiles::DIRECTORY);
+    let teams = root.join(a206_core::teams::DIRECTORY);
+    std::fs::create_dir(&profiles).unwrap();
+    std::fs::create_dir(&teams).unwrap();
+    let (lead, reader, shared) = (nonce(), nonce(), nonce());
+    let outsider = nonce();
+    for (id, instructions) in [
+        ("lead", &lead),
+        ("reader", &reader),
+        ("outsider", &outsider),
+    ] {
+        std::fs::write(
+            profiles.join(format!("{id}.toml")),
+            format!("name = \"{id} name\"\ndescription = \"{id} does {instructions}\"\ninstructions = \"{instructions}\""),
+        )
+        .unwrap();
+    }
+    std::fs::write(
+        teams.join("research.toml"),
+        format!("name = \"Research\"\ncoordinator = \"lead\"\nmembers = [\"reader\"]\ninstructions = \"{shared}\""),
+    )
+    .unwrap();
+    let start = |parent: Id| Command::StartTeam {
+        parent,
+        team: "research".into(),
+        title: nonce(),
+        mode: Mode::Plan,
+        model: rig.model.clone(),
+        requested: Default::default(),
+    };
+    let Reply::Thread(coordinator) = rig.run(start(rig.thread)).await else {
+        panic!("the team did not start");
+    };
+    let team = coordinator
+        .team
+        .clone()
+        .expect("the coordinator records its team");
+    assert_eq!(team.role, TeamRole::Coordinator);
+    assert_eq!(
+        coordinator.profile.as_ref().map(|p| p.id.as_str()),
+        Some("lead")
+    );
+    assert_eq!(coordinator.subagent_models, rig.thread().subagent_models);
+    assert_eq!(coordinator.tool_permissions, rig.thread().tool_permissions);
+
+    // Clients are held to the same rules as the coordinator's tools.
+    let Reply::Error(nested) = rig.run(start(coordinator.id)).await else {
+        panic!("a team started inside a team");
+    };
+    assert_eq!(nested.kind, ErrorKind::PermissionDenied);
+    let Reply::Error(outside) = rig
+        .run(Command::CreateProfileSubagent {
+            parent: coordinator.id,
+            title: nonce(),
+            mode: Mode::Plan,
+            model: rig.model.clone(),
+            requested: Default::default(),
+            profile: "outsider".into(),
+        })
+        .await
+    else {
+        panic!("a coordinator's subagent started from a non-member profile");
+    };
+    assert_eq!(outside.kind, ErrorKind::PermissionDenied);
+
+    let task = send(&rig.gateway, coordinator.id);
+    let first = rig.next_request().await;
+    let offered = first.body.to_string();
+    assert!(
+        offered.contains(&lead) && offered.contains(&shared),
+        "{offered}"
+    );
+    assert!(offered.contains("reader does"), "{offered}");
+    assert!(
+        !offered.contains(&outsider),
+        "only members are offered: {offered}"
+    );
+    let unnamed = Call::new(subagents::SPAWN, json!({"task": nonce()}));
+    let foreign = Call::new(
+        subagents::SPAWN,
+        json!({"task": nonce(), "profile": "outsider"}),
+    );
+    let member = Call::new(
+        subagents::SPAWN,
+        json!({"task": nonce(), "profile": "reader"}),
+    );
+    first
+        .respond(calls_response(
+            api,
+            &[unnamed.clone(), foreign.clone(), member.clone()],
+            &nonce(),
+        ))
+        .await;
+    let (parent, child) = parent_and_child(&mut rig, api, &member.id).await;
+    let prompt = child.body.to_string();
+    assert!(
+        prompt.contains(&reader) && prompt.contains(&shared),
+        "{prompt}"
+    );
+    assert!(
+        prompt.contains("lead name"),
+        "a member knows its coordinator"
+    );
+    assert!(
+        !prompt.contains(&lead),
+        "the coordinator's instructions stay its own"
+    );
+    child.respond(text_response(api, &nonce())).await;
+    let spawned = result_json(api, &parent.body, &member.id);
+    parent.respond(text_response(api, &nonce())).await;
+    let thread = finished(task).await;
+    let calls = calls_of(&thread);
+    assert_eq!(error_kind(&calls[0]), ErrorKind::InvalidRequest);
+    assert_eq!(error_kind(&calls[1]), ErrorKind::PermissionDenied);
+
+    let id: Id = spawned["thread"].as_str().unwrap().parse().unwrap();
+    let joined = thread_of(&rig, id)
+        .team
+        .expect("the member records its team");
+    assert_eq!(joined.role, TeamRole::Member);
+    assert_eq!(joined.digest, team.digest);
+    let Reply::AgentTeams(listed) = rig.run(Command::AgentTeams).await else {
+        panic!("teams unavailable");
+    };
+    assert_eq!(listed.teams.len(), 1);
+}
+
+#[tokio::test]
 async fn cancelling_a_run_cancels_its_subagents() {
     let api = ProviderApi::OpenAi;
     let mut rig = rig(api, vec![], None).await;

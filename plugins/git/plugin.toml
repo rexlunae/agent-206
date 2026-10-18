@@ -1,7 +1,7 @@
 id = "agent206.git"
 name = "Git"
-description = "Shows the status, history and diffs of a project's git repository and stages or commits named files, without running anything the repository configures."
-version = "0.3.0"
+description = "Shows the status, history, branches and diffs of a project's git repository, stages and commits changes and creates branches, without running anything the repository configures."
+version = "0.4.0"
 abi = 2
 capabilities = ["git_read", "git_write"]
 
@@ -19,6 +19,27 @@ capabilities = ["git_read"]
 name = "max"
 type = "integer"
 description = "Most commits to list, from 1 to 200. Defaults to 20."
+
+[[tools]]
+name = "git_branches"
+description = "List the repository's local branches with the commit each points at, marking the current one."
+capabilities = ["git_read"]
+
+[[tools]]
+name = "git_branch_create"
+description = "Create a local branch at a commit without switching to it, like `git branch <name> [<start>]`. The working tree, index and current branch stay as they are. Refused when the branch exists, the repository has a reference-transaction hook, or user.name and user.email are not set."
+capabilities = ["git_write"]
+
+[[tools.params]]
+name = "name"
+type = "string"
+description = "The new branch's name, such as feature/login."
+required = true
+
+[[tools.params]]
+name = "start"
+type = "string"
+description = "A local branch name or full commit id to start from. Defaults to HEAD."
 
 [[tools]]
 name = "git_diff"

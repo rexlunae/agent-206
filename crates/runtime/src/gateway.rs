@@ -193,6 +193,8 @@ pub enum GatewayError {
     #[error(transparent)]
     Profile(#[from] crate::agent_profiles::ProfileError),
     #[error(transparent)]
+    Team(#[from] crate::agent_teams::TeamError),
+    #[error(transparent)]
     ImportReader(#[from] crate::imports::ReaderError),
     #[error(transparent)]
     OutputRules(#[from] a206_output_rules::RulesError),
@@ -290,6 +292,7 @@ impl crate::error::Classified for GatewayError {
             Self::Mcp(error) => return classify(error),
             Self::Skill(error) => return classify(error),
             Self::Profile(error) => return classify(error),
+            Self::Team(error) => return classify(error),
             Self::ImportReader(error) => return classify(error),
             Self::OutputRules(error) => return classify(error),
             Self::Prompt(error) => return classify(error),
@@ -311,15 +314,23 @@ impl crate::error::Classified for GatewayError {
 }
 type Result<T, E = GatewayError> = std::result::Result<T, E>;
 /// The mode prompt, followed by the instructions of the agent profile the
-/// conversation was started from.
-fn with_profile(prompt: String, profile: Option<&ThreadProfile>) -> String {
-    match profile.filter(|p| !p.instructions.is_empty()) {
+/// conversation was started from and what it is told of its team.
+fn with_profile(prompt: String, thread: &Thread) -> String {
+    let mut prompt = match thread
+        .profile
+        .as_deref()
+        .filter(|p| !p.instructions.is_empty())
+    {
         Some(profile) => format!(
             "{prompt}\n\n## Agent profile: {}\n\n{}",
             profile.name, profile.instructions
         ),
         None => prompt,
+    };
+    if let Some(team) = &thread.team {
+        prompt = format!("{prompt}\n\n{}", team.prompt().trim_end());
     }
+    prompt
 }
 fn poisoned<T>(lock: &'static str) -> impl FnOnce(T) -> GatewayError {
     move |_| GatewayError::Poisoned { lock }
@@ -711,6 +722,7 @@ impl Gateway {
                 | Command::CallTool { .. }
                 | Command::Skills
                 | Command::AgentProfiles
+                | Command::AgentTeams
                 | Command::PreviewImport { .. }
                 | Command::PreviewSourceImport { .. }
                 | Command::ReadSkill { .. }
@@ -1284,7 +1296,7 @@ impl Gateway {
                         .find(|p| p.mode == current.mode)
                         .map(|p| p.prompt.clone())
                         .ok_or(GatewayError::Invalid("mode prompt missing"))?;
-                    let prompt = with_profile(prompt, current.profile.as_deref());
+                    let prompt = with_profile(prompt, current);
                     let backend = if current.backend == CodingBackend::Native {
                         None
                     } else {
@@ -1562,6 +1574,27 @@ impl Gateway {
                 )
                 .await
             }
+            Command::StartTeam {
+                parent,
+                team,
+                title,
+                mode,
+                model,
+                requested,
+            } => {
+                self.start_team(
+                    parent,
+                    team,
+                    Spawn {
+                        title,
+                        mode,
+                        model,
+                        requested,
+                        profile: None,
+                    },
+                )
+                .await
+            }
             Command::Download {
                 url,
                 name,
@@ -1759,6 +1792,7 @@ impl Gateway {
             }
             Command::Skills => Ok(Reply::Skills(self.skills()?)),
             Command::AgentProfiles => Ok(Reply::AgentProfiles(self.agent_profiles().await?)),
+            Command::AgentTeams => Ok(Reply::AgentTeams(self.agent_teams().await?)),
             Command::ReadSkill { name } => Ok(Reply::Skill(self.read_skill(&name)?)),
             Command::SetSkillEnabled {
                 name,

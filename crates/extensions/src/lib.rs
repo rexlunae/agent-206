@@ -28,10 +28,13 @@ pub fn required_capability(request: &abi::HostRequest) -> Option<Capability> {
         | R::EditFile { .. }
         | R::CreateDirectory { .. }
         | R::PatchFiles { .. } => Some(Capability::WriteWorkspace),
-        R::GitStatus | R::GitLog { .. } | R::GitDiff { .. } => Some(Capability::GitRead),
-        R::GitCommit { .. } | R::GitCommitStaged { .. } | R::GitStage { .. } => {
-            Some(Capability::GitWrite)
+        R::GitStatus | R::GitLog { .. } | R::GitDiff { .. } | R::GitBranches => {
+            Some(Capability::GitRead)
         }
+        R::GitCommit { .. }
+        | R::GitCommitStaged { .. }
+        | R::GitStage { .. }
+        | R::GitCreateBranch { .. } => Some(Capability::GitWrite),
         R::Fetch { .. } => Some(Capability::Network),
         R::StateGet { .. }
         | R::StatePut { .. }

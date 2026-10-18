@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 pub mod acp;
 pub mod agent_profiles;
+pub mod agent_teams;
 pub mod backends;
 pub mod client;
 pub mod connection;

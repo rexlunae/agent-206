@@ -79,6 +79,16 @@ pub struct Caller {
     pub capabilities: BTreeSet<Capability>,
     /// How many conversations it was delegated from.
     pub ancestors: usize,
+    /// The team it coordinates or works for, if any.
+    pub team: Option<Box<ThreadTeam>>,
+}
+impl Caller {
+    /// Whether its subagents start only from its team's member profiles.
+    pub fn coordinates(&self) -> bool {
+        self.team
+            .as_ref()
+            .is_some_and(|t| t.role == TeamRole::Coordinator)
+    }
 }
 /// One direct subagent, as of one read.
 #[derive(Debug, Clone)]
@@ -296,6 +306,7 @@ impl Delegator {
                 subagent_models: thread.subagent_models.clone(),
                 capabilities: thread.grant.capabilities.clone(),
                 ancestors,
+                team: thread.team.clone(),
             },
             children,
         ))

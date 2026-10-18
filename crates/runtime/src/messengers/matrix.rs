@@ -29,7 +29,7 @@ const MAX_PAGES: usize = 32;
 const MAX_DISCOVERIES: usize = 4_096;
 /// Parts a long reply is split into, in UTF-16 code units. Matrix limits an
 /// event to 64 KiB including its JSON envelope.
-const MAX_MESSAGE_UNITS: usize = 8000;
+pub(super) const MAX_MESSAGE_UNITS: usize = 8000;
 const CLIENT: [&str; 3] = ["_matrix", "client", "v3"];
 
 pub(crate) struct Matrix {

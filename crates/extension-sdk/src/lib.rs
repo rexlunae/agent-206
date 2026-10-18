@@ -363,6 +363,24 @@ pub mod host {
             _ => Err(unexpected()),
         }
     }
+    /// The repository's local branches, by name.
+    pub fn git_branches() -> Result<GitBranches, HostFailure> {
+        match call(&HostRequest::GitBranches)? {
+            HostReply::Branches(branches) => Ok(branches),
+            _ => Err(unexpected()),
+        }
+    }
+    /// Create the local branch `name` at `start` (`HEAD` when `None`)
+    /// without switching to it.
+    pub fn git_create_branch(name: &str, start: Option<&str>) -> Result<GitBranch, HostFailure> {
+        match call(&HostRequest::GitCreateBranch {
+            name: name.into(),
+            start: start.map(Into::into),
+        })? {
+            HostReply::Branch(branch) => Ok(branch),
+            _ => Err(unexpected()),
+        }
+    }
     /// A unified diff of one file, staged or unstaged.
     pub fn git_diff(path: &str, staged: bool) -> Result<GitDiff, HostFailure> {
         match call(&HostRequest::GitDiff {

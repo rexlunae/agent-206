@@ -117,14 +117,16 @@ pub enum MessengerError {
     SendOnly { service: &'static str },
     #[error("the gateway is not paired with an unlocked vault; unlock the vault and try again")]
     NoPairing,
-    #[error("there is no enabled webhook named {name}")]
-    NoWebhook { name: String },
-    #[error("webhook {name} was disabled, disconnected or changed, so nothing more was sent")]
+    #[error("{destination} is not an enabled webhook or an allowed chat of a running messenger")]
+    NoDestination { destination: String },
+    #[error("a model cannot post to {service} chats outside a reply yet")]
+    NoChatPosts { service: &'static str },
+    #[error("messenger {name} was disabled, disconnected or changed, so nothing more was sent")]
     Withdrawn { name: String },
     #[error("the message is empty")]
     EmptyMessage,
     #[error(
-        "the message is longer than this webhook takes ({most} characters); send a shorter one"
+        "the message is longer than this destination takes ({most} characters); send a shorter one"
     )]
     MessageTooLong { most: usize },
     #[error("{sent} of {total} parts were sent before one failed")]
@@ -181,9 +183,10 @@ impl crate::error::Classified for MessengerError {
             | Self::Endpoint(_)
             | Self::EndpointPath
             | Self::SendOnly { .. }
+            | Self::NoChatPosts { .. }
             | Self::EmptyMessage
             | Self::MessageTooLong { .. } => ErrorKind::InvalidRequest,
-            Self::NoWebhook { .. } => ErrorKind::NotFound,
+            Self::NoDestination { .. } => ErrorKind::NotFound,
             Self::NoPairing => ErrorKind::Unavailable,
             Self::Withdrawn { .. } => ErrorKind::Cancelled,
             Self::PartlySent { source, .. } => return crate::error::classify(source.as_ref()),
@@ -882,6 +885,103 @@ fn bounded_parts(text: &str, limit: usize, most: usize) -> Vec<String> {
         parts.push(format!("{kept}{CUT_SHORT}"));
     }
     parts
+}
+
+/// Most parts a message sent with `send_message` is posted in; a longer
+/// message is refused whole rather than cut.
+pub const MAX_SENT_PARTS: usize = 8;
+
+/// `text` in the parts of at most `limit` UTF-16 units it is sent in,
+/// leaving out any part that would hold only whitespace, or why it cannot
+/// be sent whole.
+fn sent_parts(text: &str, limit: usize) -> Result<Vec<String>> {
+    let parts: Vec<String> = split(text, limit)
+        .into_iter()
+        .filter(|part| !part.trim().is_empty())
+        .map(str::to_owned)
+        .collect();
+    if parts.is_empty() {
+        return Err(MessengerError::EmptyMessage);
+    }
+    if parts.len() > MAX_SENT_PARTS {
+        return Err(MessengerError::MessageTooLong {
+            most: limit * MAX_SENT_PARTS,
+        });
+    }
+    Ok(parts)
+}
+
+/// Send `parts` in order with `send`; the number sent. `withdrawn` is asked
+/// before each part: once the user has disabled, disconnected or changed
+/// messenger `name`, nothing more is sent. A part that fails or is withheld
+/// stops the rest, and the error says how many were already delivered.
+async fn send_in_parts<F: Future<Output = Result<()>>>(
+    name: &str,
+    parts: Vec<String>,
+    withdrawn: impl Fn() -> bool,
+    send: impl Fn(String) -> F,
+) -> Result<usize> {
+    let total = parts.len();
+    for (sent, part) in parts.into_iter().enumerate() {
+        let delivered = if withdrawn() {
+            Err(MessengerError::Withdrawn {
+                name: name.to_owned(),
+            })
+        } else {
+            send(part).await
+        };
+        if let Err(error) = delivered {
+            return Err(if sent == 0 {
+                error
+            } else {
+                MessengerError::PartlySent {
+                    sent,
+                    total,
+                    source: Box::new(error),
+                }
+            });
+        }
+    }
+    Ok(total)
+}
+
+/// The longest part `send_message` posts to a chat of `kind`, or `None` if a
+/// model cannot post to its chats outside a reply. Kinds that send each part
+/// with one request through the broker can; IRC and Signal send over the
+/// running messenger's own connection, which is not shared with the tool.
+pub fn chat_part_limit(kind: MessengerKind) -> Option<usize> {
+    match kind {
+        MessengerKind::Telegram => Some(telegram::MAX_MESSAGE_UNITS),
+        MessengerKind::Matrix => Some(matrix::MAX_MESSAGE_UNITS),
+        MessengerKind::Discord => Some(discord::MAX_MESSAGE_UNITS),
+        MessengerKind::Slack => Some(slack::MAX_MESSAGE_UNITS),
+        MessengerKind::Beeper => Some(beeper::MAX_MESSAGE),
+        MessengerKind::Irc | MessengerKind::Signal | MessengerKind::Webhook => None,
+    }
+}
+
+/// Post `text` to `chat` of `config` as a reply there is sent, outside any
+/// turn of that chat; the number of parts sent. The caller checks that the
+/// chat is allowed and the messenger running; see [`send_in_parts`] for
+/// `withdrawn`.
+pub(crate) async fn post(
+    root: PathBuf,
+    pairing: BrokerPairing,
+    config: &MessengerConfig,
+    chat: &str,
+    text: &str,
+    withdrawn: impl Fn() -> bool,
+) -> Result<usize> {
+    let limit = chat_part_limit(config.kind).ok_or(MessengerError::NoChatPosts {
+        service: config.kind.label(),
+    })?;
+    let parts = sent_parts(text, limit)?;
+    let adapter = Adapter::open(root, pairing, config)?;
+    let adapter = &adapter;
+    send_in_parts(&config.name, parts, withdrawn, |part| async move {
+        adapter.send(chat, &part).await
+    })
+    .await
 }
 
 /// Destination-bound requests through the vault broker for one messenger.
