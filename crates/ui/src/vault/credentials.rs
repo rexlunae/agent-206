@@ -18,7 +18,7 @@ impl Panel {
         }
         // Background metadata reads must preserve setup/import outcomes.
         self.busy.set(true);
-        self.credential_failure.set(None);
+        self.credential_read_failure.set(None);
         spawn(async move {
             let result = self
                 .session()
@@ -32,12 +32,12 @@ impl Panel {
                 Ok(Reply::CredentialPage(page)) if valid_page(&page) => {
                     self.credential_page.set(Some(page))
                 }
-                Ok(_) => self.credential_failure.set(Some(failure(
+                Ok(_) => self.credential_read_failure.set(Some(failure(
                     "vault_credentials",
                     "Could not read credentials",
                     &unexpected(),
                 ))),
-                Err(error) => self.credential_failure.set(Some(failure(
+                Err(error) => self.credential_read_failure.set(Some(failure(
                     "vault_credentials",
                     "Could not read credentials",
                     &error,
@@ -50,7 +50,6 @@ impl Panel {
         if !self.begin() {
             return;
         }
-        self.key_editor.set(false);
         self.credential_failure.set(None);
         spawn(async move {
             match self
@@ -65,6 +64,7 @@ impl Panel {
                 .await
             {
                 Ok(Reply::Ok) => {
+                    self.key_editor.set(false);
                     self.notice
                         .set(Some("API key saved. Each agent use requires approval."));
                     self.credential_page.set(None);
@@ -74,14 +74,33 @@ impl Panel {
                     "API key save was not confirmed; refresh credentials before retrying",
                     &unexpected(),
                 ))),
-                Err(error) => self.credential_failure.set(Some(failure(
-                    "vault_add_key",
-                    "Could not confirm API key save; refresh credentials before retrying",
-                    &error,
-                ))),
+                Err(error) => {
+                    if broker_refused(&error, BrokerError::StepUpRequired) {
+                        self.flow.set(Flow::StepUp(Task::AddCredential));
+                    }
+                    self.credential_failure.set(Some(failure(
+                        "vault_add_key",
+                        save_failure_title(&error),
+                        &error,
+                    )));
+                }
             }
             self.finish().await;
         });
+    }
+}
+fn save_failure_title(error: &VaultError) -> &'static str {
+    if error.code == BrokerError::StepUpRequired
+        || matches!(
+            error.report.kind,
+            a206_core::ErrorKind::InvalidRequest
+                | a206_core::ErrorKind::Conflict
+                | a206_core::ErrorKind::PermissionDenied
+        )
+    {
+        "API key was not saved. Correct the fields and re-enter the key."
+    } else {
+        "Could not confirm API key save; refresh credentials before retrying"
     }
 }
 fn valid_page(page: &CredentialPage) -> bool {
@@ -128,11 +147,11 @@ pub(super) fn Credentials(
 ) -> Element {
     let busy = (panel.busy)();
     let page = (panel.credential_page)();
-    let failed = (panel.credential_failure)().is_some();
+    let failed = (panel.credential_read_failure)().is_some();
     use_effect(move || {
         if !(panel.busy)()
             && (panel.credential_page)().is_none()
-            && (panel.credential_failure)().is_none()
+            && (panel.credential_read_failure)().is_none()
         {
             onread.call(None);
         }
@@ -182,7 +201,8 @@ pub(super) fn Credentials(
                 if page.legacy_count > 0 { p { "{page.legacy_count} legacy entries are available through the trusted local CLI." } }
             }
             if (panel.key_editor)() {
-                KeyForm { busy, onadd, oncancel: move |_| panel.key_editor.set(false) }
+                KeyForm { busy, needs_auth: !(panel.status)().is_some_and(|s| s.step_up_active) || (panel.flow)() != Flow::Idle,
+                    onadd, oncancel: move |_| panel.key_editor.set(false), onauthenticate: move |_| panel.start(Task::AddCredential) }
             }
         }
         CardFooter {
@@ -197,7 +217,13 @@ pub(super) fn Credentials(
     } }
 }
 #[component]
-fn KeyForm(busy: bool, onadd: EventHandler<KeyInput>, oncancel: EventHandler<()>) -> Element {
+fn KeyForm(
+    busy: bool,
+    needs_auth: bool,
+    onadd: EventHandler<KeyInput>,
+    oncancel: EventHandler<()>,
+    onauthenticate: EventHandler<()>,
+) -> Element {
     let mut name = use_signal(String::new);
     let mut label = use_signal(String::new);
     let mut origins = use_signal(String::new);
@@ -210,24 +236,31 @@ fn KeyForm(busy: bool, onadd: EventHandler<KeyInput>, oncancel: EventHandler<()>
         }
         // A disposed signal is already gone; no input buffer remains to clear.
     });
+    let availability = if busy || needs_auth {
+        Availability::Disabled
+    } else {
+        Availability::Enabled
+    };
     let ready = !busy
+        && !needs_auth
         && !name.read().trim().is_empty()
         && !label.read().trim().is_empty()
         && !value.read().is_empty();
     rsx! {
         Field { label: rsx! { "Credential name" }, hint: rsx! { "A unique vault identifier. Existing credentials cannot be replaced here." },
-            Input { value: ReadSignal::from(name), oninput: move |v| name.set(v) }
+            Input { availability: availability.clone(), value: ReadSignal::from(name), oninput: move |v| name.set(v) }
         }
-        Field { label: rsx! { "Label" }, Input { value: ReadSignal::from(label), oninput: move |v| label.set(v) } }
+        Field { label: rsx! { "Label" }, Input { availability: availability.clone(), value: ReadSignal::from(label), oninput: move |v| label.set(v) } }
         Field { label: rsx! { "Permitted origins" }, hint: rsx! { "Separate exact HTTPS origins with spaces. No paths or queries. Leave empty to prevent brokered use." },
-            Input { value: ReadSignal::from(origins), oninput: move |v| origins.set(v) }
+            Input { availability: availability.clone(), value: ReadSignal::from(origins), oninput: move |v| origins.set(v) }
         }
-        Field { label: rsx! { "API key" }, hint: rsx! { "Saved encrypted with approval required for every agent use." },
-            Input { r#type: InputType::Password, value: ReadSignal::from(value), oninput: move |v| { let mut buffer = value.write(); buffer.zeroize(); *buffer = v; }, autocomplete: "off" }
+        Field { label: rsx! { "API key" }, hint: rsx! { "Cleared after every submit. Re-enter it after correcting an error. Saved with approval required for every agent use." },
+            Input { availability: availability.clone(), r#type: InputType::Password, value: ReadSignal::from(value), oninput: move |v| { let mut buffer = value.write(); buffer.zeroize(); *buffer = v; }, autocomplete: "off" }
         }
+        if needs_auth { Button { variant: ButtonVariant::Secondary, availability: if busy { Availability::Disabled } else { Availability::Enabled }, onclick: move |_| onauthenticate.call(()), "Authenticate to continue" } }
         Button { variant: ButtonVariant::Primary, availability: if ready { Availability::Enabled } else { Availability::Disabled },
             onclick: move |_| {
-                let input = KeyInput { name: take(name), label: take(label), destinations: take(origins).split_whitespace().map(str::to_owned).collect(), value: WireSecret::new(take(value)) };
+                let input = KeyInput { name: name(), label: label(), destinations: origins.read().split_whitespace().map(str::to_owned).collect(), value: WireSecret::new(take(value)) };
                 onadd.call(input);
             }, "Save API key" }
         Button { variant: ButtonVariant::Ghost, onclick: move |_| { value.write().zeroize(); oncancel.call(()); }, "Cancel API key" }
@@ -237,6 +270,36 @@ fn KeyForm(busy: bool, onadd: EventHandler<KeyInput>, oncancel: EventHandler<()>
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn confirmed_rejections_and_uncertain_saves_have_different_recovery() {
+        for kind in [
+            a206_core::ErrorKind::InvalidRequest,
+            a206_core::ErrorKind::Conflict,
+            a206_core::ErrorKind::PermissionDenied,
+        ] {
+            let error = VaultError {
+                code: BrokerError::Other,
+                report: ErrorReport::new(kind, "Rejected"),
+            };
+            assert!(save_failure_title(&error).contains("Correct the fields"));
+        }
+        for kind in [
+            a206_core::ErrorKind::Protocol,
+            a206_core::ErrorKind::Unavailable,
+            a206_core::ErrorKind::Storage,
+        ] {
+            let error = VaultError {
+                code: BrokerError::Other,
+                report: ErrorReport::new(kind, "Unconfirmed"),
+            };
+            assert!(save_failure_title(&error).contains("refresh credentials"));
+        }
+        let error = VaultError {
+            code: BrokerError::StepUpRequired,
+            report: ErrorReport::new(a206_core::ErrorKind::Other, "Authentication required"),
+        };
+        assert!(save_failure_title(&error).contains("re-enter the key"));
+    }
     #[test]
     fn pages_reject_unknown_schema_bad_order_and_fabricated_cursors() {
         let mut page = CredentialPage {

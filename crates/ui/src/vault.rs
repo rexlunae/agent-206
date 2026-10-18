@@ -128,6 +128,7 @@ struct Panel {
     import_result: Signal<Option<a206_vault_channel::ImportApplied>>,
     credential_page: Signal<Option<a206_vault_channel::CredentialPage>>,
     credential_failure: Signal<Option<Failure>>,
+    credential_read_failure: Signal<Option<Failure>>,
     key_editor: Signal<bool>,
     /// The Get started checklist, when this panel is on that page.
     progress: Option<VaultProgress>,
@@ -214,6 +215,9 @@ impl Panel {
     }
     fn forget_credentials(mut self) {
         self.credential_page.set(None);
+        // A page error belongs to the previous lock/connection state. Keep
+        // mutation failures separately so an uncertain save is never hidden.
+        self.credential_read_failure.set(None);
         self.key_editor.set(false);
     }
     /// The Get started page's background re-read. It never starts a broker,
@@ -541,6 +545,7 @@ fn VaultPanel(target: Target) -> Element {
         import_result: use_signal(|| None),
         credential_page: use_signal(|| None),
         credential_failure: use_signal(|| None),
+        credential_read_failure: use_signal(|| None),
         key_editor: use_signal(|| false),
         progress: VaultProgress::listener(),
     };
@@ -749,6 +754,9 @@ fn VaultPanel(target: Target) -> Element {
         }
     }
     if let Some(Failure { title, report }) = (panel.credential_failure)() {
+        ErrorNotice { report, title }
+    }
+    if let Some(Failure { title, report }) = (panel.credential_read_failure)() {
         ErrorNotice { report, title }
     }
     if status.as_ref().is_some_and(|s| s.unlocked) {
