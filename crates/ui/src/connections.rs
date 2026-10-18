@@ -57,7 +57,15 @@ fn change(
     if !online || busy || base.revision != revision {
         return None;
     }
-    let next = update(base, draft?).ok()?;
+    let draft = draft?;
+    // Compare the raw draft before normalization: opening or reloading an
+    // account must never submit whitespace cleanup as a user edit.
+    if base.providers.iter().find(|p| p.id == draft.id) == Some(draft) {
+        return None;
+    }
+    // Invalid local fields disable Save; gateway errors from actual saves
+    // remain structured and are displayed below.
+    let next = update(base, draft).ok()?;
     (next != *base).then_some(next)
 }
 
@@ -110,6 +118,11 @@ pub(crate) fn ConnectionEditor(
             Button { variant: ButtonVariant::Primary, availability: if can_save { Availability::Enabled } else { Availability::Disabled }, onclick: move |_| {
                 let Some(settings) = change(&base.read(), state.data.read().settings.revision, draft.read().as_ref(), (state.connected)(), busy()) else { return; };
                 busy.set(true); failure.set(None);
+                // Deliberately detached from this synchronous event handler,
+                // but owned by the Dioxus editor scope and canceled on unmount
+                // (including a gateway switch). A sent save may still commit;
+                // cancellation is not rollback. The next snapshot is authoritative.
+                // While mounted, retain errors and await refresh before closing.
                 spawn(async move {
                     let result = crate::call(Command::SaveSettings(Box::new(settings))).await.and_then(saved);
                     crate::refresh(state).await;
@@ -197,5 +210,20 @@ mod tests {
         assert_eq!(account.label, "Unsaved draft");
         assert!(change(&base, base.revision, Some(&account), false, false).is_none());
         assert!(change(&base, base.revision, Some(&account), true, true).is_none());
+    }
+
+    #[test]
+    fn untouched_whitespace_is_not_an_edit() {
+        let (mut base, mut account) = fixture();
+        account.label = format!(" {} ", account.label);
+        account.base_url = format!(" {} ", account.base_url);
+        for reference in [None, Some(" saved-reference ".into()), Some("  ".into())] {
+            account.credential = reference;
+            base.providers[0] = account.clone();
+            assert!(change(&base, base.revision, Some(&account), true, false).is_none());
+            let mut edited = account.clone();
+            edited.label = "Deliberate rename".into();
+            assert!(change(&base, base.revision, Some(&edited), true, false).is_some());
+        }
     }
 }
