@@ -931,6 +931,12 @@ pub enum Command {
     PreviewImport {
         source: std::path::PathBuf,
     },
+    /// Explicit adapter selection. Older gateways reject this opcode rather
+    /// than silently interpreting another tool's directory as RustyClaw.
+    PreviewSourceImport {
+        tool: imports::Tool,
+        source: std::path::PathBuf,
+    },
     /// Apply only selected non-secret settings from a held, unchanged review.
     ApplyImport {
         review: Id,
@@ -1203,6 +1209,7 @@ impl Command {
             Self::Snapshot => "snapshot",
             Self::SaveSettings(..) => "save_settings",
             Self::PreviewImport { .. } => "preview_import",
+            Self::PreviewSourceImport { .. } => "preview_source_import",
             Self::ApplyImport { .. } => "apply_import",
             Self::RefreshCatalog { .. } => "refresh_catalog",
             Self::CreateThread { .. } => "create_thread",

@@ -12,6 +12,47 @@ fn random() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
+#[tokio::test]
+async fn claude_code_review_and_selected_apply_use_the_same_gateway_commands() -> Result<()> {
+    let app = App::start(tempfile::tempdir()?, Default::default()).await?;
+    let source = tempfile::tempdir()?;
+    let private = random();
+    let bytes = serde_json::to_vec(
+        &serde_json::json!({"env":{"ANTHROPIC_BASE_URL":"https://example.test", "ANTHROPIC_AUTH_TOKEN":private}, "model":private, "permissions":{"allow":[private]}}),
+    )?;
+    std::fs::write(source.path().join("settings.json"), &bytes)?;
+    let output = app
+        .cli(&[
+            "import",
+            "review-claude-code",
+            source.path().to_str().context("source path")?,
+        ])
+        .await?;
+    ensure!(!output.contains(&private));
+    let review: a206_core::imports::Review = toml::from_str(&output)?;
+    ensure!(review.preview.tool == a206_core::imports::Tool::ClaudeCode);
+    ensure!(app.snapshot().await?.settings.providers.is_empty());
+    let receipt: a206_core::imports::Receipt = toml::from_str(
+        &app.cli(&[
+            "import",
+            "apply-review",
+            &review.id.to_string(),
+            "--provider",
+            "0",
+        ])
+        .await?,
+    )?;
+    ensure!(receipt.providers_added.len() == 1 && !receipt.vault_imported);
+    let snapshot = app.snapshot().await?;
+    ensure!(snapshot.settings.providers[0].api == a206_core::ProviderApi::Anthropic);
+    ensure!(snapshot.settings.providers[0].base_url == "https://example.test/v1");
+    ensure!(snapshot.settings.providers[0].credential.is_none());
+    ensure!(snapshot.catalogs.is_empty());
+    ensure!(std::fs::read(source.path().join("settings.json"))? == bytes);
+    ensure!(!app.root.join("vault").exists());
+    Ok(())
+}
+
 /// A RustyClaw settings directory with one hosted and one local provider.
 fn rustyclaw(dir: &Path) -> Result<std::path::PathBuf> {
     let root = dir.join("rustyclaw");

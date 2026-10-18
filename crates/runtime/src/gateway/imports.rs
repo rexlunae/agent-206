@@ -2,19 +2,19 @@
 use super::{Gateway, GatewayError, Result, poisoned};
 use a206_core::{
     Id, Reply,
-    imports::{Applied, PREVIEW_VERSION, REVIEW_VERSION, Receipt, Review, Selection},
+    imports::{Applied, PREVIEW_VERSION, REVIEW_VERSION, Receipt, Review, Selection, Tool},
 };
 use std::path::Path;
 
 impl Gateway {
-    pub(super) async fn preview_import(&self, source: &Path) -> Result<Reply> {
+    pub(super) async fn preview_import(&self, tool: Tool, source: &Path) -> Result<Reply> {
         super::check(
             source.is_absolute(),
             GatewayError::Invalid("Import source must be an absolute path on the gateway host."),
         )?;
         let settings = self.snapshot()?.settings;
         // No vault operation is offered here, so its availability stays unknown.
-        let preview = crate::imports::preview_settings(source, &settings).await?;
+        let preview = crate::imports::preview_settings_for(tool, source, &settings).await?;
         super::check(
             preview.providers.len() <= 200 && preview.messengers.len() <= 200,
             GatewayError::Invalid(
@@ -68,7 +68,12 @@ impl Gateway {
             settings.revision == review.settings_revision,
             GatewayError::Conflict("Target settings changed. Preview the source again."),
         )?;
-        let current = crate::imports::preview_settings(&review.preview.source, &settings).await?;
+        let current = crate::imports::preview_settings_for(
+            review.preview.tool,
+            &review.preview.source,
+            &settings,
+        )
+        .await?;
         super::check(
             current == review.preview,
             GatewayError::Conflict("Import source changed. Preview the source again."),

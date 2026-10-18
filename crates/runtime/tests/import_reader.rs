@@ -20,9 +20,108 @@ fn main() -> ExitCode {
         runtime.block_on(reviewed_settings_require_unchanged_source_and_target());
         runtime.block_on(selected_settings_and_partial_receipt_failures_are_explicit());
         runtime.block_on(source_metadata_is_removed_or_refused_before_any_reply());
+        runtime.block_on(claude_settings_use_the_isolated_review_and_guarded_apply());
         println!("import reader: ok");
     }
     ExitCode::SUCCESS
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+async fn claude_settings_use_the_isolated_review_and_guarded_apply() {
+    use a206_core::{
+        Command, ErrorKind, Reply,
+        imports::{Selection, Tool},
+    };
+    let profile = tempfile::tempdir().unwrap();
+    let gateway = a206_runtime::gateway::Gateway::open(profile.path()).unwrap();
+    let source = tempfile::tempdir().unwrap();
+    let path = source.path().join("settings.json");
+    let private = uuid::Uuid::new_v4().to_string();
+    let bytes = serde_json::to_vec(&serde_json::json!({"env":{"ANTHROPIC_BASE_URL":"https://example.test/proxy", "ANTHROPIC_API_KEY":private}, "model":private, "hooks":{"command":private}, "permissions":{"allow":[private]}, "apiKeyHelper":private})).unwrap();
+    std::fs::write(&path, &bytes).unwrap();
+    // Other scopes and authentication files are neither parsed nor merged.
+    std::fs::write(source.path().join("settings.local.json"), "not JSON").unwrap();
+    std::fs::write(source.path().join(".credentials.json"), &private).unwrap();
+    let preview = || Command::PreviewSourceImport {
+        tool: Tool::ClaudeCode,
+        source: source.path().into(),
+    };
+    let Reply::ImportPreview(review) = request(&gateway, preview()).await else {
+        panic!("no Claude Code review")
+    };
+    assert_eq!(review.preview.tool, Tool::ClaudeCode);
+    assert!(review.preview.vault.is_none());
+    let encoded = a206_protocol::encode(&review).unwrap();
+    assert!(
+        !encoded
+            .windows(private.len())
+            .any(|window| window == private.as_bytes())
+    );
+    let selection = Selection {
+        providers: [0].into(),
+        ..Default::default()
+    };
+    // A target change invalidates the held review through the shared save path.
+    let settings = gateway.snapshot().unwrap().settings;
+    assert!(matches!(
+        request(&gateway, Command::SaveSettings(Box::new(settings))).await,
+        Reply::Ok
+    ));
+    let Reply::Error(error) = request(
+        &gateway,
+        Command::ApplyImport {
+            review: review.id,
+            selection: selection.clone(),
+        },
+    )
+    .await
+    else {
+        panic!("stale target accepted")
+    };
+    assert_eq!(error.kind, ErrorKind::Conflict);
+    let Reply::ImportPreview(review) = request(&gateway, preview()).await else {
+        panic!("no fresh review")
+    };
+    std::fs::write(&path, b"{}").unwrap();
+    let Reply::Error(error) = request(
+        &gateway,
+        Command::ApplyImport {
+            review: review.id,
+            selection: selection.clone(),
+        },
+    )
+    .await
+    else {
+        panic!("changed source accepted")
+    };
+    assert_eq!(error.kind, ErrorKind::Conflict);
+    std::fs::write(&path, &bytes).unwrap();
+    let Reply::ImportPreview(review) = request(&gateway, preview()).await else {
+        panic!("no restored review")
+    };
+    let Reply::ImportApplied(applied) = request(
+        &gateway,
+        Command::ApplyImport {
+            review: review.id,
+            selection,
+        },
+    )
+    .await
+    else {
+        panic!("import refused")
+    };
+    assert_eq!(applied.receipt.tool, Tool::ClaudeCode);
+    assert_eq!(applied.receipt.providers_added.len(), 1);
+    assert!(!applied.receipt.vault_imported && applied.receipt_error.is_none());
+    let snapshot = gateway.snapshot().unwrap();
+    assert_eq!(
+        snapshot.settings.providers[0].base_url,
+        "https://example.test/proxy/v1"
+    );
+    assert!(snapshot.settings.providers[0].credential.is_none());
+    assert!(snapshot.catalogs.is_empty());
+    assert_eq!(std::fs::read(path).unwrap(), bytes);
+    assert!(!profile.path().join("vault").exists());
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]

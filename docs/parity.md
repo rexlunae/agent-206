@@ -12,9 +12,11 @@ runs against local processes use their own bridge routes instead: the Gateway
 page's health checks (`/api/health`) and the Security page's vault card
 (`/api/vault`). Chat streaming and tool approvals use the same snapshot polling
 as the desktop but have not been exercised in a browser against a live model
-provider. By design the browser only reads and locks
-the vault: creating, unlocking, pairing and enrolling it need the desktop or
-terminal app, so the vault password never passes through a browser.
+provider. For a gateway local to the web server, a verified encrypted broker
+channel supports vault creation, unlock, pairing, TOTP enrollment and reviewed
+RustyClaw password-vault migration. Passwords terminate in the UI and isolated
+broker; the web bridge carries ciphertext. Remote SSH vault controls remain
+unavailable. See docs/web-vault-setup.md.
 
 Reference: [RustyClaw `481a428c`](https://github.com/rexlunae/RustyClaw/tree/481a428cb7a3b82d1a5e556ffef40e3dd9f52ce3) (`rc/` below).
 Agent 206 paths are prefixed `a206/`; the survey was taken at `1666303`. Parity = equivalent user-facing
@@ -161,7 +163,7 @@ invocations and relays gateway-authorized host calls (`a206/docs/plugin-api.md`)
 | RustyClaw command | Agent 206 status (`a206/crates/app/src/main.rs` Action) | Notes |
 | --- | --- | --- |
 | `setup`, `onboard`, `configure` | partial: `setup [--local\|--ssh]` resumes gateway, vault, TOTP and pairing on the shared flows, then runs doctor (`a206/crates/app/src/setup_cli.rs`); no `onboard`/`configure` aliases (their provider-key flags do not match). The desktop, TUI and web Get started page shows the same steps plus provider and first conversation (`a206/crates/ui/src/welcome.rs`) | Provider step in the CLI walkthrough |
-| `import` (OpenClaw), `refresh-token` | partial: `import rustyclaw [PATH] [--apply]` with an OS-isolated, bounded settings preview and per-item GUI/CLI apply, plus separate broker-held password-vault review/apply on Security and CLI with private receipts; OpenClaw and `refresh-token` missing | Remote SSH vault migration, key files, rollback, more adapters per `docs/imports.md`; OAuth import through the broker |
+| `import` (OpenClaw), `refresh-token` | partial: `import rustyclaw [PATH] [--apply]` with an OS-isolated, bounded settings preview and per-item GUI/CLI apply, plus separate broker-held password-vault review/apply on Security and CLI with private receipts; scoped Claude Code settings.json endpoint review/apply through the isolated reader and shared GUI/CLI; OpenClaw and `refresh-token` missing | Remote SSH vault migration, key files, rollback, more adapters per `docs/imports.md`; OAuth import through the broker |
 | `config get/set/unset` | partial: `settings [--apply FILE]` TOML | Field-level commands |
 | `doctor [--repair]` | partial: read-only `doctor [--toml]` over profile, gateway, broker, pairing and providers (`a206/crates/runtime/src/doctor.rs`), also on the desktop/TUI Gateway page; no `--repair` | Explicit, reviewed repairs |
 | `tui`, `desktop` | present | TUI interaction QA pending |

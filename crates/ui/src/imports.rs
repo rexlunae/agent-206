@@ -3,12 +3,18 @@ use crate::{PageFrame, call, error::ErrorNotice};
 use a206_core::{Command, ErrorKind, ErrorReport, Reply, imports::*};
 use fc_dioxus::prelude::*;
 
-fn reviewed(reply: Reply) -> Result<Review, ErrorReport> {
+fn reviewed(reply: Reply, tool: Tool) -> Result<Review, ErrorReport> {
     match reply {
-        Reply::ImportPreview(review) if review.version == REVIEW_VERSION => Ok(*review),
+        Reply::ImportPreview(review)
+            if review.version == REVIEW_VERSION
+                && review.preview.version == PREVIEW_VERSION
+                && review.preview.tool == tool =>
+        {
+            Ok(*review)
+        }
         Reply::ImportPreview(_) => Err(ErrorReport::new(
             ErrorKind::Protocol,
-            "Gateway import review version is unsupported. Update the gateway and preview again.",
+            "Gateway import review version or source tool is unsupported. Update the gateway and preview again.",
         )),
         Reply::Error(error) => Err(error),
         _ => Err(ErrorReport::new(
@@ -45,19 +51,26 @@ pub(crate) fn Imports() -> Element {
     let mut review = use_signal(|| None::<Review>);
     let mut failure = use_signal(|| None::<ErrorReport>);
     let mut busy = use_signal(|| false);
+    let mut tool = use_signal(|| Tool::RustyClaw);
+    let tool_value = use_memo(move || Some(tool().label().to_owned()));
     rsx! { PageFrame { kicker: "Settings", title: "Import", description: "Review settings from another installation before adding them.",
         Card { variant: CardVariant::Elevated,
-            CardHeader { CardTitle { "RustyClaw source" } CardSubtitle { "Only RustyClaw is supported here. The path is on the gateway host, including when you connect remotely." } }
-            CardBody { Field { label: rsx! { "Installation directory" }, hint: rsx! { "Enter an absolute path. Source files are read-only; nothing is activated during preview." },
-                Input { value: ReadSignal::from(source), availability: if busy() { Availability::Disabled } else { Availability::Enabled }, placeholder: "/path/to/.rustyclaw", oninput: move |value| { source.set(value); review.set(None); failure.set(None); } }
-            } }
+            CardHeader { CardTitle { "Source settings" } CardSubtitle { "The path is on the gateway host, including when you connect remotely." } }
+            CardBody {
+                Field { label: rsx! { "Source tool" }, Select { label: name!("Import source tool"), value: ReadSignal::from(tool_value), availability: if busy() { Availability::Disabled } else { Availability::Enabled }, options: [Tool::RustyClaw, Tool::ClaudeCode].into_iter().map(|tool| SelectChoice::new(tool.label(), tool.label())).collect(), onchange: move |value: String| { tool.set(if value == Tool::ClaudeCode.label() { Tool::ClaudeCode } else { Tool::RustyClaw }); review.set(None); failure.set(None); } } }
+                Field { label: rsx! { "Settings directory" }, hint: rsx! { if tool() == Tool::ClaudeCode { "Select one directory containing settings.json, such as ~/.claude or a project's .claude. Only an explicit ANTHROPIC_BASE_URL endpoint is reviewed. Other scopes, shell variables and subscription accounts are not inferred." } else { "Enter an absolute installation path. Source files are read-only; nothing is activated during preview." } },
+                    Input { value: ReadSignal::from(source), availability: if busy() { Availability::Disabled } else { Availability::Enabled }, placeholder: "/absolute/settings/directory", oninput: move |value| { source.set(value); review.set(None); failure.set(None); } }
+                }
+            }
             // The gateway validates its own host's path syntax. A web/TUI/
             // desktop client must not apply its platform's filesystem rules.
             CardFooter { Button { variant: ButtonVariant::Primary, availability: if busy() || source().trim().is_empty() { Availability::Disabled } else { Availability::Enabled }, onclick: move |_| {
                 busy.set(true); failure.set(None); review.set(None);
                 let source = source();
+                let tool = tool();
                 spawn(async move {
-                    match call(Command::PreviewImport { source: source.into() }).await.and_then(reviewed) {
+                    let command = match tool { Tool::RustyClaw => Command::PreviewImport { source: source.into() }, Tool::ClaudeCode => Command::PreviewSourceImport { tool, source: source.into() } };
+                    match call(command).await.and_then(|reply| reviewed(reply, tool)) {
                         Ok(result) => review.set(Some(result)), Err(error) => failure.set(Some(error)),
                     }
                     busy.set(false);
@@ -66,7 +79,7 @@ pub(crate) fn Imports() -> Element {
         }
         if let Some(report) = failure() { ErrorNotice { report, title: "Import preview unavailable".to_string() } }
         if let Some(value) = review() { ReviewPanel { key: "{value.id}", review: value } }
-        Alert { title: rsx! { "Credentials and other tools" }, "This screen imports selected connection settings and disabled messengers. It does not import vaults, plaintext credentials, grants, hooks, plugins or MCP servers. Review a password-protected RustyClaw vault separately on Security or with `agent206 vault import`. Other source adapters are still planned." }
+        Alert { title: rsx! { "Credentials and other tools" }, "This screen imports selected connection settings and supported disabled messengers. It does not import vaults, plaintext credentials, grants, hooks, plugins or MCP servers. Review a password-protected RustyClaw vault separately on Security or with `agent206 vault import`. Cline, Codex, DeepSeek Harness and other adapters are still planned." }
     } }
 }
 
@@ -88,6 +101,7 @@ fn ReviewPanel(review: Review) -> Element {
             p { "Choose each item to add. Existing accounts are kept. Messenger entries stay disabled and require a new vault credential before connecting." }
             p { class: "a206-muted", "Source labels, model text and credential references are omitted. Custom provider labels are generated. Providers have no credential reference; edit them on Connections before authenticated use." }
             Disclosure { summary: rsx! { "Source and review record" },
+                p { "Source tool: {preview.tool.label()}" }
                 p { "Configuration SHA-256: {preview.config_sha256.as_deref().unwrap_or(\"No configuration file\")}" }
                 p { "Target settings revision: {review.settings_revision}" }
                 p { "The gateway rereads the source and checks this revision before applying. A changed source or target requires a new preview." }
@@ -214,6 +228,11 @@ fn messenger_status(action: &MessengerAction) -> &'static str {
 }
 fn inactive_label(category: InactiveCategory) -> &'static str {
     match category {
+        InactiveCategory::Environment => "Environment settings",
+        InactiveCategory::Hooks => "Hooks",
+        InactiveCategory::Plugins => "Plugins and marketplaces",
+        InactiveCategory::Credentials => "Credentials and helpers",
+        InactiveCategory::ModelSelection => "Model choices",
         InactiveCategory::Messengers => "Messengers",
         InactiveCategory::McpServers => "MCP servers",
         InactiveCategory::ToolPermissions => "Tool permission rules",
@@ -239,7 +258,10 @@ mod tests {
     use super::*;
     #[test]
     fn unexpected_replies_preserve_failure_instead_of_claiming_an_import() {
-        assert_eq!(reviewed(Reply::Ok).unwrap_err().kind, ErrorKind::Protocol);
+        assert_eq!(
+            reviewed(Reply::Ok, Tool::RustyClaw).unwrap_err().kind,
+            ErrorKind::Protocol
+        );
         assert_eq!(applied(Reply::Ok).unwrap_err().kind, ErrorKind::Protocol);
         let failure = ErrorReport::new(ErrorKind::Conflict, "Source changed");
         assert_eq!(applied(Reply::Error(failure.clone())).unwrap_err(), failure);
@@ -263,10 +285,24 @@ mod tests {
                 unsupported: vec![],
             },
         };
-        let failure = reviewed(Reply::ImportPreview(Box::new(review))).unwrap_err();
+        let failure = reviewed(
+            Reply::ImportPreview(Box::new(review.clone())),
+            Tool::RustyClaw,
+        )
+        .unwrap_err();
         assert_eq!(failure.kind, ErrorKind::Protocol);
         assert!(!format!("{failure:?}").contains(&secret));
         assert!(failure.message.contains("Update the gateway"));
+        let mut review = review;
+        review.version = REVIEW_VERSION;
+        assert!(
+            reviewed(
+                Reply::ImportPreview(Box::new(review.clone())),
+                Tool::ClaudeCode
+            )
+            .is_err()
+        );
+        assert!(reviewed(Reply::ImportPreview(Box::new(review)), Tool::RustyClaw).is_ok());
     }
     #[tokio::test]
     async fn confirmation_refreshes_shared_state_and_keeps_a_partial_receipt_error() {

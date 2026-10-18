@@ -2,7 +2,46 @@
 
 Import is a required setup feature. This contract separates source discovery,
 review and application so migration cannot silently grant authority or activate
-foreign code. The RustyClaw adapter is implemented (below); the others are not.
+foreign code. RustyClaw settings/vault migration and the scoped Claude Code
+connection adapter below are implemented; other source adapters remain planned.
+
+## Claude Code settings adapter
+
+Select **Claude Code** on Import and choose an absolute directory containing
+`settings.json` on the gateway host. The CLI uses
+`agent206 import review-claude-code /absolute/settings-directory`, followed by
+`import apply-review ID --provider 0` when the reviewed item is available. Both
+use the same isolated source reader, held review, selected apply, source/target
+checks and private receipt as RustyClaw settings. Preview changes nothing.
+
+This adapter imports only an explicit `env.ANTHROPIC_BASE_URL` connection, using
+Anthropic Messages. The SDK adds `/v1/messages` under that base, so the imported
+Agent 206 endpoint adds `/v1` to preserve the request prefix. Invalid or
+credential-bearing URLs are omitted and unavailable. A cloud-provider or
+host-managed routing switch makes the item unavailable, even when the switch
+is false or empty: the adapter does not reconstruct shell/host precedence.
+
+The selected `settings.json` is one explicit scope. It does not merge
+`settings.local.json`, managed settings, shell variables or another project's
+settings, and never reads authentication files/keychains. Missing an explicit
+base URL adds no default or subscription account. Credentials and credential
+helpers, model choices, other environment values, permissions, hooks, plugins,
+MCP configuration and sandbox settings remain inactive; their contents do not
+cross the reader boundary. The connection has no credential reference and
+requires live API discovery before model selection. Instructions, sessions,
+history and other tool data are not imported by this adapter.
+
+Format evidence inspected 2026-10-18: [Claude Code settings scopes](https://code.claude.com/docs/en/settings),
+[environment variables](https://code.claude.com/docs/en/env-vars), and the
+[official Anthropic TypeScript SDK message path](https://github.com/anthropics/anthropic-sdk-typescript/blob/main/src/resources/messages/messages.ts).
+Tests cover generated private/model strings staying behind, route refusal,
+duplicates, malformed JSON diagnostics, source bounds and symlinks, plus actual
+isolated gateway/CLI review and guarded apply. Release web acceptance with a
+disposable source verified the source selector, blank/empty-selection gating,
+source-change refusal, cleared selections after a fresh preview and selected
+application with a private receipt. Source private/model text was absent from
+the DOM, the source stayed unchanged and no vault was created. Native desktop
+and TUI interactive acceptance remains pending.
 
 ## RustyClaw adapter
 
@@ -61,7 +100,8 @@ from previews because they can contain inline passwords or signed tokens.
 Providers still need live API discovery; messengers are saved disabled and
 without credentials. Vault migration is a separate action on Security or through
 `agent206 vault import FILE --apply`; settings selection never copies or unlocks
-a vault. Other tool adapters remain planned.
+a vault. Claude Code supports the limited connection adapter above; other tool
+adapters remain planned.
 
 Before any reader reply (including the legacy terminal flow), the remaining
 preview strings are checked for known credential shapes. A match refuses the
@@ -176,7 +216,7 @@ This is the prerequisite for the shared GUI preview/apply flow, not that UI.
 | --- | --- | --- |
 | RustyClaw | Settings, conversations/projects, prompts, encrypted vault and all policy metadata | Pinned source baseline in security-setup.md; configuration, sessions and credentials readers must be versioned |
 | Cline | Task history, connection settings, instructions | [Task documentation](https://docs.cline.bot/core-workflows/task-management); inspect source-version storage schemas before implementing native task readers |
-| Claude Code | JSON settings, instruction files, session transcripts | [Settings](https://code.claude.com/docs/en/settings), [JSON/stream output and session transcripts](https://code.claude.com/docs/en/headless); retain scope/precedence and transcript provenance |
+| Claude Code | Explicit settings.json Anthropic endpoint (implemented); instruction files and session transcripts (planned) | [Settings](https://code.claude.com/docs/en/settings), [environment](https://code.claude.com/docs/en/env-vars); no implicit scope merging or imported authority |
 | Codex | TOML configuration, instructions, session history | Local upstream source under ignored .reference/codex; pin the inspected revision and rollout schemas when implementing |
 | DeepSeek Harness | Supported configuration/history/export format | [Official harness](https://deepseek.com/en/harness/), [deepseek-ai/deepseek-harness](https://github.com/deepseek-ai/deepseek-harness); pin source/storage schemas before implementing, independently of the DeepSeek provider |
 | Other common tools | Exported conversations, connection settings and instructions | Add versioned adapters for documented formats; evaluate OpenClaw, Aider, Continue, Cursor and Windsurf individually |

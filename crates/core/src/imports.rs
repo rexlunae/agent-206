@@ -69,6 +69,15 @@ pub struct Applied {
 #[serde(rename_all = "snake_case")]
 pub enum Tool {
     RustyClaw,
+    ClaudeCode,
+}
+impl Tool {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::RustyClaw => "RustyClaw",
+            Self::ClaudeCode => "Claude Code",
+        }
+    }
 }
 
 /// What would change, and what will not, if this preview were applied.
@@ -247,6 +256,11 @@ pub enum UnsupportedMessenger {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InactiveCategory {
+    Environment,
+    Hooks,
+    Plugins,
+    Credentials,
+    ModelSelection,
     /// Messenger accounts. Previews now list them under `messengers`; kept
     /// so earlier previews still read.
     Messengers,

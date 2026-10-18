@@ -7,6 +7,7 @@
 //! Credentials never pass through here; the vault broker copies an encrypted
 //! vault itself (`a206_broker::Request::ImportVault`).
 #![forbid(unsafe_code)]
+pub mod claude_code;
 pub mod rustyclaw;
 
 use std::path::{Path, PathBuf};
@@ -16,6 +17,12 @@ pub const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ImportError {
+    #[error("{} is not a JSON settings file this importer understands", path.display())]
+    JsonConfig {
+        path: PathBuf,
+        #[source]
+        source: JsonConfigFailure,
+    },
     #[error("{} does not exist", path.display())]
     NotFound { path: PathBuf },
     #[error("{} is not a directory", path.display())]
@@ -44,6 +51,21 @@ pub enum ImportError {
     },
     #[error("could not encode the import receipt")]
     EncodeReceipt(#[source] toml::ser::Error),
+}
+/// JSON diagnostics retain location only; parser messages can quote credentials.
+#[derive(Debug, thiserror::Error)]
+#[error("invalid foreign JSON at line {line}, column {column}; inspect the source locally")]
+pub struct JsonConfigFailure {
+    pub line: usize,
+    pub column: usize,
+}
+impl From<serde_json::Error> for JsonConfigFailure {
+    fn from(error: serde_json::Error) -> Self {
+        Self {
+            line: error.line(),
+            column: error.column(),
+        }
+    }
 }
 /// Safe parser diagnostics for foreign configuration. TOML errors can include
 /// plaintext credentials in both their source excerpt and semantic message.
