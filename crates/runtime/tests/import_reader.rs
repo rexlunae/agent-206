@@ -17,9 +17,216 @@ fn main() -> ExitCode {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(previews_keep_source_immutable_and_redact_failures());
         runtime.block_on(source_is_the_only_user_directory_and_is_read_only());
+        runtime.block_on(reviewed_settings_require_unchanged_source_and_target());
+        runtime.block_on(selected_settings_and_partial_receipt_failures_are_explicit());
         println!("import reader: ok");
     }
     ExitCode::SUCCESS
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+async fn request(
+    gateway: &a206_runtime::gateway::Gateway,
+    command: a206_core::Command,
+) -> a206_core::Reply {
+    gateway
+        .request(a206_protocol::Request {
+            id: uuid::Uuid::new_v4(),
+            body: command,
+        })
+        .await
+        .body
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn installation() -> tempfile::TempDir {
+    let source = tempfile::tempdir().unwrap();
+    let id = uuid::Uuid::new_v4().simple().to_string();
+    let config = format!(
+        r#"[model]
+provider = "openai"
+[[custom_providers]]
+id = "{id}"
+display_name = "Imported account"
+base_url = "https://{id}.example.test/v1"
+[[messengers]]
+name = "inbox"
+messenger_type = "telegram"
+token = "{id}"
+allowed_chats = ["123"]
+allowed_users = ["456"]
+[mcp.servers.untrusted]
+command = "untrusted-program"
+"#
+    );
+    std::fs::write(source.path().join("config.toml"), config).unwrap();
+    source
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+async fn review(
+    gateway: &a206_runtime::gateway::Gateway,
+    source: &std::path::Path,
+) -> a206_core::imports::Review {
+    let a206_core::Reply::ImportPreview(review) = request(
+        gateway,
+        a206_core::Command::PreviewImport {
+            source: source.to_owned(),
+        },
+    )
+    .await
+    else {
+        panic!("preview failed")
+    };
+    *review
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn chosen() -> a206_core::imports::Selection {
+    a206_core::imports::Selection {
+        providers: [1].into(),
+        messengers: [0].into(),
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+async fn reviewed_settings_require_unchanged_source_and_target() {
+    use a206_core::{Command, ErrorKind, Reply};
+    let profile = tempfile::tempdir().unwrap();
+    let gateway = a206_runtime::gateway::Gateway::open(profile.path()).unwrap();
+    let source = installation();
+    let before = gateway.snapshot().unwrap().settings;
+    let first = review(&gateway, source.path()).await;
+    let config = source.path().join("config.toml");
+    let text = std::fs::read_to_string(&config).unwrap();
+    std::fs::write(&config, format!("{text}\n# changed since review\n")).unwrap();
+    let Reply::Error(error) = request(
+        &gateway,
+        Command::ApplyImport {
+            review: first.id,
+            selection: chosen(),
+        },
+    )
+    .await
+    else {
+        panic!("changed source accepted")
+    };
+    assert_eq!(error.kind, ErrorKind::Conflict);
+    assert_eq!(gateway.snapshot().unwrap().settings, before);
+
+    let second = review(&gateway, source.path()).await;
+    assert!(matches!(
+        request(&gateway, Command::SaveSettings(Box::new(before.clone()))).await,
+        Reply::Ok
+    ));
+    let Reply::Error(error) = request(
+        &gateway,
+        Command::ApplyImport {
+            review: second.id,
+            selection: chosen(),
+        },
+    )
+    .await
+    else {
+        panic!("changed target accepted")
+    };
+    assert_eq!(error.kind, ErrorKind::Conflict);
+    assert!(gateway.snapshot().unwrap().settings.providers.is_empty());
+
+    let third = review(&gateway, source.path()).await;
+    let selection = a206_core::imports::Selection {
+        providers: [999].into(),
+        messengers: Default::default(),
+    };
+    let Reply::Error(error) = request(
+        &gateway,
+        Command::ApplyImport {
+            review: third.id,
+            selection,
+        },
+    )
+    .await
+    else {
+        panic!("unknown selection accepted")
+    };
+    assert_eq!(error.kind, ErrorKind::InvalidRequest);
+    assert!(gateway.snapshot().unwrap().settings.providers.is_empty());
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+async fn selected_settings_and_partial_receipt_failures_are_explicit() {
+    use a206_core::{Command, ErrorKind, Reply};
+    for block_receipt in [false, true] {
+        let profile = tempfile::tempdir().unwrap();
+        let gateway = a206_runtime::gateway::Gateway::open(profile.path()).unwrap();
+        let source = installation();
+        let reviewed = review(&gateway, source.path()).await;
+        if block_receipt {
+            std::fs::write(profile.path().join("imports"), "blocked").unwrap();
+        }
+        let id = uuid::Uuid::new_v4();
+        let command = Command::ApplyImport {
+            review: reviewed.id,
+            selection: chosen(),
+        };
+        let response = gateway
+            .request(a206_protocol::Request {
+                id,
+                body: command.clone(),
+            })
+            .await;
+        let Reply::ImportApplied(applied) = &response.body else {
+            panic!("{:?}", response.body)
+        };
+        assert_eq!(applied.receipt.providers_added.len(), 1);
+        assert_eq!(applied.receipt.messengers_added, vec!["inbox"]);
+        assert!(!applied.receipt.vault_imported);
+        assert_eq!(applied.receipt_error.is_some(), block_receipt);
+        if !block_receipt {
+            let receipt = profile
+                .path()
+                .join("imports")
+                .join(format!("{}.toml", reviewed.id));
+            assert!(receipt.is_file());
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(receipt).unwrap().permissions().mode() & 0o077,
+                0
+            );
+        }
+        assert_eq!(
+            gateway
+                .request(a206_protocol::Request { id, body: command })
+                .await
+                .body,
+            response.body
+        );
+        let settings = gateway.snapshot().unwrap().settings;
+        assert_eq!(settings.providers.len(), 1);
+        assert_eq!(
+            settings.providers[0].base_url,
+            reviewed.preview.providers[1].base_url
+        );
+        let messenger = &settings.messengers[0];
+        assert!(!messenger.enabled);
+        assert!(messenger.credential.is_none());
+        assert_eq!(messenger.allowed_chats, ["123".to_owned()].into());
+        assert_eq!(messenger.allowed_users, ["456".to_owned()].into());
+        assert!(settings.mcp_servers.is_empty());
+        assert!(!a206_broker::vault_path(profile.path()).exists());
+        let Reply::Error(error) = request(
+            &gateway,
+            Command::ApplyImport {
+                review: reviewed.id,
+                selection: chosen(),
+            },
+        )
+        .await
+        else {
+            panic!("used review accepted")
+        };
+        assert_eq!(error.kind, ErrorKind::Conflict);
+    }
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]

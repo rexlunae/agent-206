@@ -204,11 +204,21 @@ fn plan(presets: &[ProviderPreset], settings: &Settings, source: Source) -> Prov
             .unwrap_or_else(|| source.source_id.clone()),
         source_id: source.source_id,
         preset: found.map(|p| p.id.clone()),
-        base_url,
+        // Invalid URLs may contain a password or signed token. They are not
+        // useful configuration and must not enter review text or DOM state.
+        base_url: safe_endpoint(base_url),
         api,
         credential: source.credential,
         model_reference: source.model_reference,
         action,
+    }
+}
+
+fn safe_endpoint(value: String) -> String {
+    if a206_core::providers::base_url(&value).is_ok() {
+        value
+    } else {
+        String::new()
     }
 }
 
@@ -441,7 +451,7 @@ pub fn preview(root: &Path, settings: &Settings, vault_exists: Option<bool>) -> 
                 label: model.provider.clone(),
                 source_id: model.provider,
                 preset: None,
-                base_url: model.base_url.unwrap_or_default(),
+                base_url: safe_endpoint(model.base_url.unwrap_or_default()),
                 api: ProviderApi::default(),
                 credential: None,
                 model_reference: model.model,
@@ -632,6 +642,27 @@ execute_command = "Deny"
 
     fn rand_port() -> u16 {
         (uuid::Uuid::new_v4().as_u128() % 20_000) as u16
+    }
+
+    #[test]
+    fn refused_endpoint_credentials_never_enter_a_preview() {
+        let secret = random();
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            &dir.path().join("config.toml"),
+            &format!(
+                "[model]\nprovider = \"openai\"\nbase_url = \"https://user:{secret}@example.test/v1?token={secret}\"\n"
+            ),
+        );
+        let preview = preview(dir.path(), &Settings::default(), None).unwrap();
+        assert!(matches!(
+            preview.providers[0].action,
+            ProviderAction::Unsupported {
+                reason: UnsupportedProvider::InvalidEndpoint
+            }
+        ));
+        assert!(preview.providers[0].base_url.is_empty());
+        assert!(!toml::to_string(&preview).unwrap().contains(&secret));
     }
 
     #[test]

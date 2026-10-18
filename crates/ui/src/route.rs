@@ -4,6 +4,7 @@ use crate::{
     PageFrame, Shell,
     activity::Activity,
     conversation::Workspace as Chat,
+    imports::Imports,
     inbox::Inbox,
     messengers::Messengers,
     pages::{
@@ -61,6 +62,8 @@ pub(crate) enum Route {
     Prompts {},
     #[route("/settings/security")]
     Security {},
+    #[route("/settings/import")]
+    Imports {},
     #[route("/joshua")]
     Joshua {},
     #[route("/gateway")]
@@ -90,6 +93,7 @@ impl Route {
             Self::Appearance {} => IconName::Settings,
             Self::Prompts {} => IconName::Edit,
             Self::Security {} => IconName::Lock,
+            Self::Imports {} => IconName::Download,
             Self::Joshua {} | Self::Gateway {} => IconName::Terminal,
             Self::Welcome {} => IconName::Check,
         }
@@ -120,6 +124,7 @@ impl Route {
                 Self::Joshua {},
                 Self::Prompts {},
                 Self::Security {},
+                Self::Imports {},
             ],
         ]
     }
@@ -142,6 +147,7 @@ impl Route {
             Self::Appearance {} => "Appearance",
             Self::Prompts {} => "Agent modes",
             Self::Security {} => "Security",
+            Self::Imports {} => "Import",
             Self::Joshua {} => "Joshua",
             Self::Gateway {} => "Gateway",
             Self::Welcome {} => "Get started",
@@ -289,6 +295,17 @@ pub(crate) mod tests {
         dom.provide_root_context(history.clone());
         dom.rebuild_in_place();
         (dom, history)
+    }
+
+    #[test]
+    fn import_deep_link_offers_the_review_action() {
+        let (dom, history) = app_at("/settings/import");
+        let html = dioxus_ssr::render(&dom);
+        assert_eq!(history.current_route(), "/settings/import");
+        assert!(html.contains("<h1>Import</h1>"));
+        assert!(html.contains("Preview import"));
+        assert!(html.contains("Installation directory"));
+        assert!(html.contains("gateway host"));
     }
 
     #[test]

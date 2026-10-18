@@ -9,6 +9,7 @@ pub mod doctor;
 pub mod error;
 pub mod extension;
 pub mod ignore;
+pub mod imports;
 pub mod profiles;
 pub mod prompts;
 pub mod search;
@@ -926,6 +927,15 @@ pub enum Command {
     JoshuaStatus,
     Snapshot,
     SaveSettings(Box<Settings>),
+    /// Read-only review of a user-selected installation on the gateway host.
+    PreviewImport {
+        source: std::path::PathBuf,
+    },
+    /// Apply only selected non-secret settings from a held, unchanged review.
+    ApplyImport {
+        review: Id,
+        selection: imports::Selection,
+    },
     RefreshCatalog {
         provider: Id,
     },
@@ -1192,6 +1202,8 @@ impl Command {
             Self::JoshuaStatus => "joshua_status",
             Self::Snapshot => "snapshot",
             Self::SaveSettings(..) => "save_settings",
+            Self::PreviewImport { .. } => "preview_import",
+            Self::ApplyImport { .. } => "apply_import",
             Self::RefreshCatalog { .. } => "refresh_catalog",
             Self::CreateThread { .. } => "create_thread",
             Self::SetSubagentModel { .. } => "set_subagent_model",
@@ -1262,6 +1274,8 @@ pub enum Reply {
     Gateway(GatewayInfo),
     Skills(Vec<SkillSummary>),
     AgentProfiles(AgentProfiles),
+    ImportPreview(Box<imports::Review>),
+    ImportApplied(Box<imports::Applied>),
     Skill(SkillText),
     Tools(ToolList),
     Messages(Vec<MessageHit>),

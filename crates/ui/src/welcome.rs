@@ -469,6 +469,11 @@ pub(crate) fn Welcome() -> Element {
             }
         }
         crate::pages::VaultControls {}
+        Card { variant: CardVariant::Subtle,
+            CardHeader { CardTitle { "Import existing settings" } }
+            CardBody { p { "Review a RustyClaw installation and select connections or disabled messengers to add. Credentials and tool permissions stay unchanged." } }
+            CardFooter { LinkButton { href: Route::Imports {}.to_string(), variant: ButtonVariant::Secondary, "Review import" } }
+        }
         if snapshot.threads.is_empty() {
             Card { variant: CardVariant::Elevated,
                 CardHeader { CardTitle { "Your first conversation" } }

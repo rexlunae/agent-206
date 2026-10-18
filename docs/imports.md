@@ -27,14 +27,52 @@ digest, accounts and messengers added and whether the vault was copied, which is
 record. A repeated import adds nothing. Import only attaches to a running
 gateway and never starts one, so a preview changes nothing.
 
-Remaining gates of the flow below, not yet met by this adapter:
+The legacy `import rustyclaw --apply` command retains these limitations:
 
-- GUI review and per-item application are not exposed yet.
 - Selection is per category (`--skip-vault`, `--skip-providers`,
   `--skip-messengers`), not per item.
 - Apply is ordered, not atomic: the vault is copied before accounts are saved,
   and a failure after the copy is reported as that partial result.
 - There is no rollback command; the receipt is the record to undo by hand.
+
+### Shared settings review
+
+The Import page (`/settings/import`, linked from Get started and the sidebar)
+previews a RustyClaw installation on the **gateway host**. Desktop, web and TUI
+share this page and the `PreviewImport`/`ApplyImport` command API. The CLI exposes
+the same flow with `import review-rustyclaw /absolute/source` (TOML review) and
+`import apply-review <review-id> --provider <index> --messenger <index>`; indices
+are zero-based positions in the corresponding reviewed arrays and each option
+can be repeated. Neither operation starts a stopped gateway.
+
+Nothing is selected initially. Users select individual addable providers and
+messengers; existing and unsupported entries cannot be selected. The page shows
+endpoints, historical model references, credential references and messenger
+restrictions, plus inactive/unsupported categories. Rejected URLs are omitted
+from previews because they can contain inline passwords or signed tokens.
+Providers still need live API discovery; messengers are saved disabled and
+without credentials. Vault migration is not offered here: use the existing
+trusted-terminal broker flow. Other tool adapters remain planned.
+
+The gateway holds at most four reviews in memory, with at most 200 providers
+and 200 messengers per review. A restart, eviction or attempted apply requires
+a new preview. Apply takes only the review ID and selected indices; it never
+accepts client-supplied configurations. It rereads the isolated source and
+compares the complete preview (including the configuration hash), checks the
+target revision again through the shared settings-save path, and imports only
+the held selected data. A source edit after this reread cannot inject new data
+because application does not reopen source files. Changed targets/sources,
+missing reviews and invalid selections refuse the import. Agent tools do not
+expose either command.
+
+Settings saving and receipt writing are ordered, not a multi-file transaction.
+A receipt failure returns an explicit `ImportApplied` partial result containing
+the added identities and structured failure; the UI displays both, and the CLI
+prints the receipt data and exits unsuccessfully. The ordinary gateway request
+journal deduplicates application retries. Source/target guards, selected items,
+inactive authority, disabled messenger restrictions, replay and receipt failures
+are tested against the actual isolated reader and gateway; the CLI is tested
+through the real binary. Rollback and GUI vault migration remain planned.
 
 ### Isolated source reader
 
