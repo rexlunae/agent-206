@@ -376,6 +376,7 @@ impl Delegator {
             thread: child,
             text,
             attachments: vec![],
+            images: vec![],
         });
         ADMITTING.scope(reservation, send).await.map(drop)
     }

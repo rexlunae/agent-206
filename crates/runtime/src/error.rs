@@ -110,6 +110,7 @@ pub(crate) fn classify(error: &(dyn Error + 'static)) -> Option<ErrorKind> {
         crate::gateway::CompactionError,
         crate::instructions::InstructionError,
         crate::imports::ReaderError,
+        crate::images::ImageError,
         a206_import::ImportError,
         crate::transport::FrameError,
         crate::transport::LaunchError,
