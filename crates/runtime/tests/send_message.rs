@@ -701,3 +701,40 @@ async fn a_test_send_posts_once_to_an_enabled_webhook_without_a_model() {
     refused(request(&gateway, Command::SendTestMessage { destination: hook }).await);
     assert_eq!(hooks.received.lock().unwrap().len(), 1);
 }
+
+#[tokio::test]
+async fn a_webhook_disconnected_while_a_message_goes_out_stays_stopped() {
+    let Setup {
+        gateway,
+        state: _state,
+        hooks,
+        hook,
+        ..
+    } = setup(ProviderApi::OpenAi).await;
+    let supervisor = gateway.clone();
+    // Detached: the messengers run as long as the test's runtime.
+    tokio::spawn(async move { supervisor.supervise_messengers().await });
+    let state = |gateway: &Gateway| gateway.snapshot().unwrap().messengers[0].state;
+    let settled = |want: MessengerState| {
+        let gateway = gateway.clone();
+        async move {
+            tokio::time::timeout(PATIENCE, async {
+                while state(&gateway) != want {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(wait("the webhook's state"))
+        }
+    };
+    settled(MessengerState::Ready).await;
+    // The user disconnects the webhook while its only part is being sent:
+    // the message was delivered, but the webhook is no longer ready.
+    *hooks.disconnect.lock().unwrap() = Some((gateway.clone(), hook.clone()));
+    assert_eq!(
+        request(&gateway, Command::SendTestMessage { destination: hook }).await,
+        Reply::Ok
+    );
+    assert_eq!(hooks.received.lock().unwrap().len(), 1);
+    settled(MessengerState::Stopped).await;
+}

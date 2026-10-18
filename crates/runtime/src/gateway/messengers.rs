@@ -472,8 +472,13 @@ impl Outbox {
         // chat messenger's state is its connection, left as it is.
         if chat.is_none() {
             match &result {
+                // A webhook withdrawn while the message went out is marked
+                // Stopped by the supervisor, after the withdrawal is visible
+                // here; checking under the status lock keeps that state.
                 Ok(_) => self.base.update(name, |status| {
-                    status.state = MessengerState::Ready;
+                    if !withdrawn() {
+                        status.state = MessengerState::Ready;
+                    }
                     status.failure = None;
                 }),
                 Err(error) => {

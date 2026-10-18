@@ -200,7 +200,7 @@ fn MessengerCard(now: u64, config: MessengerConfig, status: MessengerStatus) -> 
         }
         CardFooter {
             if send_only {
-                Button { variant: ButtonVariant::Secondary, availability: if status.state == MessengerState::Ready && config.credential.is_some() { Availability::Enabled } else { Availability::Disabled }, onclick: { let name = name.clone(); move |_| dispatch(state, Command::SendTestMessage { destination: name.clone() }) }, "Send test message" }
+                Button { variant: ButtonVariant::Secondary, availability: if config.enabled && status.state == MessengerState::Ready && config.credential.is_some() { Availability::Enabled } else { Availability::Disabled }, onclick: { let name = name.clone(); move |_| dispatch(state, Command::SendTestMessage { destination: name.clone() }) }, "Send test message" }
             } else if running {
                 Button { variant: ButtonVariant::Secondary, onclick: { let name = name.clone(); move |_| dispatch(state, Command::DisconnectMessenger { name: name.clone() }) }, "Disconnect" }
             } else {
