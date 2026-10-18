@@ -15,6 +15,7 @@ a206-skills.workspace = true
 a206-output-rules.workspace = true
 a206-leak-scan.workspace = true
 a206-injection-scan.workspace = true
+a206-git-push.workspace = true
 a206-vault.workspace = true
 http = "1"
 a206-broker.workspace = true
@@ -75,6 +76,8 @@ a206-vault.workspace = true
 http = "1"
 tokio = { workspace = true, features = ["test-util"] }
 axum = { version = "0.8", features = ["ws"] }
+# The test forge stores pushed packs with gitoxide's own indexer.
+gix-pack = { version = "0.76", default-features = false, features = ["streaming-input", "sha1"] }
 [[test]]
 name = "native_exec"
 harness = false

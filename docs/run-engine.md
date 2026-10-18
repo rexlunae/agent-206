@@ -573,6 +573,61 @@ listing, the result or the conversation. See
 [messengers.md](messengers.md#webhooks) and
 [posting to chats](messengers.md#posting-to-chats).
 
+## Pushing git branches (`git_push`)
+
+`runtime/src/git_push.rs` offers `git_push` in conversations with a project
+once the user has set at least one git credential (Settings, Git credentials,
+or `git_credentials` in `settings --apply`). Each entry names a forge origin
+(`https://host[:port]`), the username the forge expects with a token
+(`x-access-token` for GitHub, `oauth2` for GitLab, or the account name) and a
+vault credential holding the token, which must be bound to that origin. The
+tool needs the conversation's GitWrite grant (Code mode), its policy is Ask,
+so each call is approved, and the host refuses a call the user did not
+approve.
+
+Arguments are `branch` (default: the current branch) and `remote` (default:
+`branch.<name>.remote`, else `origin`). The local branch goes to the branch of
+the same name on the remote, like `git push <remote> <branch>`:
+
+- The remote's `pushurl`, else `url`, must be an HTTPS URL without a username,
+  password, query or fragment; ssh remotes are refused. A remote URL that a
+  `url.*.insteadOf` or `pushInsteadOf` setting would rewrite is refused rather
+  than pushed to the unrewritten URL.
+- Settings come from the repository's own configuration, then the user's
+  (including the files the user's configuration includes). A repository whose
+  configuration includes other files (`include` or `includeIf`) is refused:
+  the project chooses those paths and they may lie outside it.
+- A repository with a `pre-push` or `reference-transaction` hook is refused,
+  and `user.name` and `user.email` must be set: the remote-tracking branch's
+  reflog records them.
+- The gateway asks the vault broker for the server's references
+  (`GitReceivePack`, broker protocol v13). The broker sends the token as the
+  password of HTTP Basic authentication, only to the credential's bound
+  origin, never follows redirects and refuses an answer that is not git's.
+- Only a fast-forward is sent: if the server's branch points at a commit that
+  is not in this branch's history, the push is refused before any pack is
+  built. If the server already has the commit there, nothing is sent and the
+  result says `up_to_date`.
+- The pack (crate `a206-git-push`) holds the new commits and the trees and
+  blobs they change, whole and compressed, with no deltas. It must fit one
+  broker message: about 4 MiB, at most 10,000 commits and 100,000 objects,
+  and no single object over 16 times that size before compression (each
+  object is read whole). Compression stops as soon as the pack would be too
+  large. Larger pushes are refused; push them from a terminal. Cancelling the
+  run stops choosing and packing objects.
+- The server's report decides the outcome. A refused update (a protected
+  branch, for example) fails with the server's reason, cleaned of control
+  characters and shortened. After a successful update the gateway moves
+  `refs/remotes/<remote>/<branch>` forward only: if it already points at a
+  commit the pushed one does not descend from (a later push finished first),
+  it is left there and the result's `tracking_branch` says so. If the update
+  fails, the error says the push itself happened.
+
+The token never reaches the gateway, the model, the conversation or a log.
+Cancelling a call after the pack was sent may leave the server updated. Not
+yet: ssh remotes, force pushes, deleting remote branches, tags, pushing to a
+differently named branch, and fetching.
+
 ## Output rules
 
 Before a tool result reaches the model, the run engine passes it through the

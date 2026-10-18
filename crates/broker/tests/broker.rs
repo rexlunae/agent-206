@@ -2713,3 +2713,209 @@ async fn reviewed_migration_reports_confirmed_copy_and_failed_receipt_separately
     a.call(Request::Shutdown).await.unwrap();
     task.await.unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn git_calls_send_the_token_as_basic_auth_to_the_receive_pack_service() {
+    use axum::{
+        Router,
+        body::Bytes,
+        extract::RawQuery,
+        http::{HeaderMap, StatusCode, header},
+        routing::{get, post},
+    };
+    use base64::Engine as _;
+    type Seen = Arc<Mutex<Vec<(String, Option<String>, String, String, Vec<u8>)>>>;
+    let seen: Seen = Arc::default();
+    let (advertised, answered) = (random().into_bytes(), random().into_bytes());
+    let record = |seen: &Seen, path: &str, query: Option<String>, headers: &HeaderMap, body| {
+        let get = |name| {
+            headers
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_owned()
+        };
+        seen.lock().unwrap().push((
+            format!("{path} {}", get(header::ACCEPT)),
+            query,
+            get(header::AUTHORIZATION),
+            get(header::CONTENT_TYPE),
+            body,
+        ));
+    };
+    let app = {
+        let (a, b) = (seen.clone(), seen.clone());
+        let (advertised, answered) = (advertised.clone(), answered.clone());
+        Router::new()
+            .route(
+                "/team/repo.git/info/refs",
+                get(move |RawQuery(query): RawQuery, headers: HeaderMap| {
+                    record(&a, "refs", query, &headers, vec![]);
+                    let advertised = advertised.clone();
+                    async move {
+                        (
+                            [(
+                                header::CONTENT_TYPE,
+                                "application/x-git-receive-pack-advertisement",
+                            )],
+                            advertised,
+                        )
+                    }
+                }),
+            )
+            .route(
+                "/team/repo.git/git-receive-pack",
+                post(move |headers: HeaderMap, body: Bytes| {
+                    record(&b, "pack", None, &headers, body.to_vec());
+                    let answered = answered.clone();
+                    async move {
+                        (
+                            [(
+                                header::CONTENT_TYPE,
+                                "application/x-git-receive-pack-result",
+                            )],
+                            answered,
+                        )
+                    }
+                }),
+            )
+            // A sign-in page answers with HTML, not git.
+            .route(
+                "/login/info/refs",
+                get(|| async { ([(header::CONTENT_TYPE, "text/html")], random()) }),
+            )
+            .route(
+                "/denied/info/refs",
+                get(|| async { (StatusCode::FORBIDDEN, random()) }),
+            )
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let (_dir, root, _task) = start().await;
+    let mut a = user(&root).await;
+    a.call(unlock(&random(), None, true)).await.unwrap();
+    let (bound, elsewhere, token, username) = (random(), random(), random(), random());
+    for (name, destination) in [
+        (&bound, origin.clone()),
+        (&elsewhere, format!("https://{}.invalid", random())),
+    ] {
+        a.call(Request::PutCredential {
+            name: name.clone(),
+            meta: meta(vec![destination]),
+            value: WireValue::Single(WireSecret::new(token.clone())),
+            replace: false,
+        })
+        .await
+        .unwrap();
+    }
+    let call = |credential: &str, repository: String, request: Option<Vec<u8>>| {
+        Request::GitReceivePack(GitCall {
+            credential: credential.to_owned(),
+            username: username.clone(),
+            repository,
+            request,
+        })
+    };
+    let repository = format!("{origin}/team/repo.git/");
+    // Only a paired gateway pushes.
+    assert_eq!(
+        denied(a.call(call(&bound, repository.clone(), None)).await),
+        BrokerError::Forbidden
+    );
+    let mut gateway = paired_gateway(&mut a, &root).await;
+    let reply = |reply| match reply {
+        Reply::Provider { status, body } => (status, body),
+        other => panic!("unexpected {other:?}"),
+    };
+    let advertisement = gateway
+        .call(call(&bound, repository.clone(), None))
+        .await
+        .unwrap();
+    assert_eq!(reply(advertisement), (200, advertised));
+    let pack = random().into_bytes();
+    let result = gateway
+        .call(call(&bound, repository.clone(), Some(pack.clone())))
+        .await
+        .unwrap();
+    assert_eq!(reply(result), (200, answered));
+    let basic = format!(
+        "Basic {}",
+        base64::engine::general_purpose::STANDARD.encode(format!("{username}:{token}"))
+    );
+    assert_eq!(
+        *seen.lock().unwrap(),
+        [
+            (
+                "refs application/x-git-receive-pack-advertisement".to_owned(),
+                Some("service=git-receive-pack".to_owned()),
+                basic.clone(),
+                String::new(),
+                vec![],
+            ),
+            (
+                "pack application/x-git-receive-pack-result".to_owned(),
+                None,
+                basic,
+                "application/x-git-receive-pack-request".to_owned(),
+                pack,
+            ),
+        ]
+    );
+
+    // Failures carry no upstream body, and anything that is not git's own
+    // answer is refused.
+    let refused = gateway
+        .call(call(&bound, format!("{origin}/denied"), None))
+        .await
+        .unwrap();
+    assert_eq!(reply(refused), (403, vec![]));
+    assert_eq!(
+        denied(
+            gateway
+                .call(call(&bound, format!("{origin}/login"), None))
+                .await
+        ),
+        BrokerError::Upstream(UpstreamFailure::NotGit)
+    );
+    // The token goes only to the origin it is bound to.
+    assert_eq!(
+        denied(
+            gateway
+                .call(call(&elsewhere, repository.clone(), None))
+                .await
+        ),
+        BrokerError::Denied(a206_vault::Denial::DestinationNotBound)
+    );
+    let host = origin.trim_start_matches("http://");
+    for bad in [
+        format!("{repository}?service=upload-pack"),
+        format!("{repository}#refs"),
+        format!("http://user@{host}/team/repo.git"),
+        format!("http://{}.invalid/team/repo.git", random()),
+        random(),
+    ] {
+        assert_eq!(
+            denied(gateway.call(call(&bound, bad.clone(), None)).await),
+            BrokerError::Invalid(InvalidRequest::GitRepository),
+            "{bad}"
+        );
+    }
+    for bad in [
+        String::new(),
+        format!("{}:{}", random(), random()),
+        "a\nb".into(),
+    ] {
+        let request = Request::GitReceivePack(GitCall {
+            credential: bound.clone(),
+            username: bad,
+            repository: repository.clone(),
+            request: None,
+        });
+        assert_eq!(
+            denied(gateway.call(request).await),
+            BrokerError::Invalid(InvalidRequest::GitUsername)
+        );
+    }
+}

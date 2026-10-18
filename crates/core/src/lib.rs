@@ -53,7 +53,7 @@ impl Capability {
             Self::Execute => "Run project commands",
             Self::Network => "Use the network",
             Self::GitRead => "Read git history",
-            Self::GitWrite => "Commit and change branches in git",
+            Self::GitWrite => "Commit, branch and push in git",
             Self::ReviewPullRequests => "Review pull requests",
             Self::Download => "Download files",
             Self::Browser => "Use the browser",
@@ -285,6 +285,20 @@ pub struct ModePrompt {
     pub mode: Mode,
     pub prompt: String,
 }
+/// How `git_push` signs in to one forge. Pushes to repositories on `origin`
+/// send the vault credential named `credential`, a token, as the password of
+/// HTTP Basic authentication with `username`, which the forge prescribes
+/// (for example `x-access-token`, `oauth2` or the account name). The vault
+/// broker attaches the token, and only if the credential is bound to
+/// `origin`; the gateway never reads it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitCredential {
+    /// `https://host[:port]`, as the vault binds credentials.
+    pub origin: String,
+    pub username: String,
+    pub credential: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Settings {
     #[serde(default)]
@@ -307,6 +321,9 @@ pub struct Settings {
     /// toolchain. The gateway stores them canonicalized.
     #[serde(default)]
     pub program_directories: Vec<std::path::PathBuf>,
+    /// The vault credentials `git_push` sends to each forge, by origin.
+    #[serde(default)]
+    pub git_credentials: Vec<GitCredential>,
     pub prompts: Vec<ModePrompt>,
     pub theme_design: String,
     pub theme_palette: Option<String>,
@@ -324,6 +341,7 @@ impl Default for Settings {
             mcp_servers: vec![],
             enabled_skills: Default::default(),
             program_directories: vec![],
+            git_credentials: vec![],
             prompts: Mode::ALL
                 .into_iter()
                 .map(|mode| ModePrompt {
