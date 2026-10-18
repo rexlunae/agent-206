@@ -152,7 +152,7 @@ impl Net for Internet {
 
 /// A successful public download.
 pub async fn public_get(source: &str) -> Result<reqwest::Response, DownloadError> {
-    let response = public_request(source, |_| true, &Internet).await?;
+    let (response, _) = public_request(source, |_| true, &Internet).await?;
     if response.status().is_success() {
         Ok(response)
     } else {
@@ -165,12 +165,13 @@ pub async fn public_get(source: &str) -> Result<reqwest::Response, DownloadError
 /// The final non-redirect response of a public `GET`, whatever its status.
 /// Every hop must be a credential-free HTTPS URL on port 443 whose host
 /// `allowed` accepts and whose every resolved address is public; the
-/// connection is pinned to those checked addresses.
+/// connection is pinned to those checked addresses. Also says whether a
+/// redirect was followed.
 pub(crate) async fn public_request(
     source: &str,
     allowed: impl Fn(&str) -> bool,
     net: &dyn Net,
-) -> Result<reqwest::Response, DownloadError> {
+) -> Result<(reqwest::Response, bool), DownloadError> {
     let mut url = Url::parse(source).map_err(DownloadError::InvalidUrl)?;
     for hop in 0..=5 {
         validate_url(&url)?;
@@ -205,7 +206,7 @@ pub(crate) async fn public_request(
                 | S::PERMANENT_REDIRECT
         );
         if !redirect {
-            return Ok(response);
+            return Ok((response, hop > 0));
         }
         if hop >= 5 {
             return Err(DownloadError::TooManyRedirects);
