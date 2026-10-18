@@ -163,8 +163,8 @@ Gateway tests additionally cover target revision changes, invalid selections,
 replayed application and receipt-write partial failures; CLI tests exercise the
 same commands through the real binary. Desktop/TUI interactive acceptance,
 browser receipt-failure acceptance, GUI vault migration and other source
-adapters remain pending. Editing existing provider labels and vault references
-also still uses `settings --apply`; GUI account editing remains a gap.
+adapters remain pending. Existing provider labels, endpoints, protocols and vault
+references can be edited on Connections or through `settings --apply`.
 See [imports.md](imports.md).
 
 1. Restore complete secret custody: encrypted broker IPC, explicit destination/use
@@ -218,3 +218,22 @@ The web controls were clicked through against a disposable local gateway: saves
 from the inspector and details popover update both, invalid input blocks Save,
 and a concurrent CLI edit preserves an unsaved draft and requires Reload. No
 provider accounts, credentials or tool grants were configured for that check.
+
+## Connection editor (2026-10-18)
+
+Connections now offers an editor for existing account names, endpoints, protocols
+and saved vault credential references in the shared GUI. It uses SaveSettings,
+matching the CLI's `settings --apply`; account identity and unedited settings are
+preserved. Polling does not overwrite drafts. A changed settings revision blocks
+Save until explicit Reload; failed saves keep the draft and structured error.
+Offline, in-flight, empty and unchanged drafts cannot be submitted. A gateway
+switch remounts the editor rather than carrying a draft into another gateway.
+The gateway retains endpoint validation, managed-Joshua protections, active-run
+cancellation and catalog invalidation. This editor does not create credentials,
+grant secret access or discover models automatically. Pure draft/gating tests
+cover the shared editor. Release web acceptance with a disposable gateway
+confirmed concurrent CLI edits preserve the draft and disable Save, explicit
+Reload restores current values, gateway endpoint rejection retains the draft
+and error, and successful edits appear immediately and reload correctly. No
+vault, real credentials, model calls or grants were created. Native desktop/TUI
+interaction remains unverified.

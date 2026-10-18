@@ -3,6 +3,7 @@
 mod activity;
 mod audit;
 mod budgets;
+mod connections;
 mod conversation;
 mod error;
 mod extensions;

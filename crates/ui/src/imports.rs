@@ -86,7 +86,7 @@ fn ReviewPanel(review: Review) -> Element {
         CardHeader { CardTitle { "Review import" } CardSubtitle { "{preview.source.display()}" } }
         CardBody { div { class: "a206-stack",
             p { "Choose each item to add. Existing accounts are kept. Messenger entries stay disabled and require a new vault credential before connecting." }
-            p { class: "a206-muted", "Source labels, model text and credential references are omitted. Custom provider labels are generated. Providers have no credential reference; edit their settings with `agent206 settings --apply` before authenticated use." }
+            p { class: "a206-muted", "Source labels, model text and credential references are omitted. Custom provider labels are generated. Providers have no credential reference; edit them on Connections before authenticated use." }
             Disclosure { summary: rsx! { "Source and review record" },
                 p { "Configuration SHA-256: {preview.config_sha256.as_deref().unwrap_or(\"No configuration file\")}" }
                 p { "Target settings revision: {review.settings_revision}" }
