@@ -368,17 +368,44 @@ impl Gateway {
     }
 }
 impl Outbox {
+    /// Names of messengers whose receiving session is connected now.
+    fn connected(&self) -> BTreeSet<String> {
+        match self.base.lock() {
+            Ok(store) => store
+                .state
+                .messengers
+                .iter()
+                .filter(|status| status.state == MessengerState::Connected)
+                .map(|status| status.name.clone())
+                .collect(),
+            Err(error) => {
+                // Offer no chat rather than fail the listing; webhooks
+                // do not depend on it.
+                tracing::warn!(
+                    error = &error as &dyn std::error::Error,
+                    "messenger statuses unreadable"
+                );
+                BTreeSet::new()
+            }
+        }
+    }
+
     /// Where a model may post: each webhook by its name, and each allowed
     /// chat of a messenger that can post outside a reply as `name/chat`.
     /// Only messengers that are enabled and not disconnected by the user
-    /// are listed. Messenger names never contain `/`.
+    /// are listed, and chats only while their messenger is connected, so a
+    /// messenger that failed (for example on a refused token) offers none.
+    /// Messenger names never contain `/`.
     pub fn destinations(&self) -> Vec<String> {
+        let connected = self.connected();
         let mut destinations = vec![];
         for entry in self.base.messengers.borrow().iter().filter(|e| e.run) {
             let config = &entry.config;
             if config.kind.is_send_only() {
                 destinations.push(config.name.clone());
-            } else if crate::messengers::chat_part_limit(config.kind).is_some() {
+            } else if crate::messengers::chat_part_limit(config.kind).is_some()
+                && connected.contains(&config.name)
+            {
                 destinations.extend(
                     config
                         .allowed_chats
@@ -391,13 +418,16 @@ impl Outbox {
     }
 
     /// Send `text` to `destination`, one of [`Self::destinations`]; the
-    /// number of parts sent. A failure is also recorded in the messenger's
-    /// status, so it is visible on the Messengers page.
+    /// number of parts sent. A webhook's failure is also recorded in its
+    /// status, so it is visible on the Messengers page until a send
+    /// succeeds; a chat messenger's status is its connection, so a failed
+    /// post is reported only to the caller.
     pub async fn send(&self, destination: &str, text: &str) -> Result<usize, MessengerError> {
         let (name, chat) = match destination.split_once('/') {
             Some((name, chat)) => (name, Some(chat)),
             None => (destination, None),
         };
+        let connected = self.connected();
         let config = self
             .base
             .messengers
@@ -411,6 +441,7 @@ impl Outbox {
                         None => config.kind.is_send_only(),
                         Some(chat) => {
                             crate::messengers::chat_part_limit(config.kind).is_some()
+                                && connected.contains(name)
                                 && config.allowed_chats.contains(chat)
                         }
                     }
@@ -436,18 +467,19 @@ impl Outbox {
                 crate::messengers::post(root, pairing, &config, chat, text, withdrawn).await
             }
         };
-        match &result {
-            // A webhook's only state is whether its last message went out;
-            // a chat messenger's state is its connection, left as it is.
-            Ok(_) if chat.is_none() => self.base.update(name, |status| {
-                status.state = MessengerState::Ready;
-                status.failure = None;
-            }),
-            Ok(_) => {}
-            Err(error) => {
-                let report = crate::error::handle("messenger", error);
-                self.base
-                    .update(name, |status| status.failure = Some(report));
+        // A webhook's only state is whether its last message went out; a
+        // chat messenger's state is its connection, left as it is.
+        if chat.is_none() {
+            match &result {
+                Ok(_) => self.base.update(name, |status| {
+                    status.state = MessengerState::Ready;
+                    status.failure = None;
+                }),
+                Err(error) => {
+                    let report = crate::error::handle("messenger", error);
+                    self.base
+                        .update(name, |status| status.failure = Some(report));
+                }
             }
         }
         result

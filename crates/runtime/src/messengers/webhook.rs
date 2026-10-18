@@ -109,13 +109,14 @@ mod tests {
     fn long_messages_split_and_too_long_or_blank_ones_are_refused_whole() {
         for format in WebhookFormat::ALL {
             let limit = part_limit(format);
-            let fits = "x".repeat(limit * crate::messengers::MAX_SENT_PARTS);
+            // At most eight parts, as documented in docs/messengers.md.
+            let fits = "x".repeat(limit * 8);
             let sent = parts(format, &fits).unwrap();
-            assert_eq!(sent.len(), crate::messengers::MAX_SENT_PARTS);
+            assert_eq!(sent.len(), 8);
             assert_eq!(sent.concat(), fits);
             assert!(matches!(
                 parts(format, &format!("{fits}x")),
-                Err(MessengerError::MessageTooLong { most }) if most == limit * crate::messengers::MAX_SENT_PARTS
+                Err(MessengerError::MessageTooLong { most }) if most == limit * 8
             ));
             assert!(matches!(
                 parts(format, " \n "),

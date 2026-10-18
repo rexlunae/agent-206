@@ -366,57 +366,90 @@ async fn a_webhook_withdrawn_mid_message_gets_no_more_of_it() {
 
 type Posted = Arc<Mutex<Vec<(String, Value)>>>;
 
-/// A Telegram Bot API stand-in: names the bot, has no updates, and records
-/// what each sendMessage carried under the path segment holding the token.
-async fn serve_bot() -> (String, Posted) {
+/// What the Bot API stand-in saw, and a messenger the user disconnects
+/// through this gateway as soon as the first message arrives.
+#[derive(Clone, Default)]
+struct Bot {
+    posted: Posted,
+    disconnect: Arc<Mutex<Option<(Gateway, String)>>>,
+}
+
+/// A Telegram Bot API stand-in: names the bot (or refuses its token), has no
+/// updates, and records what each sendMessage carried under the path
+/// segment holding the token.
+async fn serve_bot(token_works: bool) -> (String, Bot) {
+    use axum::http::StatusCode;
     use axum::routing::{any, get};
-    let posted = Posted::default();
+    let bot = Bot::default();
     let me = json!({"ok": true, "result": {"id": std::process::id(), "username": nonce()}});
-    let router =
-        Router::new()
-            .route("/{bot}/getMe", get(move || async move { Json(me) }))
-            .route(
-                "/{bot}/getUpdates",
-                any(|| async {
-                    tokio::time::sleep(Duration::from_millis(20)).await;
-                    Json(json!({"ok": true, "result": []}))
-                }),
-            )
-            .route(
-                "/{bot}/sendMessage",
-                post(
-                    |State(posted): State<Posted>,
-                     Path(bot): Path<String>,
-                     Json(body): Json<Value>| async move {
-                        posted.lock().unwrap().push((bot, body));
-                        Json(json!({"ok": true, "result": {"message_id": 1}}))
-                    },
-                ),
-            )
-            .with_state(posted.clone());
+    let router = Router::new()
+        .route(
+            "/{bot}/getMe",
+            get(move || async move {
+                if token_works {
+                    (StatusCode::OK, Json(me))
+                } else {
+                    (StatusCode::UNAUTHORIZED, Json(json!({"ok": false})))
+                }
+            }),
+        )
+        .route(
+            "/{bot}/getUpdates",
+            any(|| async {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                Json(json!({"ok": true, "result": []}))
+            }),
+        )
+        .route(
+            "/{bot}/sendMessage",
+            post(
+                |State(bot): State<Bot>, Path(path): Path<String>, Json(body): Json<Value>| async move {
+                    bot.posted.lock().unwrap().push((path, body));
+                    let disconnect = bot.disconnect.lock().unwrap().take();
+                    if let Some((gateway, name)) = disconnect {
+                        let reply = request(&gateway, Command::DisconnectMessenger { name }).await;
+                        assert_eq!(reply, Reply::Ok);
+                    }
+                    Json(json!({"ok": true, "result": {"message_id": 1}}))
+                },
+            ),
+        )
+        .with_state(bot.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let origin = format!("http://{}", listener.local_addr().unwrap());
     // Detached: the server lives as long as the test's runtime.
     tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
-    (origin, posted)
+    (origin, bot)
 }
 
-#[tokio::test]
-async fn a_model_posts_only_to_allowed_chats_of_a_running_messenger() {
-    let api = ProviderApi::OpenAi;
-    let (origin, posted) = serve_bot().await;
+/// A gateway paired with a broker holding a Telegram bot token, a running
+/// Telegram messenger allowing one chat, and a conversation that permits
+/// `send_message`.
+struct Chats {
+    gateway: Gateway,
+    _state: tempfile::TempDir,
+    bot: Bot,
+    token: String,
+    name: String,
+    chat: String,
+    requests: tokio::sync::mpsc::Receiver<Opened>,
+    thread: Id,
+}
+
+async fn chats(api: ProviderApi, token_works: bool) -> Chats {
+    let (origin, bot) = serve_bot(token_works).await;
     let token = format!("{}:{}", std::process::id(), nonce().replace('-', "_"));
     let (state, credential, pairing) = broker(&origin, &token).await;
     let gateway = Gateway::open(state.path()).unwrap();
-    let (model, mut requests) = connect(&gateway, api).await;
-    let (bot, chat, other) = (format!("t-{}", nonce()), nonce(), nonce());
+    let (model, requests) = connect(&gateway, api).await;
+    let (name, chat) = (format!("t-{}", nonce()), nonce());
     let mut settings = gateway.snapshot().unwrap().settings;
     settings.messengers.push(MessengerConfig {
         enabled: true,
         credential: Some(credential),
         endpoint: Some(origin.clone()),
         allowed_chats: [chat.clone()].into(),
-        ..MessengerConfig::new(bot.clone(), MessengerKind::Telegram)
+        ..MessengerConfig::new(name.clone(), MessengerKind::Telegram)
     });
     assert_eq!(
         request(&gateway, Command::SaveSettings(Box::new(settings))).await,
@@ -426,34 +459,80 @@ async fn a_model_posts_only_to_allowed_chats_of_a_running_messenger() {
         request(&gateway, Command::PairBroker { pairing }).await,
         Reply::Ok
     );
+    let supervisor = gateway.clone();
+    // Detached: the messengers run as long as the test's runtime.
+    tokio::spawn(async move { supervisor.supervise_messengers().await });
+    // The messenger connects, or fails on its refused token.
+    let settled = if token_works {
+        MessengerState::Connected
+    } else {
+        MessengerState::Failed
+    };
+    tokio::time::timeout(PATIENCE, async {
+        while gateway.snapshot().unwrap().messengers[0].state != settled {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(wait("the messenger to settle"));
     let thread = conversation(&gateway, model).await;
-    let tool = a206_runtime::message_tool::SEND;
-    let resolve = |asked: ApprovalRequest| Command::ResolveApproval {
+    Chats {
+        gateway,
+        _state: state,
+        bot,
+        token,
+        name,
+        chat,
+        requests,
+        thread,
+    }
+}
+
+fn approve(thread: Id, asked: ApprovalRequest) -> Command {
+    Command::ResolveApproval {
         thread,
         approval: asked.id,
         digest: asked.digest,
         decision: ApprovalDecision::Approve,
-    };
+    }
+}
+
+#[tokio::test]
+async fn a_model_posts_only_to_allowed_chats_of_a_running_messenger() {
+    let api = ProviderApi::OpenAi;
+    let Chats {
+        gateway,
+        bot,
+        token,
+        name,
+        chat,
+        mut requests,
+        thread,
+        _state,
+        ..
+    } = chats(api, true).await;
+    let other = nonce();
+    let tool = a206_runtime::message_tool::SEND;
 
     // Only the allowed chat is offered.
     let task = send(&gateway, thread);
     let first = next_request(&mut requests).await;
     assert!(offered(api, &first.body).contains(&tool.to_owned()));
     let body = first.body.to_string();
-    assert!(body.contains(&format!("{bot}/{chat}")));
+    assert!(body.contains(&format!("{name}/{chat}")));
     assert!(!body.contains(&other));
     let mut seen = vec![body];
 
     // A chat the user never allowed is refused even once the user approves.
     let stray = Call::new(
         tool,
-        json!({"destination": format!("{bot}/{other}"), "text": nonce()}),
+        json!({"destination": format!("{name}/{other}"), "text": nonce()}),
     );
     first
         .respond(calls_response(api, std::slice::from_ref(&stray), &nonce()))
         .await;
     let asked = approval(&gateway, thread).await;
-    assert_eq!(request(&gateway, resolve(asked)).await, Reply::Ok);
+    assert_eq!(request(&gateway, approve(thread, asked)).await, Reply::Ok);
     let second = next_request(&mut requests).await;
     let refused = result_for(api, &second.body, &stray.id).unwrap();
     assert!(
@@ -462,7 +541,7 @@ async fn a_model_posts_only_to_allowed_chats_of_a_running_messenger() {
     );
     seen.push(second.body.to_string());
     assert!(
-        posted.lock().unwrap().is_empty(),
+        bot.posted.lock().unwrap().is_empty(),
         "posted to a chat not allowed"
     );
 
@@ -470,21 +549,21 @@ async fn a_model_posts_only_to_allowed_chats_of_a_running_messenger() {
     let text = nonce();
     let sent = Call::new(
         tool,
-        json!({"destination": format!("{bot}/{chat}"), "text": text}),
+        json!({"destination": format!("{name}/{chat}"), "text": text}),
     );
     second
         .respond(calls_response(api, std::slice::from_ref(&sent), &nonce()))
         .await;
     let asked = approval(&gateway, thread).await;
     assert!(asked.arguments.contains(&text));
-    assert_eq!(request(&gateway, resolve(asked)).await, Reply::Ok);
+    assert_eq!(request(&gateway, approve(thread, asked)).await, Reply::Ok);
     let third = next_request(&mut requests).await;
     let result = result_for(api, &third.body, &sent.id).unwrap();
     assert!(result.contains("\"parts\":1"), "{result}");
     seen.push(third.body.to_string());
     third.respond(text_response(api, &nonce())).await;
     assert_eq!(finished(task).await.state, RunState::Complete);
-    let delivered = posted.lock().unwrap().clone();
+    let delivered = bot.posted.lock().unwrap().clone();
     let [(path, body)] = delivered.as_slice() else {
         panic!("one message: {delivered:?}");
     };
@@ -497,7 +576,11 @@ async fn a_model_posts_only_to_allowed_chats_of_a_running_messenger() {
 
     // Once the user disconnects the messenger, its chats are not offered.
     assert_eq!(
-        request(&gateway, Command::DisconnectMessenger { name: bot.clone() }).await,
+        request(
+            &gateway,
+            Command::DisconnectMessenger { name: name.clone() }
+        )
+        .await,
         Reply::Ok
     );
     let task = send(&gateway, thread);
@@ -505,4 +588,59 @@ async fn a_model_posts_only_to_allowed_chats_of_a_running_messenger() {
     assert!(!offered(api, &next.body).contains(&tool.to_owned()));
     next.respond(text_response(api, &nonce())).await;
     assert_eq!(finished(task).await.state, RunState::Complete);
+}
+
+#[tokio::test]
+async fn a_messenger_that_failed_to_connect_offers_no_chat() {
+    let api = ProviderApi::OpenAi;
+    let Chats {
+        gateway,
+        mut requests,
+        thread,
+        _state,
+        ..
+    } = chats(api, false).await;
+    let task = send(&gateway, thread);
+    let next = next_request(&mut requests).await;
+    let tool = a206_runtime::message_tool::SEND;
+    assert!(!offered(api, &next.body).contains(&tool.to_owned()));
+    next.respond(text_response(api, &nonce())).await;
+    assert_eq!(finished(task).await.state, RunState::Complete);
+}
+
+#[tokio::test]
+async fn a_chat_withdrawn_mid_message_gets_no_more_of_it() {
+    let api = ProviderApi::OpenAi;
+    let Chats {
+        gateway,
+        bot,
+        name,
+        chat,
+        mut requests,
+        thread,
+        _state,
+        ..
+    } = chats(api, true).await;
+    // The user disconnects the messenger as soon as its first part arrives.
+    *bot.disconnect.lock().unwrap() = Some((gateway.clone(), name.clone()));
+    let tool = a206_runtime::message_tool::SEND;
+    let task = send(&gateway, thread);
+    let first = next_request(&mut requests).await;
+    // Two Telegram parts.
+    let text: String = (0..150).map(|_| nonce()).collect::<Vec<_>>().join(" ");
+    let call = Call::new(
+        tool,
+        json!({"destination": format!("{name}/{chat}"), "text": text}),
+    );
+    first
+        .respond(calls_response(api, std::slice::from_ref(&call), &nonce()))
+        .await;
+    let asked = approval(&gateway, thread).await;
+    assert_eq!(request(&gateway, approve(thread, asked)).await, Reply::Ok);
+    let second = next_request(&mut requests).await;
+    let result = result_for(api, &second.body, &call.id).unwrap();
+    second.respond(text_response(api, &nonce())).await;
+    assert_eq!(finished(task).await.state, RunState::Complete);
+    assert_eq!(bot.posted.lock().unwrap().len(), 1);
+    assert!(result.contains("1 of 2 parts"), "{result}");
 }
