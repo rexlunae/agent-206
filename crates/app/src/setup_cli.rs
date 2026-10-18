@@ -15,6 +15,16 @@ use std::path::{Path, PathBuf};
 
 #[derive(Subcommand)]
 pub enum ImportSource {
+    /// Review RustyClaw settings on the gateway host, without changing them.
+    ReviewRustyclaw { path: PathBuf },
+    /// Apply selected zero-based item indices from a held gateway review.
+    ApplyReview {
+        review: uuid::Uuid,
+        #[arg(long)]
+        provider: Vec<usize>,
+        #[arg(long)]
+        messenger: Vec<usize>,
+    },
     /// Import from a RustyClaw installation (default ~/.rustyclaw).
     #[command(name = "rustyclaw")]
     RustyClaw {
@@ -287,14 +297,44 @@ async fn import_vault(root: &Path, source: &Path) -> Result<()> {
 }
 
 pub async fn import(root: &Path, remote: Option<String>, source: ImportSource) -> Result<()> {
-    let ImportSource::RustyClaw {
-        path,
-        apply,
-        skip_vault,
-        skip_providers,
-        skip_messengers,
-        toml,
-    } = source;
+    let (path, apply, skip_vault, skip_providers, skip_messengers, toml) = match source {
+        ImportSource::ReviewRustyclaw { path } => {
+            return review_command(root, remote, Command::PreviewImport { source: path }).await;
+        }
+        ImportSource::ApplyReview {
+            review,
+            provider,
+            messenger,
+        } => {
+            return review_command(
+                root,
+                remote,
+                Command::ApplyImport {
+                    review,
+                    selection: a206_core::imports::Selection {
+                        providers: provider.into_iter().collect(),
+                        messengers: messenger.into_iter().collect(),
+                    },
+                },
+            )
+            .await;
+        }
+        ImportSource::RustyClaw {
+            path,
+            apply,
+            skip_vault,
+            skip_providers,
+            skip_messengers,
+            toml,
+        } => (
+            path,
+            apply,
+            skip_vault,
+            skip_providers,
+            skip_messengers,
+            toml,
+        ),
+    };
     let path = match path {
         Some(path) => path,
         None => a206_import::rustyclaw::default_root(Path::new(
@@ -433,6 +473,34 @@ pub async fn import(root: &Path, remote: Option<String>, source: ImportSource) -
         println!(
             "To use messenger {name}: agent206 vault add {name}-token --kind token --destination {origin}, then agent206 messenger set {name} --credential {name}-token, agent206 messenger allow {name} <chat> and agent206 messenger enable {name}"
         );
+    }
+    Ok(())
+}
+
+async fn review_command(root: &Path, remote: Option<String>, command: Command) -> Result<()> {
+    let target = a206_runtime::connection::require(root, remote)?;
+    let client = a206_runtime::control::GatewayController::attach(
+        root.to_owned(),
+        target.remote().map(str::to_owned),
+    );
+    let reply = client.call(command).await?.into_result()?;
+    match reply {
+        Reply::ImportPreview(review) => {
+            if review.version != a206_core::imports::REVIEW_VERSION {
+                bail!(
+                    "gateway import review version is unsupported; update the gateway and preview again"
+                );
+            }
+            print!("{}", toml::to_string_pretty(&review)?);
+        }
+        Reply::ImportApplied(result) => {
+            print!("{}", toml::to_string_pretty(&result.receipt)?);
+            if let Some(error) = result.receipt_error {
+                return Err(anyhow::Error::new(error)
+                    .context("Settings were imported, but their receipt could not be saved"));
+            }
+        }
+        _ => bail!("gateway did not return an import review or application result"),
     }
     Ok(())
 }

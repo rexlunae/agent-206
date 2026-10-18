@@ -30,6 +30,7 @@ mod delegation;
 mod plans;
 mod schedules;
 pub use plans::Plans;
+mod imports;
 mod pause;
 mod profiles;
 mod skills;
@@ -175,6 +176,8 @@ pub enum GatewayError {
     #[error(transparent)]
     Profile(#[from] crate::agent_profiles::ProfileError),
     #[error(transparent)]
+    ImportReader(#[from] crate::imports::ReaderError),
+    #[error(transparent)]
     OutputRules(#[from] a206_output_rules::RulesError),
     #[error(transparent)]
     Prompt(#[from] crate::prompt_tool::PromptError),
@@ -268,6 +271,7 @@ impl crate::error::Classified for GatewayError {
             Self::Mcp(error) => return classify(error),
             Self::Skill(error) => return classify(error),
             Self::Profile(error) => return classify(error),
+            Self::ImportReader(error) => return classify(error),
             Self::OutputRules(error) => return classify(error),
             Self::Prompt(error) => return classify(error),
             Self::Programs(error) => return classify(error),
@@ -397,6 +401,7 @@ pub struct Gateway {
     reserved: delegation::Reserved,
     /// Wakes the scheduler when a job is added or changed.
     jobs_changed: Arc<tokio::sync::Notify>,
+    import_reviews: Arc<Mutex<std::collections::VecDeque<a206_core::imports::Review>>>,
 }
 /// The broker pairing this gateway holds, with the connection that anchors it.
 struct Paired {
@@ -506,6 +511,7 @@ impl Gateway {
             delegation: Default::default(),
             reserved: Arc::default(),
             jobs_changed: Arc::default(),
+            import_reviews: Arc::default(),
         };
         // Schedule tools; each conversation still denies them until the user
         // permits them, and each new job waits for the user's approval.
@@ -655,6 +661,7 @@ impl Gateway {
                 | Command::CallTool { .. }
                 | Command::Skills
                 | Command::AgentProfiles
+                | Command::PreviewImport { .. }
                 | Command::ReadSkill { .. }
                 | Command::ListTools { .. }
                 // Read-only; its reply copies message text.
@@ -693,6 +700,129 @@ impl Gateway {
                 (Ok(reply), stop)
             }
         }
+    }
+    fn save_settings(&self, mut settings: Box<Settings>) -> Result<Reply> {
+        provider::validate_presets(&settings.provider_presets)?;
+        messengers::validate(&settings.messengers)?;
+        let mut backend_kinds = BTreeSet::new();
+        for backend in &settings.backends {
+            crate::backends::validate_config(backend)?;
+            check(
+                backend_kinds.insert(backend.kind.label()),
+                GatewayError::Invalid("duplicate coding backend configuration"),
+            )?;
+        }
+        let mut ids = BTreeSet::new();
+        for config in &settings.providers {
+            check(
+                ids.insert(config.id),
+                GatewayError::Invalid("duplicate provider id"),
+            )?;
+            provider::endpoint(config, "models")?;
+            check(
+                !config.label.trim().is_empty(),
+                GatewayError::Invalid("provider label is required"),
+            )?;
+        }
+        for mode in Mode::ALL {
+            check(
+                settings.prompts.iter().filter(|p| p.mode == mode).count() == 1,
+                GatewayError::Invalid("each mode needs exactly one prompt"),
+            )?;
+        }
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let mut store = self.lock()?;
+        let mut hidden = a206_sandbox::hidden_home_paths();
+        hidden.push(store.root.clone());
+        settings.program_directories = crate::exec_tool::programs::validate(
+            &settings.program_directories,
+            &store.state.settings.program_directories,
+            &hidden,
+            home.as_deref(),
+            &store.root,
+        )?;
+        check(
+            settings.revision == store.state.settings.revision,
+            GatewayError::Conflict(
+                "settings changed in another operation; refresh and retry your change",
+            ),
+        )?;
+        // Skill approval is its own user operation, never a settings edit.
+        settings.enabled_skills = store.state.settings.enabled_skills.clone();
+        let mcp_servers = Self::mcp_statuses(&store.state, &settings.mcp_servers)?;
+        if let Some(id) = store.state.managed_joshua_provider {
+            let owned = store
+                .state
+                .settings
+                .providers
+                .iter()
+                .find(|provider| provider.id == id)
+                .ok_or(GatewayError::Conflict(
+                    "managed Joshua connection is missing; stop Joshua before applying settings",
+                ))?;
+            check(
+                settings
+                    .providers
+                    .iter()
+                    .find(|provider| provider.id == id)
+                    .is_some_and(|provider| {
+                        provider.base_url == owned.base_url
+                            && provider.api == owned.api
+                            && provider.credential == owned.credential
+                    }),
+                GatewayError::Conflict(
+                    "stop managed Joshua before removing its connection or changing its endpoint, protocol or credentials",
+                ),
+            )?;
+        }
+        // Revocation also stops already-running inference and coding backends.
+        let running = self.running.lock().map_err(poisoned("run"))?;
+        for thread in &store.state.threads {
+            let provider_changed = thread.model.as_ref().is_some_and(|key| {
+                let previous = store
+                    .state
+                    .settings
+                    .providers
+                    .iter()
+                    .find(|p| p.id == key.provider);
+                settings.providers.iter().find(|p| p.id == key.provider) != previous
+            });
+            let backend_changed = thread.backend != CodingBackend::Native
+                && settings.backends.iter().find(|b| b.kind == thread.backend)
+                    != store
+                        .state
+                        .settings
+                        .backends
+                        .iter()
+                        .find(|b| b.kind == thread.backend);
+            if (provider_changed || backend_changed)
+                && let Some(token) = running.get(&thread.id)
+            {
+                token.cancel();
+            }
+        }
+        drop(running);
+        settings.revision += 1;
+        write_settings(&store.root, &settings)?;
+        // Endpoint/credential changes invalidate any facts from the previous source.
+        let old = store.state.settings.providers.clone();
+        store.state.catalogs.retain(|c| {
+            settings
+                .providers
+                .iter()
+                .any(|p| p.id == c.provider && old.contains(p))
+        });
+        store.state.messengers =
+            Self::messenger_statuses(&store.state.messengers, &settings.messengers);
+        let previous = std::mem::replace(&mut store.state.settings, *settings);
+        store.state.mcp_servers = mcp_servers;
+        store.persist(Some(EventKind::SettingsChanged))?;
+        self.stop_changed_mcp(&previous.mcp_servers, &store.state.settings.mcp_servers)?;
+        drop(store);
+        // Background commands given a directory that was removed stop.
+        self.grants_changed()?;
+        self.publish_messengers()?;
+        Ok(Reply::Ok)
     }
     async fn handle(&self, command: Command) -> Result<Reply> {
         match command {
@@ -811,121 +941,10 @@ impl Gateway {
                 Ok(Reply::Ok)
             }
             Command::Events { after } => Ok(Reply::Events(self.lock()?.events(after)?)),
-            Command::SaveSettings(mut settings) => {
-                provider::validate_presets(&settings.provider_presets)?;
-                messengers::validate(&settings.messengers)?;
-                let mut backend_kinds = BTreeSet::new();
-                for backend in &settings.backends {
-                    crate::backends::validate_config(backend)?;
-                    check(
-                        backend_kinds.insert(backend.kind.label()),
-                        GatewayError::Invalid("duplicate coding backend configuration"),
-                    )?;
-                }
-                let mut ids = BTreeSet::new();
-                for config in &settings.providers {
-                    check(
-                        ids.insert(config.id),
-                        GatewayError::Invalid("duplicate provider id"),
-                    )?;
-                    provider::endpoint(config, "models")?;
-                    check(
-                        !config.label.trim().is_empty(),
-                        GatewayError::Invalid("provider label is required"),
-                    )?;
-                }
-                for mode in Mode::ALL {
-                    check(
-                        settings.prompts.iter().filter(|p| p.mode == mode).count() == 1,
-                        GatewayError::Invalid("each mode needs exactly one prompt"),
-                    )?;
-                }
-                let home = std::env::var_os("HOME").map(PathBuf::from);
-                let mut store = self.lock()?;
-                let mut hidden = a206_sandbox::hidden_home_paths();
-                hidden.push(store.root.clone());
-                settings.program_directories = crate::exec_tool::programs::validate(
-                    &settings.program_directories,
-                    &store.state.settings.program_directories,
-                    &hidden,
-                    home.as_deref(),
-                    &store.root,
-                )?;
-                check(
-                    settings.revision == store.state.settings.revision,
-                    GatewayError::Conflict(
-                        "settings changed in another operation; refresh and retry your change",
-                    ),
-                )?;
-                // Skill approval is its own user operation, never a settings edit.
-                settings.enabled_skills = store.state.settings.enabled_skills.clone();
-                let mcp_servers = Self::mcp_statuses(&store.state, &settings.mcp_servers)?;
-                if let Some(id) = store.state.managed_joshua_provider {
-                    let owned = store.state.settings.providers.iter().find(|provider| provider.id == id)
-                        .ok_or(GatewayError::Conflict("managed Joshua connection is missing; stop Joshua before applying settings"))?;
-                    check(
-                        settings
-                            .providers
-                            .iter()
-                            .find(|provider| provider.id == id)
-                            .is_some_and(|provider| {
-                                provider.base_url == owned.base_url
-                                    && provider.api == owned.api
-                                    && provider.credential == owned.credential
-                            }),
-                        GatewayError::Conflict(
-                            "stop managed Joshua before removing its connection or changing its endpoint, protocol or credentials",
-                        ),
-                    )?;
-                }
-                // Revocation also stops already-running inference and coding backends.
-                let running = self.running.lock().map_err(poisoned("run"))?;
-                for thread in &store.state.threads {
-                    let provider_changed = thread.model.as_ref().is_some_and(|key| {
-                        let previous = store
-                            .state
-                            .settings
-                            .providers
-                            .iter()
-                            .find(|p| p.id == key.provider);
-                        settings.providers.iter().find(|p| p.id == key.provider) != previous
-                    });
-                    let backend_changed = thread.backend != CodingBackend::Native
-                        && settings.backends.iter().find(|b| b.kind == thread.backend)
-                            != store
-                                .state
-                                .settings
-                                .backends
-                                .iter()
-                                .find(|b| b.kind == thread.backend);
-                    if (provider_changed || backend_changed)
-                        && let Some(token) = running.get(&thread.id)
-                    {
-                        token.cancel();
-                    }
-                }
-                drop(running);
-                settings.revision += 1;
-                write_settings(&store.root, &settings)?;
-                // Endpoint/credential changes invalidate any facts from the previous source.
-                let old = store.state.settings.providers.clone();
-                store.state.catalogs.retain(|c| {
-                    settings
-                        .providers
-                        .iter()
-                        .any(|p| p.id == c.provider && old.contains(p))
-                });
-                store.state.messengers =
-                    Self::messenger_statuses(&store.state.messengers, &settings.messengers);
-                let previous = std::mem::replace(&mut store.state.settings, *settings);
-                store.state.mcp_servers = mcp_servers;
-                store.persist(Some(EventKind::SettingsChanged))?;
-                self.stop_changed_mcp(&previous.mcp_servers, &store.state.settings.mcp_servers)?;
-                drop(store);
-                // Background commands given a directory that was removed stop.
-                self.grants_changed()?;
-                self.publish_messengers()?;
-                Ok(Reply::Ok)
+            Command::SaveSettings(settings) => self.save_settings(settings),
+            Command::PreviewImport { source } => self.preview_import(&source).await,
+            Command::ApplyImport { review, selection } => {
+                self.apply_import(review, selection).await
             }
             Command::ConnectMessenger { name } => self.connect_messenger(&name, true),
             Command::DisconnectMessenger { name } => self.connect_messenger(&name, false),

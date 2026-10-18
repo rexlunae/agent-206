@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 pub const READER_COMMAND: &str = "__a206-import-reader";
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 const DEADLINE: std::time::Duration = std::time::Duration::from_secs(15);
 
 #[derive(Serialize, Deserialize)]
@@ -17,6 +17,53 @@ struct ReadRequest {
     source: PathBuf,
     settings: Settings,
     vault_exists: Option<bool>,
+    exposure: Exposure,
+}
+
+#[derive(Clone, Copy, Serialize, Deserialize)]
+enum Exposure {
+    Terminal,
+    SettingsReview,
+}
+
+/// Runs inside the reader, before any ordinary reply. Shared reviews omit
+/// optional free-form source metadata rather than guessing whether it is a
+/// password. Names used to save accounts are generated or owned by target presets.
+fn protect(
+    mut preview: Preview,
+    exposure: Exposure,
+    settings: &Settings,
+) -> Result<Preview, ReaderError> {
+    if matches!(exposure, Exposure::SettingsReview) {
+        let presets = settings.provider_presets.all();
+        for (index, provider) in preview.providers.iter_mut().enumerate() {
+            provider.label = provider
+                .preset
+                .as_ref()
+                .filter(|id| id.as_str() != "custom")
+                .and_then(|id| presets.iter().find(|preset| &preset.id == id))
+                .map(|preset| preset.name.clone())
+                .unwrap_or_else(|| format!("Imported provider {}", index + 1));
+            provider.source_id = format!("provider-{}", index + 1);
+            provider.model_reference = None;
+            provider.credential = None;
+        }
+        for messenger in &mut preview.messengers {
+            messenger.source_name = String::new();
+            messenger.source_kind = messenger
+                .kind
+                .map(|kind| kind.label().to_owned())
+                .unwrap_or_else(|| "Unsupported service".into());
+        }
+    }
+    // MessagePack string bytes remain contiguous. Scan before crossing the
+    // reader boundary; refuse the whole preview rather than corrupting a
+    // destination, login or restriction by replacing text inside it.
+    let bytes = rmp_serde::to_vec_named(&preview).map_err(ReaderError::PreviewEncoding)?;
+    if a206_leak_scan::redact(&String::from_utf8_lossy(&bytes)).is_some() {
+        return Err(ReaderError::SensitiveSource);
+    }
+    Ok(preview)
 }
 
 /// Only duplicate matching and preset defaults are needed by the reader.
@@ -48,6 +95,12 @@ fn target_settings(settings: &Settings) -> Settings {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ReaderError {
+    #[error(
+        "Source metadata contains credential-shaped text. Review the source locally; no preview was returned."
+    )]
+    SensitiveSource,
+    #[error("could not encode the import preview for inspection")]
+    PreviewEncoding(#[source] rmp_serde::encode::Error),
     #[error("could not inspect import source {}", path.display())]
     Inspect {
         path: PathBuf,
@@ -83,7 +136,8 @@ impl crate::error::Classified for ReaderError {
     fn kind(&self) -> Option<ErrorKind> {
         Some(match self {
             Self::Inspect { .. } | Self::Confine(_) | Self::Failed(_) => return None,
-            Self::Source => ErrorKind::InvalidRequest,
+            Self::Source | Self::SensitiveSource => ErrorKind::InvalidRequest,
+            Self::PreviewEncoding(_) => ErrorKind::Protocol,
             Self::Channel(_) | Self::Empty | Self::Reply | Self::Version { .. } => {
                 ErrorKind::Protocol
             }
@@ -114,6 +168,20 @@ pub async fn preview(
     settings: &Settings,
     vault_exists: Option<bool>,
 ) -> Result<Preview, ReaderError> {
+    preview_with(source, settings, vault_exists, Exposure::Terminal).await
+}
+
+/// Settings-only review: no source labels, model text or credential references.
+pub async fn preview_settings(source: &Path, settings: &Settings) -> Result<Preview, ReaderError> {
+    preview_with(source, settings, None, Exposure::SettingsReview).await
+}
+
+async fn preview_with(
+    source: &Path,
+    settings: &Settings,
+    vault_exists: Option<bool>,
+    exposure: Exposure,
+) -> Result<Preview, ReaderError> {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         let inspect = |source_error| ReaderError::Inspect {
@@ -132,6 +200,7 @@ pub async fn preview(
                 source: source.clone(),
                 settings: target_settings(settings),
                 vault_exists,
+                exposure,
             },
         };
         tokio::time::timeout(DEADLINE, async {
@@ -177,7 +246,7 @@ pub async fn preview(
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
-        let _ = (source, settings, vault_exists);
+        let _ = (source, settings, vault_exists, exposure);
         Err(ReaderError::Unsupported)
     }
 }
@@ -204,6 +273,11 @@ async fn serve_io(
             request.body.vault_exists,
         )
         .map_err(|error| crate::error::correlated("import.preview", request.id, &error))
+        .and_then(|preview| {
+            protect(preview, request.body.exposure, &request.body.settings).map_err(|error| {
+                crate::error::correlated("import.preview.protect", request.id, &error)
+            })
+        })
     };
     send_result(output, request.id, result).await?;
     Ok(())
@@ -256,6 +330,7 @@ mod tests {
                 source: PathBuf::from("/not-an-installation"),
                 settings: Settings::default(),
                 vault_exists: None,
+                exposure: Exposure::SettingsReview,
             },
         };
         let bytes = a206_protocol::encode(&request).unwrap();

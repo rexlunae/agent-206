@@ -8,6 +8,7 @@ mod error;
 mod extensions;
 mod files;
 mod health;
+mod imports;
 mod inbox;
 mod mcp;
 mod messengers;

@@ -48,6 +48,58 @@ token = "{token}"
 }
 
 #[tokio::test]
+async fn held_import_reviews_apply_only_selected_indices_and_refuse_changed_sources() -> Result<()>
+{
+    let app = App::start(tempfile::tempdir()?, Default::default()).await?;
+    let directory = tempfile::tempdir()?;
+    let source = rustyclaw(directory.path())?;
+    let source_arg = source.to_str().context("UTF-8 source path")?;
+    let review: a206_core::imports::Review =
+        toml::from_str(&app.cli(&["import", "review-rustyclaw", source_arg]).await?)?;
+    ensure!(app.snapshot().await?.settings.providers.is_empty());
+    let id = review.id.to_string();
+    let receipt: a206_core::imports::Receipt = toml::from_str(
+        &app.cli(&[
+            "import",
+            "apply-review",
+            &id,
+            "--provider",
+            "1",
+            "--messenger",
+            "0",
+        ])
+        .await?,
+    )?;
+    ensure!(receipt.providers_added.len() == 1 && receipt.messengers_added == ["bot"]);
+    ensure!(!receipt.vault_imported);
+    let settings = app.snapshot().await?.settings;
+    ensure!(
+        settings.providers.len() == 1
+            && settings.providers[0].base_url == review.preview.providers[1].base_url
+    );
+    ensure!(!settings.messengers[0].enabled && settings.messengers[0].credential.is_none());
+    let reviewed: a206_core::imports::Review =
+        toml::from_str(&app.cli(&["import", "review-rustyclaw", source_arg]).await?)?;
+    use std::io::Write;
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(source.join("config.toml"))?
+        .write_all(b"\n# changed\n")?;
+    let rejected = capture(app.command(&[
+        "import",
+        "apply-review",
+        &reviewed.id.to_string(),
+        "--provider",
+        "0",
+    ]))
+    .await?;
+    ensure!(!rejected.status.success());
+    ensure!(String::from_utf8(rejected.stderr)?.contains("source changed"));
+    ensure!(app.snapshot().await?.settings.providers.len() == 1);
+    Ok(())
+}
+
+#[tokio::test]
 async fn doctor_reports_an_unconfigured_profile_without_creating_it() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let root = dir.path().join("profile");
