@@ -49,6 +49,19 @@ impl Gateway {
             name: skill.name,
             text,
             digest: skill.digest,
+            audit: skill.audit,
+            files: skill
+                .files
+                .into_iter()
+                .map(|(path, bytes)| SkillReviewFile {
+                    path,
+                    bytes: bytes.len() as u64,
+                    text: std::str::from_utf8(&bytes)
+                        .ok()
+                        .filter(|text| !text.contains('\0'))
+                        .map(str::to_owned),
+                })
+                .collect(),
         })
     }
 
@@ -117,8 +130,13 @@ impl Gateway {
 
     /// A supporting file inside an approved skill, by relative path.
     pub fn skill_file(&self, thread: Id, name: &str, path: &str) -> Result<Vec<u8>> {
-        self.approved_skill(thread, name)?;
-        Ok(a206_skills::read_file(&self.skills_root()?, name, path)?)
+        let pins = self.skill_pins(thread)?;
+        Ok(a206_skills::read_approved_file(
+            &self.skills_root()?,
+            name,
+            path,
+            pins.get(name).ok_or(SkillError::Disabled)?,
+        )?)
     }
 }
 
@@ -315,6 +333,19 @@ mod tests {
         assert!(matches!(
             g.skill_file(thread.id, "notes", "../notes/ref.md"),
             Err(GatewayError::Skill(SkillError::Path))
+        ));
+        let reviewed = g.read_skill("notes").unwrap();
+        assert_eq!(reviewed.files[0].path, "ref.md");
+        assert_eq!(reviewed.files[0].text.as_deref(), Some(text.as_str()));
+        std::fs::write(g.skills_root().unwrap().join("notes/ref.md"), "changed").unwrap();
+        assert!(g.skill_offers(thread.id).unwrap().is_empty());
+        assert!(matches!(
+            g.skill_file(thread.id, "notes", "ref.md"),
+            Err(GatewayError::Skill(SkillError::Changed))
+        ));
+        assert!(matches!(
+            g.set_skill_enabled("notes", true, Some(&reviewed.digest)),
+            Err(GatewayError::Skill(SkillError::Changed))
         ));
     }
 

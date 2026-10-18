@@ -115,11 +115,15 @@ pub(crate) fn read(
         INFO => {
             check_keys(&request.arguments, &["name", "path"])?;
             let name = text(&request.arguments, "name")?.ok_or(SkillToolError::MissingName)?;
-            let skill = approved(root, pins, &name)?;
             match text(&request.arguments, "path")? {
-                None => skill.instructions,
-                Some(path) => String::from_utf8(a206_skills::read_file(root, &name, &path)?)
-                    .map_err(SkillToolError::NotText)?,
+                None => approved(root, pins, &name)?.instructions,
+                Some(path) => String::from_utf8(a206_skills::read_approved_file(
+                    root,
+                    &name,
+                    &path,
+                    pins.get(&name).ok_or(SkillError::Disabled)?,
+                )?)
+                .map_err(SkillToolError::NotText)?,
             }
         }
         other => return Err(SkillToolError::UnknownTool(other.into())),
