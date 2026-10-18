@@ -1,7 +1,9 @@
 //! `agent206 messenger`: configure chat service accounts and connect them.
 //! Every change is a `SaveSettings` through the gateway, which validates it;
 //! entries are added disabled and allow no chat until the user says so.
-use a206_core::{Command, MessengerConfig, MessengerKind, Mode, ModelKey, Reply, Settings};
+use a206_core::{
+    Command, MessengerConfig, MessengerKind, Mode, ModelKey, Reply, Settings, WebhookFormat,
+};
 use a206_runtime::client::Client;
 use anyhow::{Result, bail};
 use clap::Subcommand;
@@ -50,7 +52,7 @@ pub enum MessengerAction {
 #[derive(clap::Args)]
 pub struct Options {
     /// Vault credential holding the bot or access token (Beeper: the Desktop
-    /// API token), never the token itself.
+    /// API token; a webhook: its whole URL), never the token itself.
     #[arg(long)]
     credential: Option<String>,
     /// Vault credential holding the app-level token a service receives
@@ -63,9 +65,14 @@ pub struct Options {
     login: Option<String>,
     /// API base URL, when not the service's official endpoint. Required for
     /// Matrix (the homeserver's client API origin), IRC (ircs://host:port)
-    /// and Signal (the signal-cli daemon: unix:///path or tcp://127.0.0.1:port).
+    /// and Signal (the signal-cli daemon: unix:///path or tcp://127.0.0.1:port);
+    /// for a webhook, its URL's origin (https://hooks.slack.com).
     #[arg(long)]
     endpoint: Option<String>,
+    /// What a webhook posts: text (Slack, Google Chat and other JSON text
+    /// webhooks), discord or teams.
+    #[arg(long)]
+    format: Option<String>,
     /// Provider id for new chat threads; requires --model.
     #[arg(long, requires = "model")]
     provider: Option<uuid::Uuid>,
@@ -89,6 +96,14 @@ impl Options {
         }
         if let Some(endpoint) = self.endpoint {
             config.endpoint = Some(endpoint);
+        }
+        if let Some(format) = self.format {
+            config.format = WebhookFormat::ALL
+                .into_iter()
+                .find(|f| f.key().eq_ignore_ascii_case(&format))
+                .ok_or_else(|| {
+                    anyhow::anyhow!("unknown webhook format; use text, discord or teams")
+                })?;
         }
         if let Some((provider, model)) = self.provider.zip(self.model) {
             config.model = Some(ModelKey { provider, model });
@@ -240,6 +255,7 @@ mod tests {
             provider: None,
             model: None,
             mode: None,
+            format: None,
         }
     }
 
@@ -391,5 +407,26 @@ mod tests {
         let disallow = MessengerAction::Disallow { name, chat };
         let settings = edit(settings, disallow).unwrap().unwrap();
         assert!(settings.messengers[0].allowed_chats.is_empty());
+    }
+
+    #[test]
+    fn webhooks_take_a_format_and_unknown_formats_are_refused() {
+        let name = random();
+        let add = |format: &str| MessengerAction::Add {
+            name: name.clone(),
+            kind: "webhook".into(),
+            options: Options {
+                format: Some(format.to_owned()),
+                ..options()
+            },
+        };
+        for format in WebhookFormat::ALL {
+            let settings = edit(Settings::default(), add(&format.key().to_uppercase()))
+                .unwrap()
+                .unwrap();
+            assert_eq!(settings.messengers[0].kind, MessengerKind::Webhook);
+            assert_eq!(settings.messengers[0].format, format);
+        }
+        assert!(edit(Settings::default(), add(&random())).is_err());
     }
 }

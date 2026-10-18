@@ -178,6 +178,7 @@ pub mod messengers;
 pub mod providers;
 pub use messengers::{
     ChatBinding, MessengerConfig, MessengerKind, MessengerState, MessengerStatus, RefusedChat,
+    WebhookFormat,
 };
 pub mod mcp;
 pub mod schedule;

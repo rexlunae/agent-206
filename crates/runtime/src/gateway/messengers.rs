@@ -23,7 +23,7 @@ pub(super) fn validate(messengers: &[MessengerConfig]) -> Result<()> {
             GatewayError::Invalid("messenger names must be unique"),
         )?;
         let endpoint = messenger.endpoint().ok_or(GatewayError::Invalid(
-            "this messenger needs the URL of its server (for Matrix, the homeserver; for IRC, ircs://host:port; for Signal, the signal-cli daemon's socket)",
+            "this messenger needs the URL of its server (for Matrix, the homeserver; for IRC, ircs://host:port; for Signal, the signal-cli daemon's socket; for a webhook, its URL's origin)",
         ))?;
         if messenger.kind.is_irc() {
             validate_irc(messenger, endpoint)?;
@@ -42,6 +42,15 @@ pub(super) fn validate(messengers: &[MessengerConfig]) -> Result<()> {
                 GatewayError::Invalid("only IRC and Signal messengers sign in with a login"),
             )?;
         }
+        check(
+            !messenger.kind.is_send_only()
+                || (messenger.allowed_chats.is_empty()
+                    && messenger.allowed_users.is_empty()
+                    && messenger.model.is_none()),
+            GatewayError::Invalid(
+                "a webhook only sends: it has no chats, senders or model to allow or choose",
+            ),
+        )?;
         check(
             messenger.credential.as_deref().is_none_or(field),
             GatewayError::Invalid("invalid messenger credential name"),
@@ -339,5 +348,83 @@ impl Host for Gateway {
         if let Err(error) = result {
             crate::error::handle("messenger_status", &error);
         }
+    }
+}
+
+/// Sends through send-only messengers (webhooks) for the `send_message`
+/// tool. It holds the gateway without its tool hosts, so holding it forms no
+/// cycle, and offers only what the tool needs: which webhooks may be used and
+/// a send to one of them.
+#[derive(Clone)]
+pub struct Outbox {
+    base: Gateway,
+}
+impl Gateway {
+    pub(crate) fn outbox(&self) -> Outbox {
+        let mut base = self.clone();
+        base.tool_hosts = Default::default();
+        base.delegation = Default::default();
+        Outbox { base }
+    }
+}
+impl Outbox {
+    /// The webhooks a model may post to: enabled and not disconnected by the
+    /// user, by name, with their format.
+    pub fn destinations(&self) -> Vec<(String, WebhookFormat)> {
+        self.base
+            .messengers
+            .borrow()
+            .iter()
+            .filter(|entry| entry.run && entry.config.kind.is_send_only())
+            .map(|entry| (entry.config.name.clone(), entry.config.format))
+            .collect()
+    }
+
+    /// Send `text` to the webhook `name`; the number of parts sent. The
+    /// messenger's status shows the outcome, so a failure is also visible on
+    /// the Messengers page.
+    pub async fn send(&self, name: &str, text: &str) -> Result<usize, MessengerError> {
+        let config = self
+            .base
+            .messengers
+            .borrow()
+            .iter()
+            .find(|entry| {
+                entry.run && entry.config.kind.is_send_only() && entry.config.name == name
+            })
+            .map(|entry| entry.config.clone())
+            .ok_or_else(|| MessengerError::NoWebhook {
+                name: name.to_owned(),
+            })?;
+        let pairing = Host::pairing(&self.base).ok_or(MessengerError::NoPairing)?;
+        // The user may withdraw the webhook while a long message is going
+        // out; the parts still to send then stay unsent.
+        let current = self.base.messengers.subscribe();
+        let withdrawn = || {
+            !current
+                .borrow()
+                .iter()
+                .any(|entry| entry.run && entry.config == config)
+        };
+        let result = crate::messengers::webhook::send(
+            Host::root(&self.base),
+            pairing,
+            &config,
+            text,
+            withdrawn,
+        )
+        .await;
+        match &result {
+            Ok(_) => self.base.update(name, |status| {
+                status.state = MessengerState::Ready;
+                status.failure = None;
+            }),
+            Err(error) => {
+                let report = crate::error::handle("messenger", error);
+                self.base
+                    .update(name, |status| status.failure = Some(report));
+            }
+        }
+        result
     }
 }
