@@ -993,7 +993,21 @@ impl HostCalls {
                 let budget = self.write_budget()?;
                 git_write_call_with_timeout(
                     move |interrupt| {
-                        git_commit::commit(root, &message, &paths, &user()?, &interrupt)
+                        let selection = git_commit::Selection::Paths(&paths);
+                        git_commit::commit(root, &message, selection, &user()?, &interrupt)
+                    },
+                    budget,
+                )
+                .await
+            }
+            HostRequest::GitCommitStaged { message } => {
+                let root = self.workspace()?;
+                let user = self.user_git;
+                let budget = self.write_budget()?;
+                git_write_call_with_timeout(
+                    move |interrupt| {
+                        let selection = git_commit::Selection::Staged;
+                        git_commit::commit(root, &message, selection, &user()?, &interrupt)
                     },
                     budget,
                 )
