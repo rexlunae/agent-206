@@ -278,18 +278,30 @@ impl Gateway {
         let Some(job) = store.state.jobs.iter_mut().find(|job| job.id == id) else {
             return Ok(());
         };
-        match &mut job.last {
+        let ended = Some(now());
+        let settled = match &mut job.last {
             Some(last) if last.id == run => {
                 last.outcome = outcome;
-                last.ended = Some(now());
+                last.ended = ended;
+                None
             }
             // A newer run is the latest; this one ends in the history only.
             _ => {
-                job.history = job.history.wrapping_add(1);
-                store.settle_run(run, outcome, now())?;
+                let Some(mut earlier) = store
+                    .job_runs(id)?
+                    .into_iter()
+                    .find(|earlier| earlier.id == run)
+                else {
+                    // Already pruned from the history.
+                    return Ok(());
+                };
+                earlier.outcome = outcome;
+                earlier.ended = ended;
+                job_mut(&mut store.state, id)?.history += 1;
+                Some(earlier)
             }
-        }
-        store.persist(Some(EventKind::JobChanged { id }))?;
+        };
+        store.persist_settling(Some(EventKind::JobChanged { id }), settled.as_ref())?;
         Ok(())
     }
 

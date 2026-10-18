@@ -206,7 +206,16 @@ impl Store {
         Ok(store)
     }
     pub fn persist(&mut self, kind: Option<EventKind>) -> Result<()> {
-        let result = self.persist_inner(kind);
+        self.persist_settling(kind, None)
+    }
+    /// [`Store::persist`], also recording in the same transaction how
+    /// `settled`, an earlier run no longer its job's latest, ended.
+    pub fn persist_settling(
+        &mut self,
+        kind: Option<EventKind>,
+        settled: Option<&JobRun>,
+    ) -> Result<()> {
+        let result = self.persist_inner(kind, settled);
         if result.is_err() {
             // Restore the committed snapshot after a rejected or failed mutation.
             let data: Option<Vec<u8>> = self
@@ -226,11 +235,18 @@ impl Store {
     pub fn remaining(&self) -> Result<usize> {
         Ok(LIMIT.saturating_sub(rmp_serde::to_vec_named(&self.state)?.len() + 1))
     }
-    fn persist_inner(&mut self, kind: Option<EventKind>) -> Result<()> {
+    fn persist_inner(&mut self, kind: Option<EventKind>, settled: Option<&JobRun>) -> Result<()> {
         if rmp_serde::to_vec_named(&self.state)?.len() >= LIMIT {
             return Err(StoreError::Full);
         }
         let tx = self.db.transaction()?;
+        // Pruned from the history meanwhile, it updates nothing.
+        if let Some(run) = settled {
+            tx.execute(
+                "UPDATE job_runs SET payload=?1 WHERE run=?2",
+                params![rmp_serde::to_vec_named(run)?, run.id.to_string()],
+            )?;
+        }
         if let Some(kind) = kind {
             let job = match kind {
                 EventKind::JobChanged { id } => Some(id),
@@ -270,28 +286,6 @@ impl Store {
             row.get::<_, Vec<u8>>(0)
         })?;
         rows.map(|r| Ok(rmp_serde::from_slice(&r?)?)).collect()
-    }
-    /// Record how an earlier run, no longer its job's latest, ended.
-    pub fn settle_run(&self, run: Id, outcome: JobOutcome, ended: u64) -> Result<()> {
-        let key = run.to_string();
-        let payload: Option<Vec<u8>> = self
-            .db
-            .query_row("SELECT payload FROM job_runs WHERE run=?1", [&key], |row| {
-                row.get(0)
-            })
-            .optional()?;
-        // Pruned from the history meanwhile.
-        let Some(payload) = payload else {
-            return Ok(());
-        };
-        let mut settled: JobRun = rmp_serde::from_slice(&payload)?;
-        settled.outcome = outcome;
-        settled.ended = Some(ended);
-        self.db.execute(
-            "UPDATE job_runs SET payload=?1 WHERE run=?2",
-            params![rmp_serde::to_vec_named(&settled)?, key],
-        )?;
-        Ok(())
     }
     pub fn events(&self, after: u64) -> Result<Vec<Event>> {
         if after > self.state.last_event || self.state.last_event.saturating_sub(after) > 10_000 {
