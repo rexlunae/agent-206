@@ -1912,6 +1912,28 @@ mod tests {
     }
 
     #[test]
+    fn a_conversation_saved_before_usage_totals_opens_as_counted_partway() {
+        let mut thread = Thread::new(Id::new_v4().to_string(), Mode::Chat);
+        thread.usage_total.record(
+            Id::new_v4(),
+            &Usage {
+                input_tokens: Some(1),
+                output_tokens: None,
+                cost: None,
+            },
+        );
+        let mut saved = toml::Value::try_from(&thread).unwrap();
+        saved.as_table_mut().unwrap().remove("usage_total").unwrap();
+        let opened: Thread = saved.try_into().unwrap();
+        assert_eq!(opened.id, thread.id);
+        assert!(!opened.usage_total.from_start);
+        assert_eq!(opened.usage_total.reports, 0);
+        assert_eq!(
+            opened.usage_total.exact(&opened.usage_total.input_tokens),
+            None
+        );
+    }
+    #[test]
     fn profile_creation_is_refused_by_gateways_without_profile_policy() {
         #[derive(Serialize, Deserialize)]
         enum LegacyCommand {
