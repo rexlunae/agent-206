@@ -39,7 +39,7 @@ pub enum ImportError {
     Config {
         path: PathBuf,
         #[source]
-        source: toml::de::Error,
+        source: ConfigFailure,
     },
     #[error("could not write the import receipt {}", path.display())]
     Receipt {
@@ -49,6 +49,19 @@ pub enum ImportError {
     },
     #[error("could not encode the import receipt")]
     EncodeReceipt(#[source] toml::ser::Error),
+}
+/// Safe parser diagnostics for foreign configuration. TOML errors can include
+/// plaintext credentials in both their source excerpt and semantic message.
+/// Keep the location, deliberately discard those secret-bearing strings.
+#[derive(Debug, thiserror::Error)]
+#[error("invalid foreign configuration at byte range {span:?}; inspect the source locally")]
+pub struct ConfigFailure {
+    pub span: Option<std::ops::Range<usize>>,
+}
+impl From<toml::de::Error> for ConfigFailure {
+    fn from(error: toml::de::Error) -> Self {
+        Self { span: error.span() }
+    }
 }
 type Result<T, E = ImportError> = std::result::Result<T, E>;
 

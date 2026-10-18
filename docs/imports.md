@@ -29,12 +29,38 @@ gateway and never starts one, so a preview changes nothing.
 
 Remaining gates of the flow below, not yet met by this adapter:
 
-- Readers run in the CLI process, not the isolated reader process.
+- GUI review and per-item application are not exposed yet.
 - Selection is per category (`--skip-vault`, `--skip-providers`,
   `--skip-messengers`), not per item.
 - Apply is ordered, not atomic: the vault is copied before accounts are saved,
   and a failure after the copy is reported as that partial result.
 - There is no rollback command; the receipt is the record to undo by hand.
+
+### Isolated source reader
+
+The CLI launches `a206_runtime::imports::preview`: a fresh copy of the current
+executable under Seatbelt on macOS or bubblewrap plus Landlock on Linux. The
+reader gets only the selected source directory read-only, private scratch,
+system libraries and its own executable. It has no network, other executable
+grant or inherited environment. Missing isolation fails the preview. Source
+directory symlinks are refused; a canonical source path fixes the granted root.
+Paths configured outside that source are not granted implicitly. This may make
+an external credentials/workspace location unavailable; it must be selected
+separately when a future adapter supports additional sources.
+
+One versioned, bounded MessagePack request/result carries duplicate-matching
+account identities/endpoints, messenger names/kinds and preset defaults. User
+prompts, MCP/backend commands, grants and credential handles are not forwarded.
+The reader returns the existing reviewed preview; only the broker can import
+credentials. Parser errors retain their byte range but discard source excerpts
+and semantic messages that could echo plaintext credentials. Failures keep their
+structured cause chain and request correlation. Oversized replies return a
+bounded protocol error. A deadline or caller cancellation kills the reader.
+
+The `import_reader` Cargo test runs the real reader and probes its source write,
+unrelated-file, executable and network denials. Unit tests cover protocol version,
+truncated/oversized frames, oversized results and target-data minimization.
+This is the prerequisite for the shared GUI preview/apply flow, not that UI.
 
 ## Sources and evidence
 

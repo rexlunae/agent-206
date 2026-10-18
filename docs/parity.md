@@ -161,7 +161,7 @@ invocations and relays gateway-authorized host calls (`a206/docs/plugin-api.md`)
 | RustyClaw command | Agent 206 status (`a206/crates/app/src/main.rs` Action) | Notes |
 | --- | --- | --- |
 | `setup`, `onboard`, `configure` | partial: `setup [--local\|--ssh]` resumes gateway, vault, TOTP and pairing on the shared flows, then runs doctor (`a206/crates/app/src/setup_cli.rs`); no `onboard`/`configure` aliases (their provider-key flags do not match). The desktop, TUI and web Get started page shows the same steps plus provider and first conversation (`a206/crates/ui/src/welcome.rs`) | Provider step in the CLI walkthrough |
-| `import` (OpenClaw), `refresh-token` | partial: `import rustyclaw [PATH] [--apply]` with preview, broker-only vault copy and receipts (`a206/crates/import`); OpenClaw and `refresh-token` missing | More adapters per `docs/imports.md`; OAuth import through the broker |
+| `import` (OpenClaw), `refresh-token` | partial: `import rustyclaw [PATH] [--apply]` with an OS-isolated, bounded source preview, broker-only vault copy and receipts (`a206/crates/import`, `runtime/src/imports.rs`); OpenClaw and `refresh-token` missing | Shared GUI review/apply, more adapters per `docs/imports.md`; OAuth import through the broker |
 | `config get/set/unset` | partial: `settings [--apply FILE]` TOML | Field-level commands |
 | `doctor [--repair]` | partial: read-only `doctor [--toml]` over profile, gateway, broker, pairing and providers (`a206/crates/runtime/src/doctor.rs`), also on the desktop/TUI Gateway page; no `--repair` | Explicit, reviewed repairs |
 | `tui`, `desktop` | present | TUI interaction QA pending |

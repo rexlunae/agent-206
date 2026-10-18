@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 a206-vault-channel.workspace = true
 a206-core.workspace = true
+a206-import.workspace = true
 a206-protocol.workspace = true
 a206-extensions.workspace = true
 a206-mcp.workspace = true
@@ -76,6 +77,9 @@ tokio = { workspace = true, features = ["test-util"] }
 axum = { version = "0.8", features = ["ws"] }
 [[test]]
 name = "native_exec"
+harness = false
+[[test]]
+name = "import_reader"
 harness = false
 [[test]]
 name = "coding_backends"

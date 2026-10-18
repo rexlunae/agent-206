@@ -329,7 +329,7 @@ pub async fn import(root: &Path, remote: Option<String>, source: ImportSource) -
         }
         GatewayTarget::Ssh { .. } => None,
     };
-    let preview = a206_import::rustyclaw::preview(&path, &snapshot.settings, vault_exists)?;
+    let preview = a206_runtime::imports::preview(&path, &snapshot.settings, vault_exists).await?;
     if toml {
         print!("{}", toml::to_string_pretty(&preview)?);
     } else {
