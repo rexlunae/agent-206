@@ -418,6 +418,9 @@ until the user permits them on that conversation.
   (`profile`): its mode and model become the defaults, its capabilities narrow
   the grant and its instructions join the subagent's prompt. A profile only
   narrows; see [agent-profiles.md](agent-profiles.md).
+- A team coordinator's `subagent_spawn` offers only the team's member profiles
+  and requires one, and the gateway refuses any other; see
+  [agent-teams.md](agent-teams.md).
 - `CancelRun` cancels the thread's run and the runs of every thread delegated
   from it, whoever started them. A subagent run is reserved under its parent's
   run token before `subagent_spawn`/`subagent_send` returns, and only that
@@ -431,7 +434,8 @@ delegator reaches the gateway's tool hosts through a weak link, so the hosts
 holding it never keep a closed gateway alive. A gateway that gains a tool host
 (`with_tool_host`) gets subagent tools bound to its own host list, so its other
 clones keep theirs. Tests: `crates/runtime/tests/tool_loop.rs` (spawn,
-inherited permissions, wait, cascading cancel, refusals, steering, profiles),
+inherited permissions, wait, cascading cancel, refusals, steering, profiles,
+teams),
 `delegation_tool/tests.rs` and `gateway/delegation/tests.rs` (reservations,
 clones, waiting on user-started runs).
 

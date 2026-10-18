@@ -18,6 +18,7 @@ fn caller(model: Option<ModelKey>, subagent_models: &[ModelKey]) -> Caller {
         subagent_models: subagent_models.iter().cloned().collect(),
         capabilities: Default::default(),
         ancestors: 0,
+        team: None,
     }
 }
 

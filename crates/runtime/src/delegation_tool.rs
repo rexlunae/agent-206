@@ -19,7 +19,7 @@ use crate::{
     tools::{self, ToolHost, ToolListing, ToolOutput, ToolRequest, ToolScope, ToolSpec},
 };
 use a206_core::{
-    AgentProfiles, Capability, ErrorKind, ErrorReport, Id, Mode, ModelKey, RunState,
+    AgentProfile, AgentProfiles, Capability, ErrorKind, ErrorReport, Id, Mode, ModelKey, RunState,
     ToolPermission, UnavailableTools,
 };
 use futures_util::future::BoxFuture;
@@ -221,6 +221,14 @@ impl DelegationHost {
     }
 
     fn specs(caller: &Caller, profiles: &AgentProfiles) -> Vec<ToolSpec> {
+        // A coordinator is offered only its team's member profiles, and must
+        // name one; the gateway refuses any other.
+        let team = caller.team.as_ref().filter(|_| caller.coordinates());
+        let offered: Vec<&AgentProfile> = profiles
+            .profiles
+            .iter()
+            .filter(|p| team.is_none_or(|t| t.has_member(&p.id)))
+            .collect();
         let thread = json!({"type": "string", "description": "The subagent's ID, as subagent_spawn or subagent_list returned it."});
         let modes: Vec<Value> = Mode::ALL.iter().map(|m| json!(m)).collect();
         let capabilities: Vec<Value> = caller.capabilities.iter().map(|c| json!(c)).collect();
@@ -235,10 +243,9 @@ impl DelegationHost {
             "model": {"type": "string", "enum": models, "description": "Defaults to the profile's model, else your model when it is permitted for subagents."},
             "capabilities": {"type": "array", "items": {"type": "string", "enum": capabilities}, "description": "Capabilities to give it; defaults to all of yours its mode and profile allow."}
         });
-        if !profiles.profiles.is_empty() {
-            let ids: Vec<Value> = profiles.profiles.iter().map(|p| json!(p.id)).collect();
-            let summaries: Vec<String> = profiles
-                .profiles
+        if !offered.is_empty() {
+            let ids: Vec<Value> = offered.iter().map(|p| json!(p.id)).collect();
+            let summaries: Vec<String> = offered
                 .iter()
                 .map(|p| {
                     let summary = match &p.description {
@@ -252,7 +259,11 @@ impl DelegationHost {
                 "type": "string",
                 "enum": ids,
                 "description": format!(
-                    "Start from one of the user's agent profiles, which sets its mode, model, capabilities and extra instructions:\n{}",
+                    "{}, which sets its mode, model, capabilities and extra instructions:\n{}",
+                    match team {
+                        Some(team) => format!("The member of team {} to give the task to: its agent profile", team.name),
+                        None => "Start from one of the user's agent profiles".into(),
+                    },
                     summaries.join("\n")
                 ),
             });
@@ -272,7 +283,7 @@ impl DelegationHost {
                 json!({
                     "type": "object",
                     "properties": spawn,
-                    "required": ["task"],
+                    "required": if team.is_some() { json!(["task", "profile"]) } else { json!(["task"]) },
                     "additionalProperties": false
                 }),
             ),
@@ -346,6 +357,11 @@ impl DelegationHost {
                 };
                 let profile = match text(arguments, "profile").map_err(fail)? {
                     Some(id) => Some(self.delegator.profile(id).await?),
+                    None if caller.coordinates() => {
+                        return Err(crate::error::report(
+                            &crate::agent_teams::TeamError::MemberRequired,
+                        ));
+                    }
                     None => None,
                 };
                 let mode = match text(arguments, "mode").map_err(fail)? {

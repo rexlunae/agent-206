@@ -674,6 +674,7 @@ fn Inspector(thread: Thread) -> Element {
         }
         if !thread.subagent_models.is_empty() {
             crate::profiles::Delegate { thread: id }
+            crate::teams::StartTeam { thread: id }
         }
     } }
 }
@@ -852,6 +853,10 @@ fn ThreadFacts(thread: Thread) -> Element {
         dl { class: "a206-fact-grid",
             dt { "Agent engine" } dd { "{thread.backend.label()}" }
             if let Some(profile) = &thread.profile { dt { "Agent profile" } dd { "{profile.name}" } }
+            if let Some(team) = &thread.team { dt { "Agent team" } dd { {match team.role {
+                a206_core::TeamRole::Coordinator => format!("{}, coordinating", team.name),
+                a206_core::TeamRole::Member => format!("{}, member", team.name),
+            }} } }
             if let Some(activity) = &thread.backend_activity { dt { "Last operation" } dd { "{activity}" } }
             dt { "Context used" } dd { {pct.map(|p| format!("{p:.1}%")).unwrap_or_else(|| "Not reported".into())} }
             dt { "Context limit" } dd { "{number(limit)}" }

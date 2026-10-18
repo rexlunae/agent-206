@@ -13,6 +13,7 @@ pub mod imports;
 pub mod profiles;
 pub mod prompts;
 pub mod search;
+pub mod teams;
 pub mod tools;
 pub use audit::{AuditBuilder, AuditField, AuditFinding, AuditLocation, AuditReport, AuditRule};
 pub use error::{ErrorKind, ErrorReport};
@@ -20,6 +21,7 @@ pub use ignore::Ignore;
 pub use profiles::{AgentProfile, AgentProfiles, ProfileProblem, ThreadProfile};
 pub use prompts::{AnswerError, PromptAnswer, PromptOutcome, UserPrompt};
 pub use search::{MessageHit, SearchError};
+pub use teams::{AgentTeam, AgentTeams, TeamMember, TeamRole, ThreadTeam};
 pub use tools::{
     ApprovalDecision, ApprovalOutcome, ApprovalRequest, OutputCount, OutputReduction, ToolBudget,
     ToolCall, ToolCallState, ToolList, ToolOffer, ToolPermission, UnavailableTools,
@@ -522,6 +524,9 @@ pub struct Thread {
     /// The agent profile this subagent was started from, if any.
     #[serde(default)]
     pub profile: Option<Box<ThreadProfile>>,
+    /// The agent team this subagent coordinates or works for, if any.
+    #[serde(default)]
+    pub team: Option<Box<ThreadTeam>>,
 }
 /// One step of a conversation's plan.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -601,6 +606,7 @@ impl Thread {
             held: false,
             plan: vec![],
             profile: None,
+            team: None,
         }
     }
 }
@@ -1049,6 +1055,17 @@ pub enum Command {
         requested: BTreeSet<Capability>,
         profile: String,
     },
+    /// Start `team` on `parent`: a subagent from the team's coordinator
+    /// profile, checked as `CreateProfileSubagent` checks it, that may start
+    /// its own subagents only from the team's member profiles.
+    StartTeam {
+        parent: Id,
+        team: String,
+        title: String,
+        mode: Mode,
+        model: ModelKey,
+        requested: BTreeSet<Capability>,
+    },
     Events {
         after: u64,
     },
@@ -1142,6 +1159,8 @@ pub enum Command {
     Skills,
     /// The agent profiles in the gateway's profile directory.
     AgentProfiles,
+    /// The agent teams in the gateway's team directory.
+    AgentTeams,
     /// The full `SKILL.md` of one skill, for review.
     ReadSkill {
         name: String,
@@ -1231,6 +1250,7 @@ impl Command {
             Self::CreateProject { .. } => "create_project",
             Self::CreateSubagent { .. } => "create_subagent",
             Self::CreateProfileSubagent { .. } => "create_profile_subagent",
+            Self::StartTeam { .. } => "start_team",
             Self::Events { .. } => "events",
             Self::Download { .. } => "download",
             Self::CancelDownload { .. } => "cancel_download",
@@ -1253,6 +1273,7 @@ impl Command {
             Self::DisconnectMcpServer { .. } => "disconnect_mcp_server",
             Self::Skills => "skills",
             Self::AgentProfiles => "agent_profiles",
+            Self::AgentTeams => "agent_teams",
             Self::ReadSkill { .. } => "read_skill",
             Self::SetSkillEnabled { .. } => "set_skill_enabled",
             Self::ScheduleJob { .. } => "schedule_job",
@@ -1281,6 +1302,7 @@ pub enum Reply {
     Gateway(GatewayInfo),
     Skills(Vec<SkillSummary>),
     AgentProfiles(AgentProfiles),
+    AgentTeams(AgentTeams),
     ImportPreview(Box<imports::Review>),
     ImportApplied(Box<imports::Applied>),
     Skill(SkillText),
