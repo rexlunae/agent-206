@@ -19,9 +19,101 @@ fn main() -> ExitCode {
         runtime.block_on(source_is_the_only_user_directory_and_is_read_only());
         runtime.block_on(reviewed_settings_require_unchanged_source_and_target());
         runtime.block_on(selected_settings_and_partial_receipt_failures_are_explicit());
+        runtime.block_on(source_metadata_is_removed_or_refused_before_any_reply());
         println!("import reader: ok");
     }
     ExitCode::SUCCESS
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+async fn source_metadata_is_removed_or_refused_before_any_reply() {
+    use a206_core::{Command, ErrorKind, Reply, Settings};
+    let profile = tempfile::tempdir().unwrap();
+    let gateway = a206_runtime::gateway::Gateway::open(profile.path()).unwrap();
+    let source = tempfile::tempdir().unwrap();
+    let private = uuid::Uuid::new_v4().to_string();
+    let config = source.path().join("config.toml");
+    std::fs::write(
+        &config,
+        format!(
+            r#"[model]
+provider = "openai"
+model = "{private}"
+[[custom_providers]]
+id = "{private}"
+display_name = "{private}"
+api_key_secret = "{private}"
+base_url = "https://example.test/v1"
+"#
+        ),
+    )
+    .unwrap();
+    let review = review(&gateway, source.path()).await;
+    assert!(
+        review
+            .preview
+            .providers
+            .iter()
+            .all(|provider| provider.model_reference.is_none() && provider.credential.is_none())
+    );
+    assert_eq!(review.preview.providers[1].label, "Imported provider 2");
+    let encoded = a206_protocol::encode(&Reply::ImportPreview(Box::new(review))).unwrap();
+    assert!(
+        !encoded
+            .windows(private.len())
+            .any(|window| window == private.as_bytes())
+    );
+
+    // Credential-shaped text in fields necessary to import must refuse the
+    // whole preview, not enter a reply/log or silently alter the destination.
+    let key = format!("sk-proj-{}", uuid::Uuid::new_v4().simple());
+    std::fs::write(
+        &config,
+        format!(
+            r#"[[custom_providers]]
+id = "ordinary"
+base_url = "https://example.test/{key}"
+"#
+        ),
+    )
+    .unwrap();
+    let reply = request(
+        &gateway,
+        Command::PreviewImport {
+            source: source.path().to_owned(),
+        },
+    )
+    .await;
+    let Reply::Error(error) = &reply else {
+        panic!("sensitive endpoint accepted")
+    };
+    assert_eq!(error.kind, ErrorKind::InvalidRequest);
+    assert!(error.correlation.is_some());
+    assert!(!format!("{reply:?}").contains(&key));
+    let encoded = a206_protocol::encode(&reply).unwrap();
+    assert!(
+        !encoded
+            .windows(key.len())
+            .any(|window| window == key.as_bytes())
+    );
+
+    // The legacy terminal reader also refuses recognizable credential text
+    // in ordinary metadata, even though it keeps legitimate source labels.
+    std::fs::write(
+        &config,
+        format!(
+            r#"[[custom_providers]]
+id = "ordinary"
+display_name = "{key}"
+base_url = "https://example.test/v1"
+"#
+        ),
+    )
+    .unwrap();
+    let failure = a206_runtime::imports::preview(source.path(), &Settings::default(), None)
+        .await
+        .unwrap_err();
+    assert!(!format!("{failure:?} {failure:#}").contains(&key));
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]

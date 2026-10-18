@@ -2,7 +2,7 @@
 use super::{Gateway, GatewayError, Result, poisoned};
 use a206_core::{
     Id, Reply,
-    imports::{Applied, PREVIEW_VERSION, Receipt, Review, Selection},
+    imports::{Applied, PREVIEW_VERSION, REVIEW_VERSION, Receipt, Review, Selection},
 };
 use std::path::Path;
 
@@ -14,7 +14,7 @@ impl Gateway {
         )?;
         let settings = self.snapshot()?.settings;
         // No vault operation is offered here, so its availability stays unknown.
-        let preview = crate::imports::preview(source, &settings, None).await?;
+        let preview = crate::imports::preview_settings(source, &settings).await?;
         super::check(
             preview.providers.len() <= 200 && preview.messengers.len() <= 200,
             GatewayError::Invalid(
@@ -22,6 +22,7 @@ impl Gateway {
             ),
         )?;
         let review = Review {
+            version: REVIEW_VERSION,
             id: Id::new_v4(),
             settings_revision: settings.revision,
             preview,
@@ -67,7 +68,7 @@ impl Gateway {
             settings.revision == review.settings_revision,
             GatewayError::Conflict("Target settings changed. Preview the source again."),
         )?;
-        let current = crate::imports::preview(&review.preview.source, &settings, None).await?;
+        let current = crate::imports::preview_settings(&review.preview.source, &settings).await?;
         super::check(
             current == review.preview,
             GatewayError::Conflict("Import source changed. Preview the source again."),

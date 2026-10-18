@@ -163,7 +163,9 @@ Gateway tests additionally cover target revision changes, invalid selections,
 replayed application and receipt-write partial failures; CLI tests exercise the
 same commands through the real binary. Desktop/TUI interactive acceptance,
 browser receipt-failure acceptance, GUI vault migration and other source
-adapters remain pending. See [imports.md](imports.md).
+adapters remain pending. Editing existing provider labels and vault references
+also still uses `settings --apply`; GUI account editing remains a gap.
+See [imports.md](imports.md).
 
 1. Restore complete secret custody: encrypted broker IPC, explicit destination/use
    approvals, TOTP and lossless legacy vault migration. Enable authenticated model
@@ -185,9 +187,10 @@ verification precedes secret inputs. The panel supports create/unlock/lock,
 step-up, begin/confirm/cancel TOTP and pairing, with actual broker state and
 separate pairing failures. First-run gateway selection opens Security. Native and
 web use the same typed setup subset and broker rules. See
-[web-vault-setup.md](web-vault-setup.md). Remote SSH vault setup, a GUI import
-review/apply screen, key-file workflows and modern vault-envelope migration are
-still pending; the existing RustyClaw CLI import remains available.
+[web-vault-setup.md](web-vault-setup.md). Remote SSH vault setup, GUI vault
+migration, key-file workflows and modern vault-envelope migration remain pending.
+The shared settings import review/apply screen is described above; the existing
+RustyClaw terminal vault import remains available.
 ## Supporting-file review update (2026-10-17)
 
 Skill approval now covers the bounded package, including hidden supporting files.

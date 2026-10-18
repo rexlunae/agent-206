@@ -485,7 +485,14 @@ async fn review_command(root: &Path, remote: Option<String>, command: Command) -
     );
     let reply = client.call(command).await?.into_result()?;
     match reply {
-        Reply::ImportPreview(review) => print!("{}", toml::to_string_pretty(&review)?),
+        Reply::ImportPreview(review) => {
+            if review.version != a206_core::imports::REVIEW_VERSION {
+                bail!(
+                    "gateway import review version is unsupported; update the gateway and preview again"
+                );
+            }
+            print!("{}", toml::to_string_pretty(&review)?);
+        }
         Reply::ImportApplied(result) => {
             print!("{}", toml::to_string_pretty(&result.receipt)?);
             if let Some(error) = result.receipt_error {

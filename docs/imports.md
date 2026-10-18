@@ -47,12 +47,28 @@ can be repeated. Neither operation starts a stopped gateway.
 
 Nothing is selected initially. Users select individual addable providers and
 messengers; existing and unsupported entries cannot be selected. The page shows
-endpoints, historical model references, credential references and messenger
-restrictions, plus inactive/unsupported categories. Rejected URLs are omitted
+endpoints and messenger restrictions, plus inactive/unsupported categories.
+Settings reviews omit free-form source provider IDs, labels, model text and
+credential references inside the isolated reader, before its first reply.
+Labels come from trusted target presets or a generated item number; source
+messenger display names and unknown service text are omitted too. Renaming
+custom connections and assigning their vault references currently requires
+the `settings --apply` CLI; existing account editing in the GUI remains a gap.
+Review schema v2 is checked before GUI/CLI presentation; unversioned development
+replies are refused with an update action. Rejected URLs are omitted
 from previews because they can contain inline passwords or signed tokens.
 Providers still need live API discovery; messengers are saved disabled and
 without credentials. Vault migration is not offered here: use the existing
 trusted-terminal broker flow. Other tool adapters remain planned.
+
+Before any reader reply (including the legacy terminal flow), the remaining
+preview strings are checked for known credential shapes. A match refuses the
+whole preview with a static, correlated error rather than changing an endpoint,
+login or policy restriction. This scanner is defense in depth and cannot identify
+arbitrary unknown secrets in data required for migration. Optional free-form
+fields are therefore omitted structurally from settings reviews, not merely
+pattern-redacted. The legacy trusted-terminal flow retains legitimate source
+labels, provenance and symbolic vault references for its explicit vault migration.
 
 The gateway holds at most four reviews in memory, with at most 200 providers
 and 200 messengers per review. A restart, eviction or attempted apply requires

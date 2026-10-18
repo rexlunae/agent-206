@@ -3,9 +3,15 @@ use crate::{Id, MessengerConfig, MessengerKind, ProviderConfig, Settings};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeSet, path::PathBuf};
 pub const PREVIEW_VERSION: u32 = 1;
+/// Review v2 omits optional source metadata and credential references in the
+/// isolated reader. Unversioned development replies decode as zero and must
+/// not be rendered or applied by new clients.
+pub const REVIEW_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Review {
+    #[serde(default)]
+    pub version: u32,
     pub id: Id,
     pub settings_revision: u64,
     pub preview: Preview,

@@ -5,7 +5,11 @@ use fc_dioxus::prelude::*;
 
 fn reviewed(reply: Reply) -> Result<Review, ErrorReport> {
     match reply {
-        Reply::ImportPreview(review) => Ok(*review),
+        Reply::ImportPreview(review) if review.version == REVIEW_VERSION => Ok(*review),
+        Reply::ImportPreview(_) => Err(ErrorReport::new(
+            ErrorKind::Protocol,
+            "Gateway import review version is unsupported. Update the gateway and preview again.",
+        )),
         Reply::Error(error) => Err(error),
         _ => Err(ErrorReport::new(
             ErrorKind::Protocol,
@@ -22,6 +26,17 @@ fn applied(reply: Reply) -> Result<Applied, ErrorReport> {
             "Gateway did not confirm the import. Refresh settings before retrying.",
         )),
     }
+}
+
+async fn finish_application(
+    reply: Result<Reply, ErrorReport>,
+    refresh: impl std::future::Future<Output = ()>,
+) -> Result<Applied, ErrorReport> {
+    let value = applied(reply?)?;
+    // Publish confirmation only after the shared snapshot refresh has run.
+    // Keep receipt failures in the confirmed partial result across the await.
+    refresh.await;
+    Ok(value)
 }
 
 #[component]
@@ -57,6 +72,7 @@ pub(crate) fn Imports() -> Element {
 
 #[component]
 fn ReviewPanel(review: Review) -> Element {
+    let state = use_context::<crate::State>();
     let selection = use_signal(Selection::default);
     let mut failure = use_signal(|| None::<ErrorReport>);
     let mut busy = use_signal(|| false);
@@ -70,6 +86,7 @@ fn ReviewPanel(review: Review) -> Element {
         CardHeader { CardTitle { "Review import" } CardSubtitle { "{preview.source.display()}" } }
         CardBody { div { class: "a206-stack",
             p { "Choose each item to add. Existing accounts are kept. Messenger entries stay disabled and require a new vault credential before connecting." }
+            p { class: "a206-muted", "Source labels, model text and credential references are omitted. Custom provider labels are generated. Providers have no credential reference; edit their settings with `agent206 settings --apply` before authenticated use." }
             Disclosure { summary: rsx! { "Source and review record" },
                 p { "Configuration SHA-256: {preview.config_sha256.as_deref().unwrap_or(\"No configuration file\")}" }
                 p { "Target settings revision: {review.settings_revision}" }
@@ -103,7 +120,8 @@ fn ReviewPanel(review: Review) -> Element {
             busy.set(true); attempted.set(true); failure.set(None);
             let chosen = selection();
             spawn(async move {
-                match call(Command::ApplyImport { review: review_id, selection: chosen }).await.and_then(applied) {
+                let response = call(Command::ApplyImport { review: review_id, selection: chosen }).await;
+                match finish_application(response, crate::refresh(state)).await {
                     Ok(value) => result.set(Some(value)), Err(error) => failure.set(Some(error)),
                 }
                 busy.set(false);
@@ -132,8 +150,6 @@ fn ProviderRow(
             onchange: move |on| { let mut value = selection.write(); if on { value.providers.insert(index); } else { value.providers.remove(&index); } } }
         p { class: "a206-muted", "{provider.api.label()} · {provider.base_url}" }
         if !available { Badge { {provider_status(&provider.action)} } }
-        if let Some(model) = &provider.model_reference { p { class: "a206-muted", "Historical model reference: {model}. No model is selected; availability must be verified through the provider API." } }
-        if let Some(credential) = &provider.credential { p { class: "a206-muted", "Vault reference: {credential}. No key is copied; the vault's credential policies and origin binding still apply." } }
     } }
 }
 
@@ -227,5 +243,65 @@ mod tests {
         assert_eq!(applied(Reply::Ok).unwrap_err().kind, ErrorKind::Protocol);
         let failure = ErrorReport::new(ErrorKind::Conflict, "Source changed");
         assert_eq!(applied(Reply::Error(failure.clone())).unwrap_err(), failure);
+    }
+    #[test]
+    fn an_unversioned_development_review_never_reaches_the_view() {
+        let secret = uuid::Uuid::new_v4().to_string();
+        let review = Review {
+            version: 0,
+            id: uuid::Uuid::new_v4(),
+            settings_revision: 0,
+            preview: Preview {
+                version: PREVIEW_VERSION,
+                tool: Tool::RustyClaw,
+                source: secret.clone().into(),
+                config_sha256: None,
+                vault: None,
+                providers: vec![],
+                messengers: vec![],
+                inactive: vec![],
+                unsupported: vec![],
+            },
+        };
+        let failure = reviewed(Reply::ImportPreview(Box::new(review))).unwrap_err();
+        assert_eq!(failure.kind, ErrorKind::Protocol);
+        assert!(!format!("{failure:?}").contains(&secret));
+        assert!(failure.message.contains("Update the gateway"));
+    }
+    #[tokio::test]
+    async fn confirmation_refreshes_shared_state_and_keeps_a_partial_receipt_error() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let refreshed = AtomicBool::new(false);
+        let value = Applied {
+            receipt: Receipt {
+                version: PREVIEW_VERSION,
+                id: uuid::Uuid::new_v4(),
+                tool: Tool::RustyClaw,
+                source: "/source".into(),
+                config_sha256: None,
+                applied_at: 0,
+                providers_added: vec![uuid::Uuid::new_v4()],
+                messengers_added: vec![],
+                vault_imported: false,
+            },
+            receipt_error: Some(ErrorReport::new(ErrorKind::Storage, "Receipt write failed")),
+        };
+        let confirmed =
+            finish_application(Ok(Reply::ImportApplied(Box::new(value.clone()))), async {
+                refreshed.store(true, Ordering::SeqCst);
+            })
+            .await
+            .unwrap();
+        assert!(refreshed.load(Ordering::SeqCst));
+        assert_eq!(confirmed, value);
+        refreshed.store(false, Ordering::SeqCst);
+        assert!(
+            finish_application(Ok(Reply::Ok), async {
+                refreshed.store(true, Ordering::SeqCst);
+            })
+            .await
+            .is_err()
+        );
+        assert!(!refreshed.load(Ordering::SeqCst));
     }
 }
