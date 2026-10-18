@@ -57,8 +57,8 @@ pub(crate) fn Imports() -> Element {
         Card { variant: CardVariant::Elevated,
             CardHeader { CardTitle { "Source settings" } CardSubtitle { "The path is on the gateway host, including when you connect remotely." } }
             CardBody {
-                Field { label: rsx! { "Source tool" }, Select { label: name!("Import source tool"), value: ReadSignal::from(tool_value), availability: if busy() { Availability::Disabled } else { Availability::Enabled }, options: [Tool::RustyClaw, Tool::ClaudeCode].into_iter().map(|tool| SelectChoice::new(tool.label(), tool.label())).collect(), onchange: move |value: String| { tool.set(if value == Tool::ClaudeCode.label() { Tool::ClaudeCode } else { Tool::RustyClaw }); review.set(None); failure.set(None); } } }
-                Field { label: rsx! { "Settings directory" }, hint: rsx! { if tool() == Tool::ClaudeCode { "Select one directory containing settings.json, such as ~/.claude or a project's .claude. Only an explicit ANTHROPIC_BASE_URL endpoint is reviewed. Other scopes, shell variables and subscription accounts are not inferred." } else { "Enter an absolute installation path. Source files are read-only; nothing is activated during preview." } },
+                Field { label: rsx! { "Source tool" }, Select { label: name!("Import source tool"), value: ReadSignal::from(tool_value), availability: if busy() { Availability::Disabled } else { Availability::Enabled }, options: Tool::ALL.into_iter().map(|tool| SelectChoice::new(tool.label(), tool.label())).collect(), onchange: move |value: String| { tool.set(Tool::ALL.into_iter().find(|tool| tool.label() == value).unwrap_or(Tool::RustyClaw)); review.set(None); failure.set(None); } } }
+                Field { label: rsx! { "Settings directory" }, hint: rsx! { {source_hint(tool())} },
                     Input { value: ReadSignal::from(source), availability: if busy() { Availability::Disabled } else { Availability::Enabled }, placeholder: "/absolute/settings/directory", oninput: move |value| { source.set(value); review.set(None); failure.set(None); } }
                 }
             }
@@ -69,7 +69,7 @@ pub(crate) fn Imports() -> Element {
                 let source = source();
                 let tool = tool();
                 spawn(async move {
-                    let command = match tool { Tool::RustyClaw => Command::PreviewImport { source: source.into() }, Tool::ClaudeCode => Command::PreviewSourceImport { tool, source: source.into() } };
+                    let command = match tool { Tool::RustyClaw => Command::PreviewImport { source: source.into() }, Tool::ClaudeCode | Tool::Codex => Command::PreviewSourceImport { tool, source: source.into() } };
                     match call(command).await.and_then(|reply| reviewed(reply, tool)) {
                         Ok(result) => review.set(Some(result)), Err(error) => failure.set(Some(error)),
                     }
@@ -197,6 +197,19 @@ fn MessengerRow(
     } }
 }
 
+fn source_hint(tool: Tool) -> &'static str {
+    match tool {
+        Tool::RustyClaw => {
+            "Enter an absolute installation path. Source files are read-only; nothing is activated during preview."
+        }
+        Tool::ClaudeCode => {
+            "Select one directory containing settings.json, such as ~/.claude or a project's .claude. Only an explicit ANTHROPIC_BASE_URL endpoint is reviewed. Other scopes, shell variables and subscription accounts are not inferred."
+        }
+        Tool::Codex => {
+            "Select one directory containing config.toml, such as ~/.codex or a project's .codex. Only [model_providers] endpoints are reviewed, as OpenAI-compatible connections; test each one after import. Profiles, keys, headers and MCP servers stay behind."
+        }
+    }
+}
 fn provider_status(action: &ProviderAction) -> &'static str {
     match action {
         ProviderAction::Add => "Available",
