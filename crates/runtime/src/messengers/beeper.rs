@@ -80,6 +80,8 @@ struct Page<T> {
     has_more: bool,
     #[serde(default, rename = "newestCursor")]
     newest_cursor: Option<String>,
+    #[serde(default, rename = "oldestCursor")]
+    oldest_cursor: Option<String>,
 }
 
 #[derive(Clone, Deserialize)]
@@ -359,12 +361,12 @@ impl Beeper {
                 // An allowed chat that had no messages when the session
                 // started (Beeper did not have it, or it was empty): all it
                 // holds now arrived since.
-                None => match self.latest(&chat).await? {
-                    Some(page) => {
-                        if let Some(cursor) = page.newest_cursor {
+                None => match self.arrived(&chat).await? {
+                    Some((cursor, messages)) => {
+                        if let Some(cursor) = cursor {
                             state.messages.insert(chat.clone(), cursor);
                         }
-                        page.items
+                        messages
                     }
                     None => continue,
                 },
@@ -390,6 +392,40 @@ impl Beeper {
         }
         let more = overflow || !state.behind.is_empty();
         Ok((state, events, more))
+    }
+
+    /// Everything `chat` holds, oldest first, with the cursor after it: the
+    /// latest page and the pages before it. Past this poll's page budget the
+    /// oldest are left unanswered, which is logged.
+    async fn arrived(&self, chat: &str) -> Result<Option<(Option<String>, Vec<Message>)>> {
+        let Some(latest) = self.latest(chat).await? else {
+            return Ok(None);
+        };
+        let newest = latest.newest_cursor;
+        let mut older = latest.oldest_cursor.filter(|_| latest.has_more);
+        let mut pages = vec![latest.items];
+        while let Some(cursor) = older.take() {
+            if pages.len() >= MAX_MESSAGE_PAGES {
+                tracing::warn!(
+                    chat,
+                    "a new Beeper chat holds more messages than one poll reads; the oldest are not answered"
+                );
+                break;
+            }
+            let mut url = self.url(&["chats", chat, "messages"])?;
+            url.query_pairs_mut()
+                .append_pair("cursor", &cursor)
+                .append_pair("direction", "before");
+            let Some(page): Option<Page<Message>> = self.fetch(HttpMethod::Get, url, None).await?
+            else {
+                break;
+            };
+            older = page
+                .oldest_cursor
+                .filter(|oldest| page.has_more && *oldest != cursor);
+            pages.push(page.items);
+        }
+        Ok(Some((newest, pages.into_iter().rev().flatten().collect())))
     }
 
     /// `chat`'s messages after `cursor`, oldest first: the cursor after them,

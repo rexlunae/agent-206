@@ -418,7 +418,8 @@ agent206 messenger enable beeper
   stopped are not answered. When more chats changed since the last look than
   one page of the chat list holds (100), every allowed chat is checked
   directly. An allowed chat that did not exist, or was empty, when the
-  session started has everything it holds answered once it appears. The
+  session started has everything it holds answered once it appears, up to
+  eight pages of messages read backwards from the newest. The
   gateway checks which accounts the token reaches before every look, so a
   replaced token starts afresh.
 - **Replies** go to the same chat in parts of at most 4000 characters, at

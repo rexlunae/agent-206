@@ -2679,17 +2679,37 @@ async fn serve_beeper(desktop: BeeperDesktop) -> String {
         let Some(chat) = state.chats.get(&id) else {
             return StatusCode::NOT_FOUND.into_response();
         };
-        let (from, items): (u64, Vec<_>) = match cursor_after(&query, 'm') {
+        let before = (query.get("direction").map(String::as_str) == Some("before"))
+            .then(|| query.get("cursor")?.strip_prefix('m')?.parse::<u64>().ok())
+            .flatten();
+        let (from, items, more): (u64, Vec<_>, bool) = match cursor_after(&query, 'm') {
             Some(after) => (
                 after,
                 chat.messages.iter().filter(|(at, _)| *at > after).collect(),
+                false,
             ),
-            None => (0, chat.messages.iter().rev().take(20).rev().collect()),
+            // The latest page, or the page before `cursor`: twenty messages,
+            // and whether older ones remain.
+            None => {
+                let earlier: Vec<_> = chat
+                    .messages
+                    .iter()
+                    .filter(|(at, _)| before.is_none_or(|before| *at < before))
+                    .collect();
+                let skip = earlier.len().saturating_sub(20);
+                (0, earlier[skip..].to_vec(), skip > 0)
+            }
         };
         let newest = items.last().map_or(from, |(at, _)| *at);
+        let oldest = items.first().map_or(from, |(at, _)| *at);
         let items: Vec<_> = items.into_iter().map(|(_, m)| m.clone()).collect();
-        Json(json!({"items": items, "hasMore": false, "newestCursor": format!("m{newest}")}))
-            .into_response()
+        Json(json!({
+            "items": items,
+            "hasMore": more,
+            "newestCursor": format!("m{newest}"),
+            "oldestCursor": format!("m{oldest}"),
+        }))
+        .into_response()
     };
     let send = |State(desktop): State<BeeperDesktop>,
                 headers: HeaderMap,
@@ -2945,7 +2965,9 @@ async fn beeper_finds_allowed_chats_behind_busy_lists_and_new_chats_and_rechecks
     let supervisor = tokio::spawn(supervise(host.clone(), receiver, FAST, stop.clone()));
     host.until(|h| h.status(name).state == MessengerState::Connected && desktop.lists() >= 2)
         .await;
-    let (behind, first) = (random(), random());
+    // More of `later`'s messages than one page holds.
+    let behind = random();
+    let first: Vec<String> = (0..45).map(|_| random()).collect();
     {
         // At once, so one look sees it all: the allowed chat changes first,
         // then more chats than one page holds.
@@ -2956,11 +2978,13 @@ async fn beeper_finds_allowed_chats_behind_busy_lists_and_new_chats_and_rechecks
             state.chat(&other, "single", "Signal", &random());
             state.post(&other, beeper_text(&random(), &random()));
         }
-        // A chat created after the session started, and its first message.
+        // A chat created after the session started, and its first messages.
         state.chat(&later, "single", "iMessage", &random());
-        state.post(&later, beeper_text(&friend, &first));
+        for text in &first {
+            state.post(&later, beeper_text(&friend, text));
+        }
     }
-    host.until(|_| desktop.sent.lock().unwrap().len() == 2)
+    host.until(|_| desktop.sent.lock().unwrap().len() == 1 + first.len())
         .await;
     // Once nothing is left to answer, another token reaching other accounts
     // is still noticed.
@@ -2973,12 +2997,15 @@ async fn beeper_finds_allowed_chats_behind_busy_lists_and_new_chats_and_rechecks
     stop.cancel();
     supervisor.await.unwrap();
 
-    let sent: BTreeSet<_> = desktop.sent.lock().unwrap().iter().cloned().collect();
-    assert_eq!(
-        sent,
-        BTreeSet::from([
-            (busy, format!("reply to {behind}")),
-            (later, format!("reply to {first}")),
-        ])
-    );
+    let sent = desktop.sent.lock().unwrap().clone();
+    let to = |chat: &str| -> Vec<String> {
+        sent.iter()
+            .filter(|(to, _)| to == chat)
+            .map(|(_, text)| text.clone())
+            .collect()
+    };
+    assert_eq!(to(&busy), [format!("reply to {behind}")]);
+    // Every message the new chat held is answered once, in order.
+    let replies: Vec<_> = first.iter().map(|t| format!("reply to {t}")).collect();
+    assert_eq!(to(&later), replies);
 }
