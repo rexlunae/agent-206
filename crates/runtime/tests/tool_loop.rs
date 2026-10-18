@@ -1874,6 +1874,47 @@ async fn arguments_take_their_declared_types_and_repeats_are_reported() {
     }
 }
 
+#[tokio::test]
+async fn a_request_repeated_within_a_response_still_ends_the_streak_it_interrupts() {
+    let api = ProviderApi::OpenAi;
+    let (first, other) = (nonce(), nonce());
+    let specs = [&first, &other].map(|name| tool(name, ToolPermission::Allow, &[]));
+    let mut rig = rig(api, specs.to_vec(), None).await;
+    rig.permit(&first, ToolPermission::Allow).await;
+    rig.permit(&other, ToolPermission::Allow).await;
+    let task = rig.send();
+    let threshold = 5; // docs/run-engine.md: reported from the fifth request in a row
+    // One response asks for the first tool, the other, then the first again:
+    // the last request made is the first tool's, so it starts the streak.
+    let mut request = rig.next_request().await;
+    let calls = [&first, &other, &first].map(|name| Call::new(name, json!({})));
+    request.respond(calls_response(api, &calls, "")).await;
+    for _ in 0..2 {
+        tokio::time::timeout(PATIENCE, rig.calls.recv())
+            .await
+            .unwrap_or_else(wait("the tools to run"))
+            .unwrap();
+    }
+    for _ in 2..=threshold {
+        request = rig.next_request().await;
+        let call = Call::new(&first, json!({}));
+        request.respond(calls_response(api, &[call], "")).await;
+        tokio::time::timeout(PATIENCE, rig.calls.recv())
+            .await
+            .unwrap_or_else(wait("the tool to run"))
+            .unwrap();
+    }
+    request = rig.next_request().await;
+    request.respond(text_response(api, &nonce())).await;
+    let thread = finished(task).await;
+    assert_eq!(thread.state, RunState::Complete, "{:?}", thread.error);
+    let repeated: Vec<_> = calls_of(&thread).iter().map(|call| call.repeated).collect();
+    // Three requests in the first response, then one per round.
+    let mut expected = vec![None; threshold + 1];
+    expected.push(Some(threshold as u32));
+    assert_eq!(repeated, expected);
+}
+
 // ── Text addressed to the model ─────────────────────────────────────────────
 
 #[tokio::test]

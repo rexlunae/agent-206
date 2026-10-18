@@ -848,11 +848,9 @@ impl Gateway {
                 repeated: None,
             };
             let duplicate = !seen_calls.insert(record.digest.clone());
-            // The streak counts requests, whatever becomes of them; a
-            // duplicate in the same response is the same request.
-            if !duplicate {
-                record.repeated = repeats.observe(&record.digest);
-            }
+            // The streak counts requests in the order they were made,
+            // whatever becomes of them, duplicates in one response included.
+            record.repeated = repeats.observe(&record.digest);
             let usable = match parsed {
                 Err(error) => {
                     settle(
