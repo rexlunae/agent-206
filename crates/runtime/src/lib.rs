@@ -13,6 +13,7 @@ pub mod exec_tool;
 pub mod extension_host;
 pub mod extension_list_tool;
 pub mod extension_tools;
+pub mod forge;
 pub mod gateway;
 pub mod git_remote;
 pub mod images;

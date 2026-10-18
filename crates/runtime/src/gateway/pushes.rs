@@ -59,6 +59,14 @@ pub(super) fn validate(entries: &mut [GitCredential]) -> Result<()> {
                 && !credential.chars().any(char::is_control),
             GatewayError::Invalid("a git credential needs a vault credential name"),
         )?;
+        if let Some(forge) = &mut entry.forge {
+            let api = a206_forge::api_url(&forge.api).map_err(|_| {
+                GatewayError::Invalid(
+                    "a forge API address must be https://host[:port][/path], or http:// on a loopback host",
+                )
+            })?;
+            forge.api = api.to_string();
+        }
     }
     Ok(())
 }
@@ -110,6 +118,7 @@ mod tests {
             origin: origin.into(),
             username: name(),
             credential: name(),
+            forge: None,
         }
     }
 

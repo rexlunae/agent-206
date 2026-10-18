@@ -464,7 +464,7 @@ async fn record(root: PathBuf, target: &PushTarget) -> Result<Tracked, RemoteErr
     })
 }
 
-async fn blocking<T: Send + 'static>(
+pub(crate) async fn blocking<T: Send + 'static>(
     work: impl FnOnce() -> Result<T, RemoteError> + Send + 'static,
 ) -> Result<T, RemoteError> {
     tokio::task::spawn_blocking(work)
@@ -472,7 +472,10 @@ async fn blocking<T: Send + 'static>(
         .map_err(RemoteError::Task)?
 }
 
-fn text(args: &Map<String, Value>, name: &'static str) -> Result<Option<String>, RemoteError> {
+pub(crate) fn text(
+    args: &Map<String, Value>,
+    name: &'static str,
+) -> Result<Option<String>, RemoteError> {
     match args.get(name) {
         None | Some(Value::Null) => Ok(None),
         Some(Value::String(value)) => Ok(Some(value.clone())),
@@ -480,14 +483,15 @@ fn text(args: &Map<String, Value>, name: &'static str) -> Result<Option<String>,
     }
 }
 
-/// A paired gateway connection to the vault broker that can push.
-struct Broker {
+/// A paired gateway connection to the vault broker that can make git and
+/// forge API calls.
+pub(crate) struct Broker {
     #[cfg(unix)]
     client: a206_broker::Client,
 }
 impl Broker {
     #[cfg(unix)]
-    async fn connect(
+    pub(crate) async fn connect(
         root: &std::path::Path,
         pairing: Option<&a206_core::BrokerPairing>,
         version: u16,
@@ -509,7 +513,7 @@ impl Broker {
         Ok(Self { client })
     }
     #[cfg(not(unix))]
-    async fn connect(
+    pub(crate) async fn connect(
         _root: &std::path::Path,
         _pairing: Option<&a206_core::BrokerPairing>,
         _version: u16,
@@ -549,6 +553,31 @@ impl Broker {
         _service: Service,
         _call: a206_broker::GitCall,
     ) -> Result<Vec<u8>, RemoteError> {
+        Err(RemoteError::NotPaired)
+    }
+
+    /// One forge API request; the status and the body of a success (the
+    /// broker never relays the body of a failure).
+    #[cfg(unix)]
+    pub(crate) async fn provider(
+        &mut self,
+        call: a206_broker::ProviderCall,
+    ) -> Result<(u16, Vec<u8>), RemoteError> {
+        let reply = self
+            .client
+            .call(a206_broker::Request::Provider(call))
+            .await
+            .map_err(RemoteError::Broker)?;
+        let a206_broker::Reply::Provider { status, body } = reply else {
+            return Err(RemoteError::UnexpectedReply);
+        };
+        Ok((status, body))
+    }
+    #[cfg(not(unix))]
+    pub(crate) async fn provider(
+        &mut self,
+        _call: a206_broker::ProviderCall,
+    ) -> Result<(u16, Vec<u8>), RemoteError> {
         Err(RemoteError::NotPaired)
     }
 }

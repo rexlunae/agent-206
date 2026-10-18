@@ -1030,6 +1030,8 @@ const GIT_AGENT: &str = concat!("git/agent206-", env!("CARGO_PKG_VERSION"));
 
 fn http_client() -> reqwest::ClientBuilder {
     reqwest::Client::builder()
+        // Forge APIs refuse requests that do not name their client.
+        .user_agent(concat!("agent206/", env!("CARGO_PKG_VERSION")))
         .timeout(Duration::from_secs(180))
         .connect_timeout(Duration::from_secs(10))
         .redirect(reqwest::redirect::Policy::none())

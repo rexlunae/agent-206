@@ -630,6 +630,10 @@ impl Gateway {
         // permits it, and then still approved by the user call by call.
         let push_tools = Arc::new(crate::git_remote::RemoteHost::new(gateway.pushes()));
         Arc::make_mut(&mut gateway.tool_hosts).push(push_tools);
+        // Reading pull requests, denied in each conversation until the user
+        // permits it.
+        let forge_tools = Arc::new(crate::forge::ForgeHost::new(gateway.pushes()));
+        Arc::make_mut(&mut gateway.tool_hosts).push(forge_tools);
         // The plan tool, denied in each conversation until the user permits it.
         let plan_tools = Arc::new(crate::plan_tool::PlanHost::new(gateway.plans()));
         Arc::make_mut(&mut gateway.tool_hosts).push(plan_tools);

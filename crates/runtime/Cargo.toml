@@ -16,6 +16,7 @@ a206-output-rules.workspace = true
 a206-leak-scan.workspace = true
 a206-injection-scan.workspace = true
 a206-git-push.workspace = true
+a206-forge.workspace = true
 a206-vault.workspace = true
 http = "1"
 a206-broker.workspace = true
