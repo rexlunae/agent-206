@@ -1,7 +1,7 @@
 id = "agent206.web"
 name = "Web pages"
 description = "Fetches public HTTPS pages, raw or as readable text, through the gateway, which refuses private and local addresses."
-version = "0.2.0"
+version = "0.3.0"
 abi = 2
 capabilities = ["network"]
 # Any public HTTPS host: the gateway still refuses private, reserved and
@@ -44,3 +44,14 @@ description = "Also return the page's title and description. Defaults to false."
 name = "max_bytes"
 type = "integer"
 description = "Most bytes of text to return, 1 to 196608. Defaults to 50000."
+
+[[triggers]]
+name = "page_changed"
+description = "Fires when the readable text of a public HTTPS page changes, and reports the start of its new text. The first check only records the page; a page that cannot be fetched fails the run without firing."
+capabilities = ["network"]
+
+[[triggers.params]]
+name = "url"
+type = "string"
+description = "A credential-free https:// URL on the standard port."
+required = true

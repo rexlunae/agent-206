@@ -99,7 +99,9 @@ pub fn classify(error: &(dyn Error + 'static)) -> Option<ErrorKind> {
     }
     if let Some(error) = error.downcast_ref::<ArgError>() {
         return Some(match error {
-            ArgError::UnknownTool(_) | ArgError::UnknownPanel(_) => ErrorKind::NotFound,
+            ArgError::UnknownTool(_) | ArgError::UnknownPanel(_) | ArgError::UnknownTrigger(_) => {
+                ErrorKind::NotFound
+            }
             _ => ErrorKind::InvalidRequest,
         });
     }
@@ -131,7 +133,8 @@ pub fn classify(error: &(dyn Error + 'static)) -> Option<ErrorKind> {
         | E::OutputBounds(_)
         | E::Output(_)
         | E::WrongOutcome { .. }
-        | E::View(_) => ErrorKind::Protocol,
+        | E::View(_)
+        | E::Cursor => ErrorKind::Protocol,
         // Fuel is the invocation's compute budget.
         E::OutOfFuel(_) => ErrorKind::Timeout,
         E::Bridge(_) => ErrorKind::Unavailable,

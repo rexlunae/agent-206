@@ -1,10 +1,12 @@
-//! Scheduled messages: text the gateway sends to a conversation at set times.
+//! Scheduled messages: text the gateway sends to a conversation at set times,
+//! heartbeat checks and checks of extension triggers.
 //! The same gateway commands as `agent206 schedule`; a job carries no
 //! authority of its own and runs under its conversation's permissions.
 use crate::{PageFrame, State, call, dispatch, error::ErrorNotice, route::Route};
 use a206_core::{
-    Command, Delivery, ErrorKind, ErrorReport, Job, JobAuthor, JobKind, JobOutcome, JobRun, Reply,
-    Schedule, ScheduleInputError, Snapshot,
+    Command, Delivery, ErrorKind, ErrorReport, Job, JobAuthor, JobKind, JobOutcome, JobRun,
+    PluginSummary, Reply, Schedule, ScheduleInputError, Snapshot,
+    extension::{Args, ParamKind, ParamSpec, TriggerSpec, Value},
     messengers::post_destinations,
     schedule::{MAX_JOB_RUNS, format_interval, parse_interval, parse_local},
 };
@@ -55,14 +57,20 @@ fn describe(schedule: &Schedule, zone: &TimeZone) -> String {
     }
 }
 
-fn outcome(outcome: &JobOutcome, kind: JobKind) -> (BadgeTone, &'static str) {
+fn outcome(outcome: &JobOutcome, kind: &JobKind) -> (BadgeTone, &'static str) {
     match outcome {
         JobOutcome::Running => (BadgeTone::Info, "Running"),
         // A heartbeat that does not answer HEARTBEAT_OK found something.
-        JobOutcome::Complete if kind == JobKind::Heartbeat => {
+        JobOutcome::Complete if *kind == JobKind::Heartbeat => {
             (BadgeTone::Warning, "Needs attention")
         }
+        JobOutcome::Complete if matches!(kind, JobKind::Trigger { .. }) => {
+            (BadgeTone::Accent, "Fired; answered")
+        }
         JobOutcome::Complete => (BadgeTone::Success, "Complete"),
+        JobOutcome::Quiet if matches!(kind, JobKind::Trigger { .. }) => {
+            (BadgeTone::Neutral, "Did not fire")
+        }
         JobOutcome::Quiet => (BadgeTone::Success, "Nothing needed attention"),
         JobOutcome::Failed => (BadgeTone::Danger, "Failed"),
         JobOutcome::Cancelled => (BadgeTone::Neutral, "Cancelled"),
@@ -106,6 +114,129 @@ fn delivery_choices(destinations: &[String], current: Option<&str>) -> Vec<Selec
     choices
 }
 
+/// What a trigger check does, naming the extension as the user knows it.
+fn trigger_summary(plugins: &[PluginSummary], extension: &str, trigger: &str) -> String {
+    let plugin = plugins.iter().find(|p| p.id == extension);
+    let name = plugin.map_or(extension, |p| p.name.as_str());
+    let found = plugin.and_then(|p| p.triggers.iter().find(|t| t.name == trigger));
+    match (plugin, found) {
+        (Some(_), Some(spec)) => format!(
+            "Checks the trigger “{trigger}” of {name} each run: {} When it fires, the job sends what the extension reported, after the text below.",
+            spec.description
+        ),
+        (Some(_), None) => format!(
+            "Checks the trigger “{trigger}” of {name}, which no longer offers it; runs are refused until it does."
+        ),
+        (None, _) => format!(
+            "Checks the trigger “{trigger}” of the extension {extension}, which is not installed; runs are refused until it is."
+        ),
+    }
+}
+
+/// An argument value as text.
+fn show_value(value: &Value) -> String {
+    match value {
+        Value::Nil => String::new(),
+        Value::Bool(flag) => flag.to_string(),
+        Value::Int(number) => number.to_string(),
+        Value::Float(number) => number.to_string(),
+        Value::Str(text) => text.clone(),
+        Value::List(_) | Value::Map(_) => format!("{value:?}"),
+    }
+}
+
+/// Why a trigger argument typed into the form cannot be used.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+enum ArgInputError {
+    #[error("{0} is required")]
+    Missing(String),
+    #[error("{name} must be {}", kind.label())]
+    Kind { name: String, kind: ParamKind },
+    #[error(
+        "{0} takes a list or table; schedule this trigger with `agent206 schedule add --trigger`"
+    )]
+    Structured(String),
+}
+
+/// The arguments the form's fields give a trigger, by its declared kinds.
+/// Empty fields are left out.
+fn trigger_args(
+    params: &[ParamSpec],
+    inputs: &std::collections::BTreeMap<String, String>,
+) -> Result<Args, ArgInputError> {
+    let mut args = Args::new();
+    for param in params {
+        let text = inputs.get(&param.name).map_or("", |text| text.trim());
+        if text.is_empty() {
+            if param.required {
+                return Err(ArgInputError::Missing(param.name.clone()));
+            }
+            continue;
+        }
+        let wrong = || ArgInputError::Kind {
+            name: param.name.clone(),
+            kind: param.kind,
+        };
+        let value = match param.kind {
+            ParamKind::String => Value::Str(text.to_owned()),
+            ParamKind::Integer => Value::Int(text.parse().map_err(|_| wrong())?),
+            ParamKind::Number => Value::Float(text.parse().map_err(|_| wrong())?),
+            ParamKind::Boolean => Value::Bool(text.parse().map_err(|_| wrong())?),
+            ParamKind::Array | ParamKind::Object => {
+                return Err(ArgInputError::Structured(param.name.clone()));
+            }
+        };
+        args.insert(param.name.clone(), value);
+    }
+    Ok(args)
+}
+
+/// What the form's job sends.
+#[derive(Debug, Clone, PartialEq)]
+enum Sends {
+    Message,
+    Heartbeat,
+    Trigger {
+        extension: String,
+        spec: TriggerSpec,
+    },
+}
+impl Sends {
+    /// The choice's value in the "Send" field.
+    fn key(&self) -> String {
+        match self {
+            Self::Message => "message".into(),
+            Self::Heartbeat => "heartbeat".into(),
+            // Extension ids hold no `/`.
+            Self::Trigger { extension, spec } => format!("trigger/{extension}/{}", spec.name),
+        }
+    }
+}
+
+/// What a job can send: a message, a heartbeat check, and each trigger of an
+/// enabled extension, labelled with the extension's name.
+fn send_choices(plugins: &[PluginSummary]) -> Vec<(Sends, String)> {
+    let mut choices = vec![
+        (Sends::Message, "A message".to_owned()),
+        (
+            Sends::Heartbeat,
+            "A heartbeat check (HEARTBEAT.md)".to_owned(),
+        ),
+    ];
+    for plugin in plugins.iter().filter(|p| p.enabled) {
+        for spec in &plugin.triggers {
+            choices.push((
+                Sends::Trigger {
+                    extension: plugin.id.clone(),
+                    spec: spec.clone(),
+                },
+                format!("A trigger check: {} “{}”", plugin.name, spec.name),
+            ));
+        }
+    }
+    choices
+}
+
 fn title(snapshot: &Snapshot, thread: Uuid) -> Option<String> {
     snapshot
         .threads
@@ -122,17 +253,22 @@ pub fn Schedules() -> Element {
     // Soonest first; paused and finished jobs after every pending one.
     jobs.sort_by_key(|job| (job.next.is_none(), job.next, job.name.clone()));
     let destinations = post_destinations(&snapshot.settings.messengers);
-    rsx! { PageFrame { kicker: "Workbench", title: "Messages on a schedule.", description: "Send a conversation a message, or a heartbeat check of its HEARTBEAT.md, once, on an interval or on a cron schedule. Each one runs as if you typed it, with that conversation's permissions at the time.",
+    rsx! { PageFrame { kicker: "Workbench", title: "Messages on a schedule.", description: "Send a conversation a message, a heartbeat check of its HEARTBEAT.md, or what an extension's trigger reports when it fires, once, on an interval or on a cron schedule. Each one runs as if you typed it, with that conversation's permissions at the time.",
         if jobs.is_empty() { EmptyState { compact: true, title: rsx! { "Nothing scheduled" }, body: rsx! { "Scheduled messages appear here, whether you add them or a conversation's model does with your approval." } } }
         for job in jobs {
-            JobCard { key: "{job.id}", job: job.clone(), conversation: title(&snapshot, job.thread), destinations: destinations.clone() }
+            JobCard { key: "{job.id}", job: job.clone(), conversation: title(&snapshot, job.thread), destinations: destinations.clone(), plugins: snapshot.plugins.clone() }
         }
         AddJob {}
     } }
 }
 
 #[component]
-fn JobCard(job: Job, conversation: Option<String>, destinations: Vec<String>) -> Element {
+fn JobCard(
+    job: Job,
+    conversation: Option<String>,
+    destinations: Vec<String>,
+    plugins: Vec<PluginSummary>,
+) -> Element {
     let state = use_context::<State>();
     let zone = TimeZone::system();
     let id = job.id;
@@ -157,15 +293,23 @@ fn JobCard(job: Job, conversation: Option<String>, destinations: Vec<String>) ->
             div { class: "a206-row",
                 if job.enabled { Badge { tone: BadgeTone::Accent, "Active" } } else { Badge { "Paused" } }
                 if job.kind == JobKind::Heartbeat { Badge { "Heartbeat check" } }
+                if matches!(job.kind, JobKind::Trigger { .. }) { Badge { "Trigger check" } }
                 span { class: "a206-muted", "{author}" }
             }
             p { "To " match conversation {
                 Some(title) => rsx! { LinkButton { size: ButtonSize::Sm, variant: ButtonVariant::Ghost, href: Route::Chat { id: job.thread, split: None, message: None }.to_string(), "{title}" } },
                 None => rsx! { span { class: "a206-muted", "a conversation that no longer exists" } },
             } }
-            match job.kind {
+            match &job.kind {
                 JobKind::Message => rsx! { blockquote { class: "a206-quote", "{job.text}" } },
                 JobKind::Heartbeat => rsx! { p { class: "a206-muted", "Sends the checklist in HEARTBEAT.md at the conversation's project root, read when it runs. A reply of exactly HEARTBEAT_OK means nothing needed attention." } },
+                JobKind::Trigger { extension, trigger, args } => rsx! {
+                    p { class: "a206-muted", "{trigger_summary(&plugins, extension, trigger)}" }
+                    if !args.is_empty() {
+                        DescriptionList { for (name, value) in args.iter() { DescriptionItem { key: "{name}", term: rsx! { "{name}" }, "{show_value(value)}" } } }
+                    }
+                    if !job.text.is_empty() { blockquote { class: "a206-quote", "{job.text}" } }
+                },
             }
             p { class: "a206-muted", match (job.enabled, job.next) {
                 (true, Some(next)) => format!("Next: {}", show_time(next, &zone)),
@@ -173,7 +317,7 @@ fn JobCard(job: Job, conversation: Option<String>, destinations: Vec<String>) ->
                 (true, None) => "It will not run again.".to_owned(),
             } }
             if let Some(last) = &job.last {
-                { let (tone, label) = outcome(&last.outcome, job.kind); rsx! {
+                { let (tone, label) = outcome(&last.outcome, &job.kind); rsx! {
                     div { class: "a206-row", span { class: "a206-muted", "Latest run {show_time(last.at, &zone)}" } Badge { tone, "{label}" } }
                 } }
                 if let JobOutcome::Refused(report) = &last.outcome { ErrorNotice { report: report.clone(), title: "The latest run was not sent".to_string() } }
@@ -244,7 +388,7 @@ fn JobHistory(job: Job) -> Element {
         match runs() {
             None if failure().is_none() => rsx! { p { class: "a206-muted", "Loading run history…" } },
             None => rsx! {},
-            Some(list) => rsx! { RunList { runs: list, kind: job.kind } },
+            Some(list) => rsx! { RunList { runs: list, kind: job.kind.clone() } },
         }
         div { Button { size: ButtonSize::Sm, variant: ButtonVariant::Ghost, onclick: move |_| reload(), "Refresh run history" } }
     } }
@@ -261,7 +405,7 @@ fn RunList(runs: Vec<JobRun>, kind: JobKind) -> Element {
         ul { class: "a206-stack",
             for run in runs {
                 li { key: "{run.id}",
-                    { let (tone, label) = outcome(&run.outcome, kind); rsx! {
+                    { let (tone, label) = outcome(&run.outcome, &kind); rsx! {
                         div { class: "a206-row",
                             span { "{show_time(run.at, &zone)}" }
                             Badge { tone, "{label}" }
@@ -292,14 +436,6 @@ impl Kind {
             Self::Every => "On an interval",
             Self::Cron => "On a cron schedule",
         }
-    }
-}
-
-fn send_label(heartbeat: bool) -> &'static str {
-    if heartbeat {
-        "A heartbeat check (HEARTBEAT.md)"
-    } else {
-        "A message"
     }
 }
 
@@ -336,7 +472,8 @@ fn AddJob() -> Element {
     let mut name = use_signal(String::new);
     let mut thread = use_signal(|| None::<String>);
     let mut text = use_signal(String::new);
-    let mut heartbeat = use_signal(|| false);
+    let mut sends = use_signal(|| Sends::Message);
+    let mut inputs = use_signal(std::collections::BTreeMap::<String, String>::new);
     let mut kind = use_signal(|| Kind::Once);
     let mut date = use_signal(String::new);
     let mut time = use_signal(String::new);
@@ -349,13 +486,14 @@ fn AddJob() -> Element {
             .unwrap_or_default()
             .to_owned()
     });
-    let conversations = state
-        .data
-        .read()
+    let snapshot = state.data.read();
+    let conversations = snapshot
         .threads
         .iter()
         .map(|t| SelectChoice::new(t.id.to_string(), t.title.clone()))
         .collect::<Vec<_>>();
+    let choices = send_choices(&snapshot.plugins);
+    drop(snapshot);
     let schedule = form_schedule(kind(), &date(), &time(), &zone(), &every(), &cron());
     let invalid = match &schedule {
         Some(Err(error)) => Some(error.to_string()),
@@ -363,30 +501,57 @@ fn AddJob() -> Element {
     };
     let target = thread().and_then(|id| id.parse::<Uuid>().ok());
     let valid = matches!(schedule, Some(Ok(_)));
-    let sends = if heartbeat() {
-        JobKind::Heartbeat
-    } else {
-        JobKind::Message
+    let job_kind = match sends() {
+        Sends::Message => Ok(JobKind::Message),
+        Sends::Heartbeat => Ok(JobKind::Heartbeat),
+        Sends::Trigger { extension, spec } => {
+            trigger_args(&spec.params, &inputs()).map(|args| JobKind::Trigger {
+                extension,
+                trigger: spec.name,
+                args,
+            })
+        }
     };
     let ready = !name().trim().is_empty()
-        && (heartbeat() || !text().trim().is_empty())
+        && (sends() != Sends::Message || !text().trim().is_empty())
         && target.is_some()
-        && valid;
-    let sends_label = use_memo(move || Some(send_label(heartbeat()).to_owned()));
+        && valid
+        && job_kind.is_ok();
+    let sends_key = use_memo(move || Some(sends().key()));
     let kind_label = use_memo(move || Some(kind().label().to_owned()));
+    let options = choices
+        .iter()
+        .map(|(choice, label)| SelectChoice::new(choice.key(), label.clone()))
+        .collect::<Vec<_>>();
+    let arg_error = job_kind.as_ref().err().map(ToString::to_string);
     rsx! { Card { variant: CardVariant::Elevated,
         CardHeader { CardTitle { "Schedule a message" } CardSubtitle { "The gateway checks the schedule and the conversation when you add it." } }
         CardBody { div { class: "a206-grid",
             Field { label: rsx! { "Name" }, Input { value: ReadSignal::from(name), oninput: move |v| name.set(v), placeholder: "Morning summary" } }
             Field { label: rsx! { "Conversation" }, Select { label: name!("Conversation to message"), value: ReadSignal::from(thread), placeholder: "Choose a conversation", options: conversations, onchange: move |id: String| thread.set(Some(id)) } }
-            Field { label: rsx! { "Send" }, Select { label: name!("What the job sends"), value: ReadSignal::from(sends_label),
-                options: [false, true].into_iter().map(|h| SelectChoice::new(send_label(h), send_label(h))).collect(),
-                onchange: move |label: String| heartbeat.set(label == send_label(true))
+            Field { label: rsx! { "Send" }, hint: rsx! { "Triggers come from enabled extensions." }, Select { label: name!("What the job sends"), value: ReadSignal::from(sends_key), options,
+                onchange: move |key: String| if let Some((choice, _)) = choices.iter().find(|(c, _)| c.key() == key) {
+                    sends.set(choice.clone());
+                    inputs.set(Default::default());
+                }
             } }
-            if heartbeat() {
-                p { class: "a206-muted", "The conversation's project needs a HEARTBEAT.md checklist, and the conversation needs permission to read the project." }
-            } else {
-                Field { label: rsx! { "Message" }, Textarea { value: ReadSignal::from(text), oninput: move |v| text.set(v), rows: "3" } }
+            match sends() {
+                Sends::Heartbeat => rsx! {
+                    p { class: "a206-muted", "The conversation's project needs a HEARTBEAT.md checklist, and the conversation needs permission to read the project." }
+                },
+                Sends::Message => rsx! {
+                    Field { label: rsx! { "Message" }, Textarea { value: ReadSignal::from(text), oninput: move |v| text.set(v), rows: "3" } }
+                },
+                Sends::Trigger { spec, .. } => rsx! {
+                    p { class: "a206-muted", "{spec.description} Each run checks it with the conversation's permissions at the time; the extension also needs the permissions the trigger uses. A run that finds nothing sends nothing." }
+                    for param in spec.params.clone() {
+                        ArgField { key: "{param.name}", param: param.clone(), value: inputs().get(&param.name).cloned().unwrap_or_default(),
+                            oninput: move |v: String| { inputs.write().insert(param.name.clone(), v); }
+                        }
+                    }
+                    if let Some(error) = arg_error.clone() { p { class: "a206-muted", role: "status", "{error}" } }
+                    Field { label: rsx! { "When it fires" }, hint: rsx! { "Optional. Sent before the extension's report, such as what to do about it." }, Textarea { value: ReadSignal::from(text), oninput: move |v| text.set(v), rows: "2" } }
+                },
             }
             Field { label: rsx! { "Repeat" }, Select { label: name!("How the message repeats"), value: ReadSignal::from(kind_label),
                 options: Kind::ALL.into_iter().map(|k| SelectChoice::new(k.label(), k.label())).collect(),
@@ -411,9 +576,20 @@ fn AddJob() -> Element {
         CardFooter { Button { variant: ButtonVariant::Primary, availability: if ready { Availability::Enabled } else { Availability::Disabled }, onclick: move |_| {
             let Some(Ok(schedule)) = form_schedule(kind(), &date(), &time(), &zone(), &every(), &cron()) else { return };
             let Some(thread) = target else { return };
-            let text = if sends == JobKind::Heartbeat { String::new() } else { text() };
-            dispatch(state, Command::ScheduleJob { name: name().trim().to_owned(), thread, text, schedule, kind: sends });
-        }, "Schedule message" } }
+            let Ok(kind) = job_kind.clone() else { return };
+            let text = if kind == JobKind::Heartbeat { String::new() } else { text() };
+            dispatch(state, Command::ScheduleJob { name: name().trim().to_owned(), thread, text, schedule, kind });
+        }, "Schedule" } }
+    } }
+}
+
+/// A field for one trigger parameter, labelled with its declaration.
+#[component]
+fn ArgField(param: ParamSpec, value: String, oninput: EventHandler<String>) -> Element {
+    let value = use_memo(use_reactive!(|value| value));
+    let need = if param.required { ", required" } else { "" };
+    rsx! { Field { label: rsx! { "{param.name}" }, hint: rsx! { "{param.description} ({param.kind.label()}{need})" },
+        Input { value: ReadSignal::from(value), oninput: move |v| oninput.call(v) }
     } }
 }
 

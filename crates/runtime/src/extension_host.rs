@@ -10,8 +10,8 @@
 //! what the tool or panel declares.
 use crate::store::{StatePut, StateQuota, Store, StoreError};
 use a206_core::{
-    Capability, ErrorKind, ErrorReport, PluginSource, PluginSummary,
-    extension::{Args, ToolOutput, ToolSpec, UiEvent, View},
+    Capability, ErrorKind, ErrorReport, Id, PluginSource, PluginSummary,
+    extension::{Args, ToolOutput, ToolSpec, TriggerOutput, UiEvent, View},
 };
 use a206_extensions::{
     ArgError, Limits, Manifest, ManifestError,
@@ -365,6 +365,49 @@ impl ExtensionHost {
         let declared = spec.capabilities.clone();
         match self.invoke(loaded, &declared, call, scope).await? {
             Outcome::Panel(view) => Ok(view),
+            _ => Err(ExtensionError::Unexpected),
+        }
+    }
+
+    /// Check `args` against trigger `trigger` of `extension`, as installed now.
+    pub fn trigger_args(
+        &self,
+        extension: &str,
+        trigger: &str,
+        args: &Args,
+    ) -> Result<(), ExtensionError> {
+        let loaded = self.load(extension)?;
+        Ok(a206_extensions::check_args(
+            loaded.manifest.trigger(trigger)?,
+            args,
+        )?)
+    }
+
+    /// Ask whether trigger `trigger` fired for the scheduled job `job`, given
+    /// the `cursor` its previous check kept. Arguments are checked against
+    /// its declaration first. Dropping the future stops the check, as with
+    /// [`Self::call_tool`].
+    pub async fn check_trigger(
+        &self,
+        extension: &str,
+        trigger: &str,
+        job: Id,
+        args: Args,
+        cursor: Option<serde_bytes::ByteBuf>,
+        scope: Scope,
+    ) -> Result<TriggerOutput, ExtensionError> {
+        let loaded = self.load(extension)?;
+        let spec = loaded.manifest.trigger(trigger)?;
+        a206_extensions::check_args(spec, &args)?;
+        let call = Call::Trigger {
+            name: trigger.into(),
+            job: job.to_string(),
+            args,
+            cursor,
+        };
+        let declared = spec.capabilities.clone();
+        match self.invoke(loaded, &declared, call, scope).await? {
+            Outcome::Trigger(output) => Ok(output),
             _ => Err(ExtensionError::Unexpected),
         }
     }
