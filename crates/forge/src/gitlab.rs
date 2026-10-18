@@ -149,7 +149,9 @@ pub(super) fn parse_jobs(body: &[u8]) -> Result<Vec<Check>, ForgeError> {
                     (CheckStatus::Completed, Some(Conclusion::Neutral))
                 }
                 "failed" => (CheckStatus::Completed, Some(Conclusion::Failure)),
-                "canceled" | "canceling" => (CheckStatus::Completed, Some(Conclusion::Cancelled)),
+                // Still stopping, so not yet finished.
+                "canceling" => (CheckStatus::Running, None),
+                "canceled" => (CheckStatus::Completed, Some(Conclusion::Cancelled)),
                 "skipped" => (CheckStatus::Completed, Some(Conclusion::Skipped)),
                 _ => (CheckStatus::Unknown, None),
             };

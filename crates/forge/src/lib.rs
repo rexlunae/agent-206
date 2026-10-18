@@ -16,6 +16,9 @@ use url::Url;
 
 /// Pull requests asked for at once; a full page means there may be more.
 pub const PAGE: usize = 30;
+/// Pages GitHub is asked for at most when looking for merged or unmerged
+/// closed pull requests, which it lists together.
+pub const MAX_LIST_PAGES: usize = 4;
 /// Checks and reviews read for one pull request.
 pub const DETAIL_PAGE: usize = 100;
 /// Longest title, name or label kept, in characters.
@@ -119,11 +122,53 @@ pub struct PullRequest {
     pipeline: Option<u64>,
 }
 
-/// One page of pull requests, newest first as the forge orders them.
+/// Pull requests being listed, a page at a time: ask for [`Listing::next`]
+/// until it is `None`, giving each answer to [`Listing::add`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Listing {
+    listed: Listed,
+    source: Option<String>,
+    /// Pages to ask for at most.
+    pages: usize,
+    /// Pages read so far.
+    read: usize,
+    /// The last page read was full, so the forge may have more.
+    more: bool,
+    found: Vec<PullRequest>,
+}
+impl Listing {
+    /// The next page to ask for, if one is needed.
+    pub fn next(&self, repository: &Repository) -> Option<Url> {
+        (self.more && self.read < self.pages && self.found.len() < PAGE)
+            .then(|| repository.list_url(self.listed, self.source.as_deref(), self.read + 1))
+    }
+    /// Reads the answer to the page [`Listing::next`] asked for.
+    pub fn add(&mut self, repository: &Repository, body: &[u8]) -> Result<(), ForgeError> {
+        let (found, read) = match repository.kind {
+            ForgeKind::GitHub => github::parse_list(body, self.listed)?,
+            ForgeKind::GitLab => gitlab::parse_list(body)?,
+        };
+        self.read += 1;
+        self.more = read >= PAGE;
+        self.found.extend(found);
+        Ok(())
+    }
+    /// At most [`PAGE`] of them, and whether those are all there are.
+    pub fn finish(mut self) -> PullRequests {
+        let complete = !self.more && self.found.len() <= PAGE;
+        self.found.truncate(PAGE);
+        PullRequests {
+            pull_requests: self.found,
+            complete,
+        }
+    }
+}
+
+/// Pull requests newest first as the forge orders them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PullRequests {
     pub pull_requests: Vec<PullRequest>,
-    /// `false` when the page was full, so older ones may be left out.
+    /// `false` when older ones may be left out.
     pub complete: bool,
 }
 
@@ -225,6 +270,23 @@ impl Repository {
                     .map_or_else(|_| String::new(), |decoded| decoded.into_owned())
             })
             .collect();
+        // A forge served under a path prefix has it in both addresses
+        // (`https://host/gitlab/group/project.git` and
+        // `https://host/gitlab/api/v4`); it is not part of the project.
+        if remote.origin() == base.origin() {
+            let api_path: Vec<&str> = base
+                .path_segments()
+                .into_iter()
+                .flatten()
+                .filter(|segment| !segment.is_empty())
+                .collect();
+            if let Some(at) = api_path.iter().rposition(|segment| *segment == "api") {
+                let prefix = &api_path[..at];
+                if path.len() > prefix.len() && path.iter().zip(prefix).all(|(a, b)| a == b) {
+                    path.drain(..prefix.len());
+                }
+            }
+        }
         if let Some(last) = path.last_mut()
             && let Some(name) = last.strip_suffix(".git")
         {
@@ -258,22 +320,34 @@ impl Repository {
         self.path.join("/")
     }
 
-    /// The pull requests to list: `listed`, from branch `source` if given.
-    pub fn list_url(&self, listed: Listed, source: Option<&str>) -> Url {
-        match self.kind {
-            ForgeKind::GitHub => github::list_url(self, listed, source),
-            ForgeKind::GitLab => gitlab::list_url(self, listed, source),
+    /// Starts listing `listed` pull requests, from branch `source` if given.
+    pub fn listing(&self, listed: Listed, source: Option<&str>) -> Listing {
+        // GitHub lists merged and unmerged closed pull requests together, so
+        // one page may hold few of those asked for.
+        let pages = match (self.kind, listed) {
+            (ForgeKind::GitHub, Listed::Closed | Listed::Merged) => MAX_LIST_PAGES,
+            _ => 1,
+        };
+        Listing {
+            listed,
+            source: source.map(str::to_owned),
+            pages,
+            read: 0,
+            more: true,
+            found: vec![],
         }
     }
-    pub fn parse_list(&self, body: &[u8], listed: Listed) -> Result<PullRequests, ForgeError> {
-        let (pull_requests, read) = match self.kind {
-            ForgeKind::GitHub => github::parse_list(body, listed)?,
-            ForgeKind::GitLab => gitlab::parse_list(body)?,
+
+    /// Page `page` (from 1) of the pull requests to list.
+    fn list_url(&self, listed: Listed, source: Option<&str>, page: usize) -> Url {
+        let mut url = match self.kind {
+            ForgeKind::GitHub => github::list_url(self, listed, source),
+            ForgeKind::GitLab => gitlab::list_url(self, listed, source),
         };
-        Ok(PullRequests {
-            pull_requests,
-            complete: read < PAGE,
-        })
+        if page > 1 {
+            url.query_pairs_mut().append_pair("page", &page.to_string());
+        }
+        url
     }
 
     pub fn pull_request_url(&self, number: u64) -> Url {

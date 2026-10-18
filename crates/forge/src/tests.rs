@@ -19,6 +19,13 @@ fn remote(path: &str) -> Url {
 fn bytes(value: &Value) -> Vec<u8> {
     serde_json::to_vec(value).unwrap()
 }
+/// One page listed as the only answer.
+fn list(repository: &Repository, listed: Listed, page: &Value) -> PullRequests {
+    let mut listing = repository.listing(listed, None);
+    listing.next(repository).unwrap();
+    listing.add(repository, &bytes(page)).unwrap();
+    listing.finish()
+}
 fn query(url: &Url) -> Vec<(String, String)> {
     url.query_pairs()
         .map(|(k, v)| (k.into_owned(), v.into_owned()))
@@ -52,6 +59,22 @@ fn remotes_name_repositories_in_each_forges_shape() {
         url.path(),
         format!("/api/v4/projects/{group}%2F{owner}%2F{name}/merge_requests/7")
     );
+    // A GitLab served under a path prefix: the prefix is not the project's.
+    let prefixed = api(ForgeKind::GitLab, "https://forge.example/gitlab/api/v4");
+    let repository =
+        Repository::new(&prefixed, &remote(&format!("/gitlab/{group}/{name}.git"))).unwrap();
+    assert_eq!(repository.name(), format!("{group}/{name}"));
+    assert_eq!(
+        repository.pull_request_url(3).path(),
+        format!("/gitlab/api/v4/projects/{group}%2F{name}/merge_requests/3")
+    );
+    // Only on the API's own host, and never the whole path.
+    let elsewhere =
+        Url::parse(&format!("https://{}.example/gitlab/{group}/{name}", word())).unwrap();
+    let repository = Repository::new(&prefixed, &elsewhere).unwrap();
+    assert_eq!(repository.name(), format!("gitlab/{group}/{name}"));
+    let root = Repository::new(&gitlab, &remote(&format!("/{group}/{name}"))).unwrap();
+    assert_eq!(root.name(), format!("{group}/{name}"));
     // An encoded slash cannot smuggle in another segment.
     assert!(Repository::new(&github, &remote(&format!("/{owner}/a%2F{name}"))).is_err());
 }
@@ -92,7 +115,10 @@ fn list_requests_name_the_state_and_source_branch() {
         &remote(&format!("/{owner}/{name}")),
     )
     .unwrap();
-    let url = github.list_url(Listed::Merged, Some(&branch));
+    let url = github
+        .listing(Listed::Merged, Some(&branch))
+        .next(&github)
+        .unwrap();
     assert_eq!(url.path(), format!("/api/v3/repos/{owner}/{name}/pulls"));
     assert_eq!(
         query(&url),
@@ -107,7 +133,10 @@ fn list_requests_name_the_state_and_source_branch() {
         &remote(&format!("/{owner}/{name}.git")),
     )
     .unwrap();
-    let url = gitlab.list_url(Listed::Open, Some(&branch));
+    let url = gitlab
+        .listing(Listed::Open, Some(&branch))
+        .next(&gitlab)
+        .unwrap();
     assert_eq!(
         query(&url),
         [
@@ -147,9 +176,7 @@ fn github_lists_tell_merged_from_closed() {
         github_pull(2, "closed", false),
         github_pull(3, "open", false),
     ]);
-    let merged = repository
-        .parse_list(&bytes(&page), Listed::Merged)
-        .unwrap();
+    let merged = list(&repository, Listed::Merged, &page);
     assert_eq!(
         merged
             .pull_requests
@@ -159,11 +186,9 @@ fn github_lists_tell_merged_from_closed() {
         [1]
     );
     assert!(merged.complete);
-    let closed = repository
-        .parse_list(&bytes(&page), Listed::Closed)
-        .unwrap();
+    let closed = list(&repository, Listed::Closed, &page);
     assert_eq!(closed.pull_requests[0].number, 2);
-    let all = repository.parse_list(&bytes(&page), Listed::All).unwrap();
+    let all = list(&repository, Listed::All, &page);
     let states: Vec<_> = all.pull_requests.iter().map(|p| p.state).collect();
     assert_eq!(states, [State::Merged, State::Closed, State::Open]);
     // Escape characters are removed and lists carry no descriptions.
@@ -182,10 +207,69 @@ fn github_lists_tell_merged_from_closed() {
     let full: Vec<Value> = (0..PAGE as u64)
         .map(|n| github_pull(n, "open", false))
         .collect();
-    let listed = repository
-        .parse_list(&bytes(&Value::Array(full)), Listed::Open)
-        .unwrap();
+    let listed = list(&repository, Listed::Open, &Value::Array(full));
     assert!(!listed.complete);
+}
+
+/// Merged pull requests can be scarce among closed ones: further pages are
+/// read until a page of them is found, the forge runs out, or the page
+/// limit is reached, and only then is the listing complete.
+#[test]
+fn github_reads_more_closed_pages_to_find_merged_ones() {
+    let repository = Repository::new(
+        &api(ForgeKind::GitHub, "https://api.forge.example"),
+        &remote(&format!("/{}/{}", word(), word())),
+    )
+    .unwrap();
+    let page = |first: u64, merged: usize, len: usize| {
+        Value::Array(
+            (0..len)
+                .map(|n| github_pull(first + n as u64, "closed", n < merged))
+                .collect(),
+        )
+    };
+    // Two merged per full page, then a short last page: all of them.
+    let mut listing = repository.listing(Listed::Merged, None);
+    let mut asked = vec![];
+    let answers = [page(100, 2, PAGE), page(200, 2, PAGE), page(300, 1, 3)];
+    for answer in &answers {
+        let url = listing.next(&repository).unwrap();
+        asked.push(query(&url));
+        listing.add(&repository, &bytes(answer)).unwrap();
+    }
+    assert_eq!(listing.next(&repository), None);
+    assert_eq!(asked[0].iter().find(|(k, _)| k == "page"), None);
+    assert_eq!(asked[2].last().unwrap(), &("page".into(), "3".into()));
+    let listed = listing.finish();
+    let numbers: Vec<_> = listed.pull_requests.iter().map(|p| p.number).collect();
+    assert_eq!(numbers, [100, 101, 200, 201, 300]);
+    assert!(listed.complete);
+
+    // Full pages up to the limit may hide older ones.
+    let mut listing = repository.listing(Listed::Merged, None);
+    let mut pages = 0;
+    while listing.next(&repository).is_some() {
+        listing
+            .add(&repository, &bytes(&page(pages * 100, 1, PAGE)))
+            .unwrap();
+        pages += 1;
+    }
+    assert_eq!(pages, MAX_LIST_PAGES as u64);
+    let listed = listing.finish();
+    assert_eq!(listed.pull_requests.len(), MAX_LIST_PAGES);
+    assert!(!listed.complete);
+
+    // Once a page of them is found, no more is asked for.
+    let mut listing = repository.listing(Listed::Closed, None);
+    listing.next(&repository).unwrap();
+    listing.add(&repository, &bytes(&page(0, 0, PAGE))).unwrap();
+    assert_eq!(listing.next(&repository), None);
+    assert!(!listing.finish().complete);
+    // Open pull requests are one page.
+    let mut listing = repository.listing(Listed::Open, None);
+    listing.next(&repository).unwrap();
+    listing.add(&repository, &bytes(&page(0, 0, PAGE))).unwrap();
+    assert_eq!(listing.next(&repository), None);
 }
 
 #[test]
@@ -350,6 +434,8 @@ fn gitlab_merge_requests_checks_and_approvals() {
         {"name": "lint", "status": "failed", "allow_failure": true},
         {"name": "test", "status": "failed"},
         {"name": "deploy", "status": "manual"},
+        {"name": "stop", "status": "canceling"},
+        {"name": "stopped", "status": "canceled"},
         {"name": "other", "status": word()},
     ]);
     let checks = repository.parse_checks(&calls[0], &bytes(&jobs)).unwrap();
@@ -361,13 +447,13 @@ fn gitlab_merge_requests_checks_and_approvals() {
             (CheckStatus::Completed, Some(Conclusion::Neutral)),
             (CheckStatus::Completed, Some(Conclusion::Failure)),
             (CheckStatus::Queued, None),
+            (CheckStatus::Running, None),
+            (CheckStatus::Completed, Some(Conclusion::Cancelled)),
             (CheckStatus::Unknown, None),
         ]
     );
     // Listed merge requests carry no pipeline, so no checks are read.
-    let listed = repository
-        .parse_list(&bytes(&json!([request])), Listed::All)
-        .unwrap();
+    let listed = list(&repository, Listed::All, &json!([request]));
     assert_eq!(listed.pull_requests[0].body, None);
     let mut without = read.clone();
     without.pipeline = None;

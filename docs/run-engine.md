@@ -684,10 +684,18 @@ per-call approval; they only send GET requests.
 - `pull_requests` lists up to 30 pull requests of the repository, newest
   first: `state` is `open` (default), `closed` (closed without merging),
   `merged` or `all`, and `branch` keeps those from one branch of the
-  repository. `complete` is false when the page was full.
+  repository. GitHub lists merged and unmerged closed pull requests
+  together, so for `closed` and `merged` it reads up to 4 pages to find 30.
+  `complete` is false when more may exist.
 - `pull_request` reads one by `number`: its details and description (cut
   at 8,000 characters), the checks on its head commit and its reviews, at
-  most 100 of each.
+  most 100 of each kind. `checks_complete` and `reviews_complete` are false
+  when a list was full or was cut.
+
+Both results are only useful whole JSON (`whole_output`), so instead of the
+gateway cutting the text, the tool leaves out the last pull requests, checks
+or reviews that would take a result past 64 KiB and marks that list
+incomplete.
 
 Both take `remote` (default: the current branch's remote, else `origin`);
 its URL must be an HTTPS repository URL, as for a fetch. Crate `a206-forge`
@@ -702,7 +710,9 @@ own word in `reported` where it has no counterpart (`unknown`):
 
 The forge's API comes from the git credential's `forge` (`kind` GitHub or
 GitLab, and `api`, its base URL such as
-`https://git.example/api/v3`); github.com and gitlab.com have bundled
+`https://git.example/api/v3`). A GitLab served under a path prefix
+(`https://git.example/gitlab/api/v4`) has the prefix removed from remotes
+on the same host. github.com and gitlab.com have bundled
 presets (`https://api.github.com`, `https://gitlab.com/api/v4`). Without
 one the call fails before anything is sent. The vault broker sends the git
 credential's vault credential to the API as a bearer token, so that vault
@@ -712,7 +722,7 @@ characters and bounded; what a forge returns was written by other people
 and reaches the model as tool data. A refused token, a missing pull
 request and an answer not shaped like the API's are separate errors. Not
 yet: opening, commenting on or merging pull requests, Gitea or Forgejo,
-further pages, and setting `forge` from the GUI (use `settings --apply`).
+pages beyond these, and setting `forge` from the GUI (use `settings --apply`).
 
 ## Output rules
 

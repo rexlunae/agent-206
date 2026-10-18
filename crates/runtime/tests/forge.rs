@@ -335,6 +335,8 @@ async fn a_model_reads_github_pull_requests_with_their_checks_and_reviews() {
     assert_eq!(answer["checks"][1]["status"], "running");
     assert_eq!(answer["reviews"][0]["author"], reviewer);
     assert_eq!(answer["reviews"][0]["state"], "changes_requested");
+    assert_eq!(answer["checks_complete"], true);
+    assert_eq!(answer["reviews_complete"], true);
 
     // A pull request the forge does not have, and a refused credential.
     let (record, _) = rig.call(READ, json!({"number": 8})).await;
@@ -426,4 +428,92 @@ async fn gitlab_merge_requests_read_the_same_way_and_unknown_forges_are_refused(
     assert_eq!(record.state, ToolCallState::Failed);
     assert_eq!(error_kind(&record), ErrorKind::InvalidRequest);
     assert_eq!(rig.api.paths().len(), asked);
+}
+
+/// Text longer than the forge crate keeps of a `max`-character field, in
+/// characters that take the most room in a JSON result (escaped quotes and
+/// three-byte characters).
+fn widest(max: usize) -> String {
+    format!("{}{}", nonce(), "\"\u{20ac}".repeat(max))
+}
+fn wide() -> String {
+    widest(a206_forge::MAX_LABEL)
+}
+
+/// Full pages of the longest fields would exceed the room for one tool
+/// result. The answer stays whole JSON within it, keeps the first entries,
+/// and says which lists were cut.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_largest_answers_are_cut_by_entry_and_say_so() {
+    let mut rig = rig().await;
+    let repo = format!("/api/v3/repos/{}/{}", rig.owner, rig.name);
+    let per = a206_forge::DETAIL_PAGE;
+    let head = sha();
+    let pull = |number: usize| {
+        json!({
+            "number": number,
+            "title": wide(),
+            "state": "open",
+            "user": {"login": wide()},
+            "head": {"ref": wide(), "sha": head},
+            "base": {"ref": wide(), "sha": wide()},
+            "html_url": wide(),
+            "body": widest(a206_forge::MAX_BODY),
+            "created_at": wide(),
+            "updated_at": wide(),
+        })
+    };
+    rig.api.answer(
+        &format!("{repo}/pulls?state=open&per_page={}", a206_forge::PAGE),
+        StatusCode::OK,
+        Value::Array((1..=a206_forge::PAGE).map(pull).collect()),
+    );
+    rig.api
+        .answer(&format!("{repo}/pulls/1"), StatusCode::OK, pull(1));
+    let runs: Vec<Value> = (0..per)
+        .map(|_| json!({"name": wide(), "status": "completed", "conclusion": wide(), "html_url": wide()}))
+        .collect();
+    rig.api.answer(
+        &format!("{repo}/commits/{head}/check-runs?per_page={per}"),
+        StatusCode::OK,
+        json!({"total_count": per, "check_runs": runs}),
+    );
+    rig.api.answer(
+        &format!("{repo}/commits/{head}/status?per_page={per}"),
+        StatusCode::OK,
+        json!({"state": "pending", "statuses": []}),
+    );
+    rig.api.answer(
+        &format!("{repo}/pulls/1/reviews?per_page={per}"),
+        StatusCode::OK,
+        Value::Array(
+            (0..per)
+                .map(|_| json!({"user": {"login": wide()}, "state": wide(), "submitted_at": wide(), "commit_id": wide()}))
+                .collect(),
+        ),
+    );
+
+    let limit = a206_runtime::tools::MAX_OUTPUT;
+    let (record, text) = rig.call(LIST, json!({})).await;
+    assert_eq!(record.state, ToolCallState::Succeeded, "{:?}", record.error);
+    let text = text.unwrap();
+    assert!(text.len() <= limit);
+    let answer: Value = serde_json::from_str(&text).unwrap();
+    let listed = answer["pull_requests"].as_array().unwrap();
+    assert!(!listed.is_empty() && listed.len() < a206_forge::PAGE);
+    assert_eq!(listed[0]["number"], 1);
+    assert_eq!(answer["complete"], false);
+
+    let (record, text) = rig.call(READ, json!({"number": 1})).await;
+    assert_eq!(record.state, ToolCallState::Succeeded, "{:?}", record.error);
+    let text = text.unwrap();
+    assert!(text.len() <= limit);
+    let answer: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(answer["pull_request"]["body_shortened"], true);
+    let checks = answer["checks"].as_array().unwrap();
+    assert!(!checks.is_empty() && checks.len() < per);
+    assert_eq!(answer["checks_complete"], false);
+    // Reviews share what room is left.
+    assert!(answer["reviews"].as_array().unwrap().len() < per);
+    assert_eq!(answer["reviews_complete"], false);
 }
