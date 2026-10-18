@@ -292,6 +292,11 @@ impl Gateway {
     fn view(&self, id: Id) -> Result<View> {
         view(&*self.lock()?, id)
     }
+    /// What the conversation's tools may reach now: its project folder and
+    /// effective capabilities.
+    pub(super) fn scope(&self, id: Id) -> Result<ToolScope> {
+        Ok(self.view(id)?.scope)
+    }
     pub(super) async fn list_tools(&self, id: Id) -> Result<Reply> {
         let view = self.view(id)?;
         let catalog = tools::catalog(&self.tool_hosts, &view.scope).await;

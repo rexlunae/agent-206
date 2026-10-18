@@ -150,6 +150,23 @@ fn SideBySide(first: Thread, target: Option<Uuid>, rest: Vec<Thread>) -> Element
         }
     }
 }
+/// What the composer's primary button does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Primary {
+    Send,
+    /// Run the typed slash command, such as `/pause`, even during a run.
+    Run,
+    Stop,
+}
+
+fn primary(running: bool, typed_command: bool) -> Primary {
+    match (running, typed_command) {
+        (_, true) => Primary::Run,
+        (true, false) => Primary::Stop,
+        (false, false) => Primary::Send,
+    }
+}
+
 /// The activity line under a running conversation.
 pub(crate) fn run_status(thread: &Thread) -> (Lifecycle, String) {
     match (thread.held, thread.paused) {
@@ -424,6 +441,7 @@ fn Conversation(thread: Thread, target: Option<Uuid>) -> Element {
         crate::slash::parse(draft().trim()),
         Ok(crate::slash::Typed::Send(_))
     );
+    let primary = primary(running, typed_command);
     let tool_count = thread.grant.capabilities.len();
     let availability = if running {
         Availability::Disabled
@@ -605,11 +623,12 @@ fn Conversation(thread: Thread, target: Option<Uuid>) -> Element {
                                 onclick: move |_| dispatch(state, Command::PauseRun { thread: id }),
                             }
                         }
-                        IconButton { icon: if running { IconName::Stop } else { IconName::ArrowUp }, label: if running { name!("Stop response") } else { name!("Send message") },
-                            title: if running { "Stop response" } else { "Send · Enter (Shift+Enter for a new line)" },
+                        IconButton { icon: if primary == Primary::Stop { IconName::Stop } else { IconName::ArrowUp },
+                            label: match primary { Primary::Stop => name!("Stop response"), Primary::Run => name!("Run command"), Primary::Send => name!("Send message") },
+                            title: match primary { Primary::Stop => "Stop response", Primary::Run => "Run command · Enter", Primary::Send => "Send · Enter (Shift+Enter for a new line)" },
                             class: "a206-compose-send", size: ButtonSize::Sm, variant: ButtonVariant::Primary,
                             availability: if running || typed_command || (has_model && !reading_files() && (!draft().trim().is_empty() || !attachments.read().is_empty())) { Availability::Enabled } else { Availability::Disabled },
-                            onclick: move |_| { if running { dispatch(state, Command::CancelRun { thread: id }); } else { submit(); } }
+                            onclick: move |_| { if primary == Primary::Stop { dispatch(state, Command::CancelRun { thread: id }); } else { submit(); } }
                         }
                     }
                 }
@@ -1026,6 +1045,15 @@ mod tests {
             .find(|b| *b != CodingBackend::Native)
             .unwrap();
         assert!(!offers(&thread, false, false).steerable);
+    }
+
+    #[test]
+    fn a_typed_command_runs_from_the_button_even_during_a_run() {
+        // `/pause` typed while a response runs must not stop it.
+        assert_eq!(primary(true, true), Primary::Run);
+        assert_eq!(primary(true, false), Primary::Stop);
+        assert_eq!(primary(false, true), Primary::Run);
+        assert_eq!(primary(false, false), Primary::Send);
     }
 
     use a206_core::PlanStep;

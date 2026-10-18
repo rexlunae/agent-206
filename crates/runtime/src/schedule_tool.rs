@@ -14,7 +14,9 @@ use crate::{
     gateway::{Jobs, MAX_AGENT_JOBS},
     tools::{ToolHost, ToolListing, ToolOutput, ToolRequest, ToolScope, ToolSpec},
 };
-use a206_core::{ErrorKind, ErrorReport, Id, Job, JobAuthor, JobOutcome, Schedule, ToolPermission};
+use a206_core::{
+    ErrorKind, ErrorReport, Id, Job, JobAuthor, JobKind, JobOutcome, Schedule, ToolPermission,
+};
 use futures_util::future::BoxFuture;
 use serde_json::{Map, Value, json};
 
@@ -316,6 +318,7 @@ fn describe(job: &Job, thread: Id) -> Value {
             JobOutcome::Complete => json!("complete"),
             JobOutcome::Failed => json!("failed"),
             JobOutcome::Cancelled => json!("cancelled"),
+            JobOutcome::Quiet => json!("quiet"),
             JobOutcome::Refused(report) => json!({ "refused": report.message }),
         };
         json!({ "at": time(run.at), "outcome": outcome })
@@ -323,6 +326,10 @@ fn describe(job: &Job, thread: Id) -> Value {
     json!({
         "id": job.id,
         "name": job.name,
+        "kind": match job.kind {
+            JobKind::Message => "message",
+            JobKind::Heartbeat => "heartbeat",
+        },
         "message": preview(&job.text, MESSAGE_BYTES),
         "message_bytes": job.text.len(),
         "schedule": schedule,

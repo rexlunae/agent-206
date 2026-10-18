@@ -3,7 +3,7 @@
 //! authority of its own and runs under its conversation's permissions.
 use crate::{PageFrame, State, dispatch, error::ErrorNotice, route::Route};
 use a206_core::{
-    Command, Job, JobAuthor, JobOutcome, Schedule, ScheduleInputError, Snapshot,
+    Command, Job, JobAuthor, JobKind, JobOutcome, Schedule, ScheduleInputError, Snapshot,
     schedule::{format_interval, parse_interval, parse_local},
 };
 use fc_dioxus::prelude::*;
@@ -53,10 +53,15 @@ fn describe(schedule: &Schedule, zone: &TimeZone) -> String {
     }
 }
 
-fn outcome(outcome: &JobOutcome) -> (BadgeTone, &'static str) {
+fn outcome(outcome: &JobOutcome, kind: JobKind) -> (BadgeTone, &'static str) {
     match outcome {
         JobOutcome::Running => (BadgeTone::Info, "Running"),
+        // A heartbeat that does not answer HEARTBEAT_OK found something.
+        JobOutcome::Complete if kind == JobKind::Heartbeat => {
+            (BadgeTone::Warning, "Needs attention")
+        }
         JobOutcome::Complete => (BadgeTone::Success, "Complete"),
+        JobOutcome::Quiet => (BadgeTone::Success, "Nothing needed attention"),
         JobOutcome::Failed => (BadgeTone::Danger, "Failed"),
         JobOutcome::Cancelled => (BadgeTone::Neutral, "Cancelled"),
         JobOutcome::Refused(_) => (BadgeTone::Warning, "Not sent"),
@@ -78,7 +83,7 @@ pub fn Schedules() -> Element {
     let mut jobs: Vec<&Job> = snapshot.jobs.iter().collect();
     // Soonest first; paused and finished jobs after every pending one.
     jobs.sort_by_key(|job| (job.next.is_none(), job.next, job.name.clone()));
-    rsx! { PageFrame { kicker: "Workbench", title: "Messages on a schedule.", description: "Send a conversation a message once, on an interval or on a cron schedule. Each one runs as if you typed it, with that conversation's permissions at the time.",
+    rsx! { PageFrame { kicker: "Workbench", title: "Messages on a schedule.", description: "Send a conversation a message, or a heartbeat check of its HEARTBEAT.md, once, on an interval or on a cron schedule. Each one runs as if you typed it, with that conversation's permissions at the time.",
         if jobs.is_empty() { EmptyState { compact: true, title: rsx! { "Nothing scheduled" }, body: rsx! { "Scheduled messages appear here, whether you add them or a conversation's model does with your approval." } } }
         for job in jobs {
             JobCard { key: "{job.id}", job: job.clone(), conversation: title(&snapshot, job.thread) }
@@ -101,20 +106,24 @@ fn JobCard(job: Job, conversation: Option<String>) -> Element {
         CardBody {
             div { class: "a206-row",
                 if job.enabled { Badge { tone: BadgeTone::Accent, "Active" } } else { Badge { "Paused" } }
+                if job.kind == JobKind::Heartbeat { Badge { "Heartbeat check" } }
                 span { class: "a206-muted", "{author}" }
             }
             p { "To " match conversation {
                 Some(title) => rsx! { LinkButton { size: ButtonSize::Sm, variant: ButtonVariant::Ghost, href: Route::Chat { id: job.thread, split: None, message: None }.to_string(), "{title}" } },
                 None => rsx! { span { class: "a206-muted", "a conversation that no longer exists" } },
             } }
-            blockquote { class: "a206-quote", "{job.text}" }
+            match job.kind {
+                JobKind::Message => rsx! { blockquote { class: "a206-quote", "{job.text}" } },
+                JobKind::Heartbeat => rsx! { p { class: "a206-muted", "Sends the checklist in HEARTBEAT.md at the conversation's project root, read when it runs. A reply of exactly HEARTBEAT_OK means nothing needed attention." } },
+            }
             p { class: "a206-muted", match (job.enabled, job.next) {
                 (true, Some(next)) => format!("Next: {}", show_time(next, &zone)),
                 (false, _) => "Paused; resuming skips the times it missed.".to_owned(),
                 (true, None) => "It will not run again.".to_owned(),
             } }
             if let Some(last) = &job.last {
-                { let (tone, label) = outcome(&last.outcome); rsx! {
+                { let (tone, label) = outcome(&last.outcome, job.kind); rsx! {
                     div { class: "a206-row", span { class: "a206-muted", "Latest run {show_time(last.at, &zone)}" } Badge { tone, "{label}" } }
                 } }
                 if let JobOutcome::Refused(report) = &last.outcome { ErrorNotice { report: report.clone(), title: "The latest run was not sent".to_string() } }
@@ -143,6 +152,14 @@ impl Kind {
             Self::Every => "On an interval",
             Self::Cron => "On a cron schedule",
         }
+    }
+}
+
+fn send_label(heartbeat: bool) -> &'static str {
+    if heartbeat {
+        "A heartbeat check (HEARTBEAT.md)"
+    } else {
+        "A message"
     }
 }
 
@@ -179,6 +196,7 @@ fn AddJob() -> Element {
     let mut name = use_signal(String::new);
     let mut thread = use_signal(|| None::<String>);
     let mut text = use_signal(String::new);
+    let mut heartbeat = use_signal(|| false);
     let mut kind = use_signal(|| Kind::Once);
     let mut date = use_signal(String::new);
     let mut time = use_signal(String::new);
@@ -205,14 +223,31 @@ fn AddJob() -> Element {
     };
     let target = thread().and_then(|id| id.parse::<Uuid>().ok());
     let valid = matches!(schedule, Some(Ok(_)));
-    let ready = !name().trim().is_empty() && !text().trim().is_empty() && target.is_some() && valid;
+    let sends = if heartbeat() {
+        JobKind::Heartbeat
+    } else {
+        JobKind::Message
+    };
+    let ready = !name().trim().is_empty()
+        && (heartbeat() || !text().trim().is_empty())
+        && target.is_some()
+        && valid;
+    let sends_label = use_memo(move || Some(send_label(heartbeat()).to_owned()));
     let kind_label = use_memo(move || Some(kind().label().to_owned()));
     rsx! { Card { variant: CardVariant::Elevated,
         CardHeader { CardTitle { "Schedule a message" } CardSubtitle { "The gateway checks the schedule and the conversation when you add it." } }
         CardBody { div { class: "a206-grid",
             Field { label: rsx! { "Name" }, Input { value: ReadSignal::from(name), oninput: move |v| name.set(v), placeholder: "Morning summary" } }
             Field { label: rsx! { "Conversation" }, Select { label: name!("Conversation to message"), value: ReadSignal::from(thread), placeholder: "Choose a conversation", options: conversations, onchange: move |id: String| thread.set(Some(id)) } }
-            Field { label: rsx! { "Message" }, Textarea { value: ReadSignal::from(text), oninput: move |v| text.set(v), rows: "3" } }
+            Field { label: rsx! { "Send" }, Select { label: name!("What the job sends"), value: ReadSignal::from(sends_label),
+                options: [false, true].into_iter().map(|h| SelectChoice::new(send_label(h), send_label(h))).collect(),
+                onchange: move |label: String| heartbeat.set(label == send_label(true))
+            } }
+            if heartbeat() {
+                p { class: "a206-muted", "The conversation's project needs a HEARTBEAT.md checklist, and the conversation needs permission to read the project." }
+            } else {
+                Field { label: rsx! { "Message" }, Textarea { value: ReadSignal::from(text), oninput: move |v| text.set(v), rows: "3" } }
+            }
             Field { label: rsx! { "Repeat" }, Select { label: name!("How the message repeats"), value: ReadSignal::from(kind_label),
                 options: Kind::ALL.into_iter().map(|k| SelectChoice::new(k.label(), k.label())).collect(),
                 onchange: move |label: String| if let Some(k) = Kind::ALL.into_iter().find(|k| k.label() == label) { kind.set(k) }
@@ -236,7 +271,8 @@ fn AddJob() -> Element {
         CardFooter { Button { variant: ButtonVariant::Primary, availability: if ready { Availability::Enabled } else { Availability::Disabled }, onclick: move |_| {
             let Some(Ok(schedule)) = form_schedule(kind(), &date(), &time(), &zone(), &every(), &cron()) else { return };
             let Some(thread) = target else { return };
-            dispatch(state, Command::ScheduleJob { name: name().trim().to_owned(), thread, text: text(), schedule });
+            let text = if sends == JobKind::Heartbeat { String::new() } else { text() };
+            dispatch(state, Command::ScheduleJob { name: name().trim().to_owned(), thread, text, schedule, kind: sends });
         }, "Schedule message" } }
     } }
 }
