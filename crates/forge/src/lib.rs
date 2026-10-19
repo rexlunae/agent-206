@@ -7,6 +7,7 @@
 //! Forges word things differently (a GitLab merge request is a pull request
 //! here, a pipeline job is a check). What a forge reports that has no
 //! counterpart is `Unknown`, with the forge's own word kept in `reported`.
+mod gitea;
 mod github;
 mod gitlab;
 
@@ -21,6 +22,9 @@ pub const PAGE: usize = 30;
 pub const MAX_LIST_PAGES: usize = 4;
 /// Checks and reviews read for one pull request.
 pub const DETAIL_PAGE: usize = 100;
+/// Pages of checks or reviews asked for at most, for a forge whose pages
+/// may hold fewer than asked.
+pub const MAX_DETAIL_PAGES: usize = 4;
 /// Longest title, name or label kept, in characters.
 pub const MAX_LABEL: usize = 256;
 /// Longest description kept, in characters.
@@ -30,8 +34,9 @@ pub const MAX_BODY: usize = 8_000;
 /// so this leaves room for escaping.
 pub const MAX_TEXT: usize = 30_000;
 /// Longest pull request title sent, in characters: what is kept of a title
-/// read back, less GitLab's draft marker.
+/// read back, less the longest draft marker an adapter adds (GitLab's).
 pub const MAX_TITLE: usize = MAX_LABEL - gitlab::DRAFT.len();
+const _: () = assert!(gitea::DRAFT.len() <= gitlab::DRAFT.len());
 
 #[derive(Debug, thiserror::Error)]
 pub enum ForgeError {
@@ -47,6 +52,14 @@ pub enum ForgeError {
     NoCommit,
     #[error("the title is only a draft marker; give it a title and set `draft` instead")]
     MarkerTitle,
+    #[error(
+        "GitLab merges as the project is set to (a merge commit or fast-forward), or squashed; it cannot rebase here"
+    )]
+    GitLabRebase,
+    #[error("the pull request's head is no longer the commit `head`; read it again")]
+    HeadMoved,
+    #[error("the forge has not worked out the pull request's changes yet; read it again shortly")]
+    NoDiff,
 }
 
 /// The bundled API location of a well-known forge, by the origin its git
@@ -55,6 +68,8 @@ pub fn preset(origin: &str) -> Option<ForgeApi> {
     let (kind, api) = match origin {
         "https://github.com" => (ForgeKind::GitHub, "https://api.github.com"),
         "https://gitlab.com" => (ForgeKind::GitLab, "https://gitlab.com/api/v4"),
+        "https://codeberg.org" => (ForgeKind::Gitea, "https://codeberg.org/api/v1"),
+        "https://gitea.com" => (ForgeKind::Gitea, "https://gitea.com/api/v1"),
         _ => return None,
     };
     Some(ForgeApi {
@@ -111,7 +126,8 @@ pub struct PullRequest {
     pub number: u64,
     pub title: String,
     pub state: State,
-    pub draft: bool,
+    /// `None` when the forge's answer does not say (older Gitea).
+    pub draft: Option<bool>,
     pub author: Option<String>,
     /// The branch it merges from, and the one it merges into.
     pub source: String,
@@ -156,9 +172,13 @@ impl Listing {
         let (found, read) = match repository.kind {
             ForgeKind::GitHub => github::parse_list(body, self.listed)?,
             ForgeKind::GitLab => gitlab::parse_list(body)?,
+            ForgeKind::Gitea => gitea::parse_list(body, self.listed, self.source.as_deref())?,
         };
         self.read += 1;
-        self.more = read >= PAGE;
+        self.more = match repository.kind {
+            ForgeKind::GitHub | ForgeKind::GitLab => read >= PAGE,
+            ForgeKind::Gitea => read > 0,
+        };
         self.found.extend(found);
         Ok(())
     }
@@ -258,19 +278,109 @@ pub struct Comment {
     pub url: Option<String>,
 }
 
-/// A request that changes something on the forge: where to send it and
-/// its JSON body.
+/// Which version of a file a line comment is on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Side {
+    /// The file at the pull request's head: an added or unchanged line.
+    #[default]
+    New,
+    /// The file at its base: a removed line.
+    Old,
+}
+
+/// A comment on one line of a pull request's changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LineComment<'a> {
+    /// The file, relative to the repository's root.
+    pub path: &'a str,
+    /// The line's number in that version of the file, from 1.
+    pub line: u32,
+    pub side: Side,
+    pub text: &'a str,
+}
+
+/// A request that changes something on the forge: how and where to send
+/// it, and its JSON body.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Change {
+    pub method: ChangeMethod,
     pub url: Url,
     pub body: Vec<u8>,
+}
+impl Change {
+    fn post(url: Url, body: serde_json::Value) -> Self {
+        Self {
+            method: ChangeMethod::Post,
+            url,
+            body: body.to_string().into_bytes(),
+        }
+    }
+    fn put(url: Url, body: serde_json::Value) -> Self {
+        Self {
+            method: ChangeMethod::Put,
+            ..Self::post(url, body)
+        }
+    }
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChangeMethod {
+    Post,
+    Put,
+}
+
+/// How a pull request's commits reach its target branch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MergeMethod {
+    /// A merge commit (or as the GitLab project is set to merge).
+    #[default]
+    Merge,
+    /// One new commit with all its changes.
+    Squash,
+    /// Its commits replayed onto the target branch.
+    Rebase,
+}
+
+/// A pull request merge, as the forge reports it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Merged {
+    /// `false` when the forge accepted the request but has not merged yet.
+    pub merged: bool,
+    /// The commit the merge made, where the forge says.
+    pub commit: Option<String>,
+}
+
+/// Checks or reviews from one page of an answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Page<T> {
+    pub items: Vec<T>,
+    /// The next page may hold more.
+    pub more: bool,
+}
+impl<T> Page<T> {
+    /// A page of at most [`DETAIL_PAGE`]: only a full one may not be the
+    /// last.
+    fn full(items: Vec<T>) -> Self {
+        let more = items.len() >= DETAIL_PAGE;
+        Self { items, more }
+    }
+    /// A page that may hold fewer than asked: only an empty one is the last.
+    fn capped(items: Vec<T>) -> Self {
+        let more = !items.is_empty();
+        Self { items, more }
+    }
 }
 
 /// What one request for checks returns, and how to read it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChecksCall {
-    pub url: Url,
+    url: Url,
     source: ChecksSource,
+}
+impl ChecksCall {
+    /// Page `page` (from 1) of these checks.
+    pub fn url(&self, page: usize) -> Url {
+        paged(self.url.clone(), page)
+    }
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ChecksSource {
@@ -280,6 +390,8 @@ enum ChecksSource {
     Statuses,
     /// GitLab pipeline jobs.
     Jobs,
+    /// Gitea commit statuses.
+    GiteaStatuses,
 }
 
 /// A repository on a forge, named by its git remote.
@@ -287,7 +399,7 @@ enum ChecksSource {
 pub struct Repository {
     kind: ForgeKind,
     api: Url,
-    /// `owner/name` on GitHub, `group/…/project` on GitLab.
+    /// `owner/name` on GitHub and Gitea, `group/…/project` on GitLab.
     path: Vec<String>,
 }
 impl Repository {
@@ -320,7 +432,7 @@ impl Repository {
                 && !segment.chars().any(|c| c == '/' || c.is_control())
         });
         let fits = match api.kind {
-            ForgeKind::GitHub => path.len() == 2,
+            ForgeKind::GitHub | ForgeKind::Gitea => path.len() == 2,
             ForgeKind::GitLab => path.len() >= 2,
         };
         if !valid || !fits {
@@ -344,9 +456,13 @@ impl Repository {
     /// Starts listing `listed` pull requests, from branch `source` if given.
     pub fn listing(&self, listed: Listed, source: Option<&str>) -> Listing {
         // GitHub lists merged and unmerged closed pull requests together, so
-        // one page may hold few of those asked for.
+        // one page may hold few of those asked for. Gitea does too, cannot
+        // ask for one branch, and may send fewer than asked, so only a
+        // further, empty page shows the list is complete.
         let pages = match (self.kind, listed) {
-            (ForgeKind::GitHub, Listed::Closed | Listed::Merged) => MAX_LIST_PAGES,
+            (ForgeKind::GitHub, Listed::Closed | Listed::Merged) | (ForgeKind::Gitea, _) => {
+                MAX_LIST_PAGES
+            }
             _ => 1,
         };
         Listing {
@@ -361,31 +477,31 @@ impl Repository {
 
     /// Page `page` (from 1) of the pull requests to list.
     fn list_url(&self, listed: Listed, source: Option<&str>, page: usize) -> Url {
-        let mut url = match self.kind {
+        let url = match self.kind {
             ForgeKind::GitHub => github::list_url(self, listed, source),
             ForgeKind::GitLab => gitlab::list_url(self, listed, source),
+            ForgeKind::Gitea => gitea::list_url(self, listed),
         };
-        if page > 1 {
-            url.query_pairs_mut().append_pair("page", &page.to_string());
-        }
-        url
+        paged(url, page)
     }
 
     pub fn pull_request_url(&self, number: u64) -> Url {
         match self.kind {
             ForgeKind::GitHub => github::pull_url(self, number),
             ForgeKind::GitLab => gitlab::pull_url(self, number),
+            ForgeKind::Gitea => gitea::pull_url(self, number),
         }
     }
     pub fn parse_pull_request(&self, body: &[u8]) -> Result<PullRequest, ForgeError> {
         match self.kind {
             ForgeKind::GitHub => github::parse_pull(body),
             ForgeKind::GitLab => gitlab::parse_pull(body),
+            ForgeKind::Gitea => gitea::parse_pull(body),
         }
     }
 
-    /// The requests that read `pull`'s checks; none on GitLab when no
-    /// pipeline ran for it.
+    /// The requests that read `pull`'s checks, each a page at a time with
+    /// [`ChecksCall::url`]; none on GitLab when no pipeline ran for it.
     pub fn checks_calls(&self, pull: &PullRequest) -> Result<Vec<ChecksCall>, ForgeError> {
         match self.kind {
             ForgeKind::GitHub => {
@@ -409,27 +525,39 @@ impl Repository {
                 })
                 .into_iter()
                 .collect()),
+            ForgeKind::Gitea => {
+                let head = pull.head.as_deref().ok_or(ForgeError::NoCommit)?;
+                Ok(vec![ChecksCall {
+                    url: gitea::statuses_url(self, head),
+                    source: ChecksSource::GiteaStatuses,
+                }])
+            }
         }
     }
-    pub fn parse_checks(&self, call: &ChecksCall, body: &[u8]) -> Result<Vec<Check>, ForgeError> {
-        match call.source {
-            ChecksSource::Runs => github::parse_runs(body),
-            ChecksSource::Statuses => github::parse_statuses(body),
-            ChecksSource::Jobs => gitlab::parse_jobs(body),
-        }
+    pub fn parse_checks(&self, call: &ChecksCall, body: &[u8]) -> Result<Page<Check>, ForgeError> {
+        Ok(match call.source {
+            ChecksSource::Runs => Page::full(github::parse_runs(body)?),
+            ChecksSource::Statuses => Page::full(github::parse_statuses(body)?),
+            ChecksSource::Jobs => Page::full(gitlab::parse_jobs(body)?),
+            ChecksSource::GiteaStatuses => Page::capped(gitea::parse_statuses(body)?),
+        })
     }
 
-    pub fn reviews_url(&self, number: u64) -> Url {
-        match self.kind {
+    /// Page `page` (from 1) of pull request `number`'s reviews.
+    pub fn reviews_url(&self, number: u64, page: usize) -> Url {
+        let url = match self.kind {
             ForgeKind::GitHub => github::reviews_url(self, number),
             ForgeKind::GitLab => gitlab::approvals_url(self, number),
-        }
+            ForgeKind::Gitea => gitea::reviews_url(self, number),
+        };
+        paged(url, page)
     }
-    pub fn parse_reviews(&self, body: &[u8]) -> Result<Vec<Review>, ForgeError> {
-        match self.kind {
-            ForgeKind::GitHub => github::parse_reviews(body),
-            ForgeKind::GitLab => gitlab::parse_approvals(body),
-        }
+    pub fn parse_reviews(&self, body: &[u8]) -> Result<Page<Review>, ForgeError> {
+        Ok(match self.kind {
+            ForgeKind::GitHub => Page::full(github::parse_reviews(body)?),
+            ForgeKind::GitLab => Page::full(gitlab::parse_approvals(body)?),
+            ForgeKind::Gitea => Page::capped(gitea::parse_reviews(body)?),
+        })
     }
 
     /// Opens `new`; the answer is read with
@@ -438,6 +566,33 @@ impl Repository {
         match self.kind {
             ForgeKind::GitHub => Ok(github::create(self, new)),
             ForgeKind::GitLab => gitlab::create(self, new),
+            ForgeKind::Gitea => gitea::create(self, new),
+        }
+    }
+
+    /// Merges pull request `number` by `method` if its head is still commit
+    /// `head`; the answer is read with [`Repository::parse_merge`].
+    pub fn merge(
+        &self,
+        number: u64,
+        head: &str,
+        method: MergeMethod,
+    ) -> Result<Change, ForgeError> {
+        match self.kind {
+            ForgeKind::GitHub => Ok(github::merge(self, number, head, method)),
+            ForgeKind::GitLab => gitlab::merge(self, number, head, method),
+            ForgeKind::Gitea => Ok(gitea::merge(self, number, head, method)),
+        }
+    }
+    pub fn parse_merge(&self, body: &[u8]) -> Result<Merged, ForgeError> {
+        match self.kind {
+            ForgeKind::GitHub => github::parse_merge(body),
+            ForgeKind::GitLab => gitlab::parse_merge(body),
+            // Gitea answers a merge with an empty success.
+            ForgeKind::Gitea => Ok(Merged {
+                merged: true,
+                commit: None,
+            }),
         }
     }
 
@@ -445,7 +600,8 @@ impl Repository {
     /// read with [`Repository::parse_comment`].
     pub fn comment(&self, number: u64, text: &str) -> Change {
         match self.kind {
-            ForgeKind::GitHub => github::comment(self, number, text),
+            // Gitea's issue comments are shaped like GitHub's.
+            ForgeKind::GitHub | ForgeKind::Gitea => github::comment(self, number, text),
             ForgeKind::GitLab => gitlab::comment(self, number, text),
         }
     }
@@ -462,6 +618,38 @@ impl Repository {
         })
     }
 
+    /// Posts `comment` on a line of pull request `number`, whose current
+    /// answer to [`Repository::pull_request_url`] is `current`, anchored at
+    /// commit `head`; refused if that is no longer its head there. Forges
+    /// take no head condition with the comment, so one pushed after
+    /// `current` was read still gets it, as outdated. The answer is
+    /// read with [`Repository::parse_line_comment`].
+    pub fn line_comment(
+        &self,
+        number: u64,
+        current: &[u8],
+        head: &str,
+        comment: &LineComment<'_>,
+    ) -> Result<Change, ForgeError> {
+        let pull = self.parse_pull_request(current)?;
+        let head = pull
+            .head
+            .filter(|now| now.eq_ignore_ascii_case(head))
+            .ok_or(ForgeError::HeadMoved)?;
+        match self.kind {
+            ForgeKind::GitHub => Ok(github::line_comment(self, number, &head, comment)),
+            ForgeKind::GitLab => gitlab::line_comment(self, number, current, &head, comment),
+            ForgeKind::Gitea => Ok(gitea::line_comment(self, number, &head, comment)),
+        }
+    }
+    pub fn parse_line_comment(&self, body: &[u8]) -> Result<Comment, ForgeError> {
+        match self.kind {
+            // Gitea answers with the review that holds the comment.
+            ForgeKind::GitHub | ForgeKind::Gitea => self.parse_comment(body),
+            ForgeKind::GitLab => gitlab::parse_discussion(body),
+        }
+    }
+
     /// `segments` under the API base.
     fn endpoint<'a>(&self, segments: impl IntoIterator<Item = &'a str>) -> Url {
         let mut url = self.api.clone();
@@ -470,6 +658,39 @@ impl Repository {
         }
         // A base that cannot take a path was refused by `api_url`.
         url
+    }
+}
+
+/// `url` asking for page `page` (from 1); the first is asked for without
+/// naming it.
+fn paged(mut url: Url, page: usize) -> Url {
+    if page > 1 {
+        url.query_pairs_mut().append_pair("page", &page.to_string());
+    }
+    url
+}
+
+/// `title` without the draft `markers` (lowercase) it starts with, so only
+/// a pull request's `draft` flag decides whether it is one. A title without
+/// one is kept exactly; with one, the spaces around the markers go too.
+fn unmarked<'a>(title: &'a str, markers: &[&str]) -> &'a str {
+    let mut rest = title;
+    let mut marked = false;
+    loop {
+        let trimmed = rest.trim_start();
+        let marker = markers.iter().find(|marker| {
+            trimmed
+                .get(..marker.len())
+                .is_some_and(|start| start.eq_ignore_ascii_case(marker))
+        });
+        match marker {
+            Some(marker) => {
+                rest = &trimmed[marker.len()..];
+                marked = true;
+            }
+            None if marked => return trimmed,
+            None => return title,
+        }
     }
 }
 

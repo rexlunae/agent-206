@@ -30,11 +30,14 @@ pub fn required_capabilities(request: &abi::HostRequest) -> &'static [Capability
         | R::EditFile { .. }
         | R::CreateDirectory { .. }
         | R::PatchFiles { .. } => &[WriteWorkspace],
-        R::GitStatus | R::GitLog { .. } | R::GitDiff { .. } | R::GitBranches => &[GitRead],
+        R::GitStatus | R::GitLog { .. } | R::GitDiff { .. } | R::GitBranches | R::GitTags => {
+            &[GitRead]
+        }
         R::GitCommit { .. }
         | R::GitCommitStaged { .. }
         | R::GitStage { .. }
-        | R::GitCreateBranch { .. } => &[GitWrite],
+        | R::GitCreateBranch { .. }
+        | R::GitCreateTag { .. } => &[GitWrite],
         // A switch rewrites project files as well as git state.
         R::GitSwitchBranch { .. } => &[GitWrite, WriteWorkspace],
         R::Fetch { .. } => &[Network],

@@ -1,8 +1,8 @@
 //! GitHub's REST API (github.com, or GitHub Enterprise Server's `/api/v3`).
 use super::{
-    Change, Check, CheckStatus, Conclusion, DETAIL_PAGE, ForgeError, Listed, MAX_BODY,
-    NewPullRequest, PAGE, PullRequest, Repository, Review, ReviewState, State, answer, bounded,
-    label, label_opt,
+    Change, Check, CheckStatus, Conclusion, DETAIL_PAGE, ForgeError, LineComment, Listed, MAX_BODY,
+    MergeMethod, Merged, NewPullRequest, PAGE, PullRequest, Repository, Review, ReviewState, Side,
+    State, answer, bounded, label, label_opt,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -13,8 +13,7 @@ struct Pull {
     number: u64,
     title: String,
     state: String,
-    #[serde(default)]
-    draft: bool,
+    draft: Option<bool>,
     merged_at: Option<String>,
     user: Option<User>,
     head: Branch,
@@ -35,7 +34,8 @@ struct Branch {
     sha: Option<String>,
 }
 
-fn repo<'a>(repository: &'a Repository, rest: &[&'a str]) -> Url {
+/// `rest` under the repository, as GitHub and Gitea both lay it out.
+pub(super) fn repo<'a>(repository: &'a Repository, rest: &[&'a str]) -> Url {
     let segments = ["repos"]
         .into_iter()
         .chain(repository.path.iter().map(String::as_str))
@@ -91,18 +91,67 @@ pub(super) fn create(repository: &Repository, new: &NewPullRequest<'_>) -> Chang
     if let Some(text) = new.body {
         body["body"] = json!(text);
     }
-    Change {
-        url: repo(repository, &["pulls"]),
-        body: body.to_string().into_bytes(),
-    }
+    Change::post(repo(repository, &["pulls"]), body)
 }
 
 /// Pull requests are issues for comments that are not on a line.
 pub(super) fn comment(repository: &Repository, number: u64, text: &str) -> Change {
-    Change {
-        url: repo(repository, &["issues", &number.to_string(), "comments"]),
-        body: json!({"body": text}).to_string().into_bytes(),
+    Change::post(
+        repo(repository, &["issues", &number.to_string(), "comments"]),
+        json!({"body": text}),
+    )
+}
+
+pub(super) fn line_comment(
+    repository: &Repository,
+    number: u64,
+    head: &str,
+    comment: &LineComment<'_>,
+) -> Change {
+    let side = match comment.side {
+        Side::New => "RIGHT",
+        Side::Old => "LEFT",
+    };
+    Change::post(
+        repo(repository, &["pulls", &number.to_string(), "comments"]),
+        json!({
+            "body": comment.text,
+            "commit_id": head,
+            "path": comment.path,
+            "line": comment.line,
+            "side": side,
+        }),
+    )
+}
+
+pub(super) fn merge(
+    repository: &Repository,
+    number: u64,
+    head: &str,
+    method: MergeMethod,
+) -> Change {
+    let method = match method {
+        MergeMethod::Merge => "merge",
+        MergeMethod::Squash => "squash",
+        MergeMethod::Rebase => "rebase",
+    };
+    Change::put(
+        repo(repository, &["pulls", &number.to_string(), "merge"]),
+        json!({"sha": head, "merge_method": method}),
+    )
+}
+
+pub(super) fn parse_merge(body: &[u8]) -> Result<Merged, ForgeError> {
+    #[derive(Deserialize)]
+    struct Answer {
+        merged: bool,
+        sha: Option<String>,
     }
+    let answer: Answer = answer(body)?;
+    Ok(Merged {
+        merged: answer.merged,
+        commit: label_opt(answer.sha),
+    })
 }
 
 pub(super) fn pull_url(repository: &Repository, number: u64) -> Url {

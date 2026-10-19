@@ -11,7 +11,7 @@
 //! the host is dropped with the gateway.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use super::Started;
-use super::{ExecError, MAX_STREAM};
+use super::{ExecError, MAX_STREAM, Size};
 use crate::tools::ToolScope;
 use a206_core::{Capability, Id, Ignore};
 use std::{
@@ -35,6 +35,21 @@ const INPUT_WAIT: Duration = Duration::from_secs(5);
 /// How long output is still collected after a session ends, in case an
 /// orphan of the command holds its pipes open.
 const DRAIN_GRACE: Duration = Duration::from_secs(1);
+
+/// The gateway's side of a session's terminal.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+type Window = super::terminal::Controller;
+/// No terminal exists where commands cannot run.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+type Window = std::convert::Infallible;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn resize(window: &Window, size: Size) -> std::io::Result<()> {
+    window.resize(size)
+}
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn resize(window: &Window, _size: Size) -> std::io::Result<()> {
+    match *window {}
+}
 
 /// How a session ended, or that it has not.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -212,8 +227,8 @@ struct Session {
     seq: u64,
     thread: Id,
     authority: Authority,
-    /// Started on a pseudo-terminal.
-    terminal: bool,
+    /// Its pseudo-terminal, if it was started on one.
+    terminal: Option<Window>,
     output: Output,
     input: mpsc::Sender<Input>,
     /// Sending to or dropping this stops the command.
@@ -350,12 +365,12 @@ impl Sessions {
         for id in Self::evictions(&map, thread)? {
             map.remove(&id);
         }
-        let terminal = started.terminal.is_some();
+        let terminal = started.terminal.clone();
         let output: Output = Arc::new(Mutex::new(Shared {
             status: Status::Running,
             stdout: Unread::default(),
             stderr: Unread::default(),
-            terminal,
+            terminal: terminal.is_some(),
         }));
         let (input, inputs) = mpsc::channel(1);
         let (stop, stopped) = oneshot::channel();
@@ -472,6 +487,20 @@ impl Sessions {
         }
     }
 
+    /// Give a running session's terminal a new window size.
+    pub(super) fn resize(&self, thread: Id, id: Id, size: Size) -> Result<(), ExecError> {
+        let map = self.map();
+        let session = owned(&map, thread, id)?;
+        let window = session
+            .terminal
+            .as_ref()
+            .ok_or(ExecError::ResizeNeedsTerminal)?;
+        if session.status().finished() {
+            return Err(ExecError::SessionFinished);
+        }
+        resize(window, size).map_err(ExecError::Resize)
+    }
+
     /// Forget a session, stopping it first if it still runs.
     pub(super) fn remove(&self, thread: Id, id: Id) -> Result<(), ExecError> {
         let mut map = self.map();
@@ -498,7 +527,7 @@ impl Sessions {
         let input = {
             let map = self.map();
             let session = owned(&map, thread, id)?;
-            match (session.terminal, keys, close) {
+            match (session.terminal.is_some(), keys, close) {
                 (false, true, _) => return Err(ExecError::KeysNeedTerminal),
                 (true, _, true) => return Err(ExecError::TerminalClose),
                 _ => session.input.clone(),
@@ -772,7 +801,7 @@ mod tests {
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
                 thread: scope.thread,
                 authority: Authority::of(scope),
-                terminal: false,
+                terminal: None,
                 output,
                 input,
                 stop: Some(stop),

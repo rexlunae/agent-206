@@ -212,7 +212,7 @@ fn github_lists_tell_merged_from_closed() {
     assert_eq!(first.source, page[0]["head"]["ref"]);
     assert_eq!(first.head.as_deref(), page[0]["head"]["sha"].as_str());
     assert_eq!(first.body, None);
-    assert!(all.pull_requests[1].draft);
+    assert_eq!(all.pull_requests[1].draft, Some(true));
 
     // A full page may not be all of them.
     let full: Vec<Value> = (0..PAGE as u64)
@@ -319,13 +319,13 @@ fn github_checks_combine_runs_and_statuses() {
     assert_eq!(calls.len(), 2);
     assert!(
         calls[0]
-            .url
+            .url(1)
             .path()
             .ends_with(&format!("/commits/{head}/check-runs"))
     );
     assert!(
         calls[1]
-            .url
+            .url(1)
             .path()
             .ends_with(&format!("/commits/{head}/status"))
     );
@@ -336,7 +336,10 @@ fn github_checks_combine_runs_and_statuses() {
         {"name": "c", "status": "in_progress", "conclusion": null},
         {"name": "d", "status": "completed", "conclusion": unheard},
     ]});
-    let checks = repository.parse_checks(&calls[0], &bytes(&runs)).unwrap();
+    let checks = repository
+        .parse_checks(&calls[0], &bytes(&runs))
+        .unwrap()
+        .items;
     let seen: Vec<_> = checks.iter().map(|c| (c.status, c.conclusion)).collect();
     assert_eq!(
         seen,
@@ -354,7 +357,8 @@ fn github_checks_combine_runs_and_statuses() {
     ]});
     let checks = repository
         .parse_checks(&calls[1], &bytes(&statuses))
-        .unwrap();
+        .unwrap()
+        .items;
     assert_eq!(checks[0].conclusion, Some(Conclusion::Failure));
     assert_eq!(checks[0].reported, "error");
     assert_eq!(checks[1].status, CheckStatus::Running);
@@ -381,7 +385,7 @@ fn github_reviews_keep_their_states() {
     .unwrap();
     assert!(
         repository
-            .reviews_url(9)
+            .reviews_url(9, 1)
             .path()
             .ends_with("/pulls/9/reviews")
     );
@@ -391,7 +395,7 @@ fn github_reviews_keep_their_states() {
         {"user": null, "state": "CHANGES_REQUESTED"},
         {"user": {"login": word()}, "state": "SOMETHING_NEW"},
     ]);
-    let read = repository.parse_reviews(&bytes(&reviews)).unwrap();
+    let read = repository.parse_reviews(&bytes(&reviews)).unwrap().items;
     let states: Vec<_> = read.iter().map(|r| r.state).collect();
     assert_eq!(
         states,
@@ -430,13 +434,13 @@ fn gitlab_merge_requests_checks_and_approvals() {
     let read = repository.parse_pull_request(&bytes(&request)).unwrap();
     assert_eq!(read.number, 12);
     assert_eq!(read.state, State::Merged);
-    assert!(read.draft);
+    assert_eq!(read.draft, Some(true));
     assert_eq!(read.body.as_deref(), request["description"].as_str());
     let calls = repository.checks_calls(&read).unwrap();
     assert_eq!(calls.len(), 1);
     assert!(
         calls[0]
-            .url
+            .url(1)
             .path()
             .ends_with(&format!("/pipelines/{pipeline}/jobs"))
     );
@@ -449,7 +453,10 @@ fn gitlab_merge_requests_checks_and_approvals() {
         {"name": "stopped", "status": "canceled"},
         {"name": "other", "status": word()},
     ]);
-    let checks = repository.parse_checks(&calls[0], &bytes(&jobs)).unwrap();
+    let checks = repository
+        .parse_checks(&calls[0], &bytes(&jobs))
+        .unwrap()
+        .items;
     let seen: Vec<_> = checks.iter().map(|c| (c.status, c.conclusion)).collect();
     assert_eq!(
         seen,
@@ -472,7 +479,7 @@ fn gitlab_merge_requests_checks_and_approvals() {
 
     let approver = word();
     let approvals = json!({"approved": true, "approved_by": [{"user": {"username": approver}}]});
-    let reviews = repository.parse_reviews(&bytes(&approvals)).unwrap();
+    let reviews = repository.parse_reviews(&bytes(&approvals)).unwrap().items;
     assert_eq!(reviews.len(), 1);
     assert_eq!(reviews[0].state, ReviewState::Approved);
     assert_eq!(reviews[0].author.as_deref(), Some(approver.as_str()));
@@ -613,6 +620,544 @@ fn opening_and_commenting_send_each_forges_fields() {
     assert_eq!(posted.url, None);
     assert!(matches!(
         github.parse_comment(br#"{"id": "x"}"#),
+        Err(ForgeError::Answer(_))
+    ));
+}
+
+fn gitea_pull(number: u64, state: &str, merged: bool, branch: &str, repo_id: i64) -> Value {
+    json!({
+        "number": number,
+        "title": word(),
+        "state": state,
+        "merged": merged,
+        "user": {"login": word()},
+        "head": {"ref": branch, "sha": sha(), "repo_id": repo_id},
+        "base": {"ref": word(), "sha": sha(), "repo_id": 1},
+        "html_url": word(),
+        "body": word(),
+    })
+}
+
+#[test]
+fn gitea_lists_read_on_until_a_page_is_empty() {
+    let (owner, name, branch) = (word(), word(), word());
+    let gitea = api(ForgeKind::Gitea, "https://forge.example/api/v1");
+    let repository = Repository::new(&gitea, &remote(&format!("/{owner}/{name}.git"))).unwrap();
+    assert!(Repository::new(&gitea, &remote(&format!("/{owner}/{name}/{}", word()))).is_err());
+    assert_eq!(
+        repository.pull_request_url(7).path(),
+        format!("/api/v1/repos/{owner}/{name}/pulls/7")
+    );
+    for origin in ["https://codeberg.org", "https://gitea.com"] {
+        assert_eq!(preset(origin).unwrap().kind, ForgeKind::Gitea);
+    }
+
+    let mut listing = repository.listing(Listed::Merged, Some(&branch));
+    let first = listing.next(&repository).unwrap();
+    assert_eq!(first.path(), format!("/api/v1/repos/{owner}/{name}/pulls"));
+    // Gitea cannot be asked for one branch.
+    assert_eq!(
+        query(&first),
+        [
+            ("state".into(), "closed".into()),
+            ("limit".into(), PAGE.to_string()),
+        ]
+    );
+    let page = json!([
+        gitea_pull(5, "closed", true, &branch, 1),
+        gitea_pull(4, "closed", false, &branch, 1),
+        gitea_pull(3, "closed", true, &word(), 1),
+        // A fork's branch of the same name.
+        gitea_pull(2, "closed", true, &branch, 2),
+    ]);
+    listing.add(&repository, &bytes(&page)).unwrap();
+    // A short page may only be the forge's own limit.
+    let second = listing.next(&repository).unwrap();
+    assert!(query(&second).contains(&("page".into(), "2".into())));
+    listing.add(&repository, b"[]").unwrap();
+    assert_eq!(listing.next(&repository), None);
+    let read = listing.finish();
+    assert!(read.complete);
+    let numbers: Vec<_> = read.pull_requests.iter().map(|p| p.number).collect();
+    assert_eq!(numbers, [5]);
+    assert_eq!(read.pull_requests[0].state, State::Merged);
+
+    // Pages that keep coming are read only so far.
+    let mut listing = repository.listing(Listed::Open, None);
+    let mut asked = 0;
+    while listing.next(&repository).is_some() {
+        asked += 1;
+        let page = json!([gitea_pull(asked, "open", false, &branch, 1)]);
+        listing.add(&repository, &bytes(&page)).unwrap();
+    }
+    assert_eq!(asked, MAX_LIST_PAGES as u64);
+    let read = listing.finish();
+    assert!(!read.complete);
+    assert_eq!(read.pull_requests.len(), MAX_LIST_PAGES);
+}
+
+#[test]
+fn gitea_checks_and_reviews() {
+    let repository = Repository::new(
+        &api(ForgeKind::Gitea, "https://forge.example/api/v1"),
+        &remote(&format!("/{}/{}", word(), word())),
+    )
+    .unwrap();
+    let mut answer = gitea_pull(6, "open", false, &word(), 1);
+    answer["draft"] = json!(true);
+    let pull = repository.parse_pull_request(&bytes(&answer)).unwrap();
+    assert_eq!(pull.draft, Some(true));
+    // An older Gitea does not say.
+    let older = repository
+        .parse_pull_request(&bytes(&gitea_pull(6, "open", false, &word(), 1)))
+        .unwrap();
+    assert_eq!(older.draft, None);
+    assert_eq!(pull.body.as_deref(), answer["body"].as_str());
+    let head = pull.head.clone().unwrap();
+    let calls = repository.checks_calls(&pull).unwrap();
+    assert_eq!(calls.len(), 1);
+    assert!(
+        calls[0]
+            .url(1)
+            .path()
+            .ends_with(&format!("/commits/{head}/status"))
+    );
+    assert!(query(&calls[0].url(3)).contains(&("page".into(), "3".into())));
+    let unheard = word();
+    let statuses = json!({"state": "pending", "statuses": [
+        {"context": "a", "status": "success"},
+        {"context": "b", "status": "error"},
+        {"context": "c", "status": "warning"},
+        {"context": "d", "status": "pending"},
+        {"context": "e", "status": unheard},
+    ]});
+    let page = repository
+        .parse_checks(&calls[0], &bytes(&statuses))
+        .unwrap();
+    let seen: Vec<_> = page
+        .items
+        .iter()
+        .map(|c| (c.status, c.conclusion))
+        .collect();
+    assert_eq!(
+        seen,
+        [
+            (CheckStatus::Completed, Some(Conclusion::Success)),
+            (CheckStatus::Completed, Some(Conclusion::Failure)),
+            (CheckStatus::Completed, Some(Conclusion::Neutral)),
+            (CheckStatus::Running, None),
+            (CheckStatus::Unknown, None),
+        ]
+    );
+    assert_eq!(page.items[4].reported, unheard);
+    // Fewer than asked may still not be all.
+    assert!(page.more);
+    let empty = repository
+        .parse_checks(&calls[0], br#"{"statuses": []}"#)
+        .unwrap();
+    assert!(!empty.more);
+    // GitHub's `state` field is not Gitea's.
+    assert!(matches!(
+        repository.parse_checks(
+            &calls[0],
+            br#"{"statuses": [{"context": "a", "state": "success"}]}"#
+        ),
+        Err(ForgeError::Answer(_))
+    ));
+    let mut headless = pull.clone();
+    headless.head = None;
+    assert!(matches!(
+        repository.checks_calls(&headless),
+        Err(ForgeError::NoCommit)
+    ));
+
+    assert!(
+        repository
+            .reviews_url(6, 1)
+            .path()
+            .ends_with("/pulls/6/reviews")
+    );
+    let reviewer = word();
+    let reviews = json!([
+        {"user": {"login": reviewer}, "state": "APPROVED", "commit_id": sha()},
+        {"user": null, "state": "REQUEST_CHANGES"},
+        {"user": {"login": word()}, "state": "APPROVED", "dismissed": true},
+        {"user": {"login": word()}, "state": "COMMENT"},
+        {"user": {"login": word()}, "state": "REQUEST_REVIEW"},
+        {"user": {"login": word()}, "state": "SOMETHING_NEW"},
+    ]);
+    let page = repository.parse_reviews(&bytes(&reviews)).unwrap();
+    let states: Vec<_> = page.items.iter().map(|r| r.state).collect();
+    assert_eq!(
+        states,
+        [
+            ReviewState::Approved,
+            ReviewState::ChangesRequested,
+            ReviewState::Dismissed,
+            ReviewState::Commented,
+            ReviewState::Pending,
+            ReviewState::Unknown,
+        ]
+    );
+    assert_eq!(page.items[0].author.as_deref(), Some(reviewer.as_str()));
+    assert!(page.more);
+    assert!(!repository.parse_reviews(b"[]").unwrap().more);
+}
+
+#[test]
+fn full_pages_alone_may_have_more_on_github_and_gitlab() {
+    let github = Repository::new(
+        &api(ForgeKind::GitHub, "https://api.forge.example"),
+        &remote(&format!("/{}/{}", word(), word())),
+    )
+    .unwrap();
+    let review = json!({"user": {"login": word()}, "state": "COMMENTED"});
+    let short = github
+        .parse_reviews(&bytes(&json!(vec![review.clone(); 3])))
+        .unwrap();
+    assert!(!short.more);
+    let full = github
+        .parse_reviews(&bytes(&json!(vec![review; DETAIL_PAGE])))
+        .unwrap();
+    assert!(full.more);
+    assert!(query(&github.reviews_url(1, 2)).contains(&("page".into(), "2".into())));
+    assert!(
+        !query(&github.reviews_url(1, 1))
+            .iter()
+            .any(|(k, _)| k == "page")
+    );
+}
+
+#[test]
+fn gitea_drafts_are_marked_work_in_progress() {
+    let (owner, name) = (word(), word());
+    let gitea = Repository::new(
+        &api(ForgeKind::Gitea, "https://forge.example/api/v1"),
+        &remote(&format!("/{owner}/{name}")),
+    )
+    .unwrap();
+    let (title, text, source, target) = (word(), word(), word(), word());
+    let new = NewPullRequest {
+        title: &title,
+        body: Some(&text),
+        source: &source,
+        target: &target,
+        draft: true,
+    };
+    let sent = gitea.create_pull_request(&new).unwrap();
+    assert_eq!(
+        sent.url.path(),
+        format!("/api/v1/repos/{owner}/{name}/pulls")
+    );
+    let body: Value = serde_json::from_slice(&sent.body).unwrap();
+    assert_eq!(
+        body,
+        json!({"title": format!("WIP: {title}"), "head": source, "base": target, "body": text})
+    );
+    for (marked, draft, posted) in [
+        (format!("WIP: {title}"), false, title.clone()),
+        (format!("[wip] Wip: {title}"), true, format!("WIP: {title}")),
+        (format!("wipe {title}"), false, format!("wipe {title}")),
+        (format!("  {title}"), false, format!("  {title}")),
+    ] {
+        let new = NewPullRequest {
+            title: &marked,
+            body: None,
+            draft,
+            ..new
+        };
+        let body: Value =
+            serde_json::from_slice(&gitea.create_pull_request(&new).unwrap().body).unwrap();
+        assert_eq!(body["title"], posted, "{marked}");
+        assert!(body.get("body").is_none());
+    }
+    for marked in ["WIP:", " [WIP] wip: "] {
+        let new = NewPullRequest {
+            title: marked,
+            draft: true,
+            ..new
+        };
+        assert!(matches!(
+            gitea.create_pull_request(&new),
+            Err(ForgeError::MarkerTitle)
+        ));
+    }
+    let longest: String = std::iter::repeat_n('x', MAX_TITLE).collect();
+    let new = NewPullRequest {
+        title: &longest,
+        draft: true,
+        ..new
+    };
+    let mut answer: Value =
+        serde_json::from_slice(&gitea.create_pull_request(&new).unwrap().body).unwrap();
+    answer["number"] = json!(1);
+    answer["state"] = json!("open");
+    answer["head"] = json!({"ref": source});
+    answer["base"] = json!({"ref": target});
+    let read = gitea.parse_pull_request(&bytes(&answer)).unwrap();
+    assert_eq!(read.title, format!("WIP: {longest}"));
+
+    let sent = gitea.comment(5, &text);
+    assert_eq!(
+        sent.url.path(),
+        format!("/api/v1/repos/{owner}/{name}/issues/5/comments")
+    );
+    let url = format!("https://forge.example/{}", word());
+    let posted = gitea
+        .parse_comment(&bytes(&json!({"id": 9, "html_url": url})))
+        .unwrap();
+    assert_eq!(posted.url, Some(url));
+}
+
+#[test]
+fn merges_name_the_head_and_each_forges_method() {
+    let (owner, name, head) = (word(), word(), sha());
+    let make = |kind, base| {
+        Repository::new(&api(kind, base), &remote(&format!("/{owner}/{name}"))).unwrap()
+    };
+    let github = make(ForgeKind::GitHub, "https://forge.example/api/v3");
+    let gitlab = make(ForgeKind::GitLab, "https://forge.example/api/v4");
+    let gitea = make(ForgeKind::Gitea, "https://forge.example/api/v1");
+    let sent = |change: Change| -> (ChangeMethod, String, Value) {
+        (
+            change.method,
+            change.url.path().to_owned(),
+            serde_json::from_slice(&change.body).unwrap(),
+        )
+    };
+    for (method, word) in [
+        (MergeMethod::Merge, "merge"),
+        (MergeMethod::Squash, "squash"),
+        (MergeMethod::Rebase, "rebase"),
+    ] {
+        assert_eq!(
+            sent(github.merge(3, &head, method).unwrap()),
+            (
+                ChangeMethod::Put,
+                format!("/api/v3/repos/{owner}/{name}/pulls/3/merge"),
+                json!({"sha": head, "merge_method": word})
+            )
+        );
+        assert_eq!(
+            sent(gitea.merge(3, &head, method).unwrap()),
+            (
+                ChangeMethod::Post,
+                format!("/api/v1/repos/{owner}/{name}/pulls/3/merge"),
+                json!({"Do": word, "head_commit_id": head})
+            )
+        );
+    }
+    assert_eq!(
+        sent(gitlab.merge(3, &head, MergeMethod::Squash).unwrap()),
+        (
+            ChangeMethod::Put,
+            format!("/api/v4/projects/{owner}%2F{name}/merge_requests/3/merge"),
+            json!({"sha": head, "squash": true})
+        )
+    );
+    assert!(matches!(
+        gitlab.merge(3, &head, MergeMethod::Rebase),
+        Err(ForgeError::GitLabRebase)
+    ));
+
+    let commit = sha();
+    assert_eq!(
+        github
+            .parse_merge(&bytes(
+                &json!({"sha": commit, "merged": true, "message": word()})
+            ))
+            .unwrap(),
+        Merged {
+            merged: true,
+            commit: Some(commit.clone())
+        }
+    );
+    assert!(matches!(
+        github.parse_merge(br#"{"sha": "x"}"#),
+        Err(ForgeError::Answer(_))
+    ));
+    let squashed = gitlab
+        .parse_merge(&bytes(
+            &json!({"state": "merged", "merge_commit_sha": null, "squash_commit_sha": commit}),
+        ))
+        .unwrap();
+    assert_eq!(squashed.commit.as_deref(), Some(commit.as_str()));
+    assert!(squashed.merged);
+    let waiting = gitlab
+        .parse_merge(&bytes(&json!({"state": "opened"})))
+        .unwrap();
+    assert!(!waiting.merged);
+    assert_eq!(
+        gitea.parse_merge(b"").unwrap(),
+        Merged {
+            merged: true,
+            commit: None
+        }
+    );
+}
+
+#[test]
+fn line_comments_are_placed_at_the_current_head_on_each_forge() {
+    let (owner, name, head, path, text) = (word(), word(), sha(), word(), word());
+    let make = |kind, base| {
+        Repository::new(&api(kind, base), &remote(&format!("/{owner}/{name}"))).unwrap()
+    };
+    let github = make(ForgeKind::GitHub, "https://forge.example/api/v3");
+    let gitlab = make(ForgeKind::GitLab, "https://forge.example/api/v4");
+    let gitea = make(ForgeKind::Gitea, "https://forge.example/api/v1");
+    let sent = |change: Change| -> (ChangeMethod, String, Value) {
+        (
+            change.method,
+            change.url.path().to_owned(),
+            serde_json::from_slice(&change.body).unwrap(),
+        )
+    };
+    let pull = |at: &str| {
+        bytes(&json!({
+            "number": 5,
+            "title": word(),
+            "state": "open",
+            "head": {"ref": word(), "sha": at},
+            "base": {"ref": word(), "sha": sha()},
+        }))
+    };
+    let new = LineComment {
+        path: &path,
+        line: 17,
+        side: Side::New,
+        text: &text,
+    };
+    let old = LineComment {
+        side: Side::Old,
+        ..new
+    };
+    // The id is compared ignoring case, and the forge's own is sent.
+    let upper = head.to_ascii_uppercase();
+    assert_eq!(
+        sent(github.line_comment(5, &pull(&head), &upper, &old).unwrap()),
+        (
+            ChangeMethod::Post,
+            format!("/api/v3/repos/{owner}/{name}/pulls/5/comments"),
+            json!({"body": text, "commit_id": head, "path": path, "line": 17, "side": "LEFT"})
+        )
+    );
+    assert_eq!(
+        sent(github.line_comment(5, &pull(&head), &head, &new).unwrap()).2["side"],
+        "RIGHT"
+    );
+    for (comment, new_position, old_position) in [(new, 17, 0), (old, 0, 17)] {
+        assert_eq!(
+            sent(
+                gitea
+                    .line_comment(5, &pull(&head), &head, &comment)
+                    .unwrap()
+            ),
+            (
+                ChangeMethod::Post,
+                format!("/api/v1/repos/{owner}/{name}/pulls/5/reviews"),
+                json!({
+                    "commit_id": head,
+                    "event": "COMMENT",
+                    "comments": [{"path": path, "body": text, "new_position": new_position, "old_position": old_position}],
+                })
+            )
+        );
+    }
+    // Pushed to since: nothing is sent.
+    for repository in [&github, &gitea] {
+        assert!(matches!(
+            repository.line_comment(5, &pull(&sha()), &head, &new),
+            Err(ForgeError::HeadMoved)
+        ));
+    }
+
+    let (base, start) = (sha(), sha());
+    let request = |sha: &str, refs: Value| {
+        bytes(&json!({
+            "iid": 5,
+            "title": word(),
+            "state": "opened",
+            "source_branch": word(),
+            "target_branch": word(),
+            "sha": sha,
+            "diff_refs": refs,
+        }))
+    };
+    let refs = json!({"base_sha": base, "start_sha": start, "head_sha": head});
+    let position = |line: &str| {
+        let mut position = json!({
+            "position_type": "text",
+            "base_sha": base,
+            "start_sha": start,
+            "head_sha": head,
+            "old_path": path,
+            "new_path": path,
+        });
+        position[line] = json!(17);
+        position
+    };
+    assert_eq!(
+        sent(
+            gitlab
+                .line_comment(5, &request(&head, refs.clone()), &head, &new)
+                .unwrap()
+        ),
+        (
+            ChangeMethod::Post,
+            format!("/api/v4/projects/{owner}%2F{name}/merge_requests/5/discussions"),
+            json!({"body": text, "position": position("new_line")})
+        )
+    );
+    assert_eq!(
+        sent(
+            gitlab
+                .line_comment(5, &request(&head, refs.clone()), &head, &old)
+                .unwrap()
+        )
+        .2["position"],
+        position("old_line")
+    );
+    // Changes not yet worked out, or worked out for an older head.
+    assert!(matches!(
+        gitlab.line_comment(5, &request(&head, Value::Null), &head, &new),
+        Err(ForgeError::NoDiff)
+    ));
+    assert!(matches!(
+        gitlab.line_comment(5, &request(&head, json!({"head_sha": head})), &head, &new),
+        Err(ForgeError::NoDiff)
+    ));
+    let stale = json!({"base_sha": base, "start_sha": start, "head_sha": sha()});
+    assert!(matches!(
+        gitlab.line_comment(5, &request(&head, stale), &head, &new),
+        Err(ForgeError::HeadMoved)
+    ));
+    assert!(matches!(
+        gitlab.line_comment(5, &request(&sha(), refs), &head, &new),
+        Err(ForgeError::HeadMoved)
+    ));
+
+    let url = format!("https://forge.example/{}", word());
+    for repository in [&github, &gitea] {
+        assert_eq!(
+            repository
+                .parse_line_comment(&bytes(&json!({"id": 77, "html_url": url})))
+                .unwrap(),
+            Comment {
+                id: 77,
+                url: Some(url.clone())
+            }
+        );
+    }
+    assert_eq!(
+        gitlab
+            .parse_line_comment(&bytes(
+                &json!({"id": word(), "notes": [{"id": 78, "body": text}]})
+            ))
+            .unwrap(),
+        Comment { id: 78, url: None }
+    );
+    assert!(matches!(
+        gitlab.parse_line_comment(&bytes(&json!({"id": word(), "notes": []}))),
         Err(ForgeError::Answer(_))
     ));
 }

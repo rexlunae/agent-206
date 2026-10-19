@@ -72,16 +72,41 @@ pub(crate) fn lock_file(root: &Path, name: &str) -> std::io::Result<std::fs::Fil
         .write(true)
         .open(root.join(name))
 }
+/// An exclusive lock on one of the profile's lock files, released when
+/// dropped. A child that another thread is starting holds a copy of every
+/// descriptor until it execs, and the lock belongs to the open file rather
+/// than to one descriptor, so closing ours alone would leave the lock held
+/// by that copy. Dropping unlocks first, which releases it for every copy.
+pub(crate) struct Held(std::fs::File);
+impl Held {
+    /// Take the lock on `file`, or `WouldBlock` while another holder has it.
+    pub(crate) fn try_lock(file: std::fs::File) -> std::io::Result<Self> {
+        fs2::FileExt::try_lock_exclusive(&file)?;
+        Ok(Self(file))
+    }
+}
+impl Drop for Held {
+    fn drop(&mut self) {
+        if let Err(error) = fs2::FileExt::unlock(&self.0) {
+            // Closing the descriptor still releases it once no copy remains.
+            tracing::warn!(
+                error = &error as &dyn std::error::Error,
+                "could not release a profile lock"
+            );
+        }
+    }
+}
 pub struct Store {
-    _lock: std::fs::File,
     db: Connection,
     pub state: Snapshot,
     pub root: PathBuf,
+    // Last, so the database is closed before another owner may open it.
+    _lock: Held,
 }
 impl Store {
     pub fn open(root: &Path) -> Result<Self> {
-        let lock = profile_lock(root).map_err(StoreError::Directory)?;
-        fs2::FileExt::try_lock_exclusive(&lock).map_err(StoreError::Owned)?;
+        let lock = Held::try_lock(profile_lock(root).map_err(StoreError::Directory)?)
+            .map_err(StoreError::Owned)?;
         let db = Connection::open(root.join("state.sqlite3"))?;
         db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
             CREATE TABLE IF NOT EXISTS snapshot(id INTEGER PRIMARY KEY CHECK(id=1), payload BLOB NOT NULL);
@@ -123,10 +148,10 @@ impl Store {
             }
         };
         let mut store = Self {
-            _lock: lock,
             db,
             state,
             root: root.to_owned(),
+            _lock: lock,
         };
         crate::provider::validate_presets(&store.state.settings.provider_presets)
             .map_err(StoreError::Presets)?;
@@ -524,6 +549,22 @@ fn record_run(tx: &rusqlite::Transaction<'_>, state: &Snapshot, job: Id) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn a_closed_store_is_free_while_a_starting_child_holds_a_copy_of_its_lock() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        // What a child forked by another thread holds until it execs.
+        let copy = store._lock.0.try_clone().unwrap();
+        assert!(matches!(
+            Store::open(directory.path()),
+            Err(StoreError::Owned(error)) if error.kind() == std::io::ErrorKind::WouldBlock
+        ));
+        drop(store);
+        let reopened = Store::open(directory.path()).unwrap();
+        drop(copy);
+        drop(reopened);
+        Store::open(directory.path()).unwrap();
+    }
     #[test]
     fn reopening_keeps_installed_extensions_but_not_over_bundled_ids() {
         let directory = tempfile::tempdir().unwrap();
