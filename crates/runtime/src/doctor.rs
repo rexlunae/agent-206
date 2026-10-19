@@ -689,16 +689,17 @@ where
     receiver.await.map_err(|_| DoctorError::Worker)
 }
 
-/// [`gather`] and [`evaluate`] off the caller's executor.
+/// [`gather_for`] and [`evaluate`] off the caller's executor, for the
+/// gateway the client already talks to.
 pub async fn check_detached(
     root: PathBuf,
-    remote: Option<String>,
+    target: Result<Option<GatewayTarget>, ErrorReport>,
 ) -> Result<DoctorReport, DoctorError> {
     detached(move || async move {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |elapsed| elapsed.as_secs());
-        evaluate(&gather(&root, remote, now).await)
+        evaluate(&gather_for(&root, target, now).await)
     })
     .await
 }

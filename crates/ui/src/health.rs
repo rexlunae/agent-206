@@ -44,7 +44,15 @@ fn profile() -> Result<(std::path::PathBuf, Option<String>), ErrorReport> {
 #[cfg(not(target_arch = "wasm32"))]
 async fn check() -> Result<DoctorReport, ErrorReport> {
     let (root, remote) = profile()?;
-    a206_runtime::doctor::check_detached(root, remote)
+    // The gateway this client's commands go to, so a refresh the report
+    // offers reaches the gateway it was found on, not one another client
+    // saved since.
+    let target = match crate::TARGET.lock().ok().and_then(|active| active.clone()) {
+        Some((target, _)) => Ok(Some(target)),
+        None => a206_runtime::connection::resolve(&root, remote)
+            .map_err(|error| a206_runtime::error::report(&error)),
+    };
+    a206_runtime::doctor::check_detached(root, target)
         .await
         .map_err(|error| a206_runtime::error::report(&error))
 }
@@ -89,6 +97,7 @@ pub(crate) fn HealthChecks() -> Element {
     let mut failed = use_signal(|| None::<(Repair, ErrorReport)>);
     let mut refresh = move || {
         running.set(true);
+        failed.set(None);
         spawn(async move {
             let result = check().await;
             if let Err(error) = &result {
