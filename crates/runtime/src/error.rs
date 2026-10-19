@@ -273,7 +273,7 @@ impl Classified for a206_broker::BrokerError {
             | B::ImportReviewUnavailable
             | B::ImportSourceChanged => ErrorKind::Conflict,
             B::NotFound => ErrorKind::NotFound,
-            B::Invalid(_) => ErrorKind::InvalidRequest,
+            B::Invalid(_) | B::SshKey(_) => ErrorKind::InvalidRequest,
             B::Channel(_) => ErrorKind::Protocol,
             B::Vault(_) => ErrorKind::Storage,
             B::Upstream(U::Timeout) => ErrorKind::Timeout,

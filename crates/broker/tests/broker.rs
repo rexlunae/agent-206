@@ -2991,3 +2991,147 @@ async fn git_calls_send_the_token_as_basic_auth_to_the_service_they_name() {
         BrokerError::Forbidden
     );
 }
+
+/// What an SSH client signs to authenticate with `key`: a session
+/// identifier and a public-key user authentication request (RFC 4252).
+fn userauth(key: &ssh_key::PublicKey) -> Vec<u8> {
+    fn put(out: &mut Vec<u8>, bytes: &[u8]) {
+        out.extend(u32::try_from(bytes.len()).unwrap().to_be_bytes());
+        out.extend(bytes);
+    }
+    let mut data = Vec::new();
+    put(&mut data, uuid::Uuid::new_v4().as_bytes());
+    data.push(50);
+    put(&mut data, random().as_bytes());
+    put(&mut data, b"ssh-connection");
+    put(&mut data, b"publickey");
+    data.push(1);
+    put(&mut data, key.algorithm().as_str().as_bytes());
+    put(&mut data, &key.to_bytes().unwrap());
+    data
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bound_ssh_key_signs_authentication_for_a_paired_gateway_only() {
+    let (_dir, root, _task) = start().await;
+    let mut a = user(&root).await;
+    a.call(unlock(&random(), None, true)).await.unwrap();
+    let (name, token) = (random(), random());
+    let host = format!("{}.test", uuid::Uuid::new_v4().simple());
+    let (private, public) = a206_vault::generate_ssh_key(&random()).unwrap();
+    let mut held = meta(vec![format!("ssh://{}:2222/", host.to_uppercase())]);
+    held.kind = CredentialKind::SshKey;
+    a.call(Request::PutCredential {
+        name: name.clone(),
+        meta: held,
+        value: WireValue::SshKeyPair {
+            private_key: WireSecret::new(private.to_string()),
+            public_key: WireSecret::new(public.clone()),
+        },
+        replace: false,
+    })
+    .await
+    .unwrap();
+    // The destination is stored in its exact form.
+    let Reply::Credentials { typed, .. } = a.call(Request::Credentials).await.unwrap() else {
+        panic!("unexpected reply");
+    };
+    let destination = format!("ssh://{host}:2222");
+    assert_eq!(
+        typed
+            .iter()
+            .find(|(n, _)| *n == name)
+            .unwrap()
+            .1
+            .destinations,
+        std::slice::from_ref(&destination)
+    );
+    let key = ssh_key::PublicKey::from_openssh(&public).unwrap();
+    let call = |credential: &str, destination: &str, sign: Option<Vec<u8>>| {
+        Request::SshAgent(SshAgentCall {
+            credential: credential.to_owned(),
+            destination: destination.to_owned(),
+            sign,
+        })
+    };
+    let data = userauth(&key);
+    assert_eq!(
+        denied(a.call(call(&name, &destination, Some(data.clone()))).await),
+        BrokerError::Forbidden
+    );
+    let mut gateway = paired_gateway(&mut a, &root).await;
+    let Reply::SshAgent {
+        public_key,
+        signature,
+    } = gateway.call(call(&name, &destination, None)).await.unwrap()
+    else {
+        panic!("unexpected reply");
+    };
+    assert_eq!(public_key, key.to_bytes().unwrap());
+    assert_eq!(signature, None);
+    let Reply::SshAgent {
+        signature: Some(signature),
+        ..
+    } = gateway
+        .call(call(&name, &destination, Some(data.clone())))
+        .await
+        .unwrap()
+    else {
+        panic!("unexpected reply");
+    };
+    let signature =
+        <ssh_key::Signature as ssh_encoding::Decode>::decode(&mut signature.as_slice()).unwrap();
+    signature::Verifier::verify(&key, &data, &signature).unwrap();
+    // Nothing but an authentication request for the key is signed.
+    assert!(matches!(
+        denied(
+            gateway
+                .call(call(&name, &destination, Some(token.into_bytes())))
+                .await
+        ),
+        BrokerError::SshKey(a206_vault::SshKeyError::NotUserAuth(_))
+    ));
+    // Only the bound server, written exactly.
+    for (other, expected) in [
+        (
+            format!("ssh://{host}:22"),
+            BrokerError::Denied(a206_vault::Denial::DestinationNotBound),
+        ),
+        (
+            format!("ssh://{host}:2222/"),
+            BrokerError::Invalid(InvalidRequest::SshAgent),
+        ),
+        (
+            format!("ssh://git@{host}:2222"),
+            BrokerError::Invalid(InvalidRequest::SshAgent),
+        ),
+    ] {
+        assert_eq!(
+            denied(gateway.call(call(&name, &other, Some(data.clone()))).await),
+            expected,
+            "{other}"
+        );
+    }
+    assert_eq!(
+        denied(
+            gateway
+                .call(call(
+                    &name,
+                    &destination,
+                    Some(vec![0; MAX_SSH_SIGN_DATA + 1])
+                ))
+                .await
+        ),
+        BrokerError::Invalid(InvalidRequest::SshAgent)
+    );
+    assert_eq!(
+        denied(gateway.call(call(&random(), &destination, None)).await),
+        BrokerError::NotFound
+    );
+    // Locking ends the gateway's use of the key.
+    a.call(Request::Lock).await.unwrap();
+    assert!(matches!(
+        denied(gateway.call(call(&name, &destination, None)).await),
+        BrokerError::Locked | BrokerError::GatewayNotPaired
+    ));
+}
