@@ -35,6 +35,7 @@ pub mod retry;
 pub mod sandbox;
 pub mod schedule;
 pub mod schedule_tool;
+pub mod search_tool;
 pub mod service;
 pub mod skill_tool;
 pub mod sse;

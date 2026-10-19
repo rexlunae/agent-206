@@ -19,15 +19,16 @@ use zeroize::Zeroizing;
 /// [`AuthScheme::DiscordBot`], version 9 [`SocketScheme::IrcSasl`], and version
 /// 10 encrypted setup channels and TOTP cancellation, 11 reviewed vault
 /// imports, 12 [`AuthScheme::WebhookUrl`], 13 [`Request::GitReceivePack`], 14
-/// [`Request::GitUploadPack`] and 15 [`Request::SshAgent`]. A broker accepts greetings from
+/// [`Request::GitUploadPack`], 15 [`AuthScheme::SubscriptionToken`] and 16
+/// [`Request::SshAgent`]. A broker accepts greetings from
 /// [`MIN_BROKER_VERSION`] up to this version, and a client falls back to the
 /// newest version an older broker accepts (see `Client::version`), so streams
 /// are only requested from brokers that understand them.
-pub const BROKER_VERSION: u16 = 15;
+pub const BROKER_VERSION: u16 = 16;
 /// First version with connection-held source reviews and guarded vault import.
 pub use a206_vault_channel::REVIEWED_IMPORT_BROKER_VERSION as REVIEWED_IMPORT_VERSION;
 /// The oldest protocol version this broker still serves and this client still
-/// speaks. Versions 3 to 15 differ only by the requests, roles and schemes they add.
+/// speaks. Versions 3 to 16 differ only by the requests, roles and schemes they add.
 pub const MIN_BROKER_VERSION: u16 = 3;
 /// The first version that serves [`Request::ProviderStream`].
 pub const STREAM_VERSION: u16 = 4;
@@ -54,9 +55,12 @@ pub const GIT_VERSION: u16 = 13;
 /// The first version that fetches over git's smart HTTP protocol
 /// ([`Request::GitUploadPack`]).
 pub const GIT_FETCH_VERSION: u16 = 14;
+/// The first version that attaches web search keys
+/// ([`AuthScheme::SubscriptionToken`]).
+pub const SEARCH_VERSION: u16 = 15;
 /// The first version that signs SSH authentication with vault-held keys
 /// ([`Request::SshAgent`]).
-pub const SSH_AGENT_VERSION: u16 = 15;
+pub const SSH_AGENT_VERSION: u16 = 16;
 /// Largest data the broker signs for SSH authentication: a session
 /// identifier and a user authentication request are far smaller.
 pub const MAX_SSH_SIGN_DATA: usize = 16 * 1024;
@@ -234,6 +238,9 @@ pub enum AuthScheme {
     /// broker sends to the stored URL, which must be on that same origin.
     /// Since [`WEBHOOK_VERSION`].
     WebhookUrl,
+    /// `X-Subscription-Token: …` with `Accept: application/json` (Brave
+    /// Search). Since [`SEARCH_VERSION`].
+    SubscriptionToken,
 }
 
 /// How the broker opens an authenticated WebSocket session. The service is
@@ -466,7 +473,7 @@ pub enum Request {
     /// Gateway role, version 14: one round of a git fetch. Answered like
     /// `GitReceivePack`.
     GitUploadPack(GitCall),
-    /// Gateway role, version 15: the public key of an SSH key bound to a
+    /// Gateway role, version 16: the public key of an SSH key bound to a
     /// destination, and a signature of an authentication request. Answered
     /// with `SshAgent`; the private key never leaves the broker.
     SshAgent(SshAgentCall),

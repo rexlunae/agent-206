@@ -122,6 +122,8 @@ struct Outbound {
     /// The credential header, or `None` when the credential is in `url`.
     header: Option<(&'static str, Zeroizing<String>)>,
     anthropic_version: Option<String>,
+    /// Ask for a JSON response (`Accept: application/json`).
+    accept_json: bool,
     body: Option<Vec<u8>>,
     /// Sent as the body's `Content-Type`.
     content_type: &'static str,
@@ -896,6 +898,7 @@ fn provider(shared: &Shared, session: &Session, call: ProviderCall, stream: bool
         AuthScheme::Bearer | AuthScheme::DiscordBot => (url, Some(("authorization", value))),
         AuthScheme::ApiKeyHeader => (url, Some(("x-api-key", value))),
         AuthScheme::GoogleApiKey => (url, Some(("x-goog-api-key", value))),
+        AuthScheme::SubscriptionToken => (url, Some(("x-subscription-token", value))),
         AuthScheme::TelegramBot => (telegram_url(url, &value)?, None),
         AuthScheme::WebhookUrl => (webhook_url(&url, &value)?, None),
     };
@@ -904,6 +907,7 @@ fn provider(shared: &Shared, session: &Session, call: ProviderCall, stream: bool
         url,
         header,
         anthropic_version: call.anthropic_version,
+        accept_json: call.auth == AuthScheme::SubscriptionToken,
         body: call.body,
         content_type: "application/json",
         expect: None,
@@ -996,6 +1000,7 @@ fn git(shared: &Shared, session: &Session, call: GitCall, service: GitService) -
         url,
         header: Some(("authorization", value)),
         anthropic_version: None,
+        accept_json: false,
         body: call.request,
         content_type,
         expect: Some(expect),
@@ -1122,6 +1127,9 @@ async fn request(http: &reqwest::Client, out: Outbound) -> Result<reqwest::Respo
     }
     if let Some(version) = out.anthropic_version {
         request = request.header("anthropic-version", version);
+    }
+    if out.accept_json {
+        request = request.header(reqwest::header::ACCEPT, "application/json");
     }
     if let Some(expect) = out.expect {
         // Some forges serve git only to clients that name themselves git.
