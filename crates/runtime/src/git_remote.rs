@@ -1,8 +1,9 @@
-//! Pushing and fetching branches of the project's repository for the native
-//! run engine: a [`ToolHost`] whose `git_push` sends a local branch or tag to
-//! the branch or tag of the same name on one of the repository's HTTPS
-//! remotes, as `git push` does, and whose `git_fetch` brings a remote branch into its
-//! remote-tracking branch, as `git fetch` does.
+//! Pushing and fetching branches and tags of the project's repository for
+//! the native run engine: a [`ToolHost`] whose `git_push` sends a local
+//! branch or tag to the branch or tag of the same name on one of the
+//! repository's HTTPS remotes, as `git push` does, and whose `git_fetch`
+//! brings a remote branch into its remote-tracking branch, or a remote tag
+//! into the local tag of the same name, as `git fetch` does.
 //!
 //! Both reach a forge with the user's token, so the tools are denied until
 //! the user permits them on the conversation, need the conversation's
@@ -18,7 +19,7 @@
 use crate::{
     extension_host::{
         Interrupt, git_fetch as fetching,
-        git_push::{self as repository, PushKind, PushTarget, Pushed, Tracked},
+        git_push::{self as repository, Named, PushTarget, RefKind, Tracked},
     },
     gateway::Pushes,
     tools::{ToolHost, ToolListing, ToolOutput, ToolRequest, ToolScope, ToolSpec},
@@ -82,6 +83,12 @@ pub enum RemoteError {
         "the server already has tag {0}, at a different object; tags are never replaced, so delete or rename one of them"
     )]
     TagExists(String),
+    #[error(
+        "a local tag {0} already exists at a different object than the remote's; tags are never replaced, so delete or rename the local one first"
+    )]
+    LocalTagExists(String),
+    #[error("the remote has no tag named {tag}")]
+    NoRemoteTag { tag: String },
     #[error("remote names may hold only letters, digits, `.`, `_` and `-`")]
     RemoteName,
     #[error("the repository has no remote named {0}")]
@@ -185,7 +192,8 @@ impl crate::error::Classified for RemoteError {
             | Self::NoTag(_)
             | Self::NoRemote(_)
             | Self::NoRepository
-            | Self::NoRemoteBranch { .. } => ErrorKind::NotFound,
+            | Self::NoRemoteBranch { .. }
+            | Self::NoRemoteTag { .. } => ErrorKind::NotFound,
             Self::NotApproved | Self::NoCredential { .. } | Self::Refused { .. } => {
                 ErrorKind::PermissionDenied
             }
@@ -221,6 +229,7 @@ impl crate::error::Classified for RemoteError {
             Self::Moved(_)
             | Self::NotFastForward(_)
             | Self::TagExists(_)
+            | Self::LocalTagExists(_)
             | Self::Rejected { .. }
             | Self::Diverged(_)
             | Self::TrackingMoved(_) => ErrorKind::Conflict,
@@ -246,11 +255,12 @@ impl RemoteHost {
     fn fetch_spec() -> ToolSpec {
         ToolSpec {
             name: FETCH.into(),
-            description: "Fetch a branch from one of the project's HTTPS git remotes into its remote-tracking branch, like `git fetch <remote> <branch>` with the remote's usual refs/heads/*:refs/remotes/<remote>/* mapping. Only the remote-tracking branch (such as origin/main) and the object store change; local branches and the working tree are left alone. The user approves each call. Refused when the repository has a reference-transaction hook, is shallow or a partial clone, or the remote's URL is not HTTPS.".into(),
+            description: "Fetch a branch from one of the project's HTTPS git remotes into its remote-tracking branch, like `git fetch <remote> <branch>` with the remote's usual refs/heads/*:refs/remotes/<remote>/* mapping, or a tag into the local tag of the same name, like `git fetch <remote> tag <tag>`. Only the remote-tracking branch (such as origin/main) or the new tag and the object store change; local branches and the working tree are left alone, and an existing local tag at another object is never replaced. The user approves each call. Refused when the repository has a reference-transaction hook, is shallow or a partial clone, or the remote's URL is not HTTPS.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "branch": {"type": "string", "description": "The branch's name on the remote, such as main. Defaults to the branch the current branch merges from, else the current branch's own name."},
+                    "branch": {"type": "string", "description": "The branch's name on the remote, such as main. Defaults to the branch the current branch merges from, else the current branch's own name, unless `tag` is given."},
+                    "tag": {"type": "string", "description": "A tag to fetch instead of a branch, such as v1.2, with the commits it needs."},
                     "remote": {"type": "string", "description": "The remote to fetch from. Defaults to the current branch's configured remote, else origin."}
                 },
                 "additionalProperties": false
@@ -291,9 +301,10 @@ impl RemoteHost {
             return Err(RemoteError::NotApproved);
         }
         let args = &request.arguments;
-        if let Some(key) = args.keys().find(|key| {
-            !(matches!(key.as_str(), "branch" | "remote") || !fetch && key.as_str() == "tag")
-        }) {
+        if let Some(key) = args
+            .keys()
+            .find(|key| !matches!(key.as_str(), "branch" | "tag" | "remote"))
+        {
             return Err(RemoteError::Unknown(key.clone()));
         }
         let branch = text(args, "branch")?;
@@ -303,12 +314,12 @@ impl RemoteHost {
         // Dropping this future (a cancelled run) stops the repository work.
         let interrupt = Arc::new(AtomicBool::new(false));
         let _stop = Interrupt(Arc::clone(&interrupt));
+        if branch.is_some() && tag.is_some() {
+            return Err(RemoteError::BranchAndTag);
+        }
         if fetch {
-            self.fetch(root, branch, remote, interrupt).await
+            self.fetch(root, branch, tag, remote, interrupt).await
         } else {
-            if branch.is_some() && tag.is_some() {
-                return Err(RemoteError::BranchAndTag);
-            }
             self.push(root, branch, tag, remote, interrupt).await
         }
     }
@@ -344,12 +355,13 @@ impl RemoteHost {
         &self,
         root: PathBuf,
         branch: Option<String>,
+        tag: Option<String>,
         remote: Option<String>,
         interrupt: Arc<AtomicBool>,
     ) -> Result<Value, RemoteError> {
         let target = blocking({
             let (root, interrupt) = (root.clone(), Arc::clone(&interrupt));
-            move || fetching::target(root, branch.as_deref(), remote.as_deref(), &interrupt)
+            move || fetching::target(root, named(&branch, &tag), remote.as_deref(), &interrupt)
         })
         .await?;
         let (mut broker, call) = self
@@ -358,12 +370,20 @@ impl RemoteHost {
         let service = Service::UploadPack;
         let advertisement = broker.call(service, call(None)).await?;
         let advertised = a206_git_push::parse_advertisement(&advertisement, service, target.hash)?;
-        let tip =
-            advertised
-                .get(&target.reference())
-                .ok_or_else(|| RemoteError::NoRemoteBranch {
-                    branch: target.branch.clone(),
-                })?;
+        let tip = advertised
+            .get(&target.reference())
+            .ok_or_else(|| match target.kind {
+                RefKind::Branch => RemoteError::NoRemoteBranch {
+                    branch: target.name.clone(),
+                },
+                RefKind::Tag => RemoteError::NoRemoteTag {
+                    tag: target.name.clone(),
+                },
+            })?;
+        // Refused before anything is downloaded; checked again when stored.
+        if target.kind == RefKind::Tag && target.previous.is_some_and(|local| local != tip) {
+            return Err(RemoteError::LocalTagExists(target.name.clone()));
+        }
         let needed = blocking({
             let (root, target, interrupt) = (root.clone(), target.clone(), Arc::clone(&interrupt));
             move || fetching::needs_pack(root, &target, tip, LIMITS, &interrupt)
@@ -383,20 +403,32 @@ impl RemoteHost {
         })
         .await?;
         tracing::info!(
-            commit = %tip,
+            commit = %fetched.commit,
+            reference = %target.tracking(),
             objects = fetched.objects,
-            "git_fetch updated a remote-tracking branch"
+            "git_fetch updated a reference"
         );
-        Ok(json!({
-            "branch": target.branch,
-            "remote": target.remote,
-            "tracking_branch": format!("{}/{}", target.remote, target.branch),
-            "from": target.previous.map(|id| id.to_string()),
-            "commit": tip.to_string(),
-            "objects": fetched.objects,
-            "up_to_date": target.previous == Some(tip),
-            "forced_update": fetched.forced,
-        }))
+        let up_to_date = target.previous == Some(tip);
+        Ok(match target.kind {
+            RefKind::Branch => json!({
+                "branch": target.name,
+                "remote": target.remote,
+                "tracking_branch": format!("{}/{}", target.remote, target.name),
+                "from": target.previous.map(|id| id.to_string()),
+                "commit": tip.to_string(),
+                "objects": fetched.objects,
+                "up_to_date": up_to_date,
+                "forced_update": fetched.forced,
+            }),
+            RefKind::Tag => json!({
+                "tag": target.name,
+                "remote": target.remote,
+                "annotated": tip != fetched.commit,
+                "commit": fetched.commit.to_string(),
+                "objects": fetched.objects,
+                "up_to_date": up_to_date,
+            }),
+        })
     }
 
     async fn push(
@@ -409,13 +441,7 @@ impl RemoteHost {
     ) -> Result<Value, RemoteError> {
         let target = blocking({
             let (root, interrupt) = (root.clone(), Arc::clone(&interrupt));
-            move || {
-                let pushed = match &tag {
-                    Some(tag) => Pushed::Tag(tag),
-                    None => Pushed::Branch(branch.as_deref()),
-                };
-                repository::target(root, pushed, remote.as_deref(), &interrupt)
-            }
+            move || repository::target(root, named(&branch, &tag), remote.as_deref(), &interrupt)
         })
         .await?;
         let (mut broker, call) = self.session(&target.url, a206_broker::GIT_VERSION).await?;
@@ -472,7 +498,7 @@ impl RemoteHost {
         result.insert("objects".into(), packed.objects.into());
         result.insert("bytes".into(), packed.pack.len().into());
         // Git keeps no remote-tracking reference for tags.
-        if target.kind == PushKind::Branch {
+        if target.kind == RefKind::Branch {
             let tracking = record(root, &target).await?;
             result.insert(
                 "tracking_branch".into(),
@@ -487,14 +513,22 @@ impl RemoteHost {
     }
 }
 
+/// A tag when one is given, else the branch (or its default).
+fn named<'a>(branch: &'a Option<String>, tag: &'a Option<String>) -> Named<'a> {
+    match tag {
+        Some(tag) => Named::Tag(tag),
+        None => Named::Branch(branch.as_deref()),
+    }
+}
+
 /// What a push result says about what was pushed.
 fn pushed(target: &PushTarget) -> Map<String, Value> {
     let mut result = Map::new();
     match target.kind {
-        PushKind::Branch => {
+        RefKind::Branch => {
             result.insert("branch".into(), target.name.clone().into());
         }
-        PushKind::Tag => {
+        RefKind::Tag => {
             result.insert("tag".into(), target.name.clone().into());
             result.insert("annotated".into(), (!target.tags.is_empty()).into());
         }

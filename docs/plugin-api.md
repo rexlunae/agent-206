@@ -418,8 +418,8 @@ refuses any tag, and so does `tag.gpgSign`, with which git signs every tag
 `tag.forceSignAnnotated` yields to an explicit annotation, as in git. `HEAD`
 is refused as a name (`invalid`), since it would be ambiguous with `HEAD`
 itself. Listing follows a symbolic tag to the object it names, and lists a
-tag whose object is missing without a commit. A tag is pushed with the
-native `git_push` tool's `tag` argument
+tag whose object is missing without a commit. A tag is pushed or fetched
+with the native `git_push` and `git_fetch` tools' `tag` argument
 ([run-engine.md](run-engine.md#pushing-git-branches-git_push)).
 
 ### Staging

@@ -656,7 +656,8 @@ are left alone; merging or switching is up to the model's other tools.
 
 Arguments are `branch` (default: the branch the current branch merges from,
 when `branch.<name>.remote` is that remote, else the current branch's own
-name) and `remote` (default: the current branch's remote, else `origin`).
+name), or `tag` instead of it, and `remote` (default: the current branch's
+remote, else `origin`).
 
 - The remote's `url` follows the push rules (HTTPS only, `insteadOf`
   rewrites refused, included configuration refused). The remote's
@@ -687,8 +688,18 @@ name) and `remote` (default: the current branch's remote, else `origin`).
   `fetch: fast-forward` or `fetch: forced-update`.
 
 The result names the branch, remote, `tracking_branch`, the old and new
-commits and how many objects arrived. Not yet: ssh remotes, several branches
-or tags at once, pruning, and packs over about 4 MiB.
+commits and how many objects arrived.
+
+A `tag` is fetched into the local tag of the same name, like
+`git fetch <remote> tag <tag>`. No refspec applies and no identity is
+needed. A local tag of that name at another object is never replaced
+(`Conflict`, before anything is downloaded); one at the same object is
+`up_to_date`. The pack's completeness is checked through the tag's tag
+objects (at most 10) to its commit, and a tag naming a tree or blob is
+refused. The result names the `tag`, whether it is `annotated` and the
+`commit` it leads to. Not yet: ssh remotes, several branches or tags at
+once (`--tags`, tags that follow a fetched branch), pruning, and packs over
+about 4 MiB.
 
 ## Pull requests (`pull_requests`, `pull_request`, `pull_request_create`, `pull_request_comment`, `pull_request_line_comment`, `pull_request_merge`)
 

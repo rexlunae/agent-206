@@ -1,7 +1,7 @@
 //! The repository side of the native `git_fetch` tool (see
-//! [`crate::git_remote`]): which remote branch is fetched from where, what
-//! this repository tells the server it has, and storing what arrives under
-//! the remote-tracking branch. Like a push, the repository is opened as the
+//! [`crate::git_remote`]): which remote branch or tag is fetched from where,
+//! what this repository tells the server it has, and storing what arrives
+//! under the remote-tracking branch, or for a tag under the local tag. Like a push, the repository is opened as the
 //! git host calls open it, nothing it configures runs, and where git would
 //! run a program, rewrite the URL or map the branch differently, the fetch
 //! is refused.
@@ -10,8 +10,10 @@ use super::{
     git_branch::branch_name,
     git_commit::{Settings, has_hooks},
     git_push::{
-        MAX_ANCESTRY, ancestor, head_branch, host, peeled, remote_name, remote_url, settings,
+        MAX_ANCESTRY, Named, RefKind, ancestor, direct, head_branch, host, peeled, remote_name,
+        remote_url, settings, tag_chain,
     },
+    git_tag::tag_name,
 };
 use crate::git_remote::RemoteError;
 use a206_git_push::{Limits, MAX_HAVES, PackError, Stored};
@@ -27,42 +29,74 @@ use std::{path::PathBuf, sync::atomic::AtomicBool};
 /// Hooks git runs for a fetch.
 const FETCH_HOOKS: [&str; 1] = ["reference-transaction"];
 
-/// A remote branch to fetch and where it is kept.
+/// A remote branch or tag to fetch and where it is kept.
 #[derive(Debug, Clone)]
 pub(crate) struct FetchTarget {
-    /// The branch's name on the remote, such as `main`.
-    pub branch: String,
+    pub kind: RefKind,
+    /// The branch's or tag's name on the remote, such as `main` or `v1.2`.
+    pub name: String,
     pub remote: String,
     /// The repository URL the remote fetches from.
     pub url: url::Url,
     pub hash: gix::hash::Kind,
-    /// Whether the remote's fetch refspec allows a forced update (`+`).
+    /// Whether the remote's fetch refspec allows a forced update (`+`);
+    /// never for a tag.
     pub force: bool,
-    /// The remote-tracking branch's commit before the fetch, if it exists.
+    /// The remote-tracking branch's commit (for a tag, the local tag's
+    /// object) before the fetch, if it exists.
     pub previous: Option<ObjectId>,
     /// Local commits whose history is complete here: the remote-tracking
-    /// branch, the branch of the same name and HEAD.
+    /// branch, the branch of the same name and HEAD (for a tag, HEAD).
     pub tips: Vec<ObjectId>,
     /// Commits to tell the server about, newest first.
     pub haves: Vec<ObjectId>,
 }
 impl FetchTarget {
-    /// The reference the branch is on the server.
+    /// The reference the branch or tag is on the server.
     pub fn reference(&self) -> String {
-        format!("refs/heads/{}", self.branch)
+        match self.kind {
+            RefKind::Branch => format!("refs/heads/{}", self.name),
+            RefKind::Tag => format!("refs/tags/{}", self.name),
+        }
     }
-    /// The remote-tracking branch, such as `refs/remotes/origin/main`.
+    /// Where it is kept here: the remote-tracking branch, such as
+    /// `refs/remotes/origin/main`, or the local tag of the same name, as
+    /// `git fetch <remote> tag <tag>` does.
     pub fn tracking(&self) -> String {
-        format!("refs/remotes/{}/{}", self.remote, self.branch)
+        match self.kind {
+            RefKind::Branch => format!("refs/remotes/{}/{}", self.remote, self.name),
+            RefKind::Tag => self.reference(),
+        }
+    }
+    /// What `tracking` points at now: a branch's commit, or the object a
+    /// tag names.
+    fn current(&self, repo: &gix::Repository) -> Result<Option<ObjectId>, RemoteError> {
+        match self.kind {
+            RefKind::Branch => peeled(repo, &self.tracking()),
+            RefKind::Tag => direct(repo, &self.tracking()),
+        }
+        .map_err(host)
+    }
+    /// The commit `tip` leads to, through a tag's tag objects; `None` when
+    /// one of those objects is missing here.
+    fn commit(
+        &self,
+        repo: &gix::Repository,
+        tip: ObjectId,
+    ) -> Result<Option<ObjectId>, RemoteError> {
+        match self.kind {
+            RefKind::Branch => Ok(Some(tip)),
+            RefKind::Tag => Ok(tag_chain(repo, tip, &self.name)?.map(|(commit, _)| commit)),
+        }
     }
 }
 
-/// Resolve `branch` (default: what the current branch merges from, else
-/// its own name) and `remote` (default: the current branch's remote, else
-/// `origin`) in the project at `root`.
+/// Resolve what to fetch (a branch defaults to what the current branch
+/// merges from, else its own name) and `remote` (default: the current
+/// branch's remote, else `origin`) in the project at `root`.
 pub(crate) fn target(
     root: PathBuf,
-    branch: Option<&str>,
+    fetched: Named<'_>,
     remote: Option<&str>,
     interrupt: &AtomicBool,
 ) -> Result<FetchTarget, RemoteError> {
@@ -76,8 +110,10 @@ pub(crate) fn target(
     if repo.git_dir().join("shallow").exists() {
         return Err(RemoteError::Shallow);
     }
-    // The remote-tracking branch's reflog records who fetched.
-    settings.identity().map_err(host)?;
+    if matches!(fetched, Named::Branch(_)) {
+        // The remote-tracking branch's reflog records who fetched.
+        settings.identity().map_err(host)?;
+    }
     let current = head_branch(&repo)?;
     let remote = remote_name(&settings, current.as_deref().unwrap_or_default(), remote)?;
     if settings
@@ -89,9 +125,10 @@ pub(crate) fn target(
     {
         return Err(RemoteError::PartialClone);
     }
-    let branch = match (branch, &current) {
-        (Some(name), _) => name.to_owned(),
-        (None, Some(local)) => settings
+    let branch = match (fetched, &current) {
+        (Named::Tag(tag), _) => return tag_target(&repo, &settings, tag, remote, interrupt),
+        (Named::Branch(Some(name)), _) => name.to_owned(),
+        (Named::Branch(None), Some(local)) => settings
             .string(&format!("branch.{local}.merge"))
             .filter(|_| {
                 settings
@@ -105,7 +142,7 @@ pub(crate) fn target(
                     .map(str::to_owned)
             })
             .unwrap_or_else(|| local.clone()),
-        (None, None) => {
+        (Named::Branch(None), None) => {
             return Err(host(unsupported(
                 "HEAD is not on a branch; name the branch to fetch",
             )));
@@ -133,7 +170,8 @@ pub(crate) fn target(
     tips.dedup();
     let haves = haves(&repo, &tips, interrupt)?;
     Ok(FetchTarget {
-        branch,
+        kind: RefKind::Branch,
+        name: branch,
         remote,
         url,
         hash: repo.object_hash(),
@@ -142,6 +180,37 @@ pub(crate) fn target(
         tips,
         haves,
     })
+}
+
+/// [`target`] for a tag: kept under the local tag of the same name, which
+/// must not already name another object. No refspec applies, as for `git
+/// fetch <remote> tag <tag>`, and no reflog records who fetched.
+fn tag_target(
+    repo: &gix::Repository,
+    settings: &Settings,
+    tag: &str,
+    remote: String,
+    interrupt: &AtomicBool,
+) -> Result<FetchTarget, RemoteError> {
+    tag_name(tag).ok_or(RemoteError::TagName)?;
+    let url = fetch_url(settings, &remote)?;
+    let mut target = FetchTarget {
+        kind: RefKind::Tag,
+        name: tag.to_owned(),
+        remote,
+        url,
+        hash: repo.object_hash(),
+        force: false,
+        previous: None,
+        tips: vec![],
+        haves: vec![],
+    };
+    target.previous = target.current(repo)?;
+    // An unborn HEAD has no commit; a HEAD that cannot be read fails.
+    let head = repo.head().map_err(|e| host(git_failure("head", &e)))?;
+    target.tips.extend(head.id().map(|id| id.detach()));
+    target.haves = haves(repo, &target.tips, interrupt)?;
+    Ok(target)
 }
 
 /// The HTTPS URL `remote` fetches from; one that a setting would rewrite is
@@ -207,8 +276,16 @@ pub(crate) fn needs_pack(
     interrupt: &AtomicBool,
 ) -> Result<bool, RemoteError> {
     let repo = open(root, interrupt).map_err(host)?;
-    match a206_git_push::check_complete(&repo, tip, target.tips.iter().copied(), limits, interrupt)
-    {
+    let Some(commit) = target.commit(&repo, tip)? else {
+        return Ok(true);
+    };
+    match a206_git_push::check_complete(
+        &repo,
+        commit,
+        target.tips.iter().copied(),
+        limits,
+        interrupt,
+    ) {
         Ok(()) => Ok(false),
         Err(PackError::Incomplete) => Ok(true),
         Err(error) => Err(error.into()),
@@ -222,6 +299,8 @@ pub(crate) struct Fetched {
     /// Whether the remote-tracking branch moved to a commit that does not
     /// contain its previous one.
     pub forced: bool,
+    /// The commit fetched: the tip, or the commit a tag leads to.
+    pub commit: ObjectId,
 }
 
 /// Store `pack` (if any), check that `tip` is complete, and point the
@@ -241,7 +320,7 @@ pub(crate) fn store(
     };
     let objects = stored.as_ref().map_or(0, |stored| stored.objects);
     match record(root, target, tip, limits, interrupt) {
-        Ok(forced) => {
+        Ok((forced, commit)) => {
             if let Some(stored) = stored {
                 // The reference now keeps the objects; a `.keep` file left
                 // behind only stops git from repacking them.
@@ -253,7 +332,11 @@ pub(crate) fn store(
                     );
                 }
             }
-            Ok(Fetched { objects, forced })
+            Ok(Fetched {
+                objects,
+                forced,
+                commit,
+            })
         }
         Err(error) => {
             if let Some(stored) = stored {
@@ -276,28 +359,41 @@ fn discard(stored: Stored) {
     }
 }
 
-/// Check `tip` is complete and move the remote-tracking branch to it, only
-/// from the value it had when the fetch began. `true` when the move was a
-/// forced update.
+/// Check `tip` is complete and move the remote-tracking branch (or create
+/// the tag) to it, only from the value it had when the fetch began. Whether
+/// the move was a forced update, and the commit fetched.
 fn record(
     root: PathBuf,
     target: &FetchTarget,
     tip: ObjectId,
     limits: Limits,
     interrupt: &AtomicBool,
-) -> Result<bool, RemoteError> {
+) -> Result<(bool, ObjectId), RemoteError> {
     // Opened again so the new pack is seen.
     let repo = open(root, interrupt).map_err(host)?;
-    a206_git_push::check_complete(&repo, tip, target.tips.iter().copied(), limits, interrupt)?;
+    let commit = target
+        .commit(&repo, tip)?
+        .ok_or(RemoteError::Pack(PackError::Incomplete))?;
+    a206_git_push::check_complete(
+        &repo,
+        commit,
+        target.tips.iter().copied(),
+        limits,
+        interrupt,
+    )?;
     let forced = match target.previous {
         None => false,
         // Nothing to write, as long as nothing else moved it meanwhile.
         Some(previous) if previous == tip => {
-            return if peeled(&repo, &target.tracking()).map_err(host)? == Some(previous) {
-                Ok(false)
+            return if target.current(&repo)? == Some(previous) {
+                Ok((false, commit))
             } else {
                 Err(RemoteError::TrackingMoved(target.tracking()))
             };
+        }
+        // A tag is never replaced.
+        Some(_) if target.kind == RefKind::Tag => {
+            return Err(RemoteError::LocalTagExists(target.name.clone()));
         }
         Some(previous) => {
             match ancestor(&repo, previous, tip, MAX_ANCESTRY, interrupt).map_err(host)? {
@@ -308,11 +404,16 @@ fn record(
         }
     };
     let settings = settings(&repo).map_err(host)?;
-    let (name, email) = settings.identity().map_err(host)?;
-    let signature = gix::actor::Signature {
-        name,
-        email,
-        time: gix::date::Time::now_local_or_utc(),
+    // Required for a branch, whose reflog records who fetched (checked when
+    // the fetch began); a tag uses it when set, as git does.
+    let signature = match settings.identity() {
+        Ok((name, email)) => Some(gix::actor::Signature {
+            name,
+            email,
+            time: gix::date::Time::now_local_or_utc(),
+        }),
+        Err(_) if target.kind == RefKind::Tag => None,
+        Err(e) => return Err(host(e)),
     };
     let tracking = target.tracking();
     let full: gix::refs::FullName = tracking
@@ -326,6 +427,8 @@ fn record(
                 force_create_reflog: false,
                 message: if forced {
                     "fetch: forced-update".into()
+                } else if target.kind == RefKind::Tag {
+                    "fetch: storing tag".into()
                 } else {
                     "fetch: fast-forward".into()
                 },
@@ -340,10 +443,11 @@ fn record(
         deref: false,
     };
     let mut time = Default::default();
-    match repo.edit_references_as([edit], Some(signature.to_ref(&mut time))) {
-        Ok(_) => Ok(forced),
-        // Another fetch or push moved it since this one began.
-        Err(_) if peeled(&repo, &tracking).map_err(host)? != target.previous => {
+    let committer = signature.as_ref().map(|s| s.to_ref(&mut time));
+    match repo.edit_references_as([edit], committer) {
+        Ok(_) => Ok((forced, commit)),
+        // Another fetch, push or tag moved it since this one began.
+        Err(_) if target.current(&repo)? != target.previous => {
             Err(RemoteError::TrackingMoved(tracking))
         }
         Err(e) => Err(host(git_failure("fetch", &e))),
