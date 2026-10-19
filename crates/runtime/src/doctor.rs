@@ -130,7 +130,10 @@ pub fn evaluate(facts: &Facts) -> DoctorReport {
         None if target.is_some() => checks.push(check(Finding::WorkspaceUnknown)),
         None => {}
     }
-    DoctorReport { checks }
+    DoctorReport {
+        checks,
+        repairs: repairs(facts),
+    }
 }
 
 fn vault_checks(facts: &Facts, gateway_running: bool, checks: &mut Vec<Check>) {
@@ -362,12 +365,15 @@ pub enum RepairError {
     UnexpectedReply,
     #[error("permission repairs are not available on this platform")]
     Unsupported,
+    #[error("this repair is not offered now; run the health checks again")]
+    NotOffered,
 }
 impl crate::error::Classified for RepairError {
     fn kind(&self) -> Option<a206_core::ErrorKind> {
         match self {
             Self::Refused(report) => Some(report.kind),
             Self::Gateway(error) => error.kind(),
+            Self::NotOffered => Some(a206_core::ErrorKind::Conflict),
             _ => None,
         }
     }
@@ -663,27 +669,54 @@ impl crate::error::Classified for DoctorError {
     }
 }
 
-/// [`gather`] and [`evaluate`] on a thread with its own Tokio runtime, for
-/// clients whose executor is not Tokio (the desktop and terminal UI).
-pub async fn check_detached(
-    root: PathBuf,
-    remote: Option<String>,
-) -> Result<DoctorReport, DoctorError> {
+/// Run `work` on a thread with its own Tokio runtime, for clients whose
+/// executor is not Tokio (the desktop and terminal UI).
+async fn detached<T, F>(work: impl FnOnce() -> F + Send + 'static) -> Result<T, DoctorError>
+where
+    T: Send + 'static,
+    F: std::future::Future<Output = T>,
+{
     let (reply, receiver) = tokio::sync::oneshot::channel();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(DoctorError::Runtime)?;
-    // Deliberately detached: it ends after one report, and a caller that
+    // Deliberately detached: it ends after one result, and a caller that
     // stopped waiting needs none.
     std::thread::spawn(move || {
+        reply.send(runtime.block_on(work())).ok();
+    });
+    receiver.await.map_err(|_| DoctorError::Worker)
+}
+
+/// [`gather_for`] and [`evaluate`] off the caller's executor, for the
+/// gateway the client already talks to (`active`), or else the saved setup
+/// with `remote` overriding it, read on the worker.
+pub async fn check_detached(
+    root: PathBuf,
+    active: Option<GatewayTarget>,
+    remote: Option<String>,
+) -> Result<DoctorReport, DoctorError> {
+    detached(move || async move {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |elapsed| elapsed.as_secs());
-        let facts = runtime.block_on(gather(&root, remote, now));
-        reply.send(evaluate(&facts)).ok();
-    });
-    receiver.await.map_err(|_| DoctorError::Worker)
+        let facts = match active {
+            Some(target) => gather_for(&root, Ok(Some(target)), now).await,
+            None => gather(&root, remote, now).await,
+        };
+        evaluate(&facts)
+    })
+    .await
+}
+
+/// [`repair`] off the caller's executor.
+pub async fn repair_detached(
+    root: PathBuf,
+    remote: Option<String>,
+    fix: Repair,
+) -> Result<Result<(), RepairError>, DoctorError> {
+    detached(move || async move { repair(&root, remote, &fix).await }).await
 }
 
 #[cfg(test)]
