@@ -49,9 +49,12 @@ impl SshHost {
             host.as_str()
         };
         let host = if bare.contains(':') {
-            bare.parse::<std::net::Ipv6Addr>()
+            // Written as `Ipv6Addr` does, so every spelling of one address
+            // names the same server.
+            let address = bare
+                .parse::<std::net::Ipv6Addr>()
                 .map_err(|_| SshHostError::Shape)?;
-            format!("[{bare}]")
+            format!("[{address}]")
         } else {
             let valid = !bare.is_empty()
                 && bare.len() <= MAX_HOST
@@ -97,6 +100,10 @@ mod tests {
             Ok(format!("ssh://{host}:2222"))
         );
         assert_eq!(parse("ssh://[::1]:22"), Ok("ssh://[::1]:22".into()));
+        assert_eq!(
+            SshHost::new("[0:0:0:0:0:0:0:1]", 22).map(|h| h.origin()),
+            parse("ssh://[0:0:0:0:0:0:0:1]")
+        );
         assert_eq!(
             SshHost::new("::1", 22).map(|h| h.origin()),
             Ok("ssh://[::1]:22".into())

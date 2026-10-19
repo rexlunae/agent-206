@@ -202,7 +202,10 @@ fn check_userauth(data: &[u8], algorithm: &[u8], blob: &[u8]) -> Result<(), SshK
     if take(&mut rest, 1) != Some(&[USERAUTH_REQUEST][..]) {
         return Err(NotUserAuth(UserAuthDefect::NotRequest));
     }
-    string(&mut rest).ok_or(NotUserAuth(UserAuthDefect::User))?;
+    // A client always names the user it logs in as.
+    string(&mut rest)
+        .filter(|user| !user.is_empty())
+        .ok_or(NotUserAuth(UserAuthDefect::User))?;
     if string(&mut rest) != Some(b"ssh-connection") {
         return Err(NotUserAuth(UserAuthDefect::Service));
     }
@@ -300,6 +303,20 @@ pub(crate) mod tests {
         assert!(matches!(
             check(&userauth(public, b"password", None)),
             Err(SshKeyError::NotUserAuth(_))
+        ));
+        // A request must name its user.
+        let mut nameless = Vec::new();
+        put(&mut nameless, uuid::Uuid::new_v4().as_bytes());
+        nameless.push(USERAUTH_REQUEST);
+        put(&mut nameless, b"");
+        put(&mut nameless, b"ssh-connection");
+        put(&mut nameless, b"publickey");
+        nameless.push(1);
+        put(&mut nameless, algorithm);
+        put(&mut nameless, &blob);
+        assert!(matches!(
+            check(&nameless),
+            Err(SshKeyError::NotUserAuth(UserAuthDefect::User))
         ));
         let mut trailing = userauth(public, b"publickey", None);
         trailing.push(0);

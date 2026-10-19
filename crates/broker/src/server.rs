@@ -234,7 +234,7 @@ fn origins(destinations: Vec<String>) -> Result<Vec<String>, BrokerError> {
     destinations
         .iter()
         .map(|d| {
-            if d.starts_with("ssh:") {
+            if d.get(..4).is_some_and(|s| s.eq_ignore_ascii_case("ssh:")) {
                 return a206_core::ssh_host::SshHost::parse(d)
                     .map(|host| host.origin())
                     .map_err(|_| BrokerError::Invalid(InvalidRequest::Destination));

@@ -3094,7 +3094,7 @@ async fn a_bound_ssh_key_signs_authentication_for_a_paired_gateway_only() {
     let (name, token) = (random(), random());
     let host = format!("{}.test", uuid::Uuid::new_v4().simple());
     let (private, public) = a206_vault::generate_ssh_key(&random()).unwrap();
-    let mut held = meta(vec![format!("ssh://{}:2222/", host.to_uppercase())]);
+    let mut held = meta(vec![format!("SSH://{}:2222/", host.to_uppercase())]);
     held.kind = CredentialKind::SshKey;
     a.call(Request::PutCredential {
         name: name.clone(),
