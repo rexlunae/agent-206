@@ -487,7 +487,9 @@ impl Sessions {
         }
     }
 
-    /// Give a running session's terminal a new window size.
+    /// Give a running session's terminal a new window size. A session
+    /// being stopped is refused at once; one whose command exits on its own
+    /// meanwhile may still take the size, as a terminal window would.
     pub(super) fn resize(&self, thread: Id, id: Id, size: Size) -> Result<(), ExecError> {
         let map = self.map();
         let session = owned(&map, thread, id)?;
@@ -495,7 +497,8 @@ impl Sessions {
             .terminal
             .as_ref()
             .ok_or(ExecError::ResizeNeedsTerminal)?;
-        if session.status().finished() {
+        // `kill` takes the stop signal before the status catches up.
+        if session.stop.is_none() || session.status().finished() {
             return Err(ExecError::SessionFinished);
         }
         resize(window, size).map_err(ExecError::Resize)
@@ -809,6 +812,33 @@ mod tests {
             },
         );
         stopped
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn a_session_being_stopped_cannot_be_resized() {
+        let sessions = Sessions::default();
+        let scope = scope(Id::new_v4(), &[Capability::Execute]);
+        let _stopped = hold(&sessions, &scope, Status::Running);
+        let pair = super::super::terminal::Pair::open(Size::default()).unwrap();
+        let id = {
+            let mut map = sessions.map();
+            let (id, session) = map.iter_mut().next().unwrap();
+            session.terminal = Some(pair.controller);
+            *id
+        };
+        let size = Size {
+            columns: 100,
+            rows: 30,
+        };
+        sessions.resize(scope.thread, id, size).unwrap();
+        sessions.kill(scope.thread, id).unwrap();
+        // Its status still reads running until the supervisor catches up.
+        assert!(!sessions.map()[&id].status().finished());
+        assert!(matches!(
+            sessions.resize(scope.thread, id, size),
+            Err(ExecError::SessionFinished)
+        ));
     }
 
     #[tokio::test]
