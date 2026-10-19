@@ -1,7 +1,7 @@
 id = "agent206.workspace"
 name = "Workspace files"
 description = "Lists, finds, searches, reads and edits files in a project workspace, and shows an overview panel."
-version = "0.6.0"
+version = "0.7.0"
 abi = 2
 capabilities = ["read_workspace", "write_workspace"]
 
@@ -158,3 +158,14 @@ description = "Check that the patch applies without writing anything. Defaults t
 id = "overview"
 title = "Workspace overview"
 capabilities = ["read_workspace"]
+
+[[triggers]]
+name = "file_changed"
+description = "Fires when a file in the project is created, changed or removed, and reports the start of its new text. The first check only records the file."
+capabilities = ["read_workspace"]
+
+[[triggers.params]]
+name = "path"
+type = "string"
+description = "File path relative to the workspace root."
+required = true

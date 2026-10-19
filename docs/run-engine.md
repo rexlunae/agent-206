@@ -575,7 +575,7 @@ listing, the result or the conversation. See
 
 ## Pushing git branches (`git_push`)
 
-`runtime/src/git_push.rs` offers `git_push` in conversations with a project
+`runtime/src/git_remote.rs` offers `git_push` in conversations with a project
 once the user has set at least one git credential (Settings, Git credentials,
 or `git_credentials` in `settings --apply`). Each entry names a forge origin
 (`https://host[:port]`), the username the forge expects with a token
@@ -625,8 +625,104 @@ the same name on the remote, like `git push <remote> <branch>`:
 
 The token never reaches the gateway, the model, the conversation or a log.
 Cancelling a call after the pack was sent may leave the server updated. Not
-yet: ssh remotes, force pushes, deleting remote branches, tags, pushing to a
-differently named branch, and fetching.
+yet: ssh remotes, force pushes, deleting remote branches, tags and pushing to a
+differently named branch.
+
+## Fetching git branches (`git_fetch`)
+
+`runtime/src/git_remote.rs` offers `git_fetch` beside `git_push`, under the
+same conditions: a git credential for the forge, the conversation's GitWrite
+grant, and Ask, so the user approves each call. It brings one branch of the
+remote up to date in its remote-tracking branch, like
+`git fetch <remote> <branch>`. Local branches, the index and the working tree
+are left alone; merging or switching is up to the model's other tools.
+
+Arguments are `branch` (default: the branch the current branch merges from,
+when `branch.<name>.remote` is that remote, else the current branch's own
+name) and `remote` (default: the current branch's remote, else `origin`).
+
+- The remote's `url` follows the push rules (HTTPS only, `insteadOf`
+  rewrites refused, included configuration refused). The remote's
+  `remote.<name>.fetch` must be the mapping `git clone` sets up,
+  `refs/heads/*:refs/remotes/<remote>/*`, with or without `+`, and be the
+  remote's only mapping (git would also update what others map to); any
+  other configuration is refused before the forge is asked for anything.
+  Submodule entries in fetched trees are kept as commit ids; the submodules'
+  own commits are not fetched, as git does not fetch them here either.
+- Shallow repositories, partial clones (`extensions.partialClone` or
+  `remote.<name>.promisor`) and a `reference-transaction` hook are refused;
+  `user.name` and `user.email` must be set for the reflog.
+- The gateway asks the vault broker for the server's references and then for
+  a pack (`GitUploadPack`, broker protocol v14), with the token sent as for a
+  push. It tells the server about up to 256 commits it has, newest first,
+  from the remote-tracking branch, the local branch of the same name and
+  HEAD. When the server's commit and everything it reaches are already here,
+  no pack is asked for; when the remote-tracking branch already points at it,
+  the result says `up_to_date`.
+- The pack (side-band or plain) must fit one broker message, the same limits
+  as a push, and is written and indexed by gitoxide into `objects/pack` with
+  a `.keep` file. The gateway then checks the fetched commit's whole history
+  is present; a pack missing anything is removed and the call fails.
+- The remote-tracking branch moves only from the value it had when the fetch
+  began. A new commit that does not contain the old one is a forced update,
+  allowed only with `+` in the refspec and reported as `forced_update`;
+  without it the call fails and the pack is removed. The reflog says
+  `fetch: fast-forward` or `fetch: forced-update`.
+
+The result names the branch, remote, `tracking_branch`, the old and new
+commits and how many objects arrived. Not yet: ssh remotes, several branches
+or tags at once, pruning, and packs over about 4 MiB.
+
+## Reading pull requests (`pull_requests`, `pull_request`)
+
+`runtime/src/forge.rs` offers two read-only tools beside `git_push` and
+`git_fetch`, under the same condition (a git credential for at least one
+forge) and the conversation's GitRead grant. Their host policy is Allow, so
+once the user permits them on the conversation they run without a
+per-call approval; they only send GET requests.
+
+- `pull_requests` lists up to 30 pull requests of the repository, newest
+  first: `state` is `open` (default), `closed` (closed without merging),
+  `merged` or `all`, and `branch` keeps those from one branch of the
+  repository. GitHub lists merged and unmerged closed pull requests
+  together, so for `closed` and `merged` it reads up to 4 pages to find 30.
+  `complete` is false when more may exist.
+- `pull_request` reads one by `number`: its details and description (cut
+  at 8,000 characters), the checks on its head commit and its reviews, at
+  most 100 of each kind. `checks_complete` and `reviews_complete` are false
+  when a list was full or was cut.
+
+Both results are only useful whole JSON (`whole_output`), so instead of the
+gateway cutting the text, the tool leaves out the last pull requests, checks
+or reviews that would take a result past 64 KiB and marks that list
+incomplete.
+
+Both take `remote` (default: the current branch's remote, else `origin`);
+its URL must be an HTTPS repository URL, as for a fetch. Crate `a206-forge`
+describes every forge the same way (state, draft, source and target
+branches, check status and conclusion, review state) and keeps a forge's
+own word in `reported` where it has no counterpart (`unknown`):
+
+| Forge | Pull requests | Checks | Reviews |
+| --- | --- | --- | --- |
+| GitHub (github.com, GitHub Enterprise Server) | pulls | check runs and commit statuses | reviews |
+| GitLab (v4 API) | merge requests (`iid`) | jobs of the head pipeline (allowed failures are `neutral`) | approvals only |
+
+The forge's API comes from the git credential's `forge` (`kind` GitHub or
+GitLab, and `api`, its base URL such as
+`https://git.example/api/v3`). A GitLab served under a path prefix
+(`https://git.example/gitlab/api/v4`) has the prefix removed from remotes
+on the same host. github.com and gitlab.com have bundled
+presets (`https://api.github.com`, `https://gitlab.com/api/v4`). Without
+one the call fails before anything is sent. The vault broker sends the git
+credential's vault credential to the API as a bearer token, so that vault
+credential must also be bound to the API's origin (for github.com,
+`https://api.github.com`). Every text field is cleaned of control
+characters and bounded; what a forge returns was written by other people
+and reaches the model as tool data. A refused token, a missing pull
+request and an answer not shaped like the API's are separate errors. Not
+yet: opening, commenting on or merging pull requests, Gitea or Forgejo,
+pages beyond these, and setting `forge` from the GUI (use `settings --apply`).
 
 ## Web search (`web_search`)
 
@@ -644,7 +740,7 @@ service otherwise), and per service `freshness` and `country` (Brave) or
 refused rather than dropped, unlike RustyClaw's silent per-provider clamping.
 The gateway builds the request and the broker attaches the key for the bound
 origin: `X-Subscription-Token` with `Accept: application/json` for Brave
-(`AuthScheme::SubscriptionToken`, broker v14) and `x-api-key` for Exa. The
+(`AuthScheme::SubscriptionToken`, broker v15) and `x-api-key` for Exa. The
 result is JSON with the service, the query and up to `count` results: title,
 URL, a snippet (Brave, tags removed) or up to 4,000 characters of page text
 (Exa), and the date and author when the service reports them. A refused key

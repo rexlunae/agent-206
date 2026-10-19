@@ -49,6 +49,7 @@ fn calls_for(
         skills_root: store.lock().unwrap().root.join("skills"),
         extension: id.into(),
         effective: effective.iter().copied().collect(),
+        current: None,
         workspace,
         store: Arc::clone(store),
         hosts: Vec::new(),
@@ -906,6 +907,38 @@ async fn revoking_stops_calls_already_running() {
     );
 }
 
+#[tokio::test]
+async fn a_withdrawn_caller_grant_stops_calls_already_running() {
+    let (dir, store) = store();
+    std::fs::write(dir.path().join("note.txt"), "text").unwrap();
+    let mut host = workspace_calls(
+        &store,
+        Some(dir.path().into()),
+        &[Capability::ReadWorkspace],
+    );
+    let ceiling = Arc::new(Mutex::new(Some(BTreeSet::from([
+        Capability::ReadWorkspace,
+    ]))));
+    let read_ceiling = Arc::clone(&ceiling);
+    host.current = Some(CurrentCeiling::new(move || {
+        read_ceiling.lock().unwrap().clone()
+    }));
+    assert!(matches!(
+        host.handle(read("note.txt")).await,
+        HostReply::File(_)
+    ));
+    *ceiling.lock().unwrap() = Some(BTreeSet::new());
+    assert_eq!(
+        code(host.handle(read("note.txt")).await),
+        Some(HostErrorCode::Denied)
+    );
+    // A call that needs nothing from the caller still runs.
+    let state = HostRequest::StateGet { key: "k".into() };
+    assert!(code(host.handle(state.clone()).await).is_none());
+    *ceiling.lock().unwrap() = None;
+    assert_eq!(code(host.handle(state).await), Some(HostErrorCode::Denied));
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn special_files_are_refused_without_blocking() {
@@ -996,6 +1029,7 @@ async fn policy_is_checked_before_the_guest_runs() {
     let workspace = || Scope {
         workspace: Some(dir.path().into()),
         ceiling: None,
+        current: None,
     };
     let kind = |error: ExtensionError| crate::error::report(&error).kind;
     use a206_core::extension::Value;

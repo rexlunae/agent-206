@@ -184,12 +184,24 @@ required = true
 id = "overview"
 title = "Workspace overview"
 capabilities = ["read_workspace"]
+
+[[triggers]]                        # checked by scheduled jobs (docs/schedules.md)
+name = "file_changed"
+description = "Fires when a file in the project changes."
+capabilities = ["read_workspace"]
+
+[[triggers.params]]                 # declared exactly like tool parameters
+name = "path"
+type = "string"
+description = "File path relative to the workspace root."
+required = true
 ```
 
 Rejected before anything runs: unknown fields, an ABI other than 2, an invalid
 id, an empty name/description/version, tool/panel/parameter names that are not
 `[a-z][a-z0-9_]{0,63}`, duplicates, more than 64 declarations of one kind, and
-a tool or panel that uses a capability the manifest does not request.
+a tool, panel or trigger that uses a capability the manifest does not request.
+Trigger names and descriptions are audited like tools' before installation.
 
 A manifest that requests `network` must list where it connects, and `hosts`
 without `network` is refused:
@@ -206,14 +218,14 @@ permission.
 
 ### Authority
 
-A call runs only when the effective grant holds every capability the tool or
-panel declares. The effective grant is the intersection of:
+A call runs only when the effective grant holds every capability the tool,
+panel or trigger declares. The effective grant is the intersection of:
 
 1. what the user granted this extension (`GrantExtension`, the Extensions page
    or `agent206 extension grant`); nothing is granted by default,
-2. the caller's ceiling: a thread's effective grant when an agent calls a tool,
-   none for a user acting directly,
-3. what the tool or panel declares.
+2. the caller's ceiling: a thread's effective grant when an agent calls a tool
+   or a scheduled job checks a trigger, none for a user acting directly,
+3. what the tool, panel or trigger declares.
 
 The gateway then checks each relayed host call against that set again, and
 against the stored grant at the moment of the call. Revoking stops an
@@ -236,9 +248,16 @@ import a206.host_take(ptr: i32, len: i32) -> i32   // copy exactly that reply to
 The host writes a MessagePack `Invocation { abi, call }` into the buffer and
 calls `a206_invoke`. `call` is `tool { name, args }` (arguments already checked
 against the declared parameters: no unknown names, required ones present,
-exact kinds; an integer is a valid `number`) or `panel { id, event }`, where
-`event` names the button the user pressed. The guest returns an `Outcome`:
-`tool { text }`, `panel { nodes }` or `failed { code, message }`.
+exact kinds; an integer is a valid `number`), `panel { id, event }`, where
+`event` names the button the user pressed, or `trigger { name, job, args,
+cursor }`, a scheduled job's check of a declared trigger: `job` is the job's ID
+and `cursor` the bytes its previous check kept. The guest returns an `Outcome`:
+`tool { text }`, `panel { nodes }`, `trigger { fired, cursor }` (`fired` is the
+report when it fired, else nil; `cursor`, at most 4,096 bytes, is kept for the
+job's next check) or `failed { code, message }`. A trigger's outcome with a
+larger cursor, or any outcome of the wrong kind, fails the call. Triggers were
+added to ABI 2 without a version change: a host only sends them to manifests
+that declare triggers.
 
 Nothing else is linked: no WASI, clocks, environment, filesystem, network,
 dynamic loading or vault. A module importing anything else fails to
@@ -249,6 +268,9 @@ struct Hello;
 impl a206_extension_sdk::Extension for Hello {
     fn tool(name: &str, args: &a206_extension_sdk::Args)
         -> Result<a206_extension_sdk::ToolOutput, a206_extension_sdk::GuestError> { … }
+    // Optional, like `panel`: answer a declared trigger's check.
+    fn trigger(name: &str, job: &str, args: &a206_extension_sdk::Args, cursor: Option<&[u8]>)
+        -> Result<a206_extension_sdk::TriggerOutput, a206_extension_sdk::GuestError> { … }
 }
 a206_extension_sdk::export!(Hello);
 ```
@@ -468,8 +490,9 @@ ceiling: Some(thread grant) })` after the conversation permits the tool.
 Provider JSON arguments convert kind for kind to `a206_core::extension::Args`.
 Tool text is extension output, never instructions.
 
-Pushing is not a host call. It is the native `git_push` tool
-([run-engine.md](run-engine.md#pushing-git-branches-git_push)), because it needs
+Pushing and fetching are not host calls. They are the native `git_push` and
+`git_fetch` tools ([run-engine.md](run-engine.md#pushing-git-branches-git_push)),
+because they need
 the vault broker, an approval of each call and more time than an extension
 invocation has.
 

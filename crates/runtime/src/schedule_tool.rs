@@ -330,6 +330,7 @@ fn describe(job: &Job, thread: Id) -> Value {
         "kind": match job.kind {
             JobKind::Message => "message",
             JobKind::Heartbeat => "heartbeat",
+            JobKind::Trigger { .. } => "trigger",
         },
         "message": preview(&job.text, MESSAGE_BYTES),
         "message_bytes": job.text.len(),

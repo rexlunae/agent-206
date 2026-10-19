@@ -520,6 +520,44 @@ fn run_module(wat: &str, invocation: &Invocation) -> Result<Outcome, EngineError
 }
 
 #[test]
+fn a_trigger_check_returns_a_bounded_cursor() {
+    let check = Invocation {
+        abi: ABI,
+        call: Call::Trigger {
+            name: "changed".into(),
+            job: "job".into(),
+            args: Args::new(),
+            cursor: None,
+        },
+    };
+    let answer = |cursor: usize| {
+        rmp_serde::to_vec_named(&Outcome::Trigger(TriggerOutput {
+            fired: Some("changed".into()),
+            cursor: Some(serde_bytes::ByteBuf::from(vec![7; cursor])),
+        }))
+        .unwrap()
+    };
+    let fits = run_module(&module(&answer(MAX_TRIGGER_CURSOR), ""), &check);
+    assert!(matches!(fits, Ok(Outcome::Trigger(_))), "{fits:?}");
+    let over = run_module(&module(&answer(MAX_TRIGGER_CURSOR + 1), ""), &check);
+    assert!(matches!(over, Err(EngineError::Cursor)), "{over:?}");
+    let tool_answer = rmp_serde::to_vec_named(&Outcome::Tool(ToolOutput {
+        text: String::new(),
+    }))
+    .unwrap();
+    let wrong = run_module(&module(&tool_answer, ""), &check);
+    assert!(
+        matches!(
+            wrong,
+            Err(EngineError::WrongOutcome {
+                expected: "trigger"
+            })
+        ),
+        "{wrong:?}"
+    );
+}
+
+#[test]
 fn malformed_guest_output_is_rejected() {
     let garbage = run_module(&module(b"\xc1", ""), &panel(None));
     assert!(
@@ -1216,4 +1254,83 @@ fn page_reader_reads_the_largest_page_within_its_fuel() {
             );
         }
     }
+}
+
+#[test]
+fn page_trigger_fires_only_when_the_readable_text_changes() {
+    let builtin = builtin("agent206.web").unwrap().unwrap();
+    let url = format!("https://{}.example/p", unique("h"));
+    let check = |html: &str, cursor: Option<serde_bytes::ByteBuf>| {
+        let invocation = Invocation {
+            abi: ABI,
+            call: Call::Trigger {
+                name: "page_changed".into(),
+                job: unique("job"),
+                args: [("url".to_owned(), Value::Str(format!("{url}#frag")))].into(),
+                cursor,
+            },
+        };
+        let (bridge, seen) = mock(web_page(html.as_bytes().to_vec(), "text/html"));
+        let (outcome, _) = engine::run(builtin.wasm, &invocation, Limits::default(), bridge);
+        assert_eq!(
+            *seen.borrow(),
+            vec![HostRequest::Fetch { url: url.clone() }]
+        );
+        match outcome {
+            Ok(Outcome::Trigger(output)) => output,
+            other => panic!("expected a trigger check, got {other:?}"),
+        }
+    };
+    let (before, after, script) = (unique("before"), unique("after"), unique("script"));
+    let page = |words: &str, script: &str| {
+        format!("<html><body><p>{words}</p><script>{script}</script></body></html>")
+    };
+    // The first check records the page without firing.
+    let first = check(&page(&before, &script), None);
+    assert_eq!(first.fired, None);
+    let kept = first.cursor.clone();
+    assert!(kept.is_some());
+    // Markup the reader drops is no change.
+    let same = check(&page(&before, &unique("other")), kept.clone());
+    assert_eq!((same.fired, &same.cursor), (None, &kept));
+    let changed = check(&page(&after, &script), kept.clone());
+    let report = changed.fired.expect("a changed page fires");
+    assert!(report.contains(&url) && report.contains(&after), "{report}");
+    assert!(!report.contains(&script), "{report}");
+    assert_ne!(changed.cursor, kept);
+    // The next check compares with the changed page.
+    let settled = check(&page(&after, &script), changed.cursor.clone());
+    assert_eq!(settled.fired, None);
+}
+
+#[test]
+fn page_trigger_fails_rather_than_fires_on_an_error_status() {
+    let builtin = builtin("agent206.web").unwrap().unwrap();
+    let invocation = Invocation {
+        abi: ABI,
+        call: Call::Trigger {
+            name: "page_changed".into(),
+            job: unique("job"),
+            args: [(
+                "url".to_owned(),
+                Value::Str(format!("https://{}.example/", unique("h"))),
+            )]
+            .into(),
+            cursor: Some(vec![1; 8].into()),
+        },
+    };
+    let (bridge, _) = mock(|_| {
+        HostReply::Fetched(FetchResponse {
+            status: 503,
+            content_type: Some("text/html".into()),
+            body: b"<p>down</p>".to_vec().into(),
+            truncated: false,
+            redirected: false,
+        })
+    });
+    let (outcome, _) = engine::run(builtin.wasm, &invocation, Limits::default(), bridge);
+    let Ok(Outcome::Failed(error)) = outcome else {
+        panic!("expected a failure, got {outcome:?}");
+    };
+    assert_eq!(error.code, "http_status");
 }

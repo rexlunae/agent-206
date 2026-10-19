@@ -191,6 +191,7 @@ fn what_waits_on_the_user_and_scheduled_runs_are_listed() {
         author: JobAuthor::User,
         history: 0,
         deliver_to: None,
+        cursor: None,
     };
     let html = render(vec![asking.clone(), idle.clone()], vec![job.clone()]);
     assert!(

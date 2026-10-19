@@ -633,8 +633,12 @@ impl Gateway {
         Arc::make_mut(&mut gateway.tool_hosts).push(message_tools);
         // Pushing git branches, denied in each conversation until the user
         // permits it, and then still approved by the user call by call.
-        let push_tools = Arc::new(crate::git_push::PushHost::new(gateway.pushes()));
+        let push_tools = Arc::new(crate::git_remote::RemoteHost::new(gateway.pushes()));
         Arc::make_mut(&mut gateway.tool_hosts).push(push_tools);
+        // Reading pull requests, denied in each conversation until the user
+        // permits it.
+        let forge_tools = Arc::new(crate::forge::ForgeHost::new(gateway.pushes()));
+        Arc::make_mut(&mut gateway.tool_hosts).push(forge_tools);
         // Web search, offered once the user adds a search service; each
         // conversation still denies it until the user permits it, and it
         // needs the conversation's network grant.
@@ -1968,6 +1972,7 @@ impl Gateway {
         Ok(crate::extension_host::Scope {
             workspace: project.map(|id| self.project_root(id)).transpose()?,
             ceiling: None,
+            current: None,
         })
     }
     /// The extension host the run engine calls tools through.

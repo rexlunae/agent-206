@@ -129,7 +129,7 @@ fn GitCredentials() -> Element {
             Field { label: rsx! { "Username" }, hint: rsx! { "The username the forge expects with a token, such as x-access-token for GitHub, oauth2 for GitLab or your account name." }, Input { value: ReadSignal::from(username), oninput: move |v| username.set(v), placeholder: "Username" } }
             Field { label: rsx! { "Vault credential" }, hint: rsx! { "The name of an API key or token credential in the vault, bound to this origin." }, Input { value: ReadSignal::from(credential), oninput: move |v| credential.set(v), placeholder: "Credential name" } }
         }
-        CardFooter { Button { variant: ButtonVariant::Secondary, disabled: incomplete, onclick: move |_| { let mut settings = state.data.read().settings.clone(); settings.git_credentials.push(a206_core::GitCredential { origin: origin().trim().into(), username: username().trim().into(), credential: credential().trim().into() }); dispatch(state, Command::SaveSettings(Box::new(settings))); }, "Add credential" } }
+        CardFooter { Button { variant: ButtonVariant::Secondary, disabled: incomplete, onclick: move |_| { let mut settings = state.data.read().settings.clone(); settings.git_credentials.push(a206_core::GitCredential { origin: origin().trim().into(), username: username().trim().into(), credential: credential().trim().into(), forge: None }); dispatch(state, Command::SaveSettings(Box::new(settings))); }, "Add credential" } }
     } }
 }
 /// The directories, beyond the system's, whose programs sandboxed commands

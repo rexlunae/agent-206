@@ -70,12 +70,15 @@ pub struct Applied {
 pub enum Tool {
     RustyClaw,
     ClaudeCode,
+    Codex,
 }
 impl Tool {
+    pub const ALL: [Self; 3] = [Self::RustyClaw, Self::ClaudeCode, Self::Codex];
     pub fn label(self) -> &'static str {
         match self {
             Self::RustyClaw => "RustyClaw",
             Self::ClaudeCode => "Claude Code",
+            Self::Codex => "Codex",
         }
     }
 }

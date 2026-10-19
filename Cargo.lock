@@ -96,6 +96,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "a206-forge"
+version = "0.1.0"
+dependencies = [
+ "a206-core",
+ "percent-encoding",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "url",
+ "uuid",
+]
+
+[[package]]
 name = "a206-git-push"
 version = "0.1.0"
 dependencies = [
@@ -223,6 +236,7 @@ dependencies = [
  "a206-broker",
  "a206-core",
  "a206-extensions",
+ "a206-forge",
  "a206-git-push",
  "a206-import",
  "a206-injection-scan",
@@ -335,6 +349,7 @@ dependencies = [
  "reqwest",
  "rqrr",
  "serde",
+ "thiserror 2.0.21",
  "tokio",
  "toml 0.9.12+spec-1.1.0",
  "tracing",

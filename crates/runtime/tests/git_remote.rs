@@ -1,16 +1,17 @@
 #![cfg(unix)]
-//! A model pushes a branch with `git_push`: only after the user approves the
-//! call, through the vault broker, which alone holds the forge token. The
-//! forge is a smart HTTP server on loopback that stores what it receives in
-//! a bare repository with gitoxide's own pack indexer. Every identifier,
-//! file and key is generated at runtime.
+//! A model pushes a branch with `git_push` and fetches one with `git_fetch`:
+//! only after the user approves the call, through the vault broker, which
+//! alone holds the forge token. The forge is a smart HTTP server on loopback
+//! that stores what it receives in a bare repository with gitoxide's own
+//! pack indexer, and serves fetches from it. Every identifier, file and key
+//! is generated at runtime.
 mod support;
 
 use a206_core::*;
 use axum::{
     Router,
     body::Bytes,
-    extract::State,
+    extract::{RawQuery, State},
     http::{HeaderMap, StatusCode, header},
     routing::{get, post},
 };
@@ -25,7 +26,8 @@ use support::*;
 
 type Gateway = a206_runtime::gateway::Gateway;
 const API: ProviderApi = ProviderApi::OpenAi;
-const TOOL: &str = a206_runtime::git_push::PUSH;
+const TOOL: &str = a206_runtime::git_remote::PUSH;
+const FETCH: &str = a206_runtime::git_remote::FETCH;
 
 /// A forge holding one bare repository at `/team/repo.git`.
 #[derive(Clone)]
@@ -35,6 +37,24 @@ struct Forge {
     seen: Arc<Mutex<Vec<(String, String)>>>,
     /// A reason to refuse every update with, like a protected branch.
     refuse: Arc<Mutex<Option<String>>>,
+    /// Leave the last object out of every pack it serves.
+    incomplete: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// The packets of a request body, `None` for a flush.
+fn packets(mut body: &[u8]) -> Vec<Option<Vec<u8>>> {
+    let mut out = vec![];
+    while !body.is_empty() {
+        let length = usize::from_str_radix(std::str::from_utf8(&body[..4]).unwrap(), 16).unwrap();
+        if length == 0 {
+            out.push(None);
+            body = &body[4..];
+        } else {
+            out.push(Some(body[4..length].to_vec()));
+            body = &body[length..];
+        }
+    }
+    out
 }
 
 fn pkt(out: &mut Vec<u8>, line: &str) {
@@ -42,8 +62,17 @@ fn pkt(out: &mut Vec<u8>, line: &str) {
     out.extend_from_slice(line.as_bytes());
 }
 
-async fn advertise(State(forge): State<Forge>, headers: HeaderMap) -> (HeaderMap, Vec<u8>) {
+async fn advertise(
+    State(forge): State<Forge>,
+    RawQuery(query): RawQuery,
+    headers: HeaderMap,
+) -> (HeaderMap, Vec<u8>) {
     forge.record(&headers, "info/refs");
+    let service = query
+        .as_deref()
+        .and_then(|q| q.strip_prefix("service="))
+        .unwrap()
+        .to_owned();
     let repo = gix::open(&forge.bare).unwrap();
     let mut refs = vec![];
     for reference in repo.references().unwrap().all().unwrap() {
@@ -52,9 +81,12 @@ async fn advertise(State(forge): State<Forge>, headers: HeaderMap) -> (HeaderMap
         refs.push((reference.name().as_bstr().to_string(), id));
     }
     let mut body = vec![];
-    pkt(&mut body, "# service=git-receive-pack\n");
+    pkt(&mut body, &format!("# service={service}\n"));
     body.extend_from_slice(b"0000");
-    let capabilities = "report-status delete-refs agent=git/forge";
+    let capabilities = match service.as_str() {
+        "git-receive-pack" => "report-status delete-refs agent=git/forge",
+        _ => "multi_ack side-band-64k ofs-delta no-progress agent=git/forge",
+    };
     if refs.is_empty() {
         let null = ObjectId::null(repo.object_hash());
         pkt(
@@ -73,11 +105,75 @@ async fn advertise(State(forge): State<Forge>, headers: HeaderMap) -> (HeaderMap
     let mut headers = HeaderMap::new();
     headers.insert(
         header::CONTENT_TYPE,
-        "application/x-git-receive-pack-advertisement"
+        format!("application/x-{service}-advertisement")
             .parse()
             .unwrap(),
     );
     (headers, body)
+}
+
+/// Answers wants and haves with a side-band pack of what the wanted commit
+/// reaches beyond the haves, as git-upload-pack does.
+async fn upload(
+    State(forge): State<Forge>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> (StatusCode, HeaderMap, Vec<u8>) {
+    forge.record(&headers, "git-upload-pack");
+    assert_eq!(
+        headers[header::CONTENT_TYPE],
+        "application/x-git-upload-pack-request"
+    );
+    let packets = packets(&body);
+    let line = |packet: &Option<Vec<u8>>| String::from_utf8(packet.clone().unwrap()).unwrap();
+    let first = line(&packets[0]);
+    let (want, capabilities) = first
+        .strip_prefix("want ")
+        .unwrap()
+        .trim_end()
+        .split_once(' ')
+        .unwrap();
+    assert!(capabilities.split(' ').any(|c| c == "side-band-64k"));
+    assert_eq!(packets[1], None);
+    assert_eq!(line(packets.last().unwrap()), "done\n");
+    let repo = gix::open(&forge.bare).unwrap();
+    let haves: Vec<ObjectId> = packets[2..packets.len() - 1]
+        .iter()
+        .map(|packet| {
+            let have = line(packet);
+            ObjectId::from_hex(have.strip_prefix("have ").unwrap().trim_end().as_bytes()).unwrap()
+        })
+        .filter(|id| repo.has_object(id))
+        .collect();
+    let never = std::sync::atomic::AtomicBool::new(false);
+    let want = ObjectId::from_hex(want.as_bytes()).unwrap();
+    let mut ids =
+        a206_git_push::objects(&repo, want, haves, a206_runtime::git_remote::LIMITS, &never)
+            .unwrap()
+            .ids;
+    if forge.incomplete.load(std::sync::atomic::Ordering::SeqCst) {
+        ids.pop();
+    }
+    let pack =
+        a206_git_push::write_pack(&repo, &ids, a206_runtime::git_remote::LIMITS, &never).unwrap();
+    let mut out = vec![];
+    pkt(&mut out, "NAK\n");
+    let band = |out: &mut Vec<u8>, band: u8, data: &[u8]| {
+        out.extend_from_slice(format!("{:04x}", data.len() + 5).as_bytes());
+        out.push(band);
+        out.extend_from_slice(data);
+    };
+    band(&mut out, 2, b"Counting objects\n");
+    for chunk in pack.chunks(1000) {
+        band(&mut out, 1, chunk);
+    }
+    out.extend_from_slice(b"0000");
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        "application/x-git-upload-pack-result".parse().unwrap(),
+    );
+    (StatusCode::OK, headers, out)
 }
 
 async fn receive(
@@ -186,12 +282,64 @@ impl Forge {
             .map(|mut r| r.peel_to_id().unwrap().detach())
     }
     fn posts(&self) -> usize {
+        self.count("git-receive-pack")
+    }
+    fn count(&self, path: &str) -> usize {
         self.seen
             .lock()
             .unwrap()
             .iter()
-            .filter(|(_, path)| path == "git-receive-pack")
+            .filter(|(_, seen)| seen == path)
             .count()
+    }
+    /// Commit a new file on the forge's `branch`, on top of `parents`.
+    fn commit(&self, branch: &str, parents: &[ObjectId]) -> ObjectId {
+        let repo = gix::open(&self.bare).unwrap();
+        let base = match parents.first() {
+            Some(parent) => repo
+                .find_commit(*parent)
+                .unwrap()
+                .tree_id()
+                .unwrap()
+                .detach(),
+            None => ObjectId::empty_tree(repo.object_hash()),
+        };
+        let blob = repo.write_blob(nonce().as_bytes()).unwrap().detach();
+        let mut tree = repo.edit_tree(base).unwrap();
+        tree.upsert(
+            format!("elsewhere/{}", nonce()),
+            gix::objs::tree::EntryKind::Blob,
+            blob,
+        )
+        .unwrap();
+        let tree = tree.write().unwrap().detach();
+        let signature = gix::actor::Signature {
+            name: "o".into(),
+            email: "o@example.invalid".into(),
+            time: gix::date::Time::new(2_000_000, 0),
+        };
+        let (mut a, mut b) = Default::default();
+        let id = repo
+            .commit_as(
+                signature.to_ref(&mut a),
+                signature.to_ref(&mut b),
+                // A fresh scratch reference, so the commit's parents are free.
+                format!("refs/scratch/{}", nonce()),
+                nonce(),
+                tree,
+                parents.iter().copied(),
+            )
+            .unwrap()
+            .detach();
+        // Moved without checking its previous value, like a forced push.
+        repo.reference(
+            format!("refs/heads/{branch}"),
+            id,
+            gix::refs::transaction::PreviousValue::Any,
+            "test",
+        )
+        .unwrap();
+        id
     }
 }
 
@@ -203,10 +351,12 @@ async fn forge(dir: &Path) -> (String, Forge) {
         bare,
         seen: Arc::default(),
         refuse: Arc::default(),
+        incomplete: Arc::default(),
     };
     let router = Router::new()
         .route("/team/repo.git/info/refs", get(advertise))
         .route("/team/repo.git/git-receive-pack", post(receive))
+        .route("/team/repo.git/git-upload-pack", post(upload))
         .with_state(forge.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let origin = format!("http://{}", listener.local_addr().unwrap());
@@ -330,15 +480,31 @@ impl Rig {
         arguments: serde_json::Value,
         decision: ApprovalDecision,
     ) -> (ToolCall, Option<String>) {
+        self.call(TOOL, arguments, decision).await
+    }
+    /// The same with `git_fetch`.
+    async fn fetch(
+        &mut self,
+        arguments: serde_json::Value,
+        decision: ApprovalDecision,
+    ) -> (ToolCall, Option<String>) {
+        self.call(FETCH, arguments, decision).await
+    }
+    async fn call(
+        &mut self,
+        tool: &str,
+        arguments: serde_json::Value,
+        decision: ApprovalDecision,
+    ) -> (ToolCall, Option<String>) {
         let task = send(&self.gateway, self.thread);
         let first = next_request(&mut self.requests).await;
-        assert!(offered(API, &first.body).contains(&TOOL.to_owned()));
-        let call = Call::new(TOOL, arguments);
+        assert!(offered(API, &first.body).contains(&tool.to_owned()));
+        let call = Call::new(tool, arguments);
         first
             .respond(calls_response(API, std::slice::from_ref(&call), ""))
             .await;
         let asked = approval(&self.gateway, self.thread).await;
-        assert_eq!(asked.tool, TOOL);
+        assert_eq!(asked.tool, tool);
         self.ok(Command::ResolveApproval {
             thread: self.thread,
             approval: asked.id,
@@ -368,7 +534,7 @@ async fn rig() -> Rig {
     let config = workspace.path().join(".git/config");
     let mut text = std::fs::read_to_string(&config).unwrap();
     text.push_str(&format!(
-        "[user]\n\tname = n\n\temail = n@example.invalid\n[remote \"origin\"]\n\turl = {origin}/team/repo.git\n"
+        "[user]\n\tname = n\n\temail = n@example.invalid\n[remote \"origin\"]\n\turl = {origin}/team/repo.git\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n"
     ));
     std::fs::write(&config, text).unwrap();
     commit(
@@ -402,6 +568,7 @@ async fn rig() -> Rig {
         origin: origin.clone(),
         username: username.clone(),
         credential,
+        forge: None,
     });
     let rig = Rig {
         gateway,
@@ -434,13 +601,16 @@ async fn rig() -> Rig {
         capabilities: [Capability::GitRead, Capability::GitWrite].into(),
     })
     .await;
-    // Allowing the tool on the conversation still leaves each call to the user.
-    rig.ok(Command::SetToolPermission {
-        thread: rig.thread,
-        tool: TOOL.into(),
-        permission: Some(ToolPermission::Allow),
-    })
-    .await;
+    // Allowing the tools on the conversation still leaves each call to the
+    // user.
+    for tool in [TOOL, FETCH] {
+        rig.ok(Command::SetToolPermission {
+            thread: rig.thread,
+            tool: tool.into(),
+            permission: Some(ToolPermission::Allow),
+        })
+        .await;
+    }
     rig
 }
 
@@ -611,5 +781,176 @@ async fn pushes_that_would_lose_commits_or_that_the_forge_refuses_change_nothing
         .await;
     assert_eq!(record.state, ToolCallState::Failed);
     assert_eq!(error_kind(&record), ErrorKind::PermissionDenied);
+    assert_eq!(rig.forge.seen.lock().unwrap().len(), seen);
+}
+
+fn result(text: Option<String>) -> serde_json::Value {
+    serde_json::from_str(&text.unwrap()).unwrap()
+}
+fn packs(root: &Path) -> usize {
+    std::fs::read_dir(root.join(".git/objects/pack"))
+        .map(|entries| entries.count())
+        .unwrap_or(0)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_model_fetches_a_branch_into_its_remote_tracking_branch_only_after_approval() {
+    let mut rig = rig().await;
+    let (record, _) = rig.push(json!({}), ApprovalDecision::Approve).await;
+    assert_eq!(record.state, ToolCallState::Succeeded, "{:?}", record.error);
+    let pushed = rig.forge.branch(&rig.branch).unwrap();
+    let elsewhere = rig.forge.commit(&rig.branch, &[pushed]);
+
+    // Denied: the forge is not asked for anything.
+    let seen = rig.forge.seen.lock().unwrap().len();
+    let (record, _) = rig.fetch(json!({}), ApprovalDecision::Deny).await;
+    assert_eq!(record.state, ToolCallState::Denied);
+    assert_eq!(rig.forge.seen.lock().unwrap().len(), seen);
+
+    // Approved: the remote-tracking branch moves to the forge's commit with
+    // everything it reaches; the local branch stays where it was.
+    let local = gix::open(rig.workspace.path())
+        .unwrap()
+        .head_id()
+        .unwrap()
+        .detach();
+    let (record, text) = rig.fetch(json!({}), ApprovalDecision::Approve).await;
+    assert_eq!(record.state, ToolCallState::Succeeded, "{:?}", record.error);
+    let fetched = result(text);
+    assert_eq!(fetched["tracking_branch"], format!("origin/{}", rig.branch));
+    assert_eq!(fetched["from"], pushed.to_string());
+    assert_eq!(fetched["commit"], elsewhere.to_string());
+    assert_eq!(fetched["forced_update"], false);
+    // The commit, its root tree, the new folder and the new file.
+    assert_eq!(fetched["objects"], 4);
+    assert_eq!(tracking(rig.workspace.path(), &rig.branch), Some(elsewhere));
+    let repo = gix::open(rig.workspace.path()).unwrap();
+    assert_eq!(repo.head_id().unwrap().detach(), local);
+    repo.find_commit(elsewhere)
+        .unwrap()
+        .tree()
+        .unwrap()
+        .traverse()
+        .breadthfirst(&mut gix::traverse::tree::Recorder::default())
+        .unwrap();
+    // Only the remote's own pushes reached its push service.
+    {
+        use base64::Engine as _;
+        let basic = format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD
+                .encode(format!("{}:{}", rig.username, rig.token))
+        );
+        assert!(
+            rig.forge
+                .seen
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|(auth, _)| *auth == basic)
+        );
+    }
+    assert_eq!(rig.forge.count("git-upload-pack"), 1);
+
+    // Nothing new: no pack is asked for.
+    let (record, text) = rig
+        .fetch(
+            json!({"branch": rig.branch, "remote": "origin"}),
+            ApprovalDecision::Approve,
+        )
+        .await;
+    assert_eq!(record.state, ToolCallState::Succeeded, "{:?}", record.error);
+    assert_eq!(result(text)["up_to_date"], true);
+    assert_eq!(rig.forge.count("git-upload-pack"), 1);
+
+    // A branch the remote lacks is not found.
+    let (record, _) = rig
+        .fetch(
+            json!({"branch": format!("b-{}", nonce())}),
+            ApprovalDecision::Approve,
+        )
+        .await;
+    assert_eq!(record.state, ToolCallState::Failed);
+    assert_eq!(error_kind(&record), ErrorKind::NotFound);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn fetches_follow_the_refspec_and_store_nothing_incomplete() {
+    let mut rig = rig().await;
+    let (record, _) = rig.push(json!({}), ApprovalDecision::Approve).await;
+    assert_eq!(record.state, ToolCallState::Succeeded, "{:?}", record.error);
+    let pushed = rig.forge.branch(&rig.branch).unwrap();
+
+    // The forge's branch was replaced with unrelated history: `+` in the
+    // refspec allows the forced update, which the result reports.
+    let replaced = rig.forge.commit(&rig.branch, &[]);
+    let (record, text) = rig.fetch(json!({}), ApprovalDecision::Approve).await;
+    assert_eq!(record.state, ToolCallState::Succeeded, "{:?}", record.error);
+    assert_eq!(result(text)["forced_update"], true);
+    assert_eq!(tracking(rig.workspace.path(), &rig.branch), Some(replaced));
+
+    // Without `+`, a branch that no longer contains the remote-tracking one
+    // is refused and nothing moves.
+    let config = rig.workspace.path().join(".git/config");
+    let text = std::fs::read_to_string(&config).unwrap();
+    std::fs::write(&config, text.replace("fetch = +refs/", "fetch = refs/")).unwrap();
+    let again = rig.forge.commit(&rig.branch, &[pushed]);
+    let before = packs(rig.workspace.path());
+    let (record, _) = rig.fetch(json!({}), ApprovalDecision::Approve).await;
+    assert_eq!(record.state, ToolCallState::Failed);
+    assert_eq!(error_kind(&record), ErrorKind::Conflict);
+    assert_eq!(tracking(rig.workspace.path(), &rig.branch), Some(replaced));
+    // The refused pack was removed again.
+    assert_eq!(packs(rig.workspace.path()), before);
+
+    // A pack missing an object the commit reaches is refused and removed.
+    let text = std::fs::read_to_string(&config).unwrap();
+    std::fs::write(&config, text.replace("fetch = refs/", "fetch = +refs/")).unwrap();
+    rig.forge
+        .incomplete
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let (record, _) = rig.fetch(json!({}), ApprovalDecision::Approve).await;
+    assert_eq!(record.state, ToolCallState::Failed);
+    assert_eq!(error_kind(&record), ErrorKind::Protocol);
+    assert_eq!(tracking(rig.workspace.path(), &rig.branch), Some(replaced));
+    assert_eq!(packs(rig.workspace.path()), before);
+    rig.forge
+        .incomplete
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    let (record, _) = rig.fetch(json!({}), ApprovalDecision::Approve).await;
+    assert_eq!(record.state, ToolCallState::Succeeded, "{:?}", record.error);
+    assert_eq!(tracking(rig.workspace.path(), &rig.branch), Some(again));
+
+    // A remote whose branches are mapped differently is refused before the
+    // forge is asked for anything.
+    let text = std::fs::read_to_string(&config).unwrap();
+    std::fs::write(
+        &config,
+        text.replace(
+            "fetch = +refs/heads/*:refs/remotes/origin/*",
+            "fetch = +refs/heads/*:refs/heads/*",
+        ),
+    )
+    .unwrap();
+    let seen = rig.forge.seen.lock().unwrap().len();
+    let (record, _) = rig.fetch(json!({}), ApprovalDecision::Approve).await;
+    assert_eq!(record.state, ToolCallState::Failed);
+    assert_eq!(error_kind(&record), ErrorKind::InvalidRequest);
+    assert_eq!(rig.forge.seen.lock().unwrap().len(), seen);
+
+    // So is the usual mapping beside another one, which git would also
+    // update.
+    let text = std::fs::read_to_string(&config).unwrap();
+    std::fs::write(
+        &config,
+        text.replace(
+            "fetch = +refs/heads/*:refs/heads/*",
+            "fetch = +refs/heads/*:refs/remotes/origin/*\n\tfetch = +refs/tags/*:refs/tags/*",
+        ),
+    )
+    .unwrap();
+    let (record, _) = rig.fetch(json!({}), ApprovalDecision::Approve).await;
+    assert_eq!(record.state, ToolCallState::Failed);
+    assert_eq!(error_kind(&record), ErrorKind::InvalidRequest);
     assert_eq!(rig.forge.seen.lock().unwrap().len(), seen);
 }

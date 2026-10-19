@@ -321,6 +321,7 @@ impl ToolHost for ExtensionToolHost {
             let scope = Scope {
                 workspace: scope.workspace.clone(),
                 ceiling: Some(scope.capabilities.clone()),
+                current: None,
             };
             let output = self
                 .extensions

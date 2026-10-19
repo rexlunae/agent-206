@@ -54,7 +54,7 @@ impl Capability {
             Self::Execute => "Run project commands",
             Self::Network => "Use the network",
             Self::GitRead => "Read git history",
-            Self::GitWrite => "Commit, branch and push in git",
+            Self::GitWrite => "Commit, branch, push and fetch in git",
             Self::ReviewPullRequests => "Review pull requests",
             Self::Download => "Download files",
             Self::Browser => "Use the browser",
@@ -300,6 +300,39 @@ pub struct GitCredential {
     pub origin: String,
     pub username: String,
     pub credential: String,
+    /// The forge's web API, for the pull request tools. `None` uses the
+    /// bundled preset for a well-known origin (github.com, gitlab.com), and
+    /// leaves other forges without pull request tools.
+    #[serde(default)]
+    pub forge: Option<ForgeApi>,
+}
+
+/// Which API a forge speaks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ForgeKind {
+    /// GitHub's REST API (github.com or GitHub Enterprise Server).
+    GitHub,
+    /// GitLab's REST API, version 4.
+    GitLab,
+}
+impl ForgeKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::GitHub => "GitHub",
+            Self::GitLab => "GitLab",
+        }
+    }
+}
+
+/// Where a forge's web API is. The git credential's vault credential is
+/// sent to it as a bearer token, so it must also be bound to `api`'s
+/// origin.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForgeApi {
+    pub kind: ForgeKind,
+    /// The API's base URL, such as `https://api.github.com` or
+    /// `https://gitlab.example/api/v4`.
+    pub api: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -890,6 +923,8 @@ pub struct PluginSummary {
     pub tools: Vec<extension::ToolSpec>,
     #[serde(default)]
     pub panels: Vec<extension::PanelSpec>,
+    #[serde(default)]
+    pub triggers: Vec<extension::TriggerSpec>,
     /// Where the `network` permission may connect; `*` is any public host.
     #[serde(default)]
     pub hosts: Vec<String>,
