@@ -922,6 +922,8 @@ impl Gateway {
                 ),
             )?;
         }
+        let programs_changed =
+            settings.program_directories != store.state.settings.program_directories;
         // Revocation also stops already-running inference and coding backends.
         let running = self.running.lock().map_err(poisoned("run"))?;
         for thread in &store.state.threads {
@@ -934,14 +936,16 @@ impl Gateway {
                     .find(|p| p.id == key.provider);
                 settings.providers.iter().find(|p| p.id == key.provider) != previous
             });
+            let current = store
+                .state
+                .settings
+                .backends
+                .iter()
+                .find(|b| b.kind == thread.backend);
+            // A runtime given program directories holds the old mounts.
             let backend_changed = thread.backend != CodingBackend::Native
-                && settings.backends.iter().find(|b| b.kind == thread.backend)
-                    != store
-                        .state
-                        .settings
-                        .backends
-                        .iter()
-                        .find(|b| b.kind == thread.backend);
+                && (settings.backends.iter().find(|b| b.kind == thread.backend) != current
+                    || (programs_changed && current.is_some_and(|b| b.program_directories)));
             if (provider_changed || backend_changed)
                 && let Some(token) = running.get(&thread.id)
             {
@@ -967,7 +971,7 @@ impl Gateway {
         self.stop_changed_mcp(
             &previous.mcp_servers,
             &store.state.settings.mcp_servers,
-            previous.program_directories != store.state.settings.program_directories,
+            programs_changed,
         )?;
         drop(store);
         // Background commands given a directory that was removed stop.
@@ -1345,7 +1349,7 @@ impl Gateway {
                         && text.len() <= 128 * 1024,
                     GatewayError::Invalid("message must be 1–131072 bytes"),
                 )?;
-                let (token, config, thread, prompt, info, backend, workspace, root) = {
+                let (token, config, thread, prompt, info, backend, programs, workspace, root) = {
                     let mut store = self.lock()?;
                     // Admit the message only with room for it and for the
                     // run's first round, which applies the same bound, so an
@@ -1407,6 +1411,12 @@ impl Gateway {
                         crate::backends::validate_selection(&config, current, &backend)?;
                         Some(backend)
                     };
+                    let programs = match &backend {
+                        Some(backend) if backend.program_directories => {
+                            store.state.settings.program_directories.clone()
+                        }
+                        _ => vec![],
+                    };
                     let workspace = current
                         .project
                         .and_then(|id| store.state.projects.iter().find(|p| p.id == id))
@@ -1446,7 +1456,9 @@ impl Gateway {
                         self.withdraw(id);
                         return Err(error);
                     }
-                    (token, config, copy, prompt, info, backend, workspace, root)
+                    (
+                        token, config, copy, prompt, info, backend, programs, workspace, root,
+                    )
                 };
                 let Some(backend) = backend else {
                     let ended = self
@@ -1513,6 +1525,7 @@ impl Gateway {
                             backend: &backend,
                             workspace: workspace.as_deref(),
                             state_root: &root,
+                            programs: &programs,
                             progress: sender,
                             cancel: token.clone(),
                             dispatched: dispatched.clone(),

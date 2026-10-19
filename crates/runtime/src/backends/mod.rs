@@ -62,6 +62,8 @@ pub enum BackendError {
     Sandbox(#[from] a206_sandbox::SandboxError),
     #[error(transparent)]
     SandboxStart(#[from] crate::sandbox::StartError),
+    #[error("a program directory cannot be given to the backend")]
+    Programs(#[from] crate::exec_tool::programs::ProgramsError),
     #[error("backend has no usable process ID")]
     ProcessId,
     #[error("could not start the backend's credential proxy")]
@@ -114,6 +116,7 @@ impl crate::error::Classified for BackendError {
             // The sandbox's own error knows its kind.
             Self::Sandbox(_) => return None,
             Self::SandboxStart(error) => return crate::error::classify(error),
+            Self::Programs(error) => return crate::error::classify(error),
             Self::Helper(_) => ErrorKind::Internal,
             Self::Setup(_)
             | Self::Configuration(_)
@@ -204,6 +207,8 @@ pub struct Run<'a> {
     pub backend: &'a BackendConfig,
     pub workspace: Option<&'a Path>,
     pub state_root: &'a Path,
+    /// The settings' program directories, when the backend opts in.
+    pub programs: &'a [std::path::PathBuf],
     pub progress: mpsc::Sender<Progress>,
     pub cancel: tokio_util::sync::CancellationToken,
     /// Counts the model requests the backend sent to the provider.
@@ -219,6 +224,7 @@ pub async fn complete(run: Run<'_>) -> Result<(String, Usage)> {
         backend,
         workspace,
         state_root,
+        programs,
         progress,
         cancel,
         dispatched,
@@ -245,6 +251,7 @@ pub async fn complete(run: Run<'_>) -> Result<(String, Usage)> {
             thread,
             workspace,
             state_root,
+            programs,
             proxy.port(),
             proxy.token(),
         ) => process?,
