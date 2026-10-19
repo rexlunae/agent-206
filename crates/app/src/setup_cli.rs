@@ -107,17 +107,24 @@ fn ask(prompt: &str) -> Result<Option<String>> {
     Ok(Some(answer.trim().to_owned()))
 }
 
-/// A preset by its number in the printed list or by its id.
+/// A preset by its id, or else by its number in the printed list. An exact
+/// id wins, so a custom preset with a numeric id stays reachable.
+fn pick<'a>(presets: &'a [ProviderPreset], answer: &str) -> Option<&'a ProviderPreset> {
+    presets.iter().find(|p| p.id == answer).or_else(|| {
+        answer
+            .parse::<usize>()
+            .ok()
+            .and_then(|number| number.checked_sub(1))
+            .and_then(|i| presets.get(i))
+    })
+}
+
 fn choose(presets: &[ProviderPreset]) -> Result<Option<&ProviderPreset>> {
     loop {
         let Some(answer) = ask("Provider (number or id): ")? else {
             return Ok(None);
         };
-        let chosen = match answer.parse::<usize>() {
-            Ok(number) => number.checked_sub(1).and_then(|i| presets.get(i)),
-            Err(_) => presets.iter().find(|p| p.id == answer),
-        };
-        match chosen {
+        match pick(presets, &answer) {
             Some(preset) => return Ok(Some(preset)),
             None => println!("Choose one of the numbers or ids listed above."),
         }
@@ -157,48 +164,78 @@ fn endpoint(preset: &ProviderPreset) -> Result<Option<(String, String)>> {
 
 /// The vault credential the account uses: one already bound to `origin`, or
 /// a new API key typed into a hidden prompt. Without an unlocked vault on
-/// this computer the account is added without one.
+/// this computer the account is added without one. A gateway that does not
+/// hold a pairing with this broker is paired on the same authenticated
+/// connection, since it cannot spend the credential otherwise.
 async fn provider_credential(
     root: &Path,
     preset: &ProviderPreset,
     origin: &str,
+    gateway_paired: Option<bool>,
 ) -> Result<Option<String>> {
     let mut client = vault_cli::connect(root).await?;
-    if !vault_cli::status(&mut client).await?.unlocked {
+    let status = vault_cli::status(&mut client).await?;
+    if !status.unlocked {
         println!(
             "The vault is locked, so no API key is stored now. To add one later: agent206 vault add NAME --destination {origin}, then name it as the account's credential with agent206 settings --apply."
         );
         return Ok(None);
     }
     let typed = vault_cli::credentials(&mut client).await?;
-    if let Some((name, _)) = typed.iter().find(|(_, meta)| {
+    let bound = typed.iter().find(|(_, meta)| {
         !meta.disabled
             && matches!(meta.kind, CredentialKind::ApiKey | CredentialKind::Token)
             && meta.destinations.iter().any(|d| d == origin)
-    }) && confirm(&format!(
-        "Use the vault credential {name}, which may be sent to {origin}?"
-    ))? {
-        return Ok(Some(name.clone()));
+    });
+    let (name, store) = match bound {
+        Some((name, _))
+            if confirm(&format!(
+                "Use the vault credential {name}, which may be sent to {origin}?"
+            ))? =>
+        {
+            (name.clone(), false)
+        }
+        _ => {
+            if !confirm(&format!(
+                "Store an API key for {} in the vault, sent only to {origin}?",
+                preset.name
+            ))? {
+                return Ok(None);
+            }
+            let base = format!("{}-api-key", preset.id);
+            let name = std::iter::once(base.clone())
+                .chain((2..).map(|n| format!("{base}-{n}")))
+                .find(|candidate| typed.iter().all(|(existing, _)| existing != candidate))
+                .context("no free credential name")?;
+            (name, true)
+        }
+    };
+    let pair = !(gateway_paired == Some(true) && status.gateway_paired == Some(true));
+    if !store && !pair {
+        return Ok(Some(name));
     }
-    if !confirm(&format!(
-        "Store an API key for {} in the vault, sent only to {origin}?",
-        preset.name
-    ))? {
-        return Ok(None);
+    // One step-up covers storing the key and pairing on this connection.
+    vault_cli::step_up(&mut client).await?;
+    if store {
+        vault_cli::store_api_key(
+            &mut client,
+            name.clone(),
+            format!("{} API key", preset.name),
+            origin.to_owned(),
+        )
+        .await?;
+        println!("API key stored in the vault as {name}");
     }
-    let base = format!("{}-api-key", preset.id);
-    let name = std::iter::once(base.clone())
-        .chain((2..).map(|n| format!("{base}-{n}")))
-        .find(|candidate| typed.iter().all(|(existing, _)| existing != candidate))
-        .context("no free credential name")?;
-    vault_cli::store_api_key(
-        &mut client,
-        name.clone(),
-        format!("{} API key", preset.name),
-        origin.to_owned(),
-    )
-    .await?;
-    println!("API key stored in the vault as {name}");
+    if pair {
+        a206_runtime::vault::pair_gateway(&mut client, root)
+            .await
+            .with_context(|| {
+                format!(
+                    "the gateway could not be paired with the vault, so the account was not added; {name} stays in the vault"
+                )
+            })?;
+        println!("Gateway paired with the vault");
+    }
     Ok(Some(name))
 }
 
@@ -213,7 +250,8 @@ pub async fn provider(root: &Path) -> Result<()> {
         return Ok(());
     }
     let client = a206_runtime::control::GatewayController::attach(root.to_owned(), None);
-    if client.control(GatewayAction::Status).await?.phase != GatewayPhase::Running {
+    let report = client.control(GatewayAction::Status).await?;
+    if report.phase != GatewayPhase::Running {
         println!(
             "Start the gateway with `agent206 gateway start`, then rerun `agent206 setup` to add a model provider."
         );
@@ -238,9 +276,10 @@ pub async fn provider(root: &Path) -> Result<()> {
     }
     for (number, preset) in presets.iter().enumerate() {
         println!(
-            "{:>3}. {} ({}, {})",
+            "{:>3}. {} [{}] ({}, {})",
             number + 1,
             preset.name,
+            preset.id,
             preset.group,
             preset.api.label()
         );
@@ -257,7 +296,8 @@ pub async fn provider(root: &Path) -> Result<()> {
         return Ok(());
     };
     let mut account = preset.configure(base_url);
-    account.credential = provider_credential(root, preset, &origin).await?;
+    let gateway_paired = report.info.as_ref().and_then(|info| info.vault_paired);
+    account.credential = provider_credential(root, preset, &origin, gateway_paired).await?;
     let (id, label, credential) = (
         account.id,
         account.label.clone(),
@@ -713,4 +753,37 @@ async fn review_command(root: &Path, remote: Option<String>, command: Command) -
         _ => bail!("gateway did not return an import review or application result"),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn preset(id: String) -> ProviderPreset {
+        ProviderPreset {
+            name: uuid::Uuid::new_v4().to_string(),
+            id,
+            group: uuid::Uuid::new_v4().to_string(),
+            api: Default::default(),
+            base_url: String::new(),
+            setup: String::new(),
+        }
+    }
+
+    #[test]
+    fn an_exact_id_wins_over_a_list_number() {
+        let named = preset(uuid::Uuid::new_v4().simple().to_string());
+        // A numeric id that is also a valid position in the list.
+        let numeric = preset("1".into());
+        let presets = [named.clone(), numeric.clone()];
+        assert_eq!(pick(&presets, "1"), Some(&numeric));
+        assert_eq!(pick(&presets, "2"), Some(&numeric));
+        assert_eq!(pick(&presets, &named.id), Some(&named));
+        // A numeric id beyond the list length is still found by id.
+        let far = preset((presets.len() + 7).to_string());
+        let presets = [named.clone(), far.clone()];
+        assert_eq!(pick(&presets, &far.id), Some(&far));
+        assert_eq!(pick(&presets, "0"), None);
+        assert_eq!(pick(&presets, &(presets.len() + 1).to_string()), None);
+    }
 }

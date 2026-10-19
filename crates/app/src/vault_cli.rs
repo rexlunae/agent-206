@@ -205,7 +205,7 @@ pub(crate) async fn unlock(client: &mut Client, create: bool) -> Result<()> {
     Ok(())
 }
 
-async fn step_up(client: &mut Client) -> Result<()> {
+pub(crate) async fn step_up(client: &mut Client) -> Result<()> {
     let state = status(client).await?;
     if !state.unlocked {
         bail!("the vault is locked; run `agent206 vault unlock`");
@@ -250,13 +250,13 @@ pub(crate) async fn credentials(client: &mut Client) -> Result<Vec<(String, Cred
 
 /// Store an API key read from a hidden prompt, which the broker sends only
 /// to `destination`. Agents get it only with approval, as `vault add` does.
+/// The caller steps up first.
 pub(crate) async fn store_api_key(
     client: &mut Client,
     name: String,
     label: String,
     destination: String,
 ) -> Result<()> {
-    step_up(client).await?;
     let value = WireValue::Single(hidden("API key: ")?);
     let meta = CredentialMeta {
         label,
