@@ -37,7 +37,7 @@ pub enum TerminalError {
 }
 
 impl Pair {
-    pub(super) fn open() -> Result<Self, TerminalError> {
+    pub(super) fn open(size: super::Size) -> Result<Self, TerminalError> {
         use rustix::{fs::OFlags, pty::OpenptFlags};
         let open = |errno: rustix::io::Errno| TerminalError::Open(errno.into());
         // Close-on-exec from the start where the platform allows, so no
@@ -60,13 +60,7 @@ impl Pair {
             rustix::fs::Mode::empty(),
         )
         .map_err(open)?;
-        let size = rustix::termios::Winsize {
-            ws_row: super::TERMINAL_ROWS,
-            ws_col: super::TERMINAL_COLUMNS,
-            ws_xpixel: 0,
-            ws_ypixel: 0,
-        };
-        rustix::termios::tcsetwinsize(&device, size).map_err(open)?;
+        rustix::termios::tcsetwinsize(&device, winsize(size)).map_err(open)?;
         let register = |errno: rustix::io::Errno| TerminalError::Register(errno.into());
         rustix::io::ioctl_fionbio(&controller, true).map_err(register)?;
         let controller = async_io::Async::new_nonblocking(std::fs::File::from(controller))
@@ -84,6 +78,26 @@ impl Pair {
 /// output, writing gives it keystrokes. Clones share the one descriptor.
 #[derive(Clone)]
 pub(super) struct Controller(Arc<async_io::Async<std::fs::File>>);
+
+impl Controller {
+    /// Give the terminal a new window size; its foreground process group
+    /// gets `SIGWINCH`, as from a resized terminal window.
+    pub(super) fn resize(&self, size: super::Size) -> io::Result<()> {
+        Ok(rustix::termios::tcsetwinsize(
+            self.0.get_ref(),
+            winsize(size),
+        )?)
+    }
+}
+
+fn winsize(size: super::Size) -> rustix::termios::Winsize {
+    rustix::termios::Winsize {
+        ws_row: size.rows,
+        ws_col: size.columns,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    }
+}
 
 /// Linux reports a terminal whose every device copy closed as `EIO`; that
 /// is the end of its output, not a failure.

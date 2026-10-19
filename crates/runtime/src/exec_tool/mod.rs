@@ -66,9 +66,12 @@ pub const MAX_TIMEOUT: u64 = 600;
 pub const DEFAULT_BACKGROUND_TIMEOUT: u64 = 600;
 /// Longest a background command may run.
 pub const MAX_BACKGROUND_TIMEOUT: u64 = 3600;
-/// Columns and rows a session's terminal reports.
+/// Columns and rows a session's terminal reports unless the call sets them.
 pub const TERMINAL_COLUMNS: u16 = 80;
 pub const TERMINAL_ROWS: u16 = 24;
+/// Widest and tallest terminal a call may ask for.
+pub const MAX_TERMINAL_COLUMNS: u16 = 1000;
+pub const MAX_TERMINAL_ROWS: u16 = 1000;
 /// Longest command accepted.
 pub const MAX_COMMAND: usize = 16 * 1024;
 /// Output kept from each of stdout and stderr; the rest is read and dropped
@@ -122,7 +125,7 @@ pub enum ExecError {
     Output(#[source] std::io::Error),
     #[error("the command did not finish within {seconds} s and was stopped")]
     TimedOut { seconds: u64 },
-    #[error("`action` must be one of list, poll, kill or remove")]
+    #[error("`action` must be one of list, poll, resize, kill or remove")]
     Action,
     #[error("`session` must name a background session")]
     Session,
@@ -134,6 +137,18 @@ pub enum ExecError {
     Key(#[from] keys::UnknownKey),
     #[error("`terminal` needs `background`")]
     TerminalNeedsBackground,
+    #[error(
+        "`columns` must be a whole number from 1 to {MAX_TERMINAL_COLUMNS} and `rows` from 1 to {MAX_TERMINAL_ROWS}"
+    )]
+    Size,
+    #[error("`columns` and `rows` need `terminal`")]
+    SizeNeedsTerminal,
+    #[error("`resize` needs both `columns` and `rows`")]
+    ResizeNeedsSize,
+    #[error("only a session started with `terminal` has a window to resize")]
+    ResizeNeedsTerminal,
+    #[error("could not resize the session's terminal")]
+    Resize(#[source] std::io::Error),
     #[error("keys need a session started with `terminal`; send text with `data`")]
     KeysNeedTerminal,
     #[error("a terminal's input cannot be closed; send the key Ctrl-D to end it")]
@@ -174,6 +189,9 @@ impl crate::error::Classified for ExecError {
             | Self::NotKeys
             | Self::Key(_)
             | Self::TerminalNeedsBackground
+            | Self::Size
+            | Self::SizeNeedsTerminal
+            | Self::ResizeNeedsSize
             | Self::MissingCommand
             | Self::Command
             | Self::Timeout
@@ -182,7 +200,9 @@ impl crate::error::Classified for ExecError {
             | Self::Unknown(_) => ErrorKind::InvalidRequest,
             // Absent and unreadable paths need different recovery.
             Self::Missing { .. } => return None,
-            Self::Helper(_) | Self::Setup(_) | Self::Output(_) => ErrorKind::Internal,
+            Self::Helper(_) | Self::Setup(_) | Self::Output(_) | Self::Resize(_) => {
+                ErrorKind::Internal
+            }
             // These errors know their own kinds.
             Self::Sandbox(_) | Self::Start(_) => return None,
             // `transparent` hides it from the chain, so classify it here.
@@ -194,6 +214,7 @@ impl crate::error::Classified for ExecError {
             | Self::SessionFinished
             | Self::InputClosed
             | Self::KeysNeedTerminal
+            | Self::ResizeNeedsTerminal
             | Self::TerminalClose
             | Self::Input(_) => ErrorKind::Conflict,
             #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -209,8 +230,39 @@ struct Call {
     working_dir: Option<PathBuf>,
     timeout: u64,
     background: bool,
-    /// Run on a pseudo-terminal; only in the background.
-    terminal: bool,
+    /// Run on a pseudo-terminal of this size; only in the background.
+    terminal: Option<Size>,
+}
+
+/// A terminal's window size.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Size {
+    pub(crate) columns: u16,
+    pub(crate) rows: u16,
+}
+impl Default for Size {
+    fn default() -> Self {
+        Self {
+            columns: TERMINAL_COLUMNS,
+            rows: TERMINAL_ROWS,
+        }
+    }
+}
+/// The `columns` and `rows` of a call, each absent or within its bound.
+fn dimensions(arguments: &Map<String, Value>) -> Result<(Option<u16>, Option<u16>), ExecError> {
+    let dimension = |key, max: u16| match arguments.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value
+            .as_u64()
+            .filter(|n| (1..=u64::from(max)).contains(n))
+            .and_then(|n| u16::try_from(n).ok())
+            .map(Some)
+            .ok_or(ExecError::Size),
+    };
+    Ok((
+        dimension("columns", MAX_TERMINAL_COLUMNS)?,
+        dimension("rows", MAX_TERMINAL_ROWS)?,
+    ))
 }
 
 fn text(arguments: &Map<String, Value>, key: &'static str) -> Result<Option<String>, ExecError> {
@@ -243,6 +295,8 @@ fn parse(arguments: &Map<String, Value>) -> Result<Call, ExecError> {
             "timeout_secs",
             "background",
             "terminal",
+            "columns",
+            "rows",
         ],
     )?;
     let text = |key| text(arguments, key);
@@ -251,6 +305,17 @@ fn parse(arguments: &Map<String, Value>) -> Result<Call, ExecError> {
     if terminal && !background {
         return Err(ExecError::TerminalNeedsBackground);
     }
+    let terminal = match (terminal, dimensions(arguments)?) {
+        (false, (None, None)) => None,
+        (false, _) => return Err(ExecError::SizeNeedsTerminal),
+        (true, (columns, rows)) => {
+            let default = Size::default();
+            Some(Size {
+                columns: columns.unwrap_or(default.columns),
+                rows: rows.unwrap_or(default.rows),
+            })
+        }
+    };
     let command = text("command")?.ok_or(ExecError::MissingCommand)?;
     if command.trim().is_empty() || command.len() > MAX_COMMAND || command.contains('\0') {
         return Err(ExecError::Command);
@@ -297,6 +362,7 @@ fn parse(arguments: &Map<String, Value>) -> Result<Call, ExecError> {
 enum Action {
     List,
     Poll(a206_core::Id),
+    Resize(a206_core::Id, Size),
     Kill(a206_core::Id),
     Remove(a206_core::Id),
 }
@@ -306,8 +372,17 @@ fn session(arguments: &Map<String, Value>) -> Result<a206_core::Id, ExecError> {
         .ok_or(ExecError::Session)
 }
 fn parse_action(arguments: &Map<String, Value>) -> Result<Action, ExecError> {
+    let action = text(arguments, "action")?;
+    if action.as_deref() == Some("resize") {
+        only(arguments, &["action", "session", "columns", "rows"])?;
+        let id = session(arguments)?;
+        return match dimensions(arguments)? {
+            (Some(columns), Some(rows)) => Ok(Action::Resize(id, Size { columns, rows })),
+            _ => Err(ExecError::ResizeNeedsSize),
+        };
+    }
     only(arguments, &["action", "session"])?;
-    match text(arguments, "action")?.as_deref() {
+    match action.as_deref() {
         Some("list") => Ok(Action::List),
         Some("poll") => Ok(Action::Poll(session(arguments)?)),
         Some("kill") => Ok(Action::Kill(session(arguments)?)),
@@ -380,9 +455,10 @@ impl ExecHost {
                  and the environment is empty. Every call needs the user's approval. With \
                  `background` it returns a session id at once and the command keeps running: \
                  follow it with `{PROCESS}` and give it input with `{PROCESS_WRITE}`. Add \
-                 `terminal` for a program that needs a terminal: it then runs on a {TERMINAL_COLUMNS}x{TERMINAL_ROWS} \
-                 pseudo-terminal with TERM=dumb, its stdout and stderr arrive as one stream, and \
-                 `{PROCESS_WRITE}` can send it keys such as Ctrl-C."
+                 `terminal` for a program that needs a terminal: it then runs on a pseudo-terminal \
+                 with TERM=dumb, {TERMINAL_COLUMNS} columns by {TERMINAL_ROWS} rows unless \
+                 `columns` and `rows` say otherwise, its stdout and stderr arrive as one stream, \
+                 `{PROCESS_WRITE}` can send it keys such as Ctrl-C and `{PROCESS}` can resize it."
             ),
             parameters: json!({
                 "type": "object",
@@ -412,6 +488,18 @@ impl ExecHost {
                     "terminal": {
                         "type": "boolean",
                         "description": "With background: run the command on a pseudo-terminal."
+                    },
+                    "columns": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": MAX_TERMINAL_COLUMNS,
+                        "description": format!("With terminal: its width, default {TERMINAL_COLUMNS}.")
+                    },
+                    "rows": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": MAX_TERMINAL_ROWS,
+                        "description": format!("With terminal: its height, default {TERMINAL_ROWS}.")
                     }
                 },
                 "required": ["command"],
@@ -429,15 +517,29 @@ impl ExecHost {
                 "Follow this conversation's background commands from `{NAME}`. `list` shows each \
                  session's id and status; `poll` returns its status and the output \
                  written since the last poll (each stream keeps at most {MAX_STREAM} unread \
-                 bytes, dropping the oldest); `kill` stops it; `remove` stops it if needed and \
+                 bytes, dropping the oldest); `resize` gives a session started with `terminal` \
+                 a new window size in `columns` and `rows`, and the command is told of it as a \
+                 terminal would tell it; `kill` stops it; `remove` stops it if needed and \
                  forgets it. A conversation holds at most {MAX_PER_THREAD} sessions; starting \
                  another removes its oldest finished one."
             ),
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "action": { "type": "string", "enum": ["list", "poll", "kill", "remove"] },
-                    "session": { "type": "string", "description": "The session id, except for list." }
+                    "action": { "type": "string", "enum": ["list", "poll", "resize", "kill", "remove"] },
+                    "session": { "type": "string", "description": "The session id, except for list." },
+                    "columns": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": MAX_TERMINAL_COLUMNS,
+                        "description": "For resize: the terminal's new width."
+                    },
+                    "rows": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": MAX_TERMINAL_ROWS,
+                        "description": "For resize: the terminal's new height."
+                    }
                 },
                 "required": ["action"],
                 "additionalProperties": false
@@ -508,6 +610,13 @@ impl ExecHost {
                 Action::Poll(id) => {
                     let (text, is_error) = self.sessions.poll(scope.thread, id)?;
                     Ok(ToolOutput { text, is_error })
+                }
+                Action::Resize(id, size) => {
+                    self.sessions.resize(scope.thread, id, size)?;
+                    Ok(done(format!(
+                        "Session {id}'s terminal is now {} columns by {} rows.",
+                        size.columns, size.rows
+                    )))
                 }
                 Action::Kill(id) => {
                     self.sessions.kill(scope.thread, id)?;
@@ -669,7 +778,11 @@ impl ExecHost {
             text: format!(
                 "Started background session {id}{}; it is stopped after {} s. Follow it with \
                  `{PROCESS}` and give it input with `{PROCESS_WRITE}`.",
-                if call.terminal { " on a terminal" } else { "" },
+                if call.terminal.is_some() {
+                    " on a terminal"
+                } else {
+                    ""
+                },
                 call.timeout
             ),
             is_error: false,
@@ -747,11 +860,11 @@ impl ExecHost {
             &self.state_root,
         )?;
         let control = root.join("control");
-        let pair = if call.terminal {
-            Some(terminal::Pair::open().map_err(ExecError::Terminal)?)
-        } else {
-            None
-        };
+        let pair = call
+            .terminal
+            .map(terminal::Pair::open)
+            .transpose()
+            .map_err(ExecError::Terminal)?;
         let profile = a206_sandbox::Profile {
             helper: &helper,
             executable: &shell,
@@ -1019,7 +1132,7 @@ mod tests {
                 working_dir: Some("src/./x".into()),
                 timeout: 5,
                 background: false,
-                terminal: false,
+                terminal: None,
             }
         );
         assert_eq!(
@@ -1061,9 +1174,9 @@ mod tests {
         let command = uuid::Uuid::new_v4().to_string();
         let call = |value: Value| parse(&arguments(value));
         let background = call(json!({ "command": command, "background": true })).unwrap();
-        assert!(background.background && !background.terminal);
+        assert!(background.background && background.terminal.is_none());
         let terminal = json!({ "command": command, "background": true, "terminal": true });
-        assert!(call(terminal).unwrap().terminal);
+        assert_eq!(call(terminal).unwrap().terminal, Some(Size::default()));
         assert_eq!(background.timeout, DEFAULT_BACKGROUND_TIMEOUT);
         let long = json!({ "command": command, "timeout_secs": MAX_BACKGROUND_TIMEOUT });
         assert!(
@@ -1081,12 +1194,44 @@ mod tests {
             json!({ "command": command, "background": "yes" }),
             json!({ "command": command, "terminal": true }),
             json!({ "command": command, "background": true, "terminal": 1 }),
+            json!({ "command": command, "background": true, "columns": 100 }),
+            json!({ "command": command, "background": true, "terminal": true, "columns": 0 }),
+            json!({ "command": command, "background": true, "terminal": true,
+                    "rows": MAX_TERMINAL_ROWS + 1 }),
+            json!({ "command": command, "background": true, "terminal": true, "rows": "30" }),
         ] {
             assert_eq!(
-                crate::error::report(&call(value).unwrap_err()).kind,
-                ErrorKind::InvalidRequest
+                crate::error::report(&call(value.clone()).unwrap_err()).kind,
+                ErrorKind::InvalidRequest,
+                "{value}"
             );
         }
+    }
+
+    #[test]
+    fn terminal_size_is_the_default_unless_the_call_sets_it() {
+        let command = uuid::Uuid::new_v4().to_string();
+        let size = |extra: Value| {
+            let mut value = json!({ "command": command, "background": true, "terminal": true });
+            value
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            parse(&arguments(value)).unwrap().terminal.unwrap()
+        };
+        let default = Size::default();
+        let wide = Size {
+            columns: MAX_TERMINAL_COLUMNS,
+            rows: default.rows,
+        };
+        assert_eq!(size(json!({ "columns": MAX_TERMINAL_COLUMNS })), wide);
+        assert_eq!(
+            size(json!({ "rows": 1, "columns": 2 })),
+            Size {
+                columns: 2,
+                rows: 1
+            }
+        );
     }
 
     #[test]
@@ -1098,12 +1243,31 @@ mod tests {
             action(json!({ "action": "poll", "session": id.to_string() })).unwrap(),
             Action::Poll(id)
         );
+        assert_eq!(
+            action(
+                json!({ "action": "resize", "session": id.to_string(), "columns": 132, "rows": 43 })
+            )
+            .unwrap(),
+            Action::Resize(
+                id,
+                Size {
+                    columns: 132,
+                    rows: 43
+                }
+            )
+        );
         for value in [
             json!({}),
             json!({ "action": "poll" }),
             json!({ "action": "poll", "session": "not-an-id" }),
             json!({ "action": "signal", "session": id.to_string() }),
             json!({ "action": "list", "extra": 1 }),
+            json!({ "action": "poll", "session": id.to_string(), "rows": 30 }),
+            json!({ "action": "resize", "session": id.to_string(), "rows": 30 }),
+            json!({ "action": "resize", "session": id.to_string(), "columns": 0, "rows": 30 }),
+            json!({ "action": "resize", "columns": 100, "rows": 30 }),
+            json!({ "action": "resize", "session": id.to_string(), "columns": 100,
+                    "rows": 30, "extra": 1 }),
         ] {
             let error = action(value.clone()).unwrap_err();
             assert_eq!(
