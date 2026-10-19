@@ -265,8 +265,10 @@ agent206 messenger enable workspace
   `&gt;` escapes are undone for the model; mentions stay in Slack's
   `<@U…>` form. Replies go through `chat.postMessage`, split at 4000
   characters, with `&`, `<` and `>` escaped so a reply cannot write a
-  mention (such as `<!channel>`) or a link, and with unfurling off. Replies
-  go to the conversation, not to a message's thread.
+  mention (such as `<!channel>`) or a link, and with unfurling off. A
+  message written in a thread is answered in that thread (`thread_ts`), not
+  broadcast to the channel; any other message is answered in the channel.
+  Threads of a channel share the channel's one Agent 206 conversation.
 - **Delivery.** A `disconnect` request starts a new socket. Messages sent
   while the app was disconnected are not answered. A rejected token
   (`invalid_auth` and similar, from `auth.test` or `apps.connections.open`)
@@ -596,8 +598,8 @@ are not saved: it still starts from now after a restart.
 - Signal attachments, mentions and quoted replies.
 - IRC certificate fingerprints or custom roots, SASL EXTERNAL, networks
   without `account-tag`, and channel keys.
-- Slack thread replies, the Events API over HTTP (Socket Mode only) and
-  conversation names in the refused list.
+- Slack: a conversation of its own per thread, the Events API over HTTP
+  (Socket Mode only) and conversation names in the refused list.
 - Discord session resume, slash commands, threads' own channel ids beyond
   allowing them, and channel names in the refused list (only direct messages
   carry a title).

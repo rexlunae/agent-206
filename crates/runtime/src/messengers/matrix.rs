@@ -514,6 +514,7 @@ impl Matrix {
                 title: None,
                 text,
                 encrypted,
+                thread: None,
             })
         };
         match (event.kind.as_str(), event.content) {

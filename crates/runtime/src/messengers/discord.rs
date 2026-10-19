@@ -366,5 +366,6 @@ fn message_event(message: Message, own: Option<&str>) -> Event {
         title,
         text: message.content,
         encrypted: false,
+        thread: None,
     })
 }

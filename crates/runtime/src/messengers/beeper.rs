@@ -516,6 +516,7 @@ fn event(chat: &str, info: Option<&Chat>, message: Message) -> Event {
         title,
         text,
         encrypted: false,
+        thread: None,
     })
 }
 

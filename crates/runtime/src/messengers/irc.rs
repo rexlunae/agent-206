@@ -586,6 +586,7 @@ fn message_event(line: &Line<'_>, target: &str, text: &str, own: &str) -> Event 
             title: Some(target.to_owned()),
             text: text.to_owned(),
             encrypted: false,
+            thread: None,
         });
     }
     // A direct message is the account's chat; without one, it is nobody's.
@@ -600,6 +601,7 @@ fn message_event(line: &Line<'_>, target: &str, text: &str, own: &str) -> Event 
         title: Some(from.to_owned()),
         text: text.to_owned(),
         encrypted: false,
+        thread: None,
     })
 }
 

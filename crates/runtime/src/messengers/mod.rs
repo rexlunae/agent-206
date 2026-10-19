@@ -297,6 +297,9 @@ pub(crate) struct Inbound {
     /// End-to-end encrypted, so `text` is empty: it cannot be read here, and
     /// a plain-text answer would downgrade the chat.
     pub encrypted: bool,
+    /// The thread within `chat` the message was written in, where the
+    /// service has threads (a Slack `thread_ts`); the answer goes there.
+    pub thread: Option<String>,
 }
 
 /// Something a poll delivered.
@@ -466,6 +469,14 @@ impl Adapter {
             Self::Irc(adapter) => adapter.send(chat, text).await,
             Self::Signal(adapter) => adapter.send(chat, text).await,
             Self::Beeper(adapter) => adapter.send(chat, text).await,
+        }
+    }
+    /// Answer a message: in the thread it was written in, where the service
+    /// has threads (Slack), otherwise in its chat.
+    async fn answer(&self, chat: &str, thread: Option<&str>, text: &str) -> Result<()> {
+        match (self, thread) {
+            (Self::Slack(adapter), Some(thread)) => adapter.send_in(chat, Some(thread), text).await,
+            _ => self.send(chat, text).await,
         }
     }
 }
@@ -944,6 +955,7 @@ async fn deliver<H: Host>(
         return Ok(());
     }
     let chat = inbound.chat.clone();
+    let reply_thread = inbound.thread.clone();
     let encrypted = |error: &MessengerError| matches!(error, MessengerError::EncryptedRoom { .. });
     let checked = if inbound.encrypted {
         Err(MessengerError::EncryptedRoom { chat: chat.clone() })
@@ -973,7 +985,7 @@ async fn deliver<H: Host>(
         host.converse(thread, inbound.text).await
     };
     let sent = match turn.await {
-        Ok(Some(reply)) => adapter.send(&chat, &reply).await,
+        Ok(Some(reply)) => adapter.answer(&chat, reply_thread.as_deref(), &reply).await,
         Ok(None) => Ok(()),
         Err(error) => {
             // The chat is where this turn started, so its failure is shown
@@ -982,7 +994,9 @@ async fn deliver<H: Host>(
                 "Agent 206 could not answer: {}",
                 report(host, config, &error)
             );
-            adapter.send(&chat, &notice).await
+            adapter
+                .answer(&chat, reply_thread.as_deref(), &notice)
+                .await
         }
     };
     match sent {
