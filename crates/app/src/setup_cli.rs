@@ -107,21 +107,23 @@ fn ask(prompt: &str) -> Result<Option<String>> {
     Ok(Some(answer.trim().to_owned()))
 }
 
-/// A preset by its id, or else by its number in the printed list. An exact
-/// id wins, so a custom preset with a numeric id stays reachable.
+/// A preset by its number in the printed list, by its id, or by `id:ID`.
+/// A plain number is always a list position, so a numeric id is chosen with
+/// the `id:` form.
 fn pick<'a>(presets: &'a [ProviderPreset], answer: &str) -> Option<&'a ProviderPreset> {
-    presets.iter().find(|p| p.id == answer).or_else(|| {
-        answer
-            .parse::<usize>()
-            .ok()
-            .and_then(|number| number.checked_sub(1))
-            .and_then(|i| presets.get(i))
-    })
+    if let Some(id) = answer.strip_prefix("id:") {
+        return presets.iter().find(|p| p.id == id);
+    }
+    match answer.parse::<usize>() {
+        Ok(number) => number.checked_sub(1).and_then(|i| presets.get(i)),
+        Err(_) => presets.iter().find(|p| p.id == answer),
+    }
 }
 
 fn choose(presets: &[ProviderPreset]) -> Result<Option<&ProviderPreset>> {
     loop {
-        let Some(answer) = ask("Provider (number or id): ")? else {
+        let Some(answer) = ask("Provider (number, id, or id:ID for an id made of digits): ")?
+        else {
             return Ok(None);
         };
         match pick(presets, &answer) {
@@ -771,19 +773,18 @@ mod tests {
     }
 
     #[test]
-    fn an_exact_id_wins_over_a_list_number() {
+    fn a_number_is_a_list_position_and_id_prefix_names_an_id() {
         let named = preset(uuid::Uuid::new_v4().simple().to_string());
         // A numeric id that is also a valid position in the list.
         let numeric = preset("1".into());
         let presets = [named.clone(), numeric.clone()];
-        assert_eq!(pick(&presets, "1"), Some(&numeric));
+        assert_eq!(pick(&presets, "1"), Some(&named));
         assert_eq!(pick(&presets, "2"), Some(&numeric));
+        assert_eq!(pick(&presets, "id:1"), Some(&numeric));
         assert_eq!(pick(&presets, &named.id), Some(&named));
-        // A numeric id beyond the list length is still found by id.
-        let far = preset((presets.len() + 7).to_string());
-        let presets = [named.clone(), far.clone()];
-        assert_eq!(pick(&presets, &far.id), Some(&far));
+        assert_eq!(pick(&presets, &format!("id:{}", named.id)), Some(&named));
         assert_eq!(pick(&presets, "0"), None);
-        assert_eq!(pick(&presets, &(presets.len() + 1).to_string()), None);
+        assert_eq!(pick(&presets, "3"), None);
+        assert_eq!(pick(&presets, "id:3"), None);
     }
 }
