@@ -45,6 +45,8 @@ pub enum ForgeError {
     Answer(#[source] serde_json::Error),
     #[error("the pull request has no commit to read checks for")]
     NoCommit,
+    #[error("the title is only a draft marker; give it a title and set `draft` instead")]
+    MarkerTitle,
 }
 
 /// The bundled API location of a well-known forge, by the origin its git
@@ -432,9 +434,9 @@ impl Repository {
 
     /// Opens `new`; the answer is read with
     /// [`Repository::parse_pull_request`].
-    pub fn create_pull_request(&self, new: &NewPullRequest<'_>) -> Change {
+    pub fn create_pull_request(&self, new: &NewPullRequest<'_>) -> Result<Change, ForgeError> {
         match self.kind {
-            ForgeKind::GitHub => github::create(self, new),
+            ForgeKind::GitHub => Ok(github::create(self, new)),
             ForgeKind::GitLab => gitlab::create(self, new),
         }
     }

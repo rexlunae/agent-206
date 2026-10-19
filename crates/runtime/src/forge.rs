@@ -98,6 +98,7 @@ impl crate::error::Classified for ForgeToolError {
                 ErrorKind::InvalidRequest
             }
             Self::Forge(ForgeError::NoCommit) => ErrorKind::Provider,
+            Self::Forge(ForgeError::MarkerTitle) => ErrorKind::InvalidRequest,
         })
     }
 }
@@ -299,7 +300,7 @@ impl ForgeHost {
                     source: &source,
                     target: &base,
                     draft,
-                });
+                })?;
                 let body = forge.post(change).await?;
                 return Ok(json!({
                     "remote": remote,

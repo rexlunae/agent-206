@@ -642,17 +642,19 @@ async fn a_model_opens_and_comments_on_pull_requests_only_when_approved() {
         .unwrap()
         .shorten()
         .to_string();
+    // The longest title accepted, 249 characters, is sent whole.
+    let longest = format!("{title}{}", "y".repeat(249 - title.chars().count()));
     let (record, _) = rig
         .approved(
             CREATE,
-            json!({"title": title, "base": base}),
+            json!({"title": longest, "base": base}),
             ApprovalDecision::Approve,
         )
         .await;
     assert_eq!(error_kind(&record), ErrorKind::Conflict);
     assert_eq!(
         rig.api.posted.lock().unwrap().last().unwrap().1,
-        json!({"title": title, "head": current, "base": base, "draft": false})
+        json!({"title": longest, "head": current, "base": base, "draft": false})
     );
 
     let comment = nonce();
@@ -686,10 +688,7 @@ async fn a_model_opens_and_comments_on_pull_requests_only_when_approved() {
         (CREATE, json!({"base": base})),
         (CREATE, json!({"title": " ", "base": base})),
         (CREATE, json!({"title": "a\u{1b}[2J", "base": base})),
-        (
-            CREATE,
-            json!({"title": "x".repeat(a206_forge::MAX_TITLE + 1), "base": base}),
-        ),
+        (CREATE, json!({"title": "x".repeat(250), "base": base})),
         (
             CREATE,
             json!({"title": title, "base": base, "draft": "yes"}),

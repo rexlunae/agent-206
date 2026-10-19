@@ -84,25 +84,38 @@ pub(super) const DRAFT: &str = "Draft: ";
 const MARKERS: [&str; 3] = ["[draft]", "(draft)", "draft:"];
 
 /// `title` without the draft markers it starts with, so only `draft`
-/// decides whether the merge request is one.
-fn unmarked(mut title: &str) -> &str {
+/// decides whether the merge request is one. A title without one is kept
+/// exactly; with one, the spaces around the markers go too.
+fn unmarked(title: &str) -> &str {
+    let mut rest = title;
+    let mut marked = false;
     loop {
-        let trimmed = title.trim_start();
+        let trimmed = rest.trim_start();
         let marker = MARKERS.iter().find(|marker| {
             trimmed
                 .get(..marker.len())
                 .is_some_and(|start| start.eq_ignore_ascii_case(marker))
         });
         match marker {
-            Some(marker) => title = &trimmed[marker.len()..],
-            None => return trimmed,
+            Some(marker) => {
+                rest = &trimmed[marker.len()..];
+                marked = true;
+            }
+            None if marked => return trimmed,
+            None => return title,
         }
     }
 }
 
-pub(super) fn create(repository: &Repository, new: &NewPullRequest<'_>) -> Change {
+pub(super) fn create(
+    repository: &Repository,
+    new: &NewPullRequest<'_>,
+) -> Result<Change, ForgeError> {
     // GitLab marks a merge request as a draft by its title.
     let title = unmarked(new.title);
+    if title.trim().is_empty() {
+        return Err(ForgeError::MarkerTitle);
+    }
     let title = if new.draft {
         format!("{DRAFT}{title}")
     } else {
@@ -116,10 +129,10 @@ pub(super) fn create(repository: &Repository, new: &NewPullRequest<'_>) -> Chang
     if let Some(text) = new.body {
         body["description"] = json!(text);
     }
-    Change {
+    Ok(Change {
         url: project(repository, &["merge_requests"]),
         body: body.to_string().into_bytes(),
-    }
+    })
 }
 
 pub(super) fn comment(repository: &Repository, number: u64, text: &str) -> Change {

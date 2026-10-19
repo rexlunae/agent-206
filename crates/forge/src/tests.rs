@@ -503,7 +503,7 @@ fn opening_and_commenting_send_each_forges_fields() {
         target: &target,
         draft: true,
     };
-    let sent = github.create_pull_request(&new);
+    let sent = github.create_pull_request(&new).unwrap();
     assert_eq!(
         sent.url.path(),
         format!("/api/v3/repos/{owner}/{name}/pulls")
@@ -513,7 +513,7 @@ fn opening_and_commenting_send_each_forges_fields() {
         body,
         json!({"title": title, "head": source, "base": target, "draft": true, "body": text})
     );
-    let sent = gitlab.create_pull_request(&new);
+    let sent = gitlab.create_pull_request(&new).unwrap();
     assert_eq!(
         sent.url.path(),
         format!("/api/v4/projects/{owner}%2F{name}/merge_requests")
@@ -529,7 +529,8 @@ fn opening_and_commenting_send_each_forges_fields() {
         draft: false,
         ..new
     };
-    let body: Value = serde_json::from_slice(&gitlab.create_pull_request(&plain).body).unwrap();
+    let body: Value =
+        serde_json::from_slice(&gitlab.create_pull_request(&plain).unwrap().body).unwrap();
     assert_eq!(body["title"], title);
     assert!(body.get("description").is_none());
 
@@ -546,14 +547,29 @@ fn opening_and_commenting_send_each_forges_fields() {
             false,
             format!("draftsman {title}"),
         ),
+        // Unmarked titles go exactly as given.
+        (format!("  {title}"), false, format!("  {title}")),
     ] {
         let new = NewPullRequest {
             title: &marked,
             draft,
             ..new
         };
-        let body: Value = serde_json::from_slice(&gitlab.create_pull_request(&new).body).unwrap();
+        let body: Value =
+            serde_json::from_slice(&gitlab.create_pull_request(&new).unwrap().body).unwrap();
         assert_eq!(body["title"], posted, "{marked}");
+    }
+    // A title that is only markers is refused rather than sent blank.
+    for marked in ["Draft:", " [Draft] (draft) "] {
+        let new = NewPullRequest {
+            title: marked,
+            draft: false,
+            ..new
+        };
+        assert!(matches!(
+            gitlab.create_pull_request(&new),
+            Err(ForgeError::MarkerTitle)
+        ));
     }
     // The longest title a draft may have reads back whole.
     let longest: String = std::iter::repeat_n('x', MAX_TITLE).collect();
@@ -563,7 +579,7 @@ fn opening_and_commenting_send_each_forges_fields() {
         ..new
     };
     let mut request: Value =
-        serde_json::from_slice(&gitlab.create_pull_request(&new).body).unwrap();
+        serde_json::from_slice(&gitlab.create_pull_request(&new).unwrap().body).unwrap();
     request["iid"] = json!(1);
     request["state"] = json!("opened");
     let read = gitlab.parse_pull_request(&bytes(&request)).unwrap();
