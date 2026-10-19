@@ -145,10 +145,10 @@ fn jobs_stored_before_heartbeats_are_messages_and_only_an_exact_ok_is_quiet() {
     let checklist = Id::new_v4().to_string();
     let run = Id::new_v4();
     let message = heartbeat_message(&format!("\n{checklist}\n"), run);
-    assert_eq!(heartbeat_run(&message), Some(run));
+    assert_eq!(check_run(&message), Some(run));
     assert!(message.contains(&checklist));
-    assert_eq!(heartbeat_run(&checklist), None);
-    assert_eq!(heartbeat_run(&format!("{HEARTBEAT_HEADER}soon.")), None);
+    assert_eq!(check_run(&checklist), None);
+    assert_eq!(check_run(&format!("{HEARTBEAT_HEADER}soon.")), None);
     assert!(is_heartbeat_ok(&format!(" {HEARTBEAT_OK}\n")));
     for reply in [
         format!("{HEARTBEAT_OK} {checklist}"),
@@ -158,4 +158,34 @@ fn jobs_stored_before_heartbeats_are_messages_and_only_an_exact_ok_is_quiet() {
     ] {
         assert!(!is_heartbeat_ok(&reply), "{reply}");
     }
+}
+
+#[test]
+fn a_trigger_message_names_its_run_and_bounds_the_report() {
+    let (extension, trigger) = (
+        format!("x.{}", Id::new_v4().simple()),
+        format!("t{}", Id::new_v4().simple()),
+    );
+    let (text, report, run) = (
+        Id::new_v4().to_string(),
+        Id::new_v4().to_string(),
+        Id::new_v4(),
+    );
+    let message = trigger_message(&extension, &trigger, &format!(" {text}\n"), &report, run);
+    assert_eq!(check_run(&message), Some(run));
+    for part in [&extension, &trigger, &text, &report] {
+        assert!(message.contains(part.as_str()), "{message}");
+    }
+    // The job's own text comes before the extension's report.
+    assert!(message.find(&text) < message.find(&report), "{message}");
+    assert!(!message.contains("cut at a limit"));
+    let quiet = trigger_message(&extension, &trigger, "  ", &report, run);
+    assert!(!quiet.contains("\n\n\n"), "{quiet}");
+
+    // A report past the limit is cut at a character boundary, with a notice.
+    let long = "é".repeat(MAX_TRIGGER_REPORT);
+    let message = trigger_message(&extension, &trigger, "", &long, run);
+    let kept = message.matches('é').count();
+    assert_eq!(kept, MAX_TRIGGER_REPORT / 2);
+    assert!(message.ends_with("[the report continues; it was cut at a limit]"));
 }

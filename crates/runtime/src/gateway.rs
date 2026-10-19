@@ -1961,6 +1961,7 @@ impl Gateway {
         Ok(crate::extension_host::Scope {
             workspace: project.map(|id| self.project_root(id)).transpose()?,
             ceiling: None,
+            current: None,
         })
     }
     /// The extension host the run engine calls tools through.

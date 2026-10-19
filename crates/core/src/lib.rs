@@ -918,6 +918,8 @@ pub struct PluginSummary {
     pub tools: Vec<extension::ToolSpec>,
     #[serde(default)]
     pub panels: Vec<extension::PanelSpec>,
+    #[serde(default)]
+    pub triggers: Vec<extension::TriggerSpec>,
     /// Where the `network` permission may connect; `*` is any public host.
     #[serde(default)]
     pub hosts: Vec<String>,

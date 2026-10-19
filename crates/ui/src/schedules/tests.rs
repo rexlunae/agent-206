@@ -24,6 +24,7 @@ fn job(thread: Uuid) -> Job {
         author: JobAuthor::User,
         history: 0,
         deliver_to: None,
+        cursor: None,
     }
 }
 
@@ -293,4 +294,162 @@ fn a_job_offers_each_configured_destination_and_keeps_a_withdrawn_one() {
     assert_eq!(kept.len(), 4, "{kept:?}");
     assert_eq!(kept[3].0, gone);
     assert!(kept[3].1.contains("no longer configured"), "{kept:?}");
+}
+
+fn plugin(enabled: bool, trigger: &TriggerSpec) -> PluginSummary {
+    PluginSummary {
+        id: format!("x.{}", Uuid::new_v4().simple()),
+        name: format!("Watcher {}", Uuid::new_v4().simple()),
+        description: String::new(),
+        capabilities: Default::default(),
+        enabled,
+        version: "1.0.0".into(),
+        granted: Default::default(),
+        tools: vec![],
+        panels: vec![],
+        triggers: vec![trigger.clone()],
+        hosts: vec![],
+        source: Default::default(),
+    }
+}
+
+fn spec(params: Vec<ParamSpec>) -> TriggerSpec {
+    TriggerSpec {
+        name: format!("t{}", Uuid::new_v4().simple()),
+        description: format!("Fires when {}.", Uuid::new_v4().simple()),
+        capabilities: Default::default(),
+        params,
+    }
+}
+
+fn param(kind: ParamKind, required: bool) -> ParamSpec {
+    ParamSpec {
+        name: format!("p{}", Uuid::new_v4().simple()),
+        kind,
+        description: String::new(),
+        required,
+    }
+}
+
+#[test]
+fn only_enabled_extensions_offer_their_triggers() {
+    let (on, off) = (spec(vec![]), spec(vec![]));
+    let plugins = vec![plugin(true, &on), plugin(false, &off)];
+    let choices = send_choices(&plugins);
+    let triggers: Vec<_> = choices
+        .iter()
+        .filter_map(|(choice, label)| match choice {
+            Sends::Trigger { extension, spec } => Some((extension, spec, label)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(triggers.len(), 1, "{choices:?}");
+    let (extension, offered, label) = triggers[0];
+    assert_eq!((extension, offered), (&plugins[0].id, &on));
+    assert!(label.contains(&plugins[0].name) && label.contains(&on.name));
+    // Every choice has its own key, so the field can tell them apart.
+    let keys: std::collections::BTreeSet<_> = choices.iter().map(|(c, _)| c.key()).collect();
+    assert_eq!(keys.len(), choices.len());
+}
+
+#[test]
+fn trigger_fields_become_arguments_of_their_declared_kinds() {
+    let (text, number, flag, ratio, optional) = (
+        param(ParamKind::String, true),
+        param(ParamKind::Integer, false),
+        param(ParamKind::Boolean, false),
+        param(ParamKind::Number, false),
+        param(ParamKind::String, false),
+    );
+    let params = vec![
+        text.clone(),
+        number.clone(),
+        flag.clone(),
+        ratio.clone(),
+        optional.clone(),
+    ];
+    let value = Uuid::new_v4().to_string();
+    let count = arbitrary(1_000_000) as i64;
+    let mut inputs = std::collections::BTreeMap::new();
+    inputs.insert(text.name.clone(), format!(" {value} "));
+    inputs.insert(number.name.clone(), format!(" {count} "));
+    inputs.insert(flag.name.clone(), "true".into());
+    inputs.insert(ratio.name.clone(), "0.5".into());
+    inputs.insert(optional.name.clone(), "  ".into());
+    let args = trigger_args(&params, &inputs).unwrap();
+    // A string keeps its spaces; a parsed value does not need them gone.
+    assert_eq!(args[&text.name], Value::Str(format!(" {value} ")));
+    assert_eq!(args[&number.name], Value::Int(count));
+    assert_eq!(args[&flag.name], Value::Bool(true));
+    assert_eq!(args[&ratio.name], Value::Float(0.5));
+    assert!(!args.contains_key(&optional.name), "{args:?}");
+
+    inputs.insert(number.name.clone(), "many".into());
+    assert_eq!(
+        trigger_args(&params, &inputs),
+        Err(ArgInputError::Kind {
+            name: number.name.clone(),
+            kind: ParamKind::Integer
+        })
+    );
+    inputs.remove(&text.name);
+    assert_eq!(
+        trigger_args(&params, &inputs),
+        Err(ArgInputError::Missing(text.name.clone()))
+    );
+    let list = param(ParamKind::Array, false);
+    let mut listed = std::collections::BTreeMap::new();
+    listed.insert(list.name.clone(), "[1]".into());
+    assert_eq!(
+        trigger_args(std::slice::from_ref(&list), &listed),
+        Err(ArgInputError::Structured(list.name))
+    );
+}
+
+#[test]
+fn trigger_checks_show_their_extension_arguments_and_whether_they_fired() {
+    let thread = Thread::new(format!("t-{}", Uuid::new_v4().simple()), Mode::Chat);
+    let url = param(ParamKind::String, true);
+    let trigger = spec(vec![url.clone()]);
+    let watcher = plugin(true, &trigger);
+    let value = format!("https://{}.example/", Uuid::new_v4().simple());
+    let check = |outcome: JobOutcome| {
+        let mut job = job(thread.id);
+        job.kind = JobKind::Trigger {
+            extension: watcher.id.clone(),
+            trigger: trigger.name.clone(),
+            args: [(url.name.clone(), Value::Str(value.clone()))].into(),
+        };
+        job.last = Some(JobRun {
+            outcome,
+            ..JobRun::start(job.created)
+        });
+        job
+    };
+    let mut snapshot = crate::empty_snapshot();
+    snapshot.threads = vec![thread.clone()];
+    snapshot.plugins = vec![watcher.clone()];
+    snapshot.jobs = vec![check(JobOutcome::Quiet)];
+    let quiet = render(snapshot.clone());
+    for part in [
+        "Trigger check",
+        watcher.name.as_str(),
+        trigger.description.as_str(),
+        url.name.as_str(),
+        value.as_str(),
+        snapshot.jobs[0].text.as_str(),
+        "Did not fire",
+    ] {
+        assert!(quiet.contains(part), "{part} in {quiet}");
+    }
+    snapshot.jobs = vec![check(JobOutcome::Complete)];
+    let fired = render(snapshot.clone());
+    assert!(fired.contains("Fired; answered"), "{fired}");
+    // An extension that was removed is named, and its runs are refused.
+    snapshot.plugins.clear();
+    let gone = render(snapshot);
+    assert!(
+        gone.contains(&watcher.id) && gone.contains("not installed"),
+        "{gone}"
+    );
 }
