@@ -2,9 +2,9 @@
 //! jobs of a merge request's head pipeline are its checks, and approvals
 //! are its reviews.
 use super::{
-    Change, Check, CheckStatus, Conclusion, DETAIL_PAGE, ForgeError, Listed, MAX_BODY, MergeMethod,
-    Merged, NewPullRequest, PAGE, PullRequest, Repository, Review, ReviewState, State, answer,
-    bounded, label, label_opt, unmarked,
+    Change, Check, CheckStatus, Comment, Conclusion, DETAIL_PAGE, ForgeError, LineComment, Listed,
+    MAX_BODY, MergeMethod, Merged, NewPullRequest, PAGE, PullRequest, Repository, Review,
+    ReviewState, Side, State, answer, bounded, label, label_opt, unmarked,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -115,6 +115,81 @@ pub(super) fn comment(repository: &Repository, number: u64, text: &str) -> Chang
         ),
         json!({"body": text}),
     )
+}
+
+/// A discussion on the line, placed by the merge request's current
+/// versions, which `current` (its answer) gives.
+pub(super) fn line_comment(
+    repository: &Repository,
+    number: u64,
+    current: &[u8],
+    head: &str,
+    comment: &LineComment<'_>,
+) -> Result<Change, ForgeError> {
+    #[derive(Deserialize)]
+    struct Current {
+        diff_refs: Option<DiffRefs>,
+    }
+    #[derive(Deserialize)]
+    struct DiffRefs {
+        base_sha: Option<String>,
+        start_sha: Option<String>,
+        head_sha: Option<String>,
+    }
+    let refs = answer::<Current>(current)?
+        .diff_refs
+        .ok_or(ForgeError::NoDiff)?;
+    let (Some(base), Some(start), Some(diff_head)) = (refs.base_sha, refs.start_sha, refs.head_sha)
+    else {
+        return Err(ForgeError::NoDiff);
+    };
+    // Its changes are worked out after a push, so they may be older.
+    if !diff_head.eq_ignore_ascii_case(head) {
+        return Err(ForgeError::HeadMoved);
+    }
+    let mut position = json!({
+        "position_type": "text",
+        "base_sha": base,
+        "start_sha": start,
+        "head_sha": diff_head,
+        "old_path": comment.path,
+        "new_path": comment.path,
+    });
+    let line = match comment.side {
+        Side::New => "new_line",
+        Side::Old => "old_line",
+    };
+    position[line] = json!(comment.line);
+    Ok(Change::post(
+        project(
+            repository,
+            &["merge_requests", &number.to_string(), "discussions"],
+        ),
+        json!({"body": comment.text, "position": position}),
+    ))
+}
+
+/// The note that starts a new discussion.
+pub(super) fn parse_discussion(body: &[u8]) -> Result<Comment, ForgeError> {
+    #[derive(Deserialize)]
+    struct Discussion {
+        notes: Vec<Note>,
+    }
+    #[derive(Deserialize)]
+    struct Note {
+        id: u64,
+    }
+    let discussion: Discussion = answer(body)?;
+    let note = discussion.notes.into_iter().next().ok_or_else(|| {
+        ForgeError::Answer(serde::de::Error::invalid_length(
+            0,
+            &"a discussion's first note",
+        ))
+    })?;
+    Ok(Comment {
+        id: note.id,
+        url: None,
+    })
 }
 
 pub(super) fn merge(

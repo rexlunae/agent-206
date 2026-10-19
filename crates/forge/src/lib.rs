@@ -56,6 +56,10 @@ pub enum ForgeError {
         "GitLab merges as the project is set to (a merge commit or fast-forward), or squashed; it cannot rebase here"
     )]
     GitLabRebase,
+    #[error("the pull request's head is no longer the commit `head`; read it again")]
+    HeadMoved,
+    #[error("the forge has not worked out the pull request's changes yet; read it again shortly")]
+    NoDiff,
 }
 
 /// The bundled API location of a well-known forge, by the origin its git
@@ -272,6 +276,27 @@ pub struct Comment {
     pub id: u64,
     /// Its web address, where the forge gives one.
     pub url: Option<String>,
+}
+
+/// Which version of a file a line comment is on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Side {
+    /// The file at the pull request's head: an added or unchanged line.
+    #[default]
+    New,
+    /// The file at its base: a removed line.
+    Old,
+}
+
+/// A comment on one line of a pull request's changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LineComment<'a> {
+    /// The file, relative to the repository's root.
+    pub path: &'a str,
+    /// The line's number in that version of the file, from 1.
+    pub line: u32,
+    pub side: Side,
+    pub text: &'a str,
 }
 
 /// A request that changes something on the forge: how and where to send
@@ -591,6 +616,36 @@ impl Repository {
             id: posted.id,
             url: label_opt(posted.html_url),
         })
+    }
+
+    /// Posts `comment` on a line of pull request `number`, whose current
+    /// answer to [`Repository::pull_request_url`] is `current`, anchored at
+    /// commit `head`; refused if that is no longer its head. The answer is
+    /// read with [`Repository::parse_line_comment`].
+    pub fn line_comment(
+        &self,
+        number: u64,
+        current: &[u8],
+        head: &str,
+        comment: &LineComment<'_>,
+    ) -> Result<Change, ForgeError> {
+        let pull = self.parse_pull_request(current)?;
+        let head = pull
+            .head
+            .filter(|now| now.eq_ignore_ascii_case(head))
+            .ok_or(ForgeError::HeadMoved)?;
+        match self.kind {
+            ForgeKind::GitHub => Ok(github::line_comment(self, number, &head, comment)),
+            ForgeKind::GitLab => gitlab::line_comment(self, number, current, &head, comment),
+            ForgeKind::Gitea => Ok(gitea::line_comment(self, number, &head, comment)),
+        }
+    }
+    pub fn parse_line_comment(&self, body: &[u8]) -> Result<Comment, ForgeError> {
+        match self.kind {
+            // Gitea answers with the review that holds the comment.
+            ForgeKind::GitHub | ForgeKind::Gitea => self.parse_comment(body),
+            ForgeKind::GitLab => gitlab::parse_discussion(body),
+        }
     }
 
     /// `segments` under the API base.

@@ -27,6 +27,7 @@ const READ: &str = a206_runtime::forge::READ;
 const CREATE: &str = a206_runtime::forge::CREATE;
 const COMMENT: &str = a206_runtime::forge::COMMENT;
 const MERGE: &str = a206_runtime::forge::MERGE;
+const LINE_COMMENT: &str = a206_runtime::forge::LINE_COMMENT;
 
 /// A forge API that answers each request path (with its query) from
 /// `answers`, and 404 otherwise.
@@ -295,7 +296,7 @@ async fn rig() -> Rig {
     })
     .await;
     // Allowing the tools that publish still leaves each call to the user.
-    for tool in [LIST, READ, CREATE, COMMENT, MERGE] {
+    for tool in [LIST, READ, CREATE, COMMENT, LINE_COMMENT, MERGE] {
         rig.ok(Command::SetToolPermission {
             thread: rig.thread,
             tool: tool.into(),
@@ -968,5 +969,144 @@ async fn a_model_merges_a_pull_request_only_at_the_approved_head() {
             .await;
         assert_eq!(error_kind(&record), ErrorKind::InvalidRequest);
     }
+    assert_eq!(rig.api.paths().len(), asked);
+}
+
+/// A line comment is anchored at the head commit the user approves, and
+/// nothing is posted once the pull request has moved on.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_model_comments_on_a_line_only_at_the_approved_head() {
+    let mut rig = rig().await;
+    let repo = format!("/api/v3/repos/{}/{}", rig.owner, rig.name);
+    let (head, path, comment) = (sha(), format!("{}/{}.rs", nonce(), nonce()), nonce());
+    let pull = |at: &str| {
+        json!({
+            "number": 8,
+            "title": nonce(),
+            "state": "open",
+            "head": {"ref": nonce(), "sha": at},
+            "base": {"ref": nonce(), "sha": sha()},
+        })
+    };
+    rig.api
+        .answer(&format!("{repo}/pulls/8"), StatusCode::OK, pull(&head));
+    let arguments = json!({"number": 8, "head": head, "path": path, "line": 12, "side": "old", "body": comment});
+    let (record, _) = rig
+        .approved(LINE_COMMENT, arguments.clone(), ApprovalDecision::Deny)
+        .await;
+    assert_eq!(record.state, ToolCallState::Denied);
+    assert!(rig.api.paths().is_empty());
+
+    let url = format!("{}/{}", rig.origin, nonce());
+    rig.api.answer(
+        &format!("{repo}/pulls/8/comments"),
+        StatusCode::CREATED,
+        json!({"id": 4242, "html_url": url, "body": comment}),
+    );
+    let (record, text) = rig
+        .approved(LINE_COMMENT, arguments.clone(), ApprovalDecision::Approve)
+        .await;
+    assert_eq!(record.state, ToolCallState::Succeeded, "{:?}", record.error);
+    assert_eq!(result(text)["comment"], json!({"id": 4242, "url": url}));
+    assert_eq!(
+        rig.api.posted.lock().unwrap().last().unwrap(),
+        &(
+            format!("{repo}/pulls/8/comments"),
+            json!({"body": comment, "commit_id": head, "path": path, "line": 12, "side": "LEFT"})
+        )
+    );
+
+    // A line the forge does not show in the changes.
+    rig.api.answer(
+        &format!("{repo}/pulls/8/comments"),
+        StatusCode::UNPROCESSABLE_ENTITY,
+        json!({"message": nonce()}),
+    );
+    let (record, _) = rig
+        .approved(LINE_COMMENT, arguments.clone(), ApprovalDecision::Approve)
+        .await;
+    assert_eq!(error_kind(&record), ErrorKind::Conflict);
+
+    // Pushed to since the user approved: read, and nothing posted.
+    rig.api
+        .answer(&format!("{repo}/pulls/8"), StatusCode::OK, pull(&sha()));
+    let posts = rig.api.posted.lock().unwrap().len();
+    let (record, _) = rig
+        .approved(LINE_COMMENT, arguments, ApprovalDecision::Approve)
+        .await;
+    assert_eq!(error_kind(&record), ErrorKind::Conflict);
+    assert_eq!(rig.api.posted.lock().unwrap().len(), posts);
+
+    // GitLab places a discussion by the merge request's current versions.
+    rig.forge(Some((ForgeKind::GitLab, "/api/v4"))).await;
+    let project = format!("/api/v4/projects/{}%2F{}", rig.owner, rig.name);
+    let (base, start) = (sha(), sha());
+    rig.api.answer(
+        &format!("{project}/merge_requests/8"),
+        StatusCode::OK,
+        json!({
+            "iid": 8,
+            "title": nonce(),
+            "state": "opened",
+            "source_branch": nonce(),
+            "target_branch": nonce(),
+            "sha": head,
+            "diff_refs": {"base_sha": base, "start_sha": start, "head_sha": head},
+        }),
+    );
+    rig.api.answer(
+        &format!("{project}/merge_requests/8/discussions"),
+        StatusCode::CREATED,
+        json!({"id": nonce(), "notes": [{"id": 515, "body": comment}]}),
+    );
+    let (record, text) = rig
+        .approved(
+            LINE_COMMENT,
+            json!({"number": 8, "head": head, "path": path, "line": 3, "body": comment}),
+            ApprovalDecision::Approve,
+        )
+        .await;
+    assert_eq!(record.state, ToolCallState::Succeeded, "{:?}", record.error);
+    assert_eq!(result(text)["comment"], json!({"id": 515, "url": null}));
+    assert_eq!(
+        rig.api.posted.lock().unwrap().last().unwrap().1,
+        json!({"body": comment, "position": {
+            "position_type": "text",
+            "base_sha": base,
+            "start_sha": start,
+            "head_sha": head,
+            "old_path": path,
+            "new_path": path,
+            "new_line": 3,
+        }})
+    );
+
+    // Bad arguments send nothing.
+    let asked = rig.api.paths().len();
+    let valid = json!({"number": 8, "head": head, "path": path, "line": 3, "body": comment});
+    for (key, value) in [
+        ("head", json!(&head[..20])),
+        ("path", json!("")),
+        ("path", json!(format!("/{path}"))),
+        ("path", json!(format!("{path}\n"))),
+        ("line", json!(0)),
+        ("line", json!(u64::from(u32::MAX) + 1)),
+        ("line", json!(1.5)),
+        ("side", json!(nonce())),
+        ("body", json!(" ")),
+    ] {
+        let mut arguments = valid.clone();
+        arguments[key] = value;
+        let (record, _) = rig
+            .approved(LINE_COMMENT, arguments, ApprovalDecision::Approve)
+            .await;
+        assert_eq!(error_kind(&record), ErrorKind::InvalidRequest, "{key}");
+    }
+    let mut arguments = valid;
+    arguments.as_object_mut().unwrap().remove("path");
+    let (record, _) = rig
+        .approved(LINE_COMMENT, arguments, ApprovalDecision::Approve)
+        .await;
+    assert_eq!(error_kind(&record), ErrorKind::InvalidRequest);
     assert_eq!(rig.api.paths().len(), asked);
 }

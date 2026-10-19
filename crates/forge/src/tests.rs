@@ -995,3 +995,169 @@ fn merges_name_the_head_and_each_forges_method() {
         }
     );
 }
+
+#[test]
+fn line_comments_are_placed_at_the_current_head_on_each_forge() {
+    let (owner, name, head, path, text) = (word(), word(), sha(), word(), word());
+    let make = |kind, base| {
+        Repository::new(&api(kind, base), &remote(&format!("/{owner}/{name}"))).unwrap()
+    };
+    let github = make(ForgeKind::GitHub, "https://forge.example/api/v3");
+    let gitlab = make(ForgeKind::GitLab, "https://forge.example/api/v4");
+    let gitea = make(ForgeKind::Gitea, "https://forge.example/api/v1");
+    let sent = |change: Change| -> (ChangeMethod, String, Value) {
+        (
+            change.method,
+            change.url.path().to_owned(),
+            serde_json::from_slice(&change.body).unwrap(),
+        )
+    };
+    let pull = |at: &str| {
+        bytes(&json!({
+            "number": 5,
+            "title": word(),
+            "state": "open",
+            "head": {"ref": word(), "sha": at},
+            "base": {"ref": word(), "sha": sha()},
+        }))
+    };
+    let new = LineComment {
+        path: &path,
+        line: 17,
+        side: Side::New,
+        text: &text,
+    };
+    let old = LineComment {
+        side: Side::Old,
+        ..new
+    };
+    // The id is compared ignoring case, and the forge's own is sent.
+    let upper = head.to_ascii_uppercase();
+    assert_eq!(
+        sent(github.line_comment(5, &pull(&head), &upper, &old).unwrap()),
+        (
+            ChangeMethod::Post,
+            format!("/api/v3/repos/{owner}/{name}/pulls/5/comments"),
+            json!({"body": text, "commit_id": head, "path": path, "line": 17, "side": "LEFT"})
+        )
+    );
+    assert_eq!(
+        sent(github.line_comment(5, &pull(&head), &head, &new).unwrap()).2["side"],
+        "RIGHT"
+    );
+    for (comment, new_position, old_position) in [(new, 17, 0), (old, 0, 17)] {
+        assert_eq!(
+            sent(
+                gitea
+                    .line_comment(5, &pull(&head), &head, &comment)
+                    .unwrap()
+            ),
+            (
+                ChangeMethod::Post,
+                format!("/api/v1/repos/{owner}/{name}/pulls/5/reviews"),
+                json!({
+                    "commit_id": head,
+                    "event": "COMMENT",
+                    "comments": [{"path": path, "body": text, "new_position": new_position, "old_position": old_position}],
+                })
+            )
+        );
+    }
+    // Pushed to since: nothing is sent.
+    for repository in [&github, &gitea] {
+        assert!(matches!(
+            repository.line_comment(5, &pull(&sha()), &head, &new),
+            Err(ForgeError::HeadMoved)
+        ));
+    }
+
+    let (base, start) = (sha(), sha());
+    let request = |sha: &str, refs: Value| {
+        bytes(&json!({
+            "iid": 5,
+            "title": word(),
+            "state": "opened",
+            "source_branch": word(),
+            "target_branch": word(),
+            "sha": sha,
+            "diff_refs": refs,
+        }))
+    };
+    let refs = json!({"base_sha": base, "start_sha": start, "head_sha": head});
+    let position = |line: &str| {
+        let mut position = json!({
+            "position_type": "text",
+            "base_sha": base,
+            "start_sha": start,
+            "head_sha": head,
+            "old_path": path,
+            "new_path": path,
+        });
+        position[line] = json!(17);
+        position
+    };
+    assert_eq!(
+        sent(
+            gitlab
+                .line_comment(5, &request(&head, refs.clone()), &head, &new)
+                .unwrap()
+        ),
+        (
+            ChangeMethod::Post,
+            format!("/api/v4/projects/{owner}%2F{name}/merge_requests/5/discussions"),
+            json!({"body": text, "position": position("new_line")})
+        )
+    );
+    assert_eq!(
+        sent(
+            gitlab
+                .line_comment(5, &request(&head, refs.clone()), &head, &old)
+                .unwrap()
+        )
+        .2["position"],
+        position("old_line")
+    );
+    // Changes not yet worked out, or worked out for an older head.
+    assert!(matches!(
+        gitlab.line_comment(5, &request(&head, Value::Null), &head, &new),
+        Err(ForgeError::NoDiff)
+    ));
+    assert!(matches!(
+        gitlab.line_comment(5, &request(&head, json!({"head_sha": head})), &head, &new),
+        Err(ForgeError::NoDiff)
+    ));
+    let stale = json!({"base_sha": base, "start_sha": start, "head_sha": sha()});
+    assert!(matches!(
+        gitlab.line_comment(5, &request(&head, stale), &head, &new),
+        Err(ForgeError::HeadMoved)
+    ));
+    assert!(matches!(
+        gitlab.line_comment(5, &request(&sha(), refs), &head, &new),
+        Err(ForgeError::HeadMoved)
+    ));
+
+    let url = format!("https://forge.example/{}", word());
+    for repository in [&github, &gitea] {
+        assert_eq!(
+            repository
+                .parse_line_comment(&bytes(&json!({"id": 77, "html_url": url})))
+                .unwrap(),
+            Comment {
+                id: 77,
+                url: Some(url.clone())
+            }
+        );
+    }
+    assert_eq!(
+        gitlab
+            .parse_line_comment(&bytes(
+                &json!({"id": word(), "notes": [{"id": 78, "body": text}]})
+            ))
+            .unwrap(),
+        Comment { id: 78, url: None }
+    );
+    assert!(matches!(
+        gitlab.parse_line_comment(&bytes(&json!({"id": word(), "notes": []}))),
+        Err(ForgeError::Answer(_))
+    ));
+}
