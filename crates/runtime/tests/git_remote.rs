@@ -1,5 +1,6 @@
 #![cfg(unix)]
-//! A model pushes a branch or tag with `git_push` and fetches one with `git_fetch`:
+//! A model pushes a branch or tag with `git_push` and fetches one with
+//! `git_fetch`:
 //! only after the user approves the call, through the vault broker, which
 //! alone holds the forge token. The forge is a smart HTTP server on loopback
 //! that stores what it receives in a bare repository with gitoxide's own
@@ -153,11 +154,18 @@ async fn upload(
         .filter(|id| repo.has_object(id))
         .collect();
     let never = std::sync::atomic::AtomicBool::new(false);
-    let want = ObjectId::from_hex(want.as_bytes()).unwrap();
+    // A wanted tag object comes with the tag objects and commit it leads to.
+    let mut want = ObjectId::from_hex(want.as_bytes()).unwrap();
+    let mut tags = vec![];
+    while let Ok(tag) = repo.find_tag(want) {
+        tags.push(want);
+        want = tag.target_id().unwrap().detach();
+    }
     let mut ids =
         a206_git_push::objects(&repo, want, haves, a206_runtime::git_remote::LIMITS, &never)
             .unwrap()
             .ids;
+    ids.splice(0..0, tags);
     if forge.incomplete.load(std::sync::atomic::Ordering::SeqCst) {
         ids.pop();
     }
@@ -892,7 +900,7 @@ async fn a_model_pushes_a_tag_the_forge_lacks_and_never_replaces_one() {
     assert_eq!(rig.forge.posts(), posts);
     assert_eq!(rig.forge.tag(&plain), Some(head));
 
-    // A branch and a tag at once, or a tag to fetch, is refused.
+    // A branch and a tag at once is refused.
     let seen = rig.forge.seen.lock().unwrap().len();
     let (record, _) = rig
         .push(
@@ -901,8 +909,129 @@ async fn a_model_pushes_a_tag_the_forge_lacks_and_never_replaces_one() {
         )
         .await;
     assert_eq!(error_kind(&record), ErrorKind::InvalidRequest);
+    assert_eq!(rig.forge.seen.lock().unwrap().len(), seen);
+}
+
+/// The forge's tag `name` at `target`, annotated when `annotated`; the
+/// object the tag points at.
+fn forge_tag(forge: &Forge, name: &str, target: ObjectId, annotated: bool) -> ObjectId {
+    let repo = gix::open(&forge.bare).unwrap();
+    let object = match annotated {
+        false => target,
+        true => repo
+            .write_object(gix::objs::Tag {
+                target,
+                target_kind: gix::object::Kind::Commit,
+                name: name.into(),
+                tagger: None,
+                message: nonce().into(),
+                signature: None,
+            })
+            .unwrap()
+            .detach(),
+    };
+    repo.reference(
+        format!("refs/tags/{name}"),
+        object,
+        gix::refs::transaction::PreviousValue::Any,
+        "test",
+    )
+    .unwrap();
+    object
+}
+fn local_tag(root: &Path, name: &str) -> Option<ObjectId> {
+    gix::open(root)
+        .unwrap()
+        .try_find_reference(format!("refs/tags/{name}").as_str())
+        .unwrap()
+        .map(|mut r| r.follow_to_object().unwrap().detach())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_model_fetches_a_tag_the_project_lacks_and_never_replaces_one() {
+    let mut rig = rig().await;
+    let (record, _) = rig.push(json!({}), ApprovalDecision::Approve).await;
+    assert_eq!(record.state, ToolCallState::Succeeded, "{:?}", record.error);
+    let pushed = rig.forge.branch(&rig.branch).unwrap();
+    // A release tagged on the forge, on a commit this project lacks.
+    let released = rig.forge.commit(&format!("r-{}", nonce()), &[pushed]);
+    let release = format!("v{}", nonce());
+    let object = forge_tag(&rig.forge, &release, released, true);
+
+    let (record, text) = rig
+        .fetch(json!({"tag": release}), ApprovalDecision::Approve)
+        .await;
+    assert_eq!(record.state, ToolCallState::Succeeded, "{:?}", record.error);
+    let fetched = result(text);
+    assert_eq!(fetched["tag"], release.as_str());
+    assert_eq!(fetched["annotated"], true);
+    assert_eq!(fetched["commit"], released.to_string());
+    assert_eq!(fetched["up_to_date"], false);
+    assert_eq!(fetched.get("tracking_branch"), None);
+    // The tag object, the commit, its root tree, the new folder and file.
+    assert_eq!(fetched["objects"], 5);
+    assert_eq!(local_tag(rig.workspace.path(), &release), Some(object));
+    let repo = gix::open(rig.workspace.path()).unwrap();
+    repo.find_commit(released)
+        .unwrap()
+        .tree()
+        .unwrap()
+        .traverse()
+        .breadthfirst(&mut gix::traverse::tree::Recorder::default())
+        .unwrap();
+    // Branches stay where they were.
+    assert_eq!(tracking(rig.workspace.path(), &rig.branch), Some(pushed));
+
+    // Again: nothing is downloaded.
+    let uploads = rig.forge.count("git-upload-pack");
+    let (record, text) = rig
+        .fetch(json!({"tag": release}), ApprovalDecision::Approve)
+        .await;
+    assert_eq!(record.state, ToolCallState::Succeeded, "{:?}", record.error);
+    assert_eq!(result(text)["up_to_date"], true);
+    assert_eq!(rig.forge.count("git-upload-pack"), uploads);
+
+    // A plain tag of a commit the project has needs no pack either.
+    let plain = format!("p{}", nonce());
+    forge_tag(&rig.forge, &plain, pushed, false);
+    let (record, text) = rig
+        .fetch(json!({"tag": plain}), ApprovalDecision::Approve)
+        .await;
+    assert_eq!(record.state, ToolCallState::Succeeded, "{:?}", record.error);
+    let fetched = result(text);
+    assert_eq!(
+        (fetched["annotated"].clone(), fetched["objects"].clone()),
+        (false.into(), 0.into())
+    );
+    assert_eq!(local_tag(rig.workspace.path(), &plain), Some(pushed));
+    assert_eq!(rig.forge.count("git-upload-pack"), uploads);
+
+    // A local tag of the same name at another object is never replaced,
+    // and nothing is downloaded for it.
+    let moved = forge_tag(&rig.forge, &plain, released, true);
     let (record, _) = rig
         .fetch(json!({"tag": plain}), ApprovalDecision::Approve)
+        .await;
+    assert_eq!(record.state, ToolCallState::Failed);
+    assert_eq!(error_kind(&record), ErrorKind::Conflict);
+    assert_ne!(local_tag(rig.workspace.path(), &plain), Some(moved));
+    assert_eq!(rig.forge.count("git-upload-pack"), uploads);
+
+    // A tag the forge lacks is not found; a branch and a tag at once is
+    // refused before the forge is asked.
+    let (record, _) = rig
+        .fetch(
+            json!({"tag": format!("t-{}", nonce())}),
+            ApprovalDecision::Approve,
+        )
+        .await;
+    assert_eq!(error_kind(&record), ErrorKind::NotFound);
+    let seen = rig.forge.seen.lock().unwrap().len();
+    let (record, _) = rig
+        .fetch(
+            json!({"tag": plain, "branch": rig.branch}),
+            ApprovalDecision::Approve,
+        )
         .await;
     assert_eq!(error_kind(&record), ErrorKind::InvalidRequest);
     assert_eq!(rig.forge.seen.lock().unwrap().len(), seen);
