@@ -410,11 +410,16 @@ Names follow the branch rules: one git accepts, at most 20 folders deep
 (`invalid`), not existing yet and not nesting with an existing tag (`conflict`).
 `target` is a local branch name or a full commit id and defaults to `HEAD`;
 revision expressions and abbreviated ids are not evaluated (`not_found`). A
-message is 1 to 16 KiB of text without NUL (`invalid`). `user.name` and
-`user.email` are required, for the tagger and the reflog where git keeps one.
-A `reference-transaction` hook refuses any tag, and `tag.gpgSign` or
-`tag.forceSignAnnotated`, with which git would sign, refuses an annotated one,
-as `unsupported`. A tag stays local; pushing tags is not offered yet.
+message is 1 to 16 KiB of text without NUL (`invalid`). An annotated tag
+needs `user.name` and `user.email` for its tagger (`unsupported` without
+them); a plain one, like `git tag`, does not. A `reference-transaction` hook
+refuses any tag, and so does `tag.gpgSign`, with which git signs every tag
+(even one asked for without a message), as `unsupported`;
+`tag.forceSignAnnotated` yields to an explicit annotation, as in git. `HEAD`
+is refused as a name (`invalid`), since it would be ambiguous with `HEAD`
+itself. Listing follows a symbolic tag to the object it names, and lists a
+tag whose object is missing without a commit. A tag stays local; pushing
+tags is not offered yet.
 
 ### Staging
 

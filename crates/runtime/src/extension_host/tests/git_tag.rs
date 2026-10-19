@@ -101,18 +101,48 @@ async fn plain_and_annotated_tags_name_a_commit_and_change_nothing_else() {
         host.handle(create(&by_id, Some(&first), None)).await,
         HostReply::Tag(_)
     ));
+    // A symbolic tag is followed; a tag whose object is missing is still
+    // listed.
+    let (symbolic, broken) = (unique("sym"), unique("broken"));
+    std::fs::write(
+        root.join(".git/refs/tags").join(&symbolic),
+        format!("ref: refs/tags/{annotated}\n"),
+    )
+    .unwrap();
+    std::fs::write(
+        root.join(".git/refs/tags").join(&broken),
+        format!("{}\n", "1".repeat(first.len())),
+    )
+    .unwrap();
     let listed = tags(&mut host).await;
-    assert_eq!(listed.len(), 4);
+    assert_eq!(listed.len(), 6);
     assert!(listed.windows(2).all(|pair| pair[0].name < pair[1].name));
     let find = |name: &str| listed.iter().find(|tag| tag.name == name).unwrap();
     assert!(find(&annotated).annotated);
     assert_eq!(find(&annotated).commit.as_deref(), Some(first.as_str()));
     assert!(!find(&plain).annotated);
+    assert_eq!(
+        find(&symbolic),
+        &GitTag {
+            name: symbolic.clone(),
+            ..find(&annotated).clone()
+        }
+    );
+    assert_eq!(
+        find(&broken),
+        &GitTag {
+            name: broken.clone(),
+            commit: None,
+            annotated: false
+        }
+    );
     assert_eq!(find(&by_id).commit.as_deref(), Some(first.as_str()));
-    assert!(
+    assert_eq!(
         listed
             .iter()
-            .any(|tag| tag.commit.is_none() && !tag.annotated)
+            .filter(|tag| tag.commit.is_none() && !tag.annotated)
+            .count(),
+        2
     );
 }
 
@@ -199,7 +229,13 @@ async fn tags_need_their_grants() {
 
 #[tokio::test]
 async fn protections_git_would_apply_refuse_a_tag() {
-    for setup in ["hook", "no identity", "no commit", "signing"] {
+    for setup in [
+        "hook",
+        "no identity",
+        "no commit",
+        "signing",
+        "forced annotation",
+    ] {
         let (dir, store) = store();
         let root = &project(dir.path());
         let expected = match setup {
@@ -217,10 +253,21 @@ async fn protections_git_would_apply_refuse_a_tag() {
                 configure(root, "[user]\n\tname = n\n\temail = n@example.invalid\n");
                 HostErrorCode::Invalid
             }
-            _ => {
+            "signing" => {
                 taggable(root);
                 configure(root, "[tag]\n\tgpgSign = true\n");
                 HostErrorCode::Unsupported
+            }
+            _ => {
+                // Yields to an explicit annotation, so nothing is refused.
+                taggable(root);
+                configure(root, "[tag]\n\tforceSignAnnotated = true\n");
+                let mut host = writer(&store, root);
+                for message in [Some("m"), None] {
+                    let reply = host.handle(create(&unique("t"), None, message)).await;
+                    assert!(matches!(reply, HostReply::Tag(_)), "{reply:?}");
+                }
+                continue;
             }
         };
         let mut host = writer(&store, root);
@@ -239,13 +286,18 @@ async fn protections_git_would_apply_refuse_a_tag() {
                 .count()
         };
         assert_eq!(count(), 0, "{setup}");
-        // Git signs only annotated tags; a plain one is still made.
-        if setup == "signing" {
-            assert!(matches!(
-                host.handle(create(&unique("t"), None, None)).await,
-                HostReply::Tag(_)
-            ));
-            assert_eq!(count(), 1);
+        // Git needs no identity for a plain tag, but signs every tag with
+        // tag.gpgSign.
+        let plain = code(host.handle(create(&unique("t"), None, None)).await);
+        match setup {
+            "no identity" => {
+                assert_eq!(plain, None);
+                assert_eq!(count(), 1);
+            }
+            _ => {
+                assert_eq!(plain, Some(expected), "{setup}");
+                assert_eq!(count(), 0, "{setup}");
+            }
         }
     }
 }

@@ -39,15 +39,20 @@ pub(super) fn list(root: PathBuf, interrupt: &AtomicBool) -> Result<HostReply, H
             break;
         }
         let name = reference.name().shorten().to_str_lossy().into_owned();
-        let annotated = match reference.target().try_id() {
-            Some(id) => kind(&repo, id.to_owned())? == Some(Kind::Tag),
-            None => false,
+        // A tag naming another (symbolic) is followed to the object it
+        // names. One whose object is missing, or whose chain is broken, is
+        // listed without a commit, as git still lists its name.
+        let annotated = match reference.follow_to_object() {
+            Ok(id) => kind(&repo, id.detach())? == Some(Kind::Tag),
+            Err(_) => false,
         };
-        let peeled = reference
-            .peel_to_id()
-            .map_err(|e| git_failure("tags", &e))?
-            .detach();
-        let commit = (kind(&repo, peeled)? == Some(Kind::Commit)).then(|| peeled.to_string());
+        let commit = match reference.peel_to_id() {
+            Ok(peeled) => {
+                let peeled = peeled.detach();
+                (kind(&repo, peeled)? == Some(Kind::Commit)).then(|| peeled.to_string())
+            }
+            Err(_) => None,
+        };
         listing.tags.push(GitTag {
             name,
             commit,
@@ -104,17 +109,21 @@ pub(super) fn create(
             "the repository has a reference-transaction hook, which extensions never run",
         ));
     }
-    // Git signs annotated tags with either setting.
-    if message.is_some()
-        && ["tag.gpgSign", "tag.forceSignAnnotated"]
-            .iter()
-            .any(|key| settings.flag(key).unwrap_or(false))
-    {
+    // With tag.gpgSign git makes every tag a signed tag object, even one
+    // asked for without a message. (tag.forceSignAnnotated yields to an
+    // explicit annotation, which a message is.)
+    if settings.flag("tag.gpgSign").unwrap_or(false) {
         return Err(unsupported(
-            "this repository signs annotated tags (tag.gpgSign), which extensions cannot do",
+            "this repository signs tags (tag.gpgSign), which extensions cannot do",
         ));
     }
-    let (tagger, email) = settings.identity()?;
+    // Only an annotated tag records its tagger; git needs no identity for
+    // a plain one, whose reflog (where git keeps one) then uses gitoxide's
+    // default.
+    let identity = match message {
+        Some(_) => Some(settings.identity()?),
+        None => settings.identity().ok(),
+    };
     let commit = match target {
         None => repo
             .head_id()
@@ -144,14 +153,16 @@ pub(super) fn create(
     // tag object written before a failed reference is unreferenced, like
     // any loose object git would collect.
     check(interrupt)?;
-    let signature = gix::actor::Signature {
-        name: tagger,
+    let signature = identity.map(|(name, email)| gix::actor::Signature {
+        name,
         email,
         time: gix::date::Time::now_local_or_utc(),
-    };
+    });
     let points_at = match message {
         None => commit,
         Some(message) => {
+            // An annotated tag always has an identity, as resolved above.
+            let tagger = signature.clone();
             let mut message = message.to_owned();
             if !message.ends_with('\n') {
                 message.push('\n');
@@ -160,7 +171,7 @@ pub(super) fn create(
                 target: commit,
                 target_kind: Kind::Commit,
                 name: name.into(),
-                tagger: Some(signature.clone()),
+                tagger,
                 message: message.into(),
                 signature: None,
             })
@@ -188,7 +199,10 @@ pub(super) fn create(
         name: full.clone(),
         deref: false,
     };
-    if let Err(error) = repo.edit_references_as([edit], Some(signature.to_ref(&mut time))) {
+    let committer = signature
+        .as_ref()
+        .map(|signature| signature.to_ref(&mut time));
+    if let Err(error) = repo.edit_references_as([edit], committer) {
         // Another process may have created it in between; anything else is
         // a write failure.
         let exists = matches!(repo.try_find_reference(&full), Ok(Some(_)));

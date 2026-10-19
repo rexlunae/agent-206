@@ -48,7 +48,7 @@ capabilities = ["git_read"]
 
 [[tools]]
 name = "git_tag_create"
-description = "Create a tag at a commit, like `git tag <name> [<commit>]`, or with a message an annotated tag, like `git tag -a -m <message>`. The working tree, index and current branch stay as they are; the tag stays local until pushed. Refused when the tag exists, the repository has a reference-transaction hook, signs annotated tags (for an annotated tag), or user.name and user.email are not set."
+description = "Create a tag at a commit, like `git tag <name> [<commit>]`, or with a message an annotated tag, like `git tag -a -m <message>`. The working tree, index and current branch stay as they are; the tag stays local until pushed. Refused when the tag exists, the repository has a reference-transaction hook or signs tags (tag.gpgSign), or, for an annotated tag, user.name and user.email are not set."
 capabilities = ["git_write"]
 
 [[tools.params]]
