@@ -1077,7 +1077,8 @@ as not sent. Compaction summaries see image names only.
 Coding backends receive the images of the message they answer, in order, after
 the transcript, while their base64 bytes stay within 8 MiB; an image that would
 pass that is named in the prompt as not sent, and images of earlier messages are
-named in the transcript. Codex gets each as an `image` input item with a data
+named in the transcript; only the answered message's images are read, so a
+missing earlier image does not stop the run. Codex gets each as an `image` input item with a data
 URL. Claude Agent gets ACP `image` content blocks only when the adapter's
 `initialize` reply advertises `promptCapabilities.image`; otherwise each image
 is named as not sent. The backend sends them with each model request of its

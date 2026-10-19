@@ -139,6 +139,8 @@ impl crate::error::Classified for BackendError {
 /// them with every model request of its turn, through the credential proxy,
 /// whose request limit leaves room for the transcript beside them.
 const IMAGE_BUDGET: usize = 8 * 1024 * 1024;
+/// The most transcript text one backend prompt carries.
+const TRANSCRIPT_LIMIT: usize = 2 * 1024 * 1024;
 type Result<T, E = BackendError> = std::result::Result<T, E>;
 pub enum Progress {
     /// The whole reply text so far (external backends).
@@ -229,11 +231,7 @@ pub async fn complete(run: Run<'_>) -> Result<(String, Usage)> {
     let mut input = transcript(thread)?;
     // Only the message being answered sends its images; earlier ones are
     // named in the transcript.
-    let (images, notes) = thread
-        .messages
-        .iter()
-        .rev()
-        .find(|message| message.role == Role::User)
+    let (images, notes) = answered(thread)
         .map(|message| images.for_backend(message, IMAGE_BUDGET))
         .unwrap_or_default();
     input.push_str(&notes);
@@ -282,6 +280,14 @@ pub async fn complete(run: Run<'_>) -> Result<(String, Usage)> {
     process.stop().await;
     result
 }
+/// The user message a backend run answers: the latest one.
+pub(crate) fn answered(thread: &Thread) -> Option<&Message> {
+    thread
+        .messages
+        .iter()
+        .rev()
+        .find(|message| message.role == Role::User)
+}
 fn transcript(thread: &Thread) -> Result<String> {
     let mut text = String::new();
     for message in &thread.messages {
@@ -293,7 +299,7 @@ fn transcript(thread: &Thread) -> Result<String> {
             });
             text.push_str(&crate::provider::message_content(message));
             check(
-                text.len() <= 2 * 1024 * 1024,
+                text.len() <= TRANSCRIPT_LIMIT,
                 BackendError::TranscriptTooLarge,
             )?;
         }

@@ -265,11 +265,28 @@ impl ImageData {
         thread: &Thread,
         info: &ModelInfo,
     ) -> Result<Self, crate::images::ImageError> {
+        Self::read(images, history(thread).iter().map(|m| &**m), info)
+    }
+    /// Read only the images of `message`, the one a coding backend answers:
+    /// earlier images are named in its transcript, never sent. Blocks on
+    /// file reads.
+    pub fn load_message(
+        images: &crate::images::Images,
+        message: &Message,
+        info: &ModelInfo,
+    ) -> Result<Self, crate::images::ImageError> {
+        Self::read(images, std::iter::once(message), info)
+    }
+    fn read<'a>(
+        images: &crate::images::Images,
+        messages: impl Iterator<Item = &'a Message>,
+        info: &ModelInfo,
+    ) -> Result<Self, crate::images::ImageError> {
         let mut data = BTreeMap::new();
         if info.image_input == Some(false) {
             return Ok(Self(data, Absent::Refused));
         }
-        for message in history(thread).iter() {
+        for message in messages {
             for image in &message.images {
                 if !data.contains_key(&image.digest) {
                     data.insert(image.digest.clone(), images.read(image)?);
@@ -1735,6 +1752,42 @@ mod tests {
             size: size as u64,
         };
         (image, bytes)
+    }
+    #[test]
+    fn a_backend_reads_only_the_answered_messages_images() {
+        let dir = tempfile::tempdir().unwrap();
+        let images = crate::images::Images::new(dir.path());
+        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+        png.extend_from_slice(Id::new_v4().as_bytes());
+        let staged = images.stage(&Id::new_v4().to_string(), &png).unwrap();
+        let (missing, _) = attached(3);
+        let message = |image: &ImageAttachment| {
+            let mut message = Message::new(Role::User, String::new(), 0, CodingBackend::Codex);
+            message.images = vec![image.clone()];
+            message
+        };
+        let info = ModelInfo {
+            key: ModelKey {
+                provider: Id::new_v4(),
+                model: Id::new_v4().to_string(),
+            },
+            name: Id::new_v4().to_string(),
+            context_limit: None,
+            output_limit: None,
+            input_cost_per_token: None,
+            output_cost_per_token: None,
+            reasoning: None,
+            reasoning_efforts: vec![],
+            image_input: None,
+        };
+        let (sent, notes) = ImageData::load_message(&images, &message(&staged), &info)
+            .unwrap()
+            .for_backend(&message(&staged), usize::MAX);
+        assert_eq!(sent.len(), 1);
+        assert!(notes.is_empty());
+        // An earlier message's image is never read, so its absence cannot
+        // stop the answered message; the answered message's own still does.
+        assert!(ImageData::load_message(&images, &message(&missing), &info).is_err());
     }
     #[test]
     fn a_backend_sends_a_messages_images_in_order_within_its_budget() {

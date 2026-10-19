@@ -2,7 +2,11 @@ use super::{BackendError, Result};
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{ChildStdin, ChildStdout};
+/// The longest line a backend may send.
 pub const MAX_LINE: usize = 2 * 1024 * 1024;
+/// The longest request line sent to a backend: a prompt's images and its
+/// transcript, with room for JSON escaping and framing.
+pub const MAX_REQUEST: usize = super::IMAGE_BUDGET + 2 * super::TRANSCRIPT_LIMIT + 1024 * 1024;
 pub struct Rpc {
     pub input: ChildStdin,
     pub output: BufReader<ChildStdout>,
@@ -37,7 +41,7 @@ impl Rpc {
     }
 }
 pub async fn write(input: &mut ChildStdin, line: String) -> std::io::Result<()> {
-    if line.len() > MAX_LINE {
+    if line.len() > MAX_REQUEST {
         return Err(std::io::Error::other("backend request exceeds its limit"));
     }
     input.write_all(line.as_bytes()).await?;
@@ -73,5 +77,27 @@ pub async fn read(output: &mut BufReader<ChildStdout>) -> std::io::Result<Option
                 .map(Some)
                 .map_err(std::io::Error::other);
         }
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[tokio::test]
+    async fn a_prompt_with_its_full_image_budget_is_written_and_a_larger_one_refused() {
+        let mut child = tokio::process::Command::new("sh")
+            .args(["-c", "cat > /dev/null"])
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut input = child.stdin.take().unwrap();
+        let prompt = "A".repeat(super::super::IMAGE_BUDGET + super::super::TRANSCRIPT_LIMIT);
+        assert!(prompt.len() > MAX_LINE);
+        write(&mut input, prompt).await.unwrap();
+        let error = write(&mut input, "A".repeat(MAX_REQUEST + 1))
+            .await
+            .unwrap_err();
+        assert_eq!(error.to_string(), "backend request exceeds its limit");
+        drop(input);
+        child.wait().await.unwrap();
     }
 }
