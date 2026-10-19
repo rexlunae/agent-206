@@ -694,8 +694,9 @@ A `tag` is fetched into the local tag of the same name, like
 `git fetch <remote> tag <tag>`. The rules above apply except the refspec
 and identity ones: a tag fetch works with any `remote.<name>.fetch`
 setting and needs no identity. Every local and remote-tracking branch (up
-to 1,000), HEAD and an existing tag of that name count as complete local
-history, so a tag on any of them needs no walk of its history. A local tag of that name at another object is never replaced
+to 1,000) and HEAD count as complete local history, so a tag on any of
+them needs no walk of its history; an existing tag of that name does not,
+so a tag whose history is incomplete here is fetched again. A local tag of that name at another object is never replaced
 (`Conflict`, before anything is downloaded); one at the same object is
 `up_to_date`. The pack's completeness is checked through the tag's tag
 objects (at most 10) to its commit, and a tag naming a tree or blob is

@@ -49,7 +49,8 @@ pub(crate) struct FetchTarget {
     pub previous: Option<ObjectId>,
     /// Local commits whose history is complete here: the remote-tracking
     /// branch, the branch of the same name and HEAD (for a tag, HEAD, every
-    /// local and remote-tracking branch and the existing tag's commit).
+    /// local and remote-tracking branch, but never the existing tag, whose
+    /// history is what the fetch checks).
     pub tips: Vec<ObjectId>,
     /// Commits to tell the server about, newest first.
     pub haves: Vec<ObjectId>,
@@ -210,8 +211,8 @@ fn tag_target(
     };
     target.previous = target.current(repo)?;
     // A tag may name any history, so every local and remote-tracking
-    // branch bounds the completeness walk, as does the commit an existing
-    // tag of that name leads to.
+    // branch bounds the completeness walk. An existing tag of that name
+    // does not: its history is what is being checked.
     // An unborn HEAD has no commit; a HEAD that cannot be read fails.
     let head = repo.head().map_err(|e| host(git_failure("head", &e)))?;
     target.tips.extend(head.id().map(|id| id.detach()));
@@ -233,9 +234,6 @@ fn tag_target(
         if let Ok(id) = reference.peel_to_id() {
             target.tips.push(id.detach());
         }
-    }
-    if let Some(previous) = target.previous {
-        target.tips.extend(target.commit(repo, previous)?);
     }
     target.tips.sort();
     target.tips.dedup();
@@ -559,5 +557,53 @@ mod tests {
             needs_pack(dir.path().into(), &target, beyond, short, &never),
             Err(RemoteError::Pack(PackError::TooManyCommits(2)))
         ));
+    }
+
+    #[test]
+    fn an_existing_tag_with_missing_history_is_not_up_to_date() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = gix::init(dir.path()).unwrap();
+        commit(&repo, "HEAD", None);
+        // A tagged commit outside every branch whose tree is missing.
+        let tagged = commit(&repo, &format!("refs/scratch/{}", nonce()), None);
+        let tree = repo.find_commit(tagged).unwrap().tree_id().unwrap();
+        let hex = tree.to_hex().to_string();
+        std::fs::remove_file(
+            dir.path()
+                .join(".git/objects")
+                .join(&hex[..2])
+                .join(&hex[2..]),
+        )
+        .unwrap();
+        let tag = nonce();
+        std::fs::write(
+            dir.path().join(".git/refs/tags").join(&tag),
+            format!("{tagged}\n"),
+        )
+        .unwrap();
+        let config = dir.path().join(".git/config");
+        let mut text = std::fs::read_to_string(&config).unwrap();
+        text.push_str("[remote \"origin\"]\n\turl = https://example.invalid/a.git\n");
+        std::fs::write(&config, text).unwrap();
+        let never = AtomicBool::new(false);
+        let target = target(dir.path().into(), Named::Tag(&tag), None, &never).unwrap();
+        assert_eq!(target.previous, Some(tagged));
+        assert!(!target.tips.contains(&tagged));
+        // The remote advertises the same tag, and its tree must be fetched.
+        assert!(
+            needs_pack(
+                dir.path().into(),
+                &target,
+                tagged,
+                Limits {
+                    commits: 1_000,
+                    objects: 1_000,
+                    bytes: 1 << 20,
+                    object: 1 << 20,
+                },
+                &never
+            )
+            .unwrap()
+        );
     }
 }
