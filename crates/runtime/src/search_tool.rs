@@ -200,7 +200,16 @@ impl SearchHost {
         let mut properties = json!({
             "query": {"type": "string", "description": "What to search for.", "minLength": 1, "maxLength": MAX_QUERY},
             "count": {"type": "integer", "description": "How many results to return.", "minimum": 1, "maximum": MAX_COUNT, "default": DEFAULT_COUNT},
-            "service": {"type": "string", "description": "The search service to use, by name.", "enum": names},
+            // The schema has room for every name with its API; the
+            // description does not.
+            "service": {"type": "string", "description": format!(
+                "The search service to use, by name: {}.",
+                services
+                    .iter()
+                    .map(|s| format!("`{}` ({})", s.label, s.api.label()))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ), "enum": names},
         });
         if !apis(SearchApi::Brave).is_empty() {
             properties["freshness"] = json!({"type": "string", "enum": FRESHNESS, "description": "Brave Search only: results from the past day (pd), week (pw), month (pm) or year (py)."});
@@ -851,7 +860,8 @@ mod tests {
         assert!(properties.get("category").is_some());
         assert!(properties.get("freshness").is_none());
         assert_eq!(exa_only.capabilities, [Capability::Network].into());
-        let both = SearchHost::spec(&[service(SearchApi::Brave), service(SearchApi::Exa)]);
+        let configured = [service(SearchApi::Brave), service(SearchApi::Exa)];
+        let both = SearchHost::spec(&configured);
         assert!(both.parameters["properties"].get("freshness").is_some());
         assert_eq!(
             both.parameters["properties"]["service"]["enum"]
@@ -860,5 +870,14 @@ mod tests {
                 .len(),
             2
         );
+        // Each name is offered with the API it speaks.
+        let mapping = both.parameters["properties"]["service"]["description"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        for s in &configured {
+            let pair = format!("`{}` ({})", s.label, s.api.label());
+            assert!(mapping.contains(&pair), "{mapping}");
+        }
     }
 }
