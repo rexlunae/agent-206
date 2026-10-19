@@ -2,10 +2,12 @@
 //! jobs of a merge request's head pipeline are its checks, and approvals
 //! are its reviews.
 use super::{
-    Check, CheckStatus, Conclusion, DETAIL_PAGE, ForgeError, Listed, MAX_BODY, PAGE, PullRequest,
-    Repository, Review, ReviewState, State, answer, bounded, label, label_opt,
+    Change, Check, CheckStatus, Conclusion, DETAIL_PAGE, ForgeError, Listed, MAX_BODY,
+    NewPullRequest, PAGE, PullRequest, Repository, Review, ReviewState, State, answer, bounded,
+    label, label_opt,
 };
 use serde::Deserialize;
+use serde_json::json;
 use url::Url;
 
 #[derive(Deserialize)]
@@ -74,6 +76,73 @@ pub(super) fn parse_list(body: &[u8]) -> Result<(Vec<PullRequest>, usize), Forge
             .collect(),
         read,
     ))
+}
+
+/// The title prefix that makes a merge request a draft.
+pub(super) const DRAFT: &str = "Draft: ";
+/// Prefixes GitLab reads as draft markers, compared ignoring case.
+const MARKERS: [&str; 3] = ["[draft]", "(draft)", "draft:"];
+
+/// `title` without the draft markers it starts with, so only `draft`
+/// decides whether the merge request is one. A title without one is kept
+/// exactly; with one, the spaces around the markers go too.
+fn unmarked(title: &str) -> &str {
+    let mut rest = title;
+    let mut marked = false;
+    loop {
+        let trimmed = rest.trim_start();
+        let marker = MARKERS.iter().find(|marker| {
+            trimmed
+                .get(..marker.len())
+                .is_some_and(|start| start.eq_ignore_ascii_case(marker))
+        });
+        match marker {
+            Some(marker) => {
+                rest = &trimmed[marker.len()..];
+                marked = true;
+            }
+            None if marked => return trimmed,
+            None => return title,
+        }
+    }
+}
+
+pub(super) fn create(
+    repository: &Repository,
+    new: &NewPullRequest<'_>,
+) -> Result<Change, ForgeError> {
+    // GitLab marks a merge request as a draft by its title.
+    let title = unmarked(new.title);
+    if title.trim().is_empty() {
+        return Err(ForgeError::MarkerTitle);
+    }
+    let title = if new.draft {
+        format!("{DRAFT}{title}")
+    } else {
+        title.to_owned()
+    };
+    let mut body = json!({
+        "title": title,
+        "source_branch": new.source,
+        "target_branch": new.target,
+    });
+    if let Some(text) = new.body {
+        body["description"] = json!(text);
+    }
+    Ok(Change {
+        url: project(repository, &["merge_requests"]),
+        body: body.to_string().into_bytes(),
+    })
+}
+
+pub(super) fn comment(repository: &Repository, number: u64, text: &str) -> Change {
+    Change {
+        url: project(
+            repository,
+            &["merge_requests", &number.to_string(), "notes"],
+        ),
+        body: json!({"body": text}).to_string().into_bytes(),
+    }
 }
 
 pub(super) fn pull_url(repository: &Repository, number: u64) -> Url {

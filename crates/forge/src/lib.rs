@@ -25,6 +25,13 @@ pub const DETAIL_PAGE: usize = 100;
 pub const MAX_LABEL: usize = 256;
 /// Longest description kept, in characters.
 pub const MAX_BODY: usize = 8_000;
+/// Longest description or comment sent, in characters. A tool call's
+/// arguments are bounded in bytes too (64 KiB as the model encodes them),
+/// so this leaves room for escaping.
+pub const MAX_TEXT: usize = 30_000;
+/// Longest pull request title sent, in characters: what is kept of a title
+/// read back, less GitLab's draft marker.
+pub const MAX_TITLE: usize = MAX_LABEL - gitlab::DRAFT.len();
 
 #[derive(Debug, thiserror::Error)]
 pub enum ForgeError {
@@ -38,6 +45,8 @@ pub enum ForgeError {
     Answer(#[source] serde_json::Error),
     #[error("the pull request has no commit to read checks for")]
     NoCommit,
+    #[error("the title is only a draft marker; give it a title and set `draft` instead")]
+    MarkerTitle,
 }
 
 /// The bundled API location of a well-known forge, by the origin its git
@@ -229,6 +238,34 @@ pub struct Review {
     pub commit: Option<String>,
 }
 
+/// A pull request to open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NewPullRequest<'a> {
+    pub title: &'a str,
+    pub body: Option<&'a str>,
+    /// The branch of the repository whose commits it proposes.
+    pub source: &'a str,
+    /// The branch it would merge into.
+    pub target: &'a str,
+    pub draft: bool,
+}
+
+/// A comment as posted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Comment {
+    pub id: u64,
+    /// Its web address, where the forge gives one.
+    pub url: Option<String>,
+}
+
+/// A request that changes something on the forge: where to send it and
+/// its JSON body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Change {
+    pub url: Url,
+    pub body: Vec<u8>,
+}
+
 /// What one request for checks returns, and how to read it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChecksCall {
@@ -393,6 +430,36 @@ impl Repository {
             ForgeKind::GitHub => github::parse_reviews(body),
             ForgeKind::GitLab => gitlab::parse_approvals(body),
         }
+    }
+
+    /// Opens `new`; the answer is read with
+    /// [`Repository::parse_pull_request`].
+    pub fn create_pull_request(&self, new: &NewPullRequest<'_>) -> Result<Change, ForgeError> {
+        match self.kind {
+            ForgeKind::GitHub => Ok(github::create(self, new)),
+            ForgeKind::GitLab => gitlab::create(self, new),
+        }
+    }
+
+    /// Posts `text` as a comment on pull request `number`; the answer is
+    /// read with [`Repository::parse_comment`].
+    pub fn comment(&self, number: u64, text: &str) -> Change {
+        match self.kind {
+            ForgeKind::GitHub => github::comment(self, number, text),
+            ForgeKind::GitLab => gitlab::comment(self, number, text),
+        }
+    }
+    pub fn parse_comment(&self, body: &[u8]) -> Result<Comment, ForgeError> {
+        #[derive(serde::Deserialize)]
+        struct Posted {
+            id: u64,
+            html_url: Option<String>,
+        }
+        let posted: Posted = answer(body)?;
+        Ok(Comment {
+            id: posted.id,
+            url: label_opt(posted.html_url),
+        })
     }
 
     /// `segments` under the API base.

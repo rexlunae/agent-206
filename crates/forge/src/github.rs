@@ -1,9 +1,11 @@
 //! GitHub's REST API (github.com, or GitHub Enterprise Server's `/api/v3`).
 use super::{
-    Check, CheckStatus, Conclusion, DETAIL_PAGE, ForgeError, Listed, MAX_BODY, PAGE, PullRequest,
-    Repository, Review, ReviewState, State, answer, bounded, label, label_opt,
+    Change, Check, CheckStatus, Conclusion, DETAIL_PAGE, ForgeError, Listed, MAX_BODY,
+    NewPullRequest, PAGE, PullRequest, Repository, Review, ReviewState, State, answer, bounded,
+    label, label_opt,
 };
 use serde::Deserialize;
+use serde_json::json;
 use url::Url;
 
 #[derive(Deserialize)]
@@ -77,6 +79,30 @@ pub(super) fn parse_list(
         })
         .collect();
     Ok((pulls, read))
+}
+
+pub(super) fn create(repository: &Repository, new: &NewPullRequest<'_>) -> Change {
+    let mut body = json!({
+        "title": new.title,
+        "head": new.source,
+        "base": new.target,
+        "draft": new.draft,
+    });
+    if let Some(text) = new.body {
+        body["body"] = json!(text);
+    }
+    Change {
+        url: repo(repository, &["pulls"]),
+        body: body.to_string().into_bytes(),
+    }
+}
+
+/// Pull requests are issues for comments that are not on a line.
+pub(super) fn comment(repository: &Repository, number: u64, text: &str) -> Change {
+    Change {
+        url: repo(repository, &["issues", &number.to_string(), "comments"]),
+        body: json!({"body": text}).to_string().into_bytes(),
+    }
 }
 
 pub(super) fn pull_url(repository: &Repository, number: u64) -> Url {

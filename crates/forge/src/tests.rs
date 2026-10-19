@@ -481,3 +481,138 @@ fn gitlab_merge_requests_checks_and_approvals() {
         Err(ForgeError::Answer(_))
     ));
 }
+
+#[test]
+fn opening_and_commenting_send_each_forges_fields() {
+    let (owner, name) = (word(), word());
+    let github = Repository::new(
+        &api(ForgeKind::GitHub, "https://forge.example/api/v3"),
+        &remote(&format!("/{owner}/{name}")),
+    )
+    .unwrap();
+    let gitlab = Repository::new(
+        &api(ForgeKind::GitLab, "https://forge.example/api/v4"),
+        &remote(&format!("/{owner}/{name}")),
+    )
+    .unwrap();
+    let (title, text, source, target) = (word(), word(), word(), word());
+    let new = NewPullRequest {
+        title: &title,
+        body: Some(&text),
+        source: &source,
+        target: &target,
+        draft: true,
+    };
+    let sent = github.create_pull_request(&new).unwrap();
+    assert_eq!(
+        sent.url.path(),
+        format!("/api/v3/repos/{owner}/{name}/pulls")
+    );
+    let body: Value = serde_json::from_slice(&sent.body).unwrap();
+    assert_eq!(
+        body,
+        json!({"title": title, "head": source, "base": target, "draft": true, "body": text})
+    );
+    let sent = gitlab.create_pull_request(&new).unwrap();
+    assert_eq!(
+        sent.url.path(),
+        format!("/api/v4/projects/{owner}%2F{name}/merge_requests")
+    );
+    let body: Value = serde_json::from_slice(&sent.body).unwrap();
+    assert_eq!(
+        body,
+        json!({"title": format!("Draft: {title}"), "source_branch": source, "target_branch": target, "description": text})
+    );
+    // Without a description or draft flag, nothing extra is sent.
+    let plain = NewPullRequest {
+        body: None,
+        draft: false,
+        ..new
+    };
+    let body: Value =
+        serde_json::from_slice(&gitlab.create_pull_request(&plain).unwrap().body).unwrap();
+    assert_eq!(body["title"], title);
+    assert!(body.get("description").is_none());
+
+    // GitLab draft markers in the title never decide; `draft` does.
+    for (marked, draft, posted) in [
+        (format!("Draft: {title}"), false, title.clone()),
+        (
+            format!(" [DRAFT] (draft) {title}"),
+            true,
+            format!("Draft: {title}"),
+        ),
+        (
+            format!("draftsman {title}"),
+            false,
+            format!("draftsman {title}"),
+        ),
+        // Unmarked titles go exactly as given.
+        (format!("  {title}"), false, format!("  {title}")),
+    ] {
+        let new = NewPullRequest {
+            title: &marked,
+            draft,
+            ..new
+        };
+        let body: Value =
+            serde_json::from_slice(&gitlab.create_pull_request(&new).unwrap().body).unwrap();
+        assert_eq!(body["title"], posted, "{marked}");
+    }
+    // A title that is only markers is refused rather than sent blank.
+    for marked in ["Draft:", " [Draft] (draft) "] {
+        let new = NewPullRequest {
+            title: marked,
+            draft: false,
+            ..new
+        };
+        assert!(matches!(
+            gitlab.create_pull_request(&new),
+            Err(ForgeError::MarkerTitle)
+        ));
+    }
+    // The longest title a draft may have reads back whole.
+    let longest: String = std::iter::repeat_n('x', MAX_TITLE).collect();
+    let new = NewPullRequest {
+        title: &longest,
+        draft: true,
+        ..new
+    };
+    let mut request: Value =
+        serde_json::from_slice(&gitlab.create_pull_request(&new).unwrap().body).unwrap();
+    request["iid"] = json!(1);
+    request["state"] = json!("opened");
+    let read = gitlab.parse_pull_request(&bytes(&request)).unwrap();
+    assert_eq!(read.title, format!("Draft: {longest}"));
+
+    let sent = github.comment(5, &text);
+    assert_eq!(
+        sent.url.path(),
+        format!("/api/v3/repos/{owner}/{name}/issues/5/comments")
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&sent.body).unwrap(),
+        json!({"body": text})
+    );
+    let sent = gitlab.comment(5, &text);
+    assert!(sent.url.path().ends_with("/merge_requests/5/notes"));
+    let url = format!("https://forge.example/{}", word());
+    let posted = github
+        .parse_comment(&bytes(&json!({"id": 77, "html_url": url})))
+        .unwrap();
+    assert_eq!(
+        posted,
+        Comment {
+            id: 77,
+            url: Some(url)
+        }
+    );
+    let posted = gitlab
+        .parse_comment(&bytes(&json!({"id": 78, "body": text})))
+        .unwrap();
+    assert_eq!(posted.url, None);
+    assert!(matches!(
+        github.parse_comment(br#"{"id": "x"}"#),
+        Err(ForgeError::Answer(_))
+    ));
+}
