@@ -87,6 +87,8 @@ pub enum SearchConfigError {
     DuplicateId,
     #[error("search service `{0}` needs a vault credential name")]
     Credential(String),
+    #[error("search service `{0}` has `.` or `..` in its endpoint path")]
+    DotSegment(String),
     #[error("search service `{label}` has an endpoint the gateway refuses to call")]
     Endpoint {
         label: String,
@@ -117,6 +119,9 @@ pub fn validate(services: &[SearchConfig]) -> Result<(), SearchConfigError> {
         if service.credential.trim().is_empty() {
             return Err(SearchConfigError::Credential(label.to_owned()));
         }
+        if has_dot_segment(&service.base_url) {
+            return Err(SearchConfigError::DotSegment(label.to_owned()));
+        }
         crate::providers::base_url(&service.base_url).map_err(|source| {
             SearchConfigError::Endpoint {
                 label: label.to_owned(),
@@ -125,6 +130,22 @@ pub fn validate(services: &[SearchConfig]) -> Result<(), SearchConfigError> {
         })?;
     }
     Ok(())
+}
+
+/// Whether an endpoint's path has a `.` or `..` segment, plain or
+/// percent-encoded. URL parsing resolves them, so `…/res/v1/..` would send
+/// searches, and their key, to a different path than the one written.
+pub fn has_dot_segment(base_url: &str) -> bool {
+    let path = base_url
+        .split_once("://")
+        .map_or(base_url, |(_, rest)| rest)
+        .split(['?', '#'])
+        .next()
+        .unwrap_or_default();
+    path.split(['/', '\\']).skip(1).any(|segment| {
+        let segment = segment.to_ascii_lowercase().replace("%2e", ".");
+        segment == "." || segment == ".."
+    })
 }
 
 #[cfg(test)]
@@ -184,6 +205,17 @@ mod tests {
             validate(&[plain]),
             Err(SearchConfigError::Endpoint { .. })
         ));
+        for path in ["/res/v1/..", "/res/./v1", "/res/%2E%2e/v1", "/res/v1/.%2e/"] {
+            let escaping = SearchConfig {
+                base_url: format!("https://{}.example{path}", Id::new_v4().simple()),
+                ..brave.clone()
+            };
+            assert!(
+                matches!(validate(&[escaping]), Err(SearchConfigError::DotSegment(_))),
+                "{path}"
+            );
+        }
+        assert!(!has_dot_segment("https://api.example/res/v1.5/..x"));
         let many: Vec<_> = (0..=MAX_SERVICES)
             .map(|_| service(SearchApi::Exa))
             .collect();

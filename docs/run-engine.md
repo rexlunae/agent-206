@@ -804,8 +804,11 @@ yet: line comments on renamed files on GitLab, comments over a range of lines, r
 `runtime/src/search_tool.rs` offers `web_search`, after RustyClaw's tool of
 the same name, while the user has a search service in
 `Settings::search_services` (`a206_core::web_search`): Brave Search or Exa, a
-name, an endpoint (the service's official one unless the user changes it) and
-the vault credential holding its key. The tool declares
+name, an endpoint (the service's official one unless the user changes it; an
+endpoint path with `.` or `..` segments is refused, since parsing would
+resolve it to a different path) and the vault credential holding its key. A
+response without its results list is a protocol error, not an empty answer.
+The tool declares
 `Capability::Network`, so a conversation needs the network grant (Research
 mode, or `backend select … native --network`) and, like every tool, must
 permit it; calls are not approved one by one. Arguments are `query` (at most
