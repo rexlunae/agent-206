@@ -316,8 +316,9 @@ background sessions.
   when it started, the gateway rescopes again when a call returns after
   policy changed during it.
 - **Terminal sessions.** `background` with `terminal: true` runs the command
-  on a pseudo-terminal the gateway opens (`exec_tool/terminal.rs`, 80x24,
-  `TERM=dumb`): its stdin, stdout and stderr are the terminal, which is also
+  on a pseudo-terminal the gateway opens (`exec_tool/terminal.rs`,
+  `TERM=dumb`, 80 columns by 24 rows unless the call sets `columns` and
+  `rows`, each 1–1000): its stdin, stdout and stderr are the terminal, which is also
   its controlling terminal, so programs that need a terminal run and the
   line discipline turns Ctrl-C and Ctrl-Z into signals for the command's
   process group. On Linux the sandbox helper starts its own session inside
@@ -337,7 +338,12 @@ background sessions.
   Home, End, PageUp, PageDown, F1–F12, Ctrl-A–Z and Ctrl-@ [ \ ] ^ _, names
   as in RustyClaw's `send_keys`); an unknown name is refused rather than
   typed as text. Keys sent to a session without a terminal, and `close` on
-  one with a terminal (send Ctrl-D instead), are `Conflict`. On macOS the
+  one with a terminal (send Ctrl-D instead), are `Conflict`. `process`
+  `resize` with `columns` and `rows` sets a running terminal session's
+  window size from the gateway's side, so the kernel sends `SIGWINCH` to its
+  foreground group as a resized terminal window would; it is not approved
+  per call, like `poll`, and is `Conflict` for a session without a terminal
+  or one that has finished. On macOS the
   terminal's controlling side is opened without close-on-exec and marked
   so immediately after, so a program the gateway starts in that instant can
   inherit it; Linux opens it close-on-exec.
