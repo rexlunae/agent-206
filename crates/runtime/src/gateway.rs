@@ -943,7 +943,11 @@ impl Gateway {
         let previous = std::mem::replace(&mut store.state.settings, *settings);
         store.state.mcp_servers = mcp_servers;
         store.persist(Some(EventKind::SettingsChanged))?;
-        self.stop_changed_mcp(&previous.mcp_servers, &store.state.settings.mcp_servers)?;
+        self.stop_changed_mcp(
+            &previous.mcp_servers,
+            &store.state.settings.mcp_servers,
+            previous.program_directories != store.state.settings.program_directories,
+        )?;
         drop(store);
         // Background commands given a directory that was removed stop.
         self.grants_changed()?;
