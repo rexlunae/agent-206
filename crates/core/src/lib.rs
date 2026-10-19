@@ -54,7 +54,9 @@ impl Capability {
             Self::Execute => "Run project commands",
             Self::Network => "Use the network",
             Self::GitRead => "Read git history",
-            Self::GitWrite => "Commit, branch, push and fetch in git",
+            Self::GitWrite => {
+                "Commit, branch, push and fetch in git, and open and merge pull requests"
+            }
             Self::ReviewPullRequests => "Review pull requests",
             Self::Download => "Download files",
             Self::Browser => "Use the browser",
@@ -301,8 +303,9 @@ pub struct GitCredential {
     pub username: String,
     pub credential: String,
     /// The forge's web API, for the pull request tools. `None` uses the
-    /// bundled preset for a well-known origin (github.com, gitlab.com), and
-    /// leaves other forges without pull request tools.
+    /// bundled preset for a well-known origin (github.com, gitlab.com,
+    /// codeberg.org, gitea.com), and leaves other forges without pull
+    /// request tools.
     #[serde(default)]
     pub forge: Option<ForgeApi>,
 }
@@ -314,12 +317,16 @@ pub enum ForgeKind {
     GitHub,
     /// GitLab's REST API, version 4.
     GitLab,
+    /// Gitea's REST API, version 1, which Forgejo also speaks.
+    #[serde(alias = "Forgejo")]
+    Gitea,
 }
 impl ForgeKind {
     pub fn label(self) -> &'static str {
         match self {
             Self::GitHub => "GitHub",
             Self::GitLab => "GitLab",
+            Self::Gitea => "Gitea or Forgejo",
         }
     }
 }

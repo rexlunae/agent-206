@@ -158,18 +158,19 @@ fn fetch_url(settings: &Settings, remote: &str) -> Result<url::Url, RemoteError>
 }
 
 /// The name and URL of `remote` (default: the current branch's remote,
-/// else `origin`) in the project at `root`, for the pull request tools.
+/// else `origin`) in the project at `root`, and the current branch, for the
+/// pull request tools.
 pub(crate) fn remote_repository(
     root: PathBuf,
     remote: Option<&str>,
     interrupt: &AtomicBool,
-) -> Result<(String, url::Url), RemoteError> {
+) -> Result<(String, url::Url, Option<String>), RemoteError> {
     let repo = open(root, interrupt).map_err(host)?;
     let settings = settings(&repo).map_err(host)?;
     let current = head_branch(&repo)?;
     let remote = remote_name(&settings, current.as_deref().unwrap_or_default(), remote)?;
     let url = fetch_url(&settings, &remote)?;
-    Ok((remote, url))
+    Ok((remote, url, current))
 }
 
 /// Up to [`MAX_HAVES`] commits reachable from `tips`, newest first.

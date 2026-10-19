@@ -198,6 +198,54 @@ async fn doctor_reports_an_unconfigured_profile_without_creating_it() -> Result<
 }
 
 #[tokio::test]
+async fn doctor_repair_asks_first_then_narrows_permissions_and_reports_a_failed_refresh()
+-> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let app = App::start(tempfile::tempdir()?, Default::default()).await?;
+    // Nothing listens on a port whose listener was dropped, so the refresh fails.
+    let endpoint = format!(
+        "http://{}/v1",
+        std::net::TcpListener::bind("127.0.0.1:0")?.local_addr()?
+    );
+    let label = random();
+    app.cli(&[
+        "providers",
+        "add",
+        "custom",
+        "--label",
+        &label,
+        "--endpoint",
+        &endpoint,
+    ])
+    .await?;
+    let mode = || -> Result<u32> { Ok(std::fs::metadata(&app.root)?.permissions().mode() & 0o777) };
+    std::fs::set_permissions(&app.root, std::fs::Permissions::from_mode(0o755))?;
+
+    // Closed input answers no: nothing changes.
+    let declined = capture(app.command(&["doctor", "--repair"])).await?;
+    let stdout = String::from_utf8(declined.stdout)?;
+    ensure!(stdout.contains("skipped"), "{stdout}");
+    ensure!(mode()? == 0o755);
+
+    let repaired = capture(app.command(&["doctor", "--repair", "--yes"])).await?;
+    ensure!(!repaired.status.success(), "{repaired:?}");
+    let stdout = String::from_utf8(repaired.stdout)?;
+    ensure!(mode()? == 0o700, "{stdout}");
+    ensure!(stdout.contains("done: make profile"), "{stdout}");
+    ensure!(
+        stdout.contains(&format!("failed: {label}: fetch the model list")),
+        "{stdout}"
+    );
+    ensure!(stdout.contains("cause: "), "{stdout}");
+    ensure!(
+        String::from_utf8(repaired.stderr)?.contains("repair(s) failed"),
+        "stderr"
+    );
+    ensure!(stdout.contains("Health checks after repair:"), "{stdout}");
+    Ok(())
+}
+
+#[tokio::test]
 async fn doctor_and_import_against_a_running_gateway() -> Result<()> {
     let app = App::start(tempfile::tempdir()?, Default::default()).await?;
     let report: DoctorReport = toml::from_str(&{

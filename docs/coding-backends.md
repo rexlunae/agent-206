@@ -104,7 +104,7 @@ agent206 backend select "$PROJECT_THREAD_ID" native --read --git-read --git-writ
 agent206 backend select "$RESEARCH_THREAD_ID" native --network
 ```
 
-Agent 206's native engine also offers "Read git history", "Commit, branch, push and fetch in git"
+Agent 206's native engine also offers "Read git history", "Commit, branch, push and fetch in git, and open and merge pull requests"
 (which requires reading it) and "Use the network". These grants are enforced by
 its own tools: bundled and installed extensions reach git and the network only
 through host calls the gateway checks against them. The mode still caps each

@@ -315,6 +315,7 @@ fn app(state: Web, static_dir: PathBuf) -> Router {
         .route("/api/vault/channel", post(vault::handle))
         .route("/api/sign-in", post(sign_in))
         .route("/api/health", post(health))
+        .route("/api/repair", post(repair))
         .route("/api/vault", post(vault))
         .layer(DefaultBodyLimit::max(a206_protocol::MAX_FRAME + 10))
         .fallback_service(static_files(static_dir))
@@ -597,7 +598,13 @@ async fn health(State(state): State<Web>, headers: HeaderMap, bytes: Bytes) -> R
         return StatusCode::BAD_REQUEST.into_response();
     }
     let request = requests.remove(0);
-    // The gateway this bridge uses, not whatever the saved file says now.
+    let facts = bridge_facts(&state).await;
+    respond(StatusCode::OK, request.id, &crate::doctor::evaluate(&facts))
+}
+
+/// Health facts for the gateway this bridge uses, not whatever the saved
+/// file says now.
+async fn bridge_facts(state: &Web) -> crate::doctor::Facts {
     let target = {
         let gateway = state.gateway.read().unwrap_or_else(PoisonError::into_inner);
         match (&gateway.target, &gateway.problem) {
@@ -609,8 +616,36 @@ async fn health(State(state): State<Web>, headers: HeaderMap, bytes: Bytes) -> R
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_secs());
-    let facts = crate::doctor::gather_for(&state.root, target, now).await;
-    respond(StatusCode::OK, request.id, &crate::doctor::evaluate(&facts))
+    crate::doctor::gather_for(&state.root, target, now).await
+}
+
+/// A permission repair the Health checks card confirmed, made on this
+/// computer. Only a repair the bridge's own checks offer now is made, so a
+/// browser cannot name another path. Catalog refreshes go through
+/// `/api/command` like the Connections page's.
+async fn repair(State(state): State<Web>, headers: HeaderMap, bytes: Bytes) -> Response {
+    if !authorized(&state, &headers) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let mut decoder = Decoder::default();
+    let Ok(mut requests) = decoder.feed::<Request<a206_core::doctor::Repair>>(&bytes) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    if requests.len() != 1 || decoder.finish().is_err() {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let request = requests.remove(0);
+    let offered = !matches!(
+        request.body,
+        a206_core::doctor::Repair::RefreshCatalog { .. }
+    ) && crate::doctor::repairs(&bridge_facts(&state).await).contains(&request.body);
+    let result = if offered {
+        crate::doctor::repair(&state.root, None, &request.body).await
+    } else {
+        Err(crate::doctor::RepairError::NotOffered)
+    }
+    .map_err(|error| crate::error::correlated("doctor repair", request.id, &error));
+    respond(StatusCode::OK, request.id, &result)
 }
 
 /// The Security page's vault card: the state of the vault the bridge's
@@ -1132,6 +1167,71 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
         assert!(!root.path().join("connection.toml").exists());
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_bridge_makes_only_permission_repairs_its_own_checks_offer() {
+        use a206_core::{ErrorKind, ErrorReport, doctor::DoctorReport, doctor::Repair};
+        use std::os::unix::fs::PermissionsExt;
+        let mode =
+            |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        let open = |path: &std::path::Path| {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap()
+        };
+        let root = tempfile::tempdir().unwrap();
+        let profile = root.path().join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir(&profile).unwrap();
+        open(&profile);
+        let elsewhere = root.path().join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir(&elsewhere).unwrap();
+        open(&elsewhere);
+        let (state, app) = unconfigured(&profile);
+
+        let (_, report) = post::<_, DoctorReport>(&app, &state, "/api/health", ()).await;
+        let offered = Repair::RestrictProfile {
+            path: profile.clone(),
+            mode: 0o755,
+        };
+        assert!(report.repairs.contains(&offered), "{report:?}");
+
+        // A path the checks did not name, and a refresh, are refused unchanged.
+        let refused = |reply: Result<(), ErrorReport>| {
+            let error = reply.expect_err("refused");
+            assert_eq!(error.kind, ErrorKind::Conflict, "{error:?}");
+        };
+        let (_, reply) = post::<_, Result<(), ErrorReport>>(
+            &app,
+            &state,
+            "/api/repair",
+            Repair::RestrictProfile {
+                path: elsewhere.clone(),
+                mode: 0o755,
+            },
+        )
+        .await;
+        refused(reply);
+        assert_eq!(mode(&elsewhere), 0o755);
+        let (_, reply) = post::<_, Result<(), ErrorReport>>(
+            &app,
+            &state,
+            "/api/repair",
+            Repair::RefreshCatalog {
+                provider: uuid::Uuid::new_v4(),
+                label: uuid::Uuid::new_v4().to_string(),
+            },
+        )
+        .await;
+        refused(reply);
+
+        let (code, reply) =
+            post::<_, Result<(), ErrorReport>>(&app, &state, "/api/repair", offered.clone()).await;
+        assert_eq!(code, StatusCode::OK);
+        reply.unwrap();
+        assert_eq!(mode(&profile), 0o700);
+        // Once made, it is no longer offered.
+        let (_, reply) =
+            post::<_, Result<(), ErrorReport>>(&app, &state, "/api/repair", offered).await;
+        refused(reply);
     }
     #[tokio::test]
     async fn health_checks_run_on_the_bridge_for_the_bearer_only() {

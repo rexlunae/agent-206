@@ -2,10 +2,12 @@
 //! jobs of a merge request's head pipeline are its checks, and approvals
 //! are its reviews.
 use super::{
-    Check, CheckStatus, Conclusion, DETAIL_PAGE, ForgeError, Listed, MAX_BODY, PAGE, PullRequest,
-    Repository, Review, ReviewState, State, answer, bounded, label, label_opt,
+    Change, Check, CheckStatus, Comment, Conclusion, DETAIL_PAGE, ForgeError, LineComment, Listed,
+    MAX_BODY, MergeMethod, Merged, NewPullRequest, PAGE, PullRequest, Repository, Review,
+    ReviewState, Side, State, answer, bounded, label, label_opt, unmarked,
 };
 use serde::Deserialize;
+use serde_json::json;
 use url::Url;
 
 #[derive(Deserialize)]
@@ -13,10 +15,9 @@ struct MergeRequest {
     iid: u64,
     title: String,
     state: String,
-    #[serde(default)]
-    draft: bool,
-    #[serde(default)]
-    work_in_progress: bool,
+    draft: Option<bool>,
+    /// The older name for `draft`.
+    work_in_progress: Option<bool>,
     author: Option<User>,
     source_branch: String,
     target_branch: String,
@@ -76,6 +77,155 @@ pub(super) fn parse_list(body: &[u8]) -> Result<(Vec<PullRequest>, usize), Forge
     ))
 }
 
+/// The title prefix that makes a merge request a draft.
+pub(super) const DRAFT: &str = "Draft: ";
+/// Prefixes GitLab reads as draft markers, compared ignoring case.
+const MARKERS: [&str; 3] = ["[draft]", "(draft)", "draft:"];
+
+pub(super) fn create(
+    repository: &Repository,
+    new: &NewPullRequest<'_>,
+) -> Result<Change, ForgeError> {
+    // GitLab marks a merge request as a draft by its title.
+    let title = unmarked(new.title, &MARKERS);
+    if title.trim().is_empty() {
+        return Err(ForgeError::MarkerTitle);
+    }
+    let title = if new.draft {
+        format!("{DRAFT}{title}")
+    } else {
+        title.to_owned()
+    };
+    let mut body = json!({
+        "title": title,
+        "source_branch": new.source,
+        "target_branch": new.target,
+    });
+    if let Some(text) = new.body {
+        body["description"] = json!(text);
+    }
+    Ok(Change::post(project(repository, &["merge_requests"]), body))
+}
+
+pub(super) fn comment(repository: &Repository, number: u64, text: &str) -> Change {
+    Change::post(
+        project(
+            repository,
+            &["merge_requests", &number.to_string(), "notes"],
+        ),
+        json!({"body": text}),
+    )
+}
+
+/// A discussion on the line, placed by the merge request's current
+/// versions, which `current` (its answer) gives.
+pub(super) fn line_comment(
+    repository: &Repository,
+    number: u64,
+    current: &[u8],
+    head: &str,
+    comment: &LineComment<'_>,
+) -> Result<Change, ForgeError> {
+    #[derive(Deserialize)]
+    struct Current {
+        diff_refs: Option<DiffRefs>,
+    }
+    #[derive(Deserialize)]
+    struct DiffRefs {
+        base_sha: Option<String>,
+        start_sha: Option<String>,
+        head_sha: Option<String>,
+    }
+    let refs = answer::<Current>(current)?
+        .diff_refs
+        .ok_or(ForgeError::NoDiff)?;
+    let (Some(base), Some(start), Some(diff_head)) = (refs.base_sha, refs.start_sha, refs.head_sha)
+    else {
+        return Err(ForgeError::NoDiff);
+    };
+    // Its changes are worked out after a push, so they may be older.
+    if !diff_head.eq_ignore_ascii_case(head) {
+        return Err(ForgeError::HeadMoved);
+    }
+    let mut position = json!({
+        "position_type": "text",
+        "base_sha": base,
+        "start_sha": start,
+        "head_sha": diff_head,
+        "old_path": comment.path,
+        "new_path": comment.path,
+    });
+    let line = match comment.side {
+        Side::New => "new_line",
+        Side::Old => "old_line",
+    };
+    position[line] = json!(comment.line);
+    Ok(Change::post(
+        project(
+            repository,
+            &["merge_requests", &number.to_string(), "discussions"],
+        ),
+        json!({"body": comment.text, "position": position}),
+    ))
+}
+
+/// The note that starts a new discussion.
+pub(super) fn parse_discussion(body: &[u8]) -> Result<Comment, ForgeError> {
+    #[derive(Deserialize)]
+    struct Discussion {
+        notes: Vec<Note>,
+    }
+    #[derive(Deserialize)]
+    struct Note {
+        id: u64,
+    }
+    let discussion: Discussion = answer(body)?;
+    let note = discussion.notes.into_iter().next().ok_or_else(|| {
+        ForgeError::Answer(serde::de::Error::invalid_length(
+            0,
+            &"a discussion's first note",
+        ))
+    })?;
+    Ok(Comment {
+        id: note.id,
+        url: None,
+    })
+}
+
+pub(super) fn merge(
+    repository: &Repository,
+    number: u64,
+    head: &str,
+    method: MergeMethod,
+) -> Result<Change, ForgeError> {
+    let squash = match method {
+        MergeMethod::Merge => false,
+        MergeMethod::Squash => true,
+        MergeMethod::Rebase => return Err(ForgeError::GitLabRebase),
+    };
+    Ok(Change::put(
+        project(
+            repository,
+            &["merge_requests", &number.to_string(), "merge"],
+        ),
+        json!({"sha": head, "squash": squash}),
+    ))
+}
+
+pub(super) fn parse_merge(body: &[u8]) -> Result<Merged, ForgeError> {
+    #[derive(Deserialize)]
+    struct Answer {
+        state: String,
+        merge_commit_sha: Option<String>,
+        squash_commit_sha: Option<String>,
+    }
+    let answer: Answer = answer(body)?;
+    Ok(Merged {
+        merged: answer.state == "merged",
+        commit: label_opt(answer.merge_commit_sha.or(answer.squash_commit_sha)),
+    })
+}
+
 pub(super) fn pull_url(repository: &Repository, number: u64) -> Url {
     project(repository, &["merge_requests", &number.to_string()])
 }
@@ -102,7 +252,10 @@ fn convert(request: MergeRequest, with_body: bool) -> PullRequest {
         number: request.iid,
         title: label(&request.title),
         state,
-        draft: request.draft || request.work_in_progress,
+        draft: match (request.draft, request.work_in_progress) {
+            (None, None) => None,
+            (draft, old) => Some(draft.unwrap_or(false) || old.unwrap_or(false)),
+        },
         author: request.author.map(|user| label(&user.username)),
         source: label(&request.source_branch),
         target: label(&request.target_branch),
