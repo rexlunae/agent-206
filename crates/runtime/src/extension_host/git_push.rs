@@ -30,6 +30,8 @@ pub(super) const MAX_ANCESTRY: usize = 100_000;
 const TRACKING_ATTEMPTS: usize = 3;
 /// Most tag objects followed from a pushed tag to its commit.
 const MAX_TAG_CHAIN: usize = 10;
+/// Most symbolic references followed to an object, as git's own limit.
+const MAX_SYMBOLIC_DEPTH: usize = 5;
 
 /// What a push sends: a branch or a tag.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -192,13 +194,24 @@ pub(super) fn remote_name(
 }
 
 /// The object `reference` names, following symbolic references but not
-/// tag objects, if it exists and its chain is not broken.
+/// tag objects, or `None` if it or a reference it names does not exist, or
+/// the chain is longer than git follows. A reference that cannot be read is
+/// a failure.
 fn direct(repo: &gix::Repository, reference: &str) -> Result<Option<ObjectId>, HostFailure> {
-    Ok(repo
-        .try_find_reference(reference)
-        .map_err(|e| git_failure("tags", &e))?
-        .and_then(|mut reference| reference.follow_to_object().ok())
-        .map(|id| id.detach()))
+    let mut name = reference.to_owned();
+    for _ in 0..=MAX_SYMBOLIC_DEPTH {
+        let Some(found) = repo
+            .try_find_reference(name.as_str())
+            .map_err(|e| git_failure("tags", &e))?
+        else {
+            return Ok(None);
+        };
+        match found.target() {
+            gix::refs::TargetRef::Object(id) => return Ok(Some(id.to_owned())),
+            gix::refs::TargetRef::Symbolic(next) => name = next.as_bstr().to_string(),
+        }
+    }
+    Ok(None)
 }
 
 /// The commit a tag pointing at `tip` names, and the tag objects on the way
@@ -212,8 +225,9 @@ fn tag_chain(
     let mut at = tip;
     loop {
         let object = repo
-            .find_object(at)
-            .map_err(|_| RemoteError::NoTag(tag.to_owned()))?;
+            .try_find_object(at)
+            .map_err(|e| host(git_failure("tags", &e)))?
+            .ok_or_else(|| RemoteError::NoTag(tag.to_owned()))?;
         match object.kind {
             gix::object::Kind::Commit => return Ok((at, chain)),
             gix::object::Kind::Tag if chain.len() < MAX_TAG_CHAIN => {
@@ -795,6 +809,18 @@ mod tests {
         assert!(matches!(
             tag_target(&dir, &nonce()),
             Err(RemoteError::NoTag(_))
+        ));
+        // An object that is there but cannot be read is a failure, not a
+        // missing tag.
+        let (unreadable, corrupt) = (nonce(), format!("{}{}", nonce(), &nonce()[..8]));
+        let loose = dir.path().join(".git/objects").join(&corrupt[..2]);
+        std::fs::create_dir_all(&loose).unwrap();
+        std::fs::write(loose.join(&corrupt[2..]), nonce()).unwrap();
+        let corrupt = ObjectId::from_hex(corrupt.as_bytes()).unwrap();
+        tag_ref(&repo, &unreadable, Target::Object(corrupt));
+        assert!(matches!(
+            tag_target(&dir, &unreadable),
+            Err(RemoteError::Repository(_))
         ));
         assert!(matches!(tag_target(&dir, "-x"), Err(RemoteError::TagName)));
 
