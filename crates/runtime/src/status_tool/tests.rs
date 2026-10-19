@@ -208,7 +208,7 @@ async fn a_status_with_long_names_and_lists_stays_within_the_output_limit() {
     assert!(shown > 0 && shown < models.len());
     assert_eq!(listed["omitted"], json!(models.len() - shown));
     let title = status["conversation"]["title"].as_str().unwrap();
-    assert!(title.len() <= MAX_TEXT + '…'.len_utf8() && title.ends_with('…'));
+    assert!(title.len() <= MAX_TEXT && title.ends_with('…'));
     let costs = &status["usage"]["this_conversation"]["costs"];
     assert_eq!(costs["total"], json!(200));
     assert!(costs["omitted"].as_u64().unwrap() > 0);

@@ -300,12 +300,13 @@ fn listing(total: usize, items: Vec<Value>, room: usize, keep: Keep) -> Value {
     })
 }
 
-/// `value` cut to [`MAX_TEXT`] bytes at a character boundary.
+/// `value` cut at a character boundary to at most [`MAX_TEXT`] bytes, the
+/// ending `…` included.
 fn text(value: &str) -> String {
     if value.len() <= MAX_TEXT {
         return value.into();
     }
-    let mut end = MAX_TEXT;
+    let mut end = MAX_TEXT - '…'.len_utf8();
     while !value.is_char_boundary(end) {
         end -= 1;
     }
