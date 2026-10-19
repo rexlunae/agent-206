@@ -7,7 +7,8 @@ no code Agent 206 runs and they never add permissions. A model following a skill
 still works within its thread's grants.
 
 Status: **experimental**. Listing, review and approval work in the CLI and the
-desktop/TUI Extensions page. Native runs reach approved skills through the
+desktop/TUI Extensions page, for the profile's skills and for
+[project skills](#project-skills). Native runs reach approved skills through the
 `skill_list` and `skill_info` tools.
 
 ## Installing
@@ -75,7 +76,48 @@ Supporting files are read only by relative path inside the skill; absolute paths
 at any step, so a link swapped in during a read cannot reach outside the skill.
 A program requirement is met only by an executable file on `PATH`.
 
-CLI: `agent206 skills list | show NAME | enable NAME --digest HEX | disable NAME`.
+CLI: `agent206 skills list | show NAME | enable NAME --digest HEX | disable NAME`,
+each with `--project ID-OR-NAME` for a project's skills.
+
+## Project skills
+
+A project can carry its own skills in
+`<project root>/.agent206/skills/<name>/SKILL.md`, with the same package
+layout, bounds, parsing, audit and digest as profile skills. They are read
+through cap-std without following symlinks: a symlinked `.agent206` or `skills`
+directory is refused with a typed `Linked` error (a permission denial), never
+followed, and every skill folder and file below is opened as profile skills
+are.
+
+Approval is a user operation per project. `agent206 skills show NAME --project P`
+prints the package and its digest, and `agent206 skills enable NAME --digest HEX
+--project P` approves it; `--project` takes the project's id or its exact name
+(a name shared by several projects is refused; pass the id). On the Extensions
+page each project with skills has its own list below the profile's, with the
+same **Review** and **Approve this package and enable** flow. The approval is
+recorded under the project's id in `settings.toml` (`enabled_project_skills`),
+separate from `enabled_skills`, and saving settings never changes it. It names
+the project, the skill and the package digest: approving a package in one
+project does not approve the same package in another.
+
+Anyone who can write to the project, including an agent with the workspace
+write grant, can add or edit these files. An added skill is listed as off, and
+an edit to an approved one makes it "changed" and withdraws it, as for profile
+skills, so nothing in the folder reaches a model until the user reviews it.
+
+A conversation is offered a project's approved, unchanged skills only when it
+belongs to that project and its effective grant (its grant within its mode's
+ceiling and every ancestor's) includes `ReadWorkspace`, the same condition as
+for the project's instruction files. The project folder is read for a
+conversation only once the user has approved at least one of its skills; from
+then on, a folder that cannot be read (for example because it was replaced by
+a link) makes the skill tools report that failure rather than leave the
+project's skills out silently.
+
+Names never shadow each other. A model sees a project skill as `project:NAME`
+in `skill_list` and passes that name to `skill_info`; `NAME` alone is always the
+profile skill. A profile skill and a project skill with the same name are both
+offered when both are approved, each under its own name.
 
 ## Model access
 
@@ -98,7 +140,8 @@ The complete index has the same bound. At settlement the run engine also checks
 the conversation’s actual remaining output space; a complete result that cannot
 fit becomes a typed storage failure, with none of the partial instructions.
 
-Skill host imports are restricted to this builtin and current approval pins.
+Skill host imports are restricted to this builtin and current approval pins
+(the profile's, and the conversation's project's as described above).
 They confer no general filesystem access. Disabling the builtin withdraws its
 tools too. Every invocation uses the standard WASM worker process, fuel/memory
 bounds, timeout and cancellation. File reads run off the async executor in a
@@ -117,4 +160,3 @@ are permission denials; malformed skills and arguments are invalid requests.
 - ClawHub registry search/install, with pre-install audit.
 - Agent-prepared skills (`skill_create`): a model drafts, the user approves.
 - Skill-linked vault credentials (`SkillOnly` policy).
-- Project-scoped skill folders.

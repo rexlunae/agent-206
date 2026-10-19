@@ -363,6 +363,12 @@ pub struct Settings {
     /// the user approved. Any edit to a skill disables it until re-approved.
     #[serde(default)]
     pub enabled_skills: std::collections::BTreeMap<String, String>,
+    /// Enabled skills of each project's `.agent206/skills` directory, by
+    /// project and then name, pinned like [`Settings::enabled_skills`]. An
+    /// approval applies only to conversations in that project.
+    #[serde(default)]
+    pub enabled_project_skills:
+        std::collections::BTreeMap<Id, std::collections::BTreeMap<String, String>>,
     /// Absolute directories, beyond `/usr/bin` and `/bin`, whose programs
     /// sandboxed commands may run read-only, such as a Homebrew prefix or a
     /// toolchain. The gateway stores them canonicalized.
@@ -388,6 +394,7 @@ impl Default for Settings {
             mcp_servers: vec![],
             search_services: vec![],
             enabled_skills: Default::default(),
+            enabled_project_skills: Default::default(),
             program_directories: vec![],
             git_credentials: vec![],
             prompts: Mode::ALL
@@ -1460,6 +1467,26 @@ pub enum Command {
         #[serde(default)]
         digest: Option<String>,
     },
+    /// List the skills in a project's `.agent206/skills` directory, with
+    /// their approval for that project.
+    ProjectSkills {
+        project: Id,
+    },
+    /// The full package of one project skill, for review.
+    ReadProjectSkill {
+        project: Id,
+        name: String,
+    },
+    /// Approve a project skill for conversations in that project, or
+    /// withdraw approval (user operation). Like [`Command::SetSkillEnabled`],
+    /// enabling requires the reviewed `digest`.
+    SetProjectSkillEnabled {
+        project: Id,
+        name: String,
+        enabled: bool,
+        #[serde(default)]
+        digest: Option<String>,
+    },
     /// Send `text` (or, for a heartbeat check, `HEARTBEAT.md`) to `thread`
     /// on `schedule`. The job is enabled.
     ScheduleJob {
@@ -1578,6 +1605,9 @@ impl Command {
             Self::AgentTeams => "agent_teams",
             Self::ReadSkill { .. } => "read_skill",
             Self::SetSkillEnabled { .. } => "set_skill_enabled",
+            Self::ProjectSkills { .. } => "project_skills",
+            Self::ReadProjectSkill { .. } => "read_project_skill",
+            Self::SetProjectSkillEnabled { .. } => "set_project_skill_enabled",
             Self::ScheduleJob { .. } => "schedule_job",
             Self::SetJobEnabled { .. } => "set_job_enabled",
             Self::RemoveJob { .. } => "remove_job",

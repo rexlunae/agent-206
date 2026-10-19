@@ -48,6 +48,7 @@ fn calls_for(
 ) -> HostCalls {
     HostCalls {
         skills_root: store.lock().unwrap().root.join("skills"),
+        project_skills: None,
         extension: id.into(),
         effective: effective.iter().copied().collect(),
         current: None,
@@ -1031,6 +1032,7 @@ async fn policy_is_checked_before_the_guest_runs() {
         workspace: Some(dir.path().into()),
         ceiling: None,
         current: None,
+        project_skills: None,
     };
     let kind = |error: ExtensionError| crate::error::report(&error).kind;
     use a206_core::extension::Value;

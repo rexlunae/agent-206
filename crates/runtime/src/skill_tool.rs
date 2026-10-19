@@ -6,12 +6,14 @@ use crate::{
     store::Store,
     tools::{self, ToolHost, ToolListing, ToolOutput, ToolRequest, ToolScope, ToolSpec},
 };
-use a206_core::{ErrorKind, ErrorReport, ToolPermission, UnavailableTools};
-use a206_skills::{Skill, SkillError};
+use a206_core::{
+    Capability, ErrorKind, ErrorReport, Id, Settings, ToolPermission, UnavailableTools,
+};
+use a206_skills::{Skill, SkillError, SkillsDir};
 use futures_util::future::BoxFuture;
 use serde_json::{Map, Value};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
@@ -69,43 +71,140 @@ impl crate::error::Classified for SkillToolError {
         })
     }
 }
-pub(crate) fn approved(
-    root: &Path,
-    pins: &BTreeMap<String, String>,
-    name: &str,
-) -> Result<Skill, SkillError> {
+/// The model-facing name of a project skill starts with this prefix. Profile
+/// and project skills never shadow each other: `notes` is always the profile
+/// skill and `project:notes` the conversation's project skill of that name.
+pub const PROJECT_PREFIX: &str = "project:";
+
+/// The project whose approved skills a conversation may read: set only for
+/// a conversation in a project whose effective grant includes `ReadWorkspace`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectSkills {
+    pub project: Id,
+    /// The project root; its skills are in `.agent206/skills`.
+    pub root: PathBuf,
+}
+
+/// The project skills conversation `thread` may read, if any. A missing
+/// thread or project has none: project skills are offered only when the
+/// conversation is in the project and may read it, as for its instruction
+/// files ([`crate::instructions::permitted`]).
+pub(crate) fn project_scope(
+    store: &Store,
+    thread: Id,
+    capabilities: &BTreeSet<Capability>,
+) -> Option<ProjectSkills> {
+    if !crate::instructions::permitted(capabilities) {
+        return None;
+    }
+    let project = store.thread(thread).ok()?.project?;
+    let root = &store.state.projects.iter().find(|p| p.id == project)?.root;
+    Some(ProjectSkills {
+        project,
+        root: PathBuf::from(root),
+    })
+}
+
+/// The skill folders one read uses and their approval pins, taken together
+/// from the settings so a read checks one consistent approval.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Sources {
+    profile: SkillsDir,
+    pins: BTreeMap<String, String>,
+    project: Option<(SkillsDir, BTreeMap<String, String>)>,
+}
+impl Sources {
+    pub(crate) fn new(
+        settings: &Settings,
+        profile: &Path,
+        project: Option<&ProjectSkills>,
+    ) -> Self {
+        Self {
+            profile: SkillsDir::profile(profile),
+            pins: settings.enabled_skills.clone(),
+            project: project.map(|project| {
+                (
+                    SkillsDir::project(&project.root),
+                    settings
+                        .enabled_project_skills
+                        .get(&project.project)
+                        .cloned()
+                        .unwrap_or_default(),
+                )
+            }),
+        }
+    }
+    /// The folder, pins and plain name a model-facing name refers to.
+    fn locate<'a>(
+        &'a self,
+        name: &'a str,
+    ) -> Result<(&'a SkillsDir, &'a BTreeMap<String, String>, &'a str), SkillError> {
+        match name.strip_prefix(PROJECT_PREFIX) {
+            None => Ok((&self.profile, &self.pins, name)),
+            Some(name) => match &self.project {
+                Some((dir, pins)) => Ok((dir, pins, name)),
+                // Not in a project the conversation may read.
+                None => Err(SkillError::Disabled),
+            },
+        }
+    }
+}
+
+/// Load a skill only if the user approved exactly this version of it.
+pub(crate) fn approved(sources: &Sources, name: &str) -> Result<Skill, SkillError> {
+    let (dir, pins, name) = sources.locate(name)?;
     let pinned = pins.get(name).ok_or(SkillError::Disabled)?;
-    let (skill, _) = a206_skills::load(root, name)?;
+    let (skill, _) = dir.load(name)?;
     if &skill.digest != pinned {
         return Err(SkillError::Changed);
     }
     Ok(skill)
 }
-pub(crate) fn offers(
-    root: &Path,
-    pins: &BTreeMap<String, String>,
-) -> Result<Vec<SkillOffer>, SkillError> {
+/// A supporting file of an approved skill, from the approved snapshot.
+pub(crate) fn approved_file(
+    sources: &Sources,
+    name: &str,
+    path: &str,
+) -> Result<Vec<u8>, SkillError> {
+    let (dir, pins, name) = sources.locate(name)?;
+    dir.read_approved_file(name, path, pins.get(name).ok_or(SkillError::Disabled)?)
+}
+/// Approved, unchanged skills: the profile's, then the project's under
+/// [`PROJECT_PREFIX`].
+pub(crate) fn offers(sources: &Sources) -> Result<Vec<SkillOffer>, SkillError> {
     // Scan even without pins: a broken directory is unavailable, not empty.
-    Ok(a206_skills::scan(root)?
+    let mut offers = approved_offers(&sources.profile, &sources.pins, "")?;
+    // A project's folder is the project's business until the user approves
+    // one of its skills; only then is it read for the conversation.
+    if let Some((dir, pins)) = &sources.project
+        && !pins.is_empty()
+    {
+        offers.extend(approved_offers(dir, pins, PROJECT_PREFIX)?);
+    }
+    Ok(offers)
+}
+fn approved_offers(
+    dir: &SkillsDir,
+    pins: &BTreeMap<String, String>,
+    prefix: &str,
+) -> Result<Vec<SkillOffer>, SkillError> {
+    Ok(dir
+        .scan()?
         .into_iter()
         .filter_map(|entry| entry.skill.ok())
         .filter(|skill| pins.get(&skill.name) == Some(&skill.digest))
         .map(|skill| SkillOffer {
-            name: skill.name,
+            name: format!("{prefix}{}", skill.name),
             description: skill.description,
         })
         .collect())
 }
 /// Complete text only; neither the index nor instructions may be truncated.
-pub(crate) fn read(
-    root: &Path,
-    pins: &BTreeMap<String, String>,
-    request: &ToolRequest,
-) -> Result<String, SkillToolError> {
+pub(crate) fn read(sources: &Sources, request: &ToolRequest) -> Result<String, SkillToolError> {
     let result = match request.name.as_str() {
         LIST => {
             check_keys(&request.arguments, &[])?;
-            let offers = offers(root, pins)?;
+            let offers = offers(sources)?;
             a206_skills::index(
                 offers
                     .iter()
@@ -116,14 +215,9 @@ pub(crate) fn read(
             check_keys(&request.arguments, &["name", "path"])?;
             let name = text(&request.arguments, "name")?.ok_or(SkillToolError::MissingName)?;
             match text(&request.arguments, "path")? {
-                None => approved(root, pins, &name)?.instructions,
-                Some(path) => String::from_utf8(a206_skills::read_approved_file(
-                    root,
-                    &name,
-                    &path,
-                    pins.get(&name).ok_or(SkillError::Disabled)?,
-                )?)
-                .map_err(SkillToolError::NotText)?,
+                None => approved(sources, &name)?.instructions,
+                Some(path) => String::from_utf8(approved_file(sources, &name, &path)?)
+                    .map_err(SkillToolError::NotText)?,
             }
         }
         other => return Err(SkillToolError::UnknownTool(other.into())),
@@ -168,15 +262,19 @@ impl SkillToolHost {
             root: profile.join("skills"),
         }
     }
-    fn pins(&self) -> Result<BTreeMap<String, String>, SkillToolError> {
-        Ok(self
-            .store
-            .lock()
-            .map_err(|_| SkillToolError::Poisoned)?
-            .state
-            .settings
-            .enabled_skills
-            .clone())
+    /// The project skills `scope`'s conversation may read.
+    fn project(&self, scope: &ToolScope) -> Result<Option<ProjectSkills>, SkillToolError> {
+        let store = self.store.lock().map_err(|_| SkillToolError::Poisoned)?;
+        Ok(project_scope(&store, scope.thread, &scope.capabilities))
+    }
+    fn sources(&self, scope: &ToolScope) -> Result<Sources, SkillToolError> {
+        let store = self.store.lock().map_err(|_| SkillToolError::Poisoned)?;
+        let project = project_scope(&store, scope.thread, &scope.capabilities);
+        Ok(Sources::new(
+            &store.state.settings,
+            &self.root,
+            project.as_ref(),
+        ))
     }
     fn enabled(&self) -> Result<bool, SkillToolError> {
         Ok(self
@@ -225,15 +323,14 @@ fn text(
     }
 }
 impl ToolHost for SkillToolHost {
-    fn list<'a>(&'a self, _: &'a ToolScope) -> BoxFuture<'a, ToolListing> {
+    fn list<'a>(&'a self, scope: &'a ToolScope) -> BoxFuture<'a, ToolListing> {
         Box::pin(async move {
             let load = async {
                 if !self.enabled()? {
                     return Ok(vec![]);
                 }
-                let root = self.root.clone();
-                let pins = self.pins()?;
-                let available = io(move || Ok(offers(&root, &pins)?)).await?;
+                let sources = self.sources(scope)?;
+                let available = io(move || Ok(offers(&sources)?)).await?;
                 if available.is_empty() {
                     Ok(vec![])
                 } else {
@@ -263,6 +360,7 @@ impl ToolHost for SkillToolHost {
         Box::pin(async move {
             let args = crate::extension_tools::arguments(request.arguments)
                 .map_err(|e| crate::error::report(&e))?;
+            let project_skills = self.project(scope).map_err(|e| crate::error::report(&e))?;
             let output = self
                 .extensions
                 .call_tool(
@@ -273,6 +371,7 @@ impl ToolHost for SkillToolHost {
                         workspace: None,
                         ceiling: Some(scope.capabilities.clone()),
                         current: None,
+                        project_skills,
                     },
                 )
                 .await

@@ -25,15 +25,24 @@ async fn call(
     let Value::Object(arguments) = arguments else {
         panic!("arguments are an object")
     };
-    let root = host.root.clone();
-    let pins = host.pins().map_err(|error| crate::error::report(&error))?;
+    call_in(host, &scope(), name, arguments).await
+}
+async fn call_in(
+    host: &SkillToolHost,
+    scope: &ToolScope,
+    name: &str,
+    arguments: serde_json::Map<String, Value>,
+) -> Result<ToolOutput, ErrorReport> {
+    let sources = host
+        .sources(scope)
+        .map_err(|error| crate::error::report(&error))?;
     let request = ToolRequest {
         call: Id::new_v4().to_string(),
         name: name.into(),
         arguments,
         approved: false,
     };
-    io(move || read(&root, &pins, &request))
+    io(move || read(&sources, &request))
         .await
         .map(|text| ToolOutput {
             text,

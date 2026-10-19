@@ -407,17 +407,36 @@ mod native {
     #[derive(Subcommand)]
     enum SkillAction {
         /// Show installed skills, whether each is approved, and problems.
-        List,
+        List {
+            /// List the skills in this project's .agent206/skills folder
+            /// instead of the profile's (project id or exact name).
+            #[arg(long)]
+            project: Option<String>,
+        },
         /// Print a skill's SKILL.md for review, followed by its digest.
-        Show { name: String },
+        Show {
+            name: String,
+            /// Review a skill of this project (id or exact name).
+            #[arg(long)]
+            project: Option<String>,
+        },
         /// Approve the skill exactly as reviewed: pass the digest `show` printed.
         Enable {
             name: String,
             #[arg(long)]
             digest: String,
+            /// Approve a skill of this project, for its conversations only
+            /// (id or exact name).
+            #[arg(long)]
+            project: Option<String>,
         },
         /// Withdraw approval.
-        Disable { name: String },
+        Disable {
+            name: String,
+            /// Withdraw approval of a skill of this project (id or exact name).
+            #[arg(long)]
+            project: Option<String>,
+        },
     }
     #[derive(Subcommand)]
     enum McpServerAction {
@@ -495,6 +514,41 @@ mod native {
         },
         Stop,
         Status,
+    }
+    /// The project `selector` names: its id, or the exact name of exactly
+    /// one project.
+    async fn project_id(
+        client: &a206_runtime::client::Client,
+        selector: &str,
+    ) -> anyhow::Result<uuid::Uuid> {
+        if let Ok(id) = selector.parse() {
+            return Ok(id);
+        }
+        let projects = match client.call(Command::Snapshot).await? {
+            Reply::Snapshot(snapshot) => snapshot.projects,
+            Reply::Error(report) => return Err(report.into()),
+            _ => anyhow::bail!("gateway did not list projects"),
+        };
+        let mut named = projects.iter().filter(|project| project.name == selector);
+        match (named.next(), named.next()) {
+            (Some(project), None) => Ok(project.id),
+            (None, _) => {
+                anyhow::bail!("no project is named \"{selector}\"; pass a project id or name")
+            }
+            (Some(_), Some(_)) => {
+                anyhow::bail!("several projects are named \"{selector}\"; pass the project's id")
+            }
+        }
+    }
+    /// The project id a `--project` option names, if one was given.
+    async fn project_option(
+        client: &a206_runtime::client::Client,
+        selector: Option<String>,
+    ) -> anyhow::Result<Option<uuid::Uuid>> {
+        match selector {
+            Some(selector) => Ok(Some(project_id(client, &selector).await?)),
+            None => Ok(None),
+        }
     }
     /// Settings that turn one MCP server on or off, leaving everything else as is.
     async fn mcp_server_enabled(
@@ -972,12 +1026,16 @@ mod native {
                         }
                     }
                     Action::Skills { command } => match command {
-                        SkillAction::List => {
+                        SkillAction::List { project } => {
                             #[derive(serde::Serialize)]
                             struct Skills {
                                 skills: Vec<a206_core::SkillSummary>,
                             }
-                            match client.call(Command::Skills).await? {
+                            let command = match project_option(&client, project).await? {
+                                Some(project) => Command::ProjectSkills { project },
+                                None => Command::Skills,
+                            };
+                            match client.call(command).await? {
                                 Reply::Skills(skills) => {
                                     print!("{}", toml::to_string_pretty(&Skills { skills })?);
                                     return Ok(());
@@ -986,8 +1044,13 @@ mod native {
                                 _ => anyhow::bail!("gateway did not list skills"),
                             }
                         }
-                        SkillAction::Show { name } => {
-                            match client.call(Command::ReadSkill { name }).await? {
+                        SkillAction::Show { name, project } => {
+                            let project = project_option(&client, project).await?;
+                            let command = match project {
+                                Some(project) => Command::ReadProjectSkill { project, name },
+                                None => Command::ReadSkill { name },
+                            };
+                            match client.call(command).await? {
                                 Reply::Skill(skill) => {
                                     print!("{}", skill.text);
                                     for file in &skill.files {
@@ -1014,8 +1077,12 @@ mod native {
                                         }
                                     }
                                     eprintln!(
-                                        "\nTo approve exactly this package: agent206 skills enable {} --digest {}",
-                                        skill.name, skill.digest
+                                        "\nTo approve exactly this package: agent206 skills enable {} --digest {}{}",
+                                        skill.name,
+                                        skill.digest,
+                                        project
+                                            .map(|project| format!(" --project {project}"))
+                                            .unwrap_or_default()
                                     );
                                     return Ok(());
                                 }
@@ -1023,16 +1090,38 @@ mod native {
                                 _ => anyhow::bail!("gateway did not return the skill"),
                             }
                         }
-                        SkillAction::Enable { name, digest } => Command::SetSkillEnabled {
+                        SkillAction::Enable {
                             name,
-                            enabled: true,
-                            digest: Some(digest),
+                            digest,
+                            project,
+                        } => match project_option(&client, project).await? {
+                            Some(project) => Command::SetProjectSkillEnabled {
+                                project,
+                                name,
+                                enabled: true,
+                                digest: Some(digest),
+                            },
+                            None => Command::SetSkillEnabled {
+                                name,
+                                enabled: true,
+                                digest: Some(digest),
+                            },
                         },
-                        SkillAction::Disable { name } => Command::SetSkillEnabled {
-                            name,
-                            enabled: false,
-                            digest: None,
-                        },
+                        SkillAction::Disable { name, project } => {
+                            match project_option(&client, project).await? {
+                                Some(project) => Command::SetProjectSkillEnabled {
+                                    project,
+                                    name,
+                                    enabled: false,
+                                    digest: None,
+                                },
+                                None => Command::SetSkillEnabled {
+                                    name,
+                                    enabled: false,
+                                    digest: None,
+                                },
+                            }
+                        }
                     },
                     Action::McpServers { command } => match command {
                         McpServerAction::List => {

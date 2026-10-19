@@ -803,6 +803,8 @@ impl Gateway {
                 | Command::PreviewImport { .. }
                 | Command::PreviewSourceImport { .. }
                 | Command::ReadSkill { .. }
+                | Command::ProjectSkills { .. }
+                | Command::ReadProjectSkill { .. }
                 | Command::ListTools { .. }
                 // Read-only; its reply copies message text.
                 | Command::SearchMessages { .. }
@@ -892,6 +894,7 @@ impl Gateway {
         )?;
         // Skill approval is its own user operation, never a settings edit.
         settings.enabled_skills = store.state.settings.enabled_skills.clone();
+        settings.enabled_project_skills = store.state.settings.enabled_project_skills.clone();
         let mcp_servers = Self::mcp_statuses(
             &store.state,
             &settings.mcp_servers,
@@ -1929,6 +1932,19 @@ impl Gateway {
                 self.set_skill_enabled(&name, enabled, digest.as_deref())?;
                 Ok(Reply::Ok)
             }
+            Command::ProjectSkills { project } => Ok(Reply::Skills(self.project_skills(project)?)),
+            Command::ReadProjectSkill { project, name } => {
+                Ok(Reply::Skill(self.read_project_skill(project, &name)?))
+            }
+            Command::SetProjectSkillEnabled {
+                project,
+                name,
+                enabled,
+                digest,
+            } => {
+                self.set_project_skill_enabled(project, &name, enabled, digest.as_deref())?;
+                Ok(Reply::Ok)
+            }
             Command::ConnectMcpServer { name } => {
                 self.connect_mcp(&name).await?;
                 Ok(Reply::Ok)
@@ -1996,6 +2012,7 @@ impl Gateway {
             workspace: project.map(|id| self.project_root(id)).transpose()?,
             ceiling: None,
             current: None,
+            project_skills: None,
         })
     }
     /// The extension host the run engine calls tools through.

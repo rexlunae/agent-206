@@ -322,6 +322,8 @@ impl ToolHost for ExtensionToolHost {
                 workspace: scope.workspace.clone(),
                 ceiling: Some(scope.capabilities.clone()),
                 current: None,
+                // The skills builtin is offered by its own host, never here.
+                project_skills: None,
             };
             let output = self
                 .extensions

@@ -1,6 +1,7 @@
-//! Skills installed in the gateway's profile, reviewed and approved here.
+//! Skills installed in the gateway's profile or in a project's
+//! `.agent206/skills` folder, reviewed and approved here.
 use crate::{State, audit::AuditFindings, call, error::ErrorNotice};
-use a206_core::{Command, ErrorReport, Reply, SkillSummary, SkillText};
+use a206_core::{Command, ErrorReport, Id, Reply, SkillSummary, SkillText};
 use fc_dioxus::prelude::*;
 
 #[derive(Default)]
@@ -42,15 +43,74 @@ impl Review {
     }
 }
 
+/// Which skills folder a list shows: the profile's, or a project's.
+#[derive(Debug, Clone, PartialEq)]
+struct Folder {
+    /// The project and its name; `None` for the profile.
+    project: Option<(Id, String)>,
+}
+impl Folder {
+    fn list(&self) -> Command {
+        match &self.project {
+            Some((project, _)) => Command::ProjectSkills { project: *project },
+            None => Command::Skills,
+        }
+    }
+    fn read(&self, name: String) -> Command {
+        match &self.project {
+            Some((project, _)) => Command::ReadProjectSkill {
+                project: *project,
+                name,
+            },
+            None => Command::ReadSkill { name },
+        }
+    }
+    fn set(&self, name: String, enabled: bool, digest: Option<String>) -> Command {
+        match &self.project {
+            Some((project, _)) => Command::SetProjectSkillEnabled {
+                project: *project,
+                name,
+                enabled,
+                digest,
+            },
+            None => Command::SetSkillEnabled {
+                name,
+                enabled,
+                digest,
+            },
+        }
+    }
+}
+
+/// The profile's skills, then each project's that has any.
 #[component]
 pub fn Skills() -> Element {
     let state = use_context::<State>();
+    let projects: Vec<(Id, String)> = state
+        .data
+        .read()
+        .projects
+        .iter()
+        .map(|project| (project.id, project.name.clone()))
+        .collect();
+    rsx! {
+        SkillList { folder: Folder { project: None } }
+        for project in projects {
+            SkillList { key: "{project.0}", folder: Folder { project: Some(project.clone()) } }
+        }
+    }
+}
+
+#[component]
+fn SkillList(folder: Folder) -> Element {
+    let state = use_context::<State>();
+    let folder = use_signal(|| folder);
     let mut skills = use_signal(Vec::<SkillSummary>::new);
     let mut failure = use_signal(|| None::<ErrorReport>);
     let mut review = use_signal(Review::default);
     let reload = move || {
         spawn(async move {
-            match call(Command::Skills).await {
+            match call(folder.peek().list()).await {
                 Ok(Reply::Skills(list)) => {
                     failure.set(None);
                     skills.set(list);
@@ -70,13 +130,7 @@ pub fn Skills() -> Element {
     // edit made after the review is never approved by this click.
     let toggle = move |name: String, enabled: bool, digest: Option<String>| {
         spawn(async move {
-            match call(Command::SetSkillEnabled {
-                name: name.clone(),
-                enabled,
-                digest: digest.clone(),
-            })
-            .await
-            {
+            match call(folder.peek().set(name.clone(), enabled, digest.clone())).await {
                 Ok(_) => {
                     review.write().toggled(&name, enabled, digest.as_deref());
                     reload();
@@ -88,7 +142,7 @@ pub fn Skills() -> Element {
     let mut open = move |name: String| {
         let generation = review.write().open(name.clone());
         spawn(async move {
-            let result = call(Command::ReadSkill { name }).await;
+            let result = call(folder.peek().read(name)).await;
             if !review.peek().current(generation) {
                 return;
             }
@@ -102,14 +156,24 @@ pub fn Skills() -> Element {
             }
         });
     };
+    let project = folder.read().project.clone();
+    // A project without skills adds nothing to the page.
+    if project.is_some() && skills.read().is_empty() && failure.read().is_none() {
+        return rsx! {};
+    }
     rsx! {
-        h2 { "Skills" }
-        p { class: "a206-muted", "Instruction folders in your profile's skills directory. Review one before enabling it; any later edit turns it off until you approve it again. Skills never add permissions." }
+        if let Some((_, name)) = &project {
+            h3 { "Skills in project {name}" }
+            p { class: "a206-muted", "From the project's .agent206/skills folder. Approval applies only to this project's conversations that may read the project, and anyone who can write to the project can change these files: an edit turns a skill off until you approve it again. The model sees each one as project:NAME." }
+        } else {
+            h2 { "Skills" }
+            p { class: "a206-muted", "Instruction folders in your profile's skills directory. Review one before enabling it; any later edit turns it off until you approve it again. Skills never add permissions. Skills in a project's .agent206/skills folder are listed below, by project." }
+        }
         // Installing or editing a skill changes files, not settings, so the
         // list is re-read on request.
         div { class: "a206-row", Button { variant: ButtonVariant::Secondary, onclick: move |_| reload(), "Refresh" } }
         if let Some(report) = failure() { ErrorNotice { report, title: "Skills unavailable".to_string(), dismiss: move |_| failure.set(None) } }
-        if skills.read().is_empty() { EmptyState { compact: true, title: rsx! { "No skills installed" }, body: rsx! { "Copy a skill folder containing SKILL.md into the skills directory of the gateway's profile." } } }
+        if project.is_none() && skills.read().is_empty() { EmptyState { compact: true, title: rsx! { "No skills installed" }, body: rsx! { "Copy a skill folder containing SKILL.md into the skills directory of the gateway's profile, or into a project's .agent206/skills folder." } } }
         div { class: "a206-grid",
             for skill in skills() {
                 Card { key: "{skill.name}",
@@ -232,5 +296,39 @@ mod tests {
         review.close();
         review.receive(second, text("calendar", "second"));
         assert!(review.text.is_none());
+    }
+    #[test]
+    fn a_project_folder_reviews_and_approves_only_in_its_project() {
+        let project = Id::new_v4();
+        let folder = Folder {
+            project: Some((project, "Work".into())),
+        };
+        assert_eq!(folder.list(), Command::ProjectSkills { project });
+        assert_eq!(
+            folder.read("notes".into()),
+            Command::ReadProjectSkill {
+                project,
+                name: "notes".into()
+            }
+        );
+        assert_eq!(
+            folder.set("notes".into(), true, Some("digest".into())),
+            Command::SetProjectSkillEnabled {
+                project,
+                name: "notes".into(),
+                enabled: true,
+                digest: Some("digest".into()),
+            }
+        );
+        let profile = Folder { project: None };
+        assert_eq!(profile.list(), Command::Skills);
+        assert_eq!(
+            profile.set("notes".into(), false, None),
+            Command::SetSkillEnabled {
+                name: "notes".into(),
+                enabled: false,
+                digest: None,
+            }
+        );
     }
 }

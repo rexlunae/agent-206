@@ -215,7 +215,7 @@ impl Classified for a206_skills::SkillError {
             }
             NotText(_) | NoFrontmatter | Frontmatter(_) | Metadata(_) | NameMismatch
             | Unreviewed => ErrorKind::InvalidRequest,
-            Disabled | Changed => ErrorKind::PermissionDenied,
+            Disabled | Changed | Linked { .. } => ErrorKind::PermissionDenied,
         })
     }
 }

@@ -1,4 +1,5 @@
 use super::*;
+use cap_std::fs::Dir;
 
 fn skill_text(name: &str, extra: &str) -> String {
     format!(
@@ -131,21 +132,14 @@ fn supporting_files_stay_inside_the_skill() {
         std::os::unix::fs::symlink(root.path(), root.path().join("one/up")).unwrap();
         // A link swapped in after the typed check still cannot be opened,
         // whether it replaces the file, a directory or the skill itself.
+        let dir = Dir::open_ambient_dir(root.path(), cap_std::ambient_authority()).unwrap();
         for (name, path) in [("one", "link"), ("one", "up/secret"), ("alias", "SKILL.md")] {
             assert!(
-                read_bounded(root.path(), name, Path::new(path), MAX_FILE_BYTES).is_err(),
+                read_bounded(&dir, name, Path::new(path), MAX_FILE_BYTES).is_err(),
                 "{name}/{path}"
             );
         }
-        assert!(
-            read_bounded(
-                root.path(),
-                "one",
-                Path::new("ref/notes.md"),
-                MAX_FILE_BYTES
-            )
-            .is_ok()
-        );
+        assert!(read_bounded(&dir, "one", Path::new("ref/notes.md"), MAX_FILE_BYTES).is_ok());
     }
 }
 
@@ -396,4 +390,92 @@ fn approved_snapshot_paths_use_validated_normalized_components() {
         read_approved_file(root.path(), "one", "refs/./guide.md", &digest),
         Err(SkillError::Changed)
     ));
+}
+
+fn project_skills(project: &Path) -> std::path::PathBuf {
+    let mut path = project.to_path_buf();
+    path.extend(PROJECT_SKILLS);
+    path
+}
+
+#[test]
+fn project_skill_folders_use_the_profile_package_rules() {
+    let project = tempfile::tempdir().unwrap();
+    let skills = SkillsDir::project(project.path());
+    assert_eq!(skills.path(), project_skills(project.path()));
+    // A project without the folder has no skills, not an error.
+    assert!(skills.scan().unwrap().is_empty());
+    std::fs::create_dir(project.path().join(".agent206")).unwrap();
+    assert!(skills.scan().unwrap().is_empty());
+    assert!(matches!(skills.load("one"), Err(SkillError::NotFound)));
+
+    let root = project_skills(project.path());
+    let body = uuid::Uuid::new_v4().to_string();
+    write(&root, "one", &skill_text("one", ""));
+    std::fs::write(root.join("one/ref.md"), &body).unwrap();
+    write(&root, "broken", "nothing here");
+    let found = skills.scan().unwrap();
+    assert_eq!(found.len(), 2);
+    assert!(matches!(found[0].skill, Err(SkillError::NoFrontmatter)));
+    let listed = found[1].skill.as_ref().unwrap();
+    // The digest is the same one a profile copy of the package would have.
+    let profile = tempfile::tempdir().unwrap();
+    write(profile.path(), "one", &skill_text("one", ""));
+    std::fs::write(profile.path().join("one/ref.md"), &body).unwrap();
+    let (loaded, _) = skills.load("one").unwrap();
+    assert_eq!(listed.digest, loaded.digest);
+    assert_eq!(loaded.digest, load(profile.path(), "one").unwrap().0.digest);
+    assert_eq!(
+        skills
+            .read_approved_file("one", "ref.md", &loaded.digest)
+            .unwrap(),
+        body.as_bytes()
+    );
+    assert_eq!(skills.read_file("one", "ref.md").unwrap(), body.as_bytes());
+    assert!(matches!(
+        skills.read_file("one", "../broken/SKILL.md"),
+        Err(SkillError::Path)
+    ));
+    std::fs::write(root.join("one/ref.md"), "edited").unwrap();
+    assert!(matches!(
+        skills.read_approved_file("one", "ref.md", &loaded.digest),
+        Err(SkillError::Changed)
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_linked_project_skills_directory_is_refused_not_followed() {
+    // `outside` holds `skills/one/SKILL.md`, outside every project.
+    let outside = tempfile::tempdir().unwrap();
+    write(
+        &outside.path().join("skills"),
+        "one",
+        &skill_text("one", ""),
+    );
+    for component in PROJECT_SKILLS {
+        let project = tempfile::tempdir().unwrap();
+        let skills = SkillsDir::project(project.path());
+        if component == "skills" {
+            std::fs::create_dir(project.path().join(".agent206")).unwrap();
+            std::os::unix::fs::symlink(
+                outside.path().join("skills"),
+                project_skills(project.path()),
+            )
+            .unwrap();
+        } else {
+            std::os::unix::fs::symlink(outside.path(), project.path().join(".agent206")).unwrap();
+        }
+        assert!(
+            matches!(skills.scan(), Err(SkillError::Linked { component: c }) if c == component),
+            "{component}"
+        );
+        assert!(matches!(skills.load("one"), Err(SkillError::Linked { .. })));
+        assert!(matches!(
+            skills.read_file("one", "SKILL.md"),
+            Err(SkillError::Linked { .. })
+        ));
+        // The link does lead to a readable skill: only the project reader refuses it.
+        assert_eq!(scan(&project_skills(project.path())).unwrap().len(), 1);
+    }
 }
