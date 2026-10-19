@@ -138,10 +138,12 @@ pub(crate) struct McpClient {
 
 impl Gateway {
     /// Check new MCP entries against the current state and build their status:
-    /// an entry that changed, or is newly enabled, starts disconnected.
+    /// an entry that changed, or is newly enabled, starts disconnected, as does
+    /// one given `programs` when that list changed, since its session stops.
     pub(super) fn mcp_statuses(
         state: &Snapshot,
         servers: &[McpServerConfig],
+        programs: &[PathBuf],
     ) -> Result<Vec<McpServerStatus>> {
         a206_mcp::validate(servers)?;
         for server in servers {
@@ -155,7 +157,10 @@ impl Gateway {
         Ok(servers
             .iter()
             .map(|server| {
-                let unchanged = server.enabled && state.settings.mcp_servers.contains(server);
+                let unchanged = server.enabled
+                    && state.settings.mcp_servers.contains(server)
+                    && granted(server, &state.settings.program_directories)
+                        == granted(server, programs);
                 state
                     .mcp_servers
                     .iter()
@@ -299,7 +304,8 @@ impl Gateway {
             .map_err(poisoned("MCP sessions"))?
             .remove(name);
         self.mcp.servers.remove(name)?;
-        self.mcp.register(name, &config, session)
+        let programs = granted(&config, &self.lock()?.state.settings.program_directories).to_vec();
+        self.mcp.register(name, &config, &programs, session)
     }
 }
 
@@ -307,6 +313,15 @@ impl Gateway {
 impl Gateway {
     pub(crate) fn mcp_client(&self) -> McpClient {
         self.mcp.clone()
+    }
+}
+
+/// The program directories `server` is given from the settings' `programs`.
+fn granted<'a>(server: &McpServerConfig, programs: &'a [PathBuf]) -> &'a [PathBuf] {
+    if server.program_directories {
+        programs
+    } else {
+        &[]
     }
 }
 
@@ -365,11 +380,7 @@ impl McpClient {
         let project_root = config.project.map(|id| self.project_root(id)).transpose()?;
         let (state_root, programs) = {
             let store = self.lock()?;
-            let programs = if config.program_directories {
-                store.state.settings.program_directories.clone()
-            } else {
-                vec![]
-            };
+            let programs = granted(&config, &store.state.settings.program_directories).to_vec();
             (store.root.clone(), programs)
         };
         self.servers.remove(name)?;
@@ -385,7 +396,7 @@ impl McpClient {
             let mut hidden = a206_sandbox::hidden_home_paths();
             hidden.push(state_root.clone());
             let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
-            let programs = crate::exec_tool::programs::validate(
+            let mounted = crate::exec_tool::programs::validate(
                 &programs,
                 &[],
                 &hidden,
@@ -397,7 +408,7 @@ impl McpClient {
                     &config,
                     project_root.as_deref(),
                     &state_root,
-                    &programs,
+                    &mounted,
                     a206_mcp::Limits::default(),
                 )
                 .await?,
@@ -414,12 +425,19 @@ impl McpClient {
                 return Err(error);
             }
         };
-        self.register(name, &config, session)
+        self.register(name, &config, &programs, session)
     }
 
-    /// Record `session` as the live session of `name`, unless the user
-    /// changed or disconnected the server since `config` was read.
-    fn register(&self, name: &str, config: &McpServerConfig, session: Session) -> Result<()> {
+    /// Record `session`, started with `programs` mounted, as the live session
+    /// of `name`, unless the user changed or disconnected the server, or
+    /// changed the directories it is given, since `config` was read.
+    fn register(
+        &self,
+        name: &str,
+        config: &McpServerConfig,
+        programs: &[PathBuf],
+        session: Session,
+    ) -> Result<()> {
         let server = session.server().map(str::to_owned);
         let tools = session.tools().to_vec();
         let session = Arc::new(session);
@@ -434,7 +452,10 @@ impl McpClient {
                 .iter()
                 .find(|s| s.name == name);
             // The user may have changed or disconnected the server while it started.
-            if self.servers.is_stopped(name)? || current != Some(config) {
+            if self.servers.is_stopped(name)?
+                || current != Some(config)
+                || granted(config, &store.state.settings.program_directories) != programs
+            {
                 drop(store);
                 session.stop();
                 self.set_status(name, |status| status.state = McpServerState::Disconnected)
@@ -917,6 +938,45 @@ mod tests {
         assert_eq!(saved, Reply::Ok);
         assert!(!live("tools"), "its mounts no longer match the settings");
         assert!(live("other"));
+        let state = |name: &str| {
+            let statuses = g.snapshot().unwrap().mcp_servers;
+            statuses.into_iter().find(|s| s.name == name).unwrap().state
+        };
+        assert_eq!(state("tools"), McpServerState::Disconnected);
+        assert_eq!(state("other"), McpServerState::Connected);
+    }
+
+    /// A start that read the directories before a save changed them holds the
+    /// old mounts; its session is refused rather than registered.
+    #[tokio::test]
+    async fn a_server_started_with_directories_since_removed_is_refused() {
+        let state = tempfile::tempdir().unwrap();
+        let install = tempfile::tempdir().unwrap();
+        let tools = tempfile::tempdir().unwrap();
+        let g = Gateway::open(state.path()).unwrap();
+        let mut server = entry(install.path());
+        (server.enabled, server.program_directories) = (true, true);
+        let mut settings = g.snapshot().unwrap().settings;
+        settings.program_directories = vec![tools.path().to_owned()];
+        settings.mcp_servers = vec![server.clone()];
+        let saved = send(&g, Command::SaveSettings(Box::new(settings))).await;
+        assert_eq!(saved, Reply::Ok);
+        let started_with = g.snapshot().unwrap().settings.program_directories;
+        let mut settings = g.snapshot().unwrap().settings;
+        settings.program_directories = vec![];
+        let saved = send(&g, Command::SaveSettings(Box::new(settings))).await;
+        assert_eq!(saved, Reply::Ok);
+
+        let (session, _, _close) = fake_session().await;
+        let client = g.mcp_client();
+        let registered = client.register("tools", &server, &started_with, session);
+        assert!(
+            matches!(registered, Err(GatewayError::Conflict(_))),
+            "{registered:?}"
+        );
+        assert!(client.session("tools").unwrap().is_none());
+        let status = g.snapshot().unwrap().mcp_servers.remove(0);
+        assert_eq!(status.state, McpServerState::Disconnected);
     }
 
     #[tokio::test]
