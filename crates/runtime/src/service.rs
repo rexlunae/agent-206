@@ -81,8 +81,8 @@ pub fn mark_stopped(root: &Path) -> std::io::Result<()> {
 /// A locked profile must instead acknowledge cleanup through the live gateway.
 pub(crate) fn stop_if_offline(root: &Path) -> Result<bool> {
     let lock = crate::store::profile_lock(root).map_err(ServiceError::Lock)?;
-    match fs2::FileExt::try_lock_exclusive(&lock) {
-        Ok(()) => {
+    match crate::store::Held::try_lock(lock) {
+        Ok(_held) => {
             mark_stopped(root).map_err(ServiceError::MarkStopped)?;
             Ok(true)
         }
@@ -105,12 +105,12 @@ pub(crate) async fn is_ready(root: &Path) -> bool {
 }
 /// Startup and user stop share a short-lived cross-process gate. Unlike the
 /// store lock, this can be held by a controller while a legacy daemon exits.
-pub(crate) async fn lifecycle_guard(root: &Path) -> Result<std::fs::File> {
-    let lock =
-        crate::store::lock_file(root, "gateway.lifecycle.lock").map_err(ServiceError::Lock)?;
+pub(crate) async fn lifecycle_guard(root: &Path) -> Result<crate::store::Held> {
     loop {
-        match fs2::FileExt::try_lock_exclusive(&lock) {
-            Ok(()) => return Ok(lock),
+        let lock =
+            crate::store::lock_file(root, "gateway.lifecycle.lock").map_err(ServiceError::Lock)?;
+        match crate::store::Held::try_lock(lock) {
+            Ok(held) => return Ok(held),
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 tokio::time::sleep(std::time::Duration::from_millis(25)).await;
             }
