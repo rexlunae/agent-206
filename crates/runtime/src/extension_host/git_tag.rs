@@ -226,7 +226,7 @@ pub(super) fn create(
 }
 
 /// `refs/tags/<name>`, for a name `git tag` accepts.
-fn tag_name(name: &str) -> Option<FullName> {
+pub(super) fn tag_name(name: &str) -> Option<FullName> {
     if name.is_empty() || name.starts_with('-') || name == "HEAD" {
         return None;
     }
