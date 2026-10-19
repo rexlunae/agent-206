@@ -16,6 +16,7 @@ fn main() -> std::process::ExitCode {
     {
         runtime.block_on(sandboxed_servers_see_only_their_project());
         runtime.block_on(network_and_programs_follow_their_grants());
+        runtime.block_on(program_directories_are_mounted_only_when_given());
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     runtime.block_on(refuses_to_start_servers_without_os_isolation());
@@ -37,11 +38,12 @@ fn fixture_entry(capabilities: &[Capability]) -> McpServerConfig {
         default_policy: ToolPolicy::Ask,
         tools: Default::default(),
         timeout_seconds: None,
+        program_directories: false,
     }
 }
 
 async fn spawn(entry: &McpServerConfig, project: Option<&Path>, state: &Path) -> Session {
-    a206_mcp::spawn(entry, project, state, Limits::default())
+    a206_mcp::spawn(entry, project, state, &[], Limits::default())
         .await
         .unwrap()
 }
@@ -71,7 +73,14 @@ fn path(path: &Path) -> &str {
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 async fn refuses_to_start_servers_without_os_isolation() {
     let state = tempfile::tempdir().unwrap();
-    let result = a206_mcp::spawn(&fixture_entry(&[]), None, state.path(), Limits::default()).await;
+    let result = a206_mcp::spawn(
+        &fixture_entry(&[]),
+        None,
+        state.path(),
+        &[],
+        Limits::default(),
+    )
+    .await;
     assert!(matches!(result, Err(a206_mcp::McpError::Unsupported)));
 }
 
@@ -204,4 +213,38 @@ async fn network_and_programs_follow_their_grants() {
         call(&session, "run", "program", program).await,
         Ok("exit status: 0".into())
     );
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+async fn program_directories_are_mounted_only_when_given() {
+    use std::os::unix::fs::PermissionsExt;
+    let state = tempfile::tempdir().unwrap();
+    let tools = tempfile::tempdir().unwrap();
+    let tools = std::fs::canonicalize(tools.path()).unwrap();
+    let bin = tools.join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let program = bin.join(uuid::Uuid::new_v4().simple().to_string());
+    // A status no system program exits with by accident.
+    let status = 23;
+    std::fs::write(&program, format!("#!/bin/sh\nexit {status}\n")).unwrap();
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let name = program.file_name().unwrap().to_str().unwrap();
+    let entry = fixture_entry(&[Capability::Execute]);
+
+    let session = spawn(&entry, None, state.path()).await;
+    assert!(
+        call(&session, "run", "program", path(&program))
+            .await
+            .is_err(),
+        "a directory that was not given stays out of reach"
+    );
+
+    let given = std::slice::from_ref(&tools);
+    let session = a206_mcp::spawn(&entry, None, state.path(), given, Limits::default())
+        .await
+        .unwrap();
+    let ran = Ok(format!("exit status: {status}"));
+    assert_eq!(call(&session, "run", "program", path(&program)).await, ran);
+    // Its `bin` is on the server's PATH.
+    assert_eq!(call(&session, "run", "program", name).await, ran);
 }
