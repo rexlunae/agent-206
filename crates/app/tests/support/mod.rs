@@ -16,13 +16,30 @@ pub fn binary() -> Result<PathBuf> {
     .canonicalize()?)
 }
 
-pub async fn capture(mut command: Command) -> Result<std::process::Output> {
+pub async fn capture(command: Command) -> Result<std::process::Output> {
+    capture_input(command, None).await
+}
+
+/// Run with `input` as stdin, closed once written; `None` closes it at once.
+pub async fn capture_input(
+    mut command: Command,
+    input: Option<&[u8]>,
+) -> Result<std::process::Output> {
     let mut child = command
-        .stdin(Stdio::null())
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true)
         .spawn()?;
+    if let (Some(input), Some(mut stdin)) = (input, child.stdin.take()) {
+        use tokio::io::AsyncWriteExt;
+        // Answers are read one prompt at a time; the pipe holds them all.
+        stdin.write_all(input).await?;
+    }
     let stdout = child.stdout.take().context("missing stdout")?;
     let stderr = child.stderr.take().context("missing stderr")?;
     let result = tokio::time::timeout(TIMEOUT, async {

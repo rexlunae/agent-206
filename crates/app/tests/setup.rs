@@ -381,3 +381,62 @@ async fn setup_without_answers_pauses_before_creating_a_vault() -> Result<()> {
     support::checked(capture(stop).await?)?;
     Ok(())
 }
+
+#[tokio::test]
+async fn setup_adds_a_provider_from_the_library_and_fetches_its_models() -> Result<()> {
+    let app = App::start(tempfile::tempdir()?, Default::default()).await?;
+    let model = random();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let api = axum::Router::new().route(
+        "/v1/models",
+        axum::routing::get({
+            let model = model.clone();
+            move || async move { axum::Json(serde_json::json!({"data": [{"id": model}]})) }
+        }),
+    );
+    let server = tokio::spawn(async move { axum::serve(listener, api).await });
+    let endpoint = format!("http://{address}/v1");
+    let presets = app.snapshot().await?.settings.provider_presets.effective();
+    let custom = presets
+        .iter()
+        .position(|p| p.id == "custom" && p.base_url.is_empty())
+        .context("custom preset")?;
+    // Decline the vault; add a provider; an out-of-range number, then the
+    // custom preset; a plain-HTTP remote endpoint is refused before the
+    // stand-in one is accepted. With no unlocked vault no key is asked for.
+    let answers = format!(
+        "n\ny\n{}\n{}\nhttp://{}.example.test/v1\n{endpoint}\n",
+        presets.len() + 1,
+        custom + 1,
+        uuid::Uuid::new_v4().simple()
+    );
+    let output = support::capture_input(app.command(&["setup"]), Some(answers.as_bytes())).await?;
+    let stdout = String::from_utf8(output.stdout)?;
+    ensure!(output.status.success(), "{stdout}\n{:?}", output.stderr);
+    ensure!(stdout.contains("Choose one of the numbers"), "{stdout}");
+    ensure!(stdout.contains("this endpoint cannot be used"), "{stdout}");
+    ensure!(stdout.contains("The vault is locked"), "{stdout}");
+    ensure!(stdout.contains("lists 1 models"), "{stdout}");
+    let snapshot = app.snapshot().await?;
+    let [provider] = snapshot.settings.providers.as_slice() else {
+        anyhow::bail!("expected one provider: {:?}", snapshot.settings.providers);
+    };
+    ensure!(provider.base_url == endpoint && provider.credential.is_none());
+    let catalog = snapshot
+        .catalogs
+        .iter()
+        .find(|c| c.provider == provider.id)
+        .context("catalog")?;
+    ensure!(catalog.models.iter().any(|m| m.key.model == model));
+
+    // With an account configured the step asks nothing more.
+    let again = capture(app.command(&["setup"])).await?;
+    let stdout = String::from_utf8(again.stdout)?;
+    ensure!(again.status.success(), "{stdout}");
+    ensure!(stdout.contains("Model providers: 1 configured"), "{stdout}");
+    ensure!(app.snapshot().await?.settings.providers.len() == 1);
+    server.abort();
+    app.cli(&["vault", "stop"]).await?;
+    Ok(())
+}

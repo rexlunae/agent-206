@@ -3,11 +3,14 @@
 //! terminal clients. Every security decision stays with the broker.
 use crate::doctor_cli::confirm;
 use crate::vault_cli;
-use a206_core::{Command, GatewayAction, GatewayPhase, GatewayTarget, MessengerKind, Reply};
+use a206_core::{
+    Command, GatewayAction, GatewayPhase, GatewayTarget, MessengerKind, ProviderPreset, Reply,
+};
 use a206_import::{
     InactiveCategory, MessengerAction, Preview, ProviderAction, Receipt, Unsupported,
     UnsupportedMessenger, UnsupportedProvider, VaultPlan, VaultProtection,
 };
+use a206_vault::CredentialKind;
 use anyhow::{Context, Result, bail};
 use clap::Subcommand;
 use std::path::{Path, PathBuf};
@@ -71,7 +74,7 @@ pub async fn secure(root: &Path, skip_totp: bool) -> Result<()> {
             "No vault yet. To bring over a RustyClaw vault instead, answer no and run `agent206 import rustyclaw`."
         );
         if !confirm("Create a new encrypted vault now?")? {
-            println!("Setup paused before the vault; rerun `agent206 setup` to continue.");
+            println!("Setup paused before the vault; rerun `agent206 setup` to create it.");
             return Ok(());
         }
         vault_cli::unlock(&mut client, true).await?;
@@ -89,6 +92,205 @@ pub async fn secure(root: &Path, skip_totp: bool) -> Result<()> {
         vault_cli::enroll_totp(&mut client, "agent206".into()).await?;
     }
     vault_cli::pair_if_running(&mut client, root).await
+}
+
+/// One line of input, trimmed; `None` once input is closed.
+fn ask(prompt: &str) -> Result<Option<String>> {
+    use std::io::{BufRead, Write};
+    print!("{prompt}");
+    std::io::stdout().flush()?;
+    let mut answer = String::new();
+    if std::io::stdin().lock().read_line(&mut answer)? == 0 {
+        println!();
+        return Ok(None);
+    }
+    Ok(Some(answer.trim().to_owned()))
+}
+
+/// A preset by its number in the printed list or by its id.
+fn choose(presets: &[ProviderPreset]) -> Result<Option<&ProviderPreset>> {
+    loop {
+        let Some(answer) = ask("Provider (number or id): ")? else {
+            return Ok(None);
+        };
+        let chosen = match answer.parse::<usize>() {
+            Ok(number) => number.checked_sub(1).and_then(|i| presets.get(i)),
+            Err(_) => presets.iter().find(|p| p.id == answer),
+        };
+        match chosen {
+            Some(preset) => return Ok(Some(preset)),
+            None => println!("Choose one of the numbers or ids listed above."),
+        }
+    }
+}
+
+/// The account's endpoint, the preset's unless another is typed, checked by
+/// the same rule the gateway applies when the account is saved.
+fn endpoint(preset: &ProviderPreset) -> Result<Option<(String, String)>> {
+    loop {
+        let prompt = if preset.base_url.is_empty() {
+            "API base URL: ".to_owned()
+        } else {
+            format!("API base URL [{}]: ", preset.base_url)
+        };
+        let Some(answer) = ask(&prompt)? else {
+            return Ok(None);
+        };
+        let typed = if answer.is_empty() {
+            preset.base_url.clone()
+        } else {
+            answer
+        };
+        if typed.is_empty() {
+            println!("This provider has no default endpoint; enter its base URL.");
+            continue;
+        }
+        match a206_core::providers::base_url(&typed) {
+            Ok(url) => return Ok(Some((typed, url.origin().ascii_serialization()))),
+            Err(error) => println!(
+                "{:#}",
+                anyhow::Error::new(error).context("this endpoint cannot be used")
+            ),
+        }
+    }
+}
+
+/// The vault credential the account uses: one already bound to `origin`, or
+/// a new API key typed into a hidden prompt. Without an unlocked vault on
+/// this computer the account is added without one.
+async fn provider_credential(
+    root: &Path,
+    preset: &ProviderPreset,
+    origin: &str,
+) -> Result<Option<String>> {
+    let mut client = vault_cli::connect(root).await?;
+    if !vault_cli::status(&mut client).await?.unlocked {
+        println!(
+            "The vault is locked, so no API key is stored now. To add one later: agent206 vault add NAME --destination {origin}, then name it as the account's credential with agent206 settings --apply."
+        );
+        return Ok(None);
+    }
+    let typed = vault_cli::credentials(&mut client).await?;
+    if let Some((name, _)) = typed.iter().find(|(_, meta)| {
+        !meta.disabled
+            && matches!(meta.kind, CredentialKind::ApiKey | CredentialKind::Token)
+            && meta.destinations.iter().any(|d| d == origin)
+    }) && confirm(&format!(
+        "Use the vault credential {name}, which may be sent to {origin}?"
+    ))? {
+        return Ok(Some(name.clone()));
+    }
+    if !confirm(&format!(
+        "Store an API key for {} in the vault, sent only to {origin}?",
+        preset.name
+    ))? {
+        return Ok(None);
+    }
+    let base = format!("{}-api-key", preset.id);
+    let name = std::iter::once(base.clone())
+        .chain((2..).map(|n| format!("{base}-{n}")))
+        .find(|candidate| typed.iter().all(|(existing, _)| existing != candidate))
+        .context("no free credential name")?;
+    vault_cli::store_api_key(
+        &mut client,
+        name.clone(),
+        format!("{} API key", preset.name),
+        origin.to_owned(),
+    )
+    .await?;
+    println!("API key stored in the vault as {name}");
+    Ok(Some(name))
+}
+
+/// The provider part of setup on this computer: when the running gateway has
+/// no provider account, offer one from the provider library, with its API key
+/// kept in the vault and bound to the endpoint's origin, then fetch its model
+/// list from the provider's API. Models are chosen per conversation later.
+pub async fn provider(root: &Path) -> Result<()> {
+    let target = a206_runtime::connection::load(root)?.map(|connection| connection.target);
+    if target != Some(GatewayTarget::Local) {
+        // A remote gateway's vault is on its host; setup there adds providers.
+        return Ok(());
+    }
+    let client = a206_runtime::control::GatewayController::attach(root.to_owned(), None);
+    if client.control(GatewayAction::Status).await?.phase != GatewayPhase::Running {
+        println!(
+            "Start the gateway with `agent206 gateway start`, then rerun `agent206 setup` to add a model provider."
+        );
+        return Ok(());
+    }
+    let Reply::Snapshot(snapshot) = client.call(Command::Snapshot).await?.into_result()? else {
+        bail!("gateway did not return its settings");
+    };
+    let mut settings = snapshot.settings;
+    if !settings.providers.is_empty() {
+        println!("Model providers: {} configured", settings.providers.len());
+        return Ok(());
+    }
+    if !confirm("Add a model provider account now?")? {
+        println!("No provider added; add one later with `agent206 providers add`.");
+        return Ok(());
+    }
+    let presets = settings.provider_presets.effective();
+    if presets.is_empty() {
+        println!("The provider library is empty; add a preset with `agent206 settings --apply`.");
+        return Ok(());
+    }
+    for (number, preset) in presets.iter().enumerate() {
+        println!(
+            "{:>3}. {} ({}, {})",
+            number + 1,
+            preset.name,
+            preset.group,
+            preset.api.label()
+        );
+    }
+    let Some(preset) = choose(&presets)? else {
+        println!("No provider added.");
+        return Ok(());
+    };
+    if !preset.setup.is_empty() {
+        println!("{}", preset.setup);
+    }
+    let Some((base_url, origin)) = endpoint(preset)? else {
+        println!("No provider added.");
+        return Ok(());
+    };
+    let mut account = preset.configure(base_url);
+    account.credential = provider_credential(root, preset, &origin).await?;
+    let (id, label, credential) = (
+        account.id,
+        account.label.clone(),
+        account.credential.clone(),
+    );
+    settings.providers.push(account);
+    let saved = client
+        .call(Command::SaveSettings(Box::new(settings)))
+        .await
+        .map_err(anyhow::Error::from)
+        .and_then(|reply| Ok(reply.into_result().map(drop)?));
+    match credential {
+        Some(name) => saved.with_context(|| {
+            format!("the account was not saved; its credential {name} stays in the vault")
+        })?,
+        None => saved.context("the provider account was not saved")?,
+    }
+    println!("Added {label}");
+    // The account stays saved either way; a failed fetch is shown with its
+    // cause and the health checks below list it as still to fix.
+    match client
+        .call(Command::RefreshCatalog { provider: id })
+        .await
+        .map_err(anyhow::Error::from)
+        .and_then(|reply| Ok(reply.into_result()?))
+    {
+        Ok(Reply::Catalog(catalog)) => {
+            println!("{label} lists {} models", catalog.models.len());
+        }
+        Ok(_) => eprintln!("The gateway did not return {label}'s model list"),
+        Err(error) => eprintln!("Could not fetch {label}'s model list: {error:#}"),
+    }
+    Ok(())
 }
 
 fn inactive(category: InactiveCategory) -> &'static str {
