@@ -675,11 +675,11 @@ or tags at once, pruning, and packs over about 4 MiB.
 
 ## Pull requests (`pull_requests`, `pull_request`, `pull_request_create`, `pull_request_comment`)
 
-`runtime/src/forge.rs` offers two read-only tools beside `git_push` and
+`runtime/src/forge.rs` offers four pull request tools beside `git_push` and
 `git_fetch`, under the same condition (a git credential for at least one
-forge) and the conversation's GitRead grant. Their host policy is Allow, so
-once the user permits them on the conversation they run without a
-per-call approval; they only send GET requests.
+forge). Two only read, with GET requests, under the conversation's GitRead
+grant. Their host policy is Allow, so once the user permits them on the
+conversation they run without a per-call approval.
 
 - `pull_requests` lists up to 30 pull requests of the repository, newest
   first: `state` is `open` (default), `closed` (closed without merging),
@@ -704,14 +704,18 @@ conversation's permission for the tool.
 - `pull_request_create` opens a pull request (`title`, `base`, optional
   `body`, `draft`) proposing `branch` (default: the current branch, which
   must already be on the forge; see `git_push`). GitLab drafts are marked
-  by a `Draft:` title prefix. The result is the new pull request.
+  by a `Draft:` title prefix: draft markers GitLab reads at the start of a
+title (`Draft:`, `[Draft]`, `(Draft)`) are removed and `draft` alone
+decides. The result is the new pull request.
 - `pull_request_comment` posts `body` on pull request `number` (a GitHub
   issue comment, a GitLab merge request note) and returns its id and web
   address.
 
 Titles, branches and comments are sent as given or refused: blank text,
-text over its limit (256 characters for titles and branch names,
-60,000 for descriptions and comments) and control characters (other than
+text over its limit (249 characters for titles, so a GitLab draft title
+reads back whole; 255 for branch names; 30,000 characters for
+descriptions and comments, within the 64 KiB a tool call's arguments may
+take) and control characters (other than
 line breaks and tabs in descriptions and comments) are invalid requests,
 and nothing is sent. A forge's 409 or 422 (a pull request already open for
 the branch, a branch it does not have) is a conflict error; the broker does

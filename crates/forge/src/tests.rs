@@ -533,6 +533,42 @@ fn opening_and_commenting_send_each_forges_fields() {
     assert_eq!(body["title"], title);
     assert!(body.get("description").is_none());
 
+    // GitLab draft markers in the title never decide; `draft` does.
+    for (marked, draft, posted) in [
+        (format!("Draft: {title}"), false, title.clone()),
+        (
+            format!(" [DRAFT] (draft) {title}"),
+            true,
+            format!("Draft: {title}"),
+        ),
+        (
+            format!("draftsman {title}"),
+            false,
+            format!("draftsman {title}"),
+        ),
+    ] {
+        let new = NewPullRequest {
+            title: &marked,
+            draft,
+            ..new
+        };
+        let body: Value = serde_json::from_slice(&gitlab.create_pull_request(&new).body).unwrap();
+        assert_eq!(body["title"], posted, "{marked}");
+    }
+    // The longest title a draft may have reads back whole.
+    let longest: String = std::iter::repeat_n('x', MAX_TITLE).collect();
+    let new = NewPullRequest {
+        title: &longest,
+        draft: true,
+        ..new
+    };
+    let mut request: Value =
+        serde_json::from_slice(&gitlab.create_pull_request(&new).body).unwrap();
+    request["iid"] = json!(1);
+    request["state"] = json!("opened");
+    let read = gitlab.parse_pull_request(&bytes(&request)).unwrap();
+    assert_eq!(read.title, format!("Draft: {longest}"));
+
     let sent = github.comment(5, &text);
     assert_eq!(
         sent.url.path(),

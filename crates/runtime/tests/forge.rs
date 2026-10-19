@@ -688,7 +688,7 @@ async fn a_model_opens_and_comments_on_pull_requests_only_when_approved() {
         (CREATE, json!({"title": "a\u{1b}[2J", "base": base})),
         (
             CREATE,
-            json!({"title": "x".repeat(a206_forge::MAX_LABEL + 1), "base": base}),
+            json!({"title": "x".repeat(a206_forge::MAX_TITLE + 1), "base": base}),
         ),
         (
             CREATE,

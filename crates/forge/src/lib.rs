@@ -25,9 +25,13 @@ pub const DETAIL_PAGE: usize = 100;
 pub const MAX_LABEL: usize = 256;
 /// Longest description kept, in characters.
 pub const MAX_BODY: usize = 8_000;
-/// Longest description or comment sent, in characters; GitHub accepts
-/// 65,536.
-pub const MAX_TEXT: usize = 60_000;
+/// Longest description or comment sent, in characters. A tool call's
+/// arguments are bounded in bytes too (64 KiB as the model encodes them),
+/// so this leaves room for escaping.
+pub const MAX_TEXT: usize = 30_000;
+/// Longest pull request title sent, in characters: what is kept of a title
+/// read back, less GitLab's draft marker.
+pub const MAX_TITLE: usize = MAX_LABEL - gitlab::DRAFT.len();
 
 #[derive(Debug, thiserror::Error)]
 pub enum ForgeError {

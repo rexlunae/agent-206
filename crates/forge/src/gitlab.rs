@@ -78,12 +78,35 @@ pub(super) fn parse_list(body: &[u8]) -> Result<(Vec<PullRequest>, usize), Forge
     ))
 }
 
+/// The title prefix that makes a merge request a draft.
+pub(super) const DRAFT: &str = "Draft: ";
+/// Prefixes GitLab reads as draft markers, compared ignoring case.
+const MARKERS: [&str; 3] = ["[draft]", "(draft)", "draft:"];
+
+/// `title` without the draft markers it starts with, so only `draft`
+/// decides whether the merge request is one.
+fn unmarked(mut title: &str) -> &str {
+    loop {
+        let trimmed = title.trim_start();
+        let marker = MARKERS.iter().find(|marker| {
+            trimmed
+                .get(..marker.len())
+                .is_some_and(|start| start.eq_ignore_ascii_case(marker))
+        });
+        match marker {
+            Some(marker) => title = &trimmed[marker.len()..],
+            None => return trimmed,
+        }
+    }
+}
+
 pub(super) fn create(repository: &Repository, new: &NewPullRequest<'_>) -> Change {
     // GitLab marks a merge request as a draft by its title.
+    let title = unmarked(new.title);
     let title = if new.draft {
-        format!("Draft: {}", new.title)
+        format!("{DRAFT}{title}")
     } else {
-        new.title.to_owned()
+        title.to_owned()
     };
     let mut body = json!({
         "title": title,

@@ -34,7 +34,7 @@ pub const READ: &str = "pull_request";
 pub const CREATE: &str = "pull_request_create";
 /// Comments on a pull request.
 pub const COMMENT: &str = "pull_request_comment";
-/// Longest branch name accepted, in bytes; git allows more, forges less.
+/// Longest branch name accepted, in characters.
 const MAX_BRANCH: usize = 255;
 
 /// Why reading pull requests was refused or failed.
@@ -168,8 +168,8 @@ impl ForgeHost {
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "title": {"type": "string", "description": format!("The title, at most {} characters.", a206_forge::MAX_LABEL)},
-                    "body": {"type": "string", "description": format!("The description, in the forge's Markdown, at most {} characters.", a206_forge::MAX_TEXT)},
+                    "title": {"type": "string", "description": format!("The title, at most {} characters. Use `draft` rather than a draft marker in it.", a206_forge::MAX_TITLE)},
+                    "body": {"type": "string", "description": format!("The description, in the forge's Markdown, at most {} characters; the call's arguments are limited to 64 KiB as you encode them.", a206_forge::MAX_TEXT)},
                     "base": {"type": "string", "description": "The branch to merge into, such as main."},
                     "branch": {"type": "string", "description": "The branch to propose, by its name on the forge. Defaults to the current branch."},
                     "draft": {"type": "boolean", "description": "Open it as a draft. Defaults to false."},
@@ -192,7 +192,7 @@ impl ForgeHost {
                 "type": "object",
                 "properties": {
                     "number": {"type": "integer", "minimum": 1, "description": "The pull request's number."},
-                    "body": {"type": "string", "description": format!("The comment, in the forge's Markdown, at most {} characters.", a206_forge::MAX_TEXT)},
+                    "body": {"type": "string", "description": format!("The comment, in the forge's Markdown, at most {} characters; the call's arguments are limited to 64 KiB as you encode them.", a206_forge::MAX_TEXT)},
                     "remote": {"type": "string", "description": "The git remote whose forge to use. Defaults to the current branch's remote, else origin."}
                 },
                 "required": ["number", "body"],
@@ -229,7 +229,7 @@ impl ForgeHost {
             }
             READ => Question::Read(number(args)?),
             CREATE => Question::Create {
-                title: required(args, "title", a206_forge::MAX_LABEL, false)?,
+                title: required(args, "title", a206_forge::MAX_TITLE, false)?,
                 body: optional(args, "body", a206_forge::MAX_TEXT, true)?,
                 base: required(args, "base", MAX_BRANCH, false)?,
                 branch: optional(args, "branch", MAX_BRANCH, false)?,
