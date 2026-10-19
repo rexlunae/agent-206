@@ -296,6 +296,10 @@ pub struct Check {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DoctorReport {
     pub checks: Vec<Check>,
+    /// Repairs these checks offer; each is made only after the user confirms
+    /// it. Empty from clients older than repairs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub repairs: Vec<Repair>,
 }
 impl DoctorReport {
     /// The worst health of any check; `Ok` for an empty report.

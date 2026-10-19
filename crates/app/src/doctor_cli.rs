@@ -57,15 +57,15 @@ pub async fn report(root: &Path, remote: Option<String>) -> Result<DoctorReport>
 /// Offer each available repair, make the confirmed ones, then check again.
 /// Fails if a repair failed or problems remain.
 pub async fn repair(root: &Path, remote: Option<String>, yes: bool) -> Result<()> {
-    let facts = facts(root, remote.clone()).await?;
-    print(&a206_runtime::doctor::evaluate(&facts));
-    let repairs = a206_runtime::doctor::repairs(&facts);
+    let checked = report(root, remote.clone()).await?;
+    print(&checked);
+    let repairs = &checked.repairs;
     println!();
     if repairs.is_empty() {
         println!("No repairs are available; follow the steps above.");
     }
     let mut failures = 0;
-    for repair in &repairs {
+    for repair in repairs {
         if !yes && !confirm(&format!("Repair: {repair}?"))? {
             println!("  skipped");
             continue;
@@ -84,7 +84,7 @@ pub async fn repair(root: &Path, remote: Option<String>, yes: bool) -> Result<()
         }
     }
     if repairs.is_empty() {
-        return finish(&a206_runtime::doctor::evaluate(&facts), 0);
+        return finish(&checked, 0);
     }
     println!();
     println!("Health checks after repair:");
