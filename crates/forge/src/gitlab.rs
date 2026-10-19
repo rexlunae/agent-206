@@ -2,9 +2,9 @@
 //! jobs of a merge request's head pipeline are its checks, and approvals
 //! are its reviews.
 use super::{
-    Change, Check, CheckStatus, Conclusion, DETAIL_PAGE, ForgeError, Listed, MAX_BODY,
-    NewPullRequest, PAGE, PullRequest, Repository, Review, ReviewState, State, answer, bounded,
-    label, label_opt, unmarked,
+    Change, Check, CheckStatus, Conclusion, DETAIL_PAGE, ForgeError, Listed, MAX_BODY, MergeMethod,
+    Merged, NewPullRequest, PAGE, PullRequest, Repository, Review, ReviewState, State, answer,
+    bounded, label, label_opt, unmarked,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -104,20 +104,51 @@ pub(super) fn create(
     if let Some(text) = new.body {
         body["description"] = json!(text);
     }
-    Ok(Change {
-        url: project(repository, &["merge_requests"]),
-        body: body.to_string().into_bytes(),
-    })
+    Ok(Change::post(project(repository, &["merge_requests"]), body))
 }
 
 pub(super) fn comment(repository: &Repository, number: u64, text: &str) -> Change {
-    Change {
-        url: project(
+    Change::post(
+        project(
             repository,
             &["merge_requests", &number.to_string(), "notes"],
         ),
-        body: json!({"body": text}).to_string().into_bytes(),
+        json!({"body": text}),
+    )
+}
+
+pub(super) fn merge(
+    repository: &Repository,
+    number: u64,
+    head: &str,
+    method: MergeMethod,
+) -> Result<Change, ForgeError> {
+    let squash = match method {
+        MergeMethod::Merge => false,
+        MergeMethod::Squash => true,
+        MergeMethod::Rebase => return Err(ForgeError::GitLabRebase),
+    };
+    Ok(Change::put(
+        project(
+            repository,
+            &["merge_requests", &number.to_string(), "merge"],
+        ),
+        json!({"sha": head, "squash": squash}),
+    ))
+}
+
+pub(super) fn parse_merge(body: &[u8]) -> Result<Merged, ForgeError> {
+    #[derive(Deserialize)]
+    struct Answer {
+        state: String,
+        merge_commit_sha: Option<String>,
+        squash_commit_sha: Option<String>,
     }
+    let answer: Answer = answer(body)?;
+    Ok(Merged {
+        merged: answer.state == "merged",
+        commit: label_opt(answer.merge_commit_sha.or(answer.squash_commit_sha)),
+    })
 }
 
 pub(super) fn pull_url(repository: &Repository, number: u64) -> Url {

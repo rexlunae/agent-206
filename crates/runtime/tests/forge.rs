@@ -26,6 +26,7 @@ const LIST: &str = a206_runtime::forge::LIST;
 const READ: &str = a206_runtime::forge::READ;
 const CREATE: &str = a206_runtime::forge::CREATE;
 const COMMENT: &str = a206_runtime::forge::COMMENT;
+const MERGE: &str = a206_runtime::forge::MERGE;
 
 /// A forge API that answers each request path (with its query) from
 /// `answers`, and 404 otherwise.
@@ -36,6 +37,8 @@ struct Api {
     seen: Arc<Mutex<Vec<(String, String)>>>,
     /// The path and JSON body of each POST request.
     posted: Arc<Mutex<Vec<(String, Value)>>>,
+    /// The path and JSON body of each PUT request.
+    put: Arc<Mutex<Vec<(String, Value)>>>,
 }
 impl Api {
     fn answer(&self, path: &str, status: StatusCode, body: Value) {
@@ -72,6 +75,10 @@ async fn answer_request(
     if method == Method::POST {
         let sent = serde_json::from_slice(&body).unwrap();
         api.posted.lock().unwrap().push((path.clone(), sent));
+    }
+    if method == Method::PUT {
+        let sent = serde_json::from_slice(&body).unwrap();
+        api.put.lock().unwrap().push((path.clone(), sent));
     }
     let mut out = HeaderMap::new();
     out.insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
@@ -288,7 +295,7 @@ async fn rig() -> Rig {
     })
     .await;
     // Allowing the tools that publish still leaves each call to the user.
-    for tool in [LIST, READ, CREATE, COMMENT] {
+    for tool in [LIST, READ, CREATE, COMMENT, MERGE] {
         rig.ok(Command::SetToolPermission {
             thread: rig.thread,
             tool: tool.into(),
@@ -876,4 +883,90 @@ async fn gitea_answers_are_read_page_by_page_until_one_is_empty() {
     let answer = result(text);
     assert_eq!(answer["pull_request"]["draft"], Value::Null);
     assert_eq!(answer["draft_as_requested"], Value::Null);
+}
+
+/// A merge names the head commit the user approves, so a branch pushed to
+/// since is not merged; the forge's refusals are conflicts.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_model_merges_a_pull_request_only_at_the_approved_head() {
+    let mut rig = rig().await;
+    let repo = format!("/api/v3/repos/{}/{}", rig.owner, rig.name);
+    let (head, merged) = (sha(), sha());
+    let arguments = json!({"number": 12, "head": head, "method": "squash"});
+    let (record, _) = rig
+        .approved(MERGE, arguments.clone(), ApprovalDecision::Deny)
+        .await;
+    assert_eq!(record.state, ToolCallState::Denied);
+    assert!(rig.api.put.lock().unwrap().is_empty());
+
+    rig.api.answer(
+        &format!("{repo}/pulls/12/merge"),
+        StatusCode::OK,
+        json!({"sha": merged, "merged": true, "message": nonce()}),
+    );
+    let (record, text) = rig
+        .approved(MERGE, arguments.clone(), ApprovalDecision::Approve)
+        .await;
+    assert_eq!(record.state, ToolCallState::Succeeded, "{:?}", record.error);
+    let answer = result(text);
+    assert_eq!(answer["merge"], json!({"merged": true, "commit": merged}));
+    assert_eq!(
+        rig.api.put.lock().unwrap().last().unwrap(),
+        &(
+            format!("{repo}/pulls/12/merge"),
+            json!({"sha": head, "merge_method": "squash"})
+        )
+    );
+    // Moved on, conflicting or held by the forge's rules: not merged.
+    for status in [StatusCode::METHOD_NOT_ALLOWED, StatusCode::CONFLICT] {
+        rig.api
+            .answer(&format!("{repo}/pulls/12/merge"), status, json!({}));
+        let (record, _) = rig
+            .approved(MERGE, arguments.clone(), ApprovalDecision::Approve)
+            .await;
+        assert_eq!(record.state, ToolCallState::Failed);
+        assert_eq!(error_kind(&record), ErrorKind::Conflict);
+    }
+
+    // GitLab squashes or merges as the project is set to, and says when it
+    // accepted a merge it has not made yet.
+    rig.forge(Some((ForgeKind::GitLab, "/api/v4"))).await;
+    let project = format!("/api/v4/projects/{}%2F{}", rig.owner, rig.name);
+    rig.api.answer(
+        &format!("{project}/merge_requests/12/merge"),
+        StatusCode::OK,
+        json!({"iid": 12, "state": "opened", "merge_commit_sha": null}),
+    );
+    let (record, text) = rig
+        .approved(
+            MERGE,
+            json!({"number": 12, "head": head}),
+            ApprovalDecision::Approve,
+        )
+        .await;
+    assert_eq!(record.state, ToolCallState::Succeeded, "{:?}", record.error);
+    assert_eq!(
+        result(text)["merge"],
+        json!({"merged": false, "commit": null})
+    );
+    assert_eq!(
+        rig.api.put.lock().unwrap().last().unwrap().1,
+        json!({"sha": head, "squash": false})
+    );
+
+    // Bad arguments, and a rebase GitLab cannot do, send nothing.
+    let asked = rig.api.paths().len();
+    for arguments in [
+        json!({"number": 12}),
+        json!({"number": 12, "head": &head[..12]}),
+        json!({"number": 12, "head": format!("{}g", &head[1..])}),
+        json!({"number": 12, "head": head, "method": nonce()}),
+        json!({"number": 12, "head": head, "method": "rebase"}),
+    ] {
+        let (record, _) = rig
+            .approved(MERGE, arguments, ApprovalDecision::Approve)
+            .await;
+        assert_eq!(error_kind(&record), ErrorKind::InvalidRequest);
+    }
+    assert_eq!(rig.api.paths().len(), asked);
 }
