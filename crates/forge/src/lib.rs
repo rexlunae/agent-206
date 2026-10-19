@@ -620,7 +620,9 @@ impl Repository {
 
     /// Posts `comment` on a line of pull request `number`, whose current
     /// answer to [`Repository::pull_request_url`] is `current`, anchored at
-    /// commit `head`; refused if that is no longer its head. The answer is
+    /// commit `head`; refused if that is no longer its head there. Forges
+    /// take no head condition with the comment, so one pushed after
+    /// `current` was read still gets it, as outdated. The answer is
     /// read with [`Repository::parse_line_comment`].
     pub fn line_comment(
         &self,

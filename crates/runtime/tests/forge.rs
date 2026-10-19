@@ -973,7 +973,7 @@ async fn a_model_merges_a_pull_request_only_at_the_approved_head() {
 }
 
 /// A line comment is anchored at the head commit the user approves, and
-/// nothing is posted once the pull request has moved on.
+/// nothing is posted once the pull request is read to have moved on.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_model_comments_on_a_line_only_at_the_approved_head() {
     let mut rig = rig().await;

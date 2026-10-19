@@ -729,13 +729,17 @@ permission for the tool.
   file before the change, a removed line). It first reads the pull
   request and sends nothing unless its head is still `head`, the full
   commit id the user approves, and anchors the comment at that commit.
+  No forge takes that condition with the comment itself, so a push in the
+  moment between the read and the comment leaves it on `head`, where the
+  forge shows it as outdated; it is never placed on a commit the user did
+  not approve.
   GitHub gets a pull request review comment; GitLab a discussion placed by
   the merge request's current versions (`diff_refs`, which GitLab works out
   after each push: until they match `head`, the call is a conflict error),
   with the same path on both sides, so a renamed file cannot be commented
   on there yet; Gitea and Forgejo a review holding only the comment. A
-  forge's 400 or 422 (a line outside the changes it shows) is a conflict
-  error. The result is the comment's id (on Gitea and Forgejo, the
+  forge's 400 or 422 (most often a file or line outside the changes it
+  shows; its own reason is not relayed) is a conflict error. The result is the comment's id (on Gitea and Forgejo, the
   review's) and web address where the forge gives one (GitLab does not).
 - `pull_request_merge` merges pull request `number` only if its head is
   still `head`, the full commit id the model read with `pull_request` and

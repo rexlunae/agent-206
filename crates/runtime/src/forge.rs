@@ -76,9 +76,9 @@ pub enum ForgeToolError {
     #[error("`path` must be a file path relative to the repository's root")]
     Path,
     #[error(
-        "the forge refused the comment's place (HTTP {status}); `line` must be within the pull request's changes on that `side` of `path`"
+        "the forge refused the comment (HTTP {status}); most often `path` is not among the pull request's changes or `line` is outside what they show on that `side`"
     )]
-    NotInDiff { status: u16 },
+    CommentRefused { status: u16 },
     #[error(
         "the forge did not merge it (HTTP {status}); its head may no longer be `head`, or it may be a draft, have conflicts, or wait on required checks or approvals; read it again"
     )]
@@ -121,7 +121,7 @@ impl crate::error::Classified for ForgeToolError {
             | Self::Line
             | Self::Side
             | Self::Path => ErrorKind::InvalidRequest,
-            Self::Rejected { .. } | Self::NotMergeable { .. } | Self::NotInDiff { .. } => {
+            Self::Rejected { .. } | Self::NotMergeable { .. } | Self::CommentRefused { .. } => {
                 ErrorKind::Conflict
             }
             Self::UnknownTool(_) | Self::NotFound => ErrorKind::NotFound,
@@ -247,7 +247,7 @@ impl ForgeHost {
     fn line_comment_spec() -> ToolSpec {
         ToolSpec {
             name: LINE_COMMENT.into(),
-            description: "Post a review comment on one line of a pull request's (GitLab merge request's) changes, at its head commit `head` (read it with pull_request first); refused if it has moved on. The line must be within the changes the forge shows: on the new side, an added line or one shown around a change; on the old side, a removed line. On Gitea and Forgejo the comment is posted as a review holding only it. The user approves each call. Returns the comment's id (on Gitea, the review's) and web address where the forge gives one.".into(),
+            description: "Post a review comment on one line of a pull request's (GitLab merge request's) changes, anchored at commit `head`, the pull request's head as pull_request reported it; refused if the head has already moved on (a push while the comment is being sent leaves it on `head` as an outdated comment). The line must be within the changes the forge shows: on the new side, an added line or one shown around a change; on the old side, a removed line. On Gitea and Forgejo the comment is posted as a review holding only it. The user approves each call. Returns the comment's id (on Gitea, the review's) and web address where the forge gives one.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -701,15 +701,15 @@ impl Forge {
             (status, body) => self.checked(status, body),
         }
     }
-    /// Sends a line comment, whose refusals say the line is not one the
-    /// forge shows.
+    /// Sends a line comment, whose refusals most often mean the line is not
+    /// one the forge shows; the forge's own reason is not relayed.
     async fn line_comment(
         &mut self,
         change: a206_forge::Change,
     ) -> Result<Vec<u8>, ForgeToolError> {
         let (method, url, body) = Self::request(change);
         match self.exchange(method, url, body).await? {
-            (status @ (400 | 422), _) => Err(ForgeToolError::NotInDiff { status }),
+            (status @ (400 | 422), _) => Err(ForgeToolError::CommentRefused { status }),
             (status, body) => self.checked(status, body),
         }
     }
