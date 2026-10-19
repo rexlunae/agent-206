@@ -24,7 +24,7 @@ const SERVICE: &str = "Matrix";
 const POLL_MILLISECONDS: u32 = 25_000;
 /// Most timeline events one sync returns per room.
 const TIMELINE_LIMIT: u32 = 50;
-const MAX_ROOMS: usize = 64;
+pub(super) const MAX_ROOMS: usize = 64;
 const MAX_EVENTS: usize = 1_000;
 const MAX_PAGES: usize = 32;
 const MAX_DISCOVERIES: usize = 4_096;
@@ -260,29 +260,15 @@ impl Matrix {
     /// marks where answering starts.
     ///
     /// The first call with a cursor this adapter did not reach itself first
-    /// reads the pending invitations the way a first sync does, and hands
-    /// them over in a batch that keeps `since`, so a room the user allowed
+    /// reads the pending invitations with a sync that has no cursor, and
+    /// hands them over in a batch that keeps `since`, so a room the user allowed
     /// while the cursor was saved is still joined.
     pub(crate) async fn receive(&mut self, since: Option<&str>) -> Result<Batch> {
         if let Some(since) = since
             && !self.invitations_seen
         {
             // Only the invitations: the rest of a first sync is history.
-            let mut chunk = self.sync(None).await?;
-            let mut events = Vec::new();
-            loop {
-                let complete = chunk.complete;
-                events.extend(
-                    chunk
-                        .events
-                        .into_iter()
-                        .filter(|(_, event)| matches!(event, Event::Invite { .. })),
-                );
-                match &mut self.pending {
-                    Some(pending) if !complete => chunk = pending.chunk(),
-                    _ => break,
-                }
-            }
+            let events = self.invitations().await?;
             self.pending = None;
             self.invitations_seen = true;
             return Ok(Batch {
@@ -293,6 +279,34 @@ impl Matrix {
         }
         self.invitations_seen = true;
         self.sync(since).await
+    }
+
+    /// Pending invitations to allowed rooms, from a sync without a cursor
+    /// and without timelines. Joined rooms are not charged to the budget:
+    /// this sync lists every one, and an account in many unchanged rooms
+    /// must still be able to resume.
+    async fn invitations(&self) -> Result<Vec<(String, Event)>> {
+        let mut url = self.url(&["sync"])?;
+        url.query_pairs_mut()
+            .append_pair("filter", &filter(0).to_string())
+            .append_pair("timeout", "0");
+        let sync: Sync = self.request(HttpMethod::Get, url, None).await?;
+        let mut count = 0;
+        let mut events = Vec::new();
+        for (room, invited) in sync.rooms.invite {
+            if !self.allowed.contains(&room) {
+                continue;
+            }
+            if events.len() == MAX_ROOMS {
+                return Err(MessengerError::SyncBudget { service: SERVICE });
+            }
+            charge(
+                &mut count,
+                invited.invite_state.events.len().saturating_add(1),
+            )?;
+            events.push(invite(room, &invited));
+        }
+        Ok(events)
     }
 
     async fn sync(&mut self, since: Option<&str>) -> Result<Batch> {
@@ -306,22 +320,9 @@ impl Matrix {
             }
             self.pending = None;
         }
-        let filter = serde_json::json!({
-            "presence": {"types": []},
-            "account_data": {"types": []},
-            "room": {
-                "account_data": {"types": []},
-                "ephemeral": {"types": []},
-                "state": {"types": [], "lazy_load_members": true},
-                "timeline": {
-                    "limit": TIMELINE_LIMIT,
-                    "types": ["m.room.message", "m.room.encrypted"],
-                },
-            },
-        });
         let mut url = self.url(&["sync"])?;
         url.query_pairs_mut()
-            .append_pair("filter", &filter.to_string())
+            .append_pair("filter", &filter(TIMELINE_LIMIT).to_string())
             .append_pair(
                 "timeout",
                 &since.map_or(0, |_| POLL_MILLISECONDS).to_string(),
@@ -409,16 +410,7 @@ impl Matrix {
         let mut seen = BTreeSet::new();
         let mut events = Vec::new();
         for (room, invited) in sync.rooms.invite {
-            let title = invited
-                .invite_state
-                .events
-                .iter()
-                .find(|e| e.kind == "m.room.name")
-                .and_then(|e| e.content.name.clone());
-            events.push((
-                format!("invite {room}"),
-                Event::Invite { chat: room, title },
-            ));
+            events.push(invite(room, &invited));
         }
         if let Some(since) = since {
             for (room, joined) in sync.rooms.join {
@@ -583,6 +575,37 @@ impl Matrix {
         }
         Ok(())
     }
+}
+
+/// Message timelines up to `limit` events per room, without presence,
+/// account data, ephemeral or state events.
+fn filter(limit: u32) -> serde_json::Value {
+    serde_json::json!({
+        "presence": {"types": []},
+        "account_data": {"types": []},
+        "room": {
+            "account_data": {"types": []},
+            "ephemeral": {"types": []},
+            "state": {"types": [], "lazy_load_members": true},
+            "timeline": {
+                "limit": limit,
+                "types": ["m.room.message", "m.room.encrypted"],
+            },
+        },
+    })
+}
+
+fn invite(room: String, invited: &Invited) -> (String, Event) {
+    let title = invited
+        .invite_state
+        .events
+        .iter()
+        .find(|e| e.kind == "m.room.name")
+        .and_then(|e| e.content.name.clone());
+    (
+        format!("invite {room}"),
+        Event::Invite { chat: room, title },
+    )
 }
 
 fn charge(count: &mut usize, added: usize) -> Result<()> {

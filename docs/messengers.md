@@ -568,8 +568,10 @@ saved cursor:
   sent at most once even across a restart in the middle of a turn.
 - Matrix lists an invitation in an incremental sync only when it changes, so
   a resumed Matrix messenger first reads the pending invitations with a sync
-  that has no cursor, ignoring its history, and joins those to rooms that
-  are now allowed. It then resumes from the saved sync token.
+  that has no cursor and no timelines, and joins those to rooms that are now
+  allowed. Joined rooms in that sync do not count against the room limit, so
+  an account in many unchanged rooms still resumes. It then resumes from the
+  saved sync token.
 - A cursor saved for another kind of messenger or another account is not
   used; that messenger starts from now, as on its first run.
 - If the service no longer accepts the cursor, or more arrived than one batch

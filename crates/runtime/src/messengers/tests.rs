@@ -3442,6 +3442,10 @@ async fn matrix_answers_what_arrived_while_it_was_stopped() {
     let (room, member) = (matrix_id('!', &domain), matrix_id('@', &domain));
     // Invited before the position was saved, and allowed since.
     let invited = matrix_id('!', &domain);
+    // More allowed rooms than one sync may carry, unchanged meanwhile.
+    let crowd: Vec<_> = (0..=matrix::MAX_ROOMS)
+        .map(|_| matrix_id('!', &domain))
+        .collect();
     let (since, missed) = (random(), random());
     host.cursors.lock().unwrap().insert(
         name.to_owned(),
@@ -3456,10 +3460,17 @@ async fn matrix_answers_what_arrived_while_it_was_stopped() {
         let mut syncs = server.syncs.lock().unwrap();
         // An incremental sync would not list the invitation again; a sync
         // without a cursor does, along with history.
-        let mut pending = timeline(vec![(
-            &room,
-            vec![text_event(&member, "m.text", &random())],
-        )]);
+        let mut pending = timeline(
+            std::iter::once(&room)
+                .chain(&crowd)
+                .map(|joined| {
+                    (
+                        joined.as_str(),
+                        vec![text_event(&member, "m.text", &random())],
+                    )
+                })
+                .collect(),
+        );
         pending["invite"] = json!({ &invited: {"invite_state": {"events": []}} });
         syncs.push_back(pending);
         syncs.push_back(timeline(vec![(
@@ -3467,7 +3478,12 @@ async fn matrix_answers_what_arrived_while_it_was_stopped() {
             vec![text_event(&member, "m.text", &missed)],
         )]));
     }
-    let mut entry = matrix_config(name, &origin, &credential, &[&room, &invited]);
+    let allowed: Vec<_> = [&room, &invited]
+        .into_iter()
+        .chain(&crowd)
+        .map(String::as_str)
+        .collect();
+    let mut entry = matrix_config(name, &origin, &credential, &allowed);
     entry.allowed_users.insert(member);
     let (_desired, receiver) = watch::channel(vec![Desired {
         config: entry,
