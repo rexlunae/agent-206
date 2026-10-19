@@ -264,6 +264,9 @@ struct Recorder {
     changed: Arc<tokio::sync::Notify>,
     /// Sessions offered to `send_message`, by messenger.
     posters: Arc<Mutex<BTreeMap<String, Poster>>>,
+    /// Saved reading positions, by messenger; shared by hosts that stand for
+    /// the same gateway state across a restart.
+    cursors: Arc<Mutex<BTreeMap<String, SavedCursor>>>,
 }
 impl Host for Recorder {
     fn post_through(&self, name: &str, poster: Option<Poster>) {
@@ -272,6 +275,16 @@ impl Host for Recorder {
             Some(poster) => posters.insert(name.to_owned(), poster),
             None => posters.remove(name),
         };
+    }
+    fn saved_cursor(&self, name: &str) -> Result<Option<SavedCursor>> {
+        Ok(self.cursors.lock().unwrap().get(name).cloned())
+    }
+    fn save_cursor(&self, name: &str, cursor: &SavedCursor) -> Result<()> {
+        self.cursors
+            .lock()
+            .unwrap()
+            .insert(name.to_owned(), cursor.clone());
+        Ok(())
     }
     fn root(&self) -> PathBuf {
         self.root.clone()
@@ -407,6 +420,7 @@ async fn setup(
         connects: Arc::default(),
         changed: Arc::default(),
         posters: Arc::default(),
+        cursors: Arc::default(),
     };
     (bot, origin, dir, credential, host, anchor)
 }
@@ -852,6 +866,7 @@ async fn matrix_setup() -> (
         connects: Arc::default(),
         changed: Arc::default(),
         posters: Arc::default(),
+        cursors: Arc::default(),
     };
     (server, origin, dir, credential, host, anchor)
 }
@@ -1469,6 +1484,7 @@ async fn discord_setup() -> (
         connects: Arc::default(),
         changed: Arc::default(),
         posters: Arc::default(),
+        cursors: Arc::default(),
     };
     (api, origin, dir, credential, host, anchor)
 }
@@ -1766,6 +1782,7 @@ async fn slack_setup(
         connects: Arc::default(),
         changed: Arc::default(),
         posters: Arc::default(),
+        cursors: Arc::default(),
     };
     let config = MessengerConfig {
         kind: MessengerKind::Slack,
@@ -2091,6 +2108,7 @@ async fn irc_answers_signed_in_people_and_checks_nicknames_before_direct_replies
         connects: Arc::default(),
         changed: Arc::default(),
         posters: Arc::default(),
+        cursors: Arc::default(),
     };
     let entry = MessengerConfig {
         kind: MessengerKind::Irc,
@@ -2200,6 +2218,7 @@ async fn irc_without_a_login_waits_for_the_user() {
         connects: Arc::default(),
         changed: Arc::default(),
         posters: Arc::default(),
+        cursors: Arc::default(),
     };
     let entry = MessengerConfig {
         kind: MessengerKind::Irc,
@@ -2354,6 +2373,7 @@ fn signal_host(dir: &tempfile::TempDir, pairing: BrokerPairing) -> Recorder {
         connects: Arc::default(),
         changed: Arc::default(),
         posters: Arc::default(),
+        cursors: Arc::default(),
     }
 }
 
@@ -2865,6 +2885,7 @@ async fn beeper_setup() -> (
         connects: Arc::default(),
         changed: Arc::default(),
         posters: Arc::default(),
+        cursors: Arc::default(),
     };
     (desktop, origin, dir, credential, host, anchor)
 }
@@ -3292,4 +3313,223 @@ async fn signal_posts_go_out_through_the_daemon_session_in_parts() {
         post_through(&poster, &group, &random(), || false).await,
         Err(MessengerError::SocketEnded { .. })
     ));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn telegram_resumes_its_saved_offset_after_a_restart() {
+    let (bot, origin, _dir, credential, host, _anchor) = setup(200, None).await;
+    let name = "restarted";
+    let chat = 31;
+    let (before, during, after) = (random(), random(), random());
+    bot.batches
+        .lock()
+        .unwrap()
+        .push_back(json!([message(8, chat, None, &random(), &before)]));
+    let wanted = vec![Desired {
+        config: config(name, &origin, &credential, chat),
+        run: true,
+    }];
+    let (_desired, receiver) = watch::channel(wanted.clone());
+    let stop = CancellationToken::new();
+    let supervisor = tokio::spawn(supervise(host.clone(), receiver, FAST, stop.clone()));
+    host.until(|_| bot.polls.lock().unwrap().len() >= 2).await;
+    stop.cancel();
+    supervisor.await.unwrap();
+    let account = bot.id.lock().unwrap().to_string();
+    let saved = host.cursors.lock().unwrap().get(name).cloned().unwrap();
+    assert_eq!(
+        saved,
+        SavedCursor {
+            kind: MessengerKind::Telegram,
+            account: account.clone(),
+            next: Some("9".to_owned()),
+            handled: BTreeSet::new(),
+        }
+    );
+    // The gateway stopped while update 9's turn was running: its handling
+    // had started, so it was saved as handled.
+    host.cursors
+        .lock()
+        .unwrap()
+        .get_mut(name)
+        .unwrap()
+        .handled
+        .insert("9".to_owned());
+
+    // After the restart, Telegram delivers that batch again.
+    let polled = bot.polls.lock().unwrap().len();
+    bot.batches.lock().unwrap().push_back(json!([
+        message(9, chat, None, &random(), &during),
+        message(10, chat, None, &random(), &after),
+    ]));
+    let (_desired, receiver) = watch::channel(wanted);
+    let stop = CancellationToken::new();
+    let supervisor = tokio::spawn(supervise(host.clone(), receiver, FAST, stop.clone()));
+    host.until(|_| bot.polls.lock().unwrap().len() >= polled + 2)
+        .await;
+    stop.cancel();
+    supervisor.await.unwrap();
+    let polls = bot.polls.lock().unwrap().clone();
+    assert_eq!(polls[polled].get("offset").map(String::as_str), Some("9"));
+    assert_eq!(
+        polls[polled + 1].get("offset").map(String::as_str),
+        Some("11")
+    );
+    let texts: Vec<_> = host
+        .turns
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|t| t.1.clone())
+        .collect();
+    assert_eq!(texts, [before, after]);
+    assert_eq!(
+        host.cursors.lock().unwrap()[name].next.as_deref(),
+        Some("11")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_saved_position_of_another_kind_or_account_is_not_resumed() {
+    let (bot, origin, _dir, credential, host, _anchor) = setup(200, None).await;
+    let (name, chat) = ("other-position", 41);
+    let account = bot.id.lock().unwrap().to_string();
+    for (kind, account) in [
+        (MessengerKind::Matrix, account),
+        (MessengerKind::Telegram, random()),
+    ] {
+        let saved = SavedCursor {
+            kind,
+            account,
+            next: Some(random()),
+            handled: BTreeSet::new(),
+        };
+        host.cursors.lock().unwrap().insert(name.to_owned(), saved);
+        let polled = bot.polls.lock().unwrap().len();
+        let (_desired, receiver) = watch::channel(vec![Desired {
+            config: config(name, &origin, &credential, chat),
+            run: true,
+        }]);
+        let stop = CancellationToken::new();
+        let supervisor = tokio::spawn(supervise(host.clone(), receiver, FAST, stop.clone()));
+        host.until(|_| bot.polls.lock().unwrap().len() > polled)
+            .await;
+        stop.cancel();
+        supervisor.await.unwrap();
+        assert!(!bot.polls.lock().unwrap()[polled].contains_key("offset"));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn matrix_answers_what_arrived_while_it_was_stopped() {
+    let (server, origin, _dir, credential, host, _anchor) = matrix_setup().await;
+    let name = "matrix-resume";
+    let domain = server.user.split_once(':').unwrap().1.to_owned();
+    let (room, member) = (matrix_id('!', &domain), matrix_id('@', &domain));
+    let (since, missed) = (random(), random());
+    host.cursors.lock().unwrap().insert(
+        name.to_owned(),
+        SavedCursor {
+            kind: MessengerKind::Matrix,
+            account: server.user.clone(),
+            next: Some(since.clone()),
+            handled: BTreeSet::new(),
+        },
+    );
+    server.syncs.lock().unwrap().push_back(timeline(vec![(
+        &room,
+        vec![text_event(&member, "m.text", &missed)],
+    )]));
+    let mut entry = matrix_config(name, &origin, &credential, &[&room]);
+    entry.allowed_users.insert(member);
+    let (_desired, receiver) = watch::channel(vec![Desired {
+        config: entry,
+        run: true,
+    }]);
+    let stop = CancellationToken::new();
+    let supervisor = tokio::spawn(supervise(host.clone(), receiver, FAST, stop.clone()));
+    host.until(|_| !server.sent.lock().unwrap().is_empty())
+        .await;
+    stop.cancel();
+    supervisor.await.unwrap();
+    let queries = server.sync_queries.lock().unwrap().clone();
+    assert_eq!(queries[0].get("since"), Some(&since));
+    let texts: Vec<_> = host
+        .turns
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|t| t.1.clone())
+        .collect();
+    assert_eq!(texts, [missed]);
+    let saved = host.cursors.lock().unwrap()[name].clone();
+    assert_ne!(saved.next, Some(since));
+    assert!(saved.next.is_some());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn matrix_starts_over_when_too_much_arrived_while_it_was_stopped() {
+    let (server, origin, _dir, credential, host, _anchor) = matrix_setup().await;
+    let name = "matrix-behind";
+    let domain = server.user.split_once(':').unwrap().1.to_owned();
+    let (room, member) = (matrix_id('!', &domain), matrix_id('@', &domain));
+    let (since, text) = (random(), random());
+    host.cursors.lock().unwrap().insert(
+        name.to_owned(),
+        SavedCursor {
+            kind: MessengerKind::Matrix,
+            account: server.user.clone(),
+            next: Some(since.clone()),
+            handled: BTreeSet::new(),
+        },
+    );
+    {
+        let mut syncs = server.syncs.lock().unwrap();
+        // More than one batch reads.
+        syncs.push_back(timeline(vec![(
+            &room,
+            (0..1_001)
+                .map(|_| text_event(&member, "m.text", &random()))
+                .collect(),
+        )]));
+        // Starting over: the first sync only marks where answering starts.
+        syncs.push_back(timeline(vec![(
+            &room,
+            vec![text_event(&member, "m.text", &random())],
+        )]));
+        syncs.push_back(timeline(vec![(
+            &room,
+            vec![text_event(&member, "m.text", &text)],
+        )]));
+    }
+    let mut entry = matrix_config(name, &origin, &credential, &[&room]);
+    entry.allowed_users.insert(member);
+    let (_desired, receiver) = watch::channel(vec![Desired {
+        config: entry,
+        run: true,
+    }]);
+    let stop = CancellationToken::new();
+    let supervisor = tokio::spawn(supervise(host.clone(), receiver, FAST, stop.clone()));
+    host.until(|_| !server.sent.lock().unwrap().is_empty())
+        .await;
+    let status = host.status(name);
+    stop.cancel();
+    supervisor.await.unwrap();
+    // The skipped messages are reported, and the messenger kept running.
+    assert_eq!(status.state, MessengerState::Connected);
+    let failure = status.failure.unwrap();
+    assert_eq!(failure.kind, ErrorKind::Protocol);
+    assert!(failure.source.is_some());
+    assert_eq!(host.connects(name), 1);
+    let queries = server.sync_queries.lock().unwrap().clone();
+    assert_eq!(queries[0].get("since"), Some(&since));
+    assert!(!queries[1].contains_key("since"));
+    let texts: Vec<_> = host
+        .turns
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|t| t.1.clone())
+        .collect();
+    assert_eq!(texts, [text]);
 }

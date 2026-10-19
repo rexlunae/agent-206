@@ -10,8 +10,9 @@
 //! because a plain-text answer there would downgrade the room's protection.
 //!
 //! The first sync of a session that starts without a cursor answers nothing:
-//! it only marks where to start, so history is never answered. The cursor is
-//! kept across reconnects while the gateway runs, but not across restarts.
+//! it only marks where to start, so history is never answered. The caller
+//! keeps the cursor across reconnects and saves it in the gateway's state,
+//! so a restart resumes from it.
 use super::{Account, Api, Batch, Event, Inbound, MessengerError, Result, split};
 use a206_broker::{AuthScheme, HttpMethod};
 use serde::Deserialize;

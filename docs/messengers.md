@@ -90,9 +90,10 @@ Telegram is long-polled (`getUpdates`, 25 s). Messages are handled one at a
 time per messenger, in order. The poll offset advances as each message's
 handling starts and survives reconnects, so while the gateway runs a message
 is handled at most once (a reply that fails to send is not retried; the
-failure is in the status). The offset is held in memory, so a batch the
-gateway handled just before stopping can be delivered again after a
-restart. Update ids belong to one bot, so the offset is kept per bot: the
+failure is in the status). The offset, and which messages of the next
+batch have started, are saved in the gateway's state before each message is
+handled, so a restart resumes there and does not answer a message twice; see
+[Saved positions](#saved-positions). Update ids belong to one bot, so the offset is kept per bot: the
 gateway checks which bot the credential names (`getMe`) before each poll, and
 a credential replaced with another bot's token starts from a fresh offset
 instead of confirming that bot's undelivered updates. Replies longer than Telegram's limit are split at newlines without
@@ -136,11 +137,12 @@ agent206 messenger enable home
   ignored. Replies are `m.notice` messages, so other bots do not answer them,
   split at 8000 UTF-16 units.
 - **Delivery.** `/sync` is long-polled (25 s) with a filter that drops
-  presence, receipts and room state. Each time the messenger starts (a
-  gateway start, enabling it or changing its settings), its first sync
-  starts from now and answers nothing, so history is never answered. The
-  sync token is held in memory and survives reconnects, but messages sent
-  while the messenger was stopped are not answered. A 401 (expired or
+  presence, receipts and room state. The first time the messenger runs for
+  an account, its first sync starts from now and answers nothing, so history
+  is never answered. After that the sync token is saved in the gateway's
+  state, so a restart, a disconnect or a settings change resumes from it and
+  answers messages sent while the messenger was stopped, within the batch
+  limits below; see [Saved positions](#saved-positions). A 401 (expired or
   revoked token) stops the messenger until the user acts. The account is
   checked (`whoami`) before each sync, and another account behind the
   credential starts from a fresh sync token.
@@ -549,6 +551,34 @@ messenger-specific code; `docs/run-engine.md` documents this contract and
 tests it. Approval prompts are never sent to the chat, so a chat
 participant cannot approve their own request.
 
+## Saved positions
+
+Telegram and Matrix keep messages for the account on the service, under a
+cursor (the poll offset or the sync token). The gateway saves that cursor for
+each messenger in its state database (`messenger_cursors` in
+`state.sqlite3`), with the account it belongs to and the messages of the next
+batch whose handling has started. The save happens before each message is
+handled and when a batch is confirmed. When the messenger starts again, after
+a gateway restart, a disconnect or a settings change, it resumes from the
+saved cursor:
+
+- Messages that arrived while it was stopped are answered, as far as the
+  service still holds them (Telegram keeps undelivered updates for 24 hours).
+- A message whose handling had started is not answered again, so a reply is
+  sent at most once even across a restart in the middle of a turn.
+- A cursor saved for another kind of messenger or another account is not
+  used; that messenger starts from now, as on its first run.
+- If the service no longer accepts the cursor, or more arrived than one batch
+  reads (the Matrix limits above), the messenger starts from now and its
+  status reports that messages sent while it was stopped could not be read.
+- A save that fails is reported in the status and does not stop the
+  messenger; only a restart before the next successful save can repeat a
+  batch.
+
+Discord, Slack, IRC and Signal deliver only to a running connection, so there
+is nothing to resume. Beeper's cursors describe state held by one session and
+are not saved: it still starts from now after a restart.
+
 ## Not yet
 
 - WhatsApp, Google Chat and iMessage on their own (they are reached through
@@ -567,8 +597,6 @@ participant cannot approve their own request.
   carry a title).
 - Attachments, edits, reactions and group mention handling; only text
   messages are read.
-- A persisted poll offset or sync token for exactly-once delivery across
-  restarts.
 - Matrix end-to-end encryption, homeserver discovery through
   `.well-known/matrix/client`, and password sign-in (the user supplies an
   access token).
