@@ -715,7 +715,9 @@ conversation's permission for the tool.
   decides. Gitea and Forgejo drafts are marked the same way with their
   default work-in-progress prefixes (`WIP:`, `[WIP]`); an instance that
   configures other prefixes reads its own as written. The result is the
-  new pull request.
+  new pull request, with `draft_as_requested` false when the forge reports
+  a different draft state than asked (such an instance, or a version that
+  does not report drafts).
 - `pull_request_comment` posts `body` on pull request `number` (a GitHub
   issue comment, also on Gitea and Forgejo; a GitLab merge request note)
   and returns its id and web

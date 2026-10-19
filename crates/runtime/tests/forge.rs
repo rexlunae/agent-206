@@ -842,10 +842,11 @@ async fn gitea_answers_are_read_page_by_page_until_one_is_empty() {
         pull(10, &branch, Some(here), false),
     );
     let arguments = json!({"title": title, "branch": branch, "base": base, "draft": true});
-    let (record, _) = rig
+    let (record, text) = rig
         .approved(CREATE, arguments, ApprovalDecision::Approve)
         .await;
     assert_eq!(record.state, ToolCallState::Succeeded, "{:?}", record.error);
+    assert_eq!(result(text)["draft_as_requested"], true);
     assert_eq!(
         rig.api.posted.lock().unwrap().last().unwrap(),
         &(
@@ -853,4 +854,14 @@ async fn gitea_answers_are_read_page_by_page_until_one_is_empty() {
             json!({"title": format!("WIP: {title}"), "head": branch, "base": base})
         )
     );
+    // An instance with other work-in-progress prefixes may disagree, and
+    // the result says so rather than claiming the requested state.
+    let arguments = json!({"title": title, "branch": branch, "base": base, "draft": false});
+    let (record, text) = rig
+        .approved(CREATE, arguments, ApprovalDecision::Approve)
+        .await;
+    assert_eq!(record.state, ToolCallState::Succeeded, "{:?}", record.error);
+    let answer = result(text);
+    assert_eq!(answer["pull_request"]["draft"], true);
+    assert_eq!(answer["draft_as_requested"], false);
 }
