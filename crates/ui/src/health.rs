@@ -47,12 +47,12 @@ async fn check() -> Result<DoctorReport, ErrorReport> {
     // The gateway this client's commands go to, so a refresh the report
     // offers reaches the gateway it was found on, not one another client
     // saved since.
-    let target = match crate::TARGET.lock().ok().and_then(|active| active.clone()) {
-        Some((target, _)) => Ok(Some(target)),
-        None => a206_runtime::connection::resolve(&root, remote)
-            .map_err(|error| a206_runtime::error::report(&error)),
-    };
-    a206_runtime::doctor::check_detached(root, target)
+    let active = crate::TARGET
+        .lock()
+        .ok()
+        .and_then(|active| active.clone())
+        .map(|(target, _)| target);
+    a206_runtime::doctor::check_detached(root, active, remote)
         .await
         .map_err(|error| a206_runtime::error::report(&error))
 }

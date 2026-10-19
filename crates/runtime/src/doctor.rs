@@ -690,16 +690,22 @@ where
 }
 
 /// [`gather_for`] and [`evaluate`] off the caller's executor, for the
-/// gateway the client already talks to.
+/// gateway the client already talks to (`active`), or else the saved setup
+/// with `remote` overriding it, read on the worker.
 pub async fn check_detached(
     root: PathBuf,
-    target: Result<Option<GatewayTarget>, ErrorReport>,
+    active: Option<GatewayTarget>,
+    remote: Option<String>,
 ) -> Result<DoctorReport, DoctorError> {
     detached(move || async move {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |elapsed| elapsed.as_secs());
-        evaluate(&gather_for(&root, target, now).await)
+        let facts = match active {
+            Some(target) => gather_for(&root, Ok(Some(target)), now).await,
+            None => gather(&root, remote, now).await,
+        };
+        evaluate(&facts)
     })
     .await
 }
