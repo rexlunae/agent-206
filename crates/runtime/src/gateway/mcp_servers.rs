@@ -325,6 +325,18 @@ struct Launch {
 }
 
 impl Launch {
+    fn read(store: &Store, name: &str) -> Result<Self> {
+        let settings = &store.state.settings;
+        let config = settings
+            .mcp_servers
+            .iter()
+            .find(|s| s.name == name)
+            .cloned()
+            .ok_or(GatewayError::NotFound("MCP server is not configured"))?;
+        let programs = granted(&config, &settings.program_directories).to_vec();
+        Ok(Self { config, programs })
+    }
+
     /// Whether `name` still has these settings in `store`.
     fn current(&self, store: &Store, name: &str) -> bool {
         let settings = &store.state.settings;
@@ -375,10 +387,6 @@ impl McpClient {
             .ok_or(GatewayError::NotFound("MCP server is not configured"))
     }
 
-    fn project_root(&self, id: Id) -> Result<PathBuf> {
-        super::project_root(&*self.lock()?, id)
-    }
-
     /// Start a claimed server and record its tools. Callers waiting on the
     /// claim learn of a failure.
     async fn start(&self, name: &str, claim: Starting<'_>) -> Result<()> {
@@ -394,33 +402,32 @@ impl McpClient {
     /// What a start of `name` reads: its entry and the program directories it
     /// is given.
     fn launch(&self, name: &str) -> Result<Launch> {
-        let store = self.lock()?;
-        let config = store
-            .state
-            .settings
-            .mcp_servers
-            .iter()
-            .find(|s| s.name == name)
-            .cloned()
-            .ok_or(GatewayError::NotFound("MCP server is not configured"))?;
-        let programs = granted(&config, &store.state.settings.program_directories).to_vec();
-        Ok(Launch { config, programs })
+        Launch::read(&*self.lock()?, name)
     }
 
     async fn start_claimed(&self, name: &str) -> Result<()> {
-        let launch = self.launch(name)?;
-        let Launch { config, programs } = &launch;
-        check(config.enabled, McpError::Disabled)?;
-        let project_root = config.project.map(|id| self.project_root(id)).transpose()?;
-        let state_root = self.lock()?.root.clone();
         self.servers.remove(name)?;
-        self.set_status(name, |status| {
-            *status = McpServerStatus {
-                name: name.into(),
-                state: McpServerState::Connecting,
-                ..Default::default()
-            }
-        })?;
+        let (launch, project_root, state_root) = {
+            // Read under the lock that records Connecting, so a save cannot
+            // land between them and be overwritten by this start.
+            let mut store = self.lock()?;
+            let launch = Launch::read(&store, name)?;
+            check(launch.config.enabled, McpError::Disabled)?;
+            let project_root = launch
+                .config
+                .project
+                .map(|id| super::project_root(&store, id))
+                .transpose()?;
+            update_status(&mut store, name, |status| {
+                *status = McpServerStatus {
+                    name: name.into(),
+                    state: McpServerState::Connecting,
+                    ..Default::default()
+                }
+            })?;
+            (launch, project_root, store.root.clone())
+        };
+        let Launch { config, programs } = &launch;
         let started = async {
             // Checked again: the directories may have changed since they were saved.
             let mut hidden = a206_sandbox::hidden_home_paths();
