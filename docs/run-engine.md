@@ -612,9 +612,11 @@ tool needs the conversation's GitWrite grant (Code mode), its policy is Ask,
 so each call is approved, and the host refuses a call the user did not
 approve.
 
-Arguments are `branch` (default: the current branch) and `remote` (default:
-`branch.<name>.remote`, else `origin`). The local branch goes to the branch of
-the same name on the remote, like `git push <remote> <branch>`:
+Arguments are `branch` (default: the current branch), or `tag` instead of
+it, and `remote` (default: `branch.<name>.remote`, for a tag the current
+branch's, else `origin`). The local branch goes to the branch of the same
+name on the remote, like `git push <remote> <branch>`, and a tag to the tag
+of the same name, like `git push <remote> tag <tag>`:
 
 - The remote's `pushurl`, else `url`, must be an HTTPS URL without a username,
   password, query or fragment; ssh remotes are refused. A remote URL that a
@@ -624,9 +626,10 @@ the same name on the remote, like `git push <remote> <branch>`:
   (including the files the user's configuration includes). A repository whose
   configuration includes other files (`include` or `includeIf`) is refused:
   the project chooses those paths and they may lie outside it.
-- A repository with a `pre-push` or `reference-transaction` hook is refused,
-  and `user.name` and `user.email` must be set: the remote-tracking branch's
-  reflog records them.
+- A repository with a `pre-push` or `reference-transaction` hook is refused.
+  A branch push needs `user.name` and `user.email`: the remote-tracking
+  branch's reflog records them. A tag push does not, since git keeps no
+  remote-tracking tags.
 - The gateway asks the vault broker for the server's references
   (`GitReceivePack`, broker protocol v13). The broker sends the token as the
   password of HTTP Basic authentication, only to the credential's bound
@@ -635,6 +638,13 @@ the same name on the remote, like `git push <remote> <branch>`:
   is not in this branch's history, the push is refused before any pack is
   built. If the server already has the commit there, nothing is sent and the
   result says `up_to_date`.
+- A tag is sent only if the server lacks it; a server tag at another object
+  is never replaced (`Conflict`), as git refuses without force. The tag's
+  object is the one its reference names, following symbolic tags; an
+  annotated tag's tag objects (at most 10 in a chain) go in the pack with the
+  commits the server lacks, and a tag naming a tree or blob is refused. The
+  result names the `tag`, whether it is `annotated` and the `commit` it
+  leads to.
 - The pack (crate `a206-git-push`) holds the new commits and the trees and
   blobs they change, whole and compressed, with no deltas. It must fit one
   broker message: about 4 MiB, at most 10,000 commits and 100,000 objects,
@@ -652,8 +662,9 @@ the same name on the remote, like `git push <remote> <branch>`:
 
 The token never reaches the gateway, the model, the conversation or a log.
 Cancelling a call after the pack was sent may leave the server updated. Not
-yet: ssh remotes, force pushes, deleting remote branches, tags and pushing to a
-differently named branch.
+yet: ssh remotes, force pushes, deleting remote branches or tags, pushing
+several references at once (`--tags`, `--follow-tags`) and pushing to a
+differently named branch or tag.
 
 ## Fetching git branches (`git_fetch`)
 
