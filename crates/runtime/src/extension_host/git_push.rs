@@ -803,16 +803,15 @@ mod tests {
         // One whose target's name is not UTF-8 follows that exact name, not
         // a lossy copy of it, even when the copy names another tag.
         {
-            use std::os::unix::ffi::OsStrExt;
             let (bytes, lossy) = (nonce(), nonce());
             let mut raw = format!("{bytes}-").into_bytes();
             raw.push(0xff);
             let tags = dir.path().join(".git/refs/tags");
-            std::fs::write(
-                tags.join(std::ffi::OsStr::from_bytes(&raw)),
-                format!("{object}\n"),
-            )
-            .unwrap();
+            // Packed, as not every file system takes such a file name.
+            let mut packed = format!("{object} refs/tags/").into_bytes();
+            packed.extend_from_slice(&raw);
+            packed.push(b'\n');
+            std::fs::write(dir.path().join(".git/packed-refs"), packed).unwrap();
             tag_ref(&repo, &format!("{bytes}-\u{fffd}"), Target::Object(head));
             let mut pointer = b"ref: refs/tags/".to_vec();
             pointer.extend_from_slice(&raw);
