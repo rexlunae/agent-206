@@ -28,6 +28,8 @@ use std::{path::PathBuf, sync::atomic::AtomicBool};
 
 /// Hooks git runs for a fetch.
 const FETCH_HOOKS: [&str; 1] = ["reference-transaction"];
+/// Most branches a tag fetch takes as complete local history.
+const MAX_TAG_TIPS: usize = 1_000;
 
 /// A remote branch or tag to fetch and where it is kept.
 #[derive(Debug, Clone)]
@@ -46,7 +48,8 @@ pub(crate) struct FetchTarget {
     /// object) before the fetch, if it exists.
     pub previous: Option<ObjectId>,
     /// Local commits whose history is complete here: the remote-tracking
-    /// branch, the branch of the same name and HEAD (for a tag, HEAD).
+    /// branch, the branch of the same name and HEAD (for a tag, HEAD, every
+    /// local and remote-tracking branch and the existing tag's commit).
     pub tips: Vec<ObjectId>,
     /// Commits to tell the server about, newest first.
     pub haves: Vec<ObjectId>,
@@ -206,9 +209,36 @@ fn tag_target(
         haves: vec![],
     };
     target.previous = target.current(repo)?;
+    // A tag may name any history, so every local and remote-tracking
+    // branch bounds the completeness walk, as does the commit an existing
+    // tag of that name leads to.
     // An unborn HEAD has no commit; a HEAD that cannot be read fails.
     let head = repo.head().map_err(|e| host(git_failure("head", &e)))?;
     target.tips.extend(head.id().map(|id| id.detach()));
+    let references = repo
+        .references()
+        .map_err(|e| host(git_failure("branches", &e)))?;
+    let branches = references
+        .local_branches()
+        .map_err(|e| host(git_failure("branches", &e)))?
+        .chain(
+            references
+                .remote_branches()
+                .map_err(|e| host(git_failure("branches", &e)))?,
+        );
+    for reference in branches.take(MAX_TAG_TIPS) {
+        check(interrupt).map_err(host)?;
+        let mut reference = reference.map_err(|e| host(git_failure("branches", &e)))?;
+        // A broken branch bounds nothing.
+        if let Ok(id) = reference.peel_to_id() {
+            target.tips.push(id.detach());
+        }
+    }
+    if let Some(previous) = target.previous {
+        target.tips.extend(target.commit(repo, previous)?);
+    }
+    target.tips.sort();
+    target.tips.dedup();
     target.haves = haves(repo, &target.tips, interrupt)?;
     Ok(target)
 }
@@ -451,5 +481,83 @@ fn record(
             Err(RemoteError::TrackingMoved(tracking))
         }
         Err(e) => Err(host(git_failure("fetch", &e))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn nonce() -> String {
+        uuid::Uuid::new_v4().simple().to_string()
+    }
+    /// A commit on `reference` with a new file, on top of `parent`.
+    fn commit(repo: &gix::Repository, reference: &str, parent: Option<ObjectId>) -> ObjectId {
+        let base = match parent {
+            Some(parent) => repo
+                .find_commit(parent)
+                .unwrap()
+                .tree_id()
+                .unwrap()
+                .detach(),
+            None => ObjectId::empty_tree(repo.object_hash()),
+        };
+        let blob = repo.write_blob(nonce().as_bytes()).unwrap().detach();
+        let mut tree = repo.edit_tree(base).unwrap();
+        tree.upsert(nonce(), gix::objs::tree::EntryKind::Blob, blob)
+            .unwrap();
+        let tree = tree.write().unwrap().detach();
+        let signature = gix::actor::Signature {
+            name: "n".into(),
+            email: "n@example.invalid".into(),
+            time: gix::date::Time::new(2_000_000, 0),
+        };
+        let (mut a, mut b) = Default::default();
+        repo.commit_as(
+            signature.to_ref(&mut a),
+            signature.to_ref(&mut b),
+            reference,
+            nonce(),
+            tree,
+            parent,
+        )
+        .unwrap()
+        .detach()
+    }
+
+    #[test]
+    fn a_tag_on_a_long_side_branch_is_complete_without_walking_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = gix::init(dir.path()).unwrap();
+        let root = commit(&repo, "HEAD", None);
+        // A side branch longer than the walk may go, which HEAD lacks.
+        let side = format!("refs/heads/s-{}", nonce());
+        let mut tip = root;
+        for _ in 0..4 {
+            tip = commit(&repo, &side, Some(tip));
+        }
+        let config = dir.path().join(".git/config");
+        let mut text = std::fs::read_to_string(&config).unwrap();
+        text.push_str("[remote \"origin\"]\n\turl = https://example.invalid/a.git\n");
+        std::fs::write(&config, text).unwrap();
+        let tag = nonce();
+        let never = AtomicBool::new(false);
+        let target = target(dir.path().into(), Named::Tag(&tag), None, &never).unwrap();
+        let short = Limits {
+            commits: 2,
+            objects: 1_000,
+            bytes: 1 << 20,
+            object: 1 << 20,
+        };
+        // The side branch bounds the walk, so a tag of its tip needs no pack.
+        assert!(!needs_pack(dir.path().into(), &target, tip, short, &never).unwrap());
+        // A commit beyond every branch is walked, and the limit applies.
+        let beyond = commit(&repo, &format!("refs/scratch/{}", nonce()), Some(tip));
+        let beyond = commit(&repo, &format!("refs/scratch/{}", nonce()), Some(beyond));
+        let beyond = commit(&repo, &format!("refs/scratch/{}", nonce()), Some(beyond));
+        assert!(matches!(
+            needs_pack(dir.path().into(), &target, beyond, short, &never),
+            Err(RemoteError::Pack(PackError::TooManyCommits(2)))
+        ));
     }
 }

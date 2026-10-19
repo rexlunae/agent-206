@@ -660,8 +660,8 @@ name), or `tag` instead of it, and `remote` (default: the current branch's
 remote, else `origin`).
 
 - The remote's `url` follows the push rules (HTTPS only, `insteadOf`
-  rewrites refused, included configuration refused). The remote's
-  `remote.<name>.fetch` must be the mapping `git clone` sets up,
+  rewrites refused, included configuration refused). For a branch, the
+  remote's `remote.<name>.fetch` must be the mapping `git clone` sets up,
   `refs/heads/*:refs/remotes/<remote>/*`, with or without `+`, and be the
   remote's only mapping (git would also update what others map to); any
   other configuration is refused before the forge is asked for anything.
@@ -669,7 +669,7 @@ remote, else `origin`).
   own commits are not fetched, as git does not fetch them here either.
 - Shallow repositories, partial clones (`extensions.partialClone` or
   `remote.<name>.promisor`) and a `reference-transaction` hook are refused;
-  `user.name` and `user.email` must be set for the reflog.
+  for a branch, `user.name` and `user.email` must be set for the reflog.
 - The gateway asks the vault broker for the server's references and then for
   a pack (`GitUploadPack`, broker protocol v14), with the token sent as for a
   push. It tells the server about up to 256 commits it has, newest first,
@@ -691,8 +691,11 @@ The result names the branch, remote, `tracking_branch`, the old and new
 commits and how many objects arrived.
 
 A `tag` is fetched into the local tag of the same name, like
-`git fetch <remote> tag <tag>`. No refspec applies and no identity is
-needed. A local tag of that name at another object is never replaced
+`git fetch <remote> tag <tag>`. The rules above apply except the refspec
+and identity ones: a tag fetch works with any `remote.<name>.fetch`
+setting and needs no identity. Every local and remote-tracking branch (up
+to 1,000), HEAD and an existing tag of that name count as complete local
+history, so a tag on any of them needs no walk of its history. A local tag of that name at another object is never replaced
 (`Conflict`, before anything is downloaded); one at the same object is
 `up_to_date`. The pack's completeness is checked through the tag's tag
 objects (at most 10) to its commit, and a tag naming a tree or blob is
