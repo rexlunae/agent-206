@@ -218,7 +218,7 @@ impl Settings {
         })
     }
     /// An unreadable value counts as `true`, so it never weakens a check.
-    fn flag(&self, key: &str) -> Option<bool> {
+    pub(super) fn flag(&self, key: &str) -> Option<bool> {
         let read = |config: &gix::config::File| config.boolean(key).unwrap_or(Some(true));
         read(&self.repository).or_else(|| read(&self.user))
     }

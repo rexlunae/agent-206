@@ -22,9 +22,10 @@ and an `overview` panel. `apply_patch` reads a unified diff (`git diff` or
 (`/dev/null` old side) and deleted ones; renames, mode and binary changes and
 quoted paths are refused, as is a hunk with more or fewer lines than the
 counts in its `@@` header. The write tools need a separate `write_workspace` grant. It also bundles
-`agent206.git` (`plugins/git`) with `git_status`, `git_log`, `git_branches` and
-`git_diff` tools under the `git_read` grant, `git_stage`, `git_commit` and
-`git_branch_create` tools under their own `git_write` grant, and `git_switch`,
+`agent206.git` (`plugins/git`) with `git_status`, `git_log`, `git_branches`,
+`git_tags` and `git_diff` tools under the `git_read` grant, `git_stage`,
+`git_commit`, `git_branch_create` and `git_tag_create` tools under their own
+`git_write` grant, and `git_switch`,
 which needs `git_write` and `write_workspace` together, and `agent206.web` (`plugins/web`) with `fetch_url` (the
 raw response) and `read_web_page` tools under the `network` grant.
 `read_web_page` reads HTML in one pass in the guest, without a DOM: it drops
@@ -299,6 +300,8 @@ unsafe operation.
 | `git_diff { path, staged }` | `git_read` + a project | unified diff of one file (`HEAD`→index when `staged`, else index→working tree; a symbolic link compares its target text), or `binary` | 512 KiB per side (checked before a blob is read), 192 KiB of text, 3 context lines; at most 8,192 input lines combined and 1,000,000 line pairs, otherwise a budget failure |
 | `git_branches` | `git_read` + a project | local branches sorted by name: short name, commit id, whether `HEAD` is on it | 500 branches, then `truncated`; 5 s per git call |
 | `git_create_branch { name, start }` | `git_write` + a project | the new branch | see [Branches](#branches); the same deadline as `git_commit` |
+| `git_tags` | `git_read` + a project | tags sorted by name: short name, the commit it names through any tag objects (absent when it names something else), whether it is annotated | 500 tags, then `truncated`; 5 s per git call |
+| `git_create_tag { name, target, message }` | `git_write` + a project | the new tag | see [Tags](#tags); the same deadline as `git_commit` |
 | `git_switch_branch { name }` | `git_write` and `write_workspace` + a project | the branch, now current | 1,000 changed files, 512 KiB per file and 32 MiB together; see [Branches](#branches); the same deadline as `git_commit`, and a switch that has started changing files finishes and is reported |
 | `git_stage { paths, unstage }` | `git_write` + a project | done | 1 to 100 paths, 512 KiB per file and 8 MiB together; the same deadline as `git_commit`; see [Staging](#staging) |
 | `git_commit { message, paths }` | `git_write` + a project | the new commit: id, summary, author name, time | 1 to 100 paths, 16 KiB message, 512 KiB per file and 8 MiB together; 5 s and 3 s before the invocation's deadline, but once the commit is written it is reported, even past that; see [Commits](#commits) |
@@ -395,6 +398,28 @@ rebase or similar in progress. `user.name` and `user.email` are required for
 the reflog, and a reflog that cannot be opened refuses the switch as `io`. Every check is made before the first file changes. If writing a
 file then fails, the call fails naming that file and saying that the index
 and `HEAD` still name the previous branch.
+
+### Tags
+
+`git_create_tag` works like `git tag <name> [<target>]`, or with a `message`
+like `git tag -a -m <message>`: it writes `refs/tags/<name>` (a plain tag
+names the commit; an annotated one names a new tag object holding the commit,
+`user.name` and `user.email` as tagger, the time and the message, ending in a
+line break), and leaves the working tree, the index and `HEAD` as they are.
+Names follow the branch rules: one git accepts, at most 20 folders deep
+(`invalid`), not existing yet and not nesting with an existing tag (`conflict`).
+`target` is a local branch name or a full commit id and defaults to `HEAD`;
+revision expressions and abbreviated ids are not evaluated (`not_found`). A
+message is 1 to 16 KiB of text without NUL (`invalid`). An annotated tag
+needs `user.name` and `user.email` for its tagger (`unsupported` without
+them); a plain one, like `git tag`, does not. A `reference-transaction` hook
+refuses any tag, and so does `tag.gpgSign`, with which git signs every tag
+(even one asked for without a message), as `unsupported`;
+`tag.forceSignAnnotated` yields to an explicit annotation, as in git. `HEAD`
+is refused as a name (`invalid`), since it would be ambiguous with `HEAD`
+itself. Listing follows a symbolic tag to the object it names, and lists a
+tag whose object is missing without a commit. A tag stays local; pushing
+tags is not offered yet.
 
 ### Staging
 

@@ -117,6 +117,13 @@ mod native {
             /// Print the report as TOML.
             #[arg(long)]
             toml: bool,
+            /// Offer the repairs doctor can make (private permissions, model
+            /// list refreshes) one by one, then check again.
+            #[arg(long, conflicts_with = "toml")]
+            repair: bool,
+            /// With --repair, make every offered repair without asking.
+            #[arg(long, requires = "repair")]
+            yes: bool,
         },
         /// Preview, then apply with --apply, a reviewed import from another tool.
         #[cfg(unix)]
@@ -660,7 +667,10 @@ mod native {
                 {
                     return setup(&root, *local, ssh.clone(), trust).await;
                 }
-                if let Action::Doctor { toml } = action {
+                if let Action::Doctor { toml, repair, yes } = action {
+                    if repair {
+                        return crate::doctor_cli::repair(&root, args.remote.clone(), yes).await;
+                    }
                     return crate::doctor_cli::run(&root, args.remote.clone(), toml).await;
                 }
                 #[cfg(unix)]

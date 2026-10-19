@@ -557,12 +557,18 @@ impl Broker {
     }
 
     /// One forge API request; the status and the body of a success (the
-    /// broker never relays the body of a failure).
+    /// broker never relays the body of a failure). A PUT needs a broker
+    /// that sends one.
     #[cfg(unix)]
     pub(crate) async fn provider(
         &mut self,
         call: a206_broker::ProviderCall,
     ) -> Result<(u16, Vec<u8>), RemoteError> {
+        if matches!(call.method, a206_broker::HttpMethod::Put)
+            && self.client.version() < a206_broker::PUT_VERSION
+        {
+            return Err(RemoteError::BrokerTooOld);
+        }
         let reply = self
             .client
             .call(a206_broker::Request::Provider(call))

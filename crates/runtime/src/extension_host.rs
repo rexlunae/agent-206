@@ -1090,6 +1090,35 @@ impl HostCalls {
                 )
                 .await
             }
+            HostRequest::GitTags => {
+                let root = self.workspace()?;
+                git_call(move |interrupt| git_tag::list(root, &interrupt)).await
+            }
+            HostRequest::GitCreateTag {
+                name,
+                target,
+                message,
+            } => {
+                let root = self.workspace()?;
+                let user = self.user_git;
+                // As for a commit: a tag made at the last moment still
+                // reaches the guest.
+                let budget = self.write_budget()?;
+                git_write_call_with_timeout(
+                    move |interrupt| {
+                        git_tag::create(
+                            root,
+                            &name,
+                            target.as_deref(),
+                            message.as_deref(),
+                            user,
+                            &interrupt,
+                        )
+                    },
+                    budget,
+                )
+                .await
+            }
             HostRequest::GitSwitchBranch { name } => {
                 let root = self.workspace()?;
                 let user = self.user_git;
@@ -1325,6 +1354,7 @@ pub(crate) mod git_fetch;
 pub(crate) mod git_push;
 mod git_stage;
 mod git_switch;
+mod git_tag;
 pub mod packages;
 mod patch;
 mod proposals;

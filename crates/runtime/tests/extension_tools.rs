@@ -1218,6 +1218,33 @@ async fn git_tools_run_once_the_conversation_is_granted_git() {
         assert_ne!(on.as_bstr(), format!("refs/heads/{branch}").as_str());
     }
 
+    // And tags HEAD with an annotated tag, which git_tags then lists.
+    rig.tool = tool_name(GIT, "git_tag_create");
+    rig.permit(ToolPermission::Allow).await;
+    let tag = nonce();
+    let create = Call::new(&rig.tool, json!({ "name": tag, "message": nonce() }));
+    let (thread, _) = rig.round_trip(&[create]).await;
+    let record = calls_of(&thread).last().unwrap().clone();
+    assert_eq!(record.state, ToolCallState::Succeeded, "{:?}", record.error);
+    let head = {
+        let repo = gix::open(rig.workspace.path()).unwrap();
+        let mut made = repo
+            .find_reference(format!("refs/tags/{tag}").as_str())
+            .unwrap();
+        let head = repo.head_id().unwrap().detach();
+        assert_eq!(made.peel_to_id().unwrap().detach(), head);
+        head.to_string()
+    };
+    rig.tool = tool_name(GIT, "git_tags");
+    rig.permit(ToolPermission::Allow).await;
+    let (_, results) = rig.round_trip(&[Call::new(&rig.tool, json!({}))]).await;
+    let text = results.into_iter().next().flatten();
+    assert!(
+        text.as_deref()
+            .is_some_and(|text| text.contains(&format!("{tag} {} annotated", &head[..12]))),
+        "{text:?}"
+    );
+
     // Switching to it also edits project files, so it needs that grant too.
     rig.grant_thread(&[
         Capability::ReadWorkspace,

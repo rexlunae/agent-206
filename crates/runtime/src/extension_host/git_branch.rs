@@ -107,7 +107,7 @@ pub(super) fn create(
                 )
             })?
             .detach(),
-        Some(start) => start_commit(&repo, start)?,
+        Some(start) => start_commit(&repo, start, "start")?,
     };
     if repo
         .try_find_reference(&full)
@@ -119,7 +119,7 @@ pub(super) fn create(
             "the branch already exists",
         ));
     }
-    if nests(&repo, name)? {
+    if nests(&repo, "refs/heads/", name)? {
         return Err(failure(
             HostErrorCode::Conflict,
             "a branch named like a folder of this one, or inside it, exists",
@@ -169,11 +169,12 @@ pub(super) fn create(
     }))
 }
 
-/// Whether a branch is a parent folder of `name`, or `name` is a folder of
-/// branches: git stores both as paths, so they cannot exist together.
-fn nests(repo: &gix::Repository, name: &str) -> Result<bool, HostFailure> {
+/// Whether a reference under `prefix` (`refs/heads/` or `refs/tags/`) is a
+/// parent folder of `name`, or `name` is a folder of them: git stores both
+/// as paths, so they cannot exist together.
+pub(super) fn nests(repo: &gix::Repository, prefix: &str, name: &str) -> Result<bool, HostFailure> {
     for (end, _) in name.match_indices('/') {
-        let parent = format!("refs/heads/{}", &name[..end]);
+        let parent = format!("{prefix}{}", &name[..end]);
         if repo
             .try_find_reference(parent.as_str())
             .map_err(|e| git_failure("branches", &e))?
@@ -183,7 +184,7 @@ fn nests(repo: &gix::Repository, name: &str) -> Result<bool, HostFailure> {
         }
     }
     let references = repo.references().map_err(|e| git_failure("branches", &e))?;
-    let below = format!("refs/heads/{name}/");
+    let below = format!("{prefix}{name}/");
     let mut inside = references
         .prefixed(below.as_str())
         .map_err(|e| git_failure("branches", &e))?;
@@ -204,11 +205,16 @@ pub(super) fn branch_name(name: &str) -> Option<FullName> {
 
 /// A local branch's commit, or a commit named by its full id. Revision
 /// expressions are not evaluated.
-fn start_commit(repo: &gix::Repository, start: &str) -> Result<ObjectId, HostFailure> {
+/// `what` names the argument in the failure.
+pub(super) fn start_commit(
+    repo: &gix::Repository,
+    start: &str,
+    what: &str,
+) -> Result<ObjectId, HostFailure> {
     let not_found = || {
         failure(
             HostErrorCode::NotFound,
-            "the start is neither a local branch nor a full commit id",
+            &format!("the {what} is neither a local branch nor a full commit id"),
         )
     };
     if let Some(branch) = branch_name(start)
