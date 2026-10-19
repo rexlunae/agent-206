@@ -3498,6 +3498,9 @@ async fn matrix_answers_what_arrived_while_it_was_stopped() {
     assert_eq!(*server.joined.lock().unwrap(), [invited]);
     let queries = server.sync_queries.lock().unwrap().clone();
     assert!(!queries[0].contains_key("since"));
+    // The invitation pass asks for no history.
+    let filter: Value = serde_json::from_str(&queries[0]["filter"]).unwrap();
+    assert_eq!(filter["room"]["timeline"]["limit"], 0);
     assert_eq!(queries[1].get("since"), Some(&since));
     let texts: Vec<_> = host
         .turns
