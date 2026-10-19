@@ -10,6 +10,9 @@ use axum::{
 };
 use futures_util::StreamExt;
 use serde_json::{Value, json};
+/// The largest request a backend may send: its prompt's images (at most
+/// [`super::IMAGE_BUDGET`] in base64) with the transcript and its own tools.
+const PROXY_BODY_LIMIT: usize = 16 * 1024 * 1024;
 /// A proxy failure, recorded where it happens; the backend sees only a status.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ProxyError {
@@ -75,7 +78,7 @@ impl Proxy {
         };
         let router = Router::new()
             .route("/{*path}", any(forward))
-            .layer(axum::extract::DefaultBodyLimit::max(4 * 1024 * 1024))
+            .layer(axum::extract::DefaultBodyLimit::max(PROXY_BODY_LIMIT))
             .with_state(scope);
         let task = tokio::spawn(async move {
             // A failed proxy surfaces to the backend as refused requests; record why.
@@ -276,7 +279,8 @@ mod tests {
                 }),
             )
             .route("/v1/responses", completion.clone())
-            .route("/v1/chat/completions", completion);
+            .route("/v1/chat/completions", completion)
+            .layer(axum::extract::DefaultBodyLimit::disable());
         let task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
         let config = ProviderConfig {
             id: Id::new_v4(),
@@ -411,6 +415,26 @@ mod tests {
                 StatusCode::BAD_REQUEST
             );
         }
+        // A prompt carrying a full image budget reaches the provider; a
+        // request past the proxy's limit does not.
+        let images = "A".repeat(super::super::IMAGE_BUDGET);
+        let response = client
+            .post(format!("{base}/responses"))
+            .bearer_auth(proxy.token())
+            .json(&json!({"model": model, "input": [{"type": "input_image", "image_url": format!("data:image/png;base64,{images}")}]}))
+            .send()
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+        let oversized = "A".repeat(PROXY_BODY_LIMIT);
+        let response = client
+            .post(format!("{base}/responses"))
+            .bearer_auth(proxy.token())
+            .json(&json!({"model": model, "input": oversized}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
         drop(proxy);
         tokio::task::yield_now().await;
         if let Ok(response) = client.get(format!("{base}/models")).send().await {

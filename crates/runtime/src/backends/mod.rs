@@ -135,6 +135,10 @@ impl crate::error::Classified for BackendError {
         })
     }
 }
+/// The most base64 image bytes one backend prompt carries. The backend sends
+/// them with every model request of its turn, through the credential proxy,
+/// whose request limit leaves room for the transcript beside them.
+const IMAGE_BUDGET: usize = 8 * 1024 * 1024;
 type Result<T, E = BackendError> = std::result::Result<T, E>;
 pub enum Progress {
     /// The whole reply text so far (external backends).
@@ -192,6 +196,9 @@ pub struct Run<'a> {
     pub thread: &'a Thread,
     pub prompt: &'a str,
     pub info: &'a ModelInfo,
+    /// The bytes of the images the thread's history holds, from
+    /// [`crate::provider::ImageData::load`].
+    pub images: &'a crate::provider::ImageData,
     pub backend: &'a BackendConfig,
     pub workspace: Option<&'a Path>,
     pub state_root: &'a Path,
@@ -206,6 +213,7 @@ pub async fn complete(run: Run<'_>) -> Result<(String, Usage)> {
         thread,
         prompt,
         info,
+        images,
         backend,
         workspace,
         state_root,
@@ -219,6 +227,16 @@ pub async fn complete(run: Run<'_>) -> Result<(String, Usage)> {
         BackendError::ModelMismatch,
     )?;
     let mut input = transcript(thread)?;
+    // Only the message being answered sends its images; earlier ones are
+    // named in the transcript.
+    let (images, notes) = thread
+        .messages
+        .iter()
+        .rev()
+        .find(|message| message.role == Role::User)
+        .map(|message| images.for_backend(message, IMAGE_BUDGET))
+        .unwrap_or_default();
+    input.push_str(&notes);
     let proxy = proxy::Proxy::start(config.clone(), info.clone(), dispatched)
         .await
         .map_err(BackendError::Proxy)?;
@@ -247,10 +265,10 @@ pub async fn complete(run: Run<'_>) -> Result<(String, Usage)> {
         let operation = async {
             match thread.backend {
                 CodingBackend::Codex => {
-                    codex::run(&mut process, thread, prompt, &input, progress).await
+                    codex::run(&mut process, thread, prompt, &input, &images, progress).await
                 }
                 CodingBackend::ClaudeAgent => {
-                    claude::run(&mut process, thread, prompt, &input, progress).await
+                    claude::run(&mut process, thread, prompt, &input, &images, progress).await
                 }
                 CodingBackend::Native => Err(BackendError::Native),
             }

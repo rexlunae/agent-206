@@ -1058,8 +1058,7 @@ request journal: a retried request stores the bytes again rather than receiving
 a reply for an image that may since have been removed.
 
 `Send` checks every image is still stored exactly as staged, and refuses images
-for a coding backend or for a model whose models API reports that it does not
-accept them (Anthropic's `capabilities.image_input`, or `input_modalities` in
+for a model whose models API reports that it does not accept them (Anthropic's `capabilities.image_input`, or `input_modalities` in
 OpenAI-compatible catalogs such as OpenRouter). Gemini's models API does not
 report it; unreported support is left to the provider, whose refusal reaches the
 client as a provider error. Each round reads the images again, so one changed or
@@ -1073,7 +1072,17 @@ request fits whether or not its credential is brokered); an older image left
 out is named in its message's text as not resent. An image attached to several
 messages is sent with each of them or with none, and counted once per message. After the conversation's
 model changes to one whose API reports no image input, earlier images are named
-as not sent. Compaction summaries and coding backends see image names only.
+as not sent. Compaction summaries see image names only.
+
+Coding backends receive the images of the message they answer, in order, after
+the transcript, while their base64 bytes stay within 8 MiB; an image that would
+pass that is named in the prompt as not sent, and images of earlier messages are
+named in the transcript. Codex gets each as an `image` input item with a data
+URL. Claude Agent gets ACP `image` content blocks only when the adapter's
+`initialize` reply advertises `promptCapabilities.image`; otherwise each image
+is named as not sent. The backend sends them with each model request of its
+turn through its credential proxy, which accepts requests of up to 16 MiB.
+Whether the backend itself forwards an image to the model is up to it.
 
 ## Retrying model requests
 

@@ -235,6 +235,13 @@ pub struct Ask<'a> {
 /// API reports that it does not accept images learns one was attached.
 #[derive(Debug, Default)]
 pub struct ImageData(BTreeMap<String, Vec<u8>>, Absent);
+/// An image a coding backend sends with its prompt.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Encoded {
+    pub name: String,
+    pub mime: &'static str,
+    pub base64: String,
+}
 /// Why an image's bytes are not sent.
 #[derive(Debug, Default, Clone, Copy)]
 enum Absent {
@@ -309,6 +316,44 @@ impl ImageData {
             kept.insert(image.digest.clone(), bytes.clone());
         }
         Self(kept, Absent::Size)
+    }
+    /// The images of `message` a coding backend sends with its prompt, in
+    /// order, while their base64 bytes stay within `budget`, and a line
+    /// naming each image left out and why.
+    pub(crate) fn for_backend(&self, message: &Message, budget: usize) -> (Vec<Encoded>, String) {
+        let mut sent = vec![];
+        let mut notes = String::new();
+        let mut size = 0usize;
+        for image in &message.images {
+            let Some(bytes) = self.0.get(&image.digest) else {
+                notes.push_str(&match self.1 {
+                    Absent::Refused => format!(
+                        "\n[Image {:?} was attached but is not sent: the current model's API reports that it does not accept images.]",
+                        image.name
+                    ),
+                    Absent::Size => format!("\n[Image {:?} was attached but is not sent.]", image.name),
+                });
+                continue;
+            };
+            let each = bytes.len().div_ceil(3) * 4;
+            if size.saturating_add(each) > budget {
+                notes.push_str(&format!(
+                    "\n[Image {:?} was attached but is not sent: with the earlier images, the request would be too large.]",
+                    image.name
+                ));
+                continue;
+            }
+            size += each;
+            sent.push(Encoded {
+                name: image.name.clone(),
+                mime: image.media_type.mime(),
+                base64: {
+                    use base64::Engine;
+                    base64::engine::general_purpose::STANDARD.encode(bytes)
+                },
+            });
+        }
+        (sent, notes)
     }
     fn base64(&self, image: &ImageAttachment) -> Option<String> {
         use base64::Engine;
@@ -1671,4 +1716,64 @@ pub(crate) fn message_content(message: &Message) -> String {
         content.push_str(&format!("\n\n[Attached image {:?}]", image.name));
     }
     content
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn attached(size: usize) -> (ImageAttachment, Vec<u8>) {
+        let bytes: Vec<u8> = Id::new_v4()
+            .as_bytes()
+            .iter()
+            .copied()
+            .cycle()
+            .take(size)
+            .collect();
+        let image = ImageAttachment {
+            name: Id::new_v4().to_string(),
+            media_type: ImageType::Png,
+            digest: format!("{:064x}", Id::new_v4().as_u128()),
+            size: size as u64,
+        };
+        (image, bytes)
+    }
+    #[test]
+    fn a_backend_sends_a_messages_images_in_order_within_its_budget() {
+        let sizes = [3 * 64, 3 * 512, 3 * 32];
+        let images: Vec<_> = sizes.iter().map(|&size| attached(size)).collect();
+        let mut message = Message::new(Role::User, String::new(), 0, CodingBackend::Codex);
+        message.images = images.iter().map(|(image, _)| image.clone()).collect();
+        let data = ImageData(
+            images
+                .iter()
+                .map(|(image, bytes)| (image.digest.clone(), bytes.clone()))
+                .collect(),
+            Absent::Size,
+        );
+        // The second image would pass the budget; the smaller third still fits.
+        let budget = 4 * 64 + 4 * 32;
+        let (sent, notes) = data.for_backend(&message, budget);
+        use base64::Engine;
+        assert_eq!(
+            sent,
+            [&images[0], &images[2]]
+                .into_iter()
+                .map(|(image, bytes)| Encoded {
+                    name: image.name.clone(),
+                    mime: "image/png",
+                    base64: base64::engine::general_purpose::STANDARD.encode(bytes),
+                })
+                .collect::<Vec<_>>()
+        );
+        assert!(notes.contains(&format!("{:?}", images[1].0.name)));
+        assert!(notes.contains("too large"));
+        assert!(!notes.contains(&images[0].0.name));
+        // A model whose API refuses images gets every image named instead.
+        let (sent, notes) =
+            ImageData(BTreeMap::new(), Absent::Refused).for_backend(&message, budget);
+        assert!(sent.is_empty());
+        for (image, _) in &images {
+            assert!(notes.contains(&format!("{:?}", image.name)));
+        }
+        assert!(notes.contains("does not accept images"));
+    }
 }

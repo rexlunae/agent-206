@@ -1,4 +1,5 @@
 use super::{BackendError, Progress, Result, check, isolation::Process, rpc::Rpc};
+use crate::provider::Encoded;
 use a206_core::*;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -176,6 +177,7 @@ pub async fn run(
     thread: &Thread,
     prompt: &str,
     input: &str,
+    images: &[Encoded],
     progress: mpsc::Sender<Progress>,
 ) -> Result<(String, Usage)> {
     let mut rpc = Rpc::new(process)?;
@@ -207,7 +209,7 @@ pub async fn run(
         .to_owned();
     let mut params = json!({"threadId": turn.thread, "model": model, "cwd": process.cwd,
         "approvalPolicy": "never", "sandboxPolicy": {"type": "externalSandbox", "networkAccess": "restricted"},
-        "input": [{"type": "text", "text": input}] });
+        "input": turn_input(input, images) });
     if let Some(effort) = &thread.effort {
         params["effort"] = json!(effort);
     }
@@ -228,4 +230,43 @@ pub async fn run(
     let text = turn.text();
     check(!text.is_empty(), BackendError::Empty { backend: "Codex" })?;
     Ok((text, turn.usage))
+}
+/// The items of a Codex turn: the transcript, then each image as an inline
+/// data URL (the app server refuses remote image URLs).
+fn turn_input(text: &str, images: &[Encoded]) -> Value {
+    let mut items = vec![json!({"type": "text", "text": text})];
+    items.extend(images.iter().map(|image| {
+        json!({"type": "image", "url": format!("data:{};base64,{}", image.mime, image.base64)})
+    }));
+    Value::Array(items)
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn images_follow_the_transcript_as_data_urls() {
+        let text = uuid::Uuid::new_v4().to_string();
+        let images: Vec<_> = ["image/png", "image/webp"]
+            .into_iter()
+            .map(|mime| Encoded {
+                name: uuid::Uuid::new_v4().to_string(),
+                mime,
+                base64: uuid::Uuid::new_v4().simple().to_string(),
+            })
+            .collect();
+        let input = turn_input(&text, &images);
+        assert_eq!(input[0], json!({"type": "text", "text": text}));
+        for (item, image) in input.as_array().unwrap()[1..].iter().zip(&images) {
+            assert_eq!(item["type"], "image");
+            assert_eq!(
+                item["url"],
+                format!("data:{};base64,{}", image.mime, image.base64)
+            );
+        }
+        assert_eq!(input.as_array().unwrap().len(), 3);
+        assert_eq!(
+            turn_input(&text, &[]),
+            json!([{"type": "text", "text": text}])
+        );
+    }
 }

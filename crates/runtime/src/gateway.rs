@@ -1365,12 +1365,6 @@ impl Gateway {
                     )?;
                     let (config, info) = native_model(&store.state, current)?;
                     if !images.is_empty() {
-                        check(
-                            current.backend == CodingBackend::Native,
-                            GatewayError::Invalid(
-                                "images are sent only to model providers, not coding backends",
-                            ),
-                        )?;
                         // An unreported capability is left to the provider,
                         // whose refusal reaches the client.
                         check(
@@ -1485,12 +1479,25 @@ impl Gateway {
                 let (sender, mut progress) = tokio::sync::mpsc::channel(32);
                 let dispatched = Arc::<std::sync::atomic::AtomicUsize>::default();
                 let operation = async {
+                    // As for native rounds, an image changed or removed since
+                    // it was attached is reported rather than sent.
+                    let images = if thread.messages.iter().any(|m| !m.images.is_empty()) {
+                        let (images, thread, info) =
+                            (self.images.clone(), thread.clone(), info.clone());
+                        tokio::task::spawn_blocking(move || {
+                            crate::provider::ImageData::load(&images, &thread, &info)
+                        })
+                        .await??
+                    } else {
+                        crate::provider::ImageData::default()
+                    };
                     Ok::<_, GatewayError>(
                         crate::backends::complete(crate::backends::Run {
                             config: &config,
                             thread: &thread,
                             prompt: &prompt,
                             info: &info,
+                            images: &images,
                             backend: &backend,
                             workspace: workspace.as_deref(),
                             state_root: &root,
