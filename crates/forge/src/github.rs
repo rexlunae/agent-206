@@ -1,8 +1,8 @@
 //! GitHub's REST API (github.com, or GitHub Enterprise Server's `/api/v3`).
 use super::{
-    Change, Check, CheckStatus, Conclusion, DETAIL_PAGE, ForgeError, Listed, MAX_BODY, MergeMethod,
-    Merged, NewPullRequest, PAGE, PullRequest, Repository, Review, ReviewState, State, answer,
-    bounded, label, label_opt,
+    Change, Check, CheckStatus, Conclusion, DETAIL_PAGE, ForgeError, LineComment, Listed, MAX_BODY,
+    MergeMethod, Merged, NewPullRequest, PAGE, PullRequest, Repository, Review, ReviewState, Side,
+    State, answer, bounded, label, label_opt,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -99,6 +99,28 @@ pub(super) fn comment(repository: &Repository, number: u64, text: &str) -> Chang
     Change::post(
         repo(repository, &["issues", &number.to_string(), "comments"]),
         json!({"body": text}),
+    )
+}
+
+pub(super) fn line_comment(
+    repository: &Repository,
+    number: u64,
+    head: &str,
+    comment: &LineComment<'_>,
+) -> Change {
+    let side = match comment.side {
+        Side::New => "RIGHT",
+        Side::Old => "LEFT",
+    };
+    Change::post(
+        repo(repository, &["pulls", &number.to_string(), "comments"]),
+        json!({
+            "body": comment.text,
+            "commit_id": head,
+            "path": comment.path,
+            "line": comment.line,
+            "side": side,
+        }),
     )
 }
 

@@ -6,9 +6,9 @@
 //! A Gitea caps each page at its own configured limit, which may be fewer
 //! than asked, so only an empty page shows that nothing more is left.
 use super::{
-    Change, Check, CheckStatus, Conclusion, DETAIL_PAGE, ForgeError, Listed, MAX_BODY, MergeMethod,
-    NewPullRequest, PAGE, PullRequest, Repository, Review, ReviewState, State, answer, bounded,
-    github::repo, label, label_opt, unmarked,
+    Change, Check, CheckStatus, Conclusion, DETAIL_PAGE, ForgeError, LineComment, Listed, MAX_BODY,
+    MergeMethod, NewPullRequest, PAGE, PullRequest, Repository, Review, ReviewState, Side, State,
+    answer, bounded, github::repo, label, label_opt, unmarked,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -134,6 +134,33 @@ pub(super) fn merge(
     Change::post(
         repo(repository, &["pulls", &number.to_string(), "merge"]),
         json!({"Do": method, "head_commit_id": head}),
+    )
+}
+
+/// A review holding only the comment: Gitea has no lone line comment.
+pub(super) fn line_comment(
+    repository: &Repository,
+    number: u64,
+    head: &str,
+    comment: &LineComment<'_>,
+) -> Change {
+    // Gitea names line numbers positions; 0 is the other side.
+    let (new, old) = match comment.side {
+        Side::New => (comment.line, 0),
+        Side::Old => (0, comment.line),
+    };
+    Change::post(
+        repo(repository, &["pulls", &number.to_string(), "reviews"]),
+        json!({
+            "commit_id": head,
+            "event": "COMMENT",
+            "comments": [{
+                "path": comment.path,
+                "body": comment.text,
+                "new_position": new,
+                "old_position": old,
+            }],
+        }),
     )
 }
 
