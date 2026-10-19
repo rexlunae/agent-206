@@ -97,7 +97,8 @@ mod native {
             start: bool,
         },
         /// Walk through first-run setup: the gateway, then this computer's
-        /// vault, two-factor enrollment and gateway pairing. Rerun to resume.
+        /// vault, two-factor enrollment, gateway pairing and a first model
+        /// provider account. Rerun to resume.
         #[cfg(unix)]
         Setup {
             /// Use a gateway on this computer.
@@ -693,6 +694,7 @@ mod native {
                         setup(&root, local, ssh, &trust).await?;
                     }
                     crate::setup_cli::secure(&root, skip_totp).await?;
+                    crate::setup_cli::provider(&root).await?;
                     // Setup succeeded; the report shows what is still open
                     // (such as provider accounts) without failing setup.
                     println!();

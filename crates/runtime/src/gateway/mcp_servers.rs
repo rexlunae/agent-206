@@ -170,15 +170,20 @@ impl Gateway {
     }
 
     /// After settings are saved, stop sessions whose entry changed, was removed
-    /// or was disabled. Their next start uses the new entry.
+    /// or was disabled, and those given program directories when that list
+    /// changed. Their next start uses the new settings.
     pub(super) fn stop_changed_mcp(
         &self,
         previous: &[McpServerConfig],
         servers: &[McpServerConfig],
+        programs_changed: bool,
     ) -> Result<()> {
         let withdrawn: Vec<&McpServerConfig> = previous
             .iter()
-            .filter(|old| !servers.iter().any(|s| s == *old && s.enabled))
+            .filter(|old| {
+                !servers.iter().any(|s| s == *old && s.enabled)
+                    || (programs_changed && old.program_directories)
+            })
             .collect();
         if !withdrawn.is_empty() {
             // Running calls and approval waits re-check that their tool is
@@ -358,7 +363,15 @@ impl McpClient {
         let config = self.config(name)?;
         check(config.enabled, McpError::Disabled)?;
         let project_root = config.project.map(|id| self.project_root(id)).transpose()?;
-        let state_root = self.lock()?.root.clone();
+        let (state_root, programs) = {
+            let store = self.lock()?;
+            let programs = if config.program_directories {
+                store.state.settings.program_directories.clone()
+            } else {
+                vec![]
+            };
+            (store.root.clone(), programs)
+        };
         self.servers.remove(name)?;
         self.set_status(name, |status| {
             *status = McpServerStatus {
@@ -367,17 +380,32 @@ impl McpClient {
                 ..Default::default()
             }
         })?;
-        let session = match a206_mcp::spawn(
-            &config,
-            project_root.as_deref(),
-            &state_root,
-            a206_mcp::Limits::default(),
-        )
-        .await
-        {
+        let started = async {
+            // Checked again: the directories may have changed since they were saved.
+            let mut hidden = a206_sandbox::hidden_home_paths();
+            hidden.push(state_root.clone());
+            let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+            let programs = crate::exec_tool::programs::validate(
+                &programs,
+                &[],
+                &hidden,
+                home.as_deref(),
+                &state_root,
+            )?;
+            Ok::<_, GatewayError>(
+                a206_mcp::spawn(
+                    &config,
+                    project_root.as_deref(),
+                    &state_root,
+                    &programs,
+                    a206_mcp::Limits::default(),
+                )
+                .await?,
+            )
+        };
+        let session = match started.await {
             Ok(session) => session,
             Err(error) => {
-                let error = GatewayError::from(error);
                 let report = crate::error::report(&error);
                 self.set_status(name, |status| {
                     status.state = McpServerState::Failed;
@@ -747,6 +775,7 @@ mod tests {
             default_policy: ToolPolicy::Ask,
             tools: Default::default(),
             timeout_seconds: None,
+            program_directories: false,
         }
     }
     async fn send(g: &Gateway, body: Command) -> Reply {
@@ -826,6 +855,68 @@ mod tests {
         let g = Gateway::open(state.path()).unwrap();
         let status = g.snapshot().unwrap().mcp_servers.remove(0);
         assert_eq!(status.state, McpServerState::Disconnected);
+    }
+
+    /// Like the test above, this fails before any sandbox starts.
+    #[tokio::test]
+    async fn program_directories_are_checked_again_when_a_server_starts() {
+        let state = tempfile::tempdir().unwrap();
+        let install = tempfile::tempdir().unwrap();
+        let tools = tempfile::tempdir().unwrap();
+        let g = Gateway::open(state.path()).unwrap();
+        let mut settings = g.snapshot().unwrap().settings;
+        settings.program_directories = vec![tools.path().to_owned()];
+        let mut server = entry(install.path());
+        (server.enabled, server.program_directories) = (true, true);
+        settings.mcp_servers = vec![server];
+        let saved = send(&g, Command::SaveSettings(Box::new(settings))).await;
+        assert_eq!(saved, Reply::Ok);
+        drop(tools);
+        let connect = Command::ConnectMcpServer {
+            name: "tools".into(),
+        };
+        let Reply::Error(report) = send(&g, connect).await else {
+            panic!("a server given a missing directory must not start")
+        };
+        let status = g.snapshot().unwrap().mcp_servers.remove(0);
+        assert_eq!(status.state, McpServerState::Failed);
+        let failure = status.failure.unwrap();
+        assert_eq!(
+            (failure.kind, &failure.message),
+            (report.kind, &report.message)
+        );
+        assert!(failure.message.contains("program directory"), "{failure:?}");
+    }
+
+    #[tokio::test]
+    async fn changing_program_directories_stops_only_servers_given_them() {
+        let state = tempfile::tempdir().unwrap();
+        let install = tempfile::tempdir().unwrap();
+        let tools = tempfile::tempdir().unwrap();
+        let g = Gateway::open(state.path()).unwrap();
+        let mut given = entry(install.path());
+        (given.enabled, given.program_directories) = (true, true);
+        let mut other = entry(install.path());
+        (other.name, other.enabled) = ("other".into(), true);
+        assert_eq!(save(&g, vec![given, other]).await, Reply::Ok);
+        let mut closes = vec![];
+        for name in ["tools", "other"] {
+            let (session, _, close) = fake_session().await;
+            g.attach_mcp_session(name, session).unwrap();
+            closes.push(close);
+        }
+        let live = |name| g.mcp_client().session(name).unwrap().is_some();
+        // A save that leaves the directories as they were stops nothing.
+        let settings = g.snapshot().unwrap().settings;
+        let resaved = send(&g, Command::SaveSettings(Box::new(settings.clone()))).await;
+        assert_eq!(resaved, Reply::Ok);
+        assert!(live("tools") && live("other"));
+        let mut settings = g.snapshot().unwrap().settings;
+        settings.program_directories = vec![tools.path().to_owned()];
+        let saved = send(&g, Command::SaveSettings(Box::new(settings))).await;
+        assert_eq!(saved, Reply::Ok);
+        assert!(!live("tools"), "its mounts no longer match the settings");
+        assert!(live("other"));
     }
 
     #[tokio::test]

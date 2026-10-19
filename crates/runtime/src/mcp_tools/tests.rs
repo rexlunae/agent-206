@@ -195,6 +195,7 @@ async fn rig(policy: ToolPolicy) -> Rig {
         default_policy: policy,
         tools: Default::default(),
         timeout_seconds: None,
+        program_directories: false,
     };
     // Only a project conversation can be granted `execute`.
     let Reply::Project(project) = request(

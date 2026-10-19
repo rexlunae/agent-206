@@ -49,7 +49,9 @@ pub use elf::interpreter;
 pub use gateway::Control;
 pub use gateway::StartError;
 #[cfg(unix)]
-pub use profile::{HIDDEN_HOME_PATHS, NetworkAccess, Profile, hidden_home_paths};
+pub use profile::{
+    HIDDEN_HOME_PATHS, NetworkAccess, Profile, hidden_home_paths, program_search_path,
+};
 
 /// First argument that turns a process into the in-sandbox helper.
 pub const HELPER_COMMAND: &str = "__a206-sandbox-helper";
