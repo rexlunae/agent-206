@@ -40,13 +40,17 @@ impl Drop for Launch {
 /// Start `server` in its sandbox and initialize an MCP session with it.
 /// `project_root` is the bound project's directory, for workspace access;
 /// `state_root` is private application state the server must never see.
+/// `programs` are canonical directories mounted read-only and executable,
+/// with their programs on `PATH`; the caller checks them first and passes
+/// them only to an entry with `program_directories` set.
 pub async fn spawn(
     server: &McpServerConfig,
     project_root: Option<&Path>,
     state_root: &Path,
+    programs: &[PathBuf],
     limits: Limits,
 ) -> Result<Session, McpError> {
-    let (launch, stdout, stdin) = launch(server, project_root, state_root).await?;
+    let (launch, stdout, stdin) = launch(server, project_root, state_root, programs).await?;
     Session::start(
         (LineLimited::new(stdout, limits.max_line_bytes), stdin),
         Some(launch),
@@ -133,6 +137,7 @@ async fn launch(
     server: &McpServerConfig,
     project_root: Option<&Path>,
     state_root: &Path,
+    programs: &[PathBuf],
 ) -> Result<Pipes, McpError> {
     let placement = place(server, project_root, state_root)?;
     let scratch = tempfile::Builder::new()
@@ -158,7 +163,7 @@ async fn launch(
     if placement.workspace.is_none() {
         std::fs::create_dir(&cwd).map_err(McpError::Setup)?;
     }
-    let mut command = sandbox_command(server, &placement, &scratch_root, &cwd)?;
+    let mut command = sandbox_command(server, &placement, &scratch_root, &cwd, programs)?;
     #[cfg(target_os = "linux")]
     let control = a206_sandbox::Control::bind(&scratch_root.join("control"), None)
         .map_err(McpError::SandboxStart)?;
@@ -170,6 +175,12 @@ async fn launch(
         ))?
         .to_str()
         .ok_or(McpError::NonUtf8Path)?;
+    let mut path = std::ffi::OsString::from(bin);
+    for directory in a206_sandbox::program_search_path(programs) {
+        path.push(":");
+        path.push(directory);
+    }
+    path.push(":/usr/bin:/bin");
     command
         .args(&server.args)
         .env_clear()
@@ -179,7 +190,7 @@ async fn launch(
         .envs(&server.env)
         .env("HOME", &home)
         .env("TMPDIR", &tmp)
-        .env("PATH", format!("{bin}:/usr/bin:/bin"))
+        .env("PATH", path)
         .env("LANG", "en_US.UTF-8")
         .env("NO_COLOR", "1")
         .stdin(Stdio::piped())
@@ -232,6 +243,7 @@ fn sandbox_command(
     placement: &Placement,
     scratch: &Path,
     cwd: &Path,
+    programs: &[PathBuf],
 ) -> Result<Command, McpError> {
     let helper = std::env::current_exe()
         .and_then(std::fs::canonicalize)
@@ -251,7 +263,7 @@ fn sandbox_command(
             .as_deref()
             .map(|workspace| (workspace, holds(Capability::WriteWorkspace))),
         execute: holds(Capability::Execute),
-        programs: &[],
+        programs,
         hidden: &hidden,
         cwd,
         network: if holds(Capability::Network) {
@@ -271,6 +283,7 @@ fn sandbox_command(
     _placement: &Placement,
     _scratch: &Path,
     _cwd: &Path,
+    _programs: &[PathBuf],
 ) -> Result<Command, McpError> {
     Err(McpError::Unsupported)
 }

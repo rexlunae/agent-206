@@ -964,9 +964,8 @@ impl ExecHost {
 #[cfg(any(target_os = "linux", target_os = "macos", test))]
 fn search_path(programs: &[PathBuf]) -> std::ffi::OsString {
     let mut path = std::ffi::OsString::new();
-    for program in programs {
-        let bin = program.join("bin");
-        path.push(if bin.is_dir() { &bin } else { program });
+    for directory in a206_sandbox::program_search_path(programs) {
+        path.push(directory);
         path.push(":");
     }
     path.push("/usr/bin:/bin");

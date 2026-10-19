@@ -65,6 +65,7 @@ mod tests {
             default_policy: ToolPolicy::Ask,
             tools: Default::default(),
             timeout_seconds: None,
+            program_directories: false,
         }
     }
     fn thread(capabilities: &[Capability]) -> Thread {

@@ -32,6 +32,18 @@ pub fn hidden_home_paths() -> Vec<PathBuf> {
         .unwrap_or_default()
 }
 
+/// The directories to put on `PATH` for `programs` (see [`Profile::programs`]),
+/// in order: each one's `bin` where it has one, otherwise the directory itself.
+pub fn program_search_path(programs: &[PathBuf]) -> Vec<PathBuf> {
+    programs
+        .iter()
+        .map(|program| {
+            let bin = program.join("bin");
+            if bin.is_dir() { bin } else { program.clone() }
+        })
+        .collect()
+}
+
 /// System directories mounted read-only; symbolic links (merged `/usr`) are
 /// recreated as links instead.
 const SYSTEM_MOUNTS: &[&str] = &[
