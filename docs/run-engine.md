@@ -733,7 +733,7 @@ permission for the tool.
   is a conflict error, and nothing merged. The result says `merged` (false
   when GitLab accepted a merge it has not made yet) and the commit made
   where the forge says (Gitea and Forgejo do not). GitHub and GitLab merge
-  with PUT, which needs broker v7.
+  with PUT, which needs broker v7; Gitea and Forgejo merge with POST.
 
 Titles, branches and comments are sent as given or refused: blank text,
 text over its limit (249 characters for titles, so a GitLab draft title

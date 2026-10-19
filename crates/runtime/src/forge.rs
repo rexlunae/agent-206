@@ -328,12 +328,13 @@ impl ForgeHost {
             .ok_or(ForgeToolError::NoForge { origin })?;
         let repository = Repository::new(&api, &url)?;
         let (broker_root, pairing) = self.pushes.broker().map_err(RemoteError::Gateway)?;
-        // GitHub and GitLab merge with PUT.
-        let needed = match question {
-            Question::Merge { .. } => a206_broker::PUT_VERSION,
-            _ => a206_broker::MIN_BROKER_VERSION,
-        };
-        let broker = Broker::connect(&broker_root, pairing.as_ref(), needed).await?;
+        // A PUT (GitHub and GitLab merges) checks the version itself.
+        let broker = Broker::connect(
+            &broker_root,
+            pairing.as_ref(),
+            a206_broker::MIN_BROKER_VERSION,
+        )
+        .await?;
         let mut forge = Forge {
             broker,
             credential: credential.credential,
