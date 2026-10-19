@@ -35,7 +35,8 @@ struct Branch {
     sha: Option<String>,
 }
 
-fn repo<'a>(repository: &'a Repository, rest: &[&'a str]) -> Url {
+/// `rest` under the repository, as GitHub and Gitea both lay it out.
+pub(super) fn repo<'a>(repository: &'a Repository, rest: &[&'a str]) -> Url {
     let segments = ["repos"]
         .into_iter()
         .chain(repository.path.iter().map(String::as_str))

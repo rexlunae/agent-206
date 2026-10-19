@@ -687,10 +687,16 @@ conversation they run without a per-call approval.
   repository. GitHub lists merged and unmerged closed pull requests
   together, so for `closed` and `merged` it reads up to 4 pages to find 30.
   `complete` is false when more may exist.
+  Gitea and Forgejo also list closed ones together and cannot be asked for
+  one branch, so their lists are filtered here (a fork's branch of the same
+  name is left out) and read up to 4 pages.
+  Their pages may hold fewer than asked (each instance caps them), so only
+  an empty page shows that a list is complete.
 - `pull_request` reads one by `number`: its details and description (cut
   at 8,000 characters), the checks on its head commit and its reviews, at
-  most 100 of each kind. `checks_complete` and `reviews_complete` are false
-  when a list was full or was cut.
+  most 100 of each kind (on Gitea and Forgejo, from up to 4 pages).
+  `checks_complete` and `reviews_complete` are false when a list was full,
+  ran past those pages or was cut.
 
 Both results are only useful whole JSON (`whole_output`), so instead of the
 gateway cutting the text, the tool leaves out the last pull requests, checks
@@ -705,10 +711,14 @@ conversation's permission for the tool.
   `body`, `draft`) proposing `branch` (default: the current branch, which
   must already be on the forge; see `git_push`). GitLab drafts are marked
   by a `Draft:` title prefix: draft markers GitLab reads at the start of a
-title (`Draft:`, `[Draft]`, `(Draft)`) are removed and `draft` alone
-decides. The result is the new pull request.
+  title (`Draft:`, `[Draft]`, `(Draft)`) are removed and `draft` alone
+  decides. Gitea and Forgejo drafts are marked the same way with their
+  default work-in-progress prefixes (`WIP:`, `[WIP]`); an instance that
+  configures other prefixes reads its own as written. The result is the
+  new pull request.
 - `pull_request_comment` posts `body` on pull request `number` (a GitHub
-  issue comment, a GitLab merge request note) and returns its id and web
+  issue comment, also on Gitea and Forgejo; a GitLab merge request note)
+  and returns its id and web
   address.
 
 Titles, branches and comments are sent as given or refused: blank text,
@@ -718,7 +728,8 @@ descriptions and comments, within the 64 KiB a tool call's arguments may
 take) and control characters (other than
 line breaks and tabs in descriptions and comments) are invalid requests,
 and nothing is sent. A forge's 409 or 422 (a pull request already open for
-the branch, a branch it does not have) is a conflict error; the broker does
+the branch, no changes to propose; GitHub and GitLab also for a branch they
+do not have, which Gitea answers with 404) is a conflict error; the broker does
 not relay the forge's error text. A call whose answer was lost may still
 have been applied, and is not retried.
 
@@ -732,13 +743,15 @@ own word in `reported` where it has no counterpart (`unknown`):
 | --- | --- | --- | --- |
 | GitHub (github.com, GitHub Enterprise Server) | pulls | check runs and commit statuses | reviews |
 | GitLab (v4 API) | merge requests (`iid`) | jobs of the head pipeline (allowed failures are `neutral`) | approvals only |
+| Gitea or Forgejo (v1 API, from Gitea 1.24's specification) | pulls (`draft` only where the version reports it) | commit statuses, which Actions also report (`warning` is `neutral`) | reviews (dismissed ones `dismissed`, requested ones `pending`) |
 
-The forge's API comes from the git credential's `forge` (`kind` GitHub or
-GitLab, and `api`, its base URL such as
+The forge's API comes from the git credential's `forge` (`kind` GitHub,
+GitLab or Gitea, which also accepts Forgejo, and `api`, its base URL such as
 `https://git.example/api/v3`). A GitLab served under a path prefix
 (`https://git.example/gitlab/api/v4`) has the prefix removed from remotes
-on the same host. github.com and gitlab.com have bundled
-presets (`https://api.github.com`, `https://gitlab.com/api/v4`). Without
+on the same host. github.com, gitlab.com, codeberg.org and gitea.com have
+bundled presets (`https://api.github.com`, `https://gitlab.com/api/v4`,
+`https://codeberg.org/api/v1`, `https://gitea.com/api/v1`). Without
 one the call fails before anything is sent. The vault broker sends the git
 credential's vault credential to the API as a bearer token, so that vault
 credential must also be bound to the API's origin (for github.com,
@@ -746,8 +759,7 @@ credential must also be bound to the API's origin (for github.com,
 characters and bounded; what a forge returns was written by other people
 and reaches the model as tool data. A refused token, a missing pull
 request and an answer not shaped like the API's are separate errors. Not
-yet: merging pull requests, review comments on lines, Gitea or Forgejo,
-pages beyond these, and setting `forge` from the GUI (use `settings --apply`).
+yet: merging pull requests, review comments on lines, pages beyond these, and setting `forge` from the GUI (use `settings --apply`).
 
 ## Output rules
 

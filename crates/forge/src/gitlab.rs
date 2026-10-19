@@ -4,7 +4,7 @@
 use super::{
     Change, Check, CheckStatus, Conclusion, DETAIL_PAGE, ForgeError, Listed, MAX_BODY,
     NewPullRequest, PAGE, PullRequest, Repository, Review, ReviewState, State, answer, bounded,
-    label, label_opt,
+    label, label_opt, unmarked,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -83,36 +83,12 @@ pub(super) const DRAFT: &str = "Draft: ";
 /// Prefixes GitLab reads as draft markers, compared ignoring case.
 const MARKERS: [&str; 3] = ["[draft]", "(draft)", "draft:"];
 
-/// `title` without the draft markers it starts with, so only `draft`
-/// decides whether the merge request is one. A title without one is kept
-/// exactly; with one, the spaces around the markers go too.
-fn unmarked(title: &str) -> &str {
-    let mut rest = title;
-    let mut marked = false;
-    loop {
-        let trimmed = rest.trim_start();
-        let marker = MARKERS.iter().find(|marker| {
-            trimmed
-                .get(..marker.len())
-                .is_some_and(|start| start.eq_ignore_ascii_case(marker))
-        });
-        match marker {
-            Some(marker) => {
-                rest = &trimmed[marker.len()..];
-                marked = true;
-            }
-            None if marked => return trimmed,
-            None => return title,
-        }
-    }
-}
-
 pub(super) fn create(
     repository: &Repository,
     new: &NewPullRequest<'_>,
 ) -> Result<Change, ForgeError> {
     // GitLab marks a merge request as a draft by its title.
-    let title = unmarked(new.title);
+    let title = unmarked(new.title, &MARKERS);
     if title.trim().is_empty() {
         return Err(ForgeError::MarkerTitle);
     }
