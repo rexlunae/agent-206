@@ -205,7 +205,7 @@ pub(crate) async fn unlock(client: &mut Client, create: bool) -> Result<()> {
     Ok(())
 }
 
-async fn step_up(client: &mut Client) -> Result<()> {
+pub(crate) async fn step_up(client: &mut Client) -> Result<()> {
     let state = status(client).await?;
     if !state.unlocked {
         bail!("the vault is locked; run `agent206 vault unlock`");
@@ -238,6 +238,43 @@ async fn step_up(client: &mut Client) -> Result<()> {
             }
         }
     }
+}
+
+/// Typed credential metadata from the broker; never values.
+pub(crate) async fn credentials(client: &mut Client) -> Result<Vec<(String, CredentialMeta)>> {
+    let Reply::Credentials { typed, .. } = client.call(Request::Credentials).await? else {
+        bail!("unexpected broker reply");
+    };
+    Ok(typed)
+}
+
+/// Store an API key read from a hidden prompt, which the broker sends only
+/// to `destination`. Agents get it only with approval, as `vault add` does.
+/// The caller steps up first.
+pub(crate) async fn store_api_key(
+    client: &mut Client,
+    name: String,
+    label: String,
+    destination: String,
+) -> Result<()> {
+    let value = WireValue::Single(hidden("API key: ")?);
+    let meta = CredentialMeta {
+        label,
+        kind: CredentialKind::ApiKey,
+        policy: AccessPolicy::WithApproval,
+        description: None,
+        disabled: false,
+        destinations: vec![destination],
+    };
+    client
+        .call(Request::PutCredential {
+            name,
+            meta,
+            value,
+            replace: false,
+        })
+        .await?;
+    Ok(())
 }
 
 pub(crate) async fn pair_if_running(client: &mut Client, root: &Path) -> Result<()> {
@@ -446,11 +483,11 @@ pub fn run(root: &Path, action: VaultAction) -> Result<()> {
                 triggers,
                 destinations,
             } => {
-                let Reply::Credentials { typed, .. } = client.call(Request::Credentials).await?
-                else {
-                    bail!("unexpected broker reply");
-                };
-                if typed.iter().any(|(existing, _)| *existing == name) {
+                if credentials(&mut client)
+                    .await?
+                    .iter()
+                    .any(|(existing, _)| *existing == name)
+                {
                     bail!("{name} already exists; delete it first or use policy/bind");
                 }
                 step_up(&mut client).await?;
