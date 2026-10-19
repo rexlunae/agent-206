@@ -703,3 +703,177 @@ async fn a_model_opens_and_comments_on_pull_requests_only_when_approved() {
     }
     assert_eq!(rig.api.paths().len(), asked);
 }
+
+/// A Gitea (or Forgejo) may send fewer than asked on each page, so the
+/// tools read on until a page is empty, and say when they stopped first.
+#[tokio::test(flavor = "multi_thread")]
+async fn gitea_answers_are_read_page_by_page_until_one_is_empty() {
+    let mut rig = rig().await;
+    rig.forge(Some((ForgeKind::Gitea, "/api/v1"))).await;
+    let repo = format!("/api/v1/repos/{}/{}", rig.owner, rig.name);
+    let per = a206_forge::DETAIL_PAGE;
+    let (head, branch) = (sha(), nonce());
+    let (here, fork) = (
+        1 + i64::from(nonce().as_bytes()[0]),
+        1_000 + i64::from(nonce().as_bytes()[0]),
+    );
+    let pull = |number: u64, from: &str, repo_id: Option<i64>, merged: bool| {
+        json!({
+            "number": number,
+            "title": nonce(),
+            "state": if merged { "closed" } else { "open" },
+            "merged": merged,
+            "draft": true,
+            "user": {"login": nonce()},
+            "head": {"ref": from, "sha": head, "repo_id": repo_id},
+            "base": {"ref": nonce(), "sha": sha(), "repo_id": here},
+            "html_url": nonce(),
+            "body": nonce(),
+        })
+    };
+    rig.api.answer(
+        &format!("{repo}/pulls/4"),
+        StatusCode::OK,
+        pull(4, &branch, Some(here), true),
+    );
+    let statuses = format!("{repo}/commits/{head}/status?limit={per}");
+    rig.api.answer(
+        &statuses,
+        StatusCode::OK,
+        json!({"state": "failure", "statuses": [
+            {"context": "ci/test", "status": "warning"},
+            {"context": "ci/lint", "status": "failure", "target_url": nonce()},
+        ]}),
+    );
+    rig.api.answer(
+        &format!("{statuses}&page=2"),
+        StatusCode::OK,
+        json!({"state": "failure", "statuses": []}),
+    );
+    let reviews = format!("{repo}/pulls/4/reviews?limit={per}");
+    let (approver, dismissed) = (nonce(), nonce());
+    rig.api.answer(
+        &reviews,
+        StatusCode::OK,
+        json!([{"user": {"login": approver}, "state": "APPROVED", "commit_id": head}]),
+    );
+    rig.api.answer(
+        &format!("{reviews}&page=2"),
+        StatusCode::OK,
+        json!([{"user": {"login": dismissed}, "state": "REQUEST_CHANGES", "dismissed": true}]),
+    );
+    rig.api
+        .answer(&format!("{reviews}&page=3"), StatusCode::OK, json!([]));
+    let (record, text) = rig.call(READ, json!({"number": 4})).await;
+    assert_eq!(record.state, ToolCallState::Succeeded, "{:?}", record.error);
+    let answer = result(text);
+    assert_eq!(answer["forge"], "Gitea or Forgejo");
+    assert_eq!(answer["pull_request"]["state"], "merged");
+    assert_eq!(answer["pull_request"]["draft"], true);
+    let checks: Vec<_> = answer["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|check| check["conclusion"].as_str().unwrap())
+        .collect();
+    assert_eq!(checks, ["neutral", "failure"]);
+    assert_eq!(answer["checks_complete"], true);
+    assert_eq!(answer["reviews"][0]["author"], approver);
+    assert_eq!(answer["reviews"][0]["state"], "approved");
+    assert_eq!(answer["reviews"][1]["author"], dismissed);
+    assert_eq!(answer["reviews"][1]["state"], "dismissed");
+    assert_eq!(answer["reviews_complete"], true);
+
+    // Pages that never run out are read only so far, and said to be cut.
+    for page in 1..=a206_forge::MAX_DETAIL_PAGES + 1 {
+        let path = match page {
+            1 => reviews.clone(),
+            page => format!("{reviews}&page={page}"),
+        };
+        rig.api.answer(
+            &path,
+            StatusCode::OK,
+            json!([{"user": {"login": nonce()}, "state": "COMMENT"}]),
+        );
+    }
+    let (record, text) = rig.call(READ, json!({"number": 4})).await;
+    assert_eq!(record.state, ToolCallState::Succeeded, "{:?}", record.error);
+    let answer = result(text);
+    assert_eq!(
+        answer["reviews"].as_array().unwrap().len(),
+        a206_forge::MAX_DETAIL_PAGES
+    );
+    assert_eq!(answer["reviews_complete"], false);
+    let beyond = format!("{reviews}&page={}", a206_forge::MAX_DETAIL_PAGES + 1);
+    assert!(!rig.api.paths().contains(&beyond));
+
+    // Gitea cannot list one branch: pull requests from other branches, and
+    // from a fork's branch of the same name, are left out here.
+    let listed = format!("{repo}/pulls?state=open&limit={}", a206_forge::PAGE);
+    rig.api.answer(
+        &listed,
+        StatusCode::OK,
+        json!([
+            pull(9, &branch, Some(here), false),
+            pull(8, &branch, Some(fork), false),
+            pull(7, &nonce(), Some(here), false),
+            pull(6, &branch, None, false),
+        ]),
+    );
+    rig.api
+        .answer(&format!("{listed}&page=2"), StatusCode::OK, json!([]));
+    let (record, text) = rig.call(LIST, json!({"branch": branch})).await;
+    assert_eq!(record.state, ToolCallState::Succeeded, "{:?}", record.error);
+    let answer = result(text);
+    let numbers: Vec<_> = answer["pull_requests"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|pull| pull["number"].as_u64().unwrap())
+        .collect();
+    assert_eq!(numbers, [9]);
+    assert_eq!(answer["complete"], true);
+
+    // A draft is marked by Gitea's work-in-progress prefix.
+    let (title, base) = (nonce(), nonce());
+    rig.api.answer(
+        &format!("{repo}/pulls"),
+        StatusCode::CREATED,
+        pull(10, &branch, Some(here), false),
+    );
+    let arguments = json!({"title": title, "branch": branch, "base": base, "draft": true});
+    let (record, text) = rig
+        .approved(CREATE, arguments, ApprovalDecision::Approve)
+        .await;
+    assert_eq!(record.state, ToolCallState::Succeeded, "{:?}", record.error);
+    assert_eq!(result(text)["draft_as_requested"], true);
+    assert_eq!(
+        rig.api.posted.lock().unwrap().last().unwrap(),
+        &(
+            format!("{repo}/pulls"),
+            json!({"title": format!("WIP: {title}"), "head": branch, "base": base})
+        )
+    );
+    // An instance with other work-in-progress prefixes may disagree, and
+    // the result says so rather than claiming the requested state.
+    let arguments = json!({"title": title, "branch": branch, "base": base, "draft": false});
+    let (record, text) = rig
+        .approved(CREATE, arguments.clone(), ApprovalDecision::Approve)
+        .await;
+    assert_eq!(record.state, ToolCallState::Succeeded, "{:?}", record.error);
+    let answer = result(text);
+    assert_eq!(answer["pull_request"]["draft"], true);
+    assert_eq!(answer["draft_as_requested"], false);
+    // An older Gitea does not report drafts: that is unknown, not a match.
+    let mut older = pull(11, &branch, Some(here), false);
+    older.as_object_mut().unwrap().remove("draft");
+    rig.api
+        .answer(&format!("{repo}/pulls"), StatusCode::CREATED, older);
+    let (record, text) = rig
+        .approved(CREATE, arguments, ApprovalDecision::Approve)
+        .await;
+    assert_eq!(record.state, ToolCallState::Succeeded, "{:?}", record.error);
+    let answer = result(text);
+    assert_eq!(answer["pull_request"]["draft"], Value::Null);
+    assert_eq!(answer["draft_as_requested"], Value::Null);
+}

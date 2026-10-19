@@ -1,6 +1,6 @@
 [package]
 name = "a206-forge"
-description = "Forge-neutral pull requests, checks and reviews, with GitHub and GitLab adapters"
+description = "Forge-neutral pull requests, checks and reviews, with GitHub, GitLab and Gitea/Forgejo adapters"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

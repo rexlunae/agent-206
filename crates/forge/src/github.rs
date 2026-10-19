@@ -13,8 +13,7 @@ struct Pull {
     number: u64,
     title: String,
     state: String,
-    #[serde(default)]
-    draft: bool,
+    draft: Option<bool>,
     merged_at: Option<String>,
     user: Option<User>,
     head: Branch,
@@ -35,7 +34,8 @@ struct Branch {
     sha: Option<String>,
 }
 
-fn repo<'a>(repository: &'a Repository, rest: &[&'a str]) -> Url {
+/// `rest` under the repository, as GitHub and Gitea both lay it out.
+pub(super) fn repo<'a>(repository: &'a Repository, rest: &[&'a str]) -> Url {
     let segments = ["repos"]
         .into_iter()
         .chain(repository.path.iter().map(String::as_str))
