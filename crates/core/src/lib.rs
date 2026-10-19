@@ -552,6 +552,11 @@ pub struct Compaction {
     pub context_limit: Option<u64>,
     /// The summarization request's own usage.
     pub usage: Usage,
+    /// Set when the summary covers earlier rounds of a turn in progress: the
+    /// user message that started that turn. It is not covered, and is sent
+    /// verbatim with the summary ahead of the rounds kept after it.
+    #[serde(default)]
+    pub request: Option<Id>,
 }
 /// What happened to one project instruction file a native run looked for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

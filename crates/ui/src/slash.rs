@@ -57,7 +57,7 @@ pub(crate) const COMMANDS: [Spec; 11] = [
     Spec {
         name: "compact",
         argument: Argument::None,
-        about: "Summarize all but the latest turn",
+        about: "Summarize earlier messages, keeping the latest turn",
     },
     Spec {
         name: "stop",

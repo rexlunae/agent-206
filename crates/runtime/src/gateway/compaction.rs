@@ -8,10 +8,13 @@
 //! ([`crate::provider::history`]). The summarized messages stay in the thread
 //! for the user to read.
 //!
-//! Compaction keeps whole turns: it cuts only before a user message, so each
-//! assistant message keeps its tool calls together with their results in
-//! every protocol. Nothing is changed until the summary is complete; a failed
-//! or cancelled summary leaves the conversation exactly as it was.
+//! Compaction keeps whole turns where it can: it cuts before a user message.
+//! When the turn in progress is all that is left to cut, it cuts between that
+//! turn's rounds instead, keeping the turn's request and its latest rounds
+//! verbatim. Either way it cuts only between whole messages, so each assistant
+//! message keeps its tool calls together with their results in every
+//! protocol. Nothing is changed until the summary is complete; a failed or
+//! cancelled summary leaves the conversation exactly as it was.
 //!
 //! The 75% threshold and the summarize-older-turns approach follow RustyClaw
 //! (`gateway/dispatch.rs`, `gateway/providers/mod.rs`), but the trigger uses
@@ -34,6 +37,10 @@ pub(super) const KEEP_DURING_RUN: usize = 2;
 /// Turns kept verbatim by a compaction the user asks for between runs: the
 /// latest one.
 pub(super) const KEEP_BETWEEN_RUNS: usize = 1;
+/// Rounds (assistant messages) of the turn in progress kept verbatim when
+/// that turn's earlier rounds are summarized: the latest round, whose tool
+/// results the model answers next, and the one before it.
+pub(super) const KEEP_ROUNDS: usize = 2;
 /// Largest transcript sent for summarization. The earliest messages are left
 /// out (and the omission is stated) when a transcript is longer.
 const MAX_TRANSCRIPT: usize = 256 * 1024;
@@ -107,6 +114,9 @@ struct Plan {
     /// between them, and only if they are still adjacent.
     through: Id,
     first_kept: Id,
+    /// The request of the turn whose earlier rounds are summarized, if the
+    /// cut falls inside a turn.
+    request: Option<Id>,
     transcript: String,
 }
 
@@ -122,13 +132,32 @@ fn turns(thread: &Thread) -> (Option<usize>, Vec<usize>) {
     (previous, turns)
 }
 
-/// Whether a compaction keeping the last `keep_turns` turns would summarize
-/// anything.
-pub(super) fn compactable(thread: &Thread, keep_turns: usize) -> bool {
-    keep_turns > 0 && turns(thread).1.len() > keep_turns
+/// A cut inside the turn in progress: the position of the turn's request
+/// (the latest user message) and of the first round kept, when the turn has
+/// more than [`KEEP_ROUNDS`] rounds after the latest summary.
+fn within_turn(thread: &Thread) -> Option<(usize, usize)> {
+    let messages = &thread.messages;
+    let request = messages.iter().rposition(|m| m.role == Role::User)?;
+    let after_summary = messages
+        .iter()
+        .rposition(|m| m.compaction.is_some())
+        .map_or(0, |at| at + 1);
+    let rounds: Vec<usize> = (after_summary.max(request + 1)..messages.len())
+        .filter(|&at| messages[at].role == Role::Assistant)
+        .collect();
+    (rounds.len() > KEEP_ROUNDS).then(|| (request, rounds[rounds.len() - KEEP_ROUNDS]))
 }
 
-/// Plan a compaction that keeps the last `keep_turns` turns verbatim.
+/// Whether a compaction keeping the last `keep_turns` turns, or else the
+/// request and latest rounds of the turn in progress, would summarize
+/// anything.
+pub(super) fn compactable(thread: &Thread, keep_turns: usize) -> bool {
+    keep_turns > 0 && (turns(thread).1.len() > keep_turns || within_turn(thread).is_some())
+}
+
+/// Plan a compaction that keeps the last `keep_turns` turns verbatim, or,
+/// when that would summarize nothing, the request and the last
+/// [`KEEP_ROUNDS`] rounds of the turn in progress.
 fn plan(thread: &Thread, keep_turns: usize) -> Result<Plan, CompactionError> {
     let messages = &thread.messages;
     let (previous, turns) = turns(thread);
@@ -137,14 +166,33 @@ fn plan(thread: &Thread, keep_turns: usize) -> Result<Plan, CompactionError> {
         compactable(thread, keep_turns),
         CompactionError::NothingToCompact,
     )?;
-    let keep_from = turns[turns.len() - keep_turns];
-    let older = &messages[start..keep_from];
+    let (keep_from, request) = if turns.len() > keep_turns {
+        (turns[turns.len() - keep_turns], None)
+    } else {
+        let (request, keep_from) = within_turn(thread).ok_or(CompactionError::NothingToCompact)?;
+        (keep_from, Some(request))
+    };
+    // The summarizing model reads the turn's request too, in order: the
+    // one this cut keeps, or the one the previous summary kept, which no
+    // summary has covered. A kept request is not counted as covered.
+    let earlier_request = previous
+        .and_then(|at| messages[at].compaction.as_ref()?.request)
+        .and_then(|id| messages[..start].iter().position(|m| m.id == id));
+    let shown: Vec<&Message> = request
+        .or(earlier_request)
+        .filter(|&at| at < start)
+        .into_iter()
+        .chain(start..keep_from)
+        .map(|at| &messages[at])
+        .collect();
+    let covered = (start..keep_from).filter(|&at| Some(at) != request).count();
     Ok(Plan {
-        covered: u32::try_from(older.len()).unwrap_or(u32::MAX),
+        covered: u32::try_from(covered).unwrap_or(u32::MAX),
         previous: previous.map(|at| messages[at].id),
         through: messages[keep_from - 1].id,
         first_kept: messages[keep_from].id,
-        transcript: transcript(previous.map(|at| &messages[at]), older),
+        request: request.map(|at| messages[at].id),
+        transcript: transcript(previous.map(|at| &messages[at]), &shown),
     })
 }
 
@@ -166,7 +214,7 @@ fn bounded(text: &str, limit: usize) -> String {
 
 /// The text the summarizing model reads: the previous summary, then each
 /// older message with its tool calls and their results, bounded.
-fn transcript(previous: Option<&Message>, older: &[Message]) -> String {
+fn transcript(previous: Option<&Message>, older: &[&Message]) -> String {
     let items: Vec<String> = older
         .iter()
         .map(|message| {
@@ -316,6 +364,7 @@ impl Gateway {
             input_tokens: request.input_tokens,
             context_limit: request.info.context_limit,
             usage,
+            request: plan.request,
         });
         let size = rmp_serde::to_vec_named(&message)?.len();
         check(
@@ -415,13 +464,106 @@ mod tests {
         assert!(!over_threshold(Some(u64::MAX), Some(0)));
         assert!(over_threshold(Some(u64::MAX), Some(u64::MAX - 1)));
     }
+    fn message(role: Role) -> Message {
+        Message::new(role, Id::new_v4().to_string(), 0, CodingBackend::Native)
+    }
+    /// The summary a plan would insert, placed as `commit` places it.
+    fn insert(thread: &mut Thread, plan: &Plan) -> Id {
+        let mut summary = message(Role::System);
+        summary.compaction = Some(Compaction {
+            trigger: CompactionTrigger::Automatic,
+            messages: plan.covered,
+            previous: plan.previous,
+            input_tokens: None,
+            context_limit: None,
+            usage: Usage {
+                input_tokens: None,
+                output_tokens: None,
+                cost: None,
+            },
+            request: plan.request,
+        });
+        let at = thread
+            .messages
+            .iter()
+            .position(|m| m.id == plan.first_kept)
+            .unwrap();
+        assert_eq!(thread.messages[at - 1].id, plan.through);
+        let id = summary.id;
+        thread.messages.insert(at, summary);
+        id
+    }
+    #[test]
+    fn a_long_turn_is_cut_between_its_rounds_keeping_its_request() {
+        let mut thread = Thread::new(Id::new_v4().to_string(), Mode::Code);
+        let earlier = [message(Role::User), message(Role::Assistant)];
+        let request = message(Role::User);
+        thread.messages.extend(earlier.iter().cloned());
+        thread.messages.push(request.clone());
+        // One turn before the latest and up to KEEP_ROUNDS rounds: nothing.
+        for _ in 0..KEEP_ROUNDS {
+            thread.messages.push(message(Role::Assistant));
+            assert!(!compactable(&thread, KEEP_DURING_RUN));
+            assert!(matches!(
+                plan(&thread, KEEP_DURING_RUN),
+                Err(CompactionError::NothingToCompact)
+            ));
+        }
+        let note = message(Role::System);
+        thread.messages.push(note.clone());
+        thread.messages.push(message(Role::Assistant));
+        assert!(compactable(&thread, KEEP_DURING_RUN));
+        let first = plan(&thread, KEEP_DURING_RUN).unwrap();
+        // The earlier turn and the first round are summarized; the request
+        // is shown to the summarizing model but kept, not covered.
+        let rounds: Vec<&Message> = thread.messages[3..].iter().collect();
+        assert_eq!(first.request, Some(request.id));
+        assert_eq!(first.covered, 3);
+        assert_eq!(first.through, rounds[0].id);
+        assert_eq!(first.first_kept, rounds[1].id);
+        for text in [
+            &earlier[0].text,
+            &earlier[1].text,
+            &request.text,
+            &rounds[0].text,
+        ] {
+            assert!(first.transcript.contains(text.as_str()));
+        }
+        for kept in &rounds[1..] {
+            assert!(!first.transcript.contains(kept.text.as_str()));
+        }
+        let summary = insert(&mut thread, &first);
+
+        // The next cut folds that summary in and still shows the request.
+        assert!(!compactable(&thread, KEEP_DURING_RUN));
+        thread.messages.push(message(Role::Assistant));
+        let second = plan(&thread, KEEP_DURING_RUN).unwrap();
+        assert_eq!(second.previous, Some(summary));
+        assert_eq!(second.request, Some(request.id));
+        // The round the first summary kept, and the note after it.
+        assert_eq!(second.covered, 2);
+        assert!(second.transcript.contains(request.text.as_str()));
+        assert!(second.transcript.contains(note.text.as_str()));
+        let summary = insert(&mut thread, &second);
+
+        // Once later turns can be cut whole, a whole-turn cut summarizes the
+        // rest of the long turn, and still shows the request it kept.
+        for _ in 0..=KEEP_DURING_RUN {
+            thread.messages.push(message(Role::User));
+            thread.messages.push(message(Role::Assistant));
+        }
+        let whole = plan(&thread, KEEP_DURING_RUN).unwrap();
+        assert_eq!(whole.request, None);
+        assert_eq!(whole.previous, Some(summary));
+        assert!(whole.transcript.contains(request.text.as_str()));
+    }
     #[test]
     fn a_long_transcript_leaves_out_its_earliest_messages() {
         let message = |text: String| Message::new(Role::User, text, 0, CodingBackend::Native);
         let older: Vec<_> = (0..MAX_TRANSCRIPT / MAX_TEXT + 8)
             .map(|_| message(Id::new_v4().simple().to_string().repeat(MAX_TEXT / 32)))
             .collect();
-        let text = transcript(None, &older);
+        let text = transcript(None, &older.iter().collect::<Vec<_>>());
         assert!(text.len() <= MAX_TRANSCRIPT + 256);
         assert!(text.contains("earlier messages were left out"));
         assert!(text.contains(&older.last().unwrap().text));

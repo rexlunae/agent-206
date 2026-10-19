@@ -590,6 +590,88 @@ async fn tool_calls_keep_their_results_after_compaction() {
 }
 
 #[tokio::test]
+async fn a_long_turn_is_compacted_between_its_rounds() {
+    for api in PROTOCOLS {
+        let limit = limit();
+        let tool = format!("echo_{}", nonce());
+        let host = EchoHost {
+            name: tool.clone(),
+            marker: nonce(),
+        };
+        let mut rig = rig(api, Some(limit), Some(host)).await;
+        // One turn whose third round of tool calls reports a context above
+        // the threshold: no earlier turn is left to summarize.
+        let asked = nonce();
+        let run = rig.send(rig.thread, &asked);
+        let values: Vec<String> = (0..3).map(|_| nonce()).collect();
+        let calls: Vec<Call> = values
+            .iter()
+            .map(|value| Call::new(&tool, json!({ "value": value })))
+            .collect();
+        for (round, call) in calls.iter().enumerate() {
+            let opened = rig.next().await;
+            if round > 0 {
+                assert!(result_for(api, &opened.body, &calls[round - 1].id).is_some());
+            }
+            let input = if round == 2 {
+                around_threshold(limit).1
+            } else {
+                1
+            };
+            opened
+                .respond(calls_response_reporting(
+                    api,
+                    std::slice::from_ref(call),
+                    &nonce(),
+                    input,
+                ))
+                .await;
+        }
+        // The first round is summarized; the request is shown for context.
+        let summary_request = rig.next().await;
+        assert!(offered(api, &summary_request.body).is_empty(), "{api:?}");
+        assert!(mentions(&summary_request.body, &asked), "{api:?}");
+        assert!(mentions(&summary_request.body, &values[0]), "{api:?}");
+        for kept in &values[1..] {
+            assert!(!mentions(&summary_request.body, kept), "{api:?}");
+        }
+        let summary = nonce();
+        summary_request.respond(text_response(api, &summary)).await;
+        // The request leads the history verbatim, with the summary after it,
+        // then the last two rounds with their results.
+        let compacted = rig.next().await;
+        assert_pairs(api, &compacted.body);
+        let history = history_of(api, &compacted.body);
+        let lead = usize::from(api == ProviderApi::OpenAi);
+        assert!(mentions(&history[lead], &asked) && mentions(&history[lead], &summary));
+        assert!(
+            result_for(api, &compacted.body, &calls[0].id).is_none(),
+            "{api:?}"
+        );
+        assert!(!mentions(&compacted.body, &values[0]), "{api:?}");
+        for kept in &calls[1..] {
+            assert!(
+                result_for(api, &compacted.body, &kept.id).is_some(),
+                "{api:?}"
+            );
+        }
+        compacted.respond(text_response(api, &nonce())).await;
+        let thread = finished(run).await;
+        assert_eq!(thread.state, RunState::Complete, "{api:?}");
+        let found = summaries(&thread);
+        assert_eq!(found.len(), 1, "{api:?}");
+        let record = found[0].compaction.as_ref().unwrap();
+        assert_eq!(record.messages, 1);
+        assert_eq!(record.request, Some(thread.messages[0].id));
+        assert_eq!(thread.messages[0].text, asked);
+        // The summary sits after the first round; nothing was lost.
+        let at = thread.messages.iter().position(|m| m.compaction.is_some());
+        assert_eq!(at, Some(2), "{api:?}");
+        assert_eq!(calls_of(&thread).len(), 3, "{api:?}");
+    }
+}
+
+#[tokio::test]
 async fn compaction_is_refused_while_a_run_is_in_progress() {
     let mut rig = rig(ProviderApi::OpenAi, None, None).await;
     rig.turn(1).await;

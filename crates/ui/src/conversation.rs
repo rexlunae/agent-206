@@ -1055,7 +1055,7 @@ fn ContextControls(thread: Thread) -> Element {
             }
             p { class: "a206-fact-note", {format!("{summaries} summaries in this conversation")} }
             Button { size: ButtonSize::Sm, variant: ButtonVariant::Secondary, availability,
-                title: "Summarize all but the latest turn with this conversation's model",
+                title: "Summarize all but the latest turn, or all but the latest turn's request and last two steps, with this conversation's model",
                 onclick: move |_| dispatch(state, Command::CompactThread { thread: id }),
                 "Compact earlier messages"
             }

@@ -255,6 +255,36 @@ pub fn calls_response(api: ProviderApi, calls: &[Call], signature: &str) -> Stri
         }
     }
 }
+/// [`calls_response`] whose usage reports `input` input tokens.
+pub fn calls_response_reporting(
+    api: ProviderApi,
+    calls: &[Call],
+    signature: &str,
+    input: u64,
+) -> String {
+    let events = calls_response(api, calls, signature);
+    match api {
+        ProviderApi::OpenAi => events.replace(
+            "data: [DONE]\n\n",
+            &format!(
+                "{}data: [DONE]\n\n",
+                sse(
+                    None,
+                    json!({"choices": [], "usage": {"prompt_tokens": input, "completion_tokens": 1}})
+                )
+            ),
+        ),
+        ProviderApi::Anthropic => {
+            events.replace("\"input_tokens\":1", &format!("\"input_tokens\":{input}"))
+        }
+        ProviderApi::Gemini => {
+            let mut value: Value =
+                serde_json::from_str(events.trim().strip_prefix("data: ").unwrap()).unwrap();
+            value["usageMetadata"] = json!({"promptTokenCount": input, "candidatesTokenCount": 1});
+            sse(None, value)
+        }
+    }
+}
 /// The tool names a request offered, whatever its protocol.
 pub fn offered(api: ProviderApi, body: &Value) -> Vec<String> {
     let names = match api {
