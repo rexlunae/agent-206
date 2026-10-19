@@ -15,6 +15,8 @@ mod profiles_cli;
 mod running_cli;
 #[cfg(not(target_arch = "wasm32"))]
 mod schedule_cli;
+#[cfg(not(target_arch = "wasm32"))]
+mod search_cli;
 #[cfg(all(unix, not(target_arch = "wasm32")))]
 mod setup_cli;
 #[cfg(not(target_arch = "wasm32"))]
@@ -152,6 +154,12 @@ mod native {
         Teams {
             #[command(subcommand)]
             command: Option<crate::teams_cli::TeamAction>,
+        },
+        /// List, add or remove the web search services the `web_search`
+        /// tool may query.
+        SearchServices {
+            #[command(subcommand)]
+            command: crate::search_cli::SearchAction,
         },
         /// Show gateway and workspace status without starting a service.
         Status,
@@ -853,6 +861,9 @@ mod native {
                 }
                 if let Action::Teams { command } = action {
                     return crate::teams_cli::run(&client, command).await;
+                }
+                if let Action::SearchServices { command } = action {
+                    return crate::search_cli::run(&client, command).await;
                 }
                 let command = match action {
                     Action::Providers {

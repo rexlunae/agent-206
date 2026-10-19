@@ -21,6 +21,7 @@ mod route;
 mod running;
 mod schedules;
 mod search;
+mod search_services;
 mod settings;
 mod skills;
 mod slash;

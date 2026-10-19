@@ -241,6 +241,7 @@ async fn open(shared: &super::Shared, out: &SocketOut, web: Web) -> Result<Opene
             url: out.url.clone(),
             header: Some(("authorization", Zeroizing::new(header))),
             anthropic_version: None,
+            accept_json: false,
             body: None,
             content_type: "application/json",
             expect: None,

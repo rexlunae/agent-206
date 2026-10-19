@@ -40,7 +40,9 @@ mod steering;
 pub use crate::skill_tool::SkillOffer;
 pub use delegation::{Caller, Child, Delegator, DelegatorError, Reservation, Spawn};
 pub use messengers::Outbox;
+mod web_search;
 pub use schedules::{Jobs, MAX_AGENT_JOBS};
+pub use web_search::Searcher;
 
 /// Streamed reply text that is not final yet. It is published as the
 /// thread's assistant message at most every [`PartialReply::INTERVAL`], so a
@@ -256,6 +258,8 @@ pub enum GatewayError {
     Limiter(#[source] tokio::sync::AcquireError),
     #[error("reply channel closed")]
     ReplyChannel,
+    #[error("the web search services cannot be saved")]
+    SearchServices(#[from] a206_core::web_search::SearchConfigError),
 }
 impl crate::error::Classified for GatewayError {
     fn kind(&self) -> Option<ErrorKind> {
@@ -265,7 +269,8 @@ impl crate::error::Classified for GatewayError {
             | Self::DownloadUrl(_)
             | Self::Search(_)
             | Self::IrcServer(_)
-            | Self::SignalDaemon(_) => ErrorKind::InvalidRequest,
+            | Self::SignalDaemon(_)
+            | Self::SearchServices(_) => ErrorKind::InvalidRequest,
             Self::NotFound(_) => ErrorKind::NotFound,
             Self::Conflict(_) => ErrorKind::Conflict,
             Self::Denied(_) => ErrorKind::PermissionDenied,
@@ -634,6 +639,11 @@ impl Gateway {
         // permits it.
         let forge_tools = Arc::new(crate::forge::ForgeHost::new(gateway.pushes()));
         Arc::make_mut(&mut gateway.tool_hosts).push(forge_tools);
+        // Web search, offered once the user adds a search service; each
+        // conversation still denies it until the user permits it, and it
+        // needs the conversation's network grant.
+        let search_tools = Arc::new(crate::search_tool::SearchHost::new(gateway.searcher()));
+        Arc::make_mut(&mut gateway.tool_hosts).push(search_tools);
         // The plan tool, denied in each conversation until the user permits it.
         let plan_tools = Arc::new(crate::plan_tool::PlanHost::new(gateway.plans()));
         Arc::make_mut(&mut gateway.tool_hosts).push(plan_tools);
@@ -830,6 +840,7 @@ impl Gateway {
         provider::validate_presets(&settings.provider_presets)?;
         messengers::validate(&settings.messengers)?;
         pushes::validate(&mut settings.git_credentials)?;
+        a206_core::web_search::validate(&settings.search_services)?;
         let mut backend_kinds = BTreeSet::new();
         for backend in &settings.backends {
             crate::backends::validate_config(backend)?;

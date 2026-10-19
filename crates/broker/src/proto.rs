@@ -18,16 +18,17 @@ use zeroize::Zeroizing;
 /// version 7 [`HttpMethod::Put`], version 8 [`Request::SocketOpen`] with
 /// [`AuthScheme::DiscordBot`], version 9 [`SocketScheme::IrcSasl`], and version
 /// 10 encrypted setup channels and TOTP cancellation, 11 reviewed vault
-/// imports, 12 [`AuthScheme::WebhookUrl`], 13 [`Request::GitReceivePack`] and 14
-/// [`Request::GitUploadPack`]. A broker accepts greetings from
+/// imports, 12 [`AuthScheme::WebhookUrl`], 13 [`Request::GitReceivePack`], 14
+/// [`Request::GitUploadPack`] and 15 [`AuthScheme::SubscriptionToken`]. A broker
+/// accepts greetings from
 /// [`MIN_BROKER_VERSION`] up to this version, and a client falls back to the
 /// newest version an older broker accepts (see `Client::version`), so streams
 /// are only requested from brokers that understand them.
-pub const BROKER_VERSION: u16 = 14;
+pub const BROKER_VERSION: u16 = 15;
 /// First version with connection-held source reviews and guarded vault import.
 pub use a206_vault_channel::REVIEWED_IMPORT_BROKER_VERSION as REVIEWED_IMPORT_VERSION;
 /// The oldest protocol version this broker still serves and this client still
-/// speaks. Versions 3 to 14 differ only by the requests, roles and schemes they add.
+/// speaks. Versions 3 to 15 differ only by the requests, roles and schemes they add.
 pub const MIN_BROKER_VERSION: u16 = 3;
 /// The first version that serves [`Request::ProviderStream`].
 pub const STREAM_VERSION: u16 = 4;
@@ -54,6 +55,9 @@ pub const GIT_VERSION: u16 = 13;
 /// The first version that fetches over git's smart HTTP protocol
 /// ([`Request::GitUploadPack`]).
 pub const GIT_FETCH_VERSION: u16 = 14;
+/// The first version that attaches web search keys
+/// ([`AuthScheme::SubscriptionToken`]).
+pub const SEARCH_VERSION: u16 = 15;
 /// Longest IRC line the gateway may send, without its CR LF (RFC 1459's
 /// 512 bytes, less the line ending).
 pub const MAX_IRC_LINE: usize = 510;
@@ -228,6 +232,9 @@ pub enum AuthScheme {
     /// broker sends to the stored URL, which must be on that same origin.
     /// Since [`WEBHOOK_VERSION`].
     WebhookUrl,
+    /// `X-Subscription-Token: …` with `Accept: application/json` (Brave
+    /// Search). Since [`SEARCH_VERSION`].
+    SubscriptionToken,
 }
 
 /// How the broker opens an authenticated WebSocket session. The service is
