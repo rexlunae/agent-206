@@ -52,6 +52,10 @@ pub enum ForgeError {
     NoCommit,
     #[error("the title is only a draft marker; give it a title and set `draft` instead")]
     MarkerTitle,
+    #[error(
+        "GitLab merges as the project is set to (a merge commit or fast-forward), or squashed; it cannot rebase here"
+    )]
+    GitLabRebase,
 }
 
 /// The bundled API location of a well-known forge, by the origin its git
@@ -270,12 +274,54 @@ pub struct Comment {
     pub url: Option<String>,
 }
 
-/// A request that changes something on the forge: where to send it and
-/// its JSON body.
+/// A request that changes something on the forge: how and where to send
+/// it, and its JSON body.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Change {
+    pub method: ChangeMethod,
     pub url: Url,
     pub body: Vec<u8>,
+}
+impl Change {
+    fn post(url: Url, body: serde_json::Value) -> Self {
+        Self {
+            method: ChangeMethod::Post,
+            url,
+            body: body.to_string().into_bytes(),
+        }
+    }
+    fn put(url: Url, body: serde_json::Value) -> Self {
+        Self {
+            method: ChangeMethod::Put,
+            ..Self::post(url, body)
+        }
+    }
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChangeMethod {
+    Post,
+    Put,
+}
+
+/// How a pull request's commits reach its target branch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MergeMethod {
+    /// A merge commit (or as the GitLab project is set to merge).
+    #[default]
+    Merge,
+    /// One new commit with all its changes.
+    Squash,
+    /// Its commits replayed onto the target branch.
+    Rebase,
+}
+
+/// A pull request merge, as the forge reports it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Merged {
+    /// `false` when the forge accepted the request but has not merged yet.
+    pub merged: bool,
+    /// The commit the merge made, where the forge says.
+    pub commit: Option<String>,
 }
 
 /// Checks or reviews from one page of an answer.
@@ -496,6 +542,32 @@ impl Repository {
             ForgeKind::GitHub => Ok(github::create(self, new)),
             ForgeKind::GitLab => gitlab::create(self, new),
             ForgeKind::Gitea => gitea::create(self, new),
+        }
+    }
+
+    /// Merges pull request `number` by `method` if its head is still commit
+    /// `head`; the answer is read with [`Repository::parse_merge`].
+    pub fn merge(
+        &self,
+        number: u64,
+        head: &str,
+        method: MergeMethod,
+    ) -> Result<Change, ForgeError> {
+        match self.kind {
+            ForgeKind::GitHub => Ok(github::merge(self, number, head, method)),
+            ForgeKind::GitLab => gitlab::merge(self, number, head, method),
+            ForgeKind::Gitea => Ok(gitea::merge(self, number, head, method)),
+        }
+    }
+    pub fn parse_merge(&self, body: &[u8]) -> Result<Merged, ForgeError> {
+        match self.kind {
+            ForgeKind::GitHub => github::parse_merge(body),
+            ForgeKind::GitLab => gitlab::parse_merge(body),
+            // Gitea answers a merge with an empty success.
+            ForgeKind::Gitea => Ok(Merged {
+                merged: true,
+                commit: None,
+            }),
         }
     }
 

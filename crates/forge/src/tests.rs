@@ -908,3 +908,90 @@ fn gitea_drafts_are_marked_work_in_progress() {
         .unwrap();
     assert_eq!(posted.url, Some(url));
 }
+
+#[test]
+fn merges_name_the_head_and_each_forges_method() {
+    let (owner, name, head) = (word(), word(), sha());
+    let make = |kind, base| {
+        Repository::new(&api(kind, base), &remote(&format!("/{owner}/{name}"))).unwrap()
+    };
+    let github = make(ForgeKind::GitHub, "https://forge.example/api/v3");
+    let gitlab = make(ForgeKind::GitLab, "https://forge.example/api/v4");
+    let gitea = make(ForgeKind::Gitea, "https://forge.example/api/v1");
+    let sent = |change: Change| -> (ChangeMethod, String, Value) {
+        (
+            change.method,
+            change.url.path().to_owned(),
+            serde_json::from_slice(&change.body).unwrap(),
+        )
+    };
+    for (method, word) in [
+        (MergeMethod::Merge, "merge"),
+        (MergeMethod::Squash, "squash"),
+        (MergeMethod::Rebase, "rebase"),
+    ] {
+        assert_eq!(
+            sent(github.merge(3, &head, method).unwrap()),
+            (
+                ChangeMethod::Put,
+                format!("/api/v3/repos/{owner}/{name}/pulls/3/merge"),
+                json!({"sha": head, "merge_method": word})
+            )
+        );
+        assert_eq!(
+            sent(gitea.merge(3, &head, method).unwrap()),
+            (
+                ChangeMethod::Post,
+                format!("/api/v1/repos/{owner}/{name}/pulls/3/merge"),
+                json!({"Do": word, "head_commit_id": head})
+            )
+        );
+    }
+    assert_eq!(
+        sent(gitlab.merge(3, &head, MergeMethod::Squash).unwrap()),
+        (
+            ChangeMethod::Put,
+            format!("/api/v4/projects/{owner}%2F{name}/merge_requests/3/merge"),
+            json!({"sha": head, "squash": true})
+        )
+    );
+    assert!(matches!(
+        gitlab.merge(3, &head, MergeMethod::Rebase),
+        Err(ForgeError::GitLabRebase)
+    ));
+
+    let commit = sha();
+    assert_eq!(
+        github
+            .parse_merge(&bytes(
+                &json!({"sha": commit, "merged": true, "message": word()})
+            ))
+            .unwrap(),
+        Merged {
+            merged: true,
+            commit: Some(commit.clone())
+        }
+    );
+    assert!(matches!(
+        github.parse_merge(br#"{"sha": "x"}"#),
+        Err(ForgeError::Answer(_))
+    ));
+    let squashed = gitlab
+        .parse_merge(&bytes(
+            &json!({"state": "merged", "merge_commit_sha": null, "squash_commit_sha": commit}),
+        ))
+        .unwrap();
+    assert_eq!(squashed.commit.as_deref(), Some(commit.as_str()));
+    assert!(squashed.merged);
+    let waiting = gitlab
+        .parse_merge(&bytes(&json!({"state": "opened"})))
+        .unwrap();
+    assert!(!waiting.merged);
+    assert_eq!(
+        gitea.parse_merge(b"").unwrap(),
+        Merged {
+            merged: true,
+            commit: None
+        }
+    );
+}

@@ -20,7 +20,7 @@ use crate::{
     tools::{self, ToolHost, ToolListing, ToolOutput, ToolRequest, ToolScope, ToolSpec},
 };
 use a206_core::{Capability, ErrorKind, ErrorReport, ForgeApi, ToolPermission};
-use a206_forge::{ForgeError, Listed, Repository};
+use a206_forge::{ForgeError, Listed, MergeMethod, Repository};
 use futures_util::future::BoxFuture;
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -34,6 +34,8 @@ pub const READ: &str = "pull_request";
 pub const CREATE: &str = "pull_request_create";
 /// Comments on a pull request.
 pub const COMMENT: &str = "pull_request_comment";
+/// Merges a pull request.
+pub const MERGE: &str = "pull_request_merge";
 /// Longest branch name accepted, in characters.
 const MAX_BRANCH: usize = 255;
 
@@ -56,6 +58,16 @@ pub enum ForgeToolError {
     Missing(&'static str),
     #[error("there is no current branch to propose; name one in `branch`")]
     NoBranch,
+    #[error(
+        "`head` must be the full id of the pull request's head commit, as `pull_request` reads it"
+    )]
+    Head,
+    #[error("`method` must be merge, squash or rebase")]
+    Method,
+    #[error(
+        "the forge did not merge it (HTTP {status}); its head may no longer be `head`, or it may be a draft, have conflicts, or wait on required checks or approvals; read it again"
+    )]
+    NotMergeable { status: u16 },
     #[error(
         "the forge rejected the request (HTTP {status}); the branch may not be on the forge yet, or a pull request for it may already be open"
     )]
@@ -88,8 +100,10 @@ impl crate::error::Classified for ForgeToolError {
             | Self::State
             | Self::Text { .. }
             | Self::Missing(_)
-            | Self::NoBranch => ErrorKind::InvalidRequest,
-            Self::Rejected { .. } => ErrorKind::Conflict,
+            | Self::NoBranch
+            | Self::Head
+            | Self::Method => ErrorKind::InvalidRequest,
+            Self::Rejected { .. } | Self::NotMergeable { .. } => ErrorKind::Conflict,
             Self::UnknownTool(_) | Self::NotFound => ErrorKind::NotFound,
             Self::NoForge { .. } => ErrorKind::InvalidRequest,
             Self::Refused { .. } => ErrorKind::PermissionDenied,
@@ -100,7 +114,9 @@ impl crate::error::Classified for ForgeToolError {
                 ErrorKind::InvalidRequest
             }
             Self::Forge(ForgeError::NoCommit) => ErrorKind::Provider,
-            Self::Forge(ForgeError::MarkerTitle) => ErrorKind::InvalidRequest,
+            Self::Forge(ForgeError::MarkerTitle | ForgeError::GitLabRebase) => {
+                ErrorKind::InvalidRequest
+            }
         })
     }
 }
@@ -207,6 +223,27 @@ impl ForgeHost {
         }
     }
 
+    fn merge_spec() -> ToolSpec {
+        ToolSpec {
+            name: MERGE.into(),
+            description: "Merge a pull request (GitLab merge request) of the project's repository into its target branch, only if its head is still the commit `head` (read it with pull_request first). The user approves each call. The forge's own rules still apply: required checks, approvals and branch protection. Returns whether it merged and the commit made, where the forge says.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "number": {"type": "integer", "minimum": 1, "description": "The pull request's number."},
+                    "head": {"type": "string", "description": "The full id of the pull request's head commit, as pull_request reports it."},
+                    "method": {"type": "string", "enum": ["merge", "squash", "rebase"], "description": "merge (a merge commit; on GitLab, as the project is set to merge), squash or rebase (not on GitLab). Defaults to merge."},
+                    "remote": {"type": "string", "description": "The git remote whose forge to use. Defaults to the current branch's remote, else origin."}
+                },
+                "required": ["number", "head"],
+                "additionalProperties": false
+            }),
+            capabilities: [Capability::GitWrite].into(),
+            permission: ToolPermission::Ask,
+            whole_output: false,
+        }
+    }
+
     async fn run(&self, scope: &ToolScope, request: &ToolRequest) -> Result<Value, ForgeToolError> {
         let args = &request.arguments;
         let allowed: &[&str] = match request.name.as_str() {
@@ -214,6 +251,7 @@ impl ForgeHost {
             READ => &["number", "remote"],
             CREATE => &["title", "body", "base", "branch", "draft", "remote"],
             COMMENT => &["number", "body", "remote"],
+            MERGE => &["number", "head", "method", "remote"],
             _ => return Err(ForgeToolError::UnknownTool(request.name.clone())),
         };
         if let Some(key) = args.keys().find(|key| !allowed.contains(&key.as_str())) {
@@ -242,14 +280,29 @@ impl ForgeHost {
                     Some(_) => return Err(ForgeToolError::Type("draft")),
                 },
             },
-            _ => Question::Comment {
+            COMMENT => Question::Comment {
                 number: number(args)?,
                 body: required(args, "body", a206_forge::MAX_TEXT, true)?,
             },
+            _ => Question::Merge {
+                number: number(args)?,
+                head: match text(args, "head")? {
+                    Some(head) if commit_id(&head) => head,
+                    _ => return Err(ForgeToolError::Head),
+                },
+                method: match text(args, "method")?.as_deref() {
+                    None | Some("merge") => MergeMethod::Merge,
+                    Some("squash") => MergeMethod::Squash,
+                    Some("rebase") => MergeMethod::Rebase,
+                    Some(_) => return Err(ForgeToolError::Method),
+                },
+            },
         };
-        // The gateway asks the user first; never publish what it did not.
-        if matches!(question, Question::Create { .. } | Question::Comment { .. })
-            && !request.approved
+        // The gateway asks the user first; never change what it did not.
+        if matches!(
+            question,
+            Question::Create { .. } | Question::Comment { .. } | Question::Merge { .. }
+        ) && !request.approved
         {
             return Err(RemoteError::NotApproved.into());
         }
@@ -275,6 +328,7 @@ impl ForgeHost {
             .ok_or(ForgeToolError::NoForge { origin })?;
         let repository = Repository::new(&api, &url)?;
         let (broker_root, pairing) = self.pushes.broker().map_err(RemoteError::Gateway)?;
+        // A PUT (GitHub and GitLab merges) checks the version itself.
         let broker = Broker::connect(
             &broker_root,
             pairing.as_ref(),
@@ -315,6 +369,21 @@ impl ForgeHost {
                     "forge": repository.kind().label(),
                     "pull_request": pull,
                     "draft_as_requested": draft_as_requested,
+                }));
+            }
+            Question::Merge {
+                number,
+                head,
+                method,
+            } => {
+                let change = repository.merge(number, &head, method)?;
+                let body = forge.merge(change).await?;
+                return Ok(json!({
+                    "remote": remote,
+                    "repository": repository.name(),
+                    "forge": repository.kind().label(),
+                    "number": number,
+                    "merge": repository.parse_merge(&body)?,
                 }));
             }
             Question::Comment { number, body } => {
@@ -422,6 +491,16 @@ enum Question {
         number: u64,
         body: String,
     },
+    Merge {
+        number: u64,
+        head: String,
+        method: MergeMethod,
+    },
+}
+
+/// A full SHA-1 or SHA-256 commit id.
+fn commit_id(text: &str) -> bool {
+    matches!(text.len(), 40 | 64) && text.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 /// A pull request `number`.
@@ -494,8 +573,23 @@ impl Forge {
         Ok((items, false))
     }
     async fn post(&mut self, change: a206_forge::Change) -> Result<Vec<u8>, ForgeToolError> {
-        self.send(a206_broker::HttpMethod::Post, change.url, Some(change.body))
-            .await
+        let (method, url, body) = Self::request(change);
+        self.send(method, url, body).await
+    }
+    /// Sends a merge, whose refusals say why it did not merge.
+    async fn merge(&mut self, change: a206_forge::Change) -> Result<Vec<u8>, ForgeToolError> {
+        let (method, url, body) = Self::request(change);
+        match self.exchange(method, url, body).await? {
+            (status @ (405 | 406 | 409 | 422), _) => Err(ForgeToolError::NotMergeable { status }),
+            (status, body) => self.checked(status, body),
+        }
+    }
+    fn request(change: a206_forge::Change) -> (a206_broker::HttpMethod, url::Url, Option<Vec<u8>>) {
+        let method = match change.method {
+            a206_forge::ChangeMethod::Post => a206_broker::HttpMethod::Post,
+            a206_forge::ChangeMethod::Put => a206_broker::HttpMethod::Put,
+        };
+        (method, change.url, Some(change.body))
     }
     async fn send(
         &mut self,
@@ -503,7 +597,16 @@ impl Forge {
         url: url::Url,
         body: Option<Vec<u8>>,
     ) -> Result<Vec<u8>, ForgeToolError> {
-        let (status, body) = self
+        let (status, body) = self.exchange(method, url, body).await?;
+        self.checked(status, body)
+    }
+    async fn exchange(
+        &mut self,
+        method: a206_broker::HttpMethod,
+        url: url::Url,
+        body: Option<Vec<u8>>,
+    ) -> Result<(u16, Vec<u8>), ForgeToolError> {
+        Ok(self
             .broker
             .provider(a206_broker::ProviderCall {
                 credential: self.credential.clone(),
@@ -513,7 +616,9 @@ impl Forge {
                 anthropic_version: None,
                 body,
             })
-            .await?;
+            .await?)
+    }
+    fn checked(&self, status: u16, body: Vec<u8>) -> Result<Vec<u8>, ForgeToolError> {
         match status {
             200..=299 => Ok(body),
             401 | 403 => Err(ForgeToolError::Refused {
@@ -544,6 +649,7 @@ impl ToolHost for ForgeHost {
                         Self::read_spec(),
                         Self::create_spec(),
                         Self::comment_spec(),
+                        Self::merge_spec(),
                     ]
                 } else {
                     vec![]

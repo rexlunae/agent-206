@@ -673,9 +673,9 @@ The result names the branch, remote, `tracking_branch`, the old and new
 commits and how many objects arrived. Not yet: ssh remotes, several branches
 or tags at once, pruning, and packs over about 4 MiB.
 
-## Pull requests (`pull_requests`, `pull_request`, `pull_request_create`, `pull_request_comment`)
+## Pull requests (`pull_requests`, `pull_request`, `pull_request_create`, `pull_request_comment`, `pull_request_merge`)
 
-`runtime/src/forge.rs` offers four pull request tools beside `git_push` and
+`runtime/src/forge.rs` offers five pull request tools beside `git_push` and
 `git_fetch`, under the same condition (a git credential for at least one
 forge). Two only read, with GET requests, under the conversation's GitRead
 grant. Their host policy is Allow, so once the user permits them on the
@@ -703,9 +703,9 @@ gateway cutting the text, the tool leaves out the last pull requests, checks
 or reviews that would take a result past 64 KiB and marks that list
 incomplete.
 
-Two more publish what the model wrote, so they need the GitWrite grant
-and have host policy Ask: the user approves each call, whatever the
-conversation's permission for the tool.
+Three more change the forge, so they need the GitWrite grant and have
+host policy Ask: the user approves each call, whatever the conversation's
+permission for the tool.
 
 - `pull_request_create` opens a pull request (`title`, `base`, optional
   `body`, `draft`) proposing `branch` (default: the current branch, which
@@ -723,6 +723,17 @@ conversation's permission for the tool.
   issue comment, also on Gitea and Forgejo; a GitLab merge request note)
   and returns its id and web
   address.
+- `pull_request_merge` merges pull request `number` only if its head is
+  still `head`, the full commit id the model read with `pull_request` and
+  the user approves; a branch pushed to since is not merged. `method` is
+  `merge` (default; on GitLab, as the project is set to merge), `squash`
+  or `rebase` (refused on GitLab before anything is sent). The forge's
+  rules still apply: branch protection, required checks and approvals. A
+  405, 406, 409 or 422 (head moved, draft, conflicts, held by those rules)
+  is a conflict error, and nothing merged. The result says `merged` (false
+  when GitLab accepted a merge it has not made yet) and the commit made
+  where the forge says (Gitea and Forgejo do not). GitHub and GitLab merge
+  with PUT, which needs broker v7; Gitea and Forgejo merge with POST.
 
 Titles, branches and comments are sent as given or refused: blank text,
 text over its limit (249 characters for titles, so a GitLab draft title
@@ -736,7 +747,7 @@ do not have, which Gitea answers with 404) is a conflict error; the broker does
 not relay the forge's error text. A call whose answer was lost may still
 have been applied, and is not retried.
 
-All four take `remote` (default: the current branch's remote, else `origin`);
+All five take `remote` (default: the current branch's remote, else `origin`);
 its URL must be an HTTPS repository URL, as for a fetch. Crate `a206-forge`
 describes every forge the same way (state, draft, source and target
 branches, check status and conclusion, review state) and keeps a forge's
@@ -762,7 +773,7 @@ credential must also be bound to the API's origin (for github.com,
 characters and bounded; what a forge returns was written by other people
 and reaches the model as tool data. A refused token, a missing pull
 request and an answer not shaped like the API's are separate errors. Not
-yet: merging pull requests, review comments on lines, pages beyond these, and setting `forge` from the GUI (use `settings --apply`).
+yet: review comments on lines, deleting the source branch after a merge, pages beyond these, and setting `forge` from the GUI (use `settings --apply`).
 
 ## Output rules
 

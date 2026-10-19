@@ -6,7 +6,7 @@
 //! A Gitea caps each page at its own configured limit, which may be fewer
 //! than asked, so only an empty page shows that nothing more is left.
 use super::{
-    Change, Check, CheckStatus, Conclusion, DETAIL_PAGE, ForgeError, Listed, MAX_BODY,
+    Change, Check, CheckStatus, Conclusion, DETAIL_PAGE, ForgeError, Listed, MAX_BODY, MergeMethod,
     NewPullRequest, PAGE, PullRequest, Repository, Review, ReviewState, State, answer, bounded,
     github::repo, label, label_opt, unmarked,
 };
@@ -116,10 +116,25 @@ pub(super) fn create(
     if let Some(text) = new.body {
         body["body"] = json!(text);
     }
-    Ok(Change {
-        url: repo(repository, &["pulls"]),
-        body: body.to_string().into_bytes(),
-    })
+    Ok(Change::post(repo(repository, &["pulls"]), body))
+}
+
+/// Merges only if the head is still `head`.
+pub(super) fn merge(
+    repository: &Repository,
+    number: u64,
+    head: &str,
+    method: MergeMethod,
+) -> Change {
+    let method = match method {
+        MergeMethod::Merge => "merge",
+        MergeMethod::Squash => "squash",
+        MergeMethod::Rebase => "rebase",
+    };
+    Change::post(
+        repo(repository, &["pulls", &number.to_string(), "merge"]),
+        json!({"Do": method, "head_commit_id": head}),
+    )
 }
 
 pub(super) fn pull_url(repository: &Repository, number: u64) -> Url {

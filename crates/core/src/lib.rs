@@ -53,7 +53,9 @@ impl Capability {
             Self::Execute => "Run project commands",
             Self::Network => "Use the network",
             Self::GitRead => "Read git history",
-            Self::GitWrite => "Commit, branch, push and fetch in git, and open pull requests",
+            Self::GitWrite => {
+                "Commit, branch, push and fetch in git, and open and merge pull requests"
+            }
             Self::ReviewPullRequests => "Review pull requests",
             Self::Download => "Download files",
             Self::Browser => "Use the browser",
