@@ -345,7 +345,7 @@ async fn a_heartbeat_sends_heartbeat_md_and_a_heartbeat_ok_reply_is_quiet() {
     else {
         panic!("the run was recorded");
     };
-    assert_eq!(schedule::heartbeat_run(sent), Some(run), "{sent}");
+    assert_eq!(schedule::check_run(sent), Some(run), "{sent}");
 
     // Anything else is a reply that needs attention.
     let run = tokio::spawn({

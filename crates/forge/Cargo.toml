@@ -1,0 +1,18 @@
+[package]
+name = "a206-forge"
+description = "Forge-neutral pull requests, checks and reviews, with GitHub and GitLab adapters"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+[dependencies]
+a206-core.workspace = true
+percent-encoding = "2"
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+url.workspace = true
+[dev-dependencies]
+uuid.workspace = true
+[lints]
+workspace = true

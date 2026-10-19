@@ -4,7 +4,8 @@
 //! the capability-bearing declarations, which only the host interprets.
 use crate::Capability;
 pub use a206_extension_abi::{
-    Args, Field, Node, ParamKind, Tone, ToolOutput, UiEvent, Value, View,
+    Args, Field, MAX_TRIGGER_CURSOR, Node, ParamKind, Tone, ToolOutput, TriggerOutput, UiEvent,
+    Value, View,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -32,6 +33,10 @@ pub struct ParamSpec {
     #[serde(default)]
     pub required: bool,
 }
+/// A trigger an extension offers to scheduled jobs, declared like a tool:
+/// each check of a job runs it with that job's arguments, and when it fires
+/// the job sends what it reported to the job's conversation.
+pub type TriggerSpec = ToolSpec;
 /// A panel an extension contributes to the Extensions page.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

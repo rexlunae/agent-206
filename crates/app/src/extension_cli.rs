@@ -121,7 +121,7 @@ pub fn command(action: ExtensionAction) -> anyhow::Result<Option<Command>> {
     }))
 }
 
-fn toml_args(text: &str) -> Result<Args, toml::de::Error> {
+pub(crate) fn toml_args(text: &str) -> Result<Args, toml::de::Error> {
     fn value(toml: toml::Value) -> Value {
         match toml {
             toml::Value::String(text) => Value::Str(text),

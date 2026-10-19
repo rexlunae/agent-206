@@ -144,7 +144,8 @@ pub fn text(text: &str) -> AuditReport {
 }
 
 /// Audit the text an extension's manifest gives the user and the model:
-/// its name and description, and its tools', parameters' and panels' text.
+/// its name and description, and its tools', triggers', parameters' and
+/// panels' text.
 pub fn plugin(summary: &PluginSummary) -> AuditReport {
     let mut report = AuditBuilder::default();
     let mut check = |item: Option<&str>, field: AuditField, text: &str| {
@@ -160,13 +161,20 @@ pub fn plugin(summary: &PluginSummary) -> AuditReport {
     };
     check(None, AuditField::Name, &summary.name);
     check(None, AuditField::Description, &summary.description);
-    for tool in &summary.tools {
-        check(Some(&tool.name), AuditField::ToolName, &tool.name);
-        check(
-            Some(&tool.name),
-            AuditField::ToolDescription,
-            &tool.description,
-        );
+    let tools = summary
+        .tools
+        .iter()
+        .map(|tool| (tool, AuditField::ToolName, AuditField::ToolDescription));
+    let triggers = summary.triggers.iter().map(|trigger| {
+        (
+            trigger,
+            AuditField::TriggerName,
+            AuditField::TriggerDescription,
+        )
+    });
+    for (tool, name, description) in tools.chain(triggers) {
+        check(Some(&tool.name), name, &tool.name);
+        check(Some(&tool.name), description, &tool.description);
         for param in &tool.params {
             let item = format!("{}.{}", tool.name, param.name);
             check(
