@@ -557,6 +557,27 @@ a "Current plan" section with the steps and statuses, for as long as the tool is
 offered. Clients: a plan card above the composer in the shared conversation view
 (`ui/src/conversation.rs`, desktop/web/TUI) and `agent206 plan THREAD`.
 
+## Conversation status (`session_status`)
+
+`runtime/src/status_tool.rs` offers `session_status`, after RustyClaw's tool of
+the same name. It takes no arguments and returns, as JSON, what the model may
+know about the conversation it answers in: its ID, title, mode, project name,
+parent conversation and run state; its model with the connection's name and
+the model's name, context limit and output limit as the provider's models API
+reported them (null when the catalog does not list them); its permitted
+subagent models; the permissions its current tool scope holds; its
+per-response limits (model requests, tool calls, tokens); the usage providers
+reported for it alone and with its subagents (`UsageTotal`: responses,
+unfinished requests, token sums with how many responses left each out and
+whether the sum is exact, and costs per connection, never summed across
+connections); its subagent conversations (the 50 newest, with the total) with
+their states and whether they are paused; and the gateway clock in Unix
+seconds. A conversation reads only itself and the subagents it started, never
+another conversation. The tool changes nothing, uses no capability, and like
+every tool is denied until the user permits it. RustyClaw's lookup of another
+session by key is not ported: `subagent_status` covers the conversations a
+model started.
+
 ## Messages out (`send_message`)
 
 `runtime/src/message_tool.rs` offers `send_message`, after RustyClaw's

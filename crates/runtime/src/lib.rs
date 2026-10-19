@@ -38,6 +38,7 @@ pub mod schedule_tool;
 pub mod service;
 pub mod skill_tool;
 pub mod sse;
+pub mod status_tool;
 pub mod store;
 pub mod tool_calls;
 pub mod tools;
