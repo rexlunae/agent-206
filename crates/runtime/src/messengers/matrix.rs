@@ -39,6 +39,10 @@ pub(crate) struct Matrix {
     pending: Option<Pending>,
     /// The bot's own user id, whose messages are never answered.
     user: Option<String>,
+    /// This adapter has seen the pending invitations. An incremental sync
+    /// lists only invitations that changed after its cursor, so a cursor
+    /// from an earlier session hides one the user allowed meanwhile.
+    invitations_seen: bool,
 }
 
 /// Discovery is drained before authorized effects. Until the final chunk,
@@ -196,6 +200,7 @@ impl Matrix {
             allowed,
             pending: None,
             user: None,
+            invitations_seen: false,
         }
     }
 
@@ -253,7 +258,44 @@ impl Matrix {
     /// Wait for events after `since`. Without one, this is the first sync:
     /// it returns at once, delivers only pending invitations, and its cursor
     /// marks where answering starts.
+    ///
+    /// The first call with a cursor this adapter did not reach itself first
+    /// reads the pending invitations the way a first sync does, and hands
+    /// them over in a batch that keeps `since`, so a room the user allowed
+    /// while the cursor was saved is still joined.
     pub(crate) async fn receive(&mut self, since: Option<&str>) -> Result<Batch> {
+        if let Some(since) = since
+            && !self.invitations_seen
+        {
+            // Only the invitations: the rest of a first sync is history.
+            let mut chunk = self.sync(None).await?;
+            let mut events = Vec::new();
+            loop {
+                let complete = chunk.complete;
+                events.extend(
+                    chunk
+                        .events
+                        .into_iter()
+                        .filter(|(_, event)| matches!(event, Event::Invite { .. })),
+                );
+                match &mut self.pending {
+                    Some(pending) if !complete => chunk = pending.chunk(),
+                    _ => break,
+                }
+            }
+            self.pending = None;
+            self.invitations_seen = true;
+            return Ok(Batch {
+                events,
+                complete: false,
+                next: Some(since.to_owned()),
+            });
+        }
+        self.invitations_seen = true;
+        self.sync(since).await
+    }
+
+    async fn sync(&mut self, since: Option<&str>) -> Result<Batch> {
         if let Some(pending) = &mut self.pending {
             if pending.previous.as_deref() == since {
                 let batch = pending.chunk();

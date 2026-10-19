@@ -865,7 +865,9 @@ async fn session<H: Host>(
             }
             batch => batch?,
         };
-        position.restored = false;
+        // The service accepted the cursor once it delivered a whole batch
+        // after it; Matrix first hands over pending invitations alone.
+        position.restored &= !batch.complete;
         for (key, event) in batch.events {
             if position.handled.insert(key) {
                 // Saved before handling starts, so a restart during the turn

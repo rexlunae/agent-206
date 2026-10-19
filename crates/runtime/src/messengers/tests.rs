@@ -871,6 +871,17 @@ async fn matrix_setup() -> (
     (server, origin, dir, credential, host, anchor)
 }
 
+/// A new adapter given a cursor first reads the pending invitations, with
+/// a sync that has no cursor, and keeps `since`.
+async fn past_invitations(server: &Homeserver, adapter: &mut matrix::Matrix, since: &str) {
+    server.syncs.lock().unwrap().push_back(json!({}));
+    let batch = adapter.receive(Some(since)).await.unwrap();
+    assert!(batch.events.is_empty() && !batch.complete);
+    assert_eq!(batch.next.as_deref(), Some(since));
+    let query = server.sync_queries.lock().unwrap().pop().unwrap();
+    assert!(!query.contains_key("since"));
+}
+
 fn matrix_config(name: &str, origin: &str, credential: &str, rooms: &[&str]) -> MessengerConfig {
     MessengerConfig {
         kind: MessengerKind::Matrix,
@@ -1060,6 +1071,7 @@ async fn matrix_recovers_limited_timelines_and_ignores_edits() {
         [room.clone()].into(),
     );
     adapter.connect().await.unwrap();
+    past_invitations(&server, &mut adapter, "previous-sync").await;
     let sender = matrix_id('@', "example.test");
     let old = text_event(&sender, "m.text", &random());
     let recent = text_event(&sender, "m.text", &random());
@@ -1126,6 +1138,7 @@ async fn matrix_batch_budgets_do_not_advance_the_cursor() {
         Api::new(host.root.clone(), host.pairing.clone(), &config).unwrap(),
         allowed,
     );
+    past_invitations(&server, &mut adapter, "previous").await;
     server
         .syncs
         .lock()
@@ -1193,6 +1206,7 @@ async fn unrelated_rooms_do_not_starve_allowed_messages_and_large_state_is_scann
         Api::new(host.root.clone(), host.pairing.clone(), &config).unwrap(),
         config.allowed_chats.clone(),
     );
+    past_invitations(&server, &mut adapter, "previous").await;
     let mut joined: serde_json::Map<String, Value> = (0..100)
         .map(|_| {
             (
@@ -3426,6 +3440,8 @@ async fn matrix_answers_what_arrived_while_it_was_stopped() {
     let name = "matrix-resume";
     let domain = server.user.split_once(':').unwrap().1.to_owned();
     let (room, member) = (matrix_id('!', &domain), matrix_id('@', &domain));
+    // Invited before the position was saved, and allowed since.
+    let invited = matrix_id('!', &domain);
     let (since, missed) = (random(), random());
     host.cursors.lock().unwrap().insert(
         name.to_owned(),
@@ -3436,11 +3452,22 @@ async fn matrix_answers_what_arrived_while_it_was_stopped() {
             handled: BTreeSet::new(),
         },
     );
-    server.syncs.lock().unwrap().push_back(timeline(vec![(
-        &room,
-        vec![text_event(&member, "m.text", &missed)],
-    )]));
-    let mut entry = matrix_config(name, &origin, &credential, &[&room]);
+    {
+        let mut syncs = server.syncs.lock().unwrap();
+        // An incremental sync would not list the invitation again; a sync
+        // without a cursor does, along with history.
+        let mut pending = timeline(vec![(
+            &room,
+            vec![text_event(&member, "m.text", &random())],
+        )]);
+        pending["invite"] = json!({ &invited: {"invite_state": {"events": []}} });
+        syncs.push_back(pending);
+        syncs.push_back(timeline(vec![(
+            &room,
+            vec![text_event(&member, "m.text", &missed)],
+        )]));
+    }
+    let mut entry = matrix_config(name, &origin, &credential, &[&room, &invited]);
     entry.allowed_users.insert(member);
     let (_desired, receiver) = watch::channel(vec![Desired {
         config: entry,
@@ -3452,8 +3479,10 @@ async fn matrix_answers_what_arrived_while_it_was_stopped() {
         .await;
     stop.cancel();
     supervisor.await.unwrap();
+    assert_eq!(*server.joined.lock().unwrap(), [invited]);
     let queries = server.sync_queries.lock().unwrap().clone();
-    assert_eq!(queries[0].get("since"), Some(&since));
+    assert!(!queries[0].contains_key("since"));
+    assert_eq!(queries[1].get("since"), Some(&since));
     let texts: Vec<_> = host
         .turns
         .lock()
@@ -3485,6 +3514,8 @@ async fn matrix_starts_over_when_too_much_arrived_while_it_was_stopped() {
     );
     {
         let mut syncs = server.syncs.lock().unwrap();
+        // No pending invitations.
+        syncs.push_back(json!({}));
         // More than one batch reads.
         syncs.push_back(timeline(vec![(
             &room,
@@ -3522,8 +3553,8 @@ async fn matrix_starts_over_when_too_much_arrived_while_it_was_stopped() {
     assert!(failure.source.is_some());
     assert_eq!(host.connects(name), 1);
     let queries = server.sync_queries.lock().unwrap().clone();
-    assert_eq!(queries[0].get("since"), Some(&since));
-    assert!(!queries[1].contains_key("since"));
+    assert_eq!(queries[1].get("since"), Some(&since));
+    assert!(!queries[2].contains_key("since"));
     let texts: Vec<_> = host
         .turns
         .lock()
