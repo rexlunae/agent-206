@@ -15,6 +15,8 @@ mod profiles_cli;
 mod running_cli;
 #[cfg(not(target_arch = "wasm32"))]
 mod schedule_cli;
+#[cfg(not(target_arch = "wasm32"))]
+mod search_cli;
 #[cfg(all(unix, not(target_arch = "wasm32")))]
 mod setup_cli;
 #[cfg(not(target_arch = "wasm32"))]
@@ -95,7 +97,8 @@ mod native {
             start: bool,
         },
         /// Walk through first-run setup: the gateway, then this computer's
-        /// vault, two-factor enrollment and gateway pairing. Rerun to resume.
+        /// vault, two-factor enrollment, gateway pairing and a first model
+        /// provider account. Rerun to resume.
         #[cfg(unix)]
         Setup {
             /// Use a gateway on this computer.
@@ -151,6 +154,12 @@ mod native {
         Teams {
             #[command(subcommand)]
             command: Option<crate::teams_cli::TeamAction>,
+        },
+        /// List, add or remove the web search services the `web_search`
+        /// tool may query.
+        SearchServices {
+            #[command(subcommand)]
+            command: crate::search_cli::SearchAction,
         },
         /// Show gateway and workspace status without starting a service.
         Status,
@@ -685,6 +694,7 @@ mod native {
                         setup(&root, local, ssh, &trust).await?;
                     }
                     crate::setup_cli::secure(&root, skip_totp).await?;
+                    crate::setup_cli::provider(&root).await?;
                     // Setup succeeded; the report shows what is still open
                     // (such as provider accounts) without failing setup.
                     println!();
@@ -851,6 +861,9 @@ mod native {
                 }
                 if let Action::Teams { command } = action {
                     return crate::teams_cli::run(&client, command).await;
+                }
+                if let Action::SearchServices { command } = action {
+                    return crate::search_cli::run(&client, command).await;
                 }
                 let command = match action {
                     Action::Providers {

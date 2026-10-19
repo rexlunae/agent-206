@@ -1555,6 +1555,81 @@ async fn put_requests_carry_their_body_and_the_bearer_token() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn search_keys_go_in_the_subscription_header_and_ask_for_json() {
+    use axum::{Router, extract::RawQuery, http::HeaderMap, routing::get};
+    type Seen = Vec<(
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    )>;
+    let seen = Arc::new(Mutex::new(Seen::new()));
+    let app = {
+        let seen = seen.clone();
+        Router::new().route(
+            "/web/search",
+            get(move |headers: HeaderMap, RawQuery(query): RawQuery| {
+                let seen = seen.clone();
+                async move {
+                    let header = |name: &str| {
+                        headers
+                            .get(name)
+                            .and_then(|v| v.to_str().ok())
+                            .map(str::to_owned)
+                    };
+                    seen.lock().unwrap().push((
+                        header("x-subscription-token"),
+                        header("accept"),
+                        header("authorization"),
+                        query,
+                    ));
+                    "{}"
+                }
+            }),
+        )
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let (_dir, root, _task) = start().await;
+    let mut a = user(&root).await;
+    a.call(unlock(&random(), None, true)).await.unwrap();
+    let (name, token, query) = (random(), random(), random());
+    a.call(Request::PutCredential {
+        name: name.clone(),
+        meta: meta(vec![origin.clone()]),
+        value: WireValue::Single(WireSecret::new(token.clone())),
+        replace: false,
+    })
+    .await
+    .unwrap();
+    let mut gateway = paired_gateway(&mut a, &root).await;
+    assert!(gateway.version() >= SEARCH_VERSION);
+    let reply = gateway
+        .call(Request::Provider(ProviderCall {
+            credential: name,
+            method: HttpMethod::Get,
+            url: format!("{origin}/web/search?q={query}"),
+            auth: AuthScheme::SubscriptionToken,
+            anthropic_version: None,
+            body: None,
+        }))
+        .await
+        .unwrap();
+    assert!(matches!(reply, Reply::Provider { status: 200, .. }));
+    assert_eq!(
+        *seen.lock().unwrap(),
+        [(
+            Some(token),
+            Some("application/json".to_owned()),
+            None,
+            Some(format!("q={query}"))
+        )]
+    );
+}
+
 /// What the stand-in socket services saw.
 #[derive(Clone, Default)]
 struct SocketService {

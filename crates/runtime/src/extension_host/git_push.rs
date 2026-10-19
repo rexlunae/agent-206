@@ -35,7 +35,7 @@ const MAX_SYMBOLIC_DEPTH: usize = 5;
 
 /// What a push sends: a branch or a tag.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PushKind {
+pub(crate) enum RefKind {
     Branch,
     Tag,
 }
@@ -43,7 +43,7 @@ pub(crate) enum PushKind {
 /// A branch or tag to push and where to.
 #[derive(Debug, Clone)]
 pub(crate) struct PushTarget {
-    pub kind: PushKind,
+    pub kind: RefKind,
     /// The local branch or tag, such as `feature/login` or `v1.2`.
     pub name: String,
     /// The object it points at: a branch's commit, or a tag's tag object
@@ -63,16 +63,16 @@ impl PushTarget {
     /// The reference the push updates on the server, by the same name.
     pub fn reference(&self) -> String {
         match self.kind {
-            PushKind::Branch => format!("refs/heads/{}", self.name),
-            PushKind::Tag => format!("refs/tags/{}", self.name),
+            RefKind::Branch => format!("refs/heads/{}", self.name),
+            RefKind::Tag => format!("refs/tags/{}", self.name),
         }
     }
     /// How failures name what was pushed: a branch by its name, a tag as
     /// `tag <name>`.
     pub fn label(&self) -> String {
         match self.kind {
-            PushKind::Branch => self.name.clone(),
-            PushKind::Tag => format!("tag {}", self.name),
+            RefKind::Branch => self.name.clone(),
+            RefKind::Tag => format!("tag {}", self.name),
         }
     }
 }
@@ -94,9 +94,10 @@ pub(super) fn settings(repo: &gix::Repository) -> Result<Settings, HostFailure> 
     Settings::resolve(repo, &UserGit::load()?)
 }
 
-/// What to push: a branch, the current one when neither is named, or a tag.
+/// What to push or fetch: a branch (the default one when it is not
+/// named) or a tag.
 #[derive(Debug, Clone, Copy)]
-pub(crate) enum Pushed<'a> {
+pub(crate) enum Named<'a> {
     Branch(Option<&'a str>),
     Tag(&'a str),
 }
@@ -106,7 +107,7 @@ pub(crate) enum Pushed<'a> {
 /// `root`.
 pub(crate) fn target(
     root: PathBuf,
-    pushed: Pushed<'_>,
+    pushed: Named<'_>,
     remote: Option<&str>,
     interrupt: &AtomicBool,
 ) -> Result<PushTarget, RemoteError> {
@@ -118,7 +119,7 @@ pub(crate) fn target(
         )));
     }
     let (kind, name, tip, commit, tags, remote) = match pushed {
-        Pushed::Branch(branch) => {
+        Named::Branch(branch) => {
             // The remote-tracking branch's reflog records who pushed.
             settings.identity().map_err(host)?;
             let branch = match branch {
@@ -134,17 +135,18 @@ pub(crate) fn target(
                 .map_err(|_| RemoteError::NoBranch(branch.clone()))?
                 .detach();
             let remote = remote_name(&settings, &branch, remote)?;
-            (PushKind::Branch, branch, tip, tip, vec![], remote)
+            (RefKind::Branch, branch, tip, tip, vec![], remote)
         }
-        Pushed::Tag(tag) => {
+        Named::Tag(tag) => {
             let full = tag_name(tag).ok_or(RemoteError::TagName)?;
             let tip = direct(&repo, full.as_bstr().to_string().as_str())
                 .map_err(host)?
                 .ok_or_else(|| RemoteError::NoTag(tag.to_owned()))?;
-            let (commit, tags) = tag_chain(&repo, tip, tag)?;
+            let (commit, tags) =
+                tag_chain(&repo, tip, tag)?.ok_or_else(|| RemoteError::NoTag(tag.to_owned()))?;
             let current = head_branch(&repo)?;
             let remote = remote_name(&settings, current.as_deref().unwrap_or_default(), remote)?;
-            (PushKind::Tag, tag.to_owned(), tip, commit, tags, remote)
+            (RefKind::Tag, tag.to_owned(), tip, commit, tags, remote)
         }
     };
     let configured = settings
@@ -197,7 +199,10 @@ pub(super) fn remote_name(
 /// tag objects, or `None` if it or a reference it names does not exist, or
 /// the chain is longer than git follows. A reference that cannot be read is
 /// a failure.
-fn direct(repo: &gix::Repository, reference: &str) -> Result<Option<ObjectId>, HostFailure> {
+pub(super) fn direct(
+    repo: &gix::Repository,
+    reference: &str,
+) -> Result<Option<ObjectId>, HostFailure> {
     // Names stay bytes: a symbolic target need not be UTF-8.
     let Ok(mut name) = gix::refs::FullName::try_from(reference) else {
         return Ok(None);
@@ -218,21 +223,24 @@ fn direct(repo: &gix::Repository, reference: &str) -> Result<Option<ObjectId>, H
 }
 
 /// The commit a tag pointing at `tip` names, and the tag objects on the way
-/// there. A tag naming a tree or blob is refused: a push carries commits.
-fn tag_chain(
+/// there, or `None` if one of those objects is not in the repository. A tag
+/// naming a tree or blob is refused: pushes and fetches carry commits.
+pub(super) fn tag_chain(
     repo: &gix::Repository,
     tip: ObjectId,
     tag: &str,
-) -> Result<(ObjectId, Vec<ObjectId>), RemoteError> {
+) -> Result<Option<(ObjectId, Vec<ObjectId>)>, RemoteError> {
     let mut chain = vec![];
     let mut at = tip;
     loop {
-        let object = repo
+        let Some(object) = repo
             .try_find_object(at)
             .map_err(|e| host(git_failure("tags", &e)))?
-            .ok_or_else(|| RemoteError::NoTag(tag.to_owned()))?;
+        else {
+            return Ok(None);
+        };
         match object.kind {
-            gix::object::Kind::Commit => return Ok((at, chain)),
+            gix::object::Kind::Commit => return Ok(Some((at, chain))),
             gix::object::Kind::Tag if chain.len() < MAX_TAG_CHAIN => {
                 chain.push(at);
                 at = object
@@ -313,8 +321,8 @@ pub(crate) fn pack(
     // Checked before anything else: a reference that moved since it was
     // resolved is not up to date merely because the server has its old tip.
     let now = match target.kind {
-        PushKind::Branch => peeled(&repo, &target.reference()),
-        PushKind::Tag => direct(&repo, &target.reference()),
+        RefKind::Branch => peeled(&repo, &target.reference()),
+        RefKind::Tag => direct(&repo, &target.reference()),
     };
     if now.map_err(host)? != Some(target.tip) {
         return Err(RemoteError::Moved(target.label()));
@@ -323,7 +331,7 @@ pub(crate) fn pack(
         return Ok(None);
     }
     if !old.is_null() {
-        if target.kind == PushKind::Tag {
+        if target.kind == RefKind::Tag {
             return Err(RemoteError::TagExists(target.name.clone()));
         }
         match ancestor(&repo, old, target.tip, MAX_ANCESTRY, interrupt).map_err(host)? {
@@ -550,7 +558,7 @@ mod tests {
     ) -> Result<PushTarget, RemoteError> {
         target(
             dir.path().into(),
-            Pushed::Branch(branch),
+            Named::Branch(branch),
             remote,
             &AtomicBool::new(false),
         )
@@ -751,7 +759,7 @@ mod tests {
     fn tag_target(dir: &tempfile::TempDir, tag: &str) -> Result<PushTarget, RemoteError> {
         target(
             dir.path().into(),
-            Pushed::Tag(tag),
+            Named::Tag(tag),
             None,
             &AtomicBool::new(false),
         )
@@ -784,7 +792,7 @@ mod tests {
         tag_ref(&repo, &broken, Target::Object(missing));
 
         let resolved = tag_target(&dir, &plain).unwrap();
-        assert_eq!(resolved.kind, PushKind::Tag);
+        assert_eq!(resolved.kind, RefKind::Tag);
         assert_eq!(resolved.reference(), format!("refs/tags/{plain}"));
         assert_eq!((resolved.tip, resolved.commit), (head, head));
         assert!(resolved.tags.is_empty());

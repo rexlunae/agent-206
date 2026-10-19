@@ -30,8 +30,8 @@ use std::{
 /// Longest model-facing tool name; the strictest limit of the supported
 /// provider protocols.
 pub const MAX_NAME: usize = 64;
-const MAX_DESCRIPTION: usize = 4096;
-const MAX_SCHEMA: usize = 32 * 1024;
+pub(crate) const MAX_DESCRIPTION: usize = 4096;
+pub(crate) const MAX_SCHEMA: usize = 32 * 1024;
 /// Most tools offered to a model in one request.
 pub const MAX_TOOLS: usize = 128;
 /// Longest tool result text kept in the conversation and sent to the model.
