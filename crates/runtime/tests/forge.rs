@@ -858,10 +858,22 @@ async fn gitea_answers_are_read_page_by_page_until_one_is_empty() {
     // the result says so rather than claiming the requested state.
     let arguments = json!({"title": title, "branch": branch, "base": base, "draft": false});
     let (record, text) = rig
-        .approved(CREATE, arguments, ApprovalDecision::Approve)
+        .approved(CREATE, arguments.clone(), ApprovalDecision::Approve)
         .await;
     assert_eq!(record.state, ToolCallState::Succeeded, "{:?}", record.error);
     let answer = result(text);
     assert_eq!(answer["pull_request"]["draft"], true);
     assert_eq!(answer["draft_as_requested"], false);
+    // An older Gitea does not report drafts: that is unknown, not a match.
+    let mut older = pull(11, &branch, Some(here), false);
+    older.as_object_mut().unwrap().remove("draft");
+    rig.api
+        .answer(&format!("{repo}/pulls"), StatusCode::CREATED, older);
+    let (record, text) = rig
+        .approved(CREATE, arguments, ApprovalDecision::Approve)
+        .await;
+    assert_eq!(record.state, ToolCallState::Succeeded, "{:?}", record.error);
+    let answer = result(text);
+    assert_eq!(answer["pull_request"]["draft"], Value::Null);
+    assert_eq!(answer["draft_as_requested"], Value::Null);
 }

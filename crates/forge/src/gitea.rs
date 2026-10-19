@@ -19,9 +19,8 @@ struct Pull {
     number: u64,
     title: String,
     state: String,
-    /// Absent from older versions, which then report none.
-    #[serde(default)]
-    draft: bool,
+    /// Absent from older versions.
+    draft: Option<bool>,
     #[serde(default)]
     merged: bool,
     user: Option<User>,

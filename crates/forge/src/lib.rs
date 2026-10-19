@@ -118,7 +118,8 @@ pub struct PullRequest {
     pub number: u64,
     pub title: String,
     pub state: State,
-    pub draft: bool,
+    /// `None` when the forge's answer does not say (older Gitea).
+    pub draft: Option<bool>,
     pub author: Option<String>,
     /// The branch it merges from, and the one it merges into.
     pub source: String,

@@ -15,10 +15,9 @@ struct MergeRequest {
     iid: u64,
     title: String,
     state: String,
-    #[serde(default)]
-    draft: bool,
-    #[serde(default)]
-    work_in_progress: bool,
+    draft: Option<bool>,
+    /// The older name for `draft`.
+    work_in_progress: Option<bool>,
     author: Option<User>,
     source_branch: String,
     target_branch: String,
@@ -147,7 +146,10 @@ fn convert(request: MergeRequest, with_body: bool) -> PullRequest {
         number: request.iid,
         title: label(&request.title),
         state,
-        draft: request.draft || request.work_in_progress,
+        draft: match (request.draft, request.work_in_progress) {
+            (None, None) => None,
+            (draft, old) => Some(draft.unwrap_or(false) || old.unwrap_or(false)),
+        },
         author: request.author.map(|user| label(&user.username)),
         source: label(&request.source_branch),
         target: label(&request.target_branch),

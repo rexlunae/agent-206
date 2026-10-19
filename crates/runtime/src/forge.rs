@@ -167,7 +167,7 @@ impl ForgeHost {
     fn create_spec() -> ToolSpec {
         ToolSpec {
             name: CREATE.into(),
-            description: "Open a pull request (GitLab merge request) on the forge that hosts one of the project's git remotes, proposing a branch already pushed there (see git_push) for merging into another. The user approves each call. Returns the new pull request, and `draft_as_requested` false when the forge did not mark it a draft (or not) as asked.".into(),
+            description: "Open a pull request (GitLab merge request) on the forge that hosts one of the project's git remotes, proposing a branch already pushed there (see git_push) for merging into another. The user approves each call. Returns the new pull request, with `draft_as_requested` false when the forge did not mark it a draft (or not) as asked, and null when the forge does not report drafts.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -306,8 +306,9 @@ impl ForgeHost {
                 let body = forge.post(change).await?;
                 let pull = repository.parse_pull_request(&body)?;
                 // Gitea and Forgejo read drafts from title prefixes an
-                // instance may configure, so say when the forge disagrees.
-                let draft_as_requested = pull.draft == draft;
+                // instance may configure, so say when the forge disagrees,
+                // or that it does not say.
+                let draft_as_requested = pull.draft.map(|reported| reported == draft);
                 return Ok(json!({
                     "remote": remote,
                     "repository": repository.name(),

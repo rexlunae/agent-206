@@ -13,8 +13,7 @@ struct Pull {
     number: u64,
     title: String,
     state: String,
-    #[serde(default)]
-    draft: bool,
+    draft: Option<bool>,
     merged_at: Option<String>,
     user: Option<User>,
     head: Branch,

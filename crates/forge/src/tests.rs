@@ -212,7 +212,7 @@ fn github_lists_tell_merged_from_closed() {
     assert_eq!(first.source, page[0]["head"]["ref"]);
     assert_eq!(first.head.as_deref(), page[0]["head"]["sha"].as_str());
     assert_eq!(first.body, None);
-    assert!(all.pull_requests[1].draft);
+    assert_eq!(all.pull_requests[1].draft, Some(true));
 
     // A full page may not be all of them.
     let full: Vec<Value> = (0..PAGE as u64)
@@ -434,7 +434,7 @@ fn gitlab_merge_requests_checks_and_approvals() {
     let read = repository.parse_pull_request(&bytes(&request)).unwrap();
     assert_eq!(read.number, 12);
     assert_eq!(read.state, State::Merged);
-    assert!(read.draft);
+    assert_eq!(read.draft, Some(true));
     assert_eq!(read.body.as_deref(), request["description"].as_str());
     let calls = repository.checks_calls(&read).unwrap();
     assert_eq!(calls.len(), 1);
@@ -706,7 +706,12 @@ fn gitea_checks_and_reviews() {
     let mut answer = gitea_pull(6, "open", false, &word(), 1);
     answer["draft"] = json!(true);
     let pull = repository.parse_pull_request(&bytes(&answer)).unwrap();
-    assert!(pull.draft);
+    assert_eq!(pull.draft, Some(true));
+    // An older Gitea does not say.
+    let older = repository
+        .parse_pull_request(&bytes(&gitea_pull(6, "open", false, &word(), 1)))
+        .unwrap();
+    assert_eq!(older.draft, None);
     assert_eq!(pull.body.as_deref(), answer["body"].as_str());
     let head = pull.head.clone().unwrap();
     let calls = repository.checks_calls(&pull).unwrap();
