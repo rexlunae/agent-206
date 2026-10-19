@@ -114,10 +114,15 @@ fn pick<'a>(presets: &'a [ProviderPreset], answer: &str) -> Option<&'a ProviderP
     if let Some(id) = answer.strip_prefix("id:") {
         return presets.iter().find(|p| p.id == id);
     }
-    match answer.parse::<usize>() {
-        Ok(number) => number.checked_sub(1).and_then(|i| presets.get(i)),
-        Err(_) => presets.iter().find(|p| p.id == answer),
+    if !answer.is_empty() && answer.bytes().all(|b| b.is_ascii_digit()) {
+        // Digits are only ever a position, even past `usize`.
+        return answer
+            .parse::<usize>()
+            .ok()
+            .and_then(|number| number.checked_sub(1))
+            .and_then(|i| presets.get(i));
     }
+    presets.iter().find(|p| p.id == answer)
 }
 
 fn choose(presets: &[ProviderPreset]) -> Result<Option<&ProviderPreset>> {
@@ -786,5 +791,10 @@ mod tests {
         assert_eq!(pick(&presets, "0"), None);
         assert_eq!(pick(&presets, "3"), None);
         assert_eq!(pick(&presets, "id:3"), None);
+        // Digits too long for a position never fall back to an id.
+        let huge = preset("9".repeat(40));
+        let presets = [named.clone(), huge.clone()];
+        assert_eq!(pick(&presets, &huge.id), None);
+        assert_eq!(pick(&presets, &format!("id:{}", huge.id)), Some(&huge));
     }
 }
