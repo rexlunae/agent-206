@@ -433,6 +433,29 @@ pub mod host {
             _ => Err(unexpected()),
         }
     }
+    /// The repository's tags, by name.
+    pub fn git_tags() -> Result<GitTags, HostFailure> {
+        match call(&HostRequest::GitTags)? {
+            HostReply::Tags(tags) => Ok(tags),
+            _ => Err(unexpected()),
+        }
+    }
+    /// Create the tag `name` at `target` (`HEAD` when `None`), annotated
+    /// with `message` when one is given.
+    pub fn git_create_tag(
+        name: &str,
+        target: Option<&str>,
+        message: Option<&str>,
+    ) -> Result<GitTag, HostFailure> {
+        match call(&HostRequest::GitCreateTag {
+            name: name.into(),
+            target: target.map(Into::into),
+            message: message.map(Into::into),
+        })? {
+            HostReply::Tag(tag) => Ok(tag),
+            _ => Err(unexpected()),
+        }
+    }
     /// A unified diff of one file, staged or unstaged.
     pub fn git_diff(path: &str, staged: bool) -> Result<GitDiff, HostFailure> {
         match call(&HostRequest::GitDiff {

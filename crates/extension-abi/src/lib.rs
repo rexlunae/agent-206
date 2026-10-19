@@ -272,6 +272,18 @@ pub enum HostRequest {
         #[serde(default)]
         start: Option<String>,
     },
+    /// The repository's tags, by name.
+    GitTags,
+    /// Create the tag `name` at `target` (a local branch or a full commit
+    /// id; `HEAD` when absent), like `git tag <name> [<target>]`; with a
+    /// `message`, an annotated tag, like `git tag -a -m <message>`.
+    GitCreateTag {
+        name: String,
+        #[serde(default)]
+        target: Option<String>,
+        #[serde(default)]
+        message: Option<String>,
+    },
     /// Switch to the local branch `name`, like `git switch <name>`: the
     /// working tree and index change to its commit and `HEAD` names it.
     /// Refused unless the working tree and index match `HEAD`, and when a
@@ -320,6 +332,9 @@ pub enum HostReply {
     /// The branch a [`HostRequest::GitCreateBranch`] made, or the one a
     /// [`HostRequest::GitSwitchBranch`] made current.
     Branch(GitBranch),
+    Tags(GitTags),
+    /// The tag a [`HostRequest::GitCreateTag`] made.
+    Tag(GitTag),
     Patched(PatchResult),
     Fetched(FetchResponse),
     State(Option<ByteBuf>),
@@ -491,6 +506,24 @@ pub struct GitBranch {
     pub commit: String,
     /// `HEAD` is on this branch.
     pub current: bool,
+}
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitTags {
+    /// Sorted by name.
+    pub tags: Vec<GitTag>,
+    /// More tags exist than were listed.
+    pub truncated: bool,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitTag {
+    /// The short name, such as `v1.0` for `refs/tags/v1.0`.
+    pub name: String,
+    /// Full hexadecimal id of the commit it names, through any tag objects;
+    /// `None` when it names something other than a commit.
+    pub commit: Option<String>,
+    /// Whether it is an annotated tag (a tag object) rather than a plain
+    /// reference.
+    pub annotated: bool,
 }
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GitDiff {
