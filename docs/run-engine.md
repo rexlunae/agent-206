@@ -343,7 +343,7 @@ background sessions.
   window size from the gateway's side, so the kernel sends `SIGWINCH` to its
   foreground group as a resized terminal window would; it is not approved
   per call, like `poll`, and is `Conflict` for a session without a terminal
-  or one that has finished. On macOS the
+  or one that has finished or is being stopped. On macOS the
   terminal's controlling side is opened without close-on-exec and marked
   so immediately after, so a program the gateway starts in that instant can
   inherit it; Linux opens it close-on-exec.
