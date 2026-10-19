@@ -1,7 +1,7 @@
 id = "agent206.git"
 name = "Git"
-description = "Shows the status, history, branches and diffs of a project's git repository, stages and commits changes, and creates and switches branches, without running anything the repository configures."
-version = "0.5.0"
+description = "Shows the status, history, branches, tags and diffs of a project's git repository, stages and commits changes, creates and switches branches, and creates tags, without running anything the repository configures."
+version = "0.6.0"
 abi = 2
 capabilities = ["git_read", "git_write", "write_workspace"]
 
@@ -40,6 +40,32 @@ required = true
 name = "start"
 type = "string"
 description = "A local branch name or full commit id to start from. Defaults to HEAD."
+
+[[tools]]
+name = "git_tags"
+description = "List the repository's tags with the commit each names, marking annotated ones."
+capabilities = ["git_read"]
+
+[[tools]]
+name = "git_tag_create"
+description = "Create a tag at a commit, like `git tag <name> [<commit>]`, or with a message an annotated tag, like `git tag -a -m <message>`. The working tree, index and current branch stay as they are; the tag stays local until pushed. Refused when the tag exists, the repository has a reference-transaction hook, signs annotated tags (for an annotated tag), or user.name and user.email are not set."
+capabilities = ["git_write"]
+
+[[tools.params]]
+name = "name"
+type = "string"
+description = "The new tag's name, such as v1.2.0."
+required = true
+
+[[tools.params]]
+name = "commit"
+type = "string"
+description = "A local branch name or full commit id to tag. Defaults to HEAD."
+
+[[tools.params]]
+name = "message"
+type = "string"
+description = "Make an annotated tag with this message. Without one, the tag is a plain reference."
 
 [[tools]]
 name = "git_switch"
