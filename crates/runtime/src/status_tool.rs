@@ -12,11 +12,11 @@
 //! counted as missing rather than as zero.
 use crate::{
     gateway::Statuses,
-    tools::{ToolHost, ToolListing, ToolOutput, ToolRequest, ToolScope, ToolSpec},
+    tools::{self, ToolHost, ToolListing, ToolOutput, ToolRequest, ToolScope, ToolSpec},
 };
 use a206_core::{
-    Capability, ErrorKind, ErrorReport, Id, ModelKey, RunState, Snapshot, Tally, ToolPermission,
-    UsageTotal,
+    Capability, ErrorKind, ErrorReport, Id, ModelKey, RunState, Snapshot, Tally, Thread,
+    ToolBudget, ToolPermission, UsageTotal,
 };
 use futures_util::future::BoxFuture;
 use serde_json::{Value, json};
@@ -25,6 +25,14 @@ use std::collections::BTreeSet;
 pub const NAME: &str = "session_status";
 /// Most subagent conversations listed; the newest are kept.
 pub const MAX_SUBAGENTS: usize = 50;
+/// Longest text value reported, in bytes; longer ones are cut and end in `…`.
+pub const MAX_TEXT: usize = 512;
+/// Serialized bytes each list may use: the subagents get a quarter of the
+/// output limit and the three other lists an eighth each, so with the
+/// bounded text values the whole status stays under [`tools::MAX_OUTPUT`]
+/// and is never refused for its size.
+const SUBAGENT_ROOM: usize = tools::MAX_OUTPUT / 4;
+const LIST_ROOM: usize = tools::MAX_OUTPUT / 8;
 
 /// Why the status could not be read.
 #[derive(Debug, thiserror::Error)]
@@ -125,44 +133,54 @@ pub fn describe(
             .providers
             .iter()
             .find(|p| p.id == provider)
-            .map(|p| p.label.clone())
+            .map(|p| text(&p.label))
     };
-    let key = |key: &ModelKey| json!({"connection": connection(key.provider), "model": key.model});
+    let key =
+        |key: &ModelKey| json!({"connection": connection(key.provider), "model": text(&key.model)});
     let model = current.model.as_ref().map(|model| {
-        let info = state
+        let listed = state
             .catalogs
             .iter()
             .filter(|catalog| catalog.provider == model.provider)
-            .flat_map(|catalog| &catalog.models)
-            .find(|info| info.key == *model);
+            .find_map(|catalog| {
+                let info = catalog.models.iter().find(|info| info.key == *model)?;
+                Some((catalog, info))
+            });
         let mut value = key(model);
-        value["name"] = json!(info.map(|info| &info.name));
-        value["context_limit"] = json!(info.and_then(|info| info.context_limit));
-        value["output_limit"] = json!(info.and_then(|info| info.output_limit));
+        value["name"] = json!(listed.map(|(_, info)| text(&info.name)));
+        value["context_limit"] = json!(listed.and_then(|(_, info)| info.context_limit));
+        value["output_limit"] = json!(listed.and_then(|(_, info)| info.output_limit));
+        // Where the figures came from, and whether they have expired.
+        value["catalog"] = json!(listed.map(|(catalog, _)| json!({
+            "source": text(&catalog.source),
+            "fetched_at_unix": catalog.fetched_at,
+            "expires_at_unix": catalog.expires_at,
+            "stale": catalog.stale(now),
+        })));
         value
     });
     let parent = current.parent.map(|parent| {
         json!({
             "id": parent,
-            "title": state.threads.iter().find(|t| t.id == parent).map(|t| &t.title),
+            "title": state.threads.iter().find(|t| t.id == parent).map(|t| text(&t.title)),
         })
     });
     let project = current
         .project
         .and_then(|project| state.projects.iter().find(|p| p.id == project))
-        .map(|project| &project.name);
+        .map(|project| text(&project.name));
     let children: Vec<_> = state
         .threads
         .iter()
         .filter(|t| t.parent == Some(thread))
         .collect();
-    let subagents: Vec<_> = children
+    let subagents = children
         .iter()
         .skip(children.len().saturating_sub(MAX_SUBAGENTS))
         .map(|child| {
             json!({
                 "id": child.id,
-                "title": child.title,
+                "title": text(&child.title),
                 "state": state_name(&child.state),
                 "paused": child.paused,
             })
@@ -183,17 +201,23 @@ pub fn describe(
             "input_tokens": tally(&total.input_tokens),
             "output_tokens": tally(&total.output_tokens),
             // Units differ between providers, so costs are never summed.
-            "costs": total.costs.iter().map(|cost| json!({
-                "connection": connection(cost.provider),
-                "reported": cost.cost.sum,
-                "responses_without_it": cost.cost.unreported,
-            })).collect::<Vec<_>>(),
+            "costs": listing(
+                total.costs.len(),
+                total.costs.iter().map(|cost| json!({
+                    "connection": connection(cost.provider),
+                    "reported": cost.cost.sum,
+                    "responses_without_it": cost.cost.unreported,
+                })).collect(),
+                LIST_ROOM,
+                Keep::First,
+            ),
         })
     };
+    let budget = effective_budget(state, current);
     Ok(json!({
         "conversation": {
             "id": current.id,
-            "title": current.title,
+            "title": text(&current.title),
             "mode": current.mode.label(),
             "project": project,
             "parent": parent,
@@ -201,23 +225,91 @@ pub fn describe(
             "paused": current.paused,
         },
         "model": model,
-        "subagent_models": current.subagent_models.iter().map(key).collect::<Vec<_>>(),
+        "subagent_models": listing(
+            current.subagent_models.len(),
+            current.subagent_models.iter().map(key).collect(),
+            LIST_ROOM,
+            Keep::First,
+        ),
         "permissions": permissions.iter().map(|c| c.label()).collect::<Vec<_>>(),
+        // What the run engine enforces, which a parent's smaller limits lower.
         "limits_per_response": {
-            "model_requests": current.tool_budget.rounds,
-            "tool_calls": current.tool_budget.tool_calls,
-            "tokens": current.tool_budget.tokens,
+            "model_requests": budget.rounds,
+            "tool_calls": budget.tool_calls,
+            "tokens": budget.tokens,
         },
         "usage": {
             "this_conversation": usage(&current.usage_total),
             "with_subagents": usage(&UsageTotal::with_subagents(&state.threads, thread)),
         },
-        "subagents": {
-            "total": children.len(),
-            "newest": subagents,
-        },
+        "subagents": listing(children.len(), subagents, SUBAGENT_ROOM, Keep::Last),
         "gateway_time_unix": now,
     }))
+}
+
+/// The per-response limits a run of `thread` enforces: for each limit, the
+/// smallest of its own and every ancestor's, as the run engine applies them.
+fn effective_budget(state: &Snapshot, thread: &Thread) -> ToolBudget {
+    let mut budget = thread.tool_budget;
+    let mut next = thread.parent;
+    // At most one step per conversation, so even a malformed cycle ends.
+    for _ in 0..state.threads.len() {
+        let Some(parent) = next.and_then(|id| state.threads.iter().find(|t| t.id == id)) else {
+            break;
+        };
+        budget = budget.intersect(parent.tool_budget);
+        next = parent.parent;
+    }
+    budget
+}
+
+/// Which end of a list to keep when it does not fit.
+#[derive(Clone, Copy)]
+enum Keep {
+    First,
+    Last,
+}
+
+/// `items` (out of `total`) that fit in `room` serialized bytes, kept from
+/// the front or the back, with how many there are and how many were left out.
+fn listing(total: usize, items: Vec<Value>, room: usize, keep: Keep) -> Value {
+    let mut room = room;
+    let mut fits = |item: &Value| {
+        // The item and the comma separating it.
+        let size = item.to_string().len() + 1;
+        let fits = size <= room;
+        room = room.saturating_sub(size);
+        fits
+    };
+    let mut listed: Vec<Value> = match keep {
+        Keep::First => items.into_iter().take_while(|item| fits(item)).collect(),
+        Keep::Last => items
+            .into_iter()
+            .rev()
+            .take_while(|item| fits(item))
+            .collect(),
+    };
+    if let Keep::Last = keep {
+        listed.reverse();
+    }
+    json!({
+        "total": total,
+        "listed": listed.len(),
+        "omitted": total - listed.len(),
+        "items": listed,
+    })
+}
+
+/// `value` cut to [`MAX_TEXT`] bytes at a character boundary.
+fn text(value: &str) -> String {
+    if value.len() <= MAX_TEXT {
+        return value.into();
+    }
+    let mut end = MAX_TEXT;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &value[..end])
 }
 
 fn state_name(state: &RunState) -> &'static str {

@@ -1,6 +1,6 @@
 use super::*;
 use crate::gateway::Gateway;
-use a206_core::{Catalog, Mode, ModelInfo, ProviderConfig, Thread, Usage};
+use a206_core::{Catalog, Mode, ModelInfo, ProviderConfig, Thread, ToolBudget, Usage};
 
 fn word() -> String {
     Id::new_v4().simple().to_string()
@@ -43,11 +43,13 @@ async fn a_conversation_reads_its_model_limits_permissions_and_subagents() {
         model: word(),
     };
     let (name, context) = (word(), number());
+    let now = number();
+    let (fetched, expires) = (now - 1, now + number());
     state.catalogs.push(Catalog {
         provider,
         source: word(),
-        fetched_at: number(),
-        expires_at: number(),
+        fetched_at: fetched,
+        expires_at: expires,
         models: vec![ModelInfo {
             key: model.clone(),
             name: name.clone(),
@@ -72,15 +74,16 @@ async fn a_conversation_reads_its_model_limits_permissions_and_subagents() {
         .collect();
     thread_mut(&mut state, children[children.len() - 1]).paused = true;
     let permissions = BTreeSet::from([Capability::ReadWorkspace]);
-    let now = number();
 
     let status = describe(&state, id, &permissions, now).unwrap();
     let conversation = &status["conversation"];
     assert_eq!(conversation["id"], json!(id));
     assert_eq!(conversation["mode"], json!(Mode::Code.label()));
     assert_eq!(conversation["parent"]["id"], json!(parent));
+    let mut reported = status["model"].clone();
+    let catalog = reported["catalog"].take();
     assert_eq!(
-        status["model"],
+        reported,
         json!({
             "connection": label,
             "model": model.model,
@@ -88,8 +91,16 @@ async fn a_conversation_reads_its_model_limits_permissions_and_subagents() {
             "context_limit": context,
             // Not reported by the models API: unknown, never zero.
             "output_limit": null,
+            "catalog": null,
         })
     );
+    assert_eq!(catalog["fetched_at_unix"], json!(fetched));
+    assert_eq!(catalog["expires_at_unix"], json!(expires));
+    assert_eq!(catalog["stale"], json!(false));
+    // Once the catalog expires its figures are marked stale.
+    let expired = describe(&state, id, &permissions, expires).unwrap();
+    assert_eq!(expired["model"]["catalog"]["stale"], json!(true));
+    assert_eq!(expired["model"]["context_limit"], json!(context));
     assert_eq!(
         status["permissions"],
         json!([Capability::ReadWorkspace.label()])
@@ -97,7 +108,11 @@ async fn a_conversation_reads_its_model_limits_permissions_and_subagents() {
     assert_eq!(status["gateway_time_unix"], json!(now));
     // Only the newest subagents are listed, with how many there are.
     assert_eq!(status["subagents"]["total"], json!(children.len()));
-    let listed = status["subagents"]["newest"].as_array().unwrap();
+    assert_eq!(
+        status["subagents"]["omitted"],
+        json!(children.len() - MAX_SUBAGENTS)
+    );
+    let listed = status["subagents"]["items"].as_array().unwrap();
     assert_eq!(listed.len(), MAX_SUBAGENTS);
     let newest = listed.last().unwrap();
     assert_eq!(newest["id"], json!(children[children.len() - 1]));
@@ -115,6 +130,88 @@ async fn a_conversation_reads_its_model_limits_permissions_and_subagents() {
     let unlisted = describe(&state, id, &permissions, now).unwrap();
     assert_eq!(unlisted["model"]["context_limit"], Value::Null);
     assert_eq!(unlisted["model"]["name"], Value::Null);
+    assert_eq!(unlisted["model"]["catalog"], Value::Null);
+}
+
+#[tokio::test]
+async fn limits_are_the_smallest_along_the_conversations_ancestry() {
+    let (_dir, _gateway, mut state) = state();
+    let grandparent = thread(&mut state, None);
+    let parent = thread(&mut state, Some(grandparent));
+    let id = thread(&mut state, Some(parent));
+    let small = || 1 + (number() % 100) as u32;
+    let (rounds, calls, tokens) = (small(), small(), number());
+    thread_mut(&mut state, id).tool_budget = ToolBudget {
+        rounds: rounds + 1,
+        tool_calls: calls,
+        tokens: None,
+    };
+    // A parent lowered after the subagent started still bounds it.
+    thread_mut(&mut state, parent).tool_budget = ToolBudget {
+        rounds,
+        tool_calls: calls + 1,
+        tokens: Some(tokens + 1),
+    };
+    thread_mut(&mut state, grandparent).tool_budget = ToolBudget {
+        rounds: rounds + 2,
+        tool_calls: calls + 2,
+        tokens: Some(tokens),
+    };
+    let status = describe(&state, id, &BTreeSet::new(), number()).unwrap();
+    assert_eq!(
+        status["limits_per_response"],
+        json!({"model_requests": rounds, "tool_calls": calls, "tokens": tokens})
+    );
+}
+
+#[tokio::test]
+async fn a_status_with_long_names_and_lists_stays_within_the_output_limit() {
+    let (_dir, _gateway, mut state) = state();
+    let provider = Id::new_v4();
+    let long = || word().repeat(MAX_TEXT);
+    state.settings.providers.push(ProviderConfig {
+        id: provider,
+        label: long(),
+        base_url: format!("https://{}.example", word()),
+        credential: None,
+        api: Default::default(),
+    });
+    let id = thread(&mut state, None);
+    let models: BTreeSet<_> = (0..200)
+        .map(|_| ModelKey {
+            provider,
+            model: long(),
+        })
+        .collect();
+    thread_mut(&mut state, id).title = long();
+    thread_mut(&mut state, id).subagent_models = models.clone();
+    for _ in 0..MAX_SUBAGENTS {
+        let child = thread(&mut state, Some(id));
+        thread_mut(&mut state, child).title = long();
+    }
+    for _ in 0..200 {
+        thread_mut(&mut state, id).usage_total.record(
+            Id::new_v4(),
+            &Usage {
+                input_tokens: None,
+                output_tokens: None,
+                cost: Some(number() as f64),
+            },
+        );
+    }
+
+    let status = describe(&state, id, &BTreeSet::new(), number()).unwrap();
+    assert!(status.to_string().len() <= tools::MAX_OUTPUT);
+    let listed = &status["subagent_models"];
+    assert_eq!(listed["total"], json!(models.len()));
+    let shown = listed["items"].as_array().unwrap().len();
+    assert!(shown > 0 && shown < models.len());
+    assert_eq!(listed["omitted"], json!(models.len() - shown));
+    let title = status["conversation"]["title"].as_str().unwrap();
+    assert!(title.len() <= MAX_TEXT + '…'.len_utf8() && title.ends_with('…'));
+    let costs = &status["usage"]["this_conversation"]["costs"];
+    assert_eq!(costs["total"], json!(200));
+    assert!(costs["omitted"].as_u64().unwrap() > 0);
 }
 
 #[tokio::test]
@@ -153,8 +250,8 @@ async fn usage_counts_what_providers_reported_and_marks_what_is_missing() {
     assert_eq!(own["output_tokens"]["responses_without_it"], json!(1));
     assert_eq!(own["output_tokens"]["exact"], json!(false));
     // A connection that is no longer configured is named as unknown.
-    assert_eq!(own["costs"][0]["connection"], Value::Null);
-    assert_eq!(own["costs"][0]["reported"], json!(cost));
+    assert_eq!(own["costs"]["items"][0]["connection"], Value::Null);
+    assert_eq!(own["costs"]["items"][0]["reported"], json!(cost));
 
     let all = &status["usage"]["with_subagents"];
     assert_eq!(all["responses"], json!(2));
@@ -162,7 +259,7 @@ async fn usage_counts_what_providers_reported_and_marks_what_is_missing() {
     assert_eq!(all["input_tokens"]["reported"], json!(input + child_input));
     // An unfinished request may have used tokens nobody reported.
     assert_eq!(all["input_tokens"]["exact"], json!(false));
-    assert_eq!(all["costs"][0]["responses_without_it"], json!(1));
+    assert_eq!(all["costs"]["items"][0]["responses_without_it"], json!(1));
 }
 
 #[tokio::test]

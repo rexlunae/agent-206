@@ -570,15 +570,19 @@ the same name. It takes no arguments and returns, as JSON, what the model may
 know about the conversation it answers in: its ID, title, mode, project name,
 parent conversation and run state; its model with the connection's name and
 the model's name, context limit and output limit as the provider's models API
-reported them (null when the catalog does not list them); its permitted
+reported them (null when the catalog does not list them), with the catalog's
+source, retrieval time, expiry and whether it is stale; its permitted
 subagent models; the permissions its current tool scope holds; its
-per-response limits (model requests, tool calls, tokens); the usage providers
+per-response limits (model requests, tool calls, tokens) as the run engine
+enforces them, the smallest along its ancestry; the usage providers
 reported for it alone and with its subagents (`UsageTotal`: responses,
 unfinished requests, token sums with how many responses left each out and
 whether the sum is exact, and costs per connection, never summed across
-connections); its subagent conversations (the 50 newest, with the total) with
-their states and whether they are paused; and the gateway clock in Unix
-seconds. A conversation reads only itself and the subagents it started, never
+connections); its subagent conversations (the 50 newest) with their states
+and whether they are paused; and the gateway clock in Unix seconds. Text
+values are cut to 512 bytes, and each list gives its total and how many it
+left out, keeping only what fits its share of the output limit, so the status
+is never refused for its size. A conversation reads only itself and the subagents it started, never
 another conversation. The tool changes nothing, uses no capability, and like
 every tool is denied until the user permits it. RustyClaw's lookup of another
 session by key is not ported: `subagent_status` covers the conversations a
