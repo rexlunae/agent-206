@@ -198,17 +198,20 @@ pub(super) fn remote_name(
 /// the chain is longer than git follows. A reference that cannot be read is
 /// a failure.
 fn direct(repo: &gix::Repository, reference: &str) -> Result<Option<ObjectId>, HostFailure> {
-    let mut name = reference.to_owned();
+    // Names stay bytes: a symbolic target need not be UTF-8.
+    let Ok(mut name) = gix::refs::FullName::try_from(reference) else {
+        return Ok(None);
+    };
     for _ in 0..=MAX_SYMBOLIC_DEPTH {
         let Some(found) = repo
-            .try_find_reference(name.as_str())
+            .try_find_reference(&name)
             .map_err(|e| git_failure("tags", &e))?
         else {
             return Ok(None);
         };
         match found.target() {
             gix::refs::TargetRef::Object(id) => return Ok(Some(id.to_owned())),
-            gix::refs::TargetRef::Symbolic(next) => name = next.as_bstr().to_string(),
+            gix::refs::TargetRef::Symbolic(next) => name = next.to_owned(),
         }
     }
     Ok(None)
@@ -797,6 +800,26 @@ mod tests {
             (resolved.tip, resolved.tags.clone()),
             (object, vec![object])
         );
+        // One whose target's name is not UTF-8 follows that exact name, not
+        // a lossy copy of it, even when the copy names another tag.
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let (bytes, lossy) = (nonce(), nonce());
+            let mut raw = format!("{bytes}-").into_bytes();
+            raw.push(0xff);
+            let tags = dir.path().join(".git/refs/tags");
+            std::fs::write(
+                tags.join(std::ffi::OsStr::from_bytes(&raw)),
+                format!("{object}\n"),
+            )
+            .unwrap();
+            tag_ref(&repo, &format!("{bytes}-\u{fffd}"), Target::Object(head));
+            let mut pointer = b"ref: refs/tags/".to_vec();
+            pointer.extend_from_slice(&raw);
+            pointer.push(b'\n');
+            std::fs::write(tags.join(&lossy), pointer).unwrap();
+            assert_eq!(tag_target(&dir, &lossy).unwrap().tip, object);
+        }
 
         assert!(matches!(
             tag_target(&dir, &of_blob),
