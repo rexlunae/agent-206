@@ -280,7 +280,7 @@ mod tests {
     use super::*;
     #[test]
     fn credentials_require_v17_before_any_secret_is_serialized() {
-        for version in [0, 10, 11, 12, 13, 14] {
+        for version in 0..=18 {
             for request in [
                 Request::CredentialPage {
                     version: 1,
@@ -295,7 +295,7 @@ mod tests {
                     value: a206_vault_channel::Secret::new(uuid::Uuid::new_v4().to_string()),
                 },
             ] {
-                assert_eq!(reviewed_supported(version, &request).is_ok(), version >= 14);
+                assert_eq!(reviewed_supported(version, &request).is_ok(), version >= 17);
             }
             assert!(reviewed_supported(version, &Request::Status).is_ok());
         }
