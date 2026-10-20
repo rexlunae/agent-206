@@ -176,6 +176,12 @@ invocations and relays gateway-authorized host calls (`a206/docs/plugin-api.md`)
 
 ## Onboarding, TUI and desktop UX
 
+Terminal interaction acceptance is blocked by the macOS PTY findings in
+[#153](https://github.com/rexlunae/agent-206/issues/153): overlapping/truncated
+initial output and no visible command-palette response to Ctrl+K or Tab/Ctrl+K.
+The attempt did not reach Security or create a vault. Compilation and launch
+alone do not establish keyboard or credential-entry parity.
+
 | RustyClaw capability | Agent 206 status | How it should land |
 | --- | --- | --- |
 | Onboard wizard: provider, key, vault, workspace, messaging, skills (`rustyclaw-onboard/src/*`) | partial (owner: web client thread): CLI `setup` walkthrough (gateway, vault, TOTP, pairing); a Get started page in every GUI client (`a206/crates/ui/src/welcome.rs`) lists gateway, vault, authenticator, pairing, provider and first-conversation steps from live gateway, broker and snapshot state, with the Security page vault card embedded (create/unlock/enroll/pair through native or encrypted broker sessions); the workspace links to it while a step the snapshot can see is unfinished; a "When you're ready" list adds project, messenger (done only once a turned-on messenger reports Connected) and skill steps, linked to their pages and kept out of the count | A provider-key step in the walkthrough (Security API-key entry is available) |
