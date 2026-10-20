@@ -137,8 +137,14 @@ and support packaged binaries through `A206_TEST_BINARY`. Windows smoke coverage
 awaits gateway named-pipe support. The
 macOS native bundle and release WASM web assets have been built. Browser UI checks
 cover conversation creation, full-width layout, theme persistence, explicit light/dark schemes, compact split-pane composers, independent mode controls, attachment staging/removal/re-selection, keyboard entry, usage/account popovers, and onscreen bottom-edge selectors. TUI has been
-compiled and launched against the pinned Dioxus 0.7 fork. It renders, but its narrow
-terminal layout, graphics fallbacks and interaction still need manual QA.
+compiled and launched against the pinned Dioxus 0.7 fork. A macOS PTY attempt at
+`91b8e57` (140 columns, 45 rows, `TERM=xterm-256color`) produced overlapping or
+truncated text and an unsupported-image marker. Ctrl+K and Tab/Ctrl+K did not
+visibly open navigation in the captured output. The owned session exited with
+Ctrl+C; the disposable profile's gateway remained stopped and no vault was
+created. This is failed terminal acceptance, tracked in [#153](https://github.com/rexlunae/agent-206/issues/153),
+not a completed Security interaction check. Layout, graphics fallbacks and
+keyboard navigation still need investigation and acceptance.
 Provider UI checks cover grouped choices, Moonshot endpoint setup, custom preset
 creation/hiding/deletion, and restoring a bundled override with refreshed fields.
 
