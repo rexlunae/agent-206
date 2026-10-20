@@ -695,10 +695,6 @@ impl Gateway {
             catalog = tools::catalog(&self.tool_hosts, &view.scope) => catalog,
             _ = run.cancel.cancelled() => return None,
         };
-        for unavailable in &catalog.unavailable {
-            let _source = tracing::warn_span!("tools", source = %unavailable.source).entered();
-            crate::error::record("list_tools", &unavailable.error);
-        }
         let offered = catalog
             .tools
             .values()

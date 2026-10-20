@@ -40,6 +40,26 @@ mod tests {
 
     #[tokio::test]
     async fn unreadable_services_are_reported_in_the_tool_listing() {
+        use std::sync::{Arc, Mutex};
+        use tracing::instrument::WithSubscriber;
+
+        #[derive(Clone, Default)]
+        struct Buffer(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Buffer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buffer = Buffer::default();
+        let writer = buffer.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
         let root = tempfile::tempdir().unwrap();
         let gateway = Gateway::open(root.path()).unwrap();
         let host = SearchHost::new(gateway.searcher());
@@ -63,6 +83,7 @@ mod tests {
                 programs: vec![],
             },
         )
+        .with_subscriber(subscriber)
         .await;
         assert!(!listing.tools.contains_key(SEARCH));
         assert!(listing.tools.contains_key(UPDATE));
@@ -72,5 +93,9 @@ mod tests {
         assert_eq!(unavailable.error.kind, a206_core::ErrorKind::Internal);
         assert!(unavailable.error.message.contains("state lock poisoned"));
         assert!(unavailable.error.correlation.is_some());
+        let logged = String::from_utf8(buffer.0.lock().unwrap().clone()).unwrap();
+        let correlation = unavailable.error.correlation.unwrap().to_string();
+        assert_eq!(logged.matches(&correlation).count(), 1, "{logged}");
+        assert!(logged.contains("state lock poisoned"), "{logged}");
     }
 }

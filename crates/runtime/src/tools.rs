@@ -76,7 +76,8 @@ pub struct ToolScope {
 pub struct ToolListing {
     pub tools: Vec<ToolSpec>,
     /// Sources that could not list their tools, such as a server that failed
-    /// to start; the rest of the listing is still usable.
+    /// to start; the rest of the listing is still usable. The catalog collector
+    /// records these reports; hosts return them without logging them again.
     pub unavailable: Vec<UnavailableTools>,
 }
 
@@ -172,7 +173,7 @@ pub(crate) async fn catalog(hosts: &[Arc<dyn ToolHost>], scope: &ToolScope) -> C
     let refuse = |catalog: &mut Catalog, error: OfferError| {
         catalog.unavailable.push(UnavailableTools {
             source: "gateway".into(),
-            error: crate::error::handle("list_tools", &error),
+            error: crate::error::report(&error),
         });
     };
     for host in hosts {
@@ -215,6 +216,10 @@ pub(crate) async fn catalog(hosts: &[Arc<dyn ToolHost>], scope: &ToolScope) -> C
             .collect();
         catalog.tools = keep;
         refuse(&mut catalog, OfferError::TooMany);
+    }
+    for unavailable in &catalog.unavailable {
+        let _source = tracing::warn_span!("tools", source = %unavailable.source).entered();
+        crate::error::record("list_tools", &unavailable.error);
     }
     catalog
 }
