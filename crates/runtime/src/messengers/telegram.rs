@@ -3,9 +3,9 @@
 //! ([`AuthScheme::TelegramBot`]); this side never sees it.
 //!
 //! Updates are confirmed by the next poll's offset. The caller keeps the
-//! offset across reconnects, so while the gateway runs a message is handled
-//! at most once; the offset is not persisted, so if the gateway stops before
-//! the next poll, Telegram delivers that batch again after a restart.
+//! offset across reconnects and saves it, with the updates of the next batch
+//! whose handling started, in the gateway's state, so a message is handled
+//! at most once across restarts too.
 use super::{Account, Api, Batch, Event, Inbound, MessengerError, Result, split};
 use a206_broker::{AuthScheme, HttpMethod};
 use serde::Deserialize;
