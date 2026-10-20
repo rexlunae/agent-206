@@ -30,6 +30,7 @@ mod delegation;
 mod plans;
 mod pushes;
 mod schedules;
+mod statuses;
 pub use plans::Plans;
 pub use pushes::Pushes;
 mod imports;
@@ -42,6 +43,7 @@ pub use delegation::{Caller, Child, Delegator, DelegatorError, Reservation, Spaw
 pub use messengers::Outbox;
 mod web_search;
 pub use schedules::{Jobs, MAX_AGENT_JOBS};
+pub use statuses::Statuses;
 pub use web_search::Searcher;
 
 /// Streamed reply text that is not final yet. It is published as the
@@ -647,6 +649,10 @@ impl Gateway {
         // The plan tool, denied in each conversation until the user permits it.
         let plan_tools = Arc::new(crate::plan_tool::PlanHost::new(gateway.plans()));
         Arc::make_mut(&mut gateway.tool_hosts).push(plan_tools);
+        // The conversation's own status, denied in each conversation until
+        // the user permits it.
+        let status_tools = Arc::new(crate::status_tool::StatusHost::new(gateway.statuses()));
+        Arc::make_mut(&mut gateway.tool_hosts).push(status_tools);
         // Subagent tools; each conversation still denies them until the user
         // permits them, and they are offered only with subagent models.
         gateway.bind_delegation();
