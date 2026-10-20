@@ -41,7 +41,8 @@ mod vault;
 mod vault_backend;
 #[cfg(not(target_arch = "wasm32"))]
 static TERMINAL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-/// Select the text alternative for a renderer without SVG support.
+/// Select terminal rendering, including text alternatives and the refusal of
+/// vault controls until the renderer supports secure secret input.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn configure_terminal() {
     TERMINAL.store(true, std::sync::atomic::Ordering::Relaxed);

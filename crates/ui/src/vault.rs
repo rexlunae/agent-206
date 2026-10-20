@@ -1,4 +1,4 @@
-//! Vault setup on the Security page of the desktop and terminal clients:
+//! Vault setup on the Security page of the desktop and web clients:
 //! create, unlock and lock the vault, pair the local gateway and enroll an
 //! authenticator. Every request goes to the separate vault broker, which
 //! enforces its own throttling and step-up rules; this panel holds no policy.
@@ -7,6 +7,8 @@
 //! are cleared on submit. A password kept for the authenticator-code retry is
 //! held as a zeroizing [`WireSecret`], never rendered. The enrollment key is
 //! shown as text content so it can be copied into an authenticator app.
+//! Terminal clients do not mount the panel: the pinned terminal renderer does
+//! not provide safe password input (dioxus-tui#6).
 use crate::error::{ErrorNotice, record};
 use crate::vault_backend::{Session, Target, unexpected};
 use crate::welcome::{VaultFacts, VaultProgress, VaultSeen};
@@ -498,11 +500,25 @@ impl Panel {
 #[cfg(not(target_arch = "wasm32"))]
 #[component]
 pub(crate) fn VaultSection() -> Element {
-    rsx! { VaultPlacement { placement: placement() } }
+    rsx! { VaultPlacement { placement: placement(), terminal: crate::terminal_mode() } }
 }
 #[cfg(not(target_arch = "wasm32"))]
 #[component]
-fn VaultPlacement(placement: Placement) -> Element {
+fn VaultPlacement(placement: Placement, #[props(default)] terminal: bool) -> Element {
+    // Refuse before mounting VaultPanel, including its broker session and all
+    // password, authenticator, import and credential-entry state. Masking the
+    // painted text alone would not fix the renderer's value-attribute handling.
+    if terminal {
+        return rsx! {
+            Card { variant: CardVariant::Subtle,
+                CardHeader { CardTitle { "Vault" } Badge { tone: BadgeTone::Warning, "Unavailable in TUI" } }
+                CardBody {
+                    p { "Vault controls are unavailable in the TUI because its input controls cannot keep passwords and API keys private." }
+                    p { "Use the desktop client, or run `agent206 vault --help` for vault commands in a trusted terminal on the gateway host." }
+                }
+            }
+        };
+    }
     match placement {
         Placement::Local(root) => rsx! { VaultPanel { target: root } },
         Placement::Remote(endpoint) => rsx! {
@@ -851,6 +867,29 @@ mod tests {
         assert!(html.contains("not available here yet"), "{html}");
         assert!(!html.contains("<button"), "{html}");
         assert!(!html.contains("<input"), "{html}");
+    }
+
+    #[test]
+    fn terminal_never_mounts_vault_inputs_or_actions() {
+        fn root(placement: Placement) -> Element {
+            rsx! { VaultPlacement { placement, terminal: true } }
+        }
+        // A local target must be refused before a broker session is opened;
+        // remote and missing-profile states must not expose forms either.
+        for placement in [
+            Placement::Local(std::env::temp_dir().join(uuid::Uuid::new_v4().to_string())),
+            Placement::Remote(format!("ssh://{}@example.invalid", uuid::Uuid::new_v4())),
+            Placement::NoProfile,
+        ] {
+            let mut dom = VirtualDom::new_with_props(root, placement);
+            dom.rebuild_in_place();
+            let html = dioxus_ssr::render(&dom);
+            assert!(html.contains("Unavailable in TUI"), "{html}");
+            assert!(html.contains("agent206 vault --help"), "{html}");
+            assert!(!html.contains("<input"), "{html}");
+            assert!(!html.contains("<button"), "{html}");
+            assert!(!html.contains("<form"), "{html}");
+        }
     }
 }
 
