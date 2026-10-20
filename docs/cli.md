@@ -15,6 +15,12 @@ overrides the saved choice for one invocation. Unconfigured client commands fail
 without launching a gateway. With no subcommand, the app launches the desktop; `tui`
 (alias `ui`) explicitly launches the shared terminal UI when built with that feature.
 
+The TUI currently refuses vault controls because its pinned renderer does not
+keep password input private. Use the desktop client or `agent206 vault --help`
+for supported vault commands on the gateway host. This restriction also applies
+to the TUI's initial setup, imports and API-key entry; CLI vault prompts are
+separate from the affected TUI renderer.
+
 | RustyClaw command family | Agent 206 now | Required follow-up |
 | --- | --- | --- |
 | desktop / tui | desktop, tui / ui | Terminal interaction and graphics acceptance |

@@ -30,6 +30,9 @@ pub(crate) enum VaultSeen {
     Remote,
     /// The state could not be read; the vault card shows why.
     Unreadable,
+    /// This renderer cannot safely accept vault secrets.
+    #[cfg(not(target_arch = "wasm32"))]
+    Unavailable,
 }
 
 /// Provided by the Get started page so the vault card it embeds can report
@@ -60,6 +63,8 @@ enum Progress {
     /// Nobody has reported it, or it is set up somewhere else.
     Unknown,
     Checking,
+    #[cfg(not(target_arch = "wasm32"))]
+    Unavailable,
 }
 impl Progress {
     fn badge(self) -> (&'static str, BadgeTone, IconName) {
@@ -69,6 +74,8 @@ impl Progress {
             Self::Optional => ("Recommended", BadgeTone::Info, IconName::ArrowEnd),
             Self::Unknown => ("Unknown", BadgeTone::Neutral, IconName::Info),
             Self::Checking => ("Checking", BadgeTone::Neutral, IconName::Clock),
+            #[cfg(not(target_arch = "wasm32"))]
+            Self::Unavailable => ("Unavailable in TUI", BadgeTone::Warning, IconName::Info),
         }
     }
 }
@@ -138,6 +145,11 @@ fn vault_steps(vault: Option<VaultSeen>, gateway: Option<&GatewayReport>) -> [St
     match vault {
         None => [VAULT, TOTP, PAIR]
             .map(|title| Step::new(title, Progress::Checking, "Checking the vault…")),
+        #[cfg(not(target_arch = "wasm32"))]
+        Some(VaultSeen::Unavailable) => [VAULT, TOTP, PAIR].map(|title| {
+            Step::new(title, Progress::Unavailable,
+                "Vault controls cannot keep secrets private in the TUI. Use the desktop client or run `agent206 vault --help` in a trusted terminal on the gateway host.")
+        }),
         Some(VaultSeen::Remote) => {
             let detail =
                 "This gateway runs on another computer. Run `agent206 setup` in a terminal there.";
@@ -198,7 +210,7 @@ fn vault_steps(vault: Option<VaultSeen>, gateway: Option<&GatewayReport>) -> [St
                 (Some(false), _) | (_, Some(false)) => Step::new(
                     PAIR,
                     Progress::ToDo,
-                    "Not paired. Pair it from the vault card in the desktop or terminal app, or run `agent206 setup`.",
+                    "Not paired. Pair it from the desktop vault card, or run `agent206 setup`.",
                 ),
                 (Some(true), Some(true)) => Step::new(
                     PAIR,
@@ -503,15 +515,23 @@ fn StepItem(step: Step) -> Element {
 /// remote host; the web card learns that from its bridge and reports it.
 fn initial_vault(progress: VaultProgress) -> Option<VaultSeen> {
     #[cfg(not(target_arch = "wasm32"))]
-    match use_hook(crate::vault::placement) {
-        crate::vault::Placement::Remote(_) => return Some(VaultSeen::Remote),
-        // The vault card shows why it cannot read the setup.
-        crate::vault::Placement::Unreadable(_) | crate::vault::Placement::NoProfile => {
-            return Some(VaultSeen::Unreadable);
-        }
-        crate::vault::Placement::Local(_) => {}
+    if let Some(seen) = native_vault(use_hook(crate::vault::placement), crate::terminal_mode()) {
+        return Some(seen);
     }
     (progress.0)()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn native_vault(placement: crate::vault::Placement, terminal: bool) -> Option<VaultSeen> {
+    match placement {
+        crate::vault::Placement::Remote(_) => Some(VaultSeen::Remote),
+        // The vault card shows why it cannot read the setup.
+        crate::vault::Placement::Unreadable(_) | crate::vault::Placement::NoProfile => {
+            Some(VaultSeen::Unreadable)
+        }
+        crate::vault::Placement::Local(_) if terminal => Some(VaultSeen::Unavailable),
+        crate::vault::Placement::Local(_) => None,
+    }
 }
 
 #[cfg(test)]
@@ -519,6 +539,44 @@ mod tests {
     use super::*;
     use a206_core::{Catalog, GatewayInfo, ModelInfo, ModelKey, ProviderApi, ProviderConfig};
     use uuid::Uuid;
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn terminal_vault_checklist_is_unavailable_instead_of_checking_forever() {
+        use crate::vault::Placement;
+        let local = Placement::Local(std::env::temp_dir().join(text()));
+        assert_eq!(native_vault(local.clone(), false), None);
+        let seen = native_vault(local, true);
+        assert_eq!(seen, Some(VaultSeen::Unavailable));
+        for step in vault_steps(seen, Some(&stopped())) {
+            assert_eq!(step.progress, Progress::Unavailable);
+            assert_eq!(step.progress.badge().0, "Unavailable in TUI");
+            assert!(step.detail.contains("agent206 vault --help"));
+            assert_eq!(step.page, None);
+            let mut dom = VirtualDom::new_with_props(StepItem, StepItemProps { step });
+            dom.rebuild_in_place();
+            let html = dioxus_ssr::render(&dom);
+            assert!(html.contains("Unavailable in TUI"), "{html}");
+            assert!(!html.contains("Checking"), "{html}");
+        }
+        for terminal in [true, false] {
+            assert_eq!(
+                native_vault(Placement::Remote(text()), terminal),
+                Some(VaultSeen::Remote)
+            );
+            assert_eq!(
+                native_vault(Placement::NoProfile, terminal),
+                Some(VaultSeen::Unreadable)
+            );
+            assert_eq!(
+                native_vault(
+                    Placement::Unreadable(crate::vault_backend::unexpected().report),
+                    terminal
+                ),
+                Some(VaultSeen::Unreadable)
+            );
+        }
+    }
 
     fn text() -> String {
         Uuid::new_v4().to_string()

@@ -203,10 +203,16 @@ pub fn Security() -> Element {
         }
         VaultControls {}
         GatewayControls {}
-        Alert { title: rsx! { "Other credential operations" }, "Security can list credential policies and add API keys. Use `agent206 vault` on the gateway host for other entry kinds, policy changes, deletion or two-factor removal. Agent-requested credential use is unavailable." }
+        Alert { title: rsx! { "Other credential operations" },
+            if crate::terminal_mode() {
+                "Vault controls are unavailable in the TUI. Use the desktop client or `agent206 vault` on the gateway host for credential operations. Agent-requested credential use is unavailable."
+            } else {
+                "Security can list credential policies and add API keys. Use `agent206 vault` on the gateway host for other entry kinds, policy changes, deletion or two-factor removal. Agent-requested credential use is unavailable."
+            }
+        }
     } }
 }
-/// Vault setup uses the same state machine on every renderer.
+/// Shared vault controls, with an explicit refusal on unsupported renderers.
 #[component]
 pub(crate) fn VaultControls() -> Element {
     rsx! { crate::vault::VaultSection {} }
@@ -270,8 +276,14 @@ pub fn Gateway() -> Element {
         }
         HealthChecks {}
         Card { variant: CardVariant::Subtle, CardHeader { CardTitle { "Security setup" } }
-            CardBody { p { "The separate vault broker holds API keys and performs authenticated provider requests, so the gateway never sees them. Create, unlock and pair it, and enroll two-factor authentication, from the Security page or with `agent206 vault`; add credentials with `agent206 vault add`. A running gateway is not proof that the vault is set up." } }
-            CardFooter { LinkButton { href: Route::Security {}.to_string(), variant: ButtonVariant::Secondary, "Open vault and security" } }
+            CardBody { p {
+                if crate::terminal_mode() {
+                    "Vault controls are unavailable in the TUI. Use the desktop client or `agent206 vault` on the gateway host to create, unlock and pair the vault, enroll two-factor authentication and add credentials. A running gateway is not proof that the vault is set up."
+                } else {
+                    "The separate vault broker holds API keys and performs authenticated provider requests, so the gateway never sees them. Create, unlock and pair it, and enroll two-factor authentication, from the Security page or with `agent206 vault`; add credentials with `agent206 vault add`. A running gateway is not proof that the vault is set up."
+                }
+            } }
+            CardFooter { LinkButton { href: Route::Security {}.to_string(), variant: ButtonVariant::Secondary, "Open Security" } }
         }
         Alert { title: rsx! { "Shared service" }, "Stop and restart interrupt work for every connected client. Owned agent runs, downloads and the local Joshua child are cleaned up before stop is acknowledged. Start is always an explicit action after a stop; reconnect only attaches to an existing gateway." }
     } }
