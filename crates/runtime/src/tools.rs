@@ -76,7 +76,8 @@ pub struct ToolScope {
 pub struct ToolListing {
     pub tools: Vec<ToolSpec>,
     /// Sources that could not list their tools, such as a server that failed
-    /// to start; the rest of the listing is still usable.
+    /// to start; the rest of the listing is still usable. The catalog collector
+    /// records these reports; hosts return them without logging them again.
     pub unavailable: Vec<UnavailableTools>,
 }
 
@@ -177,6 +178,11 @@ pub(crate) async fn catalog(hosts: &[Arc<dyn ToolHost>], scope: &ToolScope) -> C
     };
     for host in hosts {
         let listing = host.list(scope).await;
+        // Record before awaiting another host: cancellation may drop the collector.
+        for unavailable in &listing.unavailable {
+            let _source = tracing::warn_span!("tools", source = %unavailable.source).entered();
+            crate::error::record("list_tools", &unavailable.error);
+        }
         catalog.unavailable.extend(listing.unavailable);
         for spec in listing.tools {
             if !valid_name(&spec.name) {
@@ -385,6 +391,65 @@ mod tests {
         ) -> BoxFuture<'a, Result<ToolOutput, ErrorReport>> {
             Box::pin(async { Err(ErrorReport::new(ErrorKind::Internal, "not called")) })
         }
+    }
+    #[tokio::test]
+    async fn cancelled_listing_keeps_prior_rejection_logs() {
+        use std::sync::Mutex;
+        use tracing::instrument::WithSubscriber;
+
+        #[derive(Clone, Default)]
+        struct Buffer(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Buffer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        struct Pending;
+        impl ToolHost for Pending {
+            fn list<'a>(&'a self, _: &'a ToolScope) -> BoxFuture<'a, ToolListing> {
+                Box::pin(std::future::pending())
+            }
+            fn call<'a>(
+                &'a self,
+                _: &'a ToolScope,
+                _: ToolRequest,
+            ) -> BoxFuture<'a, Result<ToolOutput, ErrorReport>> {
+                Box::pin(std::future::pending())
+            }
+        }
+        let buffer = Buffer::default();
+        let writer = buffer.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let hosts: Vec<Arc<dyn ToolHost>> = vec![
+            Arc::new(Fixed(vec![spec("has space", ToolPermission::Allow, &[])])),
+            Arc::new(Pending),
+        ];
+        let scope = ToolScope {
+            thread: Id::new_v4(),
+            workspace: None,
+            capabilities: BTreeSet::new(),
+            programs: vec![],
+        };
+        let mut listing = Box::pin(catalog(&hosts, &scope).with_subscriber(subscriber));
+        std::future::poll_fn(|cx| {
+            assert!(listing.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        drop(listing);
+        let logged = String::from_utf8(buffer.0.lock().unwrap().clone()).unwrap();
+        assert_eq!(
+            logged.matches(&OfferError::Name.to_string()).count(),
+            1,
+            "{logged}"
+        );
     }
     #[tokio::test]
     async fn ambiguous_or_invalid_tools_are_not_offered() {

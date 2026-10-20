@@ -15,7 +15,7 @@ use crate::{
     tools::{ToolHost, ToolListing, ToolOutput, ToolRequest, ToolScope, ToolSpec},
 };
 use a206_core::{
-    Capability, ErrorKind, ErrorReport, ToolPermission,
+    Capability, ErrorKind, ErrorReport, ToolPermission, UnavailableTools,
     web_search::{SearchApi, SearchConfig},
 };
 use futures_util::future::BoxFuture;
@@ -595,12 +595,15 @@ impl ToolHost for SearchHost {
             let services = match self.searcher.services() {
                 Ok(services) => services,
                 Err(error) => {
-                    // Offer no search rather than fail the whole listing.
-                    tracing::warn!(
-                        error = &error as &dyn std::error::Error,
-                        "search services unreadable"
-                    );
-                    vec![]
+                    return ToolListing {
+                        tools: vec![],
+                        unavailable: vec![UnavailableTools {
+                            source: SEARCH.into(),
+                            // The caller records unavailable sources when handling the catalog.
+                            error: crate::error::report(&error)
+                                .with_correlation(a206_core::Id::new_v4()),
+                        }],
+                    };
                 }
             };
             ToolListing {

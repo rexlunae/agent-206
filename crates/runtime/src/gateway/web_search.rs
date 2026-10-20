@@ -28,3 +28,74 @@ impl Searcher {
         Ok((root, self.base.pairing()?))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        plan_tool::{PlanHost, UPDATE},
+        search_tool::{SEARCH, SearchHost},
+        tools::{self, ToolHost, ToolScope},
+    };
+
+    #[tokio::test]
+    async fn unreadable_services_are_reported_in_the_tool_listing() {
+        use std::sync::{Arc, Mutex};
+        use tracing::instrument::WithSubscriber;
+
+        #[derive(Clone, Default)]
+        struct Buffer(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Buffer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buffer = Buffer::default();
+        let writer = buffer.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let root = tempfile::tempdir().unwrap();
+        let gateway = Gateway::open(root.path()).unwrap();
+        let host = SearchHost::new(gateway.searcher());
+        let store = gateway.store.clone();
+        std::thread::spawn(move || {
+            let _guard = store.lock().unwrap();
+            panic!("simulate an interrupted state writer");
+        })
+        .join()
+        .unwrap_err();
+        let hosts: Vec<std::sync::Arc<dyn ToolHost>> = vec![
+            std::sync::Arc::new(host),
+            std::sync::Arc::new(PlanHost::new(gateway.plans())),
+        ];
+        let listing = tools::catalog(
+            &hosts,
+            &ToolScope {
+                thread: a206_core::Id::new_v4(),
+                workspace: None,
+                capabilities: Default::default(),
+                programs: vec![],
+            },
+        )
+        .with_subscriber(subscriber)
+        .await;
+        assert!(!listing.tools.contains_key(SEARCH));
+        assert!(listing.tools.contains_key(UPDATE));
+        assert_eq!(listing.unavailable.len(), 1);
+        let unavailable = &listing.unavailable[0];
+        assert_eq!(unavailable.source, SEARCH);
+        assert_eq!(unavailable.error.kind, a206_core::ErrorKind::Internal);
+        assert!(unavailable.error.message.contains("state lock poisoned"));
+        assert!(unavailable.error.correlation.is_some());
+        let logged = String::from_utf8(buffer.0.lock().unwrap().clone()).unwrap();
+        let correlation = unavailable.error.correlation.unwrap().to_string();
+        assert_eq!(logged.matches(&correlation).count(), 1, "{logged}");
+        assert!(logged.contains("state lock poisoned"), "{logged}");
+    }
+}

@@ -859,6 +859,9 @@ name, an endpoint (the service's official one unless the user changes it; an
 endpoint path with `.` or `..` segments is refused, since parsing would
 resolve it to a different path) and the vault credential holding its key. A
 response without its results list is a protocol error, not an empty answer.
+If the gateway cannot read its search settings, tool diagnostics show an
+unavailable `web_search` source with the structured failure and its correlation
+ID. Other hosts can still list their tools.
 The tool declares
 `Capability::Network`, so a conversation needs the network grant (Research
 mode, or `backend select … native --network`) and, like every tool, must
