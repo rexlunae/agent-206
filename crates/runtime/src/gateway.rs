@@ -1375,12 +1375,6 @@ impl Gateway {
                     )?;
                     let (config, info) = native_model(&store.state, current)?;
                     if !images.is_empty() {
-                        check(
-                            current.backend == CodingBackend::Native,
-                            GatewayError::Invalid(
-                                "images are sent only to model providers, not coding backends",
-                            ),
-                        )?;
                         // An unreported capability is left to the provider,
                         // whose refusal reaches the client.
                         check(
@@ -1495,12 +1489,27 @@ impl Gateway {
                 let (sender, mut progress) = tokio::sync::mpsc::channel(32);
                 let dispatched = Arc::<std::sync::atomic::AtomicUsize>::default();
                 let operation = async {
+                    // Only the answered message's images are sent, so only
+                    // they are read; as for native rounds, one changed or
+                    // removed since it was attached is reported, not sent.
+                    let images = match crate::backends::answered(&thread) {
+                        Some(message) if !message.images.is_empty() => {
+                            let (images, message, info) =
+                                (self.images.clone(), message.clone(), info.clone());
+                            tokio::task::spawn_blocking(move || {
+                                crate::provider::ImageData::load_message(&images, &message, &info)
+                            })
+                            .await??
+                        }
+                        _ => crate::provider::ImageData::default(),
+                    };
                     Ok::<_, GatewayError>(
                         crate::backends::complete(crate::backends::Run {
                             config: &config,
                             thread: &thread,
                             prompt: &prompt,
                             info: &info,
+                            images: &images,
                             backend: &backend,
                             workspace: workspace.as_deref(),
                             state_root: &root,

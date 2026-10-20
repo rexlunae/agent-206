@@ -1,5 +1,6 @@
 //! Official ACP client SDK, with no client filesystem or terminal capabilities.
 use super::{BackendError, Progress, Result, check, isolation::Process, rpc};
+use crate::provider::Encoded;
 use a206_core::*;
 use agent_client_protocol::{
     Client, Lines,
@@ -19,6 +20,7 @@ pub async fn run(
     thread: &Thread,
     prompt: &str,
     input: &str,
+    images: &[Encoded],
     progress: mpsc::Sender<Progress>,
 ) -> Result<(String, Usage)> {
     let (Some(writer), Some(reader)) = (process.child.stdin.take(), process.child.stdout.take())
@@ -76,6 +78,7 @@ pub async fn run(
     meta.insert("claudeCode".into(), json!({"options": options}));
     let cwd = process.cwd.clone();
     let input = input.to_owned();
+    let images = images.to_vec();
     Client
         .builder()
         .name("Agent 206")
@@ -147,8 +150,12 @@ pub async fn run(
                     .lock()
                     .map_err(|_| Error::internal_error())?
                     .session = Some(session.session_id.clone());
+                let accepts = initialized.agent_capabilities.prompt_capabilities.image;
                 let response = connection
-                    .send_request(PromptRequest::new(session.session_id, vec![input.into()]))
+                    .send_request(PromptRequest::new(
+                        session.session_id,
+                        prompt_blocks(input, &images, accepts),
+                    ))
                     .block_task()
                     .await?;
                 if response.stop_reason != StopReason::EndTurn
@@ -178,4 +185,68 @@ pub async fn run(
             cost: output.cost,
         },
     ))
+}
+/// The blocks of an ACP prompt: the transcript, then each image when the
+/// agent advertises image prompts; otherwise the transcript names them as
+/// not sent.
+fn prompt_blocks(mut text: String, images: &[Encoded], accepts: bool) -> Vec<ContentBlock> {
+    if !accepts {
+        for image in images {
+            text.push_str(&format!(
+                "\n[Image {:?} was attached but is not sent: the Claude Agent adapter does not accept images.]",
+                image.name
+            ));
+        }
+        return vec![text.into()];
+    }
+    let mut blocks = vec![text.into()];
+    blocks.extend(
+        images
+            .iter()
+            .map(|image| ContentBlock::Image(ImageContent::new(image.base64.clone(), image.mime))),
+    );
+    blocks
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn images() -> Vec<Encoded> {
+        ["image/jpeg", "image/gif"]
+            .into_iter()
+            .map(|mime| Encoded {
+                name: uuid::Uuid::new_v4().to_string(),
+                mime,
+                base64: uuid::Uuid::new_v4().simple().to_string(),
+            })
+            .collect()
+    }
+    #[test]
+    fn images_follow_the_transcript_when_the_agent_accepts_them() {
+        let text = uuid::Uuid::new_v4().to_string();
+        let images = images();
+        let blocks = prompt_blocks(text.clone(), &images, true);
+        assert_eq!(blocks.len(), 3);
+        assert!(matches!(&blocks[0], ContentBlock::Text(block) if block.text == text));
+        for (block, image) in blocks[1..].iter().zip(&images) {
+            let ContentBlock::Image(block) = block else {
+                panic!("expected an image block");
+            };
+            assert_eq!(block.data, image.base64);
+            assert_eq!(block.mime_type, image.mime);
+        }
+    }
+    #[test]
+    fn an_agent_without_image_prompts_learns_the_images_were_not_sent() {
+        let text = uuid::Uuid::new_v4().to_string();
+        let images = images();
+        let blocks = prompt_blocks(text.clone(), &images, false);
+        let [ContentBlock::Text(block)] = blocks.as_slice() else {
+            panic!("expected one text block");
+        };
+        assert!(block.text.starts_with(&text));
+        for image in &images {
+            assert!(block.text.contains(&format!("{:?}", image.name)));
+            assert!(!block.text.contains(&image.base64));
+        }
+    }
 }
