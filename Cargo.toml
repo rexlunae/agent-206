@@ -49,7 +49,7 @@ sha2 = "0.10"
 tempfile = "3"
 dioxus = { version = "=0.7.9", default-features = false, features = ["lib"] }
 dioxus-ssr = "=0.7.9"
-fc-dioxus = { git = "https://github.com/rexlunae/fc-dioxus", rev = "8349dc00bfe4e4831857239c9208d0e3e3dbc7a8" }
+fc-dioxus = { git = "https://github.com/rexlunae/fc-dioxus", rev = "dc98bdd377b40d6042a647f3b302f0a150de625a" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

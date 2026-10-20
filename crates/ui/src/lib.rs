@@ -570,8 +570,14 @@ pub fn App() -> Element {
     let picked = theme();
     rsx! {
         document::Title { "Agent 206" }
-        document::Stylesheet { href: asset!("/assets/app.css") }
+        if terminal_mode() {
+            // The terminal host has no resource or HTML parser provider.
+            style { {include_str!("../assets/app.css")} }
+        } else {
+            document::Stylesheet { href: asset!("/assets/app.css") }
+        }
         FutureCss { theme: picked.theme(false), design: picked.design, palette: picked.palette,
+            stylesheets: if terminal_mode() { Stylesheets::Inline } else { Stylesheets::Automatic },
             Router::<Route> {}
         }
     }

@@ -181,6 +181,11 @@ Terminal interaction acceptance is blocked by the macOS PTY findings in
 initial output and no visible command-palette response to Ctrl+K or Tab/Ctrl+K.
 The attempt did not reach Security or create a vault. Compilation and launch
 alone do not establish keyboard or credential-entry parity.
+Bundled style text and the fc-dioxus `dc98bdd` native hidden-attribute fix are now
+integrated for TUI rendering. A repeat PTY run showed navigation text but still
+had no main pane or visible palette response; the isolated flex-row painting
+failure is tracked in [dioxus-tui#5](https://github.com/JakkuSakura/dioxus-tui/issues/5).
+These resource fixes do not complete terminal interaction acceptance.
 
 The pinned TUI renderer also displays password values without masking
 ([upstream #6](https://github.com/JakkuSakura/dioxus-tui/issues/6), verified with
