@@ -599,11 +599,9 @@ impl ToolHost for SearchHost {
                         tools: vec![],
                         unavailable: vec![UnavailableTools {
                             source: SEARCH.into(),
-                            error: crate::error::correlated(
-                                "list_search_services",
-                                a206_core::Id::new_v4(),
-                                &error,
-                            ),
+                            // The caller records unavailable sources when handling the catalog.
+                            error: crate::error::report(&error)
+                                .with_correlation(a206_core::Id::new_v4()),
                         }],
                     };
                 }
