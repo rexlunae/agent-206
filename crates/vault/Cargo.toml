@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 [dependencies]
+a206-vault-types.workspace = true
 securestore = { version = "0.100.3", default-features = false, features = ["rustls"] }
 zeroize.workspace = true
 thiserror.workspace = true

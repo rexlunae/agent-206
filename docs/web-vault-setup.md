@@ -42,6 +42,29 @@ The panel reports encryption, enrolled TOTP, agent access and pairing from the
 broker's actual state. Global agent access remains off for new vaults. Setup does
 not grant tools, activate providers, or authorize agents to spend credentials.
 
+## Credential metadata and API keys
+
+Once unlocked, **Credentials** shows typed metadata only: kind, policy and its
+skill/trigger scopes, permitted destinations and disabled state. Refresh starts
+at the first page; Next page follows the live name cursor. Pages contain at most
+50 entries and 48 KiB encoded. An entry larger than that limit produces an error
+instead of a shortened policy. Untyped legacy values are counted, never read.
+
+**Add API key** requires fresh broker authentication (TOTP when enrolled).
+Choose a unique name and label, enter exact HTTPS origins separated by spaces,
+and submit the key. Loopback HTTP is allowed for local services. Paths, queries
+and fragments are refused. Empty destinations prevent brokered use. Keys are
+saved encrypted with approval required for each agent use; global agent access
+does not change. Existing entries cannot be overwritten. If a save is not
+confirmed, refresh metadata before retrying: the write may have committed.
+
+These controls require broker v17 and refuse older brokers before sending the
+new requests. Generic setup still works with v10, and migration with v11.
+Reveal, policy/destination edits, legacy adoption, agent-access changes, deletion
+and TOTP removal remain trusted CLI operations. The CLI also offers token, login,
+passkey, SSH-key, note and other entry kinds; this panel adds API keys only. Form
+and payment entry are still unavailable in both clients.
+
 ## Optional migration
 
 Before creating a new empty vault, existing RustyClaw users can instead preview:

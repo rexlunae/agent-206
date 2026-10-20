@@ -107,15 +107,15 @@ protection on a renderer or platform that cannot enforce it.
 | Process/channel separation | Secrets outside agent context | Separate broker process with role-limited bounded MessagePack IPC, tested; gateway role is value-free. Same-user socket access and remote SSH channel are open items (see above) |
 | TOTP | Vault-held seed is authoritative; 6 digits, 30-second steps, ±1 step | Library: seed generated in memory and committed only after a valid code, enrollment expiry, ±1 step, persisted replay protection, drift diagnosis, code-gated removal; seed stored under RustyClaw's key so imported vaults stay enrolled; tested. Standalone CLI challenges enrolled vaults. Broker enrollment from the CLI and the shared Security page show the manual key and otpauth link as text with a locally generated QR code and an expandable manual-key alternative and reports enrollment only after the broker confirms a code. Broker connect challenge and recovery codes pending |
 | Unlock and step-up surfaces | Password unlock, TOTP challenge when enrolled, step-up before sensitive operations | CLI and desktop/TUI/web Security page (gateway local to the client or web server) send the same broker `Unlock`/`StepUp` requests; the TOTP challenge follows the broker's `TotpRequired`, never a client flag; secrets are cleared from fields on submit and kept out of status text and logs. Remote-gateway controls in the GUI pending (CLI on that host) |
-| Authentication throttling | Shared 3-failure / 30-second lockout over a 60-second failure window | Library throttle keyed by principal, not connection, tested; failures during lockout neither shorten nor extend it. Broker-wide wiring pending (the standalone CLI is one attempt per process) |
+| Authentication throttling | Shared 3-failure / 30-second lockout over a 60-second failure window | Library throttle keyed by principal, not connection, tested; failures during lockout neither shorten nor extend it. Broker-wide enforcement covers connections and encrypted sessions, tested |
 | Per-credential policy | Always, WithApproval, WithAuth, SkillOnly, TriggerOnly | All variants, RustyClaw JSON shape, unknown variants rejected; evaluated deny-by-default and tested. Approval/step-up facts must come from the broker's trusted surface, pending |
 | Disabled credentials | Disabled entry cannot be used | Enforced for agent use and tested; missing flag reads as RustyClaw's default; owner reveal still allowed |
-| Global agent switch | User access distinct from agent access | Held in the encrypted vault, off by default. Deliberate tightening: it is a precondition and never satisfies WithApproval (RustyClaw let it). Broker control surface pending |
+| Global agent switch | User access distinct from agent access | Held in the encrypted vault, off by default. Deliberate tightening: it is a precondition and never satisfies WithApproval (RustyClaw let it). CLI changes require broker step-up; GUI global-access controls pending |
 | Credential kinds | API/token, login, SSH key, passkey, form, payment and secure note | All kinds stored in RustyClaw's `cred:`/`val:` layout with kind/value checks and stale-value removal, tested; unknown kinds fail to parse and stay unavailable |
 | SSH key use | Keys stored as credentials | `vault add --kind ssh-key` generates an Ed25519 key or stores a decrypted Ed25519 or ECDSA (P-256, P-384) key file; RSA keys are refused, since the `rsa` crate's private-key operations leak timing (RUSTSEC-2023-0071). Broker v16 `SshAgent` (gateway role) returns the public key and signs only a public-key authentication request for that key (RFC 4252, or OpenSSH's host-bound method), for an exact `ssh://host:port` the key is bound to; the private key never leaves the broker. Tested in the vault and over the broker socket. No SSH client uses it yet |
 | Protected namespaces/paths | Internal/provider/service records cannot be read through generic bypasses | Private state and backend isolation tested; all tool/extension/import paths require explicit vault exclusion |
-| Scoped use | Skill/trigger and destination restrictions, explicit approvals | Existing narrowed tool/model grants; credential-use binding pending |
-| Reveal authentication | Per-connection short step-up window (120 seconds upstream) | 120-second window gates owner reveal, separate from agent use, expiry/revoke tested; lock/reconnect revocation wiring in the broker pending |
+| Scoped use | Skill/trigger and destination restrictions, explicit approvals | Existing narrowed tool/model grants; credential-use approval UI pending (configured providers already use exact-origin broker binding) |
+| Reveal authentication | Per-connection short step-up window (120 seconds upstream) | 120-second window gates owner reveal, separate from agent use, expiry/revoke tested; lock and reconnect revoke broker authentication, tested |
 | Prompt and leak defenses | Prompt-injection validation and outbound secret leak detection | Full boundary scanning/attack corpus pending |
 | OS sandbox | Strongest supported OS boundary, vault path excluded | macOS (Seatbelt) and Linux (bubblewrap + Landlock) isolation of external backends, MCP servers and native `execute_command` from one shared profile, tested; the WASM worker confined by the same profile on both, tested; Windows and full RustyClaw tool parity pending |
 | Audit and redaction | Log decisions without secret material | Redacted secret type exists; broker audit and adversarial no-secret leakage tests pending |
@@ -143,3 +143,24 @@ Cancellation now explicitly discards broker-held pending enrollment. See
 SSH vault controls,
 key-file workflows and modern at-rest encryption remain pending. Browser-delivered
 code and the serving origin remain trusted, as does the native client executable.
+
+## Shared credential controls
+
+Security uses the private broker session to read typed metadata and add API keys
+(broker v17). Metadata/policy definitions live in `a206-vault-types`, a pure data
+crate shared by the vault and all renderers; the web build does not link vault
+storage. Metadata pages are bounded by entry count and encoded bytes, with an
+exclusive sorted-name cursor. Policies/scopes are never truncated to fit a page;
+an oversized single entry fails explicitly. Legacy entries are counted only.
+
+Key creation shares the CLI's locked-vault, step-up, name, destination and atomic
+no-overwrite checks. The new operation accepts only a single bounded key and
+forces `ApiKey`/`WithApproval`; no policy or agent-access field is caller-controlled.
+Destinations must be exact origins, without paths, queries or fragments. No value
+read/reveal operation is added to the UI channel. Older/unknown peers are refused
+before a new secret-bearing request is sealed; no plaintext fallback exists.
+Native and encrypted broker integration tests cover authentication/role denials,
+overwrite refusal, origin validation, byte/count bounds and metadata without values.
+GUI editing, SSH-key/form/payment entry, agent-use approvals and remote vault
+controls remain pending; the CLI supports SSH-key and other entry kinds and policy
+edits. Form and payment entry remain unavailable in both clients.

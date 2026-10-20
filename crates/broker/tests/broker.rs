@@ -3210,3 +3210,243 @@ async fn a_bound_ssh_key_signs_authentication_for_a_paired_gateway_only() {
         BrokerError::Locked | BrokerError::GatewayNotPaired
     ));
 }
+fn key_input(name: &str, value: &str) -> Request {
+    Request::AddApiKey(ApiKeyInput {
+        version: a206_vault_channel::CREDENTIALS_SCHEMA_VERSION,
+        name: name.into(),
+        label: random(),
+        destinations: vec!["https://example.invalid".into()],
+        value: WireSecret::new(value.into()),
+    })
+}
+fn page_request(after: Option<String>, limit: u16) -> Request {
+    Request::CredentialPage {
+        version: a206_vault_channel::CREDENTIALS_SCHEMA_VERSION,
+        after,
+        limit,
+    }
+}
+#[tokio::test(flavor = "multi_thread")]
+async fn credential_pages_and_additions_require_user_auth_and_never_replace_or_reveal() {
+    let (_dir, root, task) = start().await;
+    let mut a = user(&root).await;
+    assert!(matches!(
+        denied(a.call(page_request(None, 5)).await),
+        BrokerError::Locked
+    ));
+    let password = random();
+    a.call(unlock(&password, None, true)).await.unwrap();
+    let mut other = user(&root).await;
+    let name = random();
+    let value = random();
+    assert_eq!(
+        denied(other.call(key_input(&name, &value)).await),
+        BrokerError::StepUpRequired
+    );
+    let mut gateway = paired_gateway(&mut a, &root).await;
+    assert_eq!(
+        denied(gateway.call(page_request(None, 5)).await),
+        BrokerError::Forbidden
+    );
+    assert_eq!(
+        denied(gateway.call(key_input(&name, &value)).await),
+        BrokerError::Forbidden
+    );
+    a.call(key_input(&name, &value)).await.unwrap();
+    assert_eq!(
+        denied(a.call(key_input(&name, &random())).await),
+        BrokerError::AlreadyExists
+    );
+    let Reply::CredentialPage(page) = a.call(page_request(None, 1)).await.unwrap() else {
+        panic!()
+    };
+    assert_eq!(page.entries.len(), 1);
+    assert_eq!(page.entries[0].0, name);
+    assert_eq!(page.entries[0].1.policy, AccessPolicy::WithApproval);
+    assert_eq!(page.entries[0].1.kind, CredentialKind::ApiKey);
+    assert_eq!(page.entries[0].1.destinations, ["https://example.invalid"]);
+    assert!(!format!("{page:?}").contains(&value));
+    assert!(!status(&mut a).await.agent_access.unwrap());
+    let second = random();
+    a.call(key_input(&second, &random())).await.unwrap();
+    let Reply::CredentialPage(first) = a.call(page_request(None, 1)).await.unwrap() else {
+        panic!()
+    };
+    let Reply::CredentialPage(last) = a.call(page_request(first.next.clone(), 1)).await.unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(first.total, 2);
+    assert!(first.next.is_some());
+    assert!(last.next.is_none());
+    assert!(first.entries[0].0 < last.entries[0].0);
+    for limit in [0, a206_vault_channel::MAX_CREDENTIAL_PAGE + 1] {
+        assert_eq!(
+            denied(a.call(page_request(None, limit)).await),
+            BrokerError::Invalid(InvalidRequest::CredentialPage)
+        );
+    }
+    for dest in [
+        "https://example.invalid/path",
+        "https://example.invalid/?q=x",
+        "https://example.invalid/#x",
+        "http://example.invalid",
+        "https://user:pass@example.invalid",
+        "ssh://example.invalid/",
+        "SSH://example.invalid/",
+        "ircs://example.invalid/",
+    ] {
+        let Request::AddApiKey(mut input) = key_input(&random(), &random()) else {
+            panic!()
+        };
+        input.destinations = vec![dest.into()];
+        assert_eq!(
+            denied(a.call(Request::AddApiKey(input)).await),
+            BrokerError::Invalid(InvalidRequest::Destination)
+        );
+    }
+    for value in [
+        String::new(),
+        "x".repeat(a206_vault_channel::MAX_API_KEY_BYTES + 1),
+    ] {
+        assert_eq!(
+            denied(a.call(key_input(&random(), &value)).await),
+            BrokerError::Invalid(InvalidRequest::ApiKeyValue)
+        );
+    }
+    a.call(Request::Lock).await.unwrap();
+    assert!(matches!(
+        denied(a.call(page_request(None, 1)).await),
+        BrokerError::Locked
+    ));
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn encrypted_credentials_share_the_same_policy_and_preserve_values_in_the_broker() {
+    use a206_vault_channel::{CREDENTIALS_SCHEMA_VERSION as V, Reply as R, Request as Q, Secret};
+    let (_dir, root, task) = start().await;
+    let (mut relay, mut channel) = secure_open(&root).await;
+    assert!(matches!(
+        secure_call(
+            &mut relay,
+            &mut channel,
+            Q::Unlock {
+                password: Secret::new(random()),
+                totp: None,
+                create: true
+            }
+        )
+        .await,
+        R::Ok
+    ));
+    let name = random();
+    let value = random();
+    let add = || Q::AddApiKey {
+        version: V,
+        name: name.clone(),
+        label: random(),
+        destinations: vec![],
+        value: Secret::new(value.clone()),
+    };
+    assert!(matches!(
+        secure_call(&mut relay, &mut channel, add()).await,
+        R::Ok
+    ));
+    assert!(
+        matches!(secure_call(&mut relay, &mut channel, add()).await, R::Error(e) if e.report.kind == a206_core::ErrorKind::Conflict)
+    );
+    let R::CredentialPage(page) = secure_call(
+        &mut relay,
+        &mut channel,
+        Q::CredentialPage {
+            version: V,
+            after: None,
+            limit: 5,
+        },
+    )
+    .await
+    else {
+        panic!()
+    };
+    assert_eq!(page.entries[0].0, name);
+    assert!(page.entries[0].1.destinations.is_empty());
+    let encoded = a206_protocol::encode(&page).unwrap();
+    assert!(!encoded.windows(value.len()).any(|w| w == value.as_bytes()));
+    assert!(matches!(
+        secure_call(
+            &mut relay,
+            &mut channel,
+            Q::CredentialPage {
+                version: V + 1,
+                after: None,
+                limit: 5
+            }
+        )
+        .await,
+        R::Error(_)
+    ));
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn metadata_pages_bound_bytes_without_truncating_policies() {
+    let (_dir, root, task) = start().await;
+    let mut a = user(&root).await;
+    a.call(unlock(&random(), None, true)).await.unwrap();
+    for prefix in ["a", "b", "c"] {
+        let mut meta = meta(vec![]);
+        meta.policy = AccessPolicy::SkillOnly(vec![random().repeat(500)]);
+        a.call(Request::PutCredential {
+            name: format!("{prefix}-{}", random()),
+            meta,
+            value: WireValue::Single(WireSecret::new(random())),
+            replace: false,
+        })
+        .await
+        .unwrap();
+    }
+    let Reply::CredentialPage(page) = a.call(page_request(None, 50)).await.unwrap() else {
+        panic!()
+    };
+    assert_eq!(page.entries.len(), 2);
+    assert!(page.next.is_some());
+    assert!(
+        a206_protocol::encode(&page).unwrap().len()
+            <= a206_vault_channel::MAX_CREDENTIAL_PAGE_BYTES
+    );
+    assert!(
+        matches!(&page.entries[0].1.policy, AccessPolicy::SkillOnly(scopes) if scopes[0].len() == 36 * 500)
+    );
+    let mut big = meta(vec![]);
+    big.policy = AccessPolicy::TriggerOnly(vec![random().repeat(2000)]);
+    a.call(Request::PutCredential {
+        name: format!("z-{}", random()),
+        meta: big,
+        value: WireValue::Single(WireSecret::new(random())),
+        replace: false,
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        denied(a.call(page_request(Some("y".into()), 50)).await),
+        BrokerError::Vault(VaultFailure::MetadataTooLarge)
+    );
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+}
+
+#[tokio::test]
+async fn credential_management_refuses_old_peers_before_sending() {
+    let broker = scripted_broker(CREDENTIALS_VERSION - 1, vec![Reply::Ok]).await;
+    let mut a = user(broker.path()).await;
+    for request in [page_request(None, 5), key_input(&random(), &random())] {
+        assert!(matches!(
+            a.call(request).await,
+            Err(ClientError::CredentialsUnsupported)
+        ));
+    }
+    assert!(matches!(a.call(Request::Status).await.unwrap(), Reply::Ok));
+}

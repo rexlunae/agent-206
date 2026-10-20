@@ -12,6 +12,27 @@ pub const MAX_MESSAGE: usize = 65535;
 pub const IMPORT_REVIEW_VERSION: u16 = 1;
 /// First broker protocol that implements connection-owned reviewed imports.
 pub const REVIEWED_IMPORT_BROKER_VERSION: u16 = 11;
+pub const CREDENTIALS_BROKER_VERSION: u16 = 17;
+pub const CREDENTIALS_SCHEMA_VERSION: u16 = 1;
+pub const MAX_CREDENTIAL_PAGE: u16 = 50;
+pub const MAX_CREDENTIAL_PAGE_BYTES: usize = 48 * 1024;
+pub const MAX_API_KEY_BYTES: usize = 16 * 1024;
+pub const MAX_CREDENTIAL_NAME_BYTES: usize = 256;
+pub const MAX_CREDENTIAL_LABEL_BYTES: usize = 256;
+pub const MAX_CREDENTIAL_DESTINATION_BYTES: usize = 2048;
+pub use a206_vault_types::{AccessPolicy, CredentialKind, CredentialMeta};
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CredentialPage {
+    #[serde(default)]
+    pub version: u16,
+    pub entries: Vec<(String, CredentialMeta)>,
+    /// Exclusive name cursor. Ordering is by name; a refresh starts over.
+    pub next: Option<String>,
+    pub total: usize,
+    /// Untyped entries remain hidden and locked; this is only a count.
+    pub legacy_count: usize,
+}
 
 /// Public identity of a source held privately by this broker connection.
 /// This describes file bytes, not decrypted contents or format validity.
@@ -122,6 +143,19 @@ fn bounded(bytes: &[u8]) -> Result<(), Error> {
 /// grants, shutdown, or arbitrary broker requests can travel through it.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Request {
+    CredentialPage {
+        version: u16,
+        after: Option<String>,
+        limit: u16,
+    },
+    /// User-only addition, always approval-required and never an overwrite.
+    AddApiKey {
+        version: u16,
+        name: String,
+        label: String,
+        destinations: Vec<String>,
+        value: Secret,
+    },
     Status,
     ReviewVaultImport {
         version: u16,
@@ -166,6 +200,7 @@ pub struct Status {
 }
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Reply {
+    CredentialPage(CredentialPage),
     Ok,
     VaultImportReview(ImportReview),
     VaultImportApplied(ImportApplied),

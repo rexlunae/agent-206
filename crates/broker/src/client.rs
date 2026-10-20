@@ -7,6 +7,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 #[derive(Debug, thiserror::Error)]
 pub enum ClientError {
     #[error(
+        "the running vault broker is too old for credential setup; run `agent206 vault stop`, then retry"
+    )]
+    CredentialsUnsupported,
+    #[error(
         "the running vault broker is too old for reviewed import; run `agent206 vault stop`, then retry"
     )]
     ReviewedImportUnsupported,
@@ -147,6 +151,13 @@ impl Client {
 
     /// Send one request. A broker error reply becomes `ClientError::Broker`.
     pub async fn call(&mut self, body: Request) -> Result<Reply, ClientError> {
+        if matches!(
+            &body,
+            Request::CredentialPage { .. } | Request::AddApiKey(_)
+        ) && self.version < CREDENTIALS_VERSION
+        {
+            return Err(ClientError::CredentialsUnsupported);
+        }
         if matches!(
             &body,
             Request::ReviewVaultImport { .. }

@@ -19,6 +19,20 @@ fn checked(reply: Reply) -> Result<Reply, Failure> {
 // serializing a reviewed request or its secrets for an unsupported connection.
 #[cfg(any(target_arch = "wasm32", test))]
 fn reviewed_supported(version: u16, request: &Request) -> Result<(), Failure> {
+    if version < a206_vault_channel::CREDENTIALS_BROKER_VERSION
+        && matches!(
+            request,
+            Request::CredentialPage { .. } | Request::AddApiKey { .. }
+        )
+    {
+        return Err(Failure {
+            code: Code::Other,
+            report: a206_core::ErrorReport::new(
+                a206_core::ErrorKind::Unavailable,
+                "This broker cannot manage credentials through this panel. Stop the old vault broker and retry with the updated application.",
+            ),
+        });
+    }
     if version < a206_vault_channel::REVIEWED_IMPORT_BROKER_VERSION
         && matches!(
             request,
@@ -45,7 +59,8 @@ mod imp {
     pub struct Session(a206_runtime::vault::Session);
     fn failure(error: a206_runtime::vault::VaultError) -> Failure {
         if let a206_runtime::vault::VaultError::Broker(a206_broker::ClientError::Broker(
-            a206_broker::BrokerError::ImportFailure(report),
+            a206_broker::BrokerError::ImportFailure(report)
+            | a206_broker::BrokerError::Channel(report),
         )) = &error
         {
             return Failure {
@@ -101,17 +116,22 @@ mod imp {
     mod tests {
         use super::*;
         #[test]
-        fn native_import_failure_keeps_the_logged_reference_at_the_display_root() {
+        fn native_structured_failures_keep_the_logged_reference_at_the_display_root() {
             let report = a206_core::ErrorReport::new(a206_core::ErrorKind::Storage, "partial copy")
                 .with_correlation(uuid::Uuid::new_v4())
                 .caused_by(a206_core::ErrorReport::new(
                     a206_core::ErrorKind::PermissionDenied,
                     "denied",
                 ));
-            let error = a206_runtime::vault::VaultError::Broker(a206_broker::ClientError::Broker(
+            for error in [
                 a206_broker::BrokerError::ImportFailure(report.clone()),
-            ));
-            assert_eq!(failure(error).report, report);
+                a206_broker::BrokerError::Channel(report.clone()),
+            ] {
+                let error = a206_runtime::vault::VaultError::Broker(
+                    a206_broker::ClientError::Broker(error),
+                );
+                assert_eq!(failure(error).report, report);
+            }
         }
     }
 }
@@ -258,6 +278,28 @@ pub(crate) use imp::{Session, Target};
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn credentials_require_v17_before_any_secret_is_serialized() {
+        for version in 0..=18 {
+            for request in [
+                Request::CredentialPage {
+                    version: 1,
+                    after: None,
+                    limit: 5,
+                },
+                Request::AddApiKey {
+                    version: 1,
+                    name: uuid::Uuid::new_v4().to_string(),
+                    label: "Key".into(),
+                    destinations: vec![],
+                    value: a206_vault_channel::Secret::new(uuid::Uuid::new_v4().to_string()),
+                },
+            ] {
+                assert_eq!(reviewed_supported(version, &request).is_ok(), version >= 17);
+            }
+            assert!(reviewed_supported(version, &Request::Status).is_ok());
+        }
+    }
     #[test]
     fn old_or_unknown_relays_keep_setup_but_never_send_reviewed_imports() {
         for version in [0, 8, 9, 10] {
