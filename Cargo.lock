@@ -3453,7 +3453,7 @@ source = "git+https://github.com/rexlunae/future-css?rev=af9f44bd151bc14bcfe0c49
 [[package]]
 name = "fc-dioxus"
 version = "0.1.1"
-source = "git+https://github.com/rexlunae/fc-dioxus?rev=8349dc00bfe4e4831857239c9208d0e3e3dbc7a8#8349dc00bfe4e4831857239c9208d0e3e3dbc7a8"
+source = "git+https://github.com/rexlunae/fc-dioxus?rev=dc98bdd377b40d6042a647f3b302f0a150de625a#dc98bdd377b40d6042a647f3b302f0a150de625a"
 dependencies = [
  "dioxus",
  "fc-context-menu",
@@ -3515,7 +3515,7 @@ source = "git+https://github.com/rexlunae/future-css?rev=af9f44bd151bc14bcfe0c49
 [[package]]
 name = "fc-tokens"
 version = "0.1.1"
-source = "git+https://github.com/rexlunae/fc-dioxus?rev=8349dc00bfe4e4831857239c9208d0e3e3dbc7a8#8349dc00bfe4e4831857239c9208d0e3e3dbc7a8"
+source = "git+https://github.com/rexlunae/fc-dioxus?rev=dc98bdd377b40d6042a647f3b302f0a150de625a#dc98bdd377b40d6042a647f3b302f0a150de625a"
 
 [[package]]
 name = "fdeflate"
