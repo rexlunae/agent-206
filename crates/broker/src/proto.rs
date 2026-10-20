@@ -19,16 +19,16 @@ use zeroize::Zeroizing;
 /// [`AuthScheme::DiscordBot`], version 9 [`SocketScheme::IrcSasl`], and version
 /// 10 encrypted setup channels and TOTP cancellation, 11 reviewed vault
 /// imports, 12 [`AuthScheme::WebhookUrl`], 13 [`Request::GitReceivePack`], 14
-/// [`Request::GitUploadPack`] and 15 [`AuthScheme::SubscriptionToken`]. A broker
-/// accepts greetings from
+/// [`Request::GitUploadPack`], 15 [`AuthScheme::SubscriptionToken`] and 16
+/// [`Request::SshAgent`]. A broker accepts greetings from
 /// [`MIN_BROKER_VERSION`] up to this version, and a client falls back to the
 /// newest version an older broker accepts (see `Client::version`), so streams
 /// are only requested from brokers that understand them.
-pub const BROKER_VERSION: u16 = 15;
+pub const BROKER_VERSION: u16 = 16;
 /// First version with connection-held source reviews and guarded vault import.
 pub use a206_vault_channel::REVIEWED_IMPORT_BROKER_VERSION as REVIEWED_IMPORT_VERSION;
 /// The oldest protocol version this broker still serves and this client still
-/// speaks. Versions 3 to 15 differ only by the requests, roles and schemes they add.
+/// speaks. Versions 3 to 16 differ only by the requests, roles and schemes they add.
 pub const MIN_BROKER_VERSION: u16 = 3;
 /// The first version that serves [`Request::ProviderStream`].
 pub const STREAM_VERSION: u16 = 4;
@@ -58,6 +58,12 @@ pub const GIT_FETCH_VERSION: u16 = 14;
 /// The first version that attaches web search keys
 /// ([`AuthScheme::SubscriptionToken`]).
 pub const SEARCH_VERSION: u16 = 15;
+/// The first version that signs SSH authentication with vault-held keys
+/// ([`Request::SshAgent`]).
+pub const SSH_AGENT_VERSION: u16 = 16;
+/// Largest data the broker signs for SSH authentication: a session
+/// identifier and a user authentication request are far smaller.
+pub const MAX_SSH_SIGN_DATA: usize = 16 * 1024;
 /// Longest IRC line the gateway may send, without its CR LF (RFC 1459's
 /// 512 bytes, less the line ending).
 pub const MAX_IRC_LINE: usize = 510;
@@ -321,6 +327,21 @@ pub struct GitCall {
     pub request: Option<Vec<u8>>,
 }
 
+/// One use of an SSH key held in the vault, for an SSH client the gateway
+/// runs (an SSH agent's work). Since [`SSH_AGENT_VERSION`].
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SshAgentCall {
+    pub credential: String,
+    /// The `ssh://host:port` server the client is connecting to; the key
+    /// must be bound to it.
+    pub destination: String,
+    /// `None` asks only for the public key; `Some` asks for a signature of
+    /// what the client signs to authenticate with that key (a session
+    /// identifier and user authentication request), and of nothing else.
+    #[serde(with = "serde_bytes")]
+    pub sign: Option<Vec<u8>>,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Request {
     ReviewVaultImport {
@@ -452,6 +473,10 @@ pub enum Request {
     /// Gateway role, version 14: one round of a git fetch. Answered like
     /// `GitReceivePack`.
     GitUploadPack(GitCall),
+    /// Gateway role, version 16: the public key of an SSH key bound to a
+    /// destination, and a signature of an authentication request. Answered
+    /// with `SshAgent`; the private key never leaves the broker.
+    SshAgent(SshAgentCall),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -516,6 +541,8 @@ pub enum BrokerError {
     Vault(#[source] VaultFailure),
     #[error("provider request failed")]
     Upstream(#[source] UpstreamFailure),
+    #[error("the SSH key could not be used")]
+    SshKey(#[source] a206_vault::SshKeyError),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
@@ -529,7 +556,7 @@ pub enum InvalidRequest {
     #[error("credential value does not match its kind")]
     KindMismatch,
     #[error(
-        "destinations must be HTTPS (or loopback HTTP) URLs, or ircs:// servers, without embedded credentials"
+        "destinations must be HTTPS (or loopback HTTP) URLs, ircs:// servers or ssh://host[:port] servers, without embedded credentials"
     )]
     Destination,
     #[error("at most 16 destinations may be bound")]
@@ -566,6 +593,8 @@ pub enum InvalidRequest {
     GitRepository,
     #[error("a git username must be 1 to 256 characters without a colon or control characters")]
     GitUsername,
+    #[error("an SSH key use names an ssh://host:port server and at most 16 KiB to sign")]
+    SshAgent,
     #[error(
         "the vault to import must be an absolute path to a readable regular file of at most 16 MiB"
     )]
@@ -636,6 +665,14 @@ pub enum Reply {
         status: u16,
         #[serde(with = "serde_bytes")]
         body: Vec<u8>,
+    },
+    /// An SSH key's public key and, when asked for, a signature, both in SSH
+    /// wire format.
+    SshAgent {
+        #[serde(with = "serde_bytes")]
+        public_key: Vec<u8>,
+        #[serde(with = "serde_bytes")]
+        signature: Option<Vec<u8>>,
     },
     /// The upstream status of a streamed call. Like `Provider`, an
     /// unsuccessful status is followed directly by `ProviderEnd`: upstream

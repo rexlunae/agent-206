@@ -341,7 +341,11 @@ impl Vault {
             .collect())
     }
 
-    fn load_value(&self, name: &str, kind: CredentialKind) -> Result<CredentialValue, Error> {
+    pub(crate) fn load_value(
+        &self,
+        name: &str,
+        kind: CredentialKind,
+    ) -> Result<CredentialValue, Error> {
         let val = val_key(name);
         // Metadata without its value is a damaged record, never an empty secret.
         let get = |suffix: &str| -> Result<Secret, Error> {
@@ -730,6 +734,100 @@ mod tests {
             .unwrap();
         assert!(matches!(
             vault.use_for_destination(&login, &origin, |_| ()),
+            Err(Error::Denied(Denial::UnsupportedKind))
+        ));
+    }
+
+    #[test]
+    fn an_ssh_key_signs_only_userauth_for_a_bound_destination() {
+        let (_dir, mut vault, _) = unlocked();
+        let name = random();
+        let (private, public) = crate::generate_ssh_key("t").unwrap();
+        let destination = format!("ssh://{}.test:22", random());
+        let mut held = meta(CredentialKind::SshKey, AccessPolicy::SkillOnly(vec![]));
+        vault
+            .put_credential(
+                &name,
+                &held,
+                CredentialValue::SshKeyPair {
+                    private_key: Secret::new(private.to_string()),
+                    public_key: Secret::new(public.clone()),
+                },
+            )
+            .unwrap();
+        let key = ssh_key::PublicKey::from_openssh(&public).unwrap();
+        let data = crate::ssh::tests::userauth(&key, b"publickey", None);
+        assert!(matches!(
+            vault.ssh_for_destination(&name, &destination, Some(&data)),
+            Err(Error::Denied(Denial::DestinationNotBound))
+        ));
+        held.destinations = vec![destination.clone()];
+        vault
+            .update_credential(&name, |m| *m = held.clone())
+            .unwrap();
+        // Agent access stays off: no agent receives the key.
+        let listed = vault
+            .ssh_for_destination(&name, &destination, None)
+            .unwrap();
+        assert_eq!(listed.public_key, key.to_bytes().unwrap());
+        assert_eq!(listed.signature, None);
+        let signed = vault
+            .ssh_for_destination(&name, &destination, Some(&data))
+            .unwrap();
+        let signature = <ssh_key::Signature as ssh_encoding::Decode>::decode(
+            &mut signed.signature.unwrap().as_slice(),
+        )
+        .unwrap();
+        signature::Verifier::verify(&key, &data, &signature).unwrap();
+        assert!(matches!(
+            vault.ssh_for_destination(&name, &destination, Some(random().as_bytes())),
+            Err(Error::SshKey(crate::SshKeyError::NotUserAuth(_)))
+        ));
+        for other in [
+            destination.replace(":22", ":2222"),
+            destination.replace(".test", ".evil"),
+        ] {
+            assert!(matches!(
+                vault.ssh_for_destination(&name, &other, None),
+                Err(Error::Denied(Denial::DestinationNotBound))
+            ));
+        }
+        // A stored public key of another key is a damaged record.
+        let (_, stranger) = crate::generate_ssh_key("s").unwrap();
+        let mismatched = random();
+        vault
+            .put_credential(
+                &mismatched,
+                &held,
+                CredentialValue::SshKeyPair {
+                    private_key: Secret::new(private.to_string()),
+                    public_key: Secret::new(stranger),
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            vault.ssh_for_destination(&mismatched, &destination, None),
+            Err(Error::SshKey(crate::SshKeyError::Mismatch))
+        ));
+        vault
+            .update_credential(&name, |m| m.disabled = true)
+            .unwrap();
+        assert!(matches!(
+            vault.ssh_for_destination(&name, &destination, None),
+            Err(Error::Denied(Denial::Disabled))
+        ));
+        let token = random();
+        let mut token_meta = meta(CredentialKind::ApiKey, AccessPolicy::Always);
+        token_meta.destinations = vec![destination.clone()];
+        vault
+            .put_credential(
+                &token,
+                &token_meta,
+                CredentialValue::Single(Secret::new(random())),
+            )
+            .unwrap();
+        assert!(matches!(
+            vault.ssh_for_destination(&token, &destination, None),
             Err(Error::Denied(Denial::UnsupportedKind))
         ));
     }

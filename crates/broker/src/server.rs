@@ -179,6 +179,7 @@ fn vault_error(error: VaultError) -> BrokerError {
         }
         VaultError::Exists => BrokerError::VaultExists,
         VaultError::ImportSource(_) => BrokerError::Invalid(I::ImportSource),
+        VaultError::SshKey(error) => BrokerError::SshKey(error),
     }
 }
 
@@ -233,6 +234,11 @@ fn origins(destinations: Vec<String>) -> Result<Vec<String>, BrokerError> {
     destinations
         .iter()
         .map(|d| {
+            if d.get(..4).is_some_and(|s| s.eq_ignore_ascii_case("ssh:")) {
+                return a206_core::ssh_host::SshHost::parse(d)
+                    .map(|host| host.origin())
+                    .map_err(|_| BrokerError::Invalid(InvalidRequest::Destination));
+            }
             if d.starts_with("ircs:") || d.starts_with("irc:") {
                 return a206_core::messengers::IrcServer::parse(d)
                     .map(|server| server.origin())
@@ -364,7 +370,8 @@ fn handle(shared: &Shared, session: &mut Session, request: Request) -> Handled {
             | Request::SocketOpen(_)
             | Request::SocketSend { .. }
             | Request::GitReceivePack(_)
-            | Request::GitUploadPack(_),
+            | Request::GitUploadPack(_)
+            | Request::SshAgent(_),
         ) => {}
         (Role::Gateway, _)
         | (
@@ -375,7 +382,8 @@ fn handle(shared: &Shared, session: &mut Session, request: Request) -> Handled {
             | Request::SocketOpen(_)
             | Request::SocketSend { .. }
             | Request::GitReceivePack(_)
-            | Request::GitUploadPack(_),
+            | Request::GitUploadPack(_)
+            | Request::SshAgent(_),
         ) => {
             return Err(BrokerError::Forbidden);
         }
@@ -782,6 +790,7 @@ fn handle(shared: &Shared, session: &mut Session, request: Request) -> Handled {
         Request::SocketSend { .. } => Err(BrokerError::Invalid(InvalidRequest::NoSocket)),
         Request::GitReceivePack(call) => git(shared, session, call, GitService::ReceivePack),
         Request::GitUploadPack(call) => git(shared, session, call, GitService::UploadPack),
+        Request::SshAgent(call) => ssh_agent(shared, session, call),
     }
 }
 
@@ -998,6 +1007,32 @@ fn git(shared: &Shared, session: &Session, call: GitCall, service: GitService) -
         cancel,
         stream: false,
     })))
+}
+
+/// Use an SSH key for the client the gateway runs: the vault checks the
+/// destination binding and signs only an authentication request for that
+/// key.
+fn ssh_agent(shared: &Shared, session: &Session, call: SshAgentCall) -> Handled {
+    let invalid = || BrokerError::Invalid(InvalidRequest::SshAgent);
+    let destination = a206_core::ssh_host::SshHost::parse(&call.destination)
+        .map_err(|_| invalid())?
+        .origin();
+    if destination != call.destination
+        || call
+            .sign
+            .as_ref()
+            .is_some_and(|d| d.len() > MAX_SSH_SIGN_DATA)
+    {
+        return Err(invalid());
+    }
+    let (vault, _) = paired(shared, session)?;
+    let used = vault
+        .ssh_for_destination(&call.credential, &destination, call.sign.as_deref())
+        .map_err(vault_error)?;
+    Ok(Outcome::Reply(Reply::SshAgent {
+        public_key: used.public_key,
+        signature: used.signature,
+    }))
 }
 
 /// Telegram takes the bot token as the first path segment. A token that could

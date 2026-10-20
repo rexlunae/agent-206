@@ -13,6 +13,7 @@ pub mod imports;
 pub mod profiles;
 pub mod prompts;
 pub mod search;
+pub mod ssh_host;
 pub mod teams;
 pub mod tools;
 pub mod web_search;
