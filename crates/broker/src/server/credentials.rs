@@ -102,6 +102,10 @@ pub(super) fn add(shared: &Shared, session: &Session, input: ApiKeyInput, now: I
         }
         let url = url::Url::parse(destination)
             .map_err(|_| BrokerError::Invalid(InvalidRequest::Destination))?;
+        // Generic credential bindings also support SSH/IRC. API-key setup
+        // stays restricted to HTTPS and loopback HTTP regardless of those
+        // other credential families.
+        allowed_scheme(&url).map_err(|_| BrokerError::Invalid(InvalidRequest::Destination))?;
         if url.path() != "/" || url.query().is_some() || url.fragment().is_some() {
             return Err(BrokerError::Invalid(InvalidRequest::Destination));
         }

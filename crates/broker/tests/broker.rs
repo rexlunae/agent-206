@@ -3292,6 +3292,9 @@ async fn credential_pages_and_additions_require_user_auth_and_never_replace_or_r
         "https://example.invalid/#x",
         "http://example.invalid",
         "https://user:pass@example.invalid",
+        "ssh://example.invalid/",
+        "SSH://example.invalid/",
+        "ircs://example.invalid/",
     ] {
         let Request::AddApiKey(mut input) = key_input(&random(), &random()) else {
             panic!()
