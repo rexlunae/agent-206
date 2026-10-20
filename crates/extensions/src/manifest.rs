@@ -1,13 +1,13 @@
 //! Extension manifests (`plugin.toml`), validated before anything runs.
 use a206_core::{
     Capability, PluginSummary,
-    extension::{Args, PanelSpec, ParamKind, ToolSpec},
+    extension::{Args, PanelSpec, ParamKind, ToolSpec, TriggerSpec},
 };
 use a206_extension_abi::{ABI, valid_name};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
-/// Most tools, panels or parameters one manifest may declare.
+/// Most tools, panels, triggers or parameters one manifest may declare.
 pub const MAX_DECLARATIONS: usize = 64;
 /// Most network destinations one manifest may declare.
 pub const MAX_HOSTS: usize = 32;
@@ -53,6 +53,8 @@ pub enum ArgError {
     UnknownTool(String),
     #[error("extension has no panel `{0}`")]
     UnknownPanel(String),
+    #[error("extension has no trigger `{0}`")]
+    UnknownTrigger(String),
     #[error("tool has no parameter `{0}`")]
     Unknown(String),
     #[error("parameter `{0}` is required")]
@@ -69,13 +71,16 @@ pub struct Manifest {
     pub description: String,
     pub version: String,
     pub abi: u32,
-    /// The union of what the tools and panels may use; requesting grants nothing.
+    /// The union of what the tools, panels and triggers may use; requesting
+    /// grants nothing.
     #[serde(default)]
     pub capabilities: BTreeSet<Capability>,
     #[serde(default)]
     pub tools: Vec<ToolSpec>,
     #[serde(default)]
     pub panels: Vec<PanelSpec>,
+    #[serde(default)]
+    pub triggers: Vec<TriggerSpec>,
     /// Where `network` may connect: exact host names, or `*` alone for any
     /// public HTTPS host. Shown to the user beside the permission.
     #[serde(default)]
@@ -116,9 +121,14 @@ impl Manifest {
             .panels
             .iter()
             .map(|panel| (panel.id.as_str(), &panel.capabilities));
+        let triggers = self
+            .triggers
+            .iter()
+            .map(|trigger| (trigger.name.as_str(), &trigger.capabilities));
         for (what, items) in [
             ("tool", tools.collect::<Vec<_>>()),
             ("panel", panels.collect()),
+            ("trigger", triggers.collect()),
         ] {
             names(what, items.iter().map(|(name, _)| *name))?;
             for (name, capabilities) in items {
@@ -130,7 +140,7 @@ impl Manifest {
                 }
             }
         }
-        for tool in &self.tools {
+        for tool in self.tools.iter().chain(&self.triggers) {
             names("parameter", tool.params.iter().map(|p| p.name.as_str()))?;
         }
         self.validate_hosts()
@@ -169,6 +179,12 @@ impl Manifest {
             .find(|panel| panel.id == id)
             .ok_or_else(|| ArgError::UnknownPanel(id.into()))
     }
+    pub fn trigger(&self, name: &str) -> Result<&TriggerSpec, ArgError> {
+        self.triggers
+            .iter()
+            .find(|trigger| trigger.name == name)
+            .ok_or_else(|| ArgError::UnknownTrigger(name.into()))
+    }
     /// What a client shows for this extension, with the user's choices.
     pub fn summary(&self, enabled: bool, granted: &BTreeSet<Capability>) -> PluginSummary {
         PluginSummary {
@@ -181,6 +197,7 @@ impl Manifest {
             granted: granted.intersection(&self.capabilities).copied().collect(),
             tools: self.tools.clone(),
             panels: self.panels.clone(),
+            triggers: self.triggers.clone(),
             hosts: self.hosts.clone(),
             source: Default::default(),
         }
@@ -346,6 +363,56 @@ mod tests {
             manifest("[[panels]]\nid = \"p\"\ntitle = \"t\"\ncapabilities = [\"execute\"]"),
             Err(ManifestError::Undeclared {
                 capability: Capability::Execute,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn triggers_are_declared_and_checked_like_tools() {
+        let parsed = manifest(
+            "[[triggers]]\nname = \"changed\"\ndescription = \"d\"\ncapabilities = [\"read_workspace\"]\n[[triggers.params]]\nname = \"path\"\ntype = \"string\"\ndescription = \"d\"\nrequired = true",
+        )
+        .unwrap();
+        let trigger = parsed.trigger("changed").unwrap();
+        assert_eq!(
+            check_args(trigger, &Args::new()),
+            Err(ArgError::Missing("path".into()))
+        );
+        assert_eq!(
+            parsed.trigger("changed_too"),
+            Err(ArgError::UnknownTrigger("changed_too".into()))
+        );
+        // A tool's name is not a trigger's.
+        assert!(parsed.tool("changed").is_err());
+        assert_eq!(
+            parsed.summary(false, &BTreeSet::new()).triggers,
+            parsed.triggers
+        );
+        assert!(matches!(
+            manifest(
+                "[[triggers]]\nname = \"t\"\ndescription = \"d\"\ncapabilities = [\"network\"]"
+            ),
+            Err(ManifestError::Undeclared {
+                capability: Capability::Network,
+                ..
+            })
+        ));
+        assert!(matches!(
+            manifest(
+                "[[triggers]]\nname = \"a\"\ndescription = \"d\"\n[[triggers]]\nname = \"a\"\ndescription = \"d\""
+            ),
+            Err(ManifestError::Duplicate {
+                what: "trigger",
+                ..
+            })
+        ));
+        assert!(matches!(
+            manifest(
+                "[[triggers]]\nname = \"a\"\ndescription = \"d\"\n[[triggers.params]]\nname = \"Bad Name\"\ntype = \"string\"\ndescription = \"d\""
+            ),
+            Err(ManifestError::Name {
+                what: "parameter",
                 ..
             })
         ));

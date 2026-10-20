@@ -10,8 +10,9 @@
 //! because a plain-text answer there would downgrade the room's protection.
 //!
 //! The first sync of a session that starts without a cursor answers nothing:
-//! it only marks where to start, so history is never answered. The cursor is
-//! kept across reconnects while the gateway runs, but not across restarts.
+//! it only marks where to start, so history is never answered. The caller
+//! keeps the cursor across reconnects and saves it in the gateway's state,
+//! so a restart resumes from it.
 use super::{Account, Api, Batch, Event, Inbound, MessengerError, Result, split};
 use a206_broker::{AuthScheme, HttpMethod};
 use serde::Deserialize;
@@ -23,7 +24,7 @@ const SERVICE: &str = "Matrix";
 const POLL_MILLISECONDS: u32 = 25_000;
 /// Most timeline events one sync returns per room.
 const TIMELINE_LIMIT: u32 = 50;
-const MAX_ROOMS: usize = 64;
+pub(super) const MAX_ROOMS: usize = 64;
 const MAX_EVENTS: usize = 1_000;
 const MAX_PAGES: usize = 32;
 const MAX_DISCOVERIES: usize = 4_096;
@@ -38,6 +39,10 @@ pub(crate) struct Matrix {
     pending: Option<Pending>,
     /// The bot's own user id, whose messages are never answered.
     user: Option<String>,
+    /// This adapter has seen the pending invitations. An incremental sync
+    /// lists only invitations that changed after its cursor, so a cursor
+    /// from an earlier session hides one the user allowed meanwhile.
+    invitations_seen: bool,
 }
 
 /// Discovery is drained before authorized effects. Until the final chunk,
@@ -195,6 +200,7 @@ impl Matrix {
             allowed,
             pending: None,
             user: None,
+            invitations_seen: false,
         }
     }
 
@@ -252,7 +258,58 @@ impl Matrix {
     /// Wait for events after `since`. Without one, this is the first sync:
     /// it returns at once, delivers only pending invitations, and its cursor
     /// marks where answering starts.
+    ///
+    /// The first call with a cursor this adapter did not reach itself first
+    /// reads the pending invitations with a sync that has no cursor, and
+    /// hands them over in a batch that keeps `since`, so a room the user allowed
+    /// while the cursor was saved is still joined.
     pub(crate) async fn receive(&mut self, since: Option<&str>) -> Result<Batch> {
+        if let Some(since) = since
+            && !self.invitations_seen
+        {
+            // Only the invitations: the rest of a first sync is history.
+            let events = self.invitations().await?;
+            self.pending = None;
+            self.invitations_seen = true;
+            return Ok(Batch {
+                events,
+                complete: false,
+                next: Some(since.to_owned()),
+            });
+        }
+        self.invitations_seen = true;
+        self.sync(since).await
+    }
+
+    /// Pending invitations to allowed rooms, from a sync without a cursor
+    /// and without timelines. Joined rooms are not charged to the budget:
+    /// this sync lists every one, and an account in many unchanged rooms
+    /// must still be able to resume.
+    async fn invitations(&self) -> Result<Vec<(String, Event)>> {
+        let mut url = self.url(&["sync"])?;
+        url.query_pairs_mut()
+            .append_pair("filter", &filter(0).to_string())
+            .append_pair("timeout", "0");
+        let sync: Sync = self.request(HttpMethod::Get, url, None).await?;
+        let mut count = 0;
+        let mut events = Vec::new();
+        for (room, invited) in sync.rooms.invite {
+            if !self.allowed.contains(&room) {
+                continue;
+            }
+            if events.len() == MAX_ROOMS {
+                return Err(MessengerError::SyncBudget { service: SERVICE });
+            }
+            charge(
+                &mut count,
+                invited.invite_state.events.len().saturating_add(1),
+            )?;
+            events.push(invite(room, &invited));
+        }
+        Ok(events)
+    }
+
+    async fn sync(&mut self, since: Option<&str>) -> Result<Batch> {
         if let Some(pending) = &mut self.pending {
             if pending.previous.as_deref() == since {
                 let batch = pending.chunk();
@@ -263,22 +320,9 @@ impl Matrix {
             }
             self.pending = None;
         }
-        let filter = serde_json::json!({
-            "presence": {"types": []},
-            "account_data": {"types": []},
-            "room": {
-                "account_data": {"types": []},
-                "ephemeral": {"types": []},
-                "state": {"types": [], "lazy_load_members": true},
-                "timeline": {
-                    "limit": TIMELINE_LIMIT,
-                    "types": ["m.room.message", "m.room.encrypted"],
-                },
-            },
-        });
         let mut url = self.url(&["sync"])?;
         url.query_pairs_mut()
-            .append_pair("filter", &filter.to_string())
+            .append_pair("filter", &filter(TIMELINE_LIMIT).to_string())
             .append_pair(
                 "timeout",
                 &since.map_or(0, |_| POLL_MILLISECONDS).to_string(),
@@ -366,16 +410,7 @@ impl Matrix {
         let mut seen = BTreeSet::new();
         let mut events = Vec::new();
         for (room, invited) in sync.rooms.invite {
-            let title = invited
-                .invite_state
-                .events
-                .iter()
-                .find(|e| e.kind == "m.room.name")
-                .and_then(|e| e.content.name.clone());
-            events.push((
-                format!("invite {room}"),
-                Event::Invite { chat: room, title },
-            ));
+            events.push(invite(room, &invited));
         }
         if let Some(since) = since {
             for (room, joined) in sync.rooms.join {
@@ -540,6 +575,37 @@ impl Matrix {
         }
         Ok(())
     }
+}
+
+/// Message timelines up to `limit` events per room, without presence,
+/// account data, ephemeral or state events.
+fn filter(limit: u32) -> serde_json::Value {
+    serde_json::json!({
+        "presence": {"types": []},
+        "account_data": {"types": []},
+        "room": {
+            "account_data": {"types": []},
+            "ephemeral": {"types": []},
+            "state": {"types": [], "lazy_load_members": true},
+            "timeline": {
+                "limit": limit,
+                "types": ["m.room.message", "m.room.encrypted"],
+            },
+        },
+    })
+}
+
+fn invite(room: String, invited: &Invited) -> (String, Event) {
+    let title = invited
+        .invite_state
+        .events
+        .iter()
+        .find(|e| e.kind == "m.room.name")
+        .and_then(|e| e.content.name.clone());
+    (
+        format!("invite {room}"),
+        Event::Invite { chat: room, title },
+    )
 }
 
 fn charge(count: &mut usize, added: usize) -> Result<()> {

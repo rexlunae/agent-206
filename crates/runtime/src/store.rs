@@ -1,4 +1,5 @@
 //! SQLite WAL snapshot, event journal and durable request deduplication.
+use crate::messengers::SavedCursor;
 use crate::provider::now;
 use a206_core::{schedule::MAX_JOB_RUNS, *};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -52,6 +53,14 @@ impl crate::error::Classified for StoreError {
 type Result<T, E = StoreError> = std::result::Result<T, E>;
 /// Largest snapshot kept: one frame, less room for the envelope it travels in.
 const LIMIT: usize = a206_protocol::MAX_FRAME - 65_536;
+/// Format version of a saved messenger position.
+const CURSOR_VERSION: u32 = 1;
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct StoredCursor {
+    version: u32,
+    cursor: SavedCursor,
+}
 
 /// Open the single profile lock used by both startup and offline stop intent.
 pub(crate) fn profile_lock(root: &Path) -> std::io::Result<std::fs::File> {
@@ -72,22 +81,48 @@ pub(crate) fn lock_file(root: &Path, name: &str) -> std::io::Result<std::fs::Fil
         .write(true)
         .open(root.join(name))
 }
+/// An exclusive lock on one of the profile's lock files, released when
+/// dropped. A child that another thread is starting holds a copy of every
+/// descriptor until it execs, and the lock belongs to the open file rather
+/// than to one descriptor, so closing ours alone would leave the lock held
+/// by that copy. Dropping unlocks first, which releases it for every copy.
+pub(crate) struct Held(std::fs::File);
+impl Held {
+    /// Take the lock on `file`, or `WouldBlock` while another holder has it.
+    pub(crate) fn try_lock(file: std::fs::File) -> std::io::Result<Self> {
+        fs2::FileExt::try_lock_exclusive(&file)?;
+        Ok(Self(file))
+    }
+}
+impl Drop for Held {
+    fn drop(&mut self) {
+        if let Err(error) = fs2::FileExt::unlock(&self.0) {
+            // Closing the descriptor still releases it once no copy remains.
+            tracing::warn!(
+                error = &error as &dyn std::error::Error,
+                "could not release a profile lock"
+            );
+        }
+    }
+}
 pub struct Store {
-    _lock: std::fs::File,
     db: Connection,
     pub state: Snapshot,
     pub root: PathBuf,
+    // Last, so the database is closed before another owner may open it.
+    _lock: Held,
 }
 impl Store {
     pub fn open(root: &Path) -> Result<Self> {
-        let lock = profile_lock(root).map_err(StoreError::Directory)?;
-        fs2::FileExt::try_lock_exclusive(&lock).map_err(StoreError::Owned)?;
+        let lock = Held::try_lock(profile_lock(root).map_err(StoreError::Directory)?)
+            .map_err(StoreError::Owned)?;
         let db = Connection::open(root.join("state.sqlite3"))?;
         db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
             CREATE TABLE IF NOT EXISTS snapshot(id INTEGER PRIMARY KEY CHECK(id=1), payload BLOB NOT NULL);
             CREATE TABLE IF NOT EXISTS events(seq INTEGER PRIMARY KEY AUTOINCREMENT, payload BLOB NOT NULL);
             CREATE TABLE IF NOT EXISTS requests(id TEXT PRIMARY KEY, request BLOB NOT NULL, reply BLOB);
             CREATE TABLE IF NOT EXISTS extension_state(extension TEXT NOT NULL, key TEXT NOT NULL, value BLOB NOT NULL, PRIMARY KEY(extension, key));
+            CREATE TABLE IF NOT EXISTS messenger_cursors(messenger TEXT PRIMARY KEY, payload BLOB NOT NULL);
             CREATE TABLE IF NOT EXISTS job_runs(seq INTEGER PRIMARY KEY AUTOINCREMENT, job TEXT NOT NULL, run TEXT NOT NULL UNIQUE, payload BLOB NOT NULL);
             CREATE INDEX IF NOT EXISTS job_runs_by_job ON job_runs(job, seq);")?;
         let data: Option<Vec<u8>> = db
@@ -123,10 +158,10 @@ impl Store {
             }
         };
         let mut store = Self {
-            _lock: lock,
             db,
             state,
             root: root.to_owned(),
+            _lock: lock,
         };
         crate::provider::validate_presets(&store.state.settings.provider_presets)
             .map_err(StoreError::Presets)?;
@@ -363,6 +398,35 @@ impl Store {
         )?;
         Ok(())
     }
+    /// Where messenger `name` last saved its reading position. A position
+    /// saved in another format version is not resumed.
+    pub fn messenger_cursor(&self, name: &str) -> Result<Option<SavedCursor>> {
+        let payload: Option<Vec<u8>> = self
+            .db
+            .query_row(
+                "SELECT payload FROM messenger_cursors WHERE messenger=?1",
+                [name],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(payload) = payload else {
+            return Ok(None);
+        };
+        let saved: StoredCursor = rmp_serde::from_slice(&payload)?;
+        Ok((saved.version == CURSOR_VERSION).then_some(saved.cursor))
+    }
+    /// Replace messenger `name`'s saved reading position.
+    pub fn put_messenger_cursor(&self, name: &str, cursor: &SavedCursor) -> Result<()> {
+        let payload = rmp_serde::to_vec_named(&StoredCursor {
+            version: CURSOR_VERSION,
+            cursor: cursor.clone(),
+        })?;
+        self.db.execute(
+            "INSERT INTO messenger_cursors(messenger,payload) VALUES(?1,?2) ON CONFLICT(messenger) DO UPDATE SET payload=excluded.payload",
+            params![name, payload],
+        )?;
+        Ok(())
+    }
     /// This extension's persisted value for `key`.
     pub fn extension_state(&self, extension: &str, key: &str) -> Result<Option<Vec<u8>>> {
         Ok(self
@@ -470,8 +534,9 @@ fn bundled_plugins(previous: &[PluginSummary]) -> Result<Vec<PluginSummary>> {
     Ok(plugins)
 }
 
-/// Mark every run the history still shows as running ended unrecorded: no
-/// run survives a restart, and recovery has settled each job's latest.
+/// Mark every run the history still shows as running ended unrecorded, and
+/// every reply it shows as posting unrecorded: neither survives a restart,
+/// and recovery has settled each job's latest.
 fn unrecorded(tx: &rusqlite::Transaction<'_>) -> Result<()> {
     let mut stmt = tx.prepare("SELECT run, payload FROM job_runs")?;
     let rows = stmt
@@ -481,8 +546,14 @@ fn unrecorded(tx: &rusqlite::Transaction<'_>) -> Result<()> {
         .collect::<rusqlite::Result<Vec<_>>>()?;
     for (key, payload) in rows {
         let mut run: JobRun = rmp_serde::from_slice(&payload)?;
-        if run.outcome == JobOutcome::Running {
-            run.outcome = JobOutcome::Unrecorded;
+        let posting = run.delivery == Some(Delivery::Posting);
+        if posting {
+            run.delivery = Some(Delivery::Unrecorded);
+        }
+        if run.outcome == JobOutcome::Running || posting {
+            if run.outcome == JobOutcome::Running {
+                run.outcome = JobOutcome::Unrecorded;
+            }
             tx.execute(
                 "UPDATE job_runs SET payload=?1 WHERE run=?2",
                 params![rmp_serde::to_vec_named(&run)?, key],
@@ -517,6 +588,56 @@ fn record_run(tx: &rusqlite::Transaction<'_>, state: &Snapshot, job: Id) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn a_closed_store_is_free_while_a_starting_child_holds_a_copy_of_its_lock() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        // What a child forked by another thread holds until it execs.
+        let copy = store._lock.0.try_clone().unwrap();
+        assert!(matches!(
+            Store::open(directory.path()),
+            Err(StoreError::Owned(error)) if error.kind() == std::io::ErrorKind::WouldBlock
+        ));
+        drop(store);
+        let reopened = Store::open(directory.path()).unwrap();
+        drop(copy);
+        drop(reopened);
+        Store::open(directory.path()).unwrap();
+    }
+    #[test]
+    fn messenger_positions_survive_reopening_and_other_versions_are_ignored() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        let (name, other) = (Id::new_v4().to_string(), Id::new_v4().to_string());
+        assert_eq!(store.messenger_cursor(&name).unwrap(), None);
+        let cursor = |next: String| SavedCursor {
+            kind: MessengerKind::Matrix,
+            account: Id::new_v4().to_string(),
+            next: Some(next),
+            handled: [Id::new_v4().to_string()].into(),
+        };
+        let first = cursor(Id::new_v4().to_string());
+        store.put_messenger_cursor(&name, &first).unwrap();
+        let second = cursor(Id::new_v4().to_string());
+        store.put_messenger_cursor(&name, &second).unwrap();
+        // A position written by a later format.
+        let newer = rmp_serde::to_vec_named(&StoredCursor {
+            version: CURSOR_VERSION + 1,
+            cursor: first,
+        })
+        .unwrap();
+        store
+            .db
+            .execute(
+                "INSERT INTO messenger_cursors(messenger,payload) VALUES(?1,?2)",
+                params![other, newer],
+            )
+            .unwrap();
+        drop(store);
+        let reopened = Store::open(directory.path()).unwrap();
+        assert_eq!(reopened.messenger_cursor(&name).unwrap(), Some(second));
+        assert_eq!(reopened.messenger_cursor(&other).unwrap(), None);
+    }
     #[test]
     fn reopening_keeps_installed_extensions_but_not_over_bundled_ids() {
         let directory = tempfile::tempdir().unwrap();

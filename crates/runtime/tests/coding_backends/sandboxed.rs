@@ -24,6 +24,7 @@ fn compile_fixture(
     state: &Path,
     outside: &Path,
     project_root: &Path,
+    image: &str,
 ) -> std::path::PathBuf {
     let thread = Id::new_v4().to_string();
     let turn = Id::new_v4().to_string();
@@ -77,6 +78,10 @@ fn main() {
         assert!(first.contains(MODEL)); assert!(first.contains("settingSources")); assert!(first.contains("bare"));
         answer(CLAUDE_SESSION, &first);
         let prompt = receive(); assert!(prompt.contains("session/prompt")); check_scope(&prompt);
+        // This agent advertises no image prompts, so the image is only named.
+        // A follow-up's transcript still names the earlier turn, but carries no image.
+        if prompt.contains("fixture-followup") { assert!(!prompt.contains("does not accept images")); }
+        else if prompt.contains("fixture-image") { assert!(prompt.contains("does not accept images")); assert!(!prompt.contains(IMAGE)); }
         send(CLAUDE_PERMISSION);
         let denied = receive(); assert!(denied.contains("cancelled"));
         send(CLAUDE_FOREIGN);
@@ -87,6 +92,8 @@ fn main() {
         assert!(receive().contains("initialized"));
         let start = receive(); assert!(start.contains(MODEL)); assert!(start.contains("baseInstructions")); send(CODEX_THREAD);
         let prompt = receive(); assert!(prompt.contains("turn/start")); assert!(prompt.contains(MODEL)); check_scope(&prompt); send(CODEX_TURN);
+        if prompt.contains("fixture-followup") { assert!(!prompt.contains("data:image/")); }
+        else if prompt.contains("fixture-image") { assert!(prompt.contains(&format!("data:image/png;base64,{}", IMAGE))); }
         if prompt.contains("fixture-malformed") { send("{"); std::thread::sleep(std::time::Duration::from_secs(60)); return; }
         if prompt.contains("fixture-oversized") { send(&"x".repeat(2 * 1024 * 1024 + 1)); std::thread::sleep(std::time::Duration::from_secs(60)); return; }
         if prompt.contains("fixture-wait") {
@@ -124,6 +131,7 @@ fn main() {
         ),
         ("OUTSIDE_FILE", literal(outside.to_str().unwrap())),
         ("MODEL", literal(model)),
+        ("IMAGE", literal(image)),
         (
             "CLAUDE_INIT",
             json_literal(
@@ -231,6 +239,12 @@ pub async fn drives_both_agent_protocols_in_the_real_os_sandbox() {
     std::os::unix::fs::symlink(&outside, project_root.join("link")).unwrap();
     let model = Id::new_v4().to_string();
     let text = Id::new_v4().to_string();
+    let mut image = b"\x89PNG\r\n\x1a\n".to_vec();
+    image.extend_from_slice(Id::new_v4().as_bytes());
+    let encoded = {
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD.encode(&image)
+    };
     let executable = compile_fixture(
         &installation,
         &model,
@@ -238,6 +252,7 @@ pub async fn drives_both_agent_protocols_in_the_real_os_sandbox() {
         &state,
         &outside,
         &project_root,
+        &encoded,
     );
     let script = installation.join("adapter.js");
     std::fs::write(&script, "").unwrap();
@@ -324,15 +339,26 @@ pub async fn drives_both_agent_protocols_in_the_real_os_sandbox() {
             .await,
             Reply::Ok
         );
+        let Reply::Image(staged) = command(
+            &gateway,
+            Command::StageImage {
+                name: Id::new_v4().to_string(),
+                data: image.clone(),
+            },
+        )
+        .await
+        else {
+            panic!("expected a staged image");
+        };
         let reply = tokio::time::timeout(
             std::time::Duration::from_secs(15),
             command(
                 &gateway,
                 Command::Send {
                     thread: thread.id,
-                    text: Id::new_v4().to_string(),
+                    text: format!("fixture-image {}", Id::new_v4()),
                     attachments: vec![],
-                    images: vec![],
+                    images: vec![staged.clone()],
                 },
             ),
         )
@@ -350,6 +376,27 @@ pub async fn drives_both_agent_protocols_in_the_real_os_sandbox() {
         assert_eq!(assistants.len(), 1);
         assert_eq!(assistants[0].text, text);
         assert_eq!(result.backend, kind);
+        // A backend reads only the answered message's images, so an earlier
+        // image that is no longer stored does not stop the next turn.
+        std::fs::remove_file(state.join("images").join(&staged.digest)).unwrap();
+        let reply = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            command(
+                &gateway,
+                Command::Send {
+                    thread: thread.id,
+                    text: format!("fixture-followup {}", Id::new_v4()),
+                    attachments: vec![],
+                    images: vec![],
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        let Reply::Thread(result) = reply else {
+            panic!("{reply:?}");
+        };
+        assert_eq!(result.state, RunState::Complete, "{:?}", result.messages);
         assert!(matches!(
             command(
                 &gateway,

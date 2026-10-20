@@ -53,6 +53,48 @@ async fn claude_code_review_and_selected_apply_use_the_same_gateway_commands() -
     Ok(())
 }
 
+#[tokio::test]
+async fn codex_review_and_selected_apply_use_the_same_gateway_commands() -> Result<()> {
+    let app = App::start(tempfile::tempdir()?, Default::default()).await?;
+    let source = tempfile::tempdir()?;
+    let private = random();
+    let id = uuid::Uuid::new_v4().simple().to_string();
+    let base = format!("https://{id}.example.test/v1");
+    let text = format!(
+        "model = \"{private}\"\nmodel_provider = \"{id}\"\n[model_providers.{id}]\nname = \"{private}\"\nbase_url = \"{base}\"\nexperimental_bearer_token = \"{private}\"\n[mcp_servers.x]\ncommand = \"{private}\"\n"
+    );
+    std::fs::write(source.path().join("config.toml"), &text)?;
+    let output = app
+        .cli(&[
+            "import",
+            "review-codex",
+            source.path().to_str().context("source path")?,
+        ])
+        .await?;
+    ensure!(!output.contains(&private));
+    let review: a206_core::imports::Review = toml::from_str(&output)?;
+    ensure!(review.preview.tool == a206_core::imports::Tool::Codex);
+    ensure!(app.snapshot().await?.settings.providers.is_empty());
+    let receipt: a206_core::imports::Receipt = toml::from_str(
+        &app.cli(&[
+            "import",
+            "apply-review",
+            &review.id.to_string(),
+            "--provider",
+            "0",
+        ])
+        .await?,
+    )?;
+    ensure!(receipt.providers_added.len() == 1 && !receipt.vault_imported);
+    let snapshot = app.snapshot().await?;
+    ensure!(snapshot.settings.providers[0].api == a206_core::ProviderApi::OpenAi);
+    ensure!(snapshot.settings.providers[0].base_url == base);
+    ensure!(snapshot.settings.providers[0].credential.is_none());
+    ensure!(snapshot.settings.mcp_servers.is_empty());
+    ensure!(std::fs::read_to_string(source.path().join("config.toml"))? == text);
+    Ok(())
+}
+
 /// A RustyClaw settings directory with one hosted and one local provider.
 fn rustyclaw(dir: &Path) -> Result<std::path::PathBuf> {
     let root = dir.join("rustyclaw");
@@ -152,6 +194,54 @@ async fn doctor_reports_an_unconfigured_profile_without_creating_it() -> Result<
     ensure!(stdout.contains("no gateway is configured"), "{stdout}");
     ensure!(stdout.contains("run: agent206 setup"), "{stdout}");
     ensure!(!root.exists(), "doctor created the profile");
+    Ok(())
+}
+
+#[tokio::test]
+async fn doctor_repair_asks_first_then_narrows_permissions_and_reports_a_failed_refresh()
+-> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let app = App::start(tempfile::tempdir()?, Default::default()).await?;
+    // Nothing listens on a port whose listener was dropped, so the refresh fails.
+    let endpoint = format!(
+        "http://{}/v1",
+        std::net::TcpListener::bind("127.0.0.1:0")?.local_addr()?
+    );
+    let label = random();
+    app.cli(&[
+        "providers",
+        "add",
+        "custom",
+        "--label",
+        &label,
+        "--endpoint",
+        &endpoint,
+    ])
+    .await?;
+    let mode = || -> Result<u32> { Ok(std::fs::metadata(&app.root)?.permissions().mode() & 0o777) };
+    std::fs::set_permissions(&app.root, std::fs::Permissions::from_mode(0o755))?;
+
+    // Closed input answers no: nothing changes.
+    let declined = capture(app.command(&["doctor", "--repair"])).await?;
+    let stdout = String::from_utf8(declined.stdout)?;
+    ensure!(stdout.contains("skipped"), "{stdout}");
+    ensure!(mode()? == 0o755);
+
+    let repaired = capture(app.command(&["doctor", "--repair", "--yes"])).await?;
+    ensure!(!repaired.status.success(), "{repaired:?}");
+    let stdout = String::from_utf8(repaired.stdout)?;
+    ensure!(mode()? == 0o700, "{stdout}");
+    ensure!(stdout.contains("done: make profile"), "{stdout}");
+    ensure!(
+        stdout.contains(&format!("failed: {label}: fetch the model list")),
+        "{stdout}"
+    );
+    ensure!(stdout.contains("cause: "), "{stdout}");
+    ensure!(
+        String::from_utf8(repaired.stderr)?.contains("repair(s) failed"),
+        "stderr"
+    );
+    ensure!(stdout.contains("Health checks after repair:"), "{stdout}");
     Ok(())
 }
 
@@ -289,5 +379,64 @@ async fn setup_without_answers_pauses_before_creating_a_vault() -> Result<()> {
     let mut stop = tokio::process::Command::new(binary()?);
     stop.arg("--data-dir").arg(&root).args(["vault", "stop"]);
     support::checked(capture(stop).await?)?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn setup_adds_a_provider_from_the_library_and_fetches_its_models() -> Result<()> {
+    let app = App::start(tempfile::tempdir()?, Default::default()).await?;
+    let model = random();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let api = axum::Router::new().route(
+        "/v1/models",
+        axum::routing::get({
+            let model = model.clone();
+            move || async move { axum::Json(serde_json::json!({"data": [{"id": model}]})) }
+        }),
+    );
+    let server = tokio::spawn(async move { axum::serve(listener, api).await });
+    let endpoint = format!("http://{address}/v1");
+    let presets = app.snapshot().await?.settings.provider_presets.effective();
+    let custom = presets
+        .iter()
+        .position(|p| p.id == "custom" && p.base_url.is_empty())
+        .context("custom preset")?;
+    // Decline the vault; add a provider; an out-of-range number, then the
+    // custom preset; a plain-HTTP remote endpoint is refused before the
+    // stand-in one is accepted. With no unlocked vault no key is asked for.
+    let answers = format!(
+        "n\ny\n{}\n{}\nhttp://{}.example.test/v1\n{endpoint}\n",
+        presets.len() + 1,
+        custom + 1,
+        uuid::Uuid::new_v4().simple()
+    );
+    let output = support::capture_input(app.command(&["setup"]), Some(answers.as_bytes())).await?;
+    let stdout = String::from_utf8(output.stdout)?;
+    ensure!(output.status.success(), "{stdout}\n{:?}", output.stderr);
+    ensure!(stdout.contains("Choose one of the numbers"), "{stdout}");
+    ensure!(stdout.contains("this endpoint cannot be used"), "{stdout}");
+    ensure!(stdout.contains("The vault is locked"), "{stdout}");
+    ensure!(stdout.contains("lists 1 models"), "{stdout}");
+    let snapshot = app.snapshot().await?;
+    let [provider] = snapshot.settings.providers.as_slice() else {
+        anyhow::bail!("expected one provider: {:?}", snapshot.settings.providers);
+    };
+    ensure!(provider.base_url == endpoint && provider.credential.is_none());
+    let catalog = snapshot
+        .catalogs
+        .iter()
+        .find(|c| c.provider == provider.id)
+        .context("catalog")?;
+    ensure!(catalog.models.iter().any(|m| m.key.model == model));
+
+    // With an account configured the step asks nothing more.
+    let again = capture(app.command(&["setup"])).await?;
+    let stdout = String::from_utf8(again.stdout)?;
+    ensure!(again.status.success(), "{stdout}");
+    ensure!(stdout.contains("Model providers: 1 configured"), "{stdout}");
+    ensure!(app.snapshot().await?.settings.providers.len() == 1);
+    server.abort();
+    app.cli(&["vault", "stop"]).await?;
     Ok(())
 }

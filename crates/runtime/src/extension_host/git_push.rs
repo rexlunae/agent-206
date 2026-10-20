@@ -1,16 +1,17 @@
 //! The repository side of the native `git_push` tool (see
-//! [`crate::git_push`]): which branch goes where, the objects it sends and
-//! the remote-tracking branch it updates. The project's repository is opened
+//! [`crate::git_remote`]): which branch or tag goes where, the objects it
+//! sends and the remote-tracking branch a branch push updates. The project's repository is opened
 //! as the git host calls open it, and nothing it configures runs; where git
 //! would run a program or rewrite the remote's URL, the push is refused.
 use super::{
     git::{check, git_failure, open, unsupported},
     git_branch::branch_name,
     git_commit::{Settings, UserGit, has_hooks, includes_files},
+    git_tag::tag_name,
 };
-use crate::git_push::PushError;
+use crate::git_remote::RemoteError;
 use a206_extensions::abi::{HostErrorCode, HostFailure};
-use a206_git_push::{Advertisement, Limits};
+use a206_git_push::{Advertisement, Limits, PackError};
 use gix::{
     ObjectId,
     refs::{
@@ -23,39 +24,68 @@ use std::{path::PathBuf, sync::atomic::AtomicBool};
 /// Hooks git runs for a push.
 const PUSH_HOOKS: [&str; 2] = ["pre-push", "reference-transaction"];
 /// Most commits a fast-forward check walks back from the pushed commit.
-const MAX_ANCESTRY: usize = 100_000;
+pub(super) const MAX_ANCESTRY: usize = 100_000;
 /// How often a remote-tracking branch update is retried after another update
 /// changed the branch first.
 const TRACKING_ATTEMPTS: usize = 3;
+/// Most tag objects followed from a pushed tag to its commit.
+const MAX_TAG_CHAIN: usize = 10;
+/// Most symbolic references followed to an object, as git's own limit.
+const MAX_SYMBOLIC_DEPTH: usize = 5;
 
-/// A branch to push and where to.
+/// What a push sends: a branch or a tag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RefKind {
+    Branch,
+    Tag,
+}
+
+/// A branch or tag to push and where to.
 #[derive(Debug, Clone)]
 pub(crate) struct PushTarget {
-    /// The local branch, such as `feature/login`.
-    pub branch: String,
-    /// The commit it points at.
+    pub kind: RefKind,
+    /// The local branch or tag, such as `feature/login` or `v1.2`.
+    pub name: String,
+    /// The object it points at: a branch's commit, or a tag's tag object
+    /// (or commit, for a plain tag).
     pub tip: ObjectId,
+    /// The commit `tip` leads to.
+    pub commit: ObjectId,
+    /// The tag objects between `tip` and `commit`, which a tag push sends
+    /// with the commits; empty for a branch or a plain tag.
+    pub tags: Vec<ObjectId>,
     pub remote: String,
     /// The repository URL the remote pushes to.
     pub url: url::Url,
     pub hash: gix::hash::Kind,
 }
 impl PushTarget {
-    /// The reference the branch updates on the server, by the same name.
+    /// The reference the push updates on the server, by the same name.
     pub fn reference(&self) -> String {
-        format!("refs/heads/{}", self.branch)
+        match self.kind {
+            RefKind::Branch => format!("refs/heads/{}", self.name),
+            RefKind::Tag => format!("refs/tags/{}", self.name),
+        }
+    }
+    /// How failures name what was pushed: a branch by its name, a tag as
+    /// `tag <name>`.
+    pub fn label(&self) -> String {
+        match self.kind {
+            RefKind::Branch => self.name.clone(),
+            RefKind::Tag => format!("tag {}", self.name),
+        }
     }
 }
 
-fn host(error: HostFailure) -> PushError {
-    PushError::Repository(error)
+pub(super) fn host(error: HostFailure) -> RemoteError {
+    RemoteError::Repository(error)
 }
 
 /// The settings a push follows: the repository's own, then the user's
 /// (with the includes the user wrote). A push is refused when the
 /// repository's configuration includes other files: the project chooses
 /// them, they may lie outside it, and git would follow them.
-fn settings(repo: &gix::Repository) -> Result<Settings, HostFailure> {
+pub(super) fn settings(repo: &gix::Repository) -> Result<Settings, HostFailure> {
     if includes_files(repo)? {
         return Err(unsupported(
             "the repository's git configuration includes other files, which this push does not read",
@@ -64,14 +94,23 @@ fn settings(repo: &gix::Repository) -> Result<Settings, HostFailure> {
     Settings::resolve(repo, &UserGit::load()?)
 }
 
-/// Resolve `branch` (default: the current one) and `remote` (default: the
-/// branch's configured remote, else `origin`) in the project at `root`.
+/// What to push or fetch: a branch (the default one when it is not
+/// named) or a tag.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Named<'a> {
+    Branch(Option<&'a str>),
+    Tag(&'a str),
+}
+
+/// Resolve what to push and `remote` (default: the branch's configured
+/// remote, for a tag the current branch's, else `origin`) in the project at
+/// `root`.
 pub(crate) fn target(
     root: PathBuf,
-    branch: Option<&str>,
+    pushed: Named<'_>,
     remote: Option<&str>,
     interrupt: &AtomicBool,
-) -> Result<PushTarget, PushError> {
+) -> Result<PushTarget, RemoteError> {
     let repo = open(root, interrupt).map_err(host)?;
     let settings = settings(&repo).map_err(host)?;
     if has_hooks(&repo, &settings, &PUSH_HOOKS) {
@@ -79,31 +118,65 @@ pub(crate) fn target(
             "the repository has a pre-push or reference-transaction hook, which git would run",
         )));
     }
-    // The remote-tracking branch's reflog records who pushed.
-    settings.identity().map_err(host)?;
-    let branch = match branch {
-        Some(name) => name.to_owned(),
-        None => repo
-            .head_name()
-            .map_err(|e| host(git_failure("head", &e)))?
-            .and_then(|name| {
-                name.category_and_short_name()
-                    .map(|(_, short)| short.to_string())
-            })
-            .ok_or_else(|| {
-                host(unsupported(
-                    "HEAD is not on a branch; name the branch to push",
-                ))
-            })?,
+    let (kind, name, tip, commit, tags, remote) = match pushed {
+        Named::Branch(branch) => {
+            // The remote-tracking branch's reflog records who pushed.
+            settings.identity().map_err(host)?;
+            let branch = match branch {
+                Some(name) => name.to_owned(),
+                None => current_branch(&repo)?,
+            };
+            let full = branch_name(&branch).ok_or(RemoteError::BranchName)?;
+            let tip = repo
+                .try_find_reference(&full)
+                .map_err(|e| host(git_failure("branches", &e)))?
+                .ok_or_else(|| RemoteError::NoBranch(branch.clone()))?
+                .peel_to_id()
+                .map_err(|_| RemoteError::NoBranch(branch.clone()))?
+                .detach();
+            let remote = remote_name(&settings, &branch, remote)?;
+            (RefKind::Branch, branch, tip, tip, vec![], remote)
+        }
+        Named::Tag(tag) => {
+            let full = tag_name(tag).ok_or(RemoteError::TagName)?;
+            let tip = direct(&repo, full.as_bstr().to_string().as_str())
+                .map_err(host)?
+                .ok_or_else(|| RemoteError::NoTag(tag.to_owned()))?;
+            let (commit, tags) =
+                tag_chain(&repo, tip, tag)?.ok_or_else(|| RemoteError::NoTag(tag.to_owned()))?;
+            let current = head_branch(&repo)?;
+            let remote = remote_name(&settings, current.as_deref().unwrap_or_default(), remote)?;
+            (RefKind::Tag, tag.to_owned(), tip, commit, tags, remote)
+        }
     };
-    let full = branch_name(&branch).ok_or(PushError::BranchName)?;
-    let tip = repo
-        .try_find_reference(&full)
-        .map_err(|e| host(git_failure("branches", &e)))?
-        .ok_or_else(|| PushError::NoBranch(branch.clone()))?
-        .peel_to_id()
-        .map_err(|_| PushError::NoBranch(branch.clone()))?
-        .detach();
+    let configured = settings
+        .string(&format!("remote.{remote}.pushurl"))
+        .or_else(|| settings.string(&format!("remote.{remote}.url")))
+        .ok_or_else(|| RemoteError::NoRemote(remote.clone()))?;
+    let configured = std::str::from_utf8(&configured).map_err(|_| RemoteError::RemoteUrl)?;
+    if settings.rewrites(configured, true) {
+        return Err(RemoteError::Rewritten);
+    }
+    let url = remote_url(configured)?;
+    Ok(PushTarget {
+        kind,
+        name,
+        tip,
+        commit,
+        tags,
+        remote,
+        url,
+        hash: repo.object_hash(),
+    })
+}
+
+/// `remote`, else `branch`'s configured remote, else `origin`; refused
+/// unless it is a plain name.
+pub(super) fn remote_name(
+    settings: &Settings,
+    branch: &str,
+    remote: Option<&str>,
+) -> Result<String, RemoteError> {
     let remote = match remote {
         Some(remote) => remote.to_owned(),
         None => settings
@@ -117,30 +190,91 @@ pub(crate) fn target(
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
     {
-        return Err(PushError::RemoteName);
+        return Err(RemoteError::RemoteName);
     }
-    let configured = settings
-        .string(&format!("remote.{remote}.pushurl"))
-        .or_else(|| settings.string(&format!("remote.{remote}.url")))
-        .ok_or_else(|| PushError::NoRemote(remote.clone()))?;
-    let configured = std::str::from_utf8(&configured).map_err(|_| PushError::RemoteUrl)?;
-    if settings.rewrites(configured) {
-        return Err(PushError::Rewritten);
+    Ok(remote)
+}
+
+/// The object `reference` names, following symbolic references but not
+/// tag objects, or `None` if it or a reference it names does not exist, or
+/// the chain is longer than git follows. A reference that cannot be read is
+/// a failure.
+pub(super) fn direct(
+    repo: &gix::Repository,
+    reference: &str,
+) -> Result<Option<ObjectId>, HostFailure> {
+    // Names stay bytes: a symbolic target need not be UTF-8.
+    let Ok(mut name) = gix::refs::FullName::try_from(reference) else {
+        return Ok(None);
+    };
+    for _ in 0..=MAX_SYMBOLIC_DEPTH {
+        let Some(found) = repo
+            .try_find_reference(&name)
+            .map_err(|e| git_failure("tags", &e))?
+        else {
+            return Ok(None);
+        };
+        match found.target() {
+            gix::refs::TargetRef::Object(id) => return Ok(Some(id.to_owned())),
+            gix::refs::TargetRef::Symbolic(next) => name = next.to_owned(),
+        }
     }
-    let url = remote_url(configured)?;
-    Ok(PushTarget {
-        branch,
-        tip,
-        remote,
-        url,
-        hash: repo.object_hash(),
-    })
+    Ok(None)
+}
+
+/// The commit a tag pointing at `tip` names, and the tag objects on the way
+/// there, or `None` if one of those objects is not in the repository. A tag
+/// naming a tree or blob is refused: pushes and fetches carry commits.
+pub(super) fn tag_chain(
+    repo: &gix::Repository,
+    tip: ObjectId,
+    tag: &str,
+) -> Result<Option<(ObjectId, Vec<ObjectId>)>, RemoteError> {
+    let mut chain = vec![];
+    let mut at = tip;
+    loop {
+        let Some(object) = repo
+            .try_find_object(at)
+            .map_err(|e| host(git_failure("tags", &e)))?
+        else {
+            return Ok(None);
+        };
+        match object.kind {
+            gix::object::Kind::Commit => return Ok(Some((at, chain))),
+            gix::object::Kind::Tag if chain.len() < MAX_TAG_CHAIN => {
+                chain.push(at);
+                at = object
+                    .into_tag()
+                    .target_id()
+                    .map_err(|e| host(git_failure("tags", &e)))?
+                    .detach();
+            }
+            _ => return Err(RemoteError::TagTarget(tag.to_owned())),
+        }
+    }
+}
+
+/// The current branch's short name.
+fn current_branch(repo: &gix::Repository) -> Result<String, RemoteError> {
+    head_branch(repo)?.ok_or_else(|| host(unsupported("HEAD is not on a branch; name the branch")))
+}
+
+/// The current branch's short name, or `None` when HEAD is detached. A
+/// HEAD that cannot be read is an error.
+pub(super) fn head_branch(repo: &gix::Repository) -> Result<Option<String>, RemoteError> {
+    Ok(repo
+        .head_name()
+        .map_err(|e| host(git_failure("head", &e)))?
+        .and_then(|name| {
+            name.category_and_short_name()
+                .map(|(_, short)| short.to_string())
+        }))
 }
 
 /// An HTTPS repository URL (or loopback HTTP, for a forge on this computer)
 /// that carries no credentials, query or fragment.
-fn remote_url(configured: &str) -> Result<url::Url, PushError> {
-    let url = url::Url::parse(configured).map_err(|_| PushError::RemoteUrl)?;
+pub(super) fn remote_url(configured: &str) -> Result<url::Url, RemoteError> {
+    let url = url::Url::parse(configured).map_err(|_| RemoteError::RemoteUrl)?;
     let loopback = matches!(
         url.host(),
         Some(url::Host::Domain("localhost"))
@@ -148,56 +282,70 @@ fn remote_url(configured: &str) -> Result<url::Url, PushError> {
             | Some(url::Host::Ipv6(std::net::Ipv6Addr::LOCALHOST))
     );
     if !(url.scheme() == "https" || url.scheme() == "http" && loopback) || url.host().is_none() {
-        return Err(PushError::RemoteUrl);
+        return Err(RemoteError::RemoteUrl);
     }
     if !url.username().is_empty() || url.password().is_some() {
-        return Err(PushError::RemoteCredentials);
+        return Err(RemoteError::RemoteCredentials);
     }
     if url.query().is_some() || url.fragment().is_some() {
-        return Err(PushError::RemoteUrl);
+        return Err(RemoteError::RemoteUrl);
     }
     Ok(url)
 }
 
 /// What one push sends.
 pub(crate) struct Packed {
-    /// The server's commit for the branch, or the null id if it has none.
+    /// The server's object for the reference, or the null id if it has none.
     pub old: ObjectId,
     pub pack: Vec<u8>,
     pub commits: usize,
     pub objects: usize,
 }
 
-/// The pack that brings the server's branch from what it advertised to
-/// `target.tip`, or `None` when the server already has the tip there.
-/// Refused unless the server's commit is an ancestor of the tip.
+/// The pack that brings the server's branch or tag from what it advertised
+/// to `target.tip`, or `None` when the server already has the tip there.
+/// A branch is refused unless the server's commit is an ancestor of the
+/// tip; a tag is refused if the server has it at all, as git refuses to
+/// replace a tag without force.
 pub(crate) fn pack(
     root: PathBuf,
     target: &PushTarget,
     advertised: &Advertisement,
     limits: Limits,
     interrupt: &AtomicBool,
-) -> Result<Option<Packed>, PushError> {
+) -> Result<Option<Packed>, RemoteError> {
     let old = advertised
         .get(&target.reference())
         .unwrap_or_else(|| ObjectId::null(target.hash));
     let repo = open(root, interrupt).map_err(host)?;
-    // Checked before anything else: a branch that moved since it was
+    // Checked before anything else: a reference that moved since it was
     // resolved is not up to date merely because the server has its old tip.
-    if peeled(&repo, &target.reference()).map_err(host)? != Some(target.tip) {
-        return Err(PushError::Moved(target.branch.clone()));
+    let now = match target.kind {
+        RefKind::Branch => peeled(&repo, &target.reference()),
+        RefKind::Tag => direct(&repo, &target.reference()),
+    };
+    if now.map_err(host)? != Some(target.tip) {
+        return Err(RemoteError::Moved(target.label()));
     }
     if old == target.tip {
         return Ok(None);
     }
     if !old.is_null() {
+        if target.kind == RefKind::Tag {
+            return Err(RemoteError::TagExists(target.name.clone()));
+        }
         match ancestor(&repo, old, target.tip, MAX_ANCESTRY, interrupt).map_err(host)? {
             Some(true) => {}
-            Some(false) => return Err(PushError::NotFastForward(target.branch.clone())),
-            None => return Err(PushError::History),
+            Some(false) => return Err(RemoteError::NotFastForward(target.name.clone())),
+            None => return Err(RemoteError::History),
         }
     }
-    let chosen = a206_git_push::objects(&repo, target.tip, advertised.known(), limits, interrupt)?;
+    let mut chosen =
+        a206_git_push::objects(&repo, target.commit, advertised.known(), limits, interrupt)?;
+    if chosen.ids.len() + target.tags.len() > limits.objects {
+        return Err(PackError::TooManyObjects(limits.objects).into());
+    }
+    chosen.ids.extend(&target.tags);
     let pack = a206_git_push::write_pack(&repo, &chosen.ids, limits, interrupt)?;
     Ok(Some(Packed {
         old,
@@ -208,7 +356,10 @@ pub(crate) fn pack(
 }
 
 /// The commit `reference` points at, if it exists.
-fn peeled(repo: &gix::Repository, reference: &str) -> Result<Option<ObjectId>, HostFailure> {
+pub(super) fn peeled(
+    repo: &gix::Repository,
+    reference: &str,
+) -> Result<Option<ObjectId>, HostFailure> {
     Ok(repo
         .try_find_reference(reference)
         .map_err(|e| git_failure("branches", &e))?
@@ -219,7 +370,7 @@ fn peeled(repo: &gix::Repository, reference: &str) -> Result<Option<ObjectId>, H
 /// Whether `old` is `tip` or one of its ancestors, or `None` when that
 /// takes more than `limit` commits to tell. A commit the repository lacks
 /// is not.
-fn ancestor(
+pub(super) fn ancestor(
     repo: &gix::Repository,
     old: ObjectId,
     tip: ObjectId,
@@ -272,7 +423,7 @@ fn record_within(root: PathBuf, target: &PushTarget, limit: usize) -> Result<Tra
     let repo = open(root, &never)?;
     let settings = settings(&repo)?;
     let (name, email) = settings.identity()?;
-    let tracking = format!("refs/remotes/{}/{}", target.remote, target.branch);
+    let tracking = format!("refs/remotes/{}/{}", target.remote, target.name);
     let full: gix::refs::FullName = tracking.as_str().try_into().map_err(|_| HostFailure {
         code: HostErrorCode::Invalid,
         message: "the remote-tracking branch name is not valid".into(),
@@ -404,8 +555,13 @@ mod tests {
         dir: &tempfile::TempDir,
         branch: Option<&str>,
         remote: Option<&str>,
-    ) -> Result<PushTarget, PushError> {
-        target(dir.path().into(), branch, remote, &AtomicBool::new(false))
+    ) -> Result<PushTarget, RemoteError> {
+        target(
+            dir.path().into(),
+            Named::Branch(branch),
+            remote,
+            &AtomicBool::new(false),
+        )
     }
 
     #[test]
@@ -420,10 +576,7 @@ mod tests {
         let current = target_of(&dir, None, None).unwrap();
         assert_eq!(current.remote, "origin");
         assert_eq!(current.url.as_str(), format!("https://{host}/a.git"));
-        assert_eq!(
-            current.reference(),
-            format!("refs/heads/{}", current.branch)
-        );
+        assert_eq!(current.reference(), format!("refs/heads/{}", current.name));
         let head = gix::open(dir.path()).unwrap().head_id().unwrap().detach();
         assert_eq!(current.tip, head);
         // A push URL wins over the fetch URL.
@@ -432,25 +585,25 @@ mod tests {
         // The branch's configured remote is its default.
         let path = dir.path().join(".git/config");
         let mut text = std::fs::read_to_string(&path).unwrap();
-        text.push_str(&format!("[branch \"{}\"]\n\tremote = up\n", current.branch));
+        text.push_str(&format!("[branch \"{}\"]\n\tremote = up\n", current.name));
         std::fs::write(&path, text).unwrap();
         assert_eq!(target_of(&dir, None, None).unwrap().remote, "up");
 
         assert!(matches!(
             target_of(&dir, Some(&nonce()), None),
-            Err(PushError::NoBranch(_))
+            Err(RemoteError::NoBranch(_))
         ));
         assert!(matches!(
             target_of(&dir, Some("-x"), None),
-            Err(PushError::BranchName)
+            Err(RemoteError::BranchName)
         ));
         assert!(matches!(
             target_of(&dir, None, Some(&nonce())),
-            Err(PushError::NoRemote(_))
+            Err(RemoteError::NoRemote(_))
         ));
         assert!(matches!(
             target_of(&dir, None, Some("a/../b")),
-            Err(PushError::RemoteName)
+            Err(RemoteError::RemoteName)
         ));
     }
 
@@ -489,9 +642,9 @@ mod tests {
             let dir = project(&config);
             let result = target_of(&dir, None, None);
             let matched = match expected {
-                "url" => matches!(result, Err(PushError::RemoteUrl)),
-                "credentials" => matches!(result, Err(PushError::RemoteCredentials)),
-                _ => matches!(result, Err(PushError::Rewritten)),
+                "url" => matches!(result, Err(RemoteError::RemoteUrl)),
+                "credentials" => matches!(result, Err(RemoteError::RemoteCredentials)),
+                _ => matches!(result, Err(RemoteError::Rewritten)),
             };
             assert!(matched, "{config}: {result:?}");
         }
@@ -505,7 +658,7 @@ mod tests {
         std::fs::write(hooks.join("pre-push"), "#!/bin/sh\n").unwrap();
         assert!(matches!(
             target_of(&dir, None, None),
-            Err(PushError::Repository(HostFailure {
+            Err(RemoteError::Repository(HostFailure {
                 code: HostErrorCode::Unsupported,
                 ..
             }))
@@ -531,7 +684,7 @@ mod tests {
         advance(&dir);
         assert!(matches!(
             pack(dir.path().into(), &resolved, &server, ROOMY, &never),
-            Err(PushError::Moved(_))
+            Err(RemoteError::Moved(_))
         ));
     }
 
@@ -544,7 +697,7 @@ mod tests {
         let first = target_of(&dir, None, None).unwrap();
         advance(&dir);
         let second = target_of(&dir, None, None).unwrap();
-        let tracking = format!("refs/remotes/origin/{}", first.branch);
+        let tracking = format!("refs/remotes/origin/{}", first.name);
         let at = || {
             let repo = gix::open(dir.path()).unwrap();
             peeled(&repo, &tracking).unwrap()
@@ -578,6 +731,196 @@ mod tests {
         assert_eq!(at(), Some(third.tip));
     }
 
+    /// An annotated tag object naming `target`, written to the repository.
+    fn tag_object(repo: &gix::Repository, target: ObjectId, kind: gix::object::Kind) -> ObjectId {
+        repo.write_object(gix::objs::Tag {
+            target,
+            target_kind: kind,
+            name: nonce().into(),
+            tagger: None,
+            message: nonce().into(),
+            signature: None,
+        })
+        .unwrap()
+        .detach()
+    }
+    fn tag_ref(repo: &gix::Repository, name: &str, target: gix::refs::Target) {
+        repo.edit_reference(RefEdit {
+            change: Change::Update {
+                log: Default::default(),
+                expected: PreviousValue::MustNotExist,
+                new: target,
+            },
+            name: format!("refs/tags/{name}").try_into().unwrap(),
+            deref: false,
+        })
+        .unwrap();
+    }
+    fn tag_target(dir: &tempfile::TempDir, tag: &str) -> Result<PushTarget, RemoteError> {
+        target(
+            dir.path().into(),
+            Named::Tag(tag),
+            None,
+            &AtomicBool::new(false),
+        )
+    }
+
+    #[test]
+    fn a_tag_push_sends_its_tag_objects_and_never_replaces_a_server_tag() {
+        let host = format!("{}.example", nonce());
+        let dir = project(&format!(
+            "[remote \"origin\"]\n\turl = https://{host}/a.git\n"
+        ));
+        let repo = gix::open(dir.path()).unwrap();
+        let head = repo.head_id().unwrap().detach();
+        let (plain, annotated, nested, symbolic, of_blob, broken) =
+            (nonce(), nonce(), nonce(), nonce(), nonce(), nonce());
+        tag_ref(&repo, &plain, Target::Object(head));
+        let object = tag_object(&repo, head, gix::object::Kind::Commit);
+        tag_ref(&repo, &annotated, Target::Object(object));
+        let outer = tag_object(&repo, object, gix::object::Kind::Tag);
+        tag_ref(&repo, &nested, Target::Object(outer));
+        tag_ref(
+            &repo,
+            &symbolic,
+            Target::Symbolic(format!("refs/tags/{annotated}").try_into().unwrap()),
+        );
+        let blob = repo.write_blob(nonce().as_bytes()).unwrap().detach();
+        tag_ref(&repo, &of_blob, Target::Object(blob));
+        let missing =
+            ObjectId::from_hex(format!("{}{}", nonce(), &nonce()[..8]).as_bytes()).unwrap();
+        tag_ref(&repo, &broken, Target::Object(missing));
+
+        let resolved = tag_target(&dir, &plain).unwrap();
+        assert_eq!(resolved.kind, RefKind::Tag);
+        assert_eq!(resolved.reference(), format!("refs/tags/{plain}"));
+        assert_eq!((resolved.tip, resolved.commit), (head, head));
+        assert!(resolved.tags.is_empty());
+        assert_eq!(resolved.remote, "origin");
+        let resolved = tag_target(&dir, &nested).unwrap();
+        assert_eq!((resolved.tip, resolved.commit), (outer, head));
+        assert_eq!(resolved.tags, vec![outer, object]);
+        // A symbolic tag pushes the object its target names, under its own
+        // name.
+        let resolved = tag_target(&dir, &symbolic).unwrap();
+        assert_eq!(resolved.reference(), format!("refs/tags/{symbolic}"));
+        assert_eq!(
+            (resolved.tip, resolved.tags.clone()),
+            (object, vec![object])
+        );
+        // One whose target's name is not UTF-8 follows that exact name, not
+        // a lossy copy of it, even when the copy names another tag.
+        {
+            let (bytes, lossy) = (nonce(), nonce());
+            let mut raw = format!("{bytes}-").into_bytes();
+            raw.push(0xff);
+            let tags = dir.path().join(".git/refs/tags");
+            // Packed, as not every file system takes such a file name.
+            let mut packed = format!("{object} refs/tags/").into_bytes();
+            packed.extend_from_slice(&raw);
+            packed.push(b'\n');
+            std::fs::write(dir.path().join(".git/packed-refs"), packed).unwrap();
+            tag_ref(&repo, &format!("{bytes}-\u{fffd}"), Target::Object(head));
+            let mut pointer = b"ref: refs/tags/".to_vec();
+            pointer.extend_from_slice(&raw);
+            pointer.push(b'\n');
+            std::fs::write(tags.join(&lossy), pointer).unwrap();
+            assert_eq!(tag_target(&dir, &lossy).unwrap().tip, object);
+        }
+
+        assert!(matches!(
+            tag_target(&dir, &of_blob),
+            Err(RemoteError::TagTarget(_))
+        ));
+        assert!(matches!(
+            tag_target(&dir, &broken),
+            Err(RemoteError::NoTag(_))
+        ));
+        assert!(matches!(
+            tag_target(&dir, &nonce()),
+            Err(RemoteError::NoTag(_))
+        ));
+        // An object that is there but cannot be read is a failure, not a
+        // missing tag.
+        let (unreadable, corrupt) = (nonce(), format!("{}{}", nonce(), &nonce()[..8]));
+        let loose = dir.path().join(".git/objects").join(&corrupt[..2]);
+        std::fs::create_dir_all(&loose).unwrap();
+        std::fs::write(loose.join(&corrupt[2..]), nonce()).unwrap();
+        let corrupt = ObjectId::from_hex(corrupt.as_bytes()).unwrap();
+        tag_ref(&repo, &unreadable, Target::Object(corrupt));
+        assert!(matches!(
+            tag_target(&dir, &unreadable),
+            Err(RemoteError::Repository(_))
+        ));
+        assert!(matches!(tag_target(&dir, "-x"), Err(RemoteError::TagName)));
+
+        // A server without the tag gets the tag objects with the commit.
+        let never = AtomicBool::new(false);
+        let empty = Advertisement {
+            refs: vec![],
+            haves: vec![],
+            capabilities: vec!["report-status".into()],
+        };
+        let nested_target = tag_target(&dir, &nested).unwrap();
+        let packed = pack(dir.path().into(), &nested_target, &empty, ROOMY, &never)
+            .unwrap()
+            .unwrap();
+        assert_eq!(packed.old, ObjectId::null(nested_target.hash));
+        assert_eq!(packed.commits, 1);
+        // The commit, its tree and blob, and both tag objects.
+        assert_eq!(packed.objects, 5);
+        // One that already has the commit gets only the tag objects.
+        let knows_commit = advertising(&tag_target(&dir, &plain).unwrap(), head);
+        let packed = pack(
+            dir.path().into(),
+            &nested_target,
+            &knows_commit,
+            ROOMY,
+            &never,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!((packed.commits, packed.objects), (0, 2));
+        // The same tag is up to date; a different one is never replaced.
+        assert!(
+            pack(
+                dir.path().into(),
+                &nested_target,
+                &advertising(&nested_target, outer),
+                ROOMY,
+                &never
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(matches!(
+            pack(
+                dir.path().into(),
+                &nested_target,
+                &advertising(&nested_target, object),
+                ROOMY,
+                &never
+            ),
+            Err(RemoteError::TagExists(_))
+        ));
+        // A tag moved after it was resolved is not pushed.
+        let annotated_target = tag_target(&dir, &annotated).unwrap();
+        repo.edit_reference(RefEdit {
+            change: Change::Update {
+                log: Default::default(),
+                expected: PreviousValue::Any,
+                new: Target::Object(head),
+            },
+            name: format!("refs/tags/{annotated}").try_into().unwrap(),
+            deref: false,
+        })
+        .unwrap();
+        assert!(matches!(
+            pack(dir.path().into(), &annotated_target, &empty, ROOMY, &never),
+            Err(RemoteError::Moved(_))
+        ));
+    }
+
     #[test]
     fn a_repository_whose_configuration_includes_files_is_not_pushed() {
         let host = format!("{}.example", nonce());
@@ -593,7 +936,7 @@ mod tests {
             assert!(
                 matches!(
                     target_of(&dir, None, None),
-                    Err(PushError::Repository(HostFailure {
+                    Err(RemoteError::Repository(HostFailure {
                         code: HostErrorCode::Unsupported,
                         ..
                     }))

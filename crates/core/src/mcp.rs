@@ -64,6 +64,11 @@ pub struct McpServerConfig {
     /// Seconds one tool call may run; the gateway default applies when absent.
     #[serde(default)]
     pub timeout_seconds: Option<u64>,
+    /// Mount the user's program directories (`Settings::program_directories`)
+    /// read-only and executable, with their programs on `PATH`. Off unless
+    /// the user turns it on for this server.
+    #[serde(default)]
+    pub program_directories: bool,
 }
 impl McpServerConfig {
     pub fn policy(&self, tool: &str) -> ToolPolicy {
@@ -132,6 +137,7 @@ mod tests {
         .unwrap();
         assert!(!config.enabled);
         assert!(config.capabilities.is_empty());
+        assert!(!config.program_directories);
         assert_eq!(config.policy(&tool), ToolPolicy::Allow);
         assert_eq!(config.policy("other"), ToolPolicy::Ask);
     }

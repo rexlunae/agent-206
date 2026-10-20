@@ -92,6 +92,7 @@ fn entry(install: &std::path::Path) -> McpServerConfig {
         default_policy: ToolPolicy::default(),
         tools: Default::default(),
         timeout_seconds: None,
+        program_directories: false,
     }
 }
 impl Rig {

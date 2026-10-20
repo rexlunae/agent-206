@@ -130,6 +130,8 @@ fn a_restart_sends_an_interrupted_message_once() {
         last: Some(JobRun::start(started)),
         author: Default::default(),
         history: 0,
+        deliver_to: None,
+        cursor: None,
     };
     let message =
         |text: &str, at: u64| Message::new(Role::User, text.into(), at, CodingBackend::default());
@@ -186,13 +188,22 @@ fn a_restart_sends_an_interrupted_message_once() {
         ..JobRun::start(started)
     });
     jobs.push(settled.clone());
-    jobs.push(job(answered.id, &text, Schedule::At { at: started }, None));
+    let mut answered_job = job(answered.id, &text, Schedule::At { at: started }, None);
+    answered_job.deliver_to = Some(Id::new_v4().to_string());
+    jobs.push(answered_job);
     jobs.push(job(
         unanswered.id,
         &text,
         Schedule::At { at: started },
         None,
     ));
+    // Ended, and was posting its reply when the gateway stopped.
+    let mut posting = settled.clone();
+    posting.last = Some(JobRun {
+        delivery: Some(Delivery::Posting),
+        ..settled.last.clone().unwrap()
+    });
+    jobs.push(posting);
     recover(
         &mut jobs,
         &[complete, interrupted, unsent, answered, unanswered],
@@ -212,9 +223,18 @@ fn a_restart_sends_an_interrupted_message_once() {
     }
     assert_eq!(jobs[5], settled, "a finished run is left alone");
     assert_eq!(outcome(&jobs[6]), JobOutcome::Complete);
+    // Its reply was never posted: posting starts after the end is recorded.
+    assert!(matches!(
+        jobs[6].last.as_ref().unwrap().delivery,
+        Some(Delivery::Failed(ref r)) if r.kind == ErrorKind::Unavailable
+    ));
     assert_eq!(outcome(&jobs[7]), JobOutcome::Failed);
+    assert_eq!(jobs[7].last.as_ref().unwrap().delivery, None);
+    let posting = jobs[8].last.as_ref().unwrap();
+    assert_eq!(posting.outcome, JobOutcome::Complete);
+    assert_eq!(posting.delivery, Some(Delivery::Unrecorded));
     assert!(
-        jobs[6..]
+        jobs[6..8]
             .iter()
             .all(|job| !job.enabled && job.next.is_none())
     );
@@ -240,6 +260,8 @@ fn a_restart_settles_a_heartbeat_by_its_reply() {
         last: Some(JobRun::start(started)),
         author: Default::default(),
         history: 0,
+        deliver_to: None,
+        cursor: None,
     };
     // A conversation that received run `run`'s check, answered with `reply`.
     let conversation = |run: Id, reply: &str| {
@@ -272,4 +294,60 @@ fn a_restart_settles_a_heartbeat_by_its_reply() {
     assert_eq!(outcome(&jobs[1]), JobOutcome::Complete);
     assert!(matches!(outcome(&jobs[2]), JobOutcome::Refused(_)));
     assert_eq!(jobs[2].next, Some(started));
+}
+
+#[test]
+fn a_restart_settles_a_trigger_check_by_the_message_naming_its_run() {
+    use a206_core::{
+        CodingBackend, Id, Job, JobKind, JobRun, Message, Mode, Thread,
+        schedule::{HEARTBEAT_OK, trigger_message},
+    };
+    let started = time();
+    let check = |thread: Id| Job {
+        kind: JobKind::Trigger {
+            extension: format!("x.{}", Id::new_v4().simple()),
+            trigger: format!("t{}", Id::new_v4().simple()),
+            args: Default::default(),
+        },
+        id: Id::new_v4(),
+        name: Id::new_v4().to_string(),
+        thread,
+        text: Id::new_v4().to_string(),
+        schedule: Schedule::At { at: started },
+        enabled: false,
+        created: started - 1,
+        next: None,
+        last: Some(JobRun::start(started)),
+        author: Default::default(),
+        history: 0,
+        deliver_to: None,
+        cursor: None,
+    };
+    let conversation = |job: &Job, run: Id, reply: &str| {
+        let mut thread = Thread::new(Id::new_v4().to_string(), Mode::Chat);
+        let report = trigger_message("x", "t", &job.text, &Id::new_v4().to_string(), run);
+        for (role, text) in [(Role::User, report.as_str()), (Role::Assistant, reply)] {
+            thread.messages.push(Message::new(
+                role,
+                text.into(),
+                started,
+                CodingBackend::default(),
+            ));
+        }
+        thread.state = RunState::Complete;
+        thread
+    };
+    let mut jobs: Vec<Job> = (0..2).map(|_| check(Id::new_v4())).collect();
+    let run = jobs[0].last.as_ref().unwrap().id;
+    // A reply of exactly HEARTBEAT_OK means nothing special to a trigger check.
+    let answered = conversation(&jobs[0], run, HEARTBEAT_OK);
+    // The job's own text alone, from another run, is not this run's message.
+    let other = conversation(&jobs[1], Id::new_v4(), HEARTBEAT_OK);
+    jobs[0].thread = answered.id;
+    jobs[1].thread = other.id;
+    recover(&mut jobs, &[answered, other]);
+    let outcome = |job: &Job| job.last.as_ref().unwrap().outcome.clone();
+    assert_eq!(outcome(&jobs[0]), JobOutcome::Complete);
+    assert!(matches!(outcome(&jobs[1]), JobOutcome::Refused(_)));
+    assert_eq!(jobs[1].next, Some(started));
 }

@@ -1,0 +1,1112 @@
+#![cfg(unix)]
+//! A model reads pull requests with `pull_requests` and `pull_request`
+//! through the vault broker, which alone holds the forge token. The forge is
+//! a stand-in REST API on loopback that answers as GitHub or GitLab does;
+//! every identifier and answer is generated at runtime.
+mod support;
+
+use a206_core::*;
+use axum::{
+    Router,
+    body::Bytes,
+    extract::{OriginalUri, State},
+    http::{HeaderMap, Method, StatusCode, header},
+};
+use serde_json::{Value, json};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+use support::*;
+
+type Gateway = a206_runtime::gateway::Gateway;
+const API: ProviderApi = ProviderApi::OpenAi;
+const LIST: &str = a206_runtime::forge::LIST;
+const READ: &str = a206_runtime::forge::READ;
+const CREATE: &str = a206_runtime::forge::CREATE;
+const COMMENT: &str = a206_runtime::forge::COMMENT;
+const MERGE: &str = a206_runtime::forge::MERGE;
+const LINE_COMMENT: &str = a206_runtime::forge::LINE_COMMENT;
+
+/// A forge API that answers each request path (with its query) from
+/// `answers`, and 404 otherwise.
+#[derive(Clone, Default)]
+struct Api {
+    answers: Arc<Mutex<HashMap<String, (StatusCode, Value)>>>,
+    /// The `Authorization` header and path of each request.
+    seen: Arc<Mutex<Vec<(String, String)>>>,
+    /// The path and JSON body of each POST request.
+    posted: Arc<Mutex<Vec<(String, Value)>>>,
+    /// The path and JSON body of each PUT request.
+    put: Arc<Mutex<Vec<(String, Value)>>>,
+}
+impl Api {
+    fn answer(&self, path: &str, status: StatusCode, body: Value) {
+        self.answers
+            .lock()
+            .unwrap()
+            .insert(path.to_owned(), (status, body));
+    }
+    fn paths(&self) -> Vec<String> {
+        self.seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, path)| path.clone())
+            .collect()
+    }
+}
+
+async fn answer_request(
+    State(api): State<Api>,
+    method: Method,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> (StatusCode, HeaderMap, String) {
+    let path = uri.path_and_query().unwrap().to_string();
+    let auth = headers
+        .get(header::AUTHORIZATION)
+        .map(|v| v.to_str().unwrap().to_owned())
+        .unwrap_or_default();
+    // Forge APIs refuse clients that do not name themselves.
+    assert!(headers.contains_key(header::USER_AGENT));
+    api.seen.lock().unwrap().push((auth, path.clone()));
+    if method == Method::POST {
+        let sent = serde_json::from_slice(&body).unwrap();
+        api.posted.lock().unwrap().push((path.clone(), sent));
+    }
+    if method == Method::PUT {
+        let sent = serde_json::from_slice(&body).unwrap();
+        api.put.lock().unwrap().push((path.clone(), sent));
+    }
+    let mut out = HeaderMap::new();
+    out.insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
+    match api.answers.lock().unwrap().get(&path) {
+        Some((status, body)) => (*status, out, body.to_string()),
+        None => (StatusCode::NOT_FOUND, out, "{}".into()),
+    }
+}
+
+/// An unlocked broker in a new profile holding `token` bound to `origin`;
+/// the credential's name and a gateway pairing.
+async fn broker(origin: &str, token: &str) -> (tempfile::TempDir, String, BrokerPairing) {
+    use a206_broker::*;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_owned();
+    let serving = root.clone();
+    // Detached: the broker lives as long as the test's runtime.
+    tokio::spawn(async move { serve(&serving).await.unwrap() });
+    let mut user = loop {
+        match Client::connect(&root, Role::User).await {
+            Ok(client) => break client,
+            Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+        }
+    };
+    user.call(Request::Unlock {
+        password: WireSecret::new(nonce()),
+        totp: None,
+        create: true,
+    })
+    .await
+    .unwrap();
+    let name = nonce();
+    user.call(Request::PutCredential {
+        name: name.clone(),
+        meta: a206_vault::CredentialMeta {
+            label: name.clone(),
+            kind: a206_vault::CredentialKind::Token,
+            policy: a206_vault::AccessPolicy::WithApproval,
+            description: None,
+            disabled: false,
+            destinations: vec![origin.to_owned()],
+        },
+        value: WireValue::Single(WireSecret::new(token.to_owned())),
+        replace: false,
+    })
+    .await
+    .unwrap();
+    let Reply::GatewayPairing { token } = user.call(Request::PairGateway).await.unwrap() else {
+        panic!("expected a pairing");
+    };
+    (dir, name, BrokerPairing::new(token.expose().to_owned()))
+}
+
+struct Rig {
+    gateway: Gateway,
+    _state: tempfile::TempDir,
+    _workspace: tempfile::TempDir,
+    api: Api,
+    origin: String,
+    token: String,
+    credential: GitCredential,
+    requests: tokio::sync::mpsc::Receiver<Opened>,
+    thread: Id,
+    /// The repository's path on the forge.
+    owner: String,
+    name: String,
+}
+impl Rig {
+    async fn ok(&self, command: Command) {
+        assert_eq!(request(&self.gateway, command).await, Reply::Ok);
+    }
+    /// Point the git credential at an API of `kind` under `path`.
+    async fn forge(&mut self, forge: Option<(ForgeKind, &str)>) {
+        self.credential.forge = forge.map(|(kind, path)| ForgeApi {
+            kind,
+            api: format!("{}{path}", self.origin),
+        });
+        let mut settings = self.gateway.snapshot().unwrap().settings;
+        settings.git_credentials = vec![self.credential.clone()];
+        self.ok(Command::SaveSettings(Box::new(settings))).await;
+    }
+    /// One run in which the model calls `tool` with `arguments`; the call's
+    /// record and result.
+    async fn call(&mut self, tool: &str, arguments: Value) -> (ToolCall, Option<String>) {
+        let task = send(&self.gateway, self.thread);
+        let first = next_request(&mut self.requests).await;
+        assert!(offered(API, &first.body).contains(&tool.to_owned()));
+        let call = Call::new(tool, arguments);
+        first
+            .respond(calls_response(API, std::slice::from_ref(&call), ""))
+            .await;
+        let second = next_request(&mut self.requests).await;
+        let result = result_for(API, &second.body, &call.id);
+        assert!(!second.body.to_string().contains(&self.token));
+        second.respond(text_response(API, &nonce())).await;
+        let thread = finished(task).await;
+        (calls_of(&thread).last().unwrap().clone(), result)
+    }
+    /// The same for a tool the user approves each call of, answered with
+    /// `decision`.
+    async fn approved(
+        &mut self,
+        tool: &str,
+        arguments: Value,
+        decision: ApprovalDecision,
+    ) -> (ToolCall, Option<String>) {
+        let task = send(&self.gateway, self.thread);
+        let first = next_request(&mut self.requests).await;
+        let call = Call::new(tool, arguments);
+        first
+            .respond(calls_response(API, std::slice::from_ref(&call), ""))
+            .await;
+        let asked = tokio::time::timeout(PATIENCE, async {
+            loop {
+                let state = self.gateway.snapshot().unwrap();
+                let thread = state.threads.iter().find(|t| t.id == self.thread).unwrap();
+                match thread.approvals.first() {
+                    Some(approval) => return approval.clone(),
+                    None => tokio::time::sleep(Duration::from_millis(5)).await,
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(wait("the approval request"));
+        assert_eq!(asked.tool, tool);
+        self.ok(Command::ResolveApproval {
+            thread: self.thread,
+            approval: asked.id,
+            digest: asked.digest,
+            decision,
+        })
+        .await;
+        let second = next_request(&mut self.requests).await;
+        let result = result_for(API, &second.body, &call.id);
+        second.respond(text_response(API, &nonce())).await;
+        let thread = finished(task).await;
+        (calls_of(&thread).last().unwrap().clone(), result)
+    }
+}
+
+/// A project whose `origin` remote is a repository on a new stand-in forge,
+/// with a git credential for it; a conversation granted git reading and
+/// permitted the pull request tools.
+async fn rig() -> Rig {
+    let api = Api::default();
+    let router = Router::new()
+        .fallback(answer_request)
+        .with_state(api.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    // Detached: the server lives as long as the test's runtime.
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let token = nonce();
+    let (state, credential, pairing) = broker(&origin, &token).await;
+    let (owner, name) = (nonce(), nonce());
+    let workspace = tempfile::tempdir().unwrap();
+    gix::init(workspace.path()).unwrap();
+    let config = workspace.path().join(".git/config");
+    let mut text = std::fs::read_to_string(&config).unwrap();
+    text.push_str(&format!(
+        "[remote \"origin\"]\n\turl = {origin}/{owner}/{name}.git\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n"
+    ));
+    std::fs::write(&config, text).unwrap();
+
+    let gateway = Gateway::open(state.path()).unwrap();
+    let (model, requests) = connect(&gateway, API).await;
+    let Reply::Project(project) = request(
+        &gateway,
+        Command::CreateProject {
+            name: nonce(),
+            root: workspace.path().display().to_string(),
+        },
+    )
+    .await
+    else {
+        panic!("project creation failed");
+    };
+    let credential = GitCredential {
+        origin: origin.clone(),
+        username: nonce(),
+        credential,
+        forge: None,
+    };
+    let mut rig = Rig {
+        gateway,
+        _state: state,
+        _workspace: workspace,
+        api,
+        origin,
+        token,
+        credential,
+        requests,
+        thread: project.manager,
+        owner,
+        name,
+    };
+    rig.forge(Some((ForgeKind::GitHub, "/api/v3"))).await;
+    rig.ok(Command::PairBroker { pairing }).await;
+    let configured = request(
+        &rig.gateway,
+        Command::ConfigureThread {
+            id: rig.thread,
+            mode: Mode::Code,
+            model: Some(model.clone()),
+            subagent_models: [model].into(),
+        },
+    )
+    .await;
+    assert!(matches!(configured, Reply::Thread(_)), "{configured:?}");
+    rig.ok(Command::SetBackend {
+        thread: rig.thread,
+        backend: CodingBackend::Native,
+        capabilities: [Capability::GitRead, Capability::GitWrite].into(),
+    })
+    .await;
+    // Allowing the tools that publish still leaves each call to the user.
+    for tool in [LIST, READ, CREATE, COMMENT, LINE_COMMENT, MERGE] {
+        rig.ok(Command::SetToolPermission {
+            thread: rig.thread,
+            tool: tool.into(),
+            permission: Some(ToolPermission::Allow),
+        })
+        .await;
+    }
+    rig
+}
+
+fn sha() -> String {
+    format!("{}{}", nonce(), &nonce()[..8])
+        .chars()
+        .take(40)
+        .collect()
+}
+
+fn result(text: Option<String>) -> Value {
+    serde_json::from_str(&text.unwrap()).unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_model_reads_github_pull_requests_with_their_checks_and_reviews() {
+    let mut rig = rig().await;
+    let repo = format!("/api/v3/repos/{}/{}", rig.owner, rig.name);
+    let branch = format!("topic/{}", nonce());
+    let (head, title, reviewer) = (sha(), nonce(), nonce());
+    let pull = json!({
+        "number": 7,
+        "title": title,
+        "state": "open",
+        "draft": false,
+        "merged_at": null,
+        "user": {"login": nonce()},
+        "head": {"ref": branch, "sha": head},
+        "base": {"ref": nonce(), "sha": sha()},
+        "html_url": format!("{}/{}", rig.origin, nonce()),
+        "body": nonce(),
+        "created_at": nonce(),
+        "updated_at": nonce(),
+    });
+    let listed = format!(
+        "{repo}/pulls?state=open&per_page={}&head={}%3A{}",
+        a206_forge::PAGE,
+        rig.owner,
+        branch.replace('/', "%2F")
+    );
+    rig.api.answer(&listed, StatusCode::OK, json!([pull]));
+
+    let (record, text) = rig.call(LIST, json!({"branch": branch})).await;
+    assert_eq!(record.state, ToolCallState::Succeeded, "{:?}", record.error);
+    let answer = result(text);
+    assert_eq!(answer["forge"], "GitHub");
+    assert_eq!(answer["repository"], format!("{}/{}", rig.owner, rig.name));
+    assert_eq!(answer["complete"], true);
+    assert_eq!(answer["pull_requests"][0]["number"], 7);
+    assert_eq!(answer["pull_requests"][0]["title"], title);
+    assert_eq!(answer["pull_requests"][0]["source"], branch);
+    // Lists leave descriptions out.
+    assert!(answer["pull_requests"][0].get("body").is_none());
+    // The broker sent the token as a bearer token; the model never saw it.
+    {
+        let seen = rig.api.seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].0, format!("Bearer {}", rig.token));
+    }
+
+    // One pull request, its check runs, commit statuses and reviews.
+    let per = a206_forge::DETAIL_PAGE;
+    rig.api
+        .answer(&format!("{repo}/pulls/7"), StatusCode::OK, pull.clone());
+    rig.api.answer(
+        &format!("{repo}/commits/{head}/check-runs?per_page={per}"),
+        StatusCode::OK,
+        json!({"total_count": 1, "check_runs": [
+            {"name": "build", "status": "completed", "conclusion": "failure", "html_url": null}
+        ]}),
+    );
+    rig.api.answer(
+        &format!("{repo}/commits/{head}/status?per_page={per}"),
+        StatusCode::OK,
+        json!({"state": "pending", "statuses": [{"context": "ci/legacy", "state": "pending"}]}),
+    );
+    rig.api.answer(
+        &format!("{repo}/pulls/7/reviews?per_page={per}"),
+        StatusCode::OK,
+        json!([{"user": {"login": reviewer}, "state": "CHANGES_REQUESTED", "commit_id": head}]),
+    );
+    let (record, text) = rig.call(READ, json!({"number": 7})).await;
+    assert_eq!(record.state, ToolCallState::Succeeded, "{:?}", record.error);
+    let answer = result(text);
+    assert_eq!(answer["pull_request"]["body"], pull["body"]);
+    assert_eq!(answer["pull_request"]["head"], head);
+    assert_eq!(answer["checks"][0]["name"], "build");
+    assert_eq!(answer["checks"][0]["conclusion"], "failure");
+    assert_eq!(answer["checks"][1]["status"], "running");
+    assert_eq!(answer["reviews"][0]["author"], reviewer);
+    assert_eq!(answer["reviews"][0]["state"], "changes_requested");
+    assert_eq!(answer["checks_complete"], true);
+    assert_eq!(answer["reviews_complete"], true);
+
+    // A pull request the forge does not have, and a refused credential.
+    let (record, _) = rig.call(READ, json!({"number": 8})).await;
+    assert_eq!(record.state, ToolCallState::Failed);
+    assert_eq!(error_kind(&record), ErrorKind::NotFound);
+    rig.api.answer(
+        &format!("{repo}/pulls/9"),
+        StatusCode::UNAUTHORIZED,
+        json!({}),
+    );
+    let (record, _) = rig.call(READ, json!({"number": 9})).await;
+    assert_eq!(error_kind(&record), ErrorKind::PermissionDenied);
+    // An answer not shaped like the API's is an error, not an empty result.
+    rig.api.answer(
+        &format!("{repo}/pulls/10"),
+        StatusCode::OK,
+        json!({"id": 1}),
+    );
+    let (record, _) = rig.call(READ, json!({"number": 10})).await;
+    assert_eq!(error_kind(&record), ErrorKind::Protocol);
+    // Bad arguments are refused before the forge is asked.
+    let asked = rig.api.paths().len();
+    for arguments in [
+        json!({"number": 0}),
+        json!({"number": -3}),
+        json!({"number": 7, "other": 1}),
+    ] {
+        let (record, _) = rig.call(READ, arguments).await;
+        assert_eq!(error_kind(&record), ErrorKind::InvalidRequest);
+    }
+    let (record, _) = rig.call(LIST, json!({"state": nonce()})).await;
+    assert_eq!(error_kind(&record), ErrorKind::InvalidRequest);
+    assert_eq!(rig.api.paths().len(), asked);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn gitlab_merge_requests_read_the_same_way_and_unknown_forges_are_refused() {
+    let mut rig = rig().await;
+    rig.forge(Some((ForgeKind::GitLab, "/api/v4"))).await;
+    let project = format!("/api/v4/projects/{}%2F{}", rig.owner, rig.name);
+    let (head, approver) = (sha(), nonce());
+    let pipeline = 100 + u64::from(nonce().as_bytes()[0]);
+    rig.api.answer(
+        &format!("{project}/merge_requests/3"),
+        StatusCode::OK,
+        json!({
+            "iid": 3,
+            "title": nonce(),
+            "state": "merged",
+            "draft": true,
+            "author": {"username": nonce()},
+            "source_branch": nonce(),
+            "target_branch": nonce(),
+            "sha": head,
+            "web_url": nonce(),
+            "description": nonce(),
+            "head_pipeline": {"id": pipeline, "status": "success"},
+        }),
+    );
+    rig.api.answer(
+        &format!(
+            "{project}/pipelines/{pipeline}/jobs?per_page={}",
+            a206_forge::DETAIL_PAGE
+        ),
+        StatusCode::OK,
+        json!([{"name": "test", "status": "success"}, {"name": "lint", "status": "failed", "allow_failure": true}]),
+    );
+    rig.api.answer(
+        &format!("{project}/merge_requests/3/approvals"),
+        StatusCode::OK,
+        json!({"approved_by": [{"user": {"username": approver}}]}),
+    );
+    let (record, text) = rig.call(READ, json!({"number": 3})).await;
+    assert_eq!(record.state, ToolCallState::Succeeded, "{:?}", record.error);
+    let answer = result(text);
+    assert_eq!(answer["forge"], "GitLab");
+    assert_eq!(answer["pull_request"]["state"], "merged");
+    assert_eq!(answer["pull_request"]["draft"], true);
+    assert_eq!(answer["checks"][0]["conclusion"], "success");
+    assert_eq!(answer["checks"][1]["conclusion"], "neutral");
+    assert_eq!(answer["reviews"][0]["author"], approver);
+    assert_eq!(answer["reviews"][0]["state"], "approved");
+
+    // A forge whose API is not set (and no preset covers loopback) is
+    // refused without asking anything.
+    rig.forge(None).await;
+    let asked = rig.api.paths().len();
+    let (record, _) = rig.call(LIST, json!({})).await;
+    assert_eq!(record.state, ToolCallState::Failed);
+    assert_eq!(error_kind(&record), ErrorKind::InvalidRequest);
+    assert_eq!(rig.api.paths().len(), asked);
+}
+
+/// Text longer than the forge crate keeps of a `max`-character field, in
+/// characters that take the most room in a JSON result (escaped quotes and
+/// three-byte characters).
+fn widest(max: usize) -> String {
+    format!("{}{}", nonce(), "\"\u{20ac}".repeat(max))
+}
+fn wide() -> String {
+    widest(a206_forge::MAX_LABEL)
+}
+
+/// Full pages of the longest fields would exceed the room for one tool
+/// result. The answer stays whole JSON within it, keeps the first entries,
+/// and says which lists were cut.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_largest_answers_are_cut_by_entry_and_say_so() {
+    let mut rig = rig().await;
+    let repo = format!("/api/v3/repos/{}/{}", rig.owner, rig.name);
+    let per = a206_forge::DETAIL_PAGE;
+    let head = sha();
+    let pull = |number: usize| {
+        json!({
+            "number": number,
+            "title": wide(),
+            "state": "open",
+            "user": {"login": wide()},
+            "head": {"ref": wide(), "sha": head},
+            "base": {"ref": wide(), "sha": wide()},
+            "html_url": wide(),
+            "body": widest(a206_forge::MAX_BODY),
+            "created_at": wide(),
+            "updated_at": wide(),
+        })
+    };
+    rig.api.answer(
+        &format!("{repo}/pulls?state=open&per_page={}", a206_forge::PAGE),
+        StatusCode::OK,
+        Value::Array((1..=a206_forge::PAGE).map(pull).collect()),
+    );
+    rig.api
+        .answer(&format!("{repo}/pulls/1"), StatusCode::OK, pull(1));
+    let runs: Vec<Value> = (0..per)
+        .map(|_| json!({"name": wide(), "status": "completed", "conclusion": wide(), "html_url": wide()}))
+        .collect();
+    rig.api.answer(
+        &format!("{repo}/commits/{head}/check-runs?per_page={per}"),
+        StatusCode::OK,
+        json!({"total_count": per, "check_runs": runs}),
+    );
+    rig.api.answer(
+        &format!("{repo}/commits/{head}/status?per_page={per}"),
+        StatusCode::OK,
+        json!({"state": "pending", "statuses": []}),
+    );
+    rig.api.answer(
+        &format!("{repo}/pulls/1/reviews?per_page={per}"),
+        StatusCode::OK,
+        Value::Array(
+            (0..per)
+                .map(|_| json!({"user": {"login": wide()}, "state": wide(), "submitted_at": wide(), "commit_id": wide()}))
+                .collect(),
+        ),
+    );
+
+    let limit = a206_runtime::tools::MAX_OUTPUT;
+    let (record, text) = rig.call(LIST, json!({})).await;
+    assert_eq!(record.state, ToolCallState::Succeeded, "{:?}", record.error);
+    let text = text.unwrap();
+    assert!(text.len() <= limit);
+    let answer: Value = serde_json::from_str(&text).unwrap();
+    let listed = answer["pull_requests"].as_array().unwrap();
+    assert!(!listed.is_empty() && listed.len() < a206_forge::PAGE);
+    assert_eq!(listed[0]["number"], 1);
+    assert_eq!(answer["complete"], false);
+
+    let (record, text) = rig.call(READ, json!({"number": 1})).await;
+    assert_eq!(record.state, ToolCallState::Succeeded, "{:?}", record.error);
+    let text = text.unwrap();
+    assert!(text.len() <= limit);
+    let answer: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(answer["pull_request"]["body_shortened"], true);
+    let checks = answer["checks"].as_array().unwrap();
+    assert!(!checks.is_empty() && checks.len() < per);
+    assert_eq!(answer["checks_complete"], false);
+    // Reviews share what room is left.
+    assert!(answer["reviews"].as_array().unwrap().len() < per);
+    assert_eq!(answer["reviews_complete"], false);
+}
+
+/// Opening a pull request and commenting on one publish what the model
+/// wrote, so each call waits for the user; a denied call sends nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_model_opens_and_comments_on_pull_requests_only_when_approved() {
+    let mut rig = rig().await;
+    let repo = format!("/api/v3/repos/{}/{}", rig.owner, rig.name);
+    let (title, body, branch, base) = (
+        nonce(),
+        format!("{}\n\n- {}", nonce(), nonce()),
+        nonce(),
+        nonce(),
+    );
+    let arguments =
+        json!({"title": title, "body": body, "branch": branch, "base": base, "draft": true});
+    let (record, _) = rig
+        .approved(CREATE, arguments.clone(), ApprovalDecision::Deny)
+        .await;
+    assert_eq!(record.state, ToolCallState::Denied);
+    assert!(rig.api.posted.lock().unwrap().is_empty());
+
+    rig.api.answer(
+        &format!("{repo}/pulls"),
+        StatusCode::CREATED,
+        json!({
+            "number": 41,
+            "title": title,
+            "state": "open",
+            "draft": true,
+            "user": {"login": nonce()},
+            "head": {"ref": branch, "sha": sha()},
+            "base": {"ref": base, "sha": sha()},
+            "html_url": format!("{}/{}", rig.origin, nonce()),
+            "body": body,
+        }),
+    );
+    let (record, text) = rig
+        .approved(CREATE, arguments.clone(), ApprovalDecision::Approve)
+        .await;
+    assert_eq!(record.state, ToolCallState::Succeeded, "{:?}", record.error);
+    let answer = result(text);
+    assert_eq!(answer["pull_request"]["number"], 41);
+    assert_eq!(answer["pull_request"]["draft"], true);
+    assert_eq!(
+        rig.api.posted.lock().unwrap().last().unwrap(),
+        &(
+            format!("{repo}/pulls"),
+            json!({"title": title, "head": branch, "base": base, "draft": true, "body": body})
+        )
+    );
+    assert_eq!(
+        rig.api.seen.lock().unwrap().last().unwrap().0,
+        format!("Bearer {}", rig.token)
+    );
+
+    // One already open for the branch: the forge's refusal is reported.
+    rig.api.answer(
+        &format!("{repo}/pulls"),
+        StatusCode::UNPROCESSABLE_ENTITY,
+        json!({"message": nonce()}),
+    );
+    let (record, _) = rig
+        .approved(CREATE, arguments, ApprovalDecision::Approve)
+        .await;
+    assert_eq!(error_kind(&record), ErrorKind::Conflict);
+    // Without `branch`, the current branch is proposed, as git names it.
+    let current = gix::open(rig._workspace.path())
+        .unwrap()
+        .head_name()
+        .unwrap()
+        .unwrap()
+        .shorten()
+        .to_string();
+    // The longest title accepted, 249 characters, is sent whole.
+    let longest = format!("{title}{}", "y".repeat(249 - title.chars().count()));
+    let (record, _) = rig
+        .approved(
+            CREATE,
+            json!({"title": longest, "base": base}),
+            ApprovalDecision::Approve,
+        )
+        .await;
+    assert_eq!(error_kind(&record), ErrorKind::Conflict);
+    assert_eq!(
+        rig.api.posted.lock().unwrap().last().unwrap().1,
+        json!({"title": longest, "head": current, "base": base, "draft": false})
+    );
+
+    let comment = nonce();
+    let url = format!("{}/{}", rig.origin, nonce());
+    rig.api.answer(
+        &format!("{repo}/issues/41/comments"),
+        StatusCode::CREATED,
+        json!({"id": 9001, "html_url": url, "body": comment}),
+    );
+    let (record, text) = rig
+        .approved(
+            COMMENT,
+            json!({"number": 41, "body": comment}),
+            ApprovalDecision::Approve,
+        )
+        .await;
+    assert_eq!(record.state, ToolCallState::Succeeded, "{:?}", record.error);
+    let answer = result(text);
+    assert_eq!(answer["comment"], json!({"id": 9001, "url": url}));
+    assert_eq!(
+        rig.api.posted.lock().unwrap().last().unwrap(),
+        &(
+            format!("{repo}/issues/41/comments"),
+            json!({"body": comment})
+        )
+    );
+
+    // Bad arguments are refused before anything is sent.
+    let asked = rig.api.paths().len();
+    for (tool, arguments) in [
+        (CREATE, json!({"base": base})),
+        (CREATE, json!({"title": " ", "base": base})),
+        (CREATE, json!({"title": "a\u{1b}[2J", "base": base})),
+        (CREATE, json!({"title": "x".repeat(250), "base": base})),
+        (
+            CREATE,
+            json!({"title": title, "base": base, "draft": "yes"}),
+        ),
+        (COMMENT, json!({"number": 41})),
+        (COMMENT, json!({"number": 41, "body": ""})),
+    ] {
+        let (record, _) = rig
+            .approved(tool, arguments, ApprovalDecision::Approve)
+            .await;
+        assert_eq!(error_kind(&record), ErrorKind::InvalidRequest);
+    }
+    assert_eq!(rig.api.paths().len(), asked);
+}
+
+/// A Gitea (or Forgejo) may send fewer than asked on each page, so the
+/// tools read on until a page is empty, and say when they stopped first.
+#[tokio::test(flavor = "multi_thread")]
+async fn gitea_answers_are_read_page_by_page_until_one_is_empty() {
+    let mut rig = rig().await;
+    rig.forge(Some((ForgeKind::Gitea, "/api/v1"))).await;
+    let repo = format!("/api/v1/repos/{}/{}", rig.owner, rig.name);
+    let per = a206_forge::DETAIL_PAGE;
+    let (head, branch) = (sha(), nonce());
+    let (here, fork) = (
+        1 + i64::from(nonce().as_bytes()[0]),
+        1_000 + i64::from(nonce().as_bytes()[0]),
+    );
+    let pull = |number: u64, from: &str, repo_id: Option<i64>, merged: bool| {
+        json!({
+            "number": number,
+            "title": nonce(),
+            "state": if merged { "closed" } else { "open" },
+            "merged": merged,
+            "draft": true,
+            "user": {"login": nonce()},
+            "head": {"ref": from, "sha": head, "repo_id": repo_id},
+            "base": {"ref": nonce(), "sha": sha(), "repo_id": here},
+            "html_url": nonce(),
+            "body": nonce(),
+        })
+    };
+    rig.api.answer(
+        &format!("{repo}/pulls/4"),
+        StatusCode::OK,
+        pull(4, &branch, Some(here), true),
+    );
+    let statuses = format!("{repo}/commits/{head}/status?limit={per}");
+    rig.api.answer(
+        &statuses,
+        StatusCode::OK,
+        json!({"state": "failure", "statuses": [
+            {"context": "ci/test", "status": "warning"},
+            {"context": "ci/lint", "status": "failure", "target_url": nonce()},
+        ]}),
+    );
+    rig.api.answer(
+        &format!("{statuses}&page=2"),
+        StatusCode::OK,
+        json!({"state": "failure", "statuses": []}),
+    );
+    let reviews = format!("{repo}/pulls/4/reviews?limit={per}");
+    let (approver, dismissed) = (nonce(), nonce());
+    rig.api.answer(
+        &reviews,
+        StatusCode::OK,
+        json!([{"user": {"login": approver}, "state": "APPROVED", "commit_id": head}]),
+    );
+    rig.api.answer(
+        &format!("{reviews}&page=2"),
+        StatusCode::OK,
+        json!([{"user": {"login": dismissed}, "state": "REQUEST_CHANGES", "dismissed": true}]),
+    );
+    rig.api
+        .answer(&format!("{reviews}&page=3"), StatusCode::OK, json!([]));
+    let (record, text) = rig.call(READ, json!({"number": 4})).await;
+    assert_eq!(record.state, ToolCallState::Succeeded, "{:?}", record.error);
+    let answer = result(text);
+    assert_eq!(answer["forge"], "Gitea or Forgejo");
+    assert_eq!(answer["pull_request"]["state"], "merged");
+    assert_eq!(answer["pull_request"]["draft"], true);
+    let checks: Vec<_> = answer["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|check| check["conclusion"].as_str().unwrap())
+        .collect();
+    assert_eq!(checks, ["neutral", "failure"]);
+    assert_eq!(answer["checks_complete"], true);
+    assert_eq!(answer["reviews"][0]["author"], approver);
+    assert_eq!(answer["reviews"][0]["state"], "approved");
+    assert_eq!(answer["reviews"][1]["author"], dismissed);
+    assert_eq!(answer["reviews"][1]["state"], "dismissed");
+    assert_eq!(answer["reviews_complete"], true);
+
+    // Pages that never run out are read only so far, and said to be cut.
+    for page in 1..=a206_forge::MAX_DETAIL_PAGES + 1 {
+        let path = match page {
+            1 => reviews.clone(),
+            page => format!("{reviews}&page={page}"),
+        };
+        rig.api.answer(
+            &path,
+            StatusCode::OK,
+            json!([{"user": {"login": nonce()}, "state": "COMMENT"}]),
+        );
+    }
+    let (record, text) = rig.call(READ, json!({"number": 4})).await;
+    assert_eq!(record.state, ToolCallState::Succeeded, "{:?}", record.error);
+    let answer = result(text);
+    assert_eq!(
+        answer["reviews"].as_array().unwrap().len(),
+        a206_forge::MAX_DETAIL_PAGES
+    );
+    assert_eq!(answer["reviews_complete"], false);
+    let beyond = format!("{reviews}&page={}", a206_forge::MAX_DETAIL_PAGES + 1);
+    assert!(!rig.api.paths().contains(&beyond));
+
+    // Gitea cannot list one branch: pull requests from other branches, and
+    // from a fork's branch of the same name, are left out here.
+    let listed = format!("{repo}/pulls?state=open&limit={}", a206_forge::PAGE);
+    rig.api.answer(
+        &listed,
+        StatusCode::OK,
+        json!([
+            pull(9, &branch, Some(here), false),
+            pull(8, &branch, Some(fork), false),
+            pull(7, &nonce(), Some(here), false),
+            pull(6, &branch, None, false),
+        ]),
+    );
+    rig.api
+        .answer(&format!("{listed}&page=2"), StatusCode::OK, json!([]));
+    let (record, text) = rig.call(LIST, json!({"branch": branch})).await;
+    assert_eq!(record.state, ToolCallState::Succeeded, "{:?}", record.error);
+    let answer = result(text);
+    let numbers: Vec<_> = answer["pull_requests"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|pull| pull["number"].as_u64().unwrap())
+        .collect();
+    assert_eq!(numbers, [9]);
+    assert_eq!(answer["complete"], true);
+
+    // A draft is marked by Gitea's work-in-progress prefix.
+    let (title, base) = (nonce(), nonce());
+    rig.api.answer(
+        &format!("{repo}/pulls"),
+        StatusCode::CREATED,
+        pull(10, &branch, Some(here), false),
+    );
+    let arguments = json!({"title": title, "branch": branch, "base": base, "draft": true});
+    let (record, text) = rig
+        .approved(CREATE, arguments, ApprovalDecision::Approve)
+        .await;
+    assert_eq!(record.state, ToolCallState::Succeeded, "{:?}", record.error);
+    assert_eq!(result(text)["draft_as_requested"], true);
+    assert_eq!(
+        rig.api.posted.lock().unwrap().last().unwrap(),
+        &(
+            format!("{repo}/pulls"),
+            json!({"title": format!("WIP: {title}"), "head": branch, "base": base})
+        )
+    );
+    // An instance with other work-in-progress prefixes may disagree, and
+    // the result says so rather than claiming the requested state.
+    let arguments = json!({"title": title, "branch": branch, "base": base, "draft": false});
+    let (record, text) = rig
+        .approved(CREATE, arguments.clone(), ApprovalDecision::Approve)
+        .await;
+    assert_eq!(record.state, ToolCallState::Succeeded, "{:?}", record.error);
+    let answer = result(text);
+    assert_eq!(answer["pull_request"]["draft"], true);
+    assert_eq!(answer["draft_as_requested"], false);
+    // An older Gitea does not report drafts: that is unknown, not a match.
+    let mut older = pull(11, &branch, Some(here), false);
+    older.as_object_mut().unwrap().remove("draft");
+    rig.api
+        .answer(&format!("{repo}/pulls"), StatusCode::CREATED, older);
+    let (record, text) = rig
+        .approved(CREATE, arguments, ApprovalDecision::Approve)
+        .await;
+    assert_eq!(record.state, ToolCallState::Succeeded, "{:?}", record.error);
+    let answer = result(text);
+    assert_eq!(answer["pull_request"]["draft"], Value::Null);
+    assert_eq!(answer["draft_as_requested"], Value::Null);
+}
+
+/// A merge names the head commit the user approves, so a branch pushed to
+/// since is not merged; the forge's refusals are conflicts.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_model_merges_a_pull_request_only_at_the_approved_head() {
+    let mut rig = rig().await;
+    let repo = format!("/api/v3/repos/{}/{}", rig.owner, rig.name);
+    let (head, merged) = (sha(), sha());
+    let arguments = json!({"number": 12, "head": head, "method": "squash"});
+    let (record, _) = rig
+        .approved(MERGE, arguments.clone(), ApprovalDecision::Deny)
+        .await;
+    assert_eq!(record.state, ToolCallState::Denied);
+    assert!(rig.api.put.lock().unwrap().is_empty());
+
+    rig.api.answer(
+        &format!("{repo}/pulls/12/merge"),
+        StatusCode::OK,
+        json!({"sha": merged, "merged": true, "message": nonce()}),
+    );
+    let (record, text) = rig
+        .approved(MERGE, arguments.clone(), ApprovalDecision::Approve)
+        .await;
+    assert_eq!(record.state, ToolCallState::Succeeded, "{:?}", record.error);
+    let answer = result(text);
+    assert_eq!(answer["merge"], json!({"merged": true, "commit": merged}));
+    assert_eq!(
+        rig.api.put.lock().unwrap().last().unwrap(),
+        &(
+            format!("{repo}/pulls/12/merge"),
+            json!({"sha": head, "merge_method": "squash"})
+        )
+    );
+    // Moved on, conflicting or held by the forge's rules: not merged.
+    for status in [StatusCode::METHOD_NOT_ALLOWED, StatusCode::CONFLICT] {
+        rig.api
+            .answer(&format!("{repo}/pulls/12/merge"), status, json!({}));
+        let (record, _) = rig
+            .approved(MERGE, arguments.clone(), ApprovalDecision::Approve)
+            .await;
+        assert_eq!(record.state, ToolCallState::Failed);
+        assert_eq!(error_kind(&record), ErrorKind::Conflict);
+    }
+
+    // GitLab squashes or merges as the project is set to, and says when it
+    // accepted a merge it has not made yet.
+    rig.forge(Some((ForgeKind::GitLab, "/api/v4"))).await;
+    let project = format!("/api/v4/projects/{}%2F{}", rig.owner, rig.name);
+    rig.api.answer(
+        &format!("{project}/merge_requests/12/merge"),
+        StatusCode::OK,
+        json!({"iid": 12, "state": "opened", "merge_commit_sha": null}),
+    );
+    let (record, text) = rig
+        .approved(
+            MERGE,
+            json!({"number": 12, "head": head}),
+            ApprovalDecision::Approve,
+        )
+        .await;
+    assert_eq!(record.state, ToolCallState::Succeeded, "{:?}", record.error);
+    assert_eq!(
+        result(text)["merge"],
+        json!({"merged": false, "commit": null})
+    );
+    assert_eq!(
+        rig.api.put.lock().unwrap().last().unwrap().1,
+        json!({"sha": head, "squash": false})
+    );
+
+    // Bad arguments, and a rebase GitLab cannot do, send nothing.
+    let asked = rig.api.paths().len();
+    for arguments in [
+        json!({"number": 12}),
+        json!({"number": 12, "head": &head[..12]}),
+        json!({"number": 12, "head": format!("{}g", &head[1..])}),
+        json!({"number": 12, "head": head, "method": nonce()}),
+        json!({"number": 12, "head": head, "method": "rebase"}),
+    ] {
+        let (record, _) = rig
+            .approved(MERGE, arguments, ApprovalDecision::Approve)
+            .await;
+        assert_eq!(error_kind(&record), ErrorKind::InvalidRequest);
+    }
+    assert_eq!(rig.api.paths().len(), asked);
+}
+
+/// A line comment is anchored at the head commit the user approves, and
+/// nothing is posted once the pull request is read to have moved on.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_model_comments_on_a_line_only_at_the_approved_head() {
+    let mut rig = rig().await;
+    let repo = format!("/api/v3/repos/{}/{}", rig.owner, rig.name);
+    let (head, path, comment) = (sha(), format!("{}/{}.rs", nonce(), nonce()), nonce());
+    let pull = |at: &str| {
+        json!({
+            "number": 8,
+            "title": nonce(),
+            "state": "open",
+            "head": {"ref": nonce(), "sha": at},
+            "base": {"ref": nonce(), "sha": sha()},
+        })
+    };
+    rig.api
+        .answer(&format!("{repo}/pulls/8"), StatusCode::OK, pull(&head));
+    let arguments = json!({"number": 8, "head": head, "path": path, "line": 12, "side": "old", "body": comment});
+    let (record, _) = rig
+        .approved(LINE_COMMENT, arguments.clone(), ApprovalDecision::Deny)
+        .await;
+    assert_eq!(record.state, ToolCallState::Denied);
+    assert!(rig.api.paths().is_empty());
+
+    let url = format!("{}/{}", rig.origin, nonce());
+    rig.api.answer(
+        &format!("{repo}/pulls/8/comments"),
+        StatusCode::CREATED,
+        json!({"id": 4242, "html_url": url, "body": comment}),
+    );
+    let (record, text) = rig
+        .approved(LINE_COMMENT, arguments.clone(), ApprovalDecision::Approve)
+        .await;
+    assert_eq!(record.state, ToolCallState::Succeeded, "{:?}", record.error);
+    assert_eq!(result(text)["comment"], json!({"id": 4242, "url": url}));
+    assert_eq!(
+        rig.api.posted.lock().unwrap().last().unwrap(),
+        &(
+            format!("{repo}/pulls/8/comments"),
+            json!({"body": comment, "commit_id": head, "path": path, "line": 12, "side": "LEFT"})
+        )
+    );
+
+    // A line the forge does not show in the changes.
+    rig.api.answer(
+        &format!("{repo}/pulls/8/comments"),
+        StatusCode::UNPROCESSABLE_ENTITY,
+        json!({"message": nonce()}),
+    );
+    let (record, _) = rig
+        .approved(LINE_COMMENT, arguments.clone(), ApprovalDecision::Approve)
+        .await;
+    assert_eq!(error_kind(&record), ErrorKind::Conflict);
+
+    // Pushed to since the user approved: read, and nothing posted.
+    rig.api
+        .answer(&format!("{repo}/pulls/8"), StatusCode::OK, pull(&sha()));
+    let posts = rig.api.posted.lock().unwrap().len();
+    let (record, _) = rig
+        .approved(LINE_COMMENT, arguments, ApprovalDecision::Approve)
+        .await;
+    assert_eq!(error_kind(&record), ErrorKind::Conflict);
+    assert_eq!(rig.api.posted.lock().unwrap().len(), posts);
+
+    // GitLab places a discussion by the merge request's current versions.
+    rig.forge(Some((ForgeKind::GitLab, "/api/v4"))).await;
+    let project = format!("/api/v4/projects/{}%2F{}", rig.owner, rig.name);
+    let (base, start) = (sha(), sha());
+    rig.api.answer(
+        &format!("{project}/merge_requests/8"),
+        StatusCode::OK,
+        json!({
+            "iid": 8,
+            "title": nonce(),
+            "state": "opened",
+            "source_branch": nonce(),
+            "target_branch": nonce(),
+            "sha": head,
+            "diff_refs": {"base_sha": base, "start_sha": start, "head_sha": head},
+        }),
+    );
+    rig.api.answer(
+        &format!("{project}/merge_requests/8/discussions"),
+        StatusCode::CREATED,
+        json!({"id": nonce(), "notes": [{"id": 515, "body": comment}]}),
+    );
+    let (record, text) = rig
+        .approved(
+            LINE_COMMENT,
+            json!({"number": 8, "head": head, "path": path, "line": 3, "body": comment}),
+            ApprovalDecision::Approve,
+        )
+        .await;
+    assert_eq!(record.state, ToolCallState::Succeeded, "{:?}", record.error);
+    assert_eq!(result(text)["comment"], json!({"id": 515, "url": null}));
+    assert_eq!(
+        rig.api.posted.lock().unwrap().last().unwrap().1,
+        json!({"body": comment, "position": {
+            "position_type": "text",
+            "base_sha": base,
+            "start_sha": start,
+            "head_sha": head,
+            "old_path": path,
+            "new_path": path,
+            "new_line": 3,
+        }})
+    );
+
+    // Bad arguments send nothing.
+    let asked = rig.api.paths().len();
+    let valid = json!({"number": 8, "head": head, "path": path, "line": 3, "body": comment});
+    for (key, value) in [
+        ("head", json!(&head[..20])),
+        ("path", json!("")),
+        ("path", json!(format!("/{path}"))),
+        ("path", json!(format!("{path}\n"))),
+        ("line", json!(0)),
+        ("line", json!(u64::from(u32::MAX) + 1)),
+        ("line", json!(1.5)),
+        ("side", json!(nonce())),
+        ("body", json!(" ")),
+    ] {
+        let mut arguments = valid.clone();
+        arguments[key] = value;
+        let (record, _) = rig
+            .approved(LINE_COMMENT, arguments, ApprovalDecision::Approve)
+            .await;
+        assert_eq!(error_kind(&record), ErrorKind::InvalidRequest, "{key}");
+    }
+    let mut arguments = valid;
+    arguments.as_object_mut().unwrap().remove("path");
+    let (record, _) = rig
+        .approved(LINE_COMMENT, arguments, ApprovalDecision::Approve)
+        .await;
+    assert_eq!(error_kind(&record), ErrorKind::InvalidRequest);
+    assert_eq!(rig.api.paths().len(), asked);
+}

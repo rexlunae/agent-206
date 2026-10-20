@@ -2,7 +2,8 @@
 //! authorizes against the caller's `network` grant and sends through its
 //! SSRF guard.
 use a206_extension_sdk::{
-    Args, Extension, FetchResponse, GuestError, ToolOutput, bool_arg, host, int_arg, string_arg,
+    Args, ByteBuf, Extension, FetchResponse, GuestError, ToolOutput, TriggerOutput, bool_arg,
+    fingerprint, host, int_arg, prefix, string_arg,
 };
 use extract::Format;
 
@@ -15,6 +16,8 @@ a206_extension_sdk::export!(Web);
 const MAX_TEXT: usize = 192 * 1024;
 const DEFAULT_BYTES: i64 = 50_000;
 const CUT: &str = "\n[the response continues; it was cut at a limit]";
+/// Most bytes of a changed page's text a `page_changed` report quotes.
+const REPORT_TEXT: usize = 8 * 1024;
 
 impl Extension for Web {
     fn tool(name: &str, args: &Args) -> Result<ToolOutput, GuestError> {
@@ -30,6 +33,63 @@ impl Extension for Web {
             _ => read_web_page(url, args),
         }
     }
+
+    fn trigger(
+        name: &str,
+        _job: &str,
+        args: &Args,
+        cursor: Option<&[u8]>,
+    ) -> Result<TriggerOutput, GuestError> {
+        if name != "page_changed" {
+            return Err(GuestError::new(
+                "unknown_trigger",
+                format!("no trigger `{name}`"),
+            ));
+        }
+        let url = string_arg(args, "url")?
+            .ok_or_else(|| GuestError::new("invalid_argument", "`url` is required"))?;
+        page_changed(url.split('#').next().unwrap_or_default(), cursor)
+    }
+}
+
+/// Fire when the page's readable text no longer has the fingerprint the
+/// previous check kept. The first check keeps one and does not fire.
+fn page_changed(url: &str, cursor: Option<&[u8]>) -> Result<TriggerOutput, GuestError> {
+    let response = host::fetch(url)?;
+    if !(200..300).contains(&response.status) {
+        return Err(GuestError::new(
+            "http_status",
+            format!("the page answered HTTP {}", response.status),
+        ));
+    }
+    let body = readable(&response.body, response.truncated)
+        .ok_or_else(|| GuestError::new("not_text", "the page is not text"))?;
+    let html = response
+        .content_type
+        .as_deref()
+        .is_none_or(|kind| kind.to_ascii_lowercase().contains("html"));
+    let text = if html {
+        extract::extract(body, None, Format::Text, extract::BUDGET).text
+    } else {
+        body.to_owned()
+    };
+    let print = fingerprint(text.as_bytes()).to_le_bytes();
+    let fired = match cursor {
+        Some(kept) if kept != print => {
+            let mut report =
+                format!("The page at {url} changed. Its readable text now begins:\n\n");
+            report.push_str(prefix(&text, REPORT_TEXT));
+            if text.len() > REPORT_TEXT {
+                report.push_str("\n[the text continues]");
+            }
+            Some(report)
+        }
+        _ => None,
+    };
+    Ok(TriggerOutput {
+        fired,
+        cursor: Some(ByteBuf::from(print.to_vec())),
+    })
 }
 
 fn fetch_url(url: &str) -> Result<ToolOutput, GuestError> {
@@ -125,13 +185,4 @@ fn readable(body: &[u8], truncated: bool) -> Option<&str> {
         }
         Err(_) => None,
     }
-}
-
-/// The longest prefix of `text` within `max` bytes, on a character boundary.
-fn prefix(text: &str, max: usize) -> &str {
-    let mut end = text.len().min(max);
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    &text[..end]
 }

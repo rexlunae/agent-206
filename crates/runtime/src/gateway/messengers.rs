@@ -3,7 +3,7 @@
 //! ordinary `Send` request, journaled and admitted like one from the app.
 use super::{Gateway, GatewayError, Result, poisoned};
 use crate::error::check;
-use crate::messengers::{Desired, Host, MessengerError, Poster};
+use crate::messengers::{Desired, Host, MessengerError, Poster, SavedCursor};
 use a206_core::messengers::{MAX_ALLOWED_CHATS, valid_field as field, valid_name};
 use a206_core::*;
 use std::collections::BTreeSet;
@@ -340,6 +340,18 @@ impl Host for Gateway {
                 posters.remove(name);
             }
         });
+    }
+    fn saved_cursor(&self, name: &str) -> Result<Option<SavedCursor>, MessengerError> {
+        let cursor = |e: GatewayError| MessengerError::Cursor(Box::new(e));
+        let store = self.lock().map_err(cursor)?;
+        store.messenger_cursor(name).map_err(|e| cursor(e.into()))
+    }
+    fn save_cursor(&self, name: &str, saved: &SavedCursor) -> Result<(), MessengerError> {
+        let cursor = |e: GatewayError| MessengerError::Cursor(Box::new(e));
+        let store = self.lock().map_err(cursor)?;
+        store
+            .put_messenger_cursor(name, saved)
+            .map_err(|e| cursor(e.into()))
     }
     fn update(&self, name: &str, change: impl FnOnce(&mut MessengerStatus) + Send) {
         let result = self.lock().and_then(|mut store| {

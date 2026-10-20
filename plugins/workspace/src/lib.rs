@@ -1,9 +1,9 @@
 //! Bundled workspace extension. Every file access is a host call that the
 //! gateway authorizes against the caller's `read_workspace` grant.
 use a206_extension_sdk::{
-    Args, DirEntry, EntryKind, Extension, Field, FileChange, FilePatch, GuestError, Node,
-    PatchResult, SearchOptions, Tone, ToolOutput, UiEvent, View, bool_arg, excerpt, host, int_arg,
-    string_arg,
+    Args, ByteBuf, DirEntry, EntryKind, Extension, Field, FileChange, FilePatch, GuestError,
+    HostErrorCode, Node, PatchResult, SearchOptions, Tone, ToolOutput, TriggerOutput, UiEvent,
+    View, bool_arg, excerpt, fingerprint, host, int_arg, prefix, string_arg,
 };
 
 mod patch;
@@ -17,6 +17,8 @@ const TOGGLE_HIDDEN: &str = "toggle-hidden";
 const README_LINES: usize = 40;
 const DEFAULT_MATCHES: i64 = 100;
 const DEFAULT_FOUND: i64 = 200;
+/// Most bytes of a changed file's text a `file_changed` report quotes.
+const REPORT_TEXT: usize = 8 * 1024;
 
 impl Extension for Workspace {
     fn tool(name: &str, args: &Args) -> Result<ToolOutput, GuestError> {
@@ -122,6 +124,21 @@ impl Extension for Workspace {
             }
             _ => Err(GuestError::new("unknown_tool", format!("no tool `{name}`"))),
         }
+    }
+
+    fn trigger(
+        name: &str,
+        _job: &str,
+        args: &Args,
+        cursor: Option<&[u8]>,
+    ) -> Result<TriggerOutput, GuestError> {
+        if name != "file_changed" {
+            return Err(GuestError::new(
+                "unknown_trigger",
+                format!("no trigger `{name}`"),
+            ));
+        }
+        file_changed(required(args, "path")?, cursor)
     }
 
     fn panel(id: &str, event: Option<&UiEvent>) -> Result<View, GuestError> {
@@ -254,6 +271,50 @@ fn field(label: &str, value: usize) -> Field {
         label: label.into(),
         value: value.to_string(),
     }
+}
+/// Fire when the file was created, changed or removed since the previous
+/// check, which kept whether it existed and its fingerprint. The first check
+/// keeps them and does not fire.
+fn file_changed(path: &str, cursor: Option<&[u8]>) -> Result<TriggerOutput, GuestError> {
+    let contents = match host::read_file(path) {
+        Ok(bytes) => Some(bytes),
+        Err(failure) if failure.code == HostErrorCode::NotFound => None,
+        Err(failure) => return Err(failure.into()),
+    };
+    let mut print = vec![u8::from(contents.is_some())];
+    print.extend(fingerprint(contents.as_deref().unwrap_or_default()).to_le_bytes());
+    let fired = match cursor {
+        Some(kept) if kept != print.as_slice() => Some(match &contents {
+            None => format!("The file {path} was removed."),
+            Some(bytes) => {
+                let what = if kept.first() == Some(&0) {
+                    "was created"
+                } else {
+                    "changed"
+                };
+                let mut report = format!("The file {path} {what}. ");
+                match std::str::from_utf8(bytes) {
+                    Ok(text) => {
+                        report.push_str("Its text now begins:\n\n");
+                        report.push_str(prefix(text, REPORT_TEXT));
+                        if text.len() > REPORT_TEXT {
+                            report.push_str("\n[the text continues]");
+                        }
+                    }
+                    Err(_) => report.push_str(&format!(
+                        "It holds {} bytes that are not UTF-8 text.",
+                        bytes.len()
+                    )),
+                }
+                report
+            }
+        }),
+        _ => None,
+    };
+    Ok(TriggerOutput {
+        fired,
+        cursor: Some(ByteBuf::from(print)),
+    })
 }
 fn text(bytes: Vec<u8>) -> Result<String, GuestError> {
     String::from_utf8(bytes).map_err(|_| GuestError::new("not_text", "the file is not UTF-8 text"))

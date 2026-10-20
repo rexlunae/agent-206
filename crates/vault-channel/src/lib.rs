@@ -12,7 +12,7 @@ pub const MAX_MESSAGE: usize = 65535;
 pub const IMPORT_REVIEW_VERSION: u16 = 1;
 /// First broker protocol that implements connection-owned reviewed imports.
 pub const REVIEWED_IMPORT_BROKER_VERSION: u16 = 11;
-pub const CREDENTIALS_BROKER_VERSION: u16 = 14;
+pub const CREDENTIALS_BROKER_VERSION: u16 = 17;
 pub const CREDENTIALS_SCHEMA_VERSION: u16 = 1;
 pub const MAX_CREDENTIAL_PAGE: u16 = 50;
 pub const MAX_CREDENTIAL_PAGE_BYTES: usize = 48 * 1024;

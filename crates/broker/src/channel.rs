@@ -135,7 +135,7 @@ pub fn reply(result: Result<Reply, BrokerError>) -> wire::Reply {
                 BrokerError::ImportReviewUnavailable | BrokerError::ImportSourceChanged => {
                     ErrorKind::Conflict
                 }
-                BrokerError::Invalid(_) => ErrorKind::InvalidRequest,
+                BrokerError::Invalid(_) | BrokerError::SshKey(_) => ErrorKind::InvalidRequest,
                 BrokerError::Channel(_) => ErrorKind::Protocol,
                 BrokerError::NotFound => ErrorKind::NotFound,
                 BrokerError::Vault(_) => ErrorKind::Storage,

@@ -232,15 +232,39 @@ async fn an_earlier_run_ending_late_leaves_the_latest_result() {
     job_mut(&mut g.lock().unwrap().state, created.id)
         .unwrap()
         .last = Some(second.clone());
-    g.finish_job(created.id, first.id, JobOutcome::Failed)
-        .unwrap();
-    assert_eq!(job(&g, created.id).last, Some(second.clone()));
-    g.finish_job(created.id, second.id, JobOutcome::Complete)
-        .unwrap();
+    let (stale, kept) = (cursor(), cursor());
+    g.finish_job(
+        created.id,
+        second.id,
+        JobOutcome::Complete,
+        false,
+        Some(Some(kept.clone())),
+    )
+    .unwrap();
+    // The earlier check's cursor must not replace what the newer one kept.
+    g.finish_job(
+        created.id,
+        first.id,
+        JobOutcome::Failed,
+        false,
+        Some(Some(stale)),
+    )
+    .unwrap();
+    let after = job(&g, created.id);
     assert_eq!(
-        job(&g, created.id).last.map(|run| run.outcome),
+        after.last.map(|run| run.outcome),
         Some(JobOutcome::Complete)
     );
+    assert_eq!(after.cursor, Some(kept.clone()));
+    // The cursor is written with the outcome, so a reopened gateway has it.
+    drop(g);
+    let g = Gateway::open(state.path()).unwrap();
+    assert_eq!(job(&g, created.id).cursor, Some(kept));
+}
+
+/// A cursor with generated contents.
+fn cursor() -> ByteBuf {
+    ByteBuf::from(Id::new_v4().as_bytes().to_vec())
 }
 
 #[tokio::test]
@@ -304,19 +328,22 @@ fn a_heartbeat_is_quiet_by_its_reply_even_when_steering_follows_it() {
         // Steered after the run's last round, so the run did not answer it.
         say(Role::User, &nonce()),
     ];
-    assert_eq!(super::ended(JobKind::Heartbeat, &thread), JobOutcome::Quiet);
     assert_eq!(
-        super::ended(JobKind::Message, &thread),
+        super::ended(&JobKind::Heartbeat, &thread),
+        JobOutcome::Quiet
+    );
+    assert_eq!(
+        super::ended(&JobKind::Message, &thread),
         JobOutcome::Complete
     );
     thread.messages[1].text = nonce();
     assert_eq!(
-        super::ended(JobKind::Heartbeat, &thread),
+        super::ended(&JobKind::Heartbeat, &thread),
         JobOutcome::Complete
     );
     thread.state = RunState::Failed;
     assert_eq!(
-        super::ended(JobKind::Heartbeat, &thread),
+        super::ended(&JobKind::Heartbeat, &thread),
         JobOutcome::Failed
     );
 }
@@ -391,15 +418,44 @@ async fn the_history_keeps_a_bounded_number_of_runs_and_settles_earlier_ones() {
     let second = JobRun::start(at);
     start(&second);
     let revision = job(&g, created.id).history;
-    g.finish_job(created.id, first.id, JobOutcome::Failed)
-        .unwrap();
+    let to = nonce();
+    job_mut(&mut g.lock().unwrap().state, created.id)
+        .unwrap()
+        .deliver_to = Some(to.clone());
+    // A run with a reply to post records its end first, as posting.
+    assert_eq!(
+        g.finish_job(created.id, first.id, JobOutcome::Complete, true, None)
+            .unwrap(),
+        Some(to)
+    );
     // Clients showing the history learn that it changed.
     assert_ne!(job(&g, created.id).history, revision);
     let history = g.lock().unwrap().job_runs(created.id).unwrap();
     assert_eq!(history[0], second, "the latest run is still running");
     assert_eq!(history[1].id, first.id);
-    assert_eq!(history[1].outcome, JobOutcome::Failed);
+    assert_eq!(history[1].outcome, JobOutcome::Complete);
+    assert_eq!(history[1].delivery, Some(Delivery::Posting));
     assert!(history[1].ended.is_some());
+    let posted = Delivery::Sent {
+        parts: 1 + arbitrary() % 8,
+    };
+    g.update_run(created.id, first.id, None, |_, run| {
+        run.delivery = Some(posted.clone())
+    })
+    .unwrap();
+    let history = g.lock().unwrap().job_runs(created.id).unwrap();
+    assert_eq!(history[1].delivery, Some(posted));
+    // A run that failed, or has no reply, has nothing to post.
+    for (outcome, posts) in [(JobOutcome::Failed, true), (JobOutcome::Complete, false)] {
+        let run = JobRun::start(at);
+        start(&run);
+        assert_eq!(
+            g.finish_job(created.id, run.id, outcome, posts, None)
+                .unwrap(),
+            None
+        );
+        assert_eq!(job(&g, created.id).last.unwrap().delivery, None);
+    }
 
     let extra = 1 + arbitrary() as usize % 8;
     let mut newest = vec![];
@@ -415,6 +471,31 @@ async fn the_history_keeps_a_bounded_number_of_runs_and_settles_earlier_ones() {
         .map(|r| r.id)
         .collect();
     assert_eq!(kept, newest);
+
+    // A run pushed out of the history still posts its reply, while the job
+    // keeps a destination; a removed job's does not.
+    let pruned = Id::new_v4();
+    let to = job(&g, created.id).deliver_to;
+    assert!(to.is_some());
+    assert_eq!(
+        g.finish_job(created.id, pruned, JobOutcome::Complete, true, None)
+            .unwrap(),
+        to
+    );
+    assert_eq!(
+        g.finish_job(created.id, pruned, JobOutcome::Failed, true, None)
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        send(&g, Command::RemoveJob { id: created.id }).await,
+        Reply::Ok
+    );
+    assert_eq!(
+        g.finish_job(created.id, pruned, JobOutcome::Complete, true, None)
+            .unwrap(),
+        None
+    );
 }
 
 #[tokio::test]
@@ -427,7 +508,12 @@ async fn runs_still_going_at_a_restart_end_unrecorded_in_the_history() {
             panic!("job scheduled");
         };
         let at = arbitrary();
-        let (first, second) = (JobRun::start(at), JobRun::start(at));
+        // The earlier one was posting its reply.
+        let first = JobRun {
+            delivery: Some(Delivery::Posting),
+            ..JobRun::start(at)
+        };
+        let second = JobRun::start(at);
         for run in [&first, &second] {
             let mut store = g.lock().unwrap();
             job_mut(&mut store.state, created.id).unwrap().last = Some(run.clone());
@@ -444,11 +530,186 @@ async fn runs_still_going_at_a_restart_end_unrecorded_in_the_history() {
     let history = runs(send(&g, Command::JobRuns { id }).await);
     assert_eq!(history[1].id, first);
     assert_eq!(history[1].outcome, JobOutcome::Unrecorded);
+    assert_eq!(history[1].delivery, Some(Delivery::Unrecorded));
     // The latest is settled from its conversation, as `Job::last` is.
     assert_eq!(history[0].id, second);
     assert_eq!(Some(&history[0]), job(&g, id).last.as_ref());
     assert!(!matches!(
         history[0].outcome,
         JobOutcome::Running | JobOutcome::Unrecorded
+    ));
+}
+
+#[test]
+fn a_runs_reply_is_the_last_answer_after_its_own_message() {
+    let say = |role, text: &str| Message::new(role, text.into(), 0, CodingBackend::default());
+    let (sent, earlier, reply) = (nonce(), nonce(), nonce());
+    let mut thread = Thread::new(nonce(), Mode::Chat);
+    thread.messages = vec![
+        // The same text, answered before this run's message was sent (in
+        // the same second, which a time cannot tell apart).
+        say(Role::User, &sent),
+        say(Role::Assistant, &earlier),
+        say(Role::User, &sent),
+        say(Role::Assistant, &nonce()),
+        // Steered into the run, which answered it.
+        say(Role::User, &nonce()),
+        say(Role::Assistant, &reply),
+        say(Role::Assistant, " \n"),
+        // Steered too late for the run, with the job's own text.
+        say(Role::User, &sent),
+    ];
+    assert_eq!(super::run_reply(&thread, &sent, 2), Some(reply));
+    // A run that answered with no text has no reply, not an earlier one.
+    thread.messages.truncate(3);
+    thread.messages.push(say(Role::Assistant, ""));
+    assert_eq!(super::run_reply(&thread, &sent, 2), None);
+    assert_eq!(super::run_reply(&thread, &nonce(), 0), None);
+    assert_eq!(super::run_reply(&thread, &sent, 99), None);
+}
+
+#[test]
+fn the_kinds_offered_for_posting_are_the_kinds_the_outbox_posts_to() {
+    for kind in MessengerKind::ALL {
+        assert_eq!(
+            kind.posts_to_chats(),
+            crate::messengers::posts_to_chats(kind),
+            "{kind:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn only_configured_post_destinations_are_accepted() {
+    let state = tempfile::tempdir().unwrap();
+    let g = Gateway::open(state.path()).unwrap();
+    let thread = thread(&g).await;
+    let Reply::Job(created) = schedule(&g, thread, every(schedule::MIN_INTERVAL)).await else {
+        panic!("job scheduled");
+    };
+    let (hook, bot, irc, chat) = (
+        format!("h-{}", nonce()),
+        format!("b-{}", nonce()),
+        format!("i-{}", nonce()),
+        nonce(),
+    );
+    let mut settings = g.snapshot().unwrap().settings;
+    let with_chat = |name: &str, kind| MessengerConfig {
+        allowed_chats: [chat.clone()].into(),
+        ..MessengerConfig::new(name.to_owned(), kind)
+    };
+    settings.messengers = vec![
+        MessengerConfig::new(hook.clone(), MessengerKind::Webhook),
+        with_chat(&bot, MessengerKind::Telegram),
+        with_chat(&irc, MessengerKind::Irc),
+    ];
+    let mut expected = vec![
+        hook.clone(),
+        format!("{bot}/{chat}"),
+        format!("{irc}/{chat}"),
+    ];
+    expected.sort();
+    let mut offered = messengers::post_destinations(&settings.messengers);
+    offered.sort();
+    assert_eq!(offered, expected);
+    g.lock().unwrap().state.settings = settings;
+    let deliver = |to: &str| Command::SetJobDelivery {
+        id: created.id,
+        to: Some(to.to_owned()),
+    };
+    for to in [
+        hook.clone(),
+        format!("{irc}/{chat}"),
+        format!("{bot}/{chat}"),
+    ] {
+        let Reply::Job(set) = send(&g, deliver(&to)).await else {
+            panic!("{to} accepted");
+        };
+        assert_eq!(set.deliver_to, Some(to));
+    }
+    // A chat must be allowed, and a chat messenger is named with its chat.
+    for to in [
+        format!("{irc}/{}", nonce()),
+        format!("{bot}/{}", nonce()),
+        bot.clone(),
+        nonce(),
+    ] {
+        assert_eq!(
+            kind(send(&g, deliver(&to)).await),
+            ErrorKind::InvalidRequest
+        );
+    }
+    assert_eq!(
+        job(&g, created.id).deliver_to,
+        Some(format!("{bot}/{chat}"))
+    );
+    let missing = Command::SetJobDelivery {
+        id: Id::new_v4(),
+        to: None,
+    };
+    assert_eq!(kind(send(&g, missing).await), ErrorKind::NotFound);
+}
+
+#[tokio::test]
+async fn a_trigger_check_does_not_start_while_the_last_one_runs() {
+    let state = tempfile::tempdir().unwrap();
+    let g = Gateway::open(state.path()).unwrap();
+    let thread = thread(&g).await;
+    let seconds = schedule::MIN_INTERVAL + arbitrary() % 1000;
+    let Reply::Job(created) = schedule(&g, thread, every(seconds)).await else {
+        panic!("job scheduled");
+    };
+    let running = JobRun::start(arbitrary());
+    {
+        let mut store = g.lock().unwrap();
+        let job = job_mut(&mut store.state, created.id).unwrap();
+        job.kind = a206_core::JobKind::Trigger {
+            extension: nonce(),
+            trigger: nonce(),
+            args: Default::default(),
+        };
+        job.last = Some(running.clone());
+    }
+    assert_eq!(
+        kind(send(&g, Command::RunJob { id: created.id }).await),
+        ErrorKind::Conflict
+    );
+    // A time that comes due meanwhile is passed over, not run beside it.
+    let first = created.next.unwrap();
+    assert_eq!(g.run_due_jobs(first).unwrap(), Some(first + seconds));
+    let after = job(&g, created.id);
+    assert_eq!(after.last, Some(running.clone()));
+    assert_eq!(after.next, Some(first + seconds));
+
+    // A schedule that stops resolving meanwhile is refused only once the
+    // check has ended, so the refusal never stands in for a running check.
+    let due = first + seconds;
+    job_mut(&mut g.lock().unwrap().state, created.id)
+        .unwrap()
+        .schedule = Schedule::In { seconds };
+    // The scheduler neither spins on the past-due time nor waits longer
+    // than the shortest interval a schedule may have to look again.
+    let wake = g.run_due_jobs(due).unwrap().unwrap();
+    assert!(due < wake && wake <= due + schedule::MIN_INTERVAL, "{wake}");
+    let deferred = job(&g, created.id);
+    assert_eq!(deferred.last, Some(running.clone()));
+    assert!(deferred.enabled);
+    assert_eq!(
+        kind(send(&g, Command::RunJob { id: created.id }).await),
+        ErrorKind::Conflict
+    );
+    job_mut(&mut g.lock().unwrap().state, created.id)
+        .unwrap()
+        .last = Some(JobRun {
+        outcome: JobOutcome::Quiet,
+        ended: Some(due),
+        ..running
+    });
+    assert_eq!(g.run_due_jobs(due).unwrap(), None);
+    let refused = job(&g, created.id);
+    assert!(!refused.enabled);
+    assert!(matches!(
+        refused.last.map(|run| run.outcome),
+        Some(JobOutcome::Refused(_))
     ));
 }

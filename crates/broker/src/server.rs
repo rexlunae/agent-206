@@ -123,6 +123,8 @@ struct Outbound {
     /// The credential header, or `None` when the credential is in `url`.
     header: Option<(&'static str, Zeroizing<String>)>,
     anthropic_version: Option<String>,
+    /// Ask for a JSON response (`Accept: application/json`).
+    accept_json: bool,
     body: Option<Vec<u8>>,
     /// Sent as the body's `Content-Type`.
     content_type: &'static str,
@@ -178,6 +180,7 @@ fn vault_error(error: VaultError) -> BrokerError {
         }
         VaultError::Exists => BrokerError::VaultExists,
         VaultError::ImportSource(_) => BrokerError::Invalid(I::ImportSource),
+        VaultError::SshKey(error) => BrokerError::SshKey(error),
     }
 }
 
@@ -232,6 +235,11 @@ fn origins(destinations: Vec<String>) -> Result<Vec<String>, BrokerError> {
     destinations
         .iter()
         .map(|d| {
+            if d.get(..4).is_some_and(|s| s.eq_ignore_ascii_case("ssh:")) {
+                return a206_core::ssh_host::SshHost::parse(d)
+                    .map(|host| host.origin())
+                    .map_err(|_| BrokerError::Invalid(InvalidRequest::Destination));
+            }
             if d.starts_with("ircs:") || d.starts_with("irc:") {
                 return a206_core::messengers::IrcServer::parse(d)
                     .map(|server| server.origin())
@@ -370,7 +378,9 @@ fn handle(shared: &Shared, session: &mut Session, request: Request) -> Handled {
             | Request::ProviderStream(_)
             | Request::SocketOpen(_)
             | Request::SocketSend { .. }
-            | Request::GitReceivePack(_),
+            | Request::GitReceivePack(_)
+            | Request::GitUploadPack(_)
+            | Request::SshAgent(_),
         ) => {}
         (Role::Gateway, _)
         | (
@@ -380,7 +390,9 @@ fn handle(shared: &Shared, session: &mut Session, request: Request) -> Handled {
             | Request::ProviderStream(_)
             | Request::SocketOpen(_)
             | Request::SocketSend { .. }
-            | Request::GitReceivePack(_),
+            | Request::GitReceivePack(_)
+            | Request::GitUploadPack(_)
+            | Request::SshAgent(_),
         ) => {
             return Err(BrokerError::Forbidden);
         }
@@ -768,7 +780,9 @@ fn handle(shared: &Shared, session: &mut Session, request: Request) -> Handled {
         Request::SocketOpen(call) => socket(shared, session, call),
         // A connection carrying a socket never reaches here with one.
         Request::SocketSend { .. } => Err(BrokerError::Invalid(InvalidRequest::NoSocket)),
-        Request::GitReceivePack(call) => git(shared, session, call),
+        Request::GitReceivePack(call) => git(shared, session, call, GitService::ReceivePack),
+        Request::GitUploadPack(call) => git(shared, session, call, GitService::UploadPack),
+        Request::SshAgent(call) => ssh_agent(shared, session, call),
     }
 }
 
@@ -876,6 +890,7 @@ fn provider(shared: &Shared, session: &Session, call: ProviderCall, stream: bool
         AuthScheme::Bearer | AuthScheme::DiscordBot => (url, Some(("authorization", value))),
         AuthScheme::ApiKeyHeader => (url, Some(("x-api-key", value))),
         AuthScheme::GoogleApiKey => (url, Some(("x-goog-api-key", value))),
+        AuthScheme::SubscriptionToken => (url, Some(("x-subscription-token", value))),
         AuthScheme::TelegramBot => (telegram_url(url, &value)?, None),
         AuthScheme::WebhookUrl => (webhook_url(&url, &value)?, None),
     };
@@ -884,6 +899,7 @@ fn provider(shared: &Shared, session: &Session, call: ProviderCall, stream: bool
         url,
         header,
         anthropic_version: call.anthropic_version,
+        accept_json: call.auth == AuthScheme::SubscriptionToken,
         body: call.body,
         content_type: "application/json",
         expect: None,
@@ -894,7 +910,37 @@ fn provider(shared: &Shared, session: &Session, call: ProviderCall, stream: bool
 
 /// Validate one round of a git push and attach the token, as HTTP Basic
 /// authentication, for the repository's exact origin.
-fn git(shared: &Shared, session: &Session, call: GitCall) -> Handled {
+/// The smart HTTP service a [`GitCall`] is for.
+#[derive(Clone, Copy)]
+enum GitService {
+    ReceivePack,
+    UploadPack,
+}
+impl GitService {
+    fn name(self) -> &'static str {
+        match self {
+            Self::ReceivePack => "git-receive-pack",
+            Self::UploadPack => "git-upload-pack",
+        }
+    }
+    /// The content types of its advertisement, its request and its result.
+    fn types(self) -> [&'static str; 3] {
+        match self {
+            Self::ReceivePack => [
+                "application/x-git-receive-pack-advertisement",
+                "application/x-git-receive-pack-request",
+                "application/x-git-receive-pack-result",
+            ],
+            Self::UploadPack => [
+                "application/x-git-upload-pack-advertisement",
+                "application/x-git-upload-pack-request",
+                "application/x-git-upload-pack-result",
+            ],
+        }
+    }
+}
+
+fn git(shared: &Shared, session: &Session, call: GitCall, service: GitService) -> Handled {
     use base64::Engine as _;
     let (vault, epoch) = paired(shared, session)?;
     let invalid = || BrokerError::Invalid(InvalidRequest::GitRepository);
@@ -929,23 +975,16 @@ fn git(shared: &Shared, session: &Session, call: GitCall) -> Handled {
         .map_err(vault_error)?;
     drop(vault);
     let base = url.path().trim_end_matches('/').to_owned();
+    let [advertisement, request, result] = service.types();
     let (method, expect, content_type) = match call.request {
         None => {
             url.set_path(&format!("{base}/info/refs"));
-            url.set_query(Some("service=git-receive-pack"));
-            (
-                HttpMethod::Get,
-                "application/x-git-receive-pack-advertisement",
-                "application/json",
-            )
+            url.set_query(Some(&format!("service={}", service.name())));
+            (HttpMethod::Get, advertisement, "application/json")
         }
         Some(_) => {
-            url.set_path(&format!("{base}/git-receive-pack"));
-            (
-                HttpMethod::Post,
-                "application/x-git-receive-pack-result",
-                "application/x-git-receive-pack-request",
-            )
+            url.set_path(&format!("{base}/{}", service.name()));
+            (HttpMethod::Post, result, request)
         }
     };
     Ok(Outcome::Send(Box::new(Outbound {
@@ -953,12 +992,39 @@ fn git(shared: &Shared, session: &Session, call: GitCall) -> Handled {
         url,
         header: Some(("authorization", value)),
         anthropic_version: None,
+        accept_json: false,
         body: call.request,
         content_type,
         expect: Some(expect),
         cancel,
         stream: false,
     })))
+}
+
+/// Use an SSH key for the client the gateway runs: the vault checks the
+/// destination binding and signs only an authentication request for that
+/// key.
+fn ssh_agent(shared: &Shared, session: &Session, call: SshAgentCall) -> Handled {
+    let invalid = || BrokerError::Invalid(InvalidRequest::SshAgent);
+    let destination = a206_core::ssh_host::SshHost::parse(&call.destination)
+        .map_err(|_| invalid())?
+        .origin();
+    if destination != call.destination
+        || call
+            .sign
+            .as_ref()
+            .is_some_and(|d| d.len() > MAX_SSH_SIGN_DATA)
+    {
+        return Err(invalid());
+    }
+    let (vault, _) = paired(shared, session)?;
+    let used = vault
+        .ssh_for_destination(&call.credential, &destination, call.sign.as_deref())
+        .map_err(vault_error)?;
+    Ok(Outcome::Reply(Reply::SshAgent {
+        public_key: used.public_key,
+        signature: used.signature,
+    }))
 }
 
 /// Telegram takes the bot token as the first path segment. A token that could
@@ -996,6 +1062,8 @@ const GIT_AGENT: &str = concat!("git/agent206-", env!("CARGO_PKG_VERSION"));
 
 fn http_client() -> reqwest::ClientBuilder {
     reqwest::Client::builder()
+        // Forge APIs refuse requests that do not name their client.
+        .user_agent(concat!("agent206/", env!("CARGO_PKG_VERSION")))
         .timeout(Duration::from_secs(180))
         .connect_timeout(Duration::from_secs(10))
         .redirect(reqwest::redirect::Policy::none())
@@ -1051,6 +1119,9 @@ async fn request(http: &reqwest::Client, out: Outbound) -> Result<reqwest::Respo
     }
     if let Some(version) = out.anthropic_version {
         request = request.header("anthropic-version", version);
+    }
+    if out.accept_json {
+        request = request.header(reqwest::header::ACCEPT, "application/json");
     }
     if let Some(expect) = out.expect {
         // Some forges serve git only to clients that name themselves git.

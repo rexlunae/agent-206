@@ -22,9 +22,10 @@ and an `overview` panel. `apply_patch` reads a unified diff (`git diff` or
 (`/dev/null` old side) and deleted ones; renames, mode and binary changes and
 quoted paths are refused, as is a hunk with more or fewer lines than the
 counts in its `@@` header. The write tools need a separate `write_workspace` grant. It also bundles
-`agent206.git` (`plugins/git`) with `git_status`, `git_log`, `git_branches` and
-`git_diff` tools under the `git_read` grant, `git_stage`, `git_commit` and
-`git_branch_create` tools under their own `git_write` grant, and `git_switch`,
+`agent206.git` (`plugins/git`) with `git_status`, `git_log`, `git_branches`,
+`git_tags` and `git_diff` tools under the `git_read` grant, `git_stage`,
+`git_commit`, `git_branch_create` and `git_tag_create` tools under their own
+`git_write` grant, and `git_switch`,
 which needs `git_write` and `write_workspace` together, and `agent206.web` (`plugins/web`) with `fetch_url` (the
 raw response) and `read_web_page` tools under the `network` grant.
 `read_web_page` reads HTML in one pass in the guest, without a DOM: it drops
@@ -184,12 +185,24 @@ required = true
 id = "overview"
 title = "Workspace overview"
 capabilities = ["read_workspace"]
+
+[[triggers]]                        # checked by scheduled jobs (docs/schedules.md)
+name = "file_changed"
+description = "Fires when a file in the project changes."
+capabilities = ["read_workspace"]
+
+[[triggers.params]]                 # declared exactly like tool parameters
+name = "path"
+type = "string"
+description = "File path relative to the workspace root."
+required = true
 ```
 
 Rejected before anything runs: unknown fields, an ABI other than 2, an invalid
 id, an empty name/description/version, tool/panel/parameter names that are not
 `[a-z][a-z0-9_]{0,63}`, duplicates, more than 64 declarations of one kind, and
-a tool or panel that uses a capability the manifest does not request.
+a tool, panel or trigger that uses a capability the manifest does not request.
+Trigger names and descriptions are audited like tools' before installation.
 
 A manifest that requests `network` must list where it connects, and `hosts`
 without `network` is refused:
@@ -206,14 +219,14 @@ permission.
 
 ### Authority
 
-A call runs only when the effective grant holds every capability the tool or
-panel declares. The effective grant is the intersection of:
+A call runs only when the effective grant holds every capability the tool,
+panel or trigger declares. The effective grant is the intersection of:
 
 1. what the user granted this extension (`GrantExtension`, the Extensions page
    or `agent206 extension grant`); nothing is granted by default,
-2. the caller's ceiling: a thread's effective grant when an agent calls a tool,
-   none for a user acting directly,
-3. what the tool or panel declares.
+2. the caller's ceiling: a thread's effective grant when an agent calls a tool
+   or a scheduled job checks a trigger, none for a user acting directly,
+3. what the tool, panel or trigger declares.
 
 The gateway then checks each relayed host call against that set again, and
 against the stored grant at the moment of the call. Revoking stops an
@@ -236,9 +249,16 @@ import a206.host_take(ptr: i32, len: i32) -> i32   // copy exactly that reply to
 The host writes a MessagePack `Invocation { abi, call }` into the buffer and
 calls `a206_invoke`. `call` is `tool { name, args }` (arguments already checked
 against the declared parameters: no unknown names, required ones present,
-exact kinds; an integer is a valid `number`) or `panel { id, event }`, where
-`event` names the button the user pressed. The guest returns an `Outcome`:
-`tool { text }`, `panel { nodes }` or `failed { code, message }`.
+exact kinds; an integer is a valid `number`), `panel { id, event }`, where
+`event` names the button the user pressed, or `trigger { name, job, args,
+cursor }`, a scheduled job's check of a declared trigger: `job` is the job's ID
+and `cursor` the bytes its previous check kept. The guest returns an `Outcome`:
+`tool { text }`, `panel { nodes }`, `trigger { fired, cursor }` (`fired` is the
+report when it fired, else nil; `cursor`, at most 4,096 bytes, is kept for the
+job's next check) or `failed { code, message }`. A trigger's outcome with a
+larger cursor, or any outcome of the wrong kind, fails the call. Triggers were
+added to ABI 2 without a version change: a host only sends them to manifests
+that declare triggers.
 
 Nothing else is linked: no WASI, clocks, environment, filesystem, network,
 dynamic loading or vault. A module importing anything else fails to
@@ -249,6 +269,9 @@ struct Hello;
 impl a206_extension_sdk::Extension for Hello {
     fn tool(name: &str, args: &a206_extension_sdk::Args)
         -> Result<a206_extension_sdk::ToolOutput, a206_extension_sdk::GuestError> { … }
+    // Optional, like `panel`: answer a declared trigger's check.
+    fn trigger(name: &str, job: &str, args: &a206_extension_sdk::Args, cursor: Option<&[u8]>)
+        -> Result<a206_extension_sdk::TriggerOutput, a206_extension_sdk::GuestError> { … }
 }
 a206_extension_sdk::export!(Hello);
 ```
@@ -277,6 +300,8 @@ unsafe operation.
 | `git_diff { path, staged }` | `git_read` + a project | unified diff of one file (`HEAD`→index when `staged`, else index→working tree; a symbolic link compares its target text), or `binary` | 512 KiB per side (checked before a blob is read), 192 KiB of text, 3 context lines; at most 8,192 input lines combined and 1,000,000 line pairs, otherwise a budget failure |
 | `git_branches` | `git_read` + a project | local branches sorted by name: short name, commit id, whether `HEAD` is on it | 500 branches, then `truncated`; 5 s per git call |
 | `git_create_branch { name, start }` | `git_write` + a project | the new branch | see [Branches](#branches); the same deadline as `git_commit` |
+| `git_tags` | `git_read` + a project | tags sorted by name: short name, the commit it names through any tag objects (absent when it names something else), whether it is annotated | 500 tags, then `truncated`; 5 s per git call |
+| `git_create_tag { name, target, message }` | `git_write` + a project | the new tag | see [Tags](#tags); the same deadline as `git_commit` |
 | `git_switch_branch { name }` | `git_write` and `write_workspace` + a project | the branch, now current | 1,000 changed files, 512 KiB per file and 32 MiB together; see [Branches](#branches); the same deadline as `git_commit`, and a switch that has started changing files finishes and is reported |
 | `git_stage { paths, unstage }` | `git_write` + a project | done | 1 to 100 paths, 512 KiB per file and 8 MiB together; the same deadline as `git_commit`; see [Staging](#staging) |
 | `git_commit { message, paths }` | `git_write` + a project | the new commit: id, summary, author name, time | 1 to 100 paths, 16 KiB message, 512 KiB per file and 8 MiB together; 5 s and 3 s before the invocation's deadline, but once the commit is written it is reported, even past that; see [Commits](#commits) |
@@ -374,6 +399,29 @@ the reflog, and a reflog that cannot be opened refuses the switch as `io`. Every
 file then fails, the call fails naming that file and saying that the index
 and `HEAD` still name the previous branch.
 
+### Tags
+
+`git_create_tag` works like `git tag <name> [<target>]`, or with a `message`
+like `git tag -a -m <message>`: it writes `refs/tags/<name>` (a plain tag
+names the commit; an annotated one names a new tag object holding the commit,
+`user.name` and `user.email` as tagger, the time and the message, ending in a
+line break), and leaves the working tree, the index and `HEAD` as they are.
+Names follow the branch rules: one git accepts, at most 20 folders deep
+(`invalid`), not existing yet and not nesting with an existing tag (`conflict`).
+`target` is a local branch name or a full commit id and defaults to `HEAD`;
+revision expressions and abbreviated ids are not evaluated (`not_found`). A
+message is 1 to 16 KiB of text without NUL (`invalid`). An annotated tag
+needs `user.name` and `user.email` for its tagger (`unsupported` without
+them); a plain one, like `git tag`, does not. A `reference-transaction` hook
+refuses any tag, and so does `tag.gpgSign`, with which git signs every tag
+(even one asked for without a message), as `unsupported`;
+`tag.forceSignAnnotated` yields to an explicit annotation, as in git. `HEAD`
+is refused as a name (`invalid`), since it would be ambiguous with `HEAD`
+itself. Listing follows a symbolic tag to the object it names, and lists a
+tag whose object is missing without a commit. A tag is pushed or fetched
+with the native `git_push` and `git_fetch` tools' `tag` argument
+([run-engine.md](run-engine.md#pushing-git-branches-git_push)).
+
 ### Staging
 
 `git_stage` changes only the index. It puts the working-tree content of
@@ -468,8 +516,9 @@ ceiling: Some(thread grant) })` after the conversation permits the tool.
 Provider JSON arguments convert kind for kind to `a206_core::extension::Args`.
 Tool text is extension output, never instructions.
 
-Pushing is not a host call. It is the native `git_push` tool
-([run-engine.md](run-engine.md#pushing-git-branches-git_push)), because it needs
+Pushing and fetching are not host calls. They are the native `git_push` and
+`git_fetch` tools ([run-engine.md](run-engine.md#pushing-git-branches-git_push)),
+because they need
 the vault broker, an approval of each call and more time than an extension
 invocation has.
 

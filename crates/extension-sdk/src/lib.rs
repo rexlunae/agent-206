@@ -30,6 +30,20 @@ pub trait Extension {
             format!("this extension has no panel `{id}`"),
         ))
     }
+    /// Check trigger `name` for the scheduled job `job`, given what the
+    /// previous check of that job kept in `cursor`.
+    fn trigger(
+        name: &str,
+        job: &str,
+        args: &Args,
+        cursor: Option<&[u8]>,
+    ) -> Result<TriggerOutput, GuestError> {
+        let _unused = (job, args, cursor);
+        Err(GuestError::new(
+            "unknown_trigger",
+            format!("this extension has no trigger `{name}`"),
+        ))
+    }
 }
 
 /// Export the ABI entry points for an [`Extension`] implementation.
@@ -47,6 +61,25 @@ macro_rules! export {
             $crate::__private::invoke::<$extension>(len)
         }
     };
+}
+
+/// A 64-bit FNV-1a fingerprint of `bytes`, for a trigger to tell whether
+/// something changed between checks. Unlike the standard hasher it is the
+/// same in every build, so an update does not make everything look changed.
+/// It detects change; it is no defense against anyone.
+pub fn fingerprint(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
+}
+
+/// The longest prefix of `text` within `max` bytes, on a character boundary.
+pub fn prefix(text: &str, max: usize) -> &str {
+    let mut end = text.len().min(max);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
 }
 
 /// Longest tool text a guest should return: the outcome limit less room for
@@ -155,6 +188,17 @@ pub mod __private {
                 call: Call::Panel { id, event },
                 ..
             }) => E::panel(&id, event.as_ref()).map_or_else(Outcome::Failed, Outcome::Panel),
+            Ok(Invocation {
+                call:
+                    Call::Trigger {
+                        name,
+                        job,
+                        args,
+                        cursor,
+                    },
+                ..
+            }) => E::trigger(&name, &job, &args, cursor.as_deref().map(|c| &c[..]))
+                .map_or_else(Outcome::Failed, Outcome::Trigger),
         };
         // An encoding failure leaves an empty output, which the host rejects
         // as an ABI violation instead of guessing at the guest's intent.
@@ -386,6 +430,29 @@ pub mod host {
     pub fn git_switch_branch(name: &str) -> Result<GitBranch, HostFailure> {
         match call(&HostRequest::GitSwitchBranch { name: name.into() })? {
             HostReply::Branch(branch) => Ok(branch),
+            _ => Err(unexpected()),
+        }
+    }
+    /// The repository's tags, by name.
+    pub fn git_tags() -> Result<GitTags, HostFailure> {
+        match call(&HostRequest::GitTags)? {
+            HostReply::Tags(tags) => Ok(tags),
+            _ => Err(unexpected()),
+        }
+    }
+    /// Create the tag `name` at `target` (`HEAD` when `None`), annotated
+    /// with `message` when one is given.
+    pub fn git_create_tag(
+        name: &str,
+        target: Option<&str>,
+        message: Option<&str>,
+    ) -> Result<GitTag, HostFailure> {
+        match call(&HostRequest::GitCreateTag {
+            name: name.into(),
+            target: target.map(Into::into),
+            message: message.map(Into::into),
+        })? {
+            HostReply::Tag(tag) => Ok(tag),
             _ => Err(unexpected()),
         }
     }

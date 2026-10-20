@@ -49,9 +49,15 @@ pub enum VaultAction {
         /// Trigger allowed by `--policy trigger` (repeatable).
         #[arg(long = "trigger")]
         triggers: Vec<String>,
-        /// Exact origin the broker may send this credential to (repeatable).
+        /// Exact origin the broker may send this credential to (repeatable);
+        /// for an SSH key, the ssh://host[:port] servers it signs in to.
         #[arg(long = "destination")]
         destinations: Vec<String>,
+        /// For `--kind ssh-key`: an OpenSSH private key file to store
+        /// (decrypted with a prompted passphrase when it has one) instead of
+        /// generating a new Ed25519 key.
+        #[arg(long)]
+        key_file: Option<std::path::PathBuf>,
     },
     /// Turn an untyped entry from an older vault into a typed credential.
     Adopt {
@@ -133,6 +139,9 @@ pub enum Kind {
     Passkey,
     Note,
     Other,
+    /// An SSH private key (Ed25519 or ECDSA), generated unless
+    /// `--key-file` names one.
+    SshKey,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -162,6 +171,29 @@ fn policy(policy: Policy, skills: Vec<String>, triggers: Vec<String>) -> AccessP
         Policy::Auth => AccessPolicy::WithAuth,
         Policy::Skill => AccessPolicy::SkillOnly(skills),
         Policy::Trigger => AccessPolicy::TriggerOnly(triggers),
+    }
+}
+
+/// The SSH key to store, decrypted, and its public key: read from
+/// `key_file`, or a new Ed25519 key named after the credential.
+fn ssh_key(
+    key_file: Option<&std::path::Path>,
+    name: &str,
+) -> Result<(zeroize::Zeroizing<String>, String)> {
+    let Some(path) = key_file else {
+        return Ok(a206_vault::generate_ssh_key(name)?);
+    };
+    let pem = zeroize::Zeroizing::new(
+        std::fs::read_to_string(path)
+            .with_context(|| format!("reading the SSH key {}", path.display()))?,
+    );
+    match a206_vault::prepare_ssh_key(&pem, None) {
+        Err(a206_vault::SshKeyError::Encrypted) => {
+            let passphrase =
+                zeroize::Zeroizing::new(rpassword::prompt_password("Passphrase of the SSH key: ")?);
+            Ok(a206_vault::prepare_ssh_key(&pem, Some(&passphrase))?)
+        }
+        other => Ok(other?),
     }
 }
 
@@ -205,7 +237,7 @@ pub(crate) async fn unlock(client: &mut Client, create: bool) -> Result<()> {
     Ok(())
 }
 
-async fn step_up(client: &mut Client) -> Result<()> {
+pub(crate) async fn step_up(client: &mut Client) -> Result<()> {
     let state = status(client).await?;
     if !state.unlocked {
         bail!("the vault is locked; run `agent206 vault unlock`");
@@ -238,6 +270,43 @@ async fn step_up(client: &mut Client) -> Result<()> {
             }
         }
     }
+}
+
+/// Typed credential metadata from the broker; never values.
+pub(crate) async fn credentials(client: &mut Client) -> Result<Vec<(String, CredentialMeta)>> {
+    let Reply::Credentials { typed, .. } = client.call(Request::Credentials).await? else {
+        bail!("unexpected broker reply");
+    };
+    Ok(typed)
+}
+
+/// Store an API key read from a hidden prompt, which the broker sends only
+/// to `destination`. Agents get it only with approval, as `vault add` does.
+/// The caller steps up first.
+pub(crate) async fn store_api_key(
+    client: &mut Client,
+    name: String,
+    label: String,
+    destination: String,
+) -> Result<()> {
+    let value = WireValue::Single(hidden("API key: ")?);
+    let meta = CredentialMeta {
+        label,
+        kind: CredentialKind::ApiKey,
+        policy: AccessPolicy::WithApproval,
+        description: None,
+        disabled: false,
+        destinations: vec![destination],
+    };
+    client
+        .call(Request::PutCredential {
+            name,
+            meta,
+            value,
+            replace: false,
+        })
+        .await?;
+    Ok(())
 }
 
 pub(crate) async fn pair_if_running(client: &mut Client, root: &Path) -> Result<()> {
@@ -445,16 +514,32 @@ pub fn run(root: &Path, action: VaultAction) -> Result<()> {
                 skills,
                 triggers,
                 destinations,
+                key_file,
             } => {
-                let Reply::Credentials { typed, .. } = client.call(Request::Credentials).await?
-                else {
-                    bail!("unexpected broker reply");
-                };
-                if typed.iter().any(|(existing, _)| *existing == name) {
+                if key_file.is_some() && !matches!(kind, Kind::SshKey) {
+                    bail!("--key-file is only for --kind ssh-key");
+                }
+                if credentials(&mut client)
+                    .await?
+                    .iter()
+                    .any(|(existing, _)| *existing == name)
+                {
                     bail!("{name} already exists; delete it first or use policy/bind");
                 }
                 step_up(&mut client).await?;
+                let mut public = None;
                 let (kind, value) = match kind {
+                    Kind::SshKey => {
+                        let (private_key, public_key) = ssh_key(key_file.as_deref(), &name)?;
+                        public = Some(public_key.clone());
+                        (
+                            CredentialKind::SshKey,
+                            WireValue::SshKeyPair {
+                                private_key: WireSecret::new(private_key.to_string()),
+                                public_key: WireSecret::new(public_key),
+                            },
+                        )
+                    }
                     Kind::Login => (
                         CredentialKind::UsernamePassword,
                         WireValue::UserPass {
@@ -490,6 +575,11 @@ pub fn run(root: &Path, action: VaultAction) -> Result<()> {
                     })
                     .await?;
                 println!("Credential stored");
+                if let Some(public) = public {
+                    println!(
+                        "Add this public key to the server's authorized keys or the forge account:\n{public}"
+                    );
+                }
             }
             VaultAction::Adopt {
                 name: legacy,
@@ -506,7 +596,7 @@ pub fn run(root: &Path, action: VaultAction) -> Result<()> {
                     Kind::Passkey => CredentialKind::HttpPasskey,
                     Kind::Note => CredentialKind::SecureNote,
                     Kind::Other => CredentialKind::Other,
-                    Kind::Login => {
+                    Kind::Login | Kind::SshKey => {
                         bail!("an untyped entry holds one value; choose a single-value kind")
                     }
                 };

@@ -739,6 +739,100 @@ async fn a_webhook_disconnected_while_a_message_goes_out_stays_stopped() {
     settled(MessengerState::Stopped).await;
 }
 
+/// Run `job` now, answer its model request with `answer`, and return the run
+/// once it has ended and posted its reply.
+async fn run_and_answer(setup: &mut Setup, api: ProviderApi, job: Id, answer: &str) -> JobRun {
+    let Reply::Job(started) = request(&setup.gateway, Command::RunJob { id: job }).await else {
+        panic!("job started");
+    };
+    let run = started.last.unwrap().id;
+    let opened = next_request(&mut setup.requests).await;
+    opened.respond(text_response(api, answer)).await;
+    tokio::time::timeout(PATIENCE, async {
+        loop {
+            let state = setup.gateway.snapshot().unwrap();
+            let job = state.jobs.iter().find(|j| j.id == job).unwrap();
+            match &job.last {
+                // A completed run's reply is posted after its end is recorded.
+                Some(last)
+                    if last.id == run
+                        && last.outcome != JobOutcome::Running
+                        && last.delivery != Some(Delivery::Posting) =>
+                {
+                    return last.clone();
+                }
+                _ => tokio::time::sleep(Duration::from_millis(5)).await,
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(wait("the job's run to end"))
+}
+
+#[tokio::test]
+async fn a_scheduled_message_posts_its_reply_where_the_user_chose() {
+    let api = ProviderApi::OpenAi;
+    let mut setup = setup(api).await;
+    let Reply::Job(job) = request(
+        &setup.gateway,
+        Command::ScheduleJob {
+            kind: JobKind::Message,
+            name: nonce(),
+            thread: setup.thread,
+            text: nonce(),
+            schedule: Schedule::Every {
+                seconds: 3600,
+                anchor: Some(Id::new_v4().as_u128() as u64 % 1_000_000_000),
+            },
+        },
+    )
+    .await
+    else {
+        panic!("job scheduled");
+    };
+    let deliver = |to: Option<String>| Command::SetJobDelivery { id: job.id, to };
+    // Only a configured destination is accepted.
+    let Reply::Error(refused) = request(&setup.gateway, deliver(Some(nonce()))).await else {
+        panic!("an unknown destination is refused");
+    };
+    assert_eq!(refused.kind, ErrorKind::InvalidRequest);
+    let Reply::Job(set) = request(&setup.gateway, deliver(Some(setup.hook.clone()))).await else {
+        panic!("delivery set");
+    };
+    assert_eq!(set.deliver_to.as_ref(), Some(&setup.hook));
+
+    let answer = nonce();
+    let run = run_and_answer(&mut setup, api, job.id, &answer).await;
+    assert_eq!(run.outcome, JobOutcome::Complete);
+    assert_eq!(run.delivery, Some(Delivery::Sent { parts: 1 }));
+    let delivered = setup.hooks.received.lock().unwrap().clone();
+    let [(at, body)] = delivered.as_slice() else {
+        panic!("one message: {delivered:?}");
+    };
+    assert_eq!(at, &setup.key);
+    assert_eq!(body["content"], answer);
+
+    // A webhook the user disconnected is not posted to; the run still
+    // completes and records why its reply was not posted.
+    let hook = setup.hook.clone();
+    assert_eq!(
+        request(&setup.gateway, Command::DisconnectMessenger { name: hook }).await,
+        Reply::Ok
+    );
+    let run = run_and_answer(&mut setup, api, job.id, &nonce()).await;
+    assert_eq!(run.outcome, JobOutcome::Complete);
+    assert!(matches!(run.delivery, Some(Delivery::Failed(_))), "{run:?}");
+
+    // Without a destination nothing is posted.
+    let Reply::Job(cleared) = request(&setup.gateway, deliver(None)).await else {
+        panic!("delivery cleared");
+    };
+    assert_eq!(cleared.deliver_to, None);
+    let run = run_and_answer(&mut setup, api, job.id, &nonce()).await;
+    assert_eq!(run.delivery, None);
+    assert_eq!(setup.hooks.received.lock().unwrap().len(), 1);
+}
+
 /// A signal-cli daemon serving `account` on a Unix socket in `dir`; the
 /// `send` params it received.
 async fn serve_signal(dir: &std::path::Path, account: String) -> (String, Received) {

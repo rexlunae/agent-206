@@ -24,6 +24,7 @@ fn main() -> std::process::ExitCode {
         runtime.block_on(background_sessions_stop_when_their_grant_is_withdrawn());
         runtime.block_on(stalled_input_fails_within_its_deadline());
         runtime.block_on(terminal_sessions_take_keys_and_interrupts());
+        runtime.block_on(terminal_windows_can_be_resized());
         runtime.block_on(background_sessions_end_with_their_host());
         println!("native exec: ok");
     }
@@ -486,6 +487,65 @@ async fn terminal_sessions_take_keys_and_interrupts() {
     let error = write(&piped, serde_json::json!({ "keys": ["Ctrl-C"] }))
         .await
         .unwrap_err();
+    assert_eq!(error.kind, ErrorKind::Conflict, "{}", error.message);
+    process(&host, &scope, "remove", &piped).await.unwrap();
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+async fn terminal_windows_can_be_resized() {
+    let state = tempfile::tempdir().unwrap();
+    let host = ExecHost::new(state.path());
+    let scope = scope(None, &[Capability::Execute]);
+    let resize = |session: &str, columns: u16, rows: u16| {
+        call(
+            &host,
+            &scope,
+            PROCESS,
+            serde_json::json!({
+                "action": "resize", "session": session, "columns": columns, "rows": rows,
+            }),
+        )
+    };
+    let (columns, rows) = (97, 31);
+    // The trap runs between the loop's commands once `SIGWINCH` arrives.
+    let session = spawn(
+        &host,
+        &scope,
+        serde_json::json!({
+            "command": "trap 'echo resized-$(stty size < /dev/tty)' WINCH; \
+                        echo size-$(stty size < /dev/tty); \
+                        while :; do sleep 0.05; done",
+            "terminal": true,
+            "columns": columns,
+            "rows": rows,
+        }),
+    )
+    .await;
+    shown(
+        &host,
+        &scope,
+        &session,
+        &[&format!("size-{rows} {columns}")],
+    )
+    .await;
+    let (columns, rows) = (columns + 20, rows + 9);
+    let resized = resize(&session, columns, rows).await.unwrap();
+    assert!(!resized.is_error, "{}", resized.text);
+    shown(
+        &host,
+        &scope,
+        &session,
+        &[&format!("resized-{rows} {columns}")],
+    )
+    .await;
+    process(&host, &scope, "kill", &session).await.unwrap();
+    idle(&host, &scope, &session).await;
+    let error = resize(&session, columns, rows).await.unwrap_err();
+    assert_eq!(error.kind, ErrorKind::Conflict, "{}", error.message);
+
+    // Only a terminal has a window.
+    let piped = spawn(&host, &scope, serde_json::json!({ "command": "sleep 600" })).await;
+    let error = resize(&piped, columns, rows).await.unwrap_err();
     assert_eq!(error.kind, ErrorKind::Conflict, "{}", error.message);
     process(&host, &scope, "remove", &piped).await.unwrap();
 }

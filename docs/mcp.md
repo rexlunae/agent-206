@@ -29,6 +29,7 @@ capabilities = ["read_workspace"]   # authority the server process holds
 project = "6c1f…"                   # required with workspace access
 default_policy = "ask"              # allow | ask | deny for unlisted tools
 timeout_seconds = 120               # per call, 1..=1800
+program_directories = false         # mount the settings' program directories
 
 [mcp_servers.env]                   # non-secret only; nothing is inherited
 LOG_LEVEL = "warn"                  # HOME, TMPDIR, PATH, LANG, NO_COLOR are reserved
@@ -53,6 +54,15 @@ private scratch directory, and nothing else unless the entry holds:
 | `write_workspace` | also write it; requires `read_workspace` |
 | `execute` | run `/bin` and `/usr/bin` programs |
 | `network` | outbound network, DNS and system trust store |
+
+With `program_directories = true` the server also gets the user's
+`program_directories` setting (the Modes settings page; Homebrew,
+toolchains): each directory mounted read-only and executable, and its `bin`
+(or the directory itself) on `PATH` after the server's own directory. The
+directories are checked again when the server starts, as for commands, so one
+that went missing or now overlaps protected state fails the start visibly.
+Changing the setting, or this flag, stops a running server; it uses the new
+directories when it is connected again.
 
 Without `network` a Linux server has its own empty network namespace and
 Landlock allows no TCP connection; with it, the server shares the host's network

@@ -45,10 +45,17 @@ fn McpServerCard(config: McpServerConfig, status: McpServerStatus) -> Element {
     } else {
         CheckState::Off
     }));
+    let programs = config.program_directories;
+    let programs = use_memo(use_reactive!(|programs| if programs {
+        CheckState::On
+    } else {
+        CheckState::Off
+    }));
     let authority = AUTHORITY
         .iter()
         .filter(|(c, _)| config.capabilities.contains(c))
         .map(|(_, label)| *label)
+        .chain(config.program_directories.then_some("Program directories"))
         .collect::<Vec<_>>();
     let running = matches!(
         status.state,
@@ -63,6 +70,8 @@ fn McpServerCard(config: McpServerConfig, status: McpServerStatus) -> Element {
             }
             p { class: "a206-muted", if authority.is_empty() { "No network, project or command access." } else { {format!("Authority: {}", authority.join(", "))} } }
             Checkbox { label: rsx! { "Enabled" }, checked: ReadSignal::from(enabled), onchange: { let name = name.clone(); move |on: bool| save_servers(state, |servers| { for s in servers.iter_mut().filter(|s| s.name == name) { s.enabled = on; } }) } }
+            Checkbox { label: rsx! { "Use program directories" }, checked: ReadSignal::from(programs), onchange: { let name = name.clone(); move |on: bool| save_servers(state, |servers| { for s in servers.iter_mut().filter(|s| s.name == name) { s.program_directories = on; } }) } }
+            p { class: "a206-muted", "Mounts the program directories chosen in Modes settings read-only, with their programs on the server's PATH. Changing this or the directories stops a running server; connect it again to use them." }
             if let Some(report) = status.failure.clone() { ErrorNotice { report, title: "MCP server failed".to_string() } }
             if status.tools.is_empty() {
                 p { class: "a206-muted", if status.state == McpServerState::Connected { "This server offers no tools." } else { "Connect the server to see its tools." } }
@@ -146,6 +155,7 @@ fn AddMcpServer() -> Element {
                 default_policy: ToolPolicy::Ask,
                 tools: Default::default(),
                 timeout_seconds: None,
+                program_directories: false,
             };
             save_servers(state, |servers| servers.push(entry));
         }, "Add server" } }

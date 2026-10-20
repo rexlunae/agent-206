@@ -316,8 +316,9 @@ background sessions.
   when it started, the gateway rescopes again when a call returns after
   policy changed during it.
 - **Terminal sessions.** `background` with `terminal: true` runs the command
-  on a pseudo-terminal the gateway opens (`exec_tool/terminal.rs`, 80x24,
-  `TERM=dumb`): its stdin, stdout and stderr are the terminal, which is also
+  on a pseudo-terminal the gateway opens (`exec_tool/terminal.rs`,
+  `TERM=dumb`, 80 columns by 24 rows unless the call sets `columns` and
+  `rows`, each 1–1000): its stdin, stdout and stderr are the terminal, which is also
   its controlling terminal, so programs that need a terminal run and the
   line discipline turns Ctrl-C and Ctrl-Z into signals for the command's
   process group. On Linux the sandbox helper starts its own session inside
@@ -337,7 +338,12 @@ background sessions.
   Home, End, PageUp, PageDown, F1–F12, Ctrl-A–Z and Ctrl-@ [ \ ] ^ _, names
   as in RustyClaw's `send_keys`); an unknown name is refused rather than
   typed as text. Keys sent to a session without a terminal, and `close` on
-  one with a terminal (send Ctrl-D instead), are `Conflict`. On macOS the
+  one with a terminal (send Ctrl-D instead), are `Conflict`. `process`
+  `resize` with `columns` and `rows` sets a running terminal session's
+  window size from the gateway's side, so the kernel sends `SIGWINCH` to its
+  foreground group as a resized terminal window would; it is not approved
+  per call, like `poll`, and is `Conflict` for a session without a terminal
+  or one that has finished or is being stopped. On macOS the
   terminal's controlling side is opened without close-on-exec and marked
   so immediately after, so a program the gateway starts in that instant can
   inherit it; Linux opens it close-on-exec.
@@ -557,6 +563,31 @@ a "Current plan" section with the steps and statuses, for as long as the tool is
 offered. Clients: a plan card above the composer in the shared conversation view
 (`ui/src/conversation.rs`, desktop/web/TUI) and `agent206 plan THREAD`.
 
+## Conversation status (`session_status`)
+
+`runtime/src/status_tool.rs` offers `session_status`, after RustyClaw's tool of
+the same name. It takes no arguments and returns, as JSON, what the model may
+know about the conversation it answers in: its ID, title, mode, project name,
+parent conversation and run state; its model with the connection's name and
+the model's name, context limit and output limit as the provider's models API
+reported them (null when the catalog does not list them), with the catalog's
+source, retrieval time, expiry and whether it is stale; its permitted
+subagent models; the permissions its current tool scope holds; its
+per-response limits (model requests, tool calls, tokens) as the run engine
+enforces them, the smallest along its ancestry; the usage providers
+reported for it alone and with its subagents (`UsageTotal`: responses,
+unfinished requests, token sums with how many responses left each out and
+whether the sum is exact, and costs per connection, never summed across
+connections); its subagent conversations (the 50 newest) with their states
+and whether they are paused; and the gateway clock in Unix seconds. Text
+values are cut to 512 bytes, and each list gives its total and how many it
+left out, keeping only what fits its share of the output limit, so the status
+is never refused for its size. A conversation reads only itself and the subagents it started, never
+another conversation. The tool changes nothing, uses no capability, and like
+every tool is denied until the user permits it. RustyClaw's lookup of another
+session by key is not ported: `subagent_status` covers the conversations a
+model started.
+
 ## Messages out (`send_message`)
 
 `runtime/src/message_tool.rs` offers `send_message`, after RustyClaw's
@@ -575,7 +606,7 @@ listing, the result or the conversation. See
 
 ## Pushing git branches (`git_push`)
 
-`runtime/src/git_push.rs` offers `git_push` in conversations with a project
+`runtime/src/git_remote.rs` offers `git_push` in conversations with a project
 once the user has set at least one git credential (Settings, Git credentials,
 or `git_credentials` in `settings --apply`). Each entry names a forge origin
 (`https://host[:port]`), the username the forge expects with a token
@@ -585,9 +616,11 @@ tool needs the conversation's GitWrite grant (Code mode), its policy is Ask,
 so each call is approved, and the host refuses a call the user did not
 approve.
 
-Arguments are `branch` (default: the current branch) and `remote` (default:
-`branch.<name>.remote`, else `origin`). The local branch goes to the branch of
-the same name on the remote, like `git push <remote> <branch>`:
+Arguments are `branch` (default: the current branch), or `tag` instead of
+it, and `remote` (default: `branch.<name>.remote`, for a tag the current
+branch's, else `origin`). The local branch goes to the branch of the same
+name on the remote, like `git push <remote> <branch>`, and a tag to the tag
+of the same name, like `git push <remote> tag <tag>`:
 
 - The remote's `pushurl`, else `url`, must be an HTTPS URL without a username,
   password, query or fragment; ssh remotes are refused. A remote URL that a
@@ -597,9 +630,10 @@ the same name on the remote, like `git push <remote> <branch>`:
   (including the files the user's configuration includes). A repository whose
   configuration includes other files (`include` or `includeIf`) is refused:
   the project chooses those paths and they may lie outside it.
-- A repository with a `pre-push` or `reference-transaction` hook is refused,
-  and `user.name` and `user.email` must be set: the remote-tracking branch's
-  reflog records them.
+- A repository with a `pre-push` or `reference-transaction` hook is refused.
+  A branch push needs `user.name` and `user.email`: the remote-tracking
+  branch's reflog records them. A tag push does not, since git keeps no
+  remote-tracking tags.
 - The gateway asks the vault broker for the server's references
   (`GitReceivePack`, broker protocol v13). The broker sends the token as the
   password of HTTP Basic authentication, only to the credential's bound
@@ -608,6 +642,13 @@ the same name on the remote, like `git push <remote> <branch>`:
   is not in this branch's history, the push is refused before any pack is
   built. If the server already has the commit there, nothing is sent and the
   result says `up_to_date`.
+- A tag is sent only if the server lacks it; a server tag at another object
+  is never replaced (`Conflict`), as git refuses without force. The tag's
+  object is the one its reference names, following symbolic tags; an
+  annotated tag's tag objects (at most 10 in a chain) go in the pack with the
+  commits the server lacks, and a tag naming a tree or blob is refused. The
+  result names the `tag`, whether it is `annotated` and the `commit` it
+  leads to.
 - The pack (crate `a206-git-push`) holds the new commits and the trees and
   blobs they change, whole and compressed, with no deltas. It must fit one
   broker message: about 4 MiB, at most 10,000 commits and 100,000 objects,
@@ -625,8 +666,219 @@ the same name on the remote, like `git push <remote> <branch>`:
 
 The token never reaches the gateway, the model, the conversation or a log.
 Cancelling a call after the pack was sent may leave the server updated. Not
-yet: ssh remotes, force pushes, deleting remote branches, tags, pushing to a
-differently named branch, and fetching.
+yet: ssh remotes, force pushes, deleting remote branches or tags, pushing
+several references at once (`--tags`, `--follow-tags`) and pushing to a
+differently named branch or tag.
+
+## Fetching git branches (`git_fetch`)
+
+`runtime/src/git_remote.rs` offers `git_fetch` beside `git_push`, under the
+same conditions: a git credential for the forge, the conversation's GitWrite
+grant, and Ask, so the user approves each call. It brings one branch of the
+remote up to date in its remote-tracking branch, like
+`git fetch <remote> <branch>`. Local branches, the index and the working tree
+are left alone; merging or switching is up to the model's other tools.
+
+Arguments are `branch` (default: the branch the current branch merges from,
+when `branch.<name>.remote` is that remote, else the current branch's own
+name), or `tag` instead of it, and `remote` (default: the current branch's
+remote, else `origin`).
+
+- The remote's `url` follows the push rules (HTTPS only, `insteadOf`
+  rewrites refused, included configuration refused). For a branch, the
+  remote's `remote.<name>.fetch` must be the mapping `git clone` sets up,
+  `refs/heads/*:refs/remotes/<remote>/*`, with or without `+`, and be the
+  remote's only mapping (git would also update what others map to); any
+  other configuration is refused before the forge is asked for anything.
+  Submodule entries in fetched trees are kept as commit ids; the submodules'
+  own commits are not fetched, as git does not fetch them here either.
+- Shallow repositories, partial clones (`extensions.partialClone` or
+  `remote.<name>.promisor`) and a `reference-transaction` hook are refused;
+  for a branch, `user.name` and `user.email` must be set for the reflog.
+- The gateway asks the vault broker for the server's references and then for
+  a pack (`GitUploadPack`, broker protocol v14), with the token sent as for a
+  push. It tells the server about up to 256 commits it has, newest first,
+  from the remote-tracking branch, the local branch of the same name and
+  HEAD. When the server's commit and everything it reaches are already here,
+  no pack is asked for; when the remote-tracking branch already points at it,
+  the result says `up_to_date`.
+- The pack (side-band or plain) must fit one broker message, the same limits
+  as a push, and is written and indexed by gitoxide into `objects/pack` with
+  a `.keep` file. The gateway then checks the fetched commit's whole history
+  is present; a pack missing anything is removed and the call fails.
+- The remote-tracking branch moves only from the value it had when the fetch
+  began. A new commit that does not contain the old one is a forced update,
+  allowed only with `+` in the refspec and reported as `forced_update`;
+  without it the call fails and the pack is removed. The reflog says
+  `fetch: fast-forward` or `fetch: forced-update`.
+
+The result names the branch, remote, `tracking_branch`, the old and new
+commits and how many objects arrived.
+
+A `tag` is fetched into the local tag of the same name, like
+`git fetch <remote> tag <tag>`. The rules above apply except the refspec
+and identity ones: a tag fetch works with any `remote.<name>.fetch`
+setting and needs no identity. Every local and remote-tracking branch (up
+to 1,000) and HEAD count as complete local history, so a tag on any of
+them needs no walk of its history; an existing tag of that name does not,
+so a tag whose history is incomplete here is fetched again. A local tag of that name at another object is never replaced
+(`Conflict`, before anything is downloaded); one at the same object is
+`up_to_date`. The pack's completeness is checked through the tag's tag
+objects (at most 10) to its commit, and a tag naming a tree or blob is
+refused. The result names the `tag`, whether it is `annotated` and the
+`commit` it leads to. Not yet: ssh remotes, several branches or tags at
+once (`--tags`, tags that follow a fetched branch), pruning, and packs over
+about 4 MiB.
+
+## Pull requests (`pull_requests`, `pull_request`, `pull_request_create`, `pull_request_comment`, `pull_request_line_comment`, `pull_request_merge`)
+
+`runtime/src/forge.rs` offers six pull request tools beside `git_push` and
+`git_fetch`, under the same condition (a git credential for at least one
+forge). Two only read, with GET requests, under the conversation's GitRead
+grant. Their host policy is Allow, so once the user permits them on the
+conversation they run without a per-call approval.
+
+- `pull_requests` lists up to 30 pull requests of the repository, newest
+  first: `state` is `open` (default), `closed` (closed without merging),
+  `merged` or `all`, and `branch` keeps those from one branch of the
+  repository. GitHub lists merged and unmerged closed pull requests
+  together, so for `closed` and `merged` it reads up to 4 pages to find 30.
+  `complete` is false when more may exist.
+  Gitea and Forgejo also list closed ones together and cannot be asked for
+  one branch, so their lists are filtered here (a fork's branch of the same
+  name is left out) and read up to 4 pages.
+  Their pages may hold fewer than asked (each instance caps them), so only
+  an empty page shows that a list is complete.
+- `pull_request` reads one by `number`: its details and description (cut
+  at 8,000 characters), the checks on its head commit and its reviews, at
+  most 100 of each kind (on Gitea and Forgejo, from up to 4 pages).
+  `checks_complete` and `reviews_complete` are false when a list was full,
+  ran past those pages or was cut.
+
+Both results are only useful whole JSON (`whole_output`), so instead of the
+gateway cutting the text, the tool leaves out the last pull requests, checks
+or reviews that would take a result past 64 KiB and marks that list
+incomplete.
+
+Four more change the forge, so they need the GitWrite grant and have
+host policy Ask: the user approves each call, whatever the conversation's
+permission for the tool.
+
+- `pull_request_create` opens a pull request (`title`, `base`, optional
+  `body`, `draft`) proposing `branch` (default: the current branch, which
+  must already be on the forge; see `git_push`). GitLab drafts are marked
+  by a `Draft:` title prefix: draft markers GitLab reads at the start of a
+  title (`Draft:`, `[Draft]`, `(Draft)`) are removed and `draft` alone
+  decides. Gitea and Forgejo drafts are marked the same way with their
+  default work-in-progress prefixes (`WIP:`, `[WIP]`); an instance that
+  configures other prefixes reads its own as written. The result is the
+  new pull request, with `draft_as_requested` false when the forge reports
+  a different draft state than asked (such an instance) and null when it
+  does not report drafts (older Gitea versions, whose pull requests have a
+  null `draft`).
+- `pull_request_comment` posts `body` on pull request `number` (a GitHub
+  issue comment, also on Gitea and Forgejo; a GitLab merge request note)
+  and returns its id and web
+  address.
+- `pull_request_line_comment` posts `body` on line `line` of file `path`
+  in pull request `number`'s changes, on `side` `new` (default: the file
+  at the head, an added line or one shown around a change) or `old` (the
+  file before the change, a removed line). It first reads the pull
+  request and sends nothing unless its head is still `head`, the full
+  commit id the user approves, and anchors the comment at that commit.
+  No forge takes that condition with the comment itself, so a push in the
+  moment between the read and the comment leaves it on `head`, where the
+  forge shows it as outdated; it is never placed on a commit the user did
+  not approve.
+  GitHub gets a pull request review comment; GitLab a discussion placed by
+  the merge request's current versions (`diff_refs`, which GitLab works out
+  after each push: until they match `head`, the call is a conflict error),
+  with the same path on both sides, so a renamed file cannot be commented
+  on there yet; Gitea and Forgejo a review holding only the comment. A
+  forge's 400 or 422 (most often a file or line outside the changes it
+  shows; its own reason is not relayed) is a conflict error. The result is the comment's id (on Gitea and Forgejo, the
+  review's) and web address where the forge gives one (GitLab does not).
+- `pull_request_merge` merges pull request `number` only if its head is
+  still `head`, the full commit id the model read with `pull_request` and
+  the user approves; a branch pushed to since is not merged. `method` is
+  `merge` (default; on GitLab, as the project is set to merge), `squash`
+  or `rebase` (refused on GitLab before anything is sent). The forge's
+  rules still apply: branch protection, required checks and approvals. A
+  405, 406, 409 or 422 (head moved, draft, conflicts, held by those rules)
+  is a conflict error, and nothing merged. The result says `merged` (false
+  when GitLab accepted a merge it has not made yet) and the commit made
+  where the forge says (Gitea and Forgejo do not). GitHub and GitLab merge
+  with PUT, which needs broker v7; Gitea and Forgejo merge with POST.
+
+Titles, branches and comments are sent as given or refused: blank text,
+text over its limit (249 characters for titles, so a GitLab draft title
+reads back whole; 255 for branch names; 30,000 characters for
+descriptions and comments, within the 64 KiB a tool call's arguments may
+take) and control characters (other than
+line breaks and tabs in descriptions and comments) are invalid requests,
+and nothing is sent. A forge's 409 or 422 (a pull request already open for
+the branch, no changes to propose; GitHub and GitLab also for a branch they
+do not have, which Gitea answers with 404) is a conflict error; the broker does
+not relay the forge's error text. A call whose answer was lost may still
+have been applied, and is not retried.
+
+All six take `remote` (default: the current branch's remote, else `origin`);
+its URL must be an HTTPS repository URL, as for a fetch. Crate `a206-forge`
+describes every forge the same way (state, draft, source and target
+branches, check status and conclusion, review state) and keeps a forge's
+own word in `reported` where it has no counterpart (`unknown`):
+
+| Forge | Pull requests | Checks | Reviews |
+| --- | --- | --- | --- |
+| GitHub (github.com, GitHub Enterprise Server) | pulls | check runs and commit statuses | reviews |
+| GitLab (v4 API) | merge requests (`iid`) | jobs of the head pipeline (allowed failures are `neutral`) | approvals only |
+| Gitea or Forgejo (v1 API, from Gitea 1.24's specification) | pulls (`draft` only where the version reports it) | commit statuses, which Actions also report (`warning` is `neutral`) | reviews (dismissed ones `dismissed`, requested ones `pending`) |
+
+The forge's API comes from the git credential's `forge` (`kind` GitHub,
+GitLab or Gitea, which also accepts Forgejo, and `api`, its base URL such as
+`https://git.example/api/v3`). A GitLab served under a path prefix
+(`https://git.example/gitlab/api/v4`) has the prefix removed from remotes
+on the same host. github.com, gitlab.com, codeberg.org and gitea.com have
+bundled presets (`https://api.github.com`, `https://gitlab.com/api/v4`,
+`https://codeberg.org/api/v1`, `https://gitea.com/api/v1`). Without
+one the call fails before anything is sent. The vault broker sends the git
+credential's vault credential to the API as a bearer token, so that vault
+credential must also be bound to the API's origin (for github.com,
+`https://api.github.com`). Every text field is cleaned of control
+characters and bounded; what a forge returns was written by other people
+and reaches the model as tool data. A refused token, a missing pull
+request and an answer not shaped like the API's are separate errors. Not
+yet: line comments on renamed files on GitLab, comments over a range of lines, replies to review comments, deleting the source branch after a merge, pages beyond these, and setting `forge` from the GUI (use `settings --apply`).
+
+## Web search (`web_search`)
+
+`runtime/src/search_tool.rs` offers `web_search`, after RustyClaw's tool of
+the same name, while the user has a search service in
+`Settings::search_services` (`a206_core::web_search`): Brave Search or Exa, a
+name, an endpoint (the service's official one unless the user changes it; an
+endpoint path with `.` or `..` segments is refused, since parsing would
+resolve it to a different path) and the vault credential holding its key. A
+response without its results list is a protocol error, not an empty answer.
+The tool declares
+`Capability::Network`, so a conversation needs the network grant (Research
+mode, or `backend select … native --network`) and, like every tool, must
+permit it; calls are not approved one by one. Arguments are `query` (at most
+400 characters), `count` (1 to 10, default 5), `service` (by name; the first
+service otherwise), and per service `freshness` and `country` (Brave) or
+`type` and `category` (Exa). An option the chosen service does not support is
+refused rather than dropped, unlike RustyClaw's silent per-provider clamping.
+The gateway builds the request and the broker attaches the key for the bound
+origin: `X-Subscription-Token` with `Accept: application/json` for Brave
+(`AuthScheme::SubscriptionToken`, broker v15) and `x-api-key` for Exa. The
+result is JSON with the service, the query and up to `count` results: title,
+URL, a snippet (Brave, tags removed) or up to 4,000 characters of page text
+(Exa), and the date and author when the service reports them. A refused key
+(HTTP 401 or 403) fails the call as permission denied, 429 as rate limited.
+Results pass through the same credential redaction and injection scan as every
+tool result. The gateway never holds the key, so it cannot reach the
+listing, the result or the conversation. RustyClaw read the keys from `BRAVE_API_KEY` and
+`EXA_API_KEY`; they are not imported, since environment variables are not
+part of its stored configuration.
 
 ## Output rules
 
@@ -831,8 +1083,7 @@ request journal: a retried request stores the bytes again rather than receiving
 a reply for an image that may since have been removed.
 
 `Send` checks every image is still stored exactly as staged, and refuses images
-for a coding backend or for a model whose models API reports that it does not
-accept them (Anthropic's `capabilities.image_input`, or `input_modalities` in
+for a model whose models API reports that it does not accept them (Anthropic's `capabilities.image_input`, or `input_modalities` in
 OpenAI-compatible catalogs such as OpenRouter). Gemini's models API does not
 report it; unreported support is left to the provider, whose refusal reaches the
 client as a provider error. Each round reads the images again, so one changed or
@@ -846,7 +1097,18 @@ request fits whether or not its credential is brokered); an older image left
 out is named in its message's text as not resent. An image attached to several
 messages is sent with each of them or with none, and counted once per message. After the conversation's
 model changes to one whose API reports no image input, earlier images are named
-as not sent. Compaction summaries and coding backends see image names only.
+as not sent. Compaction summaries see image names only.
+
+Coding backends receive the images of the message they answer, in order, after
+the transcript, while their base64 bytes stay within 8 MiB; an image that would
+pass that is named in the prompt as not sent, and images of earlier messages are
+named in the transcript; only the answered message's images are read, so a
+missing earlier image does not stop the run. Codex gets each as an `image` input item with a data
+URL. Claude Agent gets ACP `image` content blocks only when the adapter's
+`initialize` reply advertises `promptCapabilities.image`; otherwise each image
+is named as not sent. The backend sends them with each model request of its
+turn through its credential proxy, which accepts requests of up to 16 MiB.
+Whether the backend itself forwards an image to the model is up to it.
 
 ## Retrying model requests
 

@@ -19,6 +19,7 @@ dioxus = { workspace = true, features = ["router"] }
 fc-dioxus = { workspace = true, features = ["router"] }
 uuid.workspace = true
 serde.workspace = true
+thiserror.workspace = true
 toml.workspace = true
 futures-util.workspace = true
 tracing.workspace = true

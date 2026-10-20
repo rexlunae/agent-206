@@ -1,21 +1,26 @@
 //! `agent206 setup` and `agent206 import`: terminal walkthroughs over the same
 //! gateway setup, vault broker requests and settings API as the desktop and
 //! terminal clients. Every security decision stays with the broker.
+use crate::doctor_cli::confirm;
 use crate::vault_cli;
-use a206_core::{Command, GatewayAction, GatewayPhase, GatewayTarget, MessengerKind, Reply};
+use a206_core::{
+    Command, GatewayAction, GatewayPhase, GatewayTarget, MessengerKind, ProviderPreset, Reply,
+};
 use a206_import::{
     InactiveCategory, MessengerAction, Preview, ProviderAction, Receipt, Unsupported,
     UnsupportedMessenger, UnsupportedProvider, VaultPlan, VaultProtection,
 };
+use a206_vault::CredentialKind;
 use anyhow::{Context, Result, bail};
 use clap::Subcommand;
-use std::io::BufRead;
 use std::path::{Path, PathBuf};
 
 #[derive(Subcommand)]
 pub enum ImportSource {
     /// Review one Claude Code settings.json scope on the gateway host.
     ReviewClaudeCode { path: PathBuf },
+    /// Review the model providers in one Codex config.toml directory on the gateway host.
+    ReviewCodex { path: PathBuf },
     /// Review RustyClaw settings on the gateway host, without changing them.
     ReviewRustyclaw { path: PathBuf },
     /// Apply selected zero-based item indices from a held gateway review.
@@ -49,20 +54,6 @@ pub enum ImportSource {
     },
 }
 
-/// Ask a yes/no question; a closed input answers no.
-fn confirm(question: &str) -> Result<bool> {
-    use std::io::Write;
-    print!("{question} [Y/n] ");
-    std::io::stdout().flush()?;
-    let mut answer = String::new();
-    if std::io::stdin().lock().read_line(&mut answer)? == 0 {
-        println!();
-        return Ok(false);
-    }
-    let answer = answer.trim();
-    Ok(answer.is_empty() || answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes"))
-}
-
 /// The vault part of first-run setup on this computer: create or unlock the
 /// vault, offer two-factor enrollment and pair a running gateway. Steps that
 /// are already done are skipped, so rerunning setup resumes it.
@@ -83,7 +74,7 @@ pub async fn secure(root: &Path, skip_totp: bool) -> Result<()> {
             "No vault yet. To bring over a RustyClaw vault instead, answer no and run `agent206 import rustyclaw`."
         );
         if !confirm("Create a new encrypted vault now?")? {
-            println!("Setup paused before the vault; rerun `agent206 setup` to continue.");
+            println!("Setup paused before the vault; rerun `agent206 setup` to create it.");
             return Ok(());
         }
         vault_cli::unlock(&mut client, true).await?;
@@ -101,6 +92,252 @@ pub async fn secure(root: &Path, skip_totp: bool) -> Result<()> {
         vault_cli::enroll_totp(&mut client, "agent206".into()).await?;
     }
     vault_cli::pair_if_running(&mut client, root).await
+}
+
+/// One line of input, trimmed; `None` once input is closed.
+fn ask(prompt: &str) -> Result<Option<String>> {
+    use std::io::{BufRead, Write};
+    print!("{prompt}");
+    std::io::stdout().flush()?;
+    let mut answer = String::new();
+    if std::io::stdin().lock().read_line(&mut answer)? == 0 {
+        println!();
+        return Ok(None);
+    }
+    Ok(Some(answer.trim().to_owned()))
+}
+
+/// A preset by its number in the printed list, by its id, or by `id:ID`.
+/// A plain number is always a list position, so a numeric id is chosen with
+/// the `id:` form.
+fn pick<'a>(presets: &'a [ProviderPreset], answer: &str) -> Option<&'a ProviderPreset> {
+    if let Some(id) = answer.strip_prefix("id:") {
+        return presets.iter().find(|p| p.id == id);
+    }
+    if !answer.is_empty() && answer.bytes().all(|b| b.is_ascii_digit()) {
+        // Digits are only ever a position, even past `usize`.
+        return answer
+            .parse::<usize>()
+            .ok()
+            .and_then(|number| number.checked_sub(1))
+            .and_then(|i| presets.get(i));
+    }
+    presets.iter().find(|p| p.id == answer)
+}
+
+fn choose(presets: &[ProviderPreset]) -> Result<Option<&ProviderPreset>> {
+    loop {
+        let Some(answer) = ask("Provider (number, id, or id:ID for an id made of digits): ")?
+        else {
+            return Ok(None);
+        };
+        match pick(presets, &answer) {
+            Some(preset) => return Ok(Some(preset)),
+            None => println!("Choose one of the numbers or ids listed above."),
+        }
+    }
+}
+
+/// The account's endpoint, the preset's unless another is typed, checked by
+/// the same rule the gateway applies when the account is saved.
+fn endpoint(preset: &ProviderPreset) -> Result<Option<(String, String)>> {
+    loop {
+        let prompt = if preset.base_url.is_empty() {
+            "API base URL: ".to_owned()
+        } else {
+            format!("API base URL [{}]: ", preset.base_url)
+        };
+        let Some(answer) = ask(&prompt)? else {
+            return Ok(None);
+        };
+        let typed = if answer.is_empty() {
+            preset.base_url.clone()
+        } else {
+            answer
+        };
+        if typed.is_empty() {
+            println!("This provider has no default endpoint; enter its base URL.");
+            continue;
+        }
+        match a206_core::providers::base_url(&typed) {
+            Ok(url) => return Ok(Some((typed, url.origin().ascii_serialization()))),
+            Err(error) => println!(
+                "{:#}",
+                anyhow::Error::new(error).context("this endpoint cannot be used")
+            ),
+        }
+    }
+}
+
+/// The vault credential the account uses: one already bound to `origin`, or
+/// a new API key typed into a hidden prompt. Without an unlocked vault on
+/// this computer the account is added without one. A gateway that does not
+/// hold a pairing with this broker is paired on the same authenticated
+/// connection, since it cannot spend the credential otherwise.
+async fn provider_credential(
+    root: &Path,
+    preset: &ProviderPreset,
+    origin: &str,
+    gateway_paired: Option<bool>,
+) -> Result<Option<String>> {
+    let mut client = vault_cli::connect(root).await?;
+    let status = vault_cli::status(&mut client).await?;
+    if !status.unlocked {
+        println!(
+            "The vault is locked, so no API key is stored now. To add one later: agent206 vault add NAME --destination {origin}, then name it as the account's credential with agent206 settings --apply."
+        );
+        return Ok(None);
+    }
+    let typed = vault_cli::credentials(&mut client).await?;
+    let bound = typed.iter().find(|(_, meta)| {
+        !meta.disabled
+            && matches!(meta.kind, CredentialKind::ApiKey | CredentialKind::Token)
+            && meta.destinations.iter().any(|d| d == origin)
+    });
+    let (name, store) = match bound {
+        Some((name, _))
+            if confirm(&format!(
+                "Use the vault credential {name}, which may be sent to {origin}?"
+            ))? =>
+        {
+            (name.clone(), false)
+        }
+        _ => {
+            if !confirm(&format!(
+                "Store an API key for {} in the vault, sent only to {origin}?",
+                preset.name
+            ))? {
+                return Ok(None);
+            }
+            let base = format!("{}-api-key", preset.id);
+            let name = std::iter::once(base.clone())
+                .chain((2..).map(|n| format!("{base}-{n}")))
+                .find(|candidate| typed.iter().all(|(existing, _)| existing != candidate))
+                .context("no free credential name")?;
+            (name, true)
+        }
+    };
+    let pair = !(gateway_paired == Some(true) && status.gateway_paired == Some(true));
+    if !store && !pair {
+        return Ok(Some(name));
+    }
+    // One step-up covers storing the key and pairing on this connection.
+    vault_cli::step_up(&mut client).await?;
+    if store {
+        vault_cli::store_api_key(
+            &mut client,
+            name.clone(),
+            format!("{} API key", preset.name),
+            origin.to_owned(),
+        )
+        .await?;
+        println!("API key stored in the vault as {name}");
+    }
+    if pair {
+        a206_runtime::vault::pair_gateway(&mut client, root)
+            .await
+            .with_context(|| {
+                format!(
+                    "the gateway could not be paired with the vault, so the account was not added; {name} stays in the vault"
+                )
+            })?;
+        println!("Gateway paired with the vault");
+    }
+    Ok(Some(name))
+}
+
+/// The provider part of setup on this computer: when the running gateway has
+/// no provider account, offer one from the provider library, with its API key
+/// kept in the vault and bound to the endpoint's origin, then fetch its model
+/// list from the provider's API. Models are chosen per conversation later.
+pub async fn provider(root: &Path) -> Result<()> {
+    let target = a206_runtime::connection::load(root)?.map(|connection| connection.target);
+    if target != Some(GatewayTarget::Local) {
+        // A remote gateway's vault is on its host; setup there adds providers.
+        return Ok(());
+    }
+    let client = a206_runtime::control::GatewayController::attach(root.to_owned(), None);
+    let report = client.control(GatewayAction::Status).await?;
+    if report.phase != GatewayPhase::Running {
+        println!(
+            "Start the gateway with `agent206 gateway start`, then rerun `agent206 setup` to add a model provider."
+        );
+        return Ok(());
+    }
+    let Reply::Snapshot(snapshot) = client.call(Command::Snapshot).await?.into_result()? else {
+        bail!("gateway did not return its settings");
+    };
+    let mut settings = snapshot.settings;
+    if !settings.providers.is_empty() {
+        println!("Model providers: {} configured", settings.providers.len());
+        return Ok(());
+    }
+    if !confirm("Add a model provider account now?")? {
+        println!("No provider added; add one later with `agent206 providers add`.");
+        return Ok(());
+    }
+    let presets = settings.provider_presets.effective();
+    if presets.is_empty() {
+        println!("The provider library is empty; add a preset with `agent206 settings --apply`.");
+        return Ok(());
+    }
+    for (number, preset) in presets.iter().enumerate() {
+        println!(
+            "{:>3}. {} [{}] ({}, {})",
+            number + 1,
+            preset.name,
+            preset.id,
+            preset.group,
+            preset.api.label()
+        );
+    }
+    let Some(preset) = choose(&presets)? else {
+        println!("No provider added.");
+        return Ok(());
+    };
+    if !preset.setup.is_empty() {
+        println!("{}", preset.setup);
+    }
+    let Some((base_url, origin)) = endpoint(preset)? else {
+        println!("No provider added.");
+        return Ok(());
+    };
+    let mut account = preset.configure(base_url);
+    let gateway_paired = report.info.as_ref().and_then(|info| info.vault_paired);
+    account.credential = provider_credential(root, preset, &origin, gateway_paired).await?;
+    let (id, label, credential) = (
+        account.id,
+        account.label.clone(),
+        account.credential.clone(),
+    );
+    settings.providers.push(account);
+    let saved = client
+        .call(Command::SaveSettings(Box::new(settings)))
+        .await
+        .map_err(anyhow::Error::from)
+        .and_then(|reply| Ok(reply.into_result().map(drop)?));
+    match credential {
+        Some(name) => saved.with_context(|| {
+            format!("the account was not saved; its credential {name} stays in the vault")
+        })?,
+        None => saved.context("the provider account was not saved")?,
+    }
+    println!("Added {label}");
+    // The account stays saved either way; a failed fetch is shown with its
+    // cause and the health checks below list it as still to fix.
+    match client
+        .call(Command::RefreshCatalog { provider: id })
+        .await
+        .map_err(anyhow::Error::from)
+        .and_then(|reply| Ok(reply.into_result()?))
+    {
+        Ok(Reply::Catalog(catalog)) => {
+            println!("{label} lists {} models", catalog.models.len());
+        }
+        Ok(_) => eprintln!("The gateway did not return {label}'s model list"),
+        Err(error) => eprintln!("Could not fetch {label}'s model list: {error:#}"),
+    }
+    Ok(())
 }
 
 fn inactive(category: InactiveCategory) -> &'static str {
@@ -288,6 +525,17 @@ pub async fn import(root: &Path, remote: Option<String>, source: ImportSource) -
                 remote,
                 Command::PreviewSourceImport {
                     tool: a206_import::Tool::ClaudeCode,
+                    source: path,
+                },
+            )
+            .await;
+        }
+        ImportSource::ReviewCodex { path } => {
+            return review_command(
+                root,
+                remote,
+                Command::PreviewSourceImport {
+                    tool: a206_import::Tool::Codex,
                     source: path,
                 },
             )
@@ -512,4 +760,41 @@ async fn review_command(root: &Path, remote: Option<String>, command: Command) -
         _ => bail!("gateway did not return an import review or application result"),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn preset(id: String) -> ProviderPreset {
+        ProviderPreset {
+            name: uuid::Uuid::new_v4().to_string(),
+            id,
+            group: uuid::Uuid::new_v4().to_string(),
+            api: Default::default(),
+            base_url: String::new(),
+            setup: String::new(),
+        }
+    }
+
+    #[test]
+    fn a_number_is_a_list_position_and_id_prefix_names_an_id() {
+        let named = preset(uuid::Uuid::new_v4().simple().to_string());
+        // A numeric id that is also a valid position in the list.
+        let numeric = preset("1".into());
+        let presets = [named.clone(), numeric.clone()];
+        assert_eq!(pick(&presets, "1"), Some(&named));
+        assert_eq!(pick(&presets, "2"), Some(&numeric));
+        assert_eq!(pick(&presets, "id:1"), Some(&numeric));
+        assert_eq!(pick(&presets, &named.id), Some(&named));
+        assert_eq!(pick(&presets, &format!("id:{}", named.id)), Some(&named));
+        assert_eq!(pick(&presets, "0"), None);
+        assert_eq!(pick(&presets, "3"), None);
+        assert_eq!(pick(&presets, "id:3"), None);
+        // Digits too long for a position never fall back to an id.
+        let huge = preset("9".repeat(40));
+        let presets = [named.clone(), huge.clone()];
+        assert_eq!(pick(&presets, &huge.id), None);
+        assert_eq!(pick(&presets, &format!("id:{}", huge.id)), Some(&huge));
+    }
 }

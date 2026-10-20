@@ -112,6 +112,7 @@ protection on a renderer or platform that cannot enforce it.
 | Disabled credentials | Disabled entry cannot be used | Enforced for agent use and tested; missing flag reads as RustyClaw's default; owner reveal still allowed |
 | Global agent switch | User access distinct from agent access | Held in the encrypted vault, off by default. Deliberate tightening: it is a precondition and never satisfies WithApproval (RustyClaw let it). CLI changes require broker step-up; GUI global-access controls pending |
 | Credential kinds | API/token, login, SSH key, passkey, form, payment and secure note | All kinds stored in RustyClaw's `cred:`/`val:` layout with kind/value checks and stale-value removal, tested; unknown kinds fail to parse and stay unavailable |
+| SSH key use | Keys stored as credentials | `vault add --kind ssh-key` generates an Ed25519 key or stores a decrypted Ed25519 or ECDSA (P-256, P-384) key file; RSA keys are refused, since the `rsa` crate's private-key operations leak timing (RUSTSEC-2023-0071). Broker v16 `SshAgent` (gateway role) returns the public key and signs only a public-key authentication request for that key (RFC 4252, or OpenSSH's host-bound method), for an exact `ssh://host:port` the key is bound to; the private key never leaves the broker. Tested in the vault and over the broker socket. No SSH client uses it yet |
 | Protected namespaces/paths | Internal/provider/service records cannot be read through generic bypasses | Private state and backend isolation tested; all tool/extension/import paths require explicit vault exclusion |
 | Scoped use | Skill/trigger and destination restrictions, explicit approvals | Existing narrowed tool/model grants; credential-use approval UI pending (configured providers already use exact-origin broker binding) |
 | Reveal authentication | Per-connection short step-up window (120 seconds upstream) | 120-second window gates owner reveal, separate from agent use, expiry/revoke tested; lock and reconnect revoke broker authentication, tested |
@@ -146,7 +147,7 @@ code and the serving origin remain trusted, as does the native client executable
 ## Shared credential controls
 
 Security uses the private broker session to read typed metadata and add API keys
-(broker v14). Metadata/policy definitions live in `a206-vault-types`, a pure data
+(broker v17). Metadata/policy definitions live in `a206-vault-types`, a pure data
 crate shared by the vault and all renderers; the web build does not link vault
 storage. Metadata pages are bounded by entry count and encoded bytes, with an
 exclusive sorted-name cursor. Policies/scopes are never truncated to fit a page;
@@ -161,4 +162,5 @@ before a new secret-bearing request is sealed; no plaintext fallback exists.
 Native and encrypted broker integration tests cover authentication/role denials,
 overwrite refusal, origin validation, byte/count bounds and metadata without values.
 GUI editing, SSH-key/form/payment entry, agent-use approvals and remote vault
-controls remain pending; the CLI supports other entry kinds and policy edits.
+controls remain pending; the CLI supports SSH-key and other entry kinds and policy
+edits. Form and payment entry remain unavailable in both clients.

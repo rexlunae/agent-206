@@ -170,6 +170,12 @@ pub enum MessengerError {
     Turn(#[source] a206_core::ErrorReport),
     #[error("the turn stopped unexpectedly")]
     TurnAborted(#[source] tokio::task::JoinError),
+    #[error("where the messenger stopped reading could not be saved or read")]
+    Cursor(#[source] Box<crate::gateway::GatewayError>),
+    #[error(
+        "messages that arrived while the messenger was stopped could not be read; it answers new messages from now on"
+    )]
+    Resume(#[source] Box<MessengerError>),
 }
 impl crate::error::Classified for MessengerError {
     fn kind(&self) -> Option<ErrorKind> {
@@ -217,7 +223,10 @@ impl crate::error::Classified for MessengerError {
             Self::SignalRefused { .. } => ErrorKind::Provider,
             Self::TooLarge { .. } => ErrorKind::Protocol,
             Self::Status { .. } | Self::Refused { .. } => ErrorKind::Provider,
-            Self::Conversation(error) => return crate::error::classify(error.as_ref()),
+            Self::Conversation(error) | Self::Cursor(error) => {
+                return crate::error::classify(error.as_ref());
+            }
+            Self::Resume(error) => return crate::error::classify(error.as_ref()),
             Self::Turn(report) => report.kind,
         })
     }
@@ -251,6 +260,14 @@ impl MessengerError {
                             UpstreamFailure::InvalidBotToken | UpstreamFailure::InvalidPassword
                         )
                 ))
+        )
+    }
+    /// A saved cursor cannot be resumed: the gap since it is beyond what
+    /// one batch reads, or the service no longer accepts it.
+    fn stale_cursor(&self) -> bool {
+        matches!(
+            self,
+            Self::SyncBudget { .. } | Self::SyncGap { .. } | Self::Status { status: 400, .. }
         )
     }
     /// The pairing ended (vault locked or re-paired): wait for a new one.
@@ -478,6 +495,22 @@ pub trait Host: Clone + Send + Sync + 'static {
     /// Offer the running session of messenger `name` to `send_message`, or
     /// withdraw it with `None` once the messenger stops.
     fn post_through(&self, name: &str, poster: Option<Poster>);
+    /// Where messenger `name` last saved its reading position.
+    fn saved_cursor(&self, name: &str) -> Result<Option<SavedCursor>>;
+    /// Save where messenger `name` stands, so a restart resumes there.
+    fn save_cursor(&self, name: &str, cursor: &SavedCursor) -> Result<()>;
+}
+
+/// A messenger's reading position as the gateway keeps it across restarts:
+/// the cursor that confirms what was handled, and the events of the batch
+/// after it whose handling already started. It is only resumed by the same
+/// kind of messenger for the same account.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SavedCursor {
+    pub kind: MessengerKind,
+    pub account: String,
+    pub next: Option<String>,
+    pub handled: BTreeSet<String>,
 }
 
 /// How `send_message` posts to an IRC or Signal chat: through the
@@ -678,6 +711,8 @@ struct Cursor {
     /// Keys of the events handled from the batch after `next`, should that
     /// batch be delivered again.
     handled: BTreeSet<String>,
+    /// Read from the gateway's state and not yet accepted by the service.
+    restored: bool,
 }
 
 impl Cursor {
@@ -686,11 +721,64 @@ impl Cursor {
     fn for_account(current: Option<Self>, account: &str) -> Self {
         current
             .filter(|cursor| cursor.account == account)
-            .unwrap_or_else(|| Self {
-                account: account.to_owned(),
-                next: None,
-                handled: BTreeSet::new(),
-            })
+            .unwrap_or_else(|| Self::fresh(account))
+    }
+    fn fresh(account: &str) -> Self {
+        Self {
+            account: account.to_owned(),
+            next: None,
+            handled: BTreeSet::new(),
+            restored: false,
+        }
+    }
+    fn saved(&self, kind: MessengerKind) -> SavedCursor {
+        SavedCursor {
+            kind,
+            account: self.account.clone(),
+            next: self.next.clone(),
+            handled: self.handled.clone(),
+        }
+    }
+}
+
+/// Telegram and Matrix keep messages for the account under a cursor that any
+/// later session may present, so their position is saved and a restart
+/// resumes it. The socket services deliver only while connected, and
+/// Beeper's cursor names state held by one session.
+fn resumes(kind: MessengerKind) -> bool {
+    matches!(kind, MessengerKind::Telegram | MessengerKind::Matrix)
+}
+
+/// The position messenger `config` saved, if it is one this messenger can
+/// resume. A position that cannot be read is reported, and reading starts
+/// over as a session without one would.
+fn restore<H: Host>(host: &H, config: &MessengerConfig) -> Option<Cursor> {
+    if !resumes(config.kind) {
+        return None;
+    }
+    let saved = match host.saved_cursor(&config.name) {
+        Ok(saved) => saved?,
+        Err(error) => {
+            report(host, config, &error);
+            return None;
+        }
+    };
+    (saved.kind == config.kind).then_some(Cursor {
+        account: saved.account,
+        next: saved.next,
+        handled: saved.handled,
+        restored: true,
+    })
+}
+
+/// Save `cursor` for a messenger that resumes. A failure is reported and
+/// does not stop the messenger: the position is still kept while it runs,
+/// and only a restart before the next successful save may repeat a batch.
+fn save<H: Host>(host: &H, config: &MessengerConfig, cursor: &Cursor) {
+    if resumes(config.kind)
+        && let Err(error) = host.save_cursor(&config.name, &cursor.saved(config.kind))
+    {
+        report(host, config, &error);
     }
 }
 
@@ -703,6 +791,9 @@ struct Carried {
     /// The adapter, while the pairing it was made for is current, so a
     /// socket's queued events survive a failed account check or reply.
     adapter: Option<(BrokerPairing, Adapter)>,
+    /// The saved position was looked up; it is read once per run, after the
+    /// first connection, so a failure to read it stays in the status.
+    looked_up: bool,
 }
 
 /// Connect and serve until an error. Resets `delay` once connected and marks
@@ -721,7 +812,11 @@ async fn session<H: Host>(
     carried: &mut Carried,
     backoff: Backoff,
 ) -> Result<()> {
-    let Carried { cursor, adapter } = carried;
+    let Carried {
+        cursor,
+        adapter,
+        looked_up,
+    } = carried;
     let adapter = match adapter.take() {
         Some((current, kept)) if current == pairing => adapter.insert((current, kept)),
         _ => {
@@ -740,6 +835,9 @@ async fn session<H: Host>(
         s.failure = None;
     });
     *delay = backoff.initial;
+    if !std::mem::replace(looked_up, true) {
+        *cursor = restore(host, config);
+    }
     let mut checked = true;
     loop {
         if !checked {
@@ -755,15 +853,33 @@ async fn session<H: Host>(
         checked = false;
         let current = Cursor::for_account(cursor.take(), &account.id);
         let position = cursor.insert(current);
-        let batch = adapter.receive(position.next.as_deref()).await?;
+        let batch = match adapter.receive(position.next.as_deref()).await {
+            // Too much arrived while the messenger was stopped, or the
+            // service forgot the position: start from now, as a messenger
+            // without a saved position does, and say what was skipped.
+            Err(error) if position.restored && error.stale_cursor() => {
+                report(host, config, &MessengerError::Resume(Box::new(error)));
+                *position = Cursor::fresh(&account.id);
+                save(host, config, position);
+                continue;
+            }
+            batch => batch?,
+        };
+        // The service accepted the cursor once it delivered a whole batch
+        // after it; Matrix first hands over pending invitations alone.
+        position.restored &= !batch.complete;
         for (key, event) in batch.events {
             if position.handled.insert(key) {
+                // Saved before handling starts, so a restart during the turn
+                // never answers this event again.
+                save(host, config, position);
                 deliver(host, config, adapter, event).await?;
             }
         }
-        if batch.complete {
+        if batch.complete && (position.next != batch.next || !position.handled.is_empty()) {
             position.next = batch.next;
             position.handled.clear();
+            save(host, config, position);
         }
     }
 }

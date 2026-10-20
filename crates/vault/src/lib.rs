@@ -7,12 +7,14 @@ mod auth;
 mod credential;
 mod import;
 mod policy;
+mod ssh;
 mod totp;
 
 pub use auth::{AuthThrottle, Lockout, StepUpWindow};
 pub use credential::CredentialValue;
 pub use import::{ImportCheck, ImportIdentity, MAX_IMPORT_BYTES, ReviewedImportError};
 pub use policy::{AccessContext, AccessPolicy, CredentialKind, CredentialMeta, Denial};
+pub use ssh::{SshKeyError, SshUse, UserAuthDefect, generate_ssh_key, prepare_ssh_key};
 pub use totp::{PendingTotp, TotpOutcome, unix_now};
 
 use securestore::{KeySource, SecretsManager};
@@ -52,6 +54,8 @@ pub enum Error {
     Corrupted,
     #[error("credential access denied: {0}")]
     Denied(#[from] Denial),
+    #[error("SSH key: {0}")]
+    SshKey(#[from] SshKeyError),
     #[error("credential value does not match its kind")]
     KindMismatch,
     #[error("two-factor authentication is already enrolled")]

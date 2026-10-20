@@ -87,6 +87,38 @@ impl Extension for Git {
                 let branch = host::git_create_branch(name, start)?;
                 format!("created {} at {}", branch.name, short(&branch.commit))
             }
+            "git_tags" => {
+                let listing = host::git_tags()?;
+                let mut lines: Vec<String> = listing
+                    .tags
+                    .iter()
+                    .map(|tag| {
+                        let commit = tag.commit.as_deref().map_or("(not a commit)", short);
+                        let kind = if tag.annotated { " annotated" } else { "" };
+                        format!("{} {commit}{kind}", tag.name)
+                    })
+                    .collect();
+                if lines.is_empty() {
+                    lines.push("no tags yet".into());
+                }
+                if listing.truncated {
+                    lines.push("[more tags exist; the listing stopped at a limit]".into());
+                }
+                lines.join("\n")
+            }
+            "git_tag_create" => {
+                let name = string_arg(args, "name")?
+                    .ok_or_else(|| GuestError::new("invalid_argument", "`name` is required"))?;
+                let commit = string_arg(args, "commit")?.filter(|commit| !commit.is_empty());
+                let message = string_arg(args, "message")?;
+                let tag = host::git_create_tag(name, commit, message)?;
+                let at = tag.commit.as_deref().map_or("", short);
+                if tag.annotated {
+                    format!("created annotated tag {} at {at}", tag.name)
+                } else {
+                    format!("created tag {} at {at}", tag.name)
+                }
+            }
             "git_switch" => {
                 let name = string_arg(args, "name")?
                     .ok_or_else(|| GuestError::new("invalid_argument", "`name` is required"))?;

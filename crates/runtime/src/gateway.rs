@@ -30,6 +30,7 @@ mod delegation;
 mod plans;
 mod pushes;
 mod schedules;
+mod statuses;
 pub use plans::Plans;
 pub use pushes::Pushes;
 mod imports;
@@ -40,7 +41,10 @@ mod steering;
 pub use crate::skill_tool::SkillOffer;
 pub use delegation::{Caller, Child, Delegator, DelegatorError, Reservation, Spawn};
 pub use messengers::Outbox;
+mod web_search;
 pub use schedules::{Jobs, MAX_AGENT_JOBS};
+pub use statuses::Statuses;
+pub use web_search::Searcher;
 
 /// Streamed reply text that is not final yet. It is published as the
 /// thread's assistant message at most every [`PartialReply::INTERVAL`], so a
@@ -256,6 +260,8 @@ pub enum GatewayError {
     Limiter(#[source] tokio::sync::AcquireError),
     #[error("reply channel closed")]
     ReplyChannel,
+    #[error("the web search services cannot be saved")]
+    SearchServices(#[from] a206_core::web_search::SearchConfigError),
 }
 impl crate::error::Classified for GatewayError {
     fn kind(&self) -> Option<ErrorKind> {
@@ -265,7 +271,8 @@ impl crate::error::Classified for GatewayError {
             | Self::DownloadUrl(_)
             | Self::Search(_)
             | Self::IrcServer(_)
-            | Self::SignalDaemon(_) => ErrorKind::InvalidRequest,
+            | Self::SignalDaemon(_)
+            | Self::SearchServices(_) => ErrorKind::InvalidRequest,
             Self::NotFound(_) => ErrorKind::NotFound,
             Self::Conflict(_) => ErrorKind::Conflict,
             Self::Denied(_) => ErrorKind::PermissionDenied,
@@ -628,11 +635,24 @@ impl Gateway {
         Arc::make_mut(&mut gateway.tool_hosts).push(message_tools);
         // Pushing git branches, denied in each conversation until the user
         // permits it, and then still approved by the user call by call.
-        let push_tools = Arc::new(crate::git_push::PushHost::new(gateway.pushes()));
+        let push_tools = Arc::new(crate::git_remote::RemoteHost::new(gateway.pushes()));
         Arc::make_mut(&mut gateway.tool_hosts).push(push_tools);
+        // Reading pull requests, denied in each conversation until the user
+        // permits it.
+        let forge_tools = Arc::new(crate::forge::ForgeHost::new(gateway.pushes()));
+        Arc::make_mut(&mut gateway.tool_hosts).push(forge_tools);
+        // Web search, offered once the user adds a search service; each
+        // conversation still denies it until the user permits it, and it
+        // needs the conversation's network grant.
+        let search_tools = Arc::new(crate::search_tool::SearchHost::new(gateway.searcher()));
+        Arc::make_mut(&mut gateway.tool_hosts).push(search_tools);
         // The plan tool, denied in each conversation until the user permits it.
         let plan_tools = Arc::new(crate::plan_tool::PlanHost::new(gateway.plans()));
         Arc::make_mut(&mut gateway.tool_hosts).push(plan_tools);
+        // The conversation's own status, denied in each conversation until
+        // the user permits it.
+        let status_tools = Arc::new(crate::status_tool::StatusHost::new(gateway.statuses()));
+        Arc::make_mut(&mut gateway.tool_hosts).push(status_tools);
         // Subagent tools; each conversation still denies them until the user
         // permits them, and they are offered only with subagent models.
         gateway.bind_delegation();
@@ -826,6 +846,7 @@ impl Gateway {
         provider::validate_presets(&settings.provider_presets)?;
         messengers::validate(&settings.messengers)?;
         pushes::validate(&mut settings.git_credentials)?;
+        a206_core::web_search::validate(&settings.search_services)?;
         let mut backend_kinds = BTreeSet::new();
         for backend in &settings.backends {
             crate::backends::validate_config(backend)?;
@@ -871,7 +892,11 @@ impl Gateway {
         )?;
         // Skill approval is its own user operation, never a settings edit.
         settings.enabled_skills = store.state.settings.enabled_skills.clone();
-        let mcp_servers = Self::mcp_statuses(&store.state, &settings.mcp_servers)?;
+        let mcp_servers = Self::mcp_statuses(
+            &store.state,
+            &settings.mcp_servers,
+            &settings.program_directories,
+        )?;
         if let Some(id) = store.state.managed_joshua_provider {
             let owned = store
                 .state
@@ -939,7 +964,11 @@ impl Gateway {
         let previous = std::mem::replace(&mut store.state.settings, *settings);
         store.state.mcp_servers = mcp_servers;
         store.persist(Some(EventKind::SettingsChanged))?;
-        self.stop_changed_mcp(&previous.mcp_servers, &store.state.settings.mcp_servers)?;
+        self.stop_changed_mcp(
+            &previous.mcp_servers,
+            &store.state.settings.mcp_servers,
+            previous.program_directories != store.state.settings.program_directories,
+        )?;
         drop(store);
         // Background commands given a directory that was removed stop.
         self.grants_changed()?;
@@ -1346,12 +1375,6 @@ impl Gateway {
                     )?;
                     let (config, info) = native_model(&store.state, current)?;
                     if !images.is_empty() {
-                        check(
-                            current.backend == CodingBackend::Native,
-                            GatewayError::Invalid(
-                                "images are sent only to model providers, not coding backends",
-                            ),
-                        )?;
                         // An unreported capability is left to the provider,
                         // whose refusal reaches the client.
                         check(
@@ -1466,12 +1489,27 @@ impl Gateway {
                 let (sender, mut progress) = tokio::sync::mpsc::channel(32);
                 let dispatched = Arc::<std::sync::atomic::AtomicUsize>::default();
                 let operation = async {
+                    // Only the answered message's images are sent, so only
+                    // they are read; as for native rounds, one changed or
+                    // removed since it was attached is reported, not sent.
+                    let images = match crate::backends::answered(&thread) {
+                        Some(message) if !message.images.is_empty() => {
+                            let (images, message, info) =
+                                (self.images.clone(), message.clone(), info.clone());
+                            tokio::task::spawn_blocking(move || {
+                                crate::provider::ImageData::load_message(&images, &message, &info)
+                            })
+                            .await??
+                        }
+                        _ => crate::provider::ImageData::default(),
+                    };
                     Ok::<_, GatewayError>(
                         crate::backends::complete(crate::backends::Run {
                             config: &config,
                             thread: &thread,
                             prompt: &prompt,
                             info: &info,
+                            images: &images,
                             backend: &backend,
                             workspace: workspace.as_deref(),
                             state_root: &root,
@@ -1866,6 +1904,7 @@ impl Gateway {
             Command::RemoveJob { id } => self.remove_job(id),
             Command::RunJob { id } => self.run_job(id),
             Command::JobRuns { id } => self.job_runs(id),
+            Command::SetJobDelivery { id, to } => self.set_job_delivery(id, to),
             Command::Steer { thread, text } => self.steer(thread, text),
             Command::PauseRun { thread } => self.set_paused(thread, true),
             Command::ResumeRun { thread } => self.set_paused(thread, false),
@@ -1956,6 +1995,7 @@ impl Gateway {
         Ok(crate::extension_host::Scope {
             workspace: project.map(|id| self.project_root(id)).transpose()?,
             ceiling: None,
+            current: None,
         })
     }
     /// The extension host the run engine calls tools through.

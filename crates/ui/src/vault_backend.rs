@@ -279,7 +279,7 @@ pub(crate) use imp::{Session, Target};
 mod tests {
     use super::*;
     #[test]
-    fn credentials_require_v14_before_any_secret_is_serialized() {
+    fn credentials_require_v17_before_any_secret_is_serialized() {
         for version in [0, 10, 11, 12, 13, 14] {
             for request in [
                 Request::CredentialPage {

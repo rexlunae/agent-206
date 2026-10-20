@@ -34,6 +34,71 @@ check and its reply like any other turn; compaction keeps long-running ones
 small. RustyClaw's unwired `subconscious.rs` decider loop is not ported: a
 heartbeat is an ordinary run with the conversation's model, grants and budget.
 
+## Trigger checks
+
+A job with `kind: Trigger { extension, trigger, args }` checks an extension's
+trigger on its schedule, replacing RustyClaw's external triggers. RustyClaw
+ran each trigger as a long-lived child script (`sh`, `python3`, …) that called
+back to an HTTP endpoint on the gateway with a token, and fetched linked secrets
+from a `/secret` endpoint. Agent 206 has no such endpoint: a trigger is a check
+that a WASM extension declares in its manifest (`[[triggers]]`, see
+`docs/plugin-api.md`), and each run of the job invokes it once in the confined
+extension worker with the limits of any other call. Polling on the scheduler
+replaces the long-running process, so nothing runs between checks.
+
+- Only the user adds trigger checks (`ScheduleJob`, the Schedules page or
+  `agent206 schedule add --trigger EXTENSION/TRIGGER --args TOML`); the
+  `schedule_add` tool only schedules messages. When the job is added, the
+  extension must be installed and `args` must match the trigger's declared
+  parameters (no unknown names, required ones present, exact kinds; an empty
+  value is left out). `text` is optional here: what to do when it fires,
+  sent before the extension's report, at most 64 KiB so the message with its
+  report stays within what a conversation accepts.
+- Each run is authorized like an agent's tool call in that conversation: the
+  extension must be enabled, the user must have granted it every capability
+  the trigger declares, and the conversation's own grant must include them
+  too, as they are at that moment. The conversation's project is the
+  workspace. A refusal (a missing permission, a removed extension, arguments
+  that no longer match an update) ends the run `Refused` with the reason.
+- The extension answers whether the trigger fired. If not, the run is `Quiet`
+  and nothing is sent. If it did, the job sends one message naming the run's
+  ID, the extension and the trigger, then the job's text, then the
+  extension's report (at most 32 KiB, cut at a character boundary with a
+  notice) marked as extension output, never instructions. As with tool
+  results, Unicode tag characters and credential-shaped strings are removed
+  from the report first, and when the part of it the message includes
+  contains text addressed to the model, the message says which kinds were
+  found. The reply ends the run `Complete`
+  and is shown as "Fired; answered".
+- The extension may keep up to 4 KiB (`Job::cursor`) for the next check of the
+  same job, such as a fingerprint of what it saw. It is stored with the job
+  only once the run's message was accepted (or the run was quiet), so a
+  report the conversation refused, for example because it was busy, is
+  reported again by the next check. It is written together with the run's
+  outcome, so a restart cannot repeat a check already recorded. Checks of one
+  job never overlap: while one runs (including while the conversation answers
+  its report), a time that comes due is passed over and "Run now" is refused
+  with a conflict, so each check starts from the cursor the one before it
+  kept. Each host call of the check is held to the
+  conversation's grant as it stands at that call, so withdrawing it stops a
+  check already running. Removing the job removes it.
+
+The bundled extensions offer two triggers. `agent206.workspace`
+`file_changed { path }` (`read_workspace`) fires when a project file is
+created, changed or removed and quotes the start of its new text.
+`agent206.web` `page_changed { url }` (`network`) fires when the readable text
+of a public HTTPS page changes, through the same SSRF guard as `fetch_url`; a
+page that answers with an error status fails the run instead of firing. It
+compares only the text of the first 512 KiB of the page, the `fetch` body
+limit, so a change past that point is not seen. Both
+record the first check without firing and compare 64-bit FNV-1a fingerprints,
+which detect change and defend against nothing.
+
+Not ported: RustyClaw's trigger tools for agents (agents may not schedule
+code that runs without them), triggers that push rather than being polled,
+and trigger-only vault credentials, which wait for brokered credential use in
+extension host calls (`docs/plugin-api.md`, Planned).
+
 ## Schedules
 
 | Schedule | Meaning |
@@ -50,8 +115,8 @@ are 24 and 168 hours, and months and years, which have no fixed length, are
 refused.
 
 If the gateway stops while a job's run is starting, the next start settles it:
-when the conversation received the message (for a heartbeat, the check message
-naming that run's ID), the run ends as the conversation
+when the conversation received the message (for a heartbeat or trigger check,
+the message naming that run's ID), the run ends as the conversation
 shows (its current run's state while that message is the latest, otherwise
 complete if a reply followed it); when it did not, the job is due again at once, so the message is sent
 exactly once.
@@ -66,20 +131,56 @@ the system) pauses the job and records why.
 
 - `ScheduleJob { name, thread, text, schedule, kind }` adds an enabled job
   (`Reply::Job`). Names are 1–200 bytes, message texts 1–128 KiB, at most 256
-  jobs; `kind` is `Message` (the default) or `Heartbeat`, which takes no text.
+  jobs; `kind` is `Message` (the default), `Heartbeat`, which takes no text,
+  or `Trigger` (above), whose text may be empty.
 - `SetJobEnabled { id, enabled }` pauses or resumes it.
 - `RunJob { id }` runs it now and leaves its schedule as it is.
 - `RemoveJob { id }` deletes it and its run history; its conversation keeps what it sent.
 - `JobRuns { id }` lists the job's latest runs, newest first (`Reply::JobRuns`).
+- `SetJobDelivery { id, to }` also posts each run's reply to a messenger, or
+  stops with `to: None` (below).
 
 Jobs are in `Snapshot::jobs`, and each change publishes `JobChanged { id }`.
 `Job::last` records the latest run, with its own ID so a late result of an
 earlier run never replaces a newer one: `Running`, `Complete`, `Failed` (the
 conversation shows the failure), `Cancelled`, `Unrecorded` (only in the history, below), `Quiet` (a heartbeat check that
-found nothing needing attention) or `Refused` with the gateway's
+found nothing needing attention, or a trigger that did not fire) or `Refused` with the gateway's
 report when the message was not run, for example because the conversation was
 busy or had no model. `JobRun::ended` is when the run ended (`None` while it
 runs, or when the gateway was stopped before it saw the end).
+
+## Posting replies to a messenger
+
+The user can give a job a messenger destination (`Job::deliver_to`): a webhook
+by its name, or an allowed chat of any other messenger as `name/chat`, the same
+destinations the `send_message` tool offers (`messengers::post_destinations`
+lists the configured ones; IRC and Signal post through their running session).
+`SetJobDelivery`
+accepts only a destination configured now; models cannot set it, and the
+schedule tools neither show nor change it.
+
+When a run completes, the gateway posts its reply (the last assistant text
+after the job's message) through the same `Outbox` as `send_message`, which
+checks then that the messenger is enabled and, for a chat, connected and still
+allowed; the vault broker spends the credential. A heartbeat check posts only a
+reply that needs attention, never a quiet one. Failed, cancelled and refused
+runs post nothing, and the destination is read when the run ends, so clearing
+it stops a run in progress from posting. The reply is the last assistant text
+after the first message with the job's text added after the job sent it
+(conversations are only ever added to), so neither an identical earlier message
+nor a steered message with the same text is taken for it. A run pushed out of
+the history by newer ones still posts its reply while the job keeps a
+destination. The run's end is recorded first,
+with `JobRun::delivery` set to `Posting`, and the post's result replaces it:
+`Sent { parts }` or `Failed` with the report (for example a disconnected
+webhook). A post still going out when the gateway stops becomes `Unrecorded` on
+restart (it may or may not have arrived; it is not resent, since resending
+could post it twice), and a run that completed but whose end was never recorded
+gets `Failed`, since posting had not started. A failed post never changes the
+run's outcome or its recorded end, and a webhook's failure also shows
+on the Messengers page. RustyClaw's cron jobs store an announce `delivery`
+(channel and target, `cron.rs`) that its gateway's cron runtime never posts;
+here the destination must be one the user already set up and allowed.
 
 ## Run history
 
@@ -101,7 +202,7 @@ is bounded and lives in the same database as the jobs.
 CLI: `agent206 schedule list`, `schedule add THREAD --name N --text T` (or
 `--heartbeat` instead of `--text`) with one
 of `--at RFC3339`, `--in 90m`, `--every 90m [--anchor RFC3339]` or `--cron EXPR [--zone Z]`,
-and `schedule pause|resume|run|runs|remove ID` (`runs` prints the job's run history as TOML). Times and intervals are parsed by
+and `schedule pause|resume|run|runs|remove ID` (`runs` prints the job's run history as TOML), and `schedule deliver ID [TO]` (post replies to TO; without it, stop). Times and intervals are parsed by
 `a206_core::schedule::{parse_instant, parse_interval}`, shared with the page below.
 
 ## Schedules page
@@ -109,8 +210,12 @@ and `schedule pause|resume|run|runs|remove ID` (`runs` prints the job's run hist
 Desktop, TUI and web share the Schedules page (`/schedules`, `crates/ui/src/schedules.rs`).
 It lists every job, soonest first, with its conversation, what its schedule means,
 who added it, its next time and its latest run (a refusal shows the gateway's
-report; a heartbeat check shows whether anything needed attention), and offers Pause/Resume, Run now, Run history (its latest runs with outcomes, how long each took and any refusal) and Remove. Its form sends `ScheduleJob`
-with a message or a heartbeat check:
+report; a heartbeat check shows whether anything needed attention; a trigger
+check names its extension, the trigger's description and its arguments, and
+whether it fired), a "Post replies to" choice of the configured destinations (and the current one, marked, if it is no longer configured), and offers Pause/Resume, Run now, Run history (its latest runs with outcomes, how long each took, whether each reply was posted and any refusal) and Remove. Its form sends `ScheduleJob`
+with a message, a heartbeat check or a check of a trigger an enabled extension
+declares, with a field for each of its parameters (strings, integers, numbers
+and booleans; a trigger taking a list or table is scheduled from the CLI):
 once at a date and time in an IANA zone (prefilled with the client's own zone;
 `parse_local` moves a time a clock change skips forward by the gap and takes the
 later of a repeated one), on an interval counted from now, or on a cron
@@ -156,6 +261,16 @@ and zones), `gateway/schedules/tests.rs` (validation, one run per wake, pause,
 run now, run history) and `crates/runtime/tests/schedules.rs` (a due job's native run against a
 scripted provider).
 
-Not yet: delivery of results to a
-messenger chat, and jitter for many jobs due
-at once.
+Delivery is tested against a webhook stand-in through a real vault broker
+(`crates/runtime/tests/send_message.rs`), plus validation of destinations in
+`gateway/schedules/tests.rs`.
+
+Trigger checks are tested through the real extension worker with the bundled
+`file_changed` trigger (`crates/runtime/tests/extension_tools.rs`: validation,
+quiet first check, refusal without the conversation's grant keeping the
+cursor, a fired report with a credential removed and model-addressed text
+pointed out, removal), the guests of both bundled triggers
+(`crates/extensions/src/tests.rs`), and restart recovery
+(`schedule/tests.rs`).
+
+Not yet: jitter for many jobs due at once.

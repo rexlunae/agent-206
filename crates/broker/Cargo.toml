@@ -34,6 +34,9 @@ base64 = "0.22"
 nix = { version = "0.31", features = ["user"] }
 [dev-dependencies]
 axum = { version = "0.8", features = ["ws"] }
+signature = { version = "2", default-features = false }
+ssh-encoding = { version = "0.2", default-features = false, features = ["alloc"] }
+ssh-key = { version = "0.6", default-features = false, features = ["std", "ed25519"] }
 totp-rs = { version = "5.7", default-features = false, features = ["otpauth"] }
 [lints]
 workspace = true

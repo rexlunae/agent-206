@@ -12,7 +12,7 @@ use a206_core::{
 use a206_vault::{CredentialKind, CredentialMeta};
 use std::path::{Path, PathBuf};
 
-pub use a206_core::doctor::{Check, DoctorReport, Finding, Health};
+pub use a206_core::doctor::{Check, DoctorReport, Finding, Health, Repair};
 
 /// What the broker said, or why it could not be asked.
 #[derive(Debug, Clone, PartialEq)]
@@ -52,6 +52,9 @@ pub struct Facts {
     /// The workspace, when the gateway is running and answered.
     pub snapshot: Option<Result<Box<Snapshot>, ErrorReport>>,
     pub broker: BrokerFacts,
+    /// Permission bits of the local vault directory, `None` when it does
+    /// not exist or the broker is remote.
+    pub vault_directory_mode: Option<u32>,
     pub now: u64,
 }
 
@@ -127,7 +130,10 @@ pub fn evaluate(facts: &Facts) -> DoctorReport {
         None if target.is_some() => checks.push(check(Finding::WorkspaceUnknown)),
         None => {}
     }
-    DoctorReport { checks }
+    DoctorReport {
+        checks,
+        repairs: repairs(facts),
+    }
 }
 
 fn vault_checks(facts: &Facts, gateway_running: bool, checks: &mut Vec<Check>) {
@@ -191,6 +197,9 @@ fn vault_checks(facts: &Facts, gateway_running: bool, checks: &mut Vec<Check>) {
     };
     if let Some(mode) = vault_mode.filter(|mode| open(*mode)) {
         checks.push(check(Finding::VaultFileOpen { mode }));
+    }
+    if let Some(mode) = facts.vault_directory_mode.filter(|mode| open(*mode)) {
+        checks.push(check(Finding::VaultDirectoryOpen { mode }));
     }
 }
 
@@ -260,6 +269,271 @@ fn credential_problem(facts: &Facts, provider: &ProviderConfig) -> Option<Findin
     } else {
         None
     }
+}
+
+/// The repairs `doctor --repair` offers for these facts: open profile and
+/// vault permissions, and provider model lists that are missing or stale
+/// while the provider's credential is usable. Everything else needs the
+/// user's own decision (a vault password, a credential, a gateway target).
+pub fn repairs(facts: &Facts) -> Vec<Repair> {
+    let mut repairs = vec![];
+    if let Some(mode) = facts.profile_mode.filter(|mode| open(*mode)) {
+        repairs.push(Repair::RestrictProfile {
+            path: facts.profile.clone(),
+            mode,
+        });
+    }
+    let vault_mode = match &facts.broker {
+        BrokerFacts::Stopped { vault_mode } | BrokerFacts::Running { vault_mode, .. } => {
+            *vault_mode
+        }
+        _ => None,
+    };
+    let vault = a206_broker::vault_path(&facts.profile);
+    if let Some(mode) = vault_mode.filter(|mode| open(*mode)) {
+        repairs.push(Repair::RestrictVault {
+            path: vault.clone(),
+            mode,
+        });
+    }
+    if let (Some(mode), Some(path)) = (
+        facts.vault_directory_mode.filter(|mode| open(*mode)),
+        vault.parent(),
+    ) {
+        repairs.push(Repair::RestrictVaultDirectory {
+            path: path.to_owned(),
+            mode,
+        });
+    }
+    if let Some(Ok(snapshot)) = &facts.snapshot {
+        for provider in &snapshot.settings.providers {
+            let catalog = snapshot.catalogs.iter().find(|c| c.provider == provider.id);
+            // The gateway spends a credential only through its pairing, so a
+            // credentialed refresh is offered only while both sides hold one.
+            if (provider.credential.is_none() || paired(facts))
+                && credential_problem(facts, provider).is_none()
+                && catalog.is_none_or(|catalog| catalog.stale(facts.now))
+            {
+                repairs.push(Repair::RefreshCatalog {
+                    provider: provider.id,
+                    label: provider.label.clone(),
+                });
+            }
+        }
+    }
+    repairs
+}
+
+/// True only when the gateway and the unlocked local broker both report an
+/// active pairing; a remote or locked broker cannot confirm one from here.
+fn paired(facts: &Facts) -> bool {
+    let held = facts
+        .gateway
+        .as_ref()
+        .and_then(|report| report.info.as_ref())
+        .and_then(|info| info.vault_paired);
+    held == Some(true)
+        && matches!(&facts.broker, BrokerFacts::Running { status, .. }
+            if status.unlocked && status.gateway_paired == Some(true))
+}
+
+/// Why one repair could not be made. Nothing is retried or worked around.
+#[derive(Debug, thiserror::Error)]
+pub enum RepairError {
+    #[error("{} is a symbolic link or not the expected kind of file; it was left unchanged", path.display())]
+    NotPlain { path: PathBuf },
+    #[error("could not change the permissions of {}", path.display())]
+    Permissions {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error(
+        "{} cannot be read by its owner and /proc is not mounted, so its permissions could not be changed safely; remove group and other access by hand",
+        path.display()
+    )]
+    NeedsProcfs {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("could not reach the gateway")]
+    Gateway(#[source] crate::control::ControlError),
+    #[error("the gateway refused the request")]
+    Refused(#[source] ErrorReport),
+    #[error("the gateway gave an unexpected reply")]
+    UnexpectedReply,
+    #[error("permission repairs are not available on this platform")]
+    Unsupported,
+    #[error("this repair is not offered now; run the health checks again")]
+    NotOffered,
+}
+impl crate::error::Classified for RepairError {
+    fn kind(&self) -> Option<a206_core::ErrorKind> {
+        match self {
+            Self::Refused(report) => Some(report.kind),
+            Self::Gateway(error) => error.kind(),
+            Self::NotOffered => Some(a206_core::ErrorKind::Conflict),
+            _ => None,
+        }
+    }
+}
+
+/// Make one repair. Permission repairs only clear group and other bits and
+/// refuse symbolic links; a catalog refresh is the same gateway command the
+/// Connections page sends.
+pub async fn repair(
+    root: &Path,
+    remote: Option<String>,
+    repair: &Repair,
+) -> Result<(), RepairError> {
+    match repair {
+        Repair::RestrictProfile { path, .. } => restrict(path, true),
+        Repair::RestrictVault { path, .. } => restrict(path, false),
+        Repair::RestrictVaultDirectory { path, .. } => restrict(path, true),
+        Repair::RefreshCatalog { provider, .. } => {
+            let controller = crate::control::GatewayController::attach(root.to_owned(), remote);
+            match controller
+                .call(a206_core::Command::RefreshCatalog {
+                    provider: *provider,
+                })
+                .await
+                .map_err(RepairError::Gateway)?
+            {
+                Reply::Error(report) => Err(RepairError::Refused(report)),
+                Reply::Catalog(_) => Ok(()),
+                _ => Err(RepairError::UnexpectedReply),
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn restrict(path: &Path, directory: bool) -> Result<(), RepairError> {
+    let failed = |source: rustix::io::Errno| RepairError::Permissions {
+        path: path.to_owned(),
+        source: source.into(),
+    };
+    let opened = |error| match error {
+        rustix::io::Errno::LOOP | rustix::io::Errno::NOTDIR => RepairError::NotPlain {
+            path: path.to_owned(),
+        },
+        error => failed(error),
+    };
+    pinned_chmod(path, directory, opened, |st_mode| {
+        use rustix::fs::{FileType, Mode};
+        let expected = if directory {
+            FileType::Directory
+        } else {
+            FileType::RegularFile
+        };
+        if FileType::from_raw_mode(st_mode) != expected {
+            return Err(RepairError::NotPlain {
+                path: path.to_owned(),
+            });
+        }
+        let mode = Mode::from_raw_mode(st_mode).bits() & 0o7777;
+        Ok((mode & 0o077 != 0).then(|| Mode::from_raw_mode(mode & !0o077)))
+    })
+    .map_err(|error| match error {
+        Pinned::Open(error) => error,
+        Pinned::Change(error) => failed(error),
+    })
+}
+
+#[cfg(unix)]
+enum Pinned {
+    Open(RepairError),
+    Change(rustix::io::Errno),
+}
+
+/// Change the mode of `path` itself, never a final link's target, so a link
+/// swapped in after the check cannot redirect the change. `decide` sees the
+/// mode of the entry that will change and returns its new mode, if any.
+/// A readable entry is changed through its own descriptor; one its owner
+/// cannot read (the owner may still change its mode) takes [`unreadable`].
+#[cfg(unix)]
+fn pinned_chmod(
+    path: &Path,
+    directory: bool,
+    opened: impl FnOnce(rustix::io::Errno) -> RepairError,
+    decide: impl FnOnce(rustix::fs::RawMode) -> Result<Option<rustix::fs::Mode>, RepairError>,
+) -> Result<(), Pinned> {
+    use rustix::fs::{Mode, OFlags};
+    // NONBLOCK keeps a FIFO put in its place from stalling the open.
+    let mut flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+    if directory {
+        flags |= OFlags::DIRECTORY;
+    }
+    match rustix::fs::open(path, flags, Mode::empty()) {
+        Ok(fd) => {
+            let stat = rustix::fs::fstat(&fd).map_err(Pinned::Change)?;
+            match decide(stat.st_mode).map_err(Pinned::Open)? {
+                Some(mode) => rustix::fs::fchmod(&fd, mode).map_err(Pinned::Change),
+                None => Ok(()),
+            }
+        }
+        Err(rustix::io::Errno::ACCESS) => unreadable(path, directory, opened, decide),
+        Err(error) => Err(Pinned::Open(opened(error))),
+    }
+}
+
+/// Pin the entry with O_PATH, which needs no read access, and change it
+/// through its /proc descriptor link (fchmod refuses an O_PATH descriptor).
+/// That link names the same inode and no other process can replace it.
+/// Without procfs the repair fails with [`RepairError::NeedsProcfs`].
+#[cfg(target_os = "linux")]
+fn unreadable(
+    path: &Path,
+    directory: bool,
+    opened: impl FnOnce(rustix::io::Errno) -> RepairError,
+    decide: impl FnOnce(rustix::fs::RawMode) -> Result<Option<rustix::fs::Mode>, RepairError>,
+) -> Result<(), Pinned> {
+    use rustix::fs::{Mode, OFlags};
+    use std::os::fd::AsRawFd;
+    let mut flags = OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    if directory {
+        flags |= OFlags::DIRECTORY;
+    }
+    let fd = rustix::fs::open(path, flags, Mode::empty()).map_err(|e| Pinned::Open(opened(e)))?;
+    let stat = rustix::fs::fstat(&fd).map_err(Pinned::Change)?;
+    let Some(mode) = decide(stat.st_mode).map_err(Pinned::Open)? else {
+        return Ok(());
+    };
+    match rustix::fs::chmod(format!("/proc/self/fd/{}", fd.as_raw_fd()), mode) {
+        Err(rustix::io::Errno::NOENT) => Err(Pinned::Open(RepairError::NeedsProcfs {
+            path: path.to_owned(),
+            source: rustix::io::Errno::NOENT.into(),
+        })),
+        result => result.map_err(Pinned::Change),
+    }
+}
+
+/// Check the entry, then change it by name without following a final link
+/// (a link swapped in changes only the link's own mode).
+#[cfg(all(unix, not(target_os = "linux")))]
+fn unreadable(
+    path: &Path,
+    _directory: bool,
+    opened: impl FnOnce(rustix::io::Errno) -> RepairError,
+    decide: impl FnOnce(rustix::fs::RawMode) -> Result<Option<rustix::fs::Mode>, RepairError>,
+) -> Result<(), Pinned> {
+    use rustix::fs::{AtFlags, CWD, FileType};
+    let stat = rustix::fs::lstat(path).map_err(Pinned::Change)?;
+    if FileType::from_raw_mode(stat.st_mode) == FileType::Symlink {
+        return Err(Pinned::Open(opened(rustix::io::Errno::LOOP)));
+    }
+    match decide(stat.st_mode).map_err(Pinned::Open)? {
+        Some(mode) => {
+            rustix::fs::chmodat(CWD, path, mode, AtFlags::SYMLINK_NOFOLLOW).map_err(Pinned::Change)
+        }
+        None => Ok(()),
+    }
+}
+
+#[cfg(not(unix))]
+fn restrict(_path: &Path, _directory: bool) -> Result<(), RepairError> {
+    Err(RepairError::Unsupported)
 }
 
 fn mode(path: &Path) -> Option<u32> {
@@ -362,10 +636,12 @@ pub async fn gather_for(
         gateway = Some(report);
     }
     let remote = matches!(&target, Ok(Some(GatewayTarget::Ssh { .. })));
-    let broker = if remote {
-        BrokerFacts::Remote
+    let (broker, vault_directory_mode) = if remote {
+        (BrokerFacts::Remote, None)
     } else {
-        broker(root).await
+        let directory = a206_broker::vault_path(root);
+        let directory = directory.parent().unwrap_or(root);
+        (broker(root).await, mode(directory))
     };
     Facts {
         profile: root.to_owned(),
@@ -374,6 +650,7 @@ pub async fn gather_for(
         gateway,
         snapshot,
         broker,
+        vault_directory_mode,
         now,
     }
 }
@@ -392,33 +669,60 @@ impl crate::error::Classified for DoctorError {
     }
 }
 
-/// [`gather`] and [`evaluate`] on a thread with its own Tokio runtime, for
-/// clients whose executor is not Tokio (the desktop and terminal UI).
-pub async fn check_detached(
-    root: PathBuf,
-    remote: Option<String>,
-) -> Result<DoctorReport, DoctorError> {
+/// Run `work` on a thread with its own Tokio runtime, for clients whose
+/// executor is not Tokio (the desktop and terminal UI).
+async fn detached<T, F>(work: impl FnOnce() -> F + Send + 'static) -> Result<T, DoctorError>
+where
+    T: Send + 'static,
+    F: std::future::Future<Output = T>,
+{
     let (reply, receiver) = tokio::sync::oneshot::channel();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(DoctorError::Runtime)?;
-    // Deliberately detached: it ends after one report, and a caller that
+    // Deliberately detached: it ends after one result, and a caller that
     // stopped waiting needs none.
     std::thread::spawn(move || {
+        reply.send(runtime.block_on(work())).ok();
+    });
+    receiver.await.map_err(|_| DoctorError::Worker)
+}
+
+/// [`gather_for`] and [`evaluate`] off the caller's executor, for the
+/// gateway the client already talks to (`active`), or else the saved setup
+/// with `remote` overriding it, read on the worker.
+pub async fn check_detached(
+    root: PathBuf,
+    active: Option<GatewayTarget>,
+    remote: Option<String>,
+) -> Result<DoctorReport, DoctorError> {
+    detached(move || async move {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |elapsed| elapsed.as_secs());
-        let facts = runtime.block_on(gather(&root, remote, now));
-        reply.send(evaluate(&facts)).ok();
-    });
-    receiver.await.map_err(|_| DoctorError::Worker)
+        let facts = match active {
+            Some(target) => gather_for(&root, Ok(Some(target)), now).await,
+            None => gather(&root, remote, now).await,
+        };
+        evaluate(&facts)
+    })
+    .await
+}
+
+/// [`repair`] off the caller's executor.
+pub async fn repair_detached(
+    root: PathBuf,
+    remote: Option<String>,
+    fix: Repair,
+) -> Result<Result<(), RepairError>, DoctorError> {
+    detached(move || async move { repair(&root, remote, &fix).await }).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use a206_core::{Catalog, GatewayInfo, ProviderApi, Settings};
+    use a206_core::{Catalog, GatewayInfo, Id, ProviderApi, Settings};
     use a206_vault::AccessPolicy;
 
     fn random() -> String {
@@ -474,6 +778,7 @@ mod tests {
             gateway: Some(running(paired)),
             snapshot: snapshot.map(|s| Ok(Box::new(s))),
             broker,
+            vault_directory_mode: Some(0o700),
             now: 1_000,
         }
     }
@@ -560,6 +865,7 @@ mod tests {
             gateway: None,
             snapshot: None,
             broker: BrokerFacts::Stopped { vault_mode: None },
+            vault_directory_mode: None,
             now: 0,
         };
         let report = evaluate(&facts);
@@ -742,5 +1048,224 @@ mod tests {
         assert_eq!(facts.target, Ok(None));
         assert_eq!(facts.broker, BrokerFacts::Stopped { vault_mode: None });
         assert_eq!(facts.profile_mode, None);
+    }
+
+    #[test]
+    fn repairs_cover_open_permissions_and_catalogs_a_usable_credential_can_refresh() {
+        let missing = provider(None);
+        let stale = provider(None);
+        let fresh = provider(None);
+        let unusable = provider(Some(random()));
+        let catalogs = vec![catalog(&stale, 1, 1_000), catalog(&fresh, 1, 2_000)];
+        let mut broker = unlocked(vec![], vec![]);
+        if let BrokerFacts::Running { vault_mode, .. } = &mut broker {
+            *vault_mode = Some(0o644);
+        }
+        let mut facts = facts(
+            Some(snapshot(
+                vec![
+                    missing.clone(),
+                    stale.clone(),
+                    fresh.clone(),
+                    unusable.clone(),
+                ],
+                catalogs.clone(),
+            )),
+            broker,
+            Some(true),
+        );
+        facts.profile_mode = Some(0o755);
+        assert_eq!(
+            repairs(&facts),
+            [
+                Repair::RestrictProfile {
+                    path: facts.profile.clone(),
+                    mode: 0o755
+                },
+                Repair::RestrictVault {
+                    path: a206_broker::vault_path(&facts.profile),
+                    mode: 0o644
+                },
+                Repair::RefreshCatalog {
+                    provider: missing.id,
+                    label: missing.label.clone()
+                },
+                Repair::RefreshCatalog {
+                    provider: stale.id,
+                    label: stale.label.clone()
+                },
+            ]
+        );
+        let healthy = super::tests::facts(
+            Some(snapshot(vec![fresh], catalogs)),
+            unlocked(vec![], vec![]),
+            Some(true),
+        );
+        assert!(repairs(&healthy).is_empty());
+        let mut remote = healthy;
+        remote.profile_mode = Some(0o700);
+        remote.broker = BrokerFacts::Remote;
+        remote.snapshot = None;
+        assert!(repairs(&remote).is_empty());
+    }
+
+    #[test]
+    fn a_credentialed_refresh_is_offered_only_while_the_gateway_is_paired() {
+        let name = random();
+        let keyed = provider(Some(name.clone()));
+        let origin = url::Url::parse(&keyed.base_url)
+            .unwrap()
+            .origin()
+            .ascii_serialization();
+        let keyless = provider(None);
+        let snap = snapshot(vec![keyed.clone(), keyless.clone()], vec![]);
+        let credentials = || vec![(name.clone(), meta(vec![origin.clone()], false))];
+        let offered = |facts: &Facts| -> Vec<Id> {
+            repairs(facts)
+                .into_iter()
+                .filter_map(|repair| match repair {
+                    Repair::RefreshCatalog { provider, .. } => Some(provider),
+                    _ => None,
+                })
+                .collect()
+        };
+        let paired = facts(
+            Some(snap.clone()),
+            unlocked(credentials(), vec![]),
+            Some(true),
+        );
+        assert_eq!(offered(&paired), [keyed.id, keyless.id]);
+        let unpaired = facts(
+            Some(snap.clone()),
+            unlocked(credentials(), vec![]),
+            Some(false),
+        );
+        assert_eq!(offered(&unpaired), [keyless.id]);
+        let mut broker_unpaired = unlocked(credentials(), vec![]);
+        if let BrokerFacts::Running { status, .. } = &mut broker_unpaired {
+            status.gateway_paired = Some(false);
+        }
+        let broker_side = facts(Some(snap.clone()), broker_unpaired, Some(true));
+        assert_eq!(offered(&broker_side), [keyless.id]);
+        let remote = facts(Some(snap), BrokerFacts::Remote, Some(true));
+        assert_eq!(offered(&remote), [keyless.id]);
+    }
+
+    #[test]
+    fn an_open_vault_directory_is_reported_and_repaired_on_its_own() {
+        let mut facts = facts(None, unlocked(vec![], vec![]), Some(true));
+        facts.vault_directory_mode = Some(0o755);
+        assert!(
+            findings(&evaluate(&facts)).contains(&&Finding::VaultDirectoryOpen { mode: 0o755 })
+        );
+        let vault = a206_broker::vault_path(&facts.profile);
+        assert_eq!(
+            repairs(&facts),
+            [Repair::RestrictVaultDirectory {
+                path: vault.parent().unwrap().to_owned(),
+                mode: 0o755
+            }]
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn permission_repairs_clear_only_group_and_other_bits_and_refuse_links() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        let set = |path: &Path, mode| {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap()
+        };
+        let root = tempfile::tempdir().unwrap();
+        let profile = root.path().join(random());
+        std::fs::create_dir(&profile).unwrap();
+        set(&profile, 0o751);
+        let fix = Repair::RestrictProfile {
+            path: profile.clone(),
+            mode: 0o751,
+        };
+        repair(&profile, None, &fix).await.unwrap();
+        assert_eq!(mode(&profile), 0o700);
+        let vault = a206_broker::vault_path(&profile);
+        std::fs::create_dir(vault.parent().unwrap()).unwrap();
+        std::fs::write(&vault, random()).unwrap();
+        set(&vault, 0o464);
+        set(vault.parent().unwrap(), 0o755);
+        let fix = Repair::RestrictVault {
+            path: vault.clone(),
+            mode: 0o464,
+        };
+        repair(&profile, None, &fix).await.unwrap();
+        assert_eq!(mode(&vault), 0o400);
+        assert_eq!(mode(vault.parent().unwrap()), 0o755);
+        let directory = Repair::RestrictVaultDirectory {
+            path: vault.parent().unwrap().to_owned(),
+            mode: 0o755,
+        };
+        repair(&profile, None, &directory).await.unwrap();
+        assert_eq!(mode(vault.parent().unwrap()), 0o700);
+
+        let elsewhere = root.path().join(random());
+        std::fs::write(&elsewhere, random()).unwrap();
+        set(&elsewhere, 0o644);
+        std::fs::remove_file(&vault).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &vault).unwrap();
+        assert!(matches!(
+            repair(&profile, None, &fix).await,
+            Err(RepairError::NotPlain { .. })
+        ));
+        assert_eq!(mode(&elsewhere), 0o644);
+        let wrong_kind = Repair::RestrictProfile {
+            path: elsewhere.clone(),
+            mode: 0o644,
+        };
+        assert!(matches!(
+            repair(&profile, None, &wrong_kind).await,
+            Err(RepairError::NotPlain { .. })
+        ));
+        assert_eq!(mode(&elsewhere), 0o644);
+    }
+
+    #[tokio::test]
+    async fn permission_repairs_need_no_read_access_from_the_owner() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        let set = |path: &Path, mode| {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap()
+        };
+        let root = tempfile::tempdir().unwrap();
+        let profile = root.path().join(random());
+        let vault = a206_broker::vault_path(&profile);
+        std::fs::create_dir_all(vault.parent().unwrap()).unwrap();
+        std::fs::write(&vault, random()).unwrap();
+        set(&vault, 0o066);
+        let fix = Repair::RestrictVault {
+            path: vault.clone(),
+            mode: 0o066,
+        };
+        repair(&profile, None, &fix).await.unwrap();
+        assert_eq!(mode(&vault), 0o000);
+        set(&vault, 0o600);
+        let directory = vault.parent().unwrap().to_owned();
+        set(&directory, 0o355);
+        let fix = Repair::RestrictVaultDirectory {
+            path: directory.clone(),
+            mode: 0o355,
+        };
+        repair(&profile, None, &fix).await.unwrap();
+        assert_eq!(mode(&directory), 0o300);
+        set(&directory, 0o700);
+    }
+
+    #[tokio::test]
+    async fn a_refresh_without_a_reachable_gateway_reports_why() {
+        let root = tempfile::tempdir().unwrap();
+        let fix = Repair::RefreshCatalog {
+            provider: uuid::Uuid::new_v4(),
+            label: random(),
+        };
+        let error = repair(root.path(), None, &fix).await.unwrap_err();
+        assert!(matches!(error, RepairError::Gateway(_)), "{error:?}");
+        assert!(std::error::Error::source(&error).is_some());
     }
 }
