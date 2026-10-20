@@ -892,7 +892,11 @@ impl Gateway {
         )?;
         // Skill approval is its own user operation, never a settings edit.
         settings.enabled_skills = store.state.settings.enabled_skills.clone();
-        let mcp_servers = Self::mcp_statuses(&store.state, &settings.mcp_servers)?;
+        let mcp_servers = Self::mcp_statuses(
+            &store.state,
+            &settings.mcp_servers,
+            &settings.program_directories,
+        )?;
         if let Some(id) = store.state.managed_joshua_provider {
             let owned = store
                 .state
