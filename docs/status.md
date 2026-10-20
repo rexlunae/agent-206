@@ -307,3 +307,11 @@ input had no DOM value attribute; the synthetic key was absent from DOM attribut
 and text. An independent Rust check confirmed the saved policy/origin/value,
 agent-access off, encrypted bytes and mode 0600. No real accounts or model calls
 were configured. Native desktop/TUI interactive acceptance remains pending.
+
+After integration with broker v17, release-web acceptance in a fresh disposable
+profile verified broker-key confirmation, vault creation, metadata loading,
+SSH-origin refusal without losing the nonsecret draft, key clearing after refusal,
+corrected HTTPS-origin save, lock hiding metadata and automatic reload after
+unlock. The synthetic key was absent from DOM text and attributes, the vault file
+was mode 0600, agent access stayed off and the deliberately stopped gateway stayed
+stopped. The temporary browser tab, web server and broker were closed afterward.

@@ -61,6 +61,6 @@ before entering a vault password in the browser. It is public and changes when
 the broker restarts. See [web vault setup](web-vault-setup.md).
 
 The shared Security page now reads bounded typed credential metadata and adds
-API keys with per-use approval through broker v14. The CLI keeps the broader
+API keys with per-use approval through broker v17. The CLI keeps the broader
 `vault add`, `adopt`, `policy`, `bind`, enable/disable, delete, agent-access and
 step-up reveal operations. No additional agent-facing secret tool is introduced.
