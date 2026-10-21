@@ -2471,6 +2471,15 @@ async fn oversized_legacy_metadata_still_allows_disabling_and_destination_recove
             name: name.clone(),
             policy: None,
             disabled: Some(true),
+            destinations: None,
+        })
+        .await
+        .unwrap();
+    owner
+        .call(Request::UpdateCredential {
+            name: name.clone(),
+            policy: None,
+            disabled: None,
             destinations: Some(vec![]),
         })
         .await
@@ -2575,6 +2584,33 @@ async fn oversized_policy_update_is_refused_before_persisting_any_change() {
         panic!()
     };
     assert_eq!(after, before);
+    let destinations = (0..16)
+        .map(|_| {
+            format!(
+                "https://{}.{}.{}.example.invalid",
+                random(),
+                "a".repeat(50),
+                "b".repeat(50)
+            )
+        })
+        .collect();
+    assert!(matches!(
+        secure_call(
+            &mut relay,
+            &mut channel,
+            Q::SetCredentialDestinations {
+                name: before.entries[0].0.clone(),
+                destinations,
+            }
+        )
+        .await,
+        R::Error(_)
+    ));
+    let Reply::CredentialPage(after_destination) = owner.call(page_request(None, 5)).await.unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(after_destination, before);
     task.abort();
     assert!(task.await.unwrap_err().is_cancelled());
 }

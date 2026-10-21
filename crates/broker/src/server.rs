@@ -687,7 +687,6 @@ fn handle(shared: &Shared, session: &mut Session, request: Request) -> Handled {
             let destinations = destinations.map(origins).transpose()?;
             let mut vault = shared.vault();
             require_step_up(session, vault.generation())?;
-            let updates_policy = policy.is_some();
             let previous = vault.credential(&name).map_err(vault_error)?;
             let mut updated = previous.clone();
             if let Some(policy) = policy {
@@ -699,12 +698,9 @@ fn handle(shared: &Shared, session: &mut Session, request: Request) -> Handled {
             if let Some(destinations) = destinations {
                 updated.destinations = destinations;
             }
-            // This safety gate belongs to policy editing. Existing native
-            // restriction/recovery operations must still be able to disable an
-            // entry or clear destinations when imported metadata is oversized.
-            if updates_policy {
-                credentials::validate_updated_metadata(&name, &previous, updated.clone())?;
-            }
+            // Preserve recovery of oversized imports while keeping policy and
+            // destination expansions from stranding a readable panel entry.
+            credentials::validate_updated_metadata(&name, &previous, updated.clone())?;
             vault
                 .update_credential(&name, |meta: &mut CredentialMeta| {
                     *meta = updated;
