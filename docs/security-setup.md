@@ -145,7 +145,7 @@ The HTTP bridge carries ciphertext, with bounded, browser-owner-bound sessions.
 Cancellation now explicitly discards broker-held pending enrollment. See
 [web-vault-setup.md](web-vault-setup.md) for exact procedures and limitations.
 SSH vault controls,
-key-file workflows and modern at-rest encryption remain pending. Browser-delivered
+vault encryption using key files and modern at-rest encryption remain pending. Browser-delivered
 code and the serving origin remain trusted, as does the native client executable.
 
 The shared Security page offers authenticator removal on desktop and confirmed
