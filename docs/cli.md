@@ -89,3 +89,9 @@ recent authentication. The encrypted panel requires broker v23; the existing
 native `RemoveTotp` request and CLI compatibility are unchanged. Network web
 channels cannot remove the authenticator they need for future sign-ins; arrange
 access through desktop, loopback web or the trusted CLI first.
+
+Security credential rows share the CLI's broker-owned deletion and step-up checks.
+The UI requires a separate exact-name confirmation and reloads metadata after a
+confirmed result. The encrypted web request requires broker v24; native CLI
+`vault delete` keeps its existing protocol compatibility. Other entry kinds,
+legacy adoption and reveal still require the trusted CLI.

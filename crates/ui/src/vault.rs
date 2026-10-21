@@ -90,6 +90,9 @@ enum Task {
     Pair,
     Enroll,
     AddCredential,
+    DeleteCredential {
+        name: String,
+    },
     SetAgentAccess(bool),
     SetCredentialDisabled {
         name: String,
@@ -153,6 +156,7 @@ struct Panel {
     key_editor: Signal<bool>,
     destination_editor: Signal<Option<credentials::DestinationDraft>>,
     policy_editor: Signal<Option<credential_policy::PolicyDraft>>,
+    delete_credential: Signal<Option<String>>,
     /// The Get started checklist, when this panel is on that page.
     progress: Option<VaultProgress>,
 }
@@ -237,6 +241,15 @@ impl Panel {
         self.status.set(Some(status));
     }
     fn forget_credentials(mut self) {
+        // Forget the pending operation as well as its confirmation when the
+        // vault locks or its state can no longer be confirmed.
+        let deleting = matches!(
+            &*self.flow.peek(),
+            Flow::StepUp(Task::DeleteCredential { .. })
+        );
+        if deleting {
+            self.flow.set(Flow::Idle);
+        }
         self.credential_page.set(None);
         // A page error belongs to the previous lock/connection state. Keep
         // mutation failures separately so an uncertain save is never hidden.
@@ -244,6 +257,7 @@ impl Panel {
         self.key_editor.set(false);
         self.destination_editor.set(None);
         self.policy_editor.set(None);
+        self.delete_credential.set(None);
     }
     /// The Get started page's background re-read. It never starts a broker,
     /// so a deliberate `vault stop` stays stopped, and its failure is shown
@@ -410,6 +424,33 @@ impl Panel {
     }
     async fn perform(mut self, task: Task) {
         match task.clone() {
+            Task::DeleteCredential { name } => {
+                match self
+                    .session()
+                    .call(Request::DeleteCredential { name })
+                    .await
+                {
+                    Ok(Reply::Ok) => {
+                        self.flow.set(Flow::Idle);
+                        self.delete_credential.set(None);
+                        self.notice.set(Some("Credential deleted."));
+                        self.credential_page.set(None);
+                        self.credential_read_failure.set(None);
+                    }
+                    Err(error) if broker_refused(&error, BrokerError::StepUpRequired) => {
+                        self.flow.set(Flow::StepUp(task));
+                    }
+                    result => {
+                        self.flow.set(Flow::Idle);
+                        // An uncertain write must not leave a one-click retry
+                        // against stale metadata. Reload, then confirm again.
+                        self.delete_credential.set(None);
+                        self.credential_page.set(None);
+                        self.credential_read_failure.set(None);
+                        self.fail("vault_delete_credential", "Deletion not confirmed; check refreshed credentials before trying again", &result.err().unwrap_or_else(unexpected));
+                    }
+                }
+            }
             Task::SetCredentialPolicy { name, policy } => {
                 match self
                     .session()
@@ -760,6 +801,7 @@ fn VaultPanel(target: Target, allow_totp_removal: bool) -> Element {
         key_editor: use_signal(|| false),
         destination_editor: use_signal(|| None),
         policy_editor: use_signal(|| None),
+        delete_credential: use_signal(|| None),
         progress: VaultProgress::listener(),
     };
     // Reads only through `peek`, so this runs once, after the first render.
@@ -885,12 +927,13 @@ fn VaultPanel(target: Target, allow_totp_removal: bool) -> Element {
                     }
                 },
                 Flow::StepUp(task) => rsx! {
-                    p { match &task { Task::Pair => "Confirm it is you before pairing the gateway.", Task::Enroll => "Confirm it is you before enrolling an authenticator.", Task::AddCredential => "Confirm it is you before adding an API key.", Task::SetAgentAccess(true) => "Confirm it is you before enabling agent credential access.", Task::SetAgentAccess(false) => "Confirm it is you before disabling agent credential access.", Task::SetCredentialDisabled { disabled: true, .. } => "Confirm it is you before disabling this credential.", Task::SetCredentialDisabled { disabled: false, .. } => "Confirm it is you before enabling this credential.", Task::SetCredentialDestinations { .. } => "Confirm it is you before replacing this credential's permitted destinations.", Task::SetCredentialPolicy { .. } => "Confirm it is you before changing this credential's policy." } }
+                    p { match &task { Task::Pair => "Confirm it is you before pairing the gateway.", Task::Enroll => "Confirm it is you before enrolling an authenticator.", Task::AddCredential => "Confirm it is you before adding an API key.", Task::DeleteCredential { .. } => "Confirm it is you before permanently deleting this credential.", Task::SetAgentAccess(true) => "Confirm it is you before enabling agent credential access.", Task::SetAgentAccess(false) => "Confirm it is you before disabling agent credential access.", Task::SetCredentialDisabled { disabled: true, .. } => "Confirm it is you before disabling this credential.", Task::SetCredentialDisabled { disabled: false, .. } => "Confirm it is you before enabling this credential.", Task::SetCredentialDestinations { .. } => "Confirm it is you before replacing this credential's permitted destinations.", Task::SetCredentialPolicy { .. } => "Confirm it is you before changing this credential's policy." } }
                     if let Task::SetCredentialPolicy { name, policy } = &task {
                         code { class: "a206-policy-identifier", "{name:?}" }
                         credential_policy::PolicySummary { policy: policy.clone() }
                     }
                     if let Task::SetCredentialDisabled { name, .. } = &task { code { "{name}" } }
+                    if let Task::DeleteCredential { name } = &task { code { class: "a206-policy-identifier", "{name:?}" } }
                     if let Task::SetCredentialDestinations { name, destinations } = &task {
                         code { "{name}" }
                         p { "New permitted destinations:" }
@@ -990,7 +1033,7 @@ fn VaultPanel(target: Target, allow_totp_removal: bool) -> Element {
                     if offer.enroll {
                         Button { variant: ButtonVariant::Secondary, availability: availability.clone(), onclick: move |_| panel.start(Task::Enroll), "Set up two-factor" }
                     }
-                    if offer.remove_totp && !(panel.key_editor)() && (panel.destination_editor)().is_none() && (panel.policy_editor)().is_none() {
+                    if offer.remove_totp && !(panel.key_editor)() && (panel.destination_editor)().is_none() && (panel.policy_editor)().is_none() && (panel.delete_credential)().is_none() {
                         Button { variant: ButtonVariant::Secondary, availability: availability.clone(), onclick: move |_| { take(password); take(confirm); take(code); panel.request_totp_removal(); }, "Remove two-factor" }
                     }
                     if offer.lock {
@@ -1055,6 +1098,59 @@ fn AgentAccessControl(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn forgetting_credentials_cancels_deletion_authentication() {
+        let mut dom = VirtualDom::new(|| rsx! { div {} });
+        dom.rebuild_in_place();
+        dom.in_scope(ScopeId::ROOT, || {
+            let mut panel = Panel {
+                allow_totp_removal: true,
+                session: Signal::new(Session::open(std::env::temp_dir())),
+                status: Signal::new(None),
+                failure: Signal::new(None),
+                warning: Signal::new(None),
+                poll_failure: Signal::new(None),
+                notice: Signal::new(None),
+                busy: Signal::new(false),
+                flow: Signal::new(Flow::Idle),
+                held: Signal::new(None),
+                enrollment: Signal::new(None),
+                import_review: Signal::new(None),
+                import_totp: Signal::new(false),
+                import_result: Signal::new(None),
+                credential_page: Signal::new(None),
+                credential_failure: Signal::new(None),
+                credential_read_failure: Signal::new(None),
+                key_editor: Signal::new(false),
+                destination_editor: Signal::new(None),
+                policy_editor: Signal::new(None),
+                delete_credential: Signal::new(None),
+                progress: None,
+            };
+            let name = uuid::Uuid::new_v4().to_string();
+            let pending = Flow::StepUp(Task::DeleteCredential { name: name.clone() });
+            panel.flow.set(pending.clone());
+            panel.delete_credential.set(Some(name.clone()));
+            panel.show(status(true, true, Some(false)));
+            assert_eq!((panel.flow)(), pending);
+            assert_eq!((panel.delete_credential)(), Some(name.clone()));
+            panel.cancel();
+            assert_eq!((panel.flow)(), Flow::Idle);
+            assert_eq!((panel.delete_credential)(), Some(name.clone()));
+            panel.flow.set(pending.clone());
+            panel.show(status(true, false, None));
+            assert_eq!((panel.flow)(), Flow::Idle);
+            assert_eq!((panel.delete_credential)(), None);
+            assert!(offer(panel.status.peek().as_ref().unwrap(), true).unlock);
+            // The unreadable/disconnected path forgets through the same method.
+            panel.flow.set(pending);
+            panel.delete_credential.set(Some(name));
+            panel.forget_credentials();
+            assert_eq!((panel.flow)(), Flow::Idle);
+            assert_eq!((panel.delete_credential)(), None);
+        });
+    }
 
     #[test]
     fn access_controls_offer_the_opposite_known_state_and_hide_unknown() {
