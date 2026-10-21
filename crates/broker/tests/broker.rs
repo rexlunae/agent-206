@@ -2302,6 +2302,428 @@ async fn secure_call(
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn encrypted_policy_edits_preserve_other_metadata_and_private_values() {
+    use a206_vault_channel::{Code, Reply as R, Request as Q, Secret};
+    let (_dir, root, task) = start().await;
+    let password = random();
+    let mut owner = user(&root).await;
+    owner.call(unlock(&password, None, true)).await.unwrap();
+    let name = random();
+    let other = random();
+    let value = random();
+    let mut expected = meta(vec!["https://example.invalid".into()]);
+    expected.disabled = true;
+    expected.description = Some(random());
+    for key in [&name, &other] {
+        owner
+            .call(Request::PutCredential {
+                name: key.clone(),
+                meta: expected.clone(),
+                value: WireValue::Single(WireSecret::new(value.clone())),
+                replace: false,
+            })
+            .await
+            .unwrap();
+    }
+    let untouched = expected.clone();
+    let (mut relay, mut channel) = secure_open(&root).await;
+    let change = |policy| Q::SetCredentialPolicy {
+        name: name.clone(),
+        policy,
+    };
+    assert!(
+        matches!(secure_call(&mut relay, &mut channel, change(AccessPolicy::Always)).await,
+        R::Error(error) if error.code == Code::StepUpRequired)
+    );
+    assert!(matches!(
+        secure_call(
+            &mut relay,
+            &mut channel,
+            Q::StepUp {
+                password: Some(Secret::new(password.clone())),
+                totp: None
+            }
+        )
+        .await,
+        R::Ok
+    ));
+    let identifier = format!(" {} exact ID ", random());
+    for policy in [
+        AccessPolicy::Always,
+        AccessPolicy::WithAuth,
+        AccessPolicy::SkillOnly(vec![random(); a206_vault_channel::MAX_POLICY_SCOPES]),
+        AccessPolicy::TriggerOnly(vec!["x".repeat(a206_vault_channel::MAX_POLICY_SCOPE_BYTES)]),
+        AccessPolicy::SkillOnly(vec![identifier.clone()]),
+        AccessPolicy::TriggerOnly(vec![identifier]),
+        AccessPolicy::SkillOnly(vec![]),
+        AccessPolicy::TriggerOnly(vec![]),
+        AccessPolicy::WithApproval,
+    ] {
+        assert!(matches!(
+            secure_call(&mut relay, &mut channel, change(policy.clone())).await,
+            R::Ok
+        ));
+        expected.policy = policy;
+        let Reply::CredentialPage(page) = owner.call(page_request(None, 5)).await.unwrap() else {
+            panic!()
+        };
+        assert_eq!(
+            page.entries.iter().find(|(key, _)| key == &name).unwrap().1,
+            expected
+        );
+        assert_eq!(
+            page.entries
+                .iter()
+                .find(|(key, _)| key == &other)
+                .unwrap()
+                .1,
+            untouched
+        );
+        let bytes = a206_protocol::encode(&page).unwrap();
+        assert!(
+            !bytes
+                .windows(value.len())
+                .any(|bytes| bytes == value.as_bytes())
+        );
+        assert_eq!(status(&mut owner).await.agent_access, Some(false));
+    }
+    for scopes in [
+        vec![String::new()],
+        vec!["bad\nidentifier".into()],
+        vec!["x".repeat(a206_vault_channel::MAX_POLICY_SCOPE_BYTES + 1)],
+        vec![random(); a206_vault_channel::MAX_POLICY_SCOPES + 1],
+    ] {
+        assert!(matches!(
+            secure_call(
+                &mut relay,
+                &mut channel,
+                change(AccessPolicy::SkillOnly(scopes))
+            )
+            .await,
+            R::Error(_)
+        ));
+    }
+    assert!(matches!(
+        secure_call(
+            &mut relay,
+            &mut channel,
+            Q::SetCredentialPolicy {
+                name: random(),
+                policy: AccessPolicy::Always
+            }
+        )
+        .await,
+        R::Error(_)
+    ));
+    owner.call(Request::Lock).await.unwrap();
+    assert!(matches!(
+        secure_call(&mut relay, &mut channel, change(AccessPolicy::Always)).await,
+        R::Error(_)
+    ));
+    owner.call(unlock(&password, None, false)).await.unwrap();
+    let Reply::CredentialPage(page) = owner.call(page_request(None, 5)).await.unwrap() else {
+        panic!()
+    };
+    assert_eq!(
+        page.entries.iter().find(|(key, _)| key == &name).unwrap().1,
+        expected
+    );
+    let Reply::Value(WireValue::Single(saved)) = owner
+        .call(Request::Reveal { name: name.clone() })
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(saved.expose(), value);
+    assert!(
+        matches!(secure_call(&mut relay, &mut channel, change(AccessPolicy::Always)).await,
+        R::Error(error) if error.code == Code::StepUpRequired)
+    );
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn imported_metadata_above_frame_limit_rejects_growth_but_allows_recovery() {
+    use a206_vault_channel::{Reply as R, Request as Q, Secret};
+    let (_dir, root, task) = start().await;
+    let source_dir = tempfile::tempdir().unwrap();
+    let source = source_dir.path().join("secrets.json");
+    let password = random();
+    let name = random();
+    let scopes = vec![random(), random()];
+    let mut original = meta(vec!["https://example.invalid".into()]);
+    original.description = Some("x".repeat(a206_protocol::MAX_FRAME + 4096));
+    original.policy = AccessPolicy::SkillOnly(scopes.clone());
+    {
+        let mut vault = a206_vault::Vault::locked(source.clone());
+        vault
+            .unlock(&a206_vault::Secret::new(password.clone()))
+            .unwrap();
+        vault
+            .put_credential(
+                &name,
+                &original,
+                a206_vault::CredentialValue::Single(a206_vault::Secret::new(random())),
+            )
+            .unwrap();
+    }
+    let source_bytes = std::fs::read(&source).unwrap();
+    let mut owner = user(&root).await;
+    let review = migration_review(&mut owner, &source).await;
+    assert!(matches!(
+        owner
+            .call(migration_apply(review.id, &password))
+            .await
+            .unwrap(),
+        Reply::VaultImportApplied(_)
+    ));
+    let mut expanded = scopes.clone();
+    expanded.push(random());
+    let (mut relay, mut channel) = secure_open(&root).await;
+    assert!(matches!(
+        secure_call(
+            &mut relay,
+            &mut channel,
+            Q::StepUp {
+                password: Some(Secret::new(password.clone())),
+                totp: None,
+            }
+        )
+        .await,
+        R::Ok
+    ));
+    assert!(matches!(
+        secure_call(
+            &mut relay,
+            &mut channel,
+            Q::SetCredentialPolicy {
+                name: name.clone(),
+                policy: AccessPolicy::SkillOnly(expanded.clone()),
+            }
+        )
+        .await,
+        R::Error(_)
+    ));
+    assert!(matches!(
+        owner
+            .call(Request::UpdateCredential {
+                name: name.clone(),
+                policy: Some(AccessPolicy::SkillOnly(expanded)),
+                disabled: None,
+                destinations: None,
+            })
+            .await,
+        Err(ClientError::Broker(BrokerError::Vault(
+            VaultFailure::MetadataTooLarge
+        )))
+    ));
+    owner
+        .call(Request::UpdateCredential {
+            name: name.clone(),
+            policy: Some(AccessPolicy::SkillOnly(vec![scopes[0].clone()])),
+            disabled: None,
+            destinations: None,
+        })
+        .await
+        .unwrap();
+    owner
+        .call(Request::UpdateCredential {
+            name: name.clone(),
+            policy: None,
+            disabled: Some(true),
+            destinations: None,
+        })
+        .await
+        .unwrap();
+    owner.call(Request::Lock).await.unwrap();
+    owner.call(Request::Shutdown).await.unwrap();
+    task.await.unwrap();
+    let mut persisted = a206_vault::Vault::locked(vault_path(&root));
+    persisted
+        .unlock(&a206_vault::Secret::new(password))
+        .unwrap();
+    let stored = persisted.credential(&name).unwrap();
+    let mut expected = original;
+    expected.policy = AccessPolicy::SkillOnly(vec![scopes[0].clone()]);
+    expected.disabled = true;
+    assert_eq!(stored, expected);
+    assert_eq!(std::fs::read(source).unwrap(), source_bytes);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn oversized_legacy_metadata_still_allows_disabling_and_destination_recovery() {
+    let (_dir, root, task) = start().await;
+    let password = random();
+    let mut owner = user(&root).await;
+    owner.call(unlock(&password, None, true)).await.unwrap();
+    let name = random();
+    let mut legacy = meta(vec!["https://example.invalid".into()]);
+    legacy.description = Some("x".repeat(a206_vault_channel::MAX_CREDENTIAL_PAGE_BYTES));
+    let scopes = vec![random(); a206_vault_channel::MAX_POLICY_SCOPES];
+    legacy.policy = AccessPolicy::SkillOnly(scopes.clone());
+    owner
+        .call(Request::PutCredential {
+            name: name.clone(),
+            meta: legacy,
+            value: WireValue::Single(WireSecret::new(random())),
+            replace: false,
+        })
+        .await
+        .unwrap();
+    // Policy expansion needs the new page budget. Existing restriction and
+    // recovery operations must still work on oversized imported metadata.
+    owner
+        .call(Request::UpdateCredential {
+            name: name.clone(),
+            policy: None,
+            disabled: Some(true),
+            destinations: None,
+        })
+        .await
+        .unwrap();
+    owner
+        .call(Request::UpdateCredential {
+            name: name.clone(),
+            policy: None,
+            disabled: None,
+            destinations: Some(vec![]),
+        })
+        .await
+        .unwrap();
+    owner
+        .call(Request::UpdateCredential {
+            name: name.clone(),
+            policy: Some(AccessPolicy::SkillOnly(vec![])),
+            disabled: None,
+            destinations: None,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        owner
+            .call(Request::UpdateCredential {
+                name: name.clone(),
+                policy: Some(AccessPolicy::SkillOnly(scopes)),
+                disabled: None,
+                destinations: None,
+            })
+            .await,
+        Err(ClientError::Broker(BrokerError::Vault(
+            VaultFailure::MetadataTooLarge
+        )))
+    ));
+    let Reply::Credentials { typed: entries, .. } = owner.call(Request::Credentials).await.unwrap()
+    else {
+        panic!()
+    };
+    let (_, meta) = entries.iter().find(|(entry, _)| entry == &name).unwrap();
+    assert!(meta.disabled);
+    assert!(meta.destinations.is_empty());
+    assert_eq!(meta.policy, AccessPolicy::SkillOnly(vec![]));
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn oversized_policy_update_is_refused_before_persisting_any_change() {
+    use a206_vault_channel::{Reply as R, Request as Q, Secret};
+    let (_dir, root, task) = start().await;
+    let password = random();
+    let mut owner = user(&root).await;
+    owner.call(unlock(&password, None, true)).await.unwrap();
+    let name = random();
+    let mut expected = meta(vec!["https://example.invalid".into()]);
+    expected.description = Some("x".repeat(a206_vault_channel::MAX_CREDENTIAL_PAGE_BYTES - 1024));
+    owner
+        .call(Request::PutCredential {
+            name: name.clone(),
+            meta: expected.clone(),
+            value: WireValue::Single(WireSecret::new(random())),
+            replace: false,
+        })
+        .await
+        .unwrap();
+    let Reply::CredentialPage(before) = owner.call(page_request(None, 5)).await.unwrap() else {
+        panic!()
+    };
+    assert_eq!(before.entries[0].1, expected);
+    let (mut relay, mut channel) = secure_open(&root).await;
+    assert!(matches!(
+        secure_call(
+            &mut relay,
+            &mut channel,
+            Q::StepUp {
+                password: Some(Secret::new(password)),
+                totp: None
+            }
+        )
+        .await,
+        R::Ok
+    ));
+    let policy = AccessPolicy::SkillOnly(vec![random(); a206_vault_channel::MAX_POLICY_SCOPES]);
+    assert!(matches!(
+        secure_call(
+            &mut relay,
+            &mut channel,
+            Q::SetCredentialPolicy {
+                name: name.clone(),
+                policy: policy.clone()
+            }
+        )
+        .await,
+        R::Error(_)
+    ));
+    assert!(matches!(
+        owner
+            .call(Request::UpdateCredential {
+                name,
+                policy: Some(policy),
+                disabled: None,
+                destinations: None,
+            })
+            .await,
+        Err(ClientError::Broker(BrokerError::Vault(
+            VaultFailure::MetadataTooLarge
+        )))
+    ));
+    let Reply::CredentialPage(after) = owner.call(page_request(None, 5)).await.unwrap() else {
+        panic!()
+    };
+    assert_eq!(after, before);
+    let destinations = (0..16)
+        .map(|_| {
+            format!(
+                "https://{}.{}.{}.example.invalid",
+                random(),
+                "a".repeat(50),
+                "b".repeat(50)
+            )
+        })
+        .collect();
+    assert!(matches!(
+        secure_call(
+            &mut relay,
+            &mut channel,
+            Q::SetCredentialDestinations {
+                name: before.entries[0].0.clone(),
+                destinations,
+            }
+        )
+        .await,
+        R::Error(_)
+    ));
+    let Reply::CredentialPage(after_destination) = owner.call(page_request(None, 5)).await.unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(after_destination, before);
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn encrypted_destination_edits_preserve_private_values_and_other_restrictions() {
     use a206_vault_channel::{Code, Reply as R, Request as Q, Secret};
     let (_dir, root, task) = start().await;

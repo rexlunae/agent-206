@@ -19,6 +19,10 @@ pub const AGENT_ACCESS_BROKER_VERSION: u16 = 18;
 pub const CREDENTIAL_STATE_BROKER_VERSION: u16 = 19;
 /// First broker that accepts destination edits through the encrypted panel.
 pub const CREDENTIAL_DESTINATIONS_BROKER_VERSION: u16 = 20;
+/// First broker accepting policy changes through the encrypted panel.
+pub const CREDENTIAL_POLICY_BROKER_VERSION: u16 = 21;
+pub const MAX_POLICY_SCOPES: usize = 64;
+pub const MAX_POLICY_SCOPE_BYTES: usize = 256;
 pub const CREDENTIALS_SCHEMA_VERSION: u16 = 1;
 pub const MAX_CREDENTIAL_PAGE: u16 = 50;
 pub const MAX_CREDENTIAL_PAGE_BYTES: usize = 48 * 1024;
@@ -204,6 +208,10 @@ pub enum Request {
     SetCredentialDestinations {
         name: String,
         destinations: Vec<String>,
+    },
+    SetCredentialPolicy {
+        name: String,
+        policy: AccessPolicy,
     },
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

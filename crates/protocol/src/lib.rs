@@ -44,6 +44,30 @@ pub fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, Error> {
     frame.extend_from_slice(&payload);
     Ok(frame)
 }
+/// Measure the same named MessagePack representation and header as `encode`,
+/// without allocating a frame or enforcing its transport limit. This supports
+/// comparisons of oversized stored data; sending it still requires `encode`.
+pub fn encoded_size<T: Serialize>(value: &T) -> Result<usize, Error> {
+    let mut count = ByteCount(HEADER);
+    rmp_serde::encode::write_named(&mut count, value)?;
+    Ok(count.0)
+}
+
+struct ByteCount(usize);
+impl std::io::Write for ByteCount {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0 = self.0.checked_add(bytes.len()).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "serialized size exceeds addressable memory",
+            )
+        })?;
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
 pub fn payload_size(header: &[u8; HEADER]) -> Result<usize, Error> {
     if &header[..4] != b"A206" || u16::from_be_bytes([header[4], header[5]]) != VERSION {
         return Err(Error::Header);
@@ -99,6 +123,43 @@ impl Decoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn measured_size_matches_frames_and_counts_beyond_the_transport_limit() {
+        #[derive(Serialize)]
+        struct Record {
+            id: Uuid,
+            description: Option<String>,
+            scopes: Vec<String>,
+        }
+        for description in [None, Some(String::new()), Some(Uuid::new_v4().to_string())] {
+            let record = Record {
+                id: Uuid::new_v4(),
+                description,
+                scopes: vec![Uuid::new_v4().to_string(), String::new()],
+            };
+            assert_eq!(
+                encoded_size(&record).unwrap(),
+                encode(&record).unwrap().len()
+            );
+        }
+        let mut large = "x".repeat(MAX_FRAME + 1);
+        let initial = encoded_size(&large).unwrap();
+        assert_eq!(initial, HEADER + 5 + large.len()); // str32 length prefix
+        assert!(matches!(encode(&large), Err(Error::TooLarge)));
+        large.push('x');
+        assert_eq!(encoded_size(&large).unwrap(), initial + 1);
+    }
+
+    #[test]
+    fn counting_overflow_is_an_error_instead_of_a_sentinel_size() {
+        use std::io::Write;
+        let mut count = ByteCount(usize::MAX);
+        assert_eq!(
+            count.write(&[0]).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        assert_eq!(count.0, usize::MAX);
+    }
     #[test]
     fn arbitrary_packet_boundaries_and_coalescing() {
         let bytes = [encode(&"first").unwrap(), encode(&"second").unwrap()].concat();

@@ -134,8 +134,8 @@ fn policy(policy: &AccessPolicy) -> String {
         AccessPolicy::WithAuth => "Fresh authentication".into(),
         AccessPolicy::SkillOnly(scopes) if scopes.is_empty() => "Locked: no skills".into(),
         AccessPolicy::TriggerOnly(scopes) if scopes.is_empty() => "Locked: no triggers".into(),
-        AccessPolicy::SkillOnly(scopes) => format!("Skills: {}", scopes.join(", ")),
-        AccessPolicy::TriggerOnly(scopes) => format!("Triggers: {}", scopes.join(", ")),
+        AccessPolicy::SkillOnly(scopes) => format!("Skills: {scopes:?}"),
+        AccessPolicy::TriggerOnly(scopes) => format!("Triggers: {scopes:?}"),
     }
 }
 fn kind(kind: CredentialKind) -> &'static str {
@@ -173,8 +173,11 @@ pub(super) fn Credentials(
             onread.call(None);
         }
     });
-    let changing =
-        busy || (panel.flow)() != Flow::Idle || (panel.key_editor)() || editing().is_some();
+    let changing = busy
+        || (panel.flow)() != Flow::Idle
+        || (panel.key_editor)()
+        || editing().is_some()
+        || (panel.policy_editor)().is_some();
     let available = if changing {
         Availability::Disabled
     } else {
@@ -194,7 +197,7 @@ pub(super) fn Credentials(
                             rsx! { strong { "{meta.label}" } br {} code { "{name}" } },
                         ),
                         TableCell::text(kind(meta.kind)),
-                        TableCell::text(policy(&meta.policy)),
+                        TableCell::rich(name, rsx! { span { class: "a206-policy-identifier", "{policy(&meta.policy)}" } }),
                         TableCell::text(if meta.destinations.is_empty() {
                             "No permitted destinations".into()
                         } else {
@@ -215,6 +218,14 @@ pub(super) fn Credentials(
                                     move |_| editing.set(Some(DestinationDraft { name: name.clone(), origins: destinations.join(" ") }))
                                 },
                                 "Edit destinations for {meta.label}"
+                            }
+                            Button { variant: ButtonVariant::Ghost,
+                                availability: if changing { Availability::Disabled } else { Availability::Enabled },
+                                onclick: {
+                                    let name = name.clone();
+                                    let policy = meta.policy.clone();
+                                    move |_| panel.policy_editor.set(Some(super::credential_policy::PolicyDraft::new(name.clone(), policy.clone())))
+                                }, "Edit policy for {meta.label}"
                             }
                         }),
                     ],
@@ -246,11 +257,17 @@ pub(super) fn Credentials(
                     oncancel: move |_| editing.set(None),
                 }
             }
+            if (panel.policy_editor)().is_some() {
+                super::credential_policy::PolicyForm { draft: panel.policy_editor, busy: busy || (panel.flow)() != Flow::Idle,
+                    onsave: move |(name, policy)| panel.start(Task::SetCredentialPolicy { name, policy }),
+                    oncancel: move |_| panel.policy_editor.set(None),
+                }
+            }
         }
         CardFooter {
-            CredentialPaging { unavailable: busy || (panel.flow)() != Flow::Idle || (panel.key_editor)(), editing: editing().is_some(), failed,
+            CredentialPaging { unavailable: busy || (panel.flow)() != Flow::Idle || (panel.key_editor)(), editing: editing().is_some() || (panel.policy_editor)().is_some(), failed,
                 next: page.as_ref().and_then(|p| p.next.clone()), onread }
-            if page.is_some() && !(panel.key_editor)() && editing().is_none() {
+            if page.is_some() && !(panel.key_editor)() && editing().is_none() && (panel.policy_editor)().is_none() {
                 Button { variant: ButtonVariant::Secondary, availability: available, onclick: move |_| panel.start(Task::AddCredential), "Add API key" }
             }
         }
@@ -378,6 +395,16 @@ fn KeyForm(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn scoped_policy_labels_quote_exact_identifiers_including_whitespace() {
+        let identifier = format!("  {}  ", uuid::Uuid::new_v4());
+        for policy_value in [
+            AccessPolicy::SkillOnly(vec![identifier.clone()]),
+            AccessPolicy::TriggerOnly(vec![identifier.clone()]),
+        ] {
+            assert!(policy(&policy_value).contains(&format!("{identifier:?}")));
+        }
+    }
     #[test]
     fn invalid_destinations_and_uncertain_writes_offer_different_recovery() {
         let error = |kind| VaultError {

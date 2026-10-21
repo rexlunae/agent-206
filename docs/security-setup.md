@@ -192,7 +192,7 @@ change, authenticated re-enable and disabled-state persistence across lock/reope
 with policy and origin retained and global access off. Native desktop interaction
 remains unverified; the TUI guard is unchanged.
 
-Other GUI editing, SSH-key/form/payment entry, agent-use approvals and remote vault
+Other entry kinds, SSH-key/form/payment entry, agent-use approvals and remote vault
 controls remain pending; the CLI supports SSH-key and other entry kinds and policy
 edits. Form and payment entry remain unavailable in both clients.
 
@@ -212,3 +212,25 @@ cancel without a change, an authenticated empty list and lock/reopen persistence
 Approval policy, enabled state and global access remained unchanged; the gateway
 stayed stopped. No real credentials, accounts or model calls were used.
 Native desktop interaction remains unverified and TUI vault controls stay blocked.
+
+Shared credential rows also edit all five policy variants through broker step-up
+(both policy editors require broker v21). Skill/trigger identifiers are separate fields,
+preserved exactly with no trimming or splitting; empty scope lists deny every use.
+Each scope draft survives selector changes, rejection and authentication cancel.
+Only a confirmed broker write clears the editor and reloads metadata. The broker
+limits panel policies to 64 nonempty identifiers of at most 256 bytes without
+control characters. It also refuses any metadata expansion beyond a bounded
+single-entry page, under the same vault lock before committing the change. An
+already oversized entry may be disabled or otherwise remain the same size or
+shrink even if it still exceeds that panel limit. The omitted-false flag's small
+encoding growth is allowed only for disabling an already oversized entry.
+Existing native flag and destination edits can therefore restrict oversized
+imported entries without blocking recovery.
+Comparisons count exact serialized bytes even for imported metadata larger than
+the 4 MiB transport frame, without allocating that frame or relaxing its limit.
+The desktop policy editor checks the negotiated v21 metadata-size capability
+before sending; this is not an unknown-opcode guard and leaves ordinary CLI/native
+operations compatible. Native `UpdateCredential` remains the opcode for policy changes; disabled state,
+destinations and private values are retained. No agent approvals or authentication
+facts are created by saving a policy. Credential-use approval and native desktop
+interaction acceptance remain pending; TUI vault controls remain unavailable.

@@ -12,6 +12,47 @@ fn version(session: &Session, schema: u16) -> Result<(), BrokerError> {
     Ok(())
 }
 
+/// Keep an updated entry readable by the bounded metadata panel. Reserve the
+/// cursor/count encoding too, so it fits even when it is not the last entry.
+/// Already oversized imports may be disabled or otherwise remain the same size
+/// or shrink, so recovery need not first fit a panel page.
+pub(super) fn validate_updated_metadata(
+    name: &str,
+    previous: &CredentialMeta,
+    meta: CredentialMeta,
+) -> Result<(), BrokerError> {
+    let updated = metadata_size(name, meta.clone())?;
+    if updated <= MAX_CREDENTIAL_PAGE_BYTES {
+        return Ok(());
+    }
+    let mut comparison = previous.clone();
+    if metadata_size(name, comparison.clone())? > MAX_CREDENTIAL_PAGE_BYTES && meta.disabled {
+        // `false` is omitted from serialized metadata. Allow the additional
+        // disabled flag for an already oversized entry, not unrelated growth.
+        comparison.disabled = true;
+    }
+    if updated <= metadata_size(name, comparison)? {
+        return Ok(());
+    }
+    Err(BrokerError::Vault(VaultFailure::MetadataTooLarge))
+}
+
+fn metadata_size(name: &str, meta: CredentialMeta) -> Result<usize, BrokerError> {
+    let page = CredentialPage {
+        version: CREDENTIALS_SCHEMA_VERSION,
+        entries: vec![(name.to_owned(), meta)],
+        next: Some(name.to_owned()),
+        total: usize::MAX,
+        legacy_count: usize::MAX,
+    };
+    a206_protocol::encoded_size(&page).map_err(|error| {
+        BrokerError::Channel(
+            a206_core::ErrorReport::capture(&error, |_| Some(a206_core::ErrorKind::Protocol))
+                .with_correlation(uuid::Uuid::new_v4()),
+        )
+    })
+}
+
 pub(super) fn page(
     shared: &Shared,
     session: &Session,

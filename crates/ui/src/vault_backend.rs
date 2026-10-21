@@ -19,6 +19,17 @@ fn checked(reply: Reply) -> Result<Reply, Failure> {
 // serializing a reviewed request or its secrets for an unsupported connection.
 #[cfg(any(target_arch = "wasm32", test))]
 fn reviewed_supported(version: u16, request: &Request) -> Result<(), Failure> {
+    if version < a206_vault_channel::CREDENTIAL_POLICY_BROKER_VERSION
+        && matches!(request, Request::SetCredentialPolicy { .. })
+    {
+        return Err(Failure {
+            code: Code::Other,
+            report: a206_core::ErrorReport::new(
+                a206_core::ErrorKind::Unavailable,
+                "This broker cannot edit credential policies through this panel. Stop the old vault broker and retry with the updated application.",
+            ),
+        });
+    }
     if version < a206_vault_channel::CREDENTIAL_DESTINATIONS_BROKER_VERSION
         && matches!(request, Request::SetCredentialDestinations { .. })
     {
@@ -120,9 +131,16 @@ mod imp {
             if let Err(error) = a206_broker::channel::validate(&request) {
                 return checked(a206_broker::channel::reply(Err(error)));
             }
+            // The native opcode already exists. This editor specifically needs
+            // v21's atomic metadata-size check, not a new native request variant.
+            let minimum = if matches!(request, Request::SetCredentialPolicy { .. }) {
+                a206_vault_channel::CREDENTIAL_POLICY_BROKER_VERSION
+            } else {
+                a206_broker::MIN_BROKER_VERSION
+            };
             let result = self
                 .0
-                .call(a206_broker::channel::request(request))
+                .call_with_minimum(a206_broker::channel::request(request), minimum)
                 .await
                 .map_err(failure)?;
             checked(a206_broker::channel::reply(Ok(result)))
@@ -314,6 +332,33 @@ pub(crate) use imp::{Session, Target};
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn policy_changes_require_v21_without_raising_existing_operation_minimums() {
+        for version in 0..=22 {
+            assert_eq!(
+                reviewed_supported(
+                    version,
+                    &Request::SetCredentialPolicy {
+                        name: uuid::Uuid::new_v4().to_string(),
+                        policy: a206_vault_channel::AccessPolicy::WithApproval
+                    }
+                )
+                .is_ok(),
+                version >= 21
+            );
+            assert_eq!(
+                reviewed_supported(
+                    version,
+                    &Request::SetCredentialDestinations {
+                        name: uuid::Uuid::new_v4().to_string(),
+                        destinations: vec![]
+                    }
+                )
+                .is_ok(),
+                version >= 20
+            );
+        }
+    }
     #[test]
     fn destination_edits_refuse_old_web_peers_without_raising_older_minimums() {
         for version in 0..=21 {

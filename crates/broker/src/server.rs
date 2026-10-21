@@ -687,17 +687,23 @@ fn handle(shared: &Shared, session: &mut Session, request: Request) -> Handled {
             let destinations = destinations.map(origins).transpose()?;
             let mut vault = shared.vault();
             require_step_up(session, vault.generation())?;
+            let previous = vault.credential(&name).map_err(vault_error)?;
+            let mut updated = previous.clone();
+            if let Some(policy) = policy {
+                updated.policy = policy;
+            }
+            if let Some(disabled) = disabled {
+                updated.disabled = disabled;
+            }
+            if let Some(destinations) = destinations {
+                updated.destinations = destinations;
+            }
+            // Preserve recovery of oversized imports while keeping policy and
+            // destination expansions from stranding a readable panel entry.
+            credentials::validate_updated_metadata(&name, &previous, updated.clone())?;
             vault
                 .update_credential(&name, |meta: &mut CredentialMeta| {
-                    if let Some(policy) = policy {
-                        meta.policy = policy;
-                    }
-                    if let Some(disabled) = disabled {
-                        meta.disabled = disabled;
-                    }
-                    if let Some(destinations) = destinations {
-                        meta.destinations = destinations;
-                    }
+                    *meta = updated;
                 })
                 .map_err(vault_error)?;
             ok()

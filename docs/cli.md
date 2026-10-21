@@ -76,5 +76,9 @@ uses shared Security controls with broker step-up (encrypted support requires v1
 Destination-list replacement is also available through shared Security controls
 with broker step-up (encrypted support requires v20); the panel accepts exact
 origins only, while CLI `vault bind` keeps its existing URL normalization.
-Policy and value editing remain CLI operations. TUI vault controls remain unavailable.
+Policy editing is also available in shared Security controls through broker step-up
+(both desktop and web policy editors require v21's atomic metadata-size check;
+the native opcode and ordinary CLI compatibility are unchanged). Skill/trigger identifiers are preserved
+exactly; an empty scope list permits no uses. Value editing remains a CLI operation.
+TUI vault controls remain unavailable.
 No additional agent-facing secret tool is introduced.
