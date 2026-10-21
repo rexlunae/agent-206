@@ -84,6 +84,7 @@ pub fn request(value: wire::Request) -> Request {
         wire::Request::ConfirmTotp { code } => Request::ConfirmTotp { code: text(code) },
         wire::Request::CancelTotp => Request::CancelTotp,
         wire::Request::PairGateway => Request::PairGateway,
+        wire::Request::SetAgentAccess { enabled } => Request::SetAgentAccess { enabled },
     }
 }
 pub fn code(error: &BrokerError) -> wire::Code {

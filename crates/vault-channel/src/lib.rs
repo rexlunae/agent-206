@@ -13,6 +13,8 @@ pub const IMPORT_REVIEW_VERSION: u16 = 1;
 /// First broker protocol that implements connection-owned reviewed imports.
 pub const REVIEWED_IMPORT_BROKER_VERSION: u16 = 11;
 pub const CREDENTIALS_BROKER_VERSION: u16 = 17;
+/// First broker that accepts agent-access changes through the encrypted panel.
+pub const AGENT_ACCESS_BROKER_VERSION: u16 = 18;
 pub const CREDENTIALS_SCHEMA_VERSION: u16 = 1;
 pub const MAX_CREDENTIAL_PAGE: u16 = 50;
 pub const MAX_CREDENTIAL_PAGE_BYTES: usize = 48 * 1024;
@@ -188,6 +190,9 @@ pub enum Request {
     },
     CancelTotp,
     PairGateway,
+    SetAgentAccess {
+        enabled: bool,
+    },
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Status {
