@@ -141,6 +141,7 @@ struct Panel {
     credential_failure: Signal<Option<Failure>>,
     credential_read_failure: Signal<Option<Failure>>,
     key_editor: Signal<bool>,
+    destination_editor: Signal<Option<credentials::DestinationDraft>>,
     /// The Get started checklist, when this panel is on that page.
     progress: Option<VaultProgress>,
 }
@@ -230,6 +231,7 @@ impl Panel {
         // mutation failures separately so an uncertain save is never hidden.
         self.credential_read_failure.set(None);
         self.key_editor.set(false);
+        self.destination_editor.set(None);
     }
     /// The Get started page's background re-read. It never starts a broker,
     /// so a deliberate `vault stop` stays stopped, and its failure is shown
@@ -404,6 +406,7 @@ impl Panel {
                 {
                     Ok(Reply::Ok) => {
                         self.flow.set(Flow::Idle);
+                        self.destination_editor.set(None);
                         self.notice.set(Some("Credential destinations saved. Its policy and enabled state are unchanged."));
                         self.credential_page.set(None);
                         self.credential_read_failure.set(None);
@@ -413,10 +416,11 @@ impl Panel {
                     }
                     result => {
                         self.flow.set(Flow::Idle);
+                        let error = result.err().unwrap_or_else(unexpected);
                         self.fail(
                             "vault_credential_destinations",
-                            "Destination change not confirmed; refresh credentials before retrying",
-                            &result.err().unwrap_or_else(unexpected),
+                            credentials::destination_failure_title(&error),
+                            &error,
                         );
                     }
                 }
@@ -650,6 +654,7 @@ fn VaultPanel(target: Target) -> Element {
         credential_failure: use_signal(|| None),
         credential_read_failure: use_signal(|| None),
         key_editor: use_signal(|| false),
+        destination_editor: use_signal(|| None),
         progress: VaultProgress::listener(),
     };
     // Reads only through `peek`, so this runs once, after the first render.

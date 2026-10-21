@@ -199,6 +199,9 @@ replace its complete list with exact origins, separated by spaces. Paths,
 queries and fragments are refused. An empty list prevents brokered use. Save
 destinations asks for fresh authentication when required and retains the exact
 requested name/list for that challenge; Cancel authentication makes no change.
+Rejected saves keep the nonsecret draft available for correction. Refresh and
+page navigation wait until the edit is saved or explicitly cancelled. Locking or
+disconnecting clears the draft along with the rest of the panel state.
 After a confirmed save, the panel reloads metadata. If confirmation fails, refresh
 credentials before retrying. Policy, enabled state, private value and global agent
 access are unchanged. This encrypted operation requires broker v20; other panel
