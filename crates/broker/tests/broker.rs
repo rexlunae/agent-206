@@ -3073,6 +3073,58 @@ async fn encrypted_agent_access_requires_connection_owned_step_up_and_survives_r
 }
 
 #[tokio::test]
+async fn encrypted_authenticator_removal_never_substitutes_step_up_for_its_factors() {
+    use a206_vault_channel::{Code, Reply as R, Request as Q, Secret};
+    let (_dir, root, task) = start().await;
+    let password = random();
+    let mut owner = user(&root).await;
+    owner.call(unlock(&password, None, true)).await.unwrap();
+    let before = std::fs::read(vault_path(&root)).unwrap();
+    let (mut relay, mut channel) = secure_open(&root).await;
+    assert!(matches!(
+        secure_call(
+            &mut relay,
+            &mut channel,
+            Q::StepUp {
+                password: Some(Secret::new(password.clone())),
+                totp: None
+            }
+        )
+        .await,
+        R::Ok
+    ));
+    // A fresh step-up must not bypass the removal request's password check.
+    assert!(
+        matches!(secure_call(&mut relay, &mut channel, Q::RemoveTotp {
+        password: Secret::new(random()), code: Secret::new("malformed".into())
+    }).await, R::Error(error) if error.code == Code::AuthenticationFailed)
+    );
+    // No enrolled factor is never reported as a successful removal.
+    assert!(matches!(
+        secure_call(
+            &mut relay,
+            &mut channel,
+            Q::RemoveTotp {
+                password: Secret::new(password.clone()),
+                code: Secret::new("malformed".into())
+            }
+        )
+        .await,
+        R::Error(_)
+    ));
+    assert_eq!(std::fs::read(vault_path(&root)).unwrap(), before);
+    owner.call(Request::Lock).await.unwrap();
+    assert!(
+        matches!(secure_call(&mut relay, &mut channel, Q::RemoveTotp {
+        password: Secret::new(password), code: Secret::new("malformed".into())
+    }).await, R::Error(error) if error.report.kind == a206_core::ErrorKind::Unavailable)
+    );
+    assert_eq!(std::fs::read(vault_path(&root)).unwrap(), before);
+    owner.call(Request::Shutdown).await.unwrap();
+    task.await.unwrap();
+}
+
+#[tokio::test]
 async fn encrypted_setup_keeps_seeds_private_and_cancellation_discards_them() {
     use a206_vault_channel::{Code, Reply as R, Request as Q, Secret};
     let (_dir, root, task) = start().await;

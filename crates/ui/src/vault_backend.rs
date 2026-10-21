@@ -19,6 +19,17 @@ fn checked(reply: Reply) -> Result<Reply, Failure> {
 // serializing a reviewed request or its secrets for an unsupported connection.
 #[cfg(any(target_arch = "wasm32", test))]
 fn reviewed_supported(version: u16, request: &Request) -> Result<(), Failure> {
+    if version < a206_vault_channel::TOTP_REMOVAL_BROKER_VERSION
+        && matches!(request, Request::RemoveTotp { .. })
+    {
+        return Err(Failure {
+            code: Code::Other,
+            report: a206_core::ErrorReport::new(
+                a206_core::ErrorKind::Unavailable,
+                "This broker cannot remove an authenticator through this panel. Stop the old vault broker and retry with the updated application.",
+            ),
+        });
+    }
     if version < a206_vault_channel::CREDENTIAL_POLICY_BROKER_VERSION
         && matches!(request, Request::SetCredentialPolicy { .. })
     {
@@ -332,6 +343,17 @@ pub(crate) use imp::{Session, Target};
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn authenticator_removal_refuses_old_web_peers_before_sealing() {
+        for version in 0..=23 {
+            let request = Request::RemoveTotp {
+                password: a206_vault_channel::Secret::new(uuid::Uuid::new_v4().to_string()),
+                code: a206_vault_channel::Secret::new(uuid::Uuid::new_v4().to_string()),
+            };
+            assert_eq!(reviewed_supported(version, &request).is_ok(), version >= 22);
+            assert!(reviewed_supported(version, &Request::CancelTotp).is_ok());
+        }
+    }
     #[test]
     fn policy_changes_require_v21_without_raising_existing_operation_minimums() {
         for version in 0..=22 {

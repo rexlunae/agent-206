@@ -118,6 +118,10 @@ pub fn request(value: wire::Request) -> Request {
         wire::Request::BeginTotp { account } => Request::BeginTotp { account },
         wire::Request::ConfirmTotp { code } => Request::ConfirmTotp { code: text(code) },
         wire::Request::CancelTotp => Request::CancelTotp,
+        wire::Request::RemoveTotp { password, code } => Request::RemoveTotp {
+            password: secret(password),
+            code: text(code),
+        },
         wire::Request::PairGateway => Request::PairGateway,
         wire::Request::SetAgentAccess { enabled } => Request::SetAgentAccess { enabled },
         wire::Request::SetCredentialDisabled { name, disabled } => Request::UpdateCredential {
@@ -241,6 +245,27 @@ pub fn status(s: crate::BrokerStatus) -> wire::Status {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn authenticator_removal_maps_both_factors_to_the_existing_native_request() {
+        let password = uuid::Uuid::new_v4().to_string();
+        let code = uuid::Uuid::new_v4().to_string();
+        let value = wire::Request::RemoveTotp {
+            password: wire::Secret::new(password.clone()),
+            code: wire::Secret::new(code.clone()),
+        };
+        let debug = format!("{value:?}");
+        assert!(!debug.contains(&password));
+        assert!(!debug.contains(&code));
+        let Request::RemoveTotp {
+            password: actual_password,
+            code: actual_code,
+        } = request(value)
+        else {
+            panic!()
+        };
+        assert_eq!(actual_password.expose(), password);
+        assert_eq!(actual_code, code);
+    }
     #[test]
     fn channel_failures_preserve_root_kind_cause_and_correlation() {
         let report = ErrorReport::new(ErrorKind::Protocol, "metadata encoding failed")
