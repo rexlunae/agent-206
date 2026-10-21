@@ -70,6 +70,14 @@ and TOTP removal remain trusted CLI operations. The CLI also offers token, login
 passkey, SSH-key, note and other entry kinds; this panel adds API keys only. Form
 and payment entry are still unavailable in both clients.
 
+Each typed metadata row offers **Disable** or **Enable**, naming its credential.
+These actions require recent authentication and broker v19. They change only the
+disabled flag; policy, destinations, label and private value are retained. Enabling
+a credential does not enable global agent access or satisfy per-use approval.
+After confirmation the panel reloads metadata. If confirmation fails, refresh
+before retrying because a lost response may follow a completed write. Controls
+are disabled while another authentication or credential-entry flow is active.
+
 ## Optional migration
 
 Before creating a new empty vault, existing RustyClaw users can instead preview:

@@ -82,14 +82,15 @@ fn known(value: Option<bool>) -> &'static str {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 enum Task {
     Pair,
     Enroll,
     AddCredential,
     SetAgentAccess(bool),
+    SetCredentialDisabled { name: String, disabled: bool },
 }
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 enum Flow {
     Idle,
     /// The vault asked for an authenticator code; the password is held.
@@ -387,7 +388,33 @@ impl Panel {
         });
     }
     async fn perform(mut self, task: Task) {
-        match task {
+        match task.clone() {
+            Task::SetCredentialDisabled { name, disabled } => {
+                match self
+                    .session()
+                    .call(Request::SetCredentialDisabled { name, disabled })
+                    .await
+                {
+                    Ok(Reply::Ok) => {
+                        self.flow.set(Flow::Idle);
+                        self.notice.set(Some(if disabled { "Credential disabled." } else { "Credential enabled. Its policy and destination restrictions still apply." }));
+                        // Reload metadata from the broker; never optimistically change a row.
+                        self.credential_page.set(None);
+                        self.credential_read_failure.set(None);
+                    }
+                    Err(error) if broker_refused(&error, BrokerError::StepUpRequired) => {
+                        self.flow.set(Flow::StepUp(task));
+                    }
+                    result => {
+                        self.flow.set(Flow::Idle);
+                        self.fail(
+                            "vault_credential_state",
+                            "Credential change not confirmed; refresh credentials before retrying",
+                            &result.err().unwrap_or_else(unexpected),
+                        );
+                    }
+                }
+            }
             Task::SetAgentAccess(enabled) => {
                 match self
                     .session()
@@ -689,14 +716,15 @@ fn VaultPanel(target: Target) -> Element {
             if let Some(Failure { title, report }) = (panel.poll_failure)() {
                 ErrorNotice { report, title }
             }
-            match flow {
+            match flow.clone() {
                 Flow::UnlockCode => rsx! {
                     Field { label: rsx! { "Authenticator code" }, hint: rsx! { "This vault has two-factor authentication. Enter the current code from your app." },
                         Input { r#type: InputType::Text, value: ReadSignal::from(code), oninput: move |v| code.set(v), autocomplete: "one-time-code", inputmode: "numeric" }
                     }
                 },
                 Flow::StepUp(task) => rsx! {
-                    p { match task { Task::Pair => "Confirm it is you before pairing the gateway.", Task::Enroll => "Confirm it is you before enrolling an authenticator.", Task::AddCredential => "Confirm it is you before adding an API key.", Task::SetAgentAccess(true) => "Confirm it is you before enabling agent credential access.", Task::SetAgentAccess(false) => "Confirm it is you before disabling agent credential access." } }
+                    p { match &task { Task::Pair => "Confirm it is you before pairing the gateway.", Task::Enroll => "Confirm it is you before enrolling an authenticator.", Task::AddCredential => "Confirm it is you before adding an API key.", Task::SetAgentAccess(true) => "Confirm it is you before enabling agent credential access.", Task::SetAgentAccess(false) => "Confirm it is you before disabling agent credential access.", Task::SetCredentialDisabled { disabled: true, .. } => "Confirm it is you before disabling this credential.", Task::SetCredentialDisabled { disabled: false, .. } => "Confirm it is you before enabling this credential." } }
+                    if let Task::SetCredentialDisabled { name, .. } = &task { code { "{name}" } }
                     if enrolled {
                         Field { label: rsx! { "Authenticator code" },
                             Input { value: ReadSignal::from(code), oninput: move |v| code.set(v), autocomplete: "one-time-code", inputmode: "numeric" }
@@ -733,7 +761,7 @@ fn VaultPanel(target: Target) -> Element {
             }
         }
         CardFooter {
-            match flow {
+            match flow.clone() {
                 Flow::UnlockCode => rsx! {
                     Button { variant: ButtonVariant::Primary, availability: availability.clone(), busy,
                         onclick: move |_| {
@@ -751,9 +779,9 @@ fn VaultPanel(target: Target) -> Element {
                     Button { variant: ButtonVariant::Primary, availability: availability.clone(), busy,
                         onclick: move |_| {
                             if enrolled {
-                                panel.step_up(task, None, Some(take(code)));
+                                panel.step_up(task.clone(), None, Some(take(code)));
                             } else {
-                                panel.step_up(task, Some(WireSecret::new(take(password))), None);
+                                panel.step_up(task.clone(), Some(WireSecret::new(take(password))), None);
                             }
                         },
                         "Continue" }
@@ -814,6 +842,7 @@ fn VaultPanel(target: Target) -> Element {
         credentials::Credentials { panel,
             onread: move |after| panel.read_credentials(after),
             onadd: move |input| panel.add_key(input),
+            onchange: move |(name, disabled)| panel.start(Task::SetCredentialDisabled { name, disabled }),
         }
     }
     }

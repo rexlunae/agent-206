@@ -19,6 +19,17 @@ fn checked(reply: Reply) -> Result<Reply, Failure> {
 // serializing a reviewed request or its secrets for an unsupported connection.
 #[cfg(any(target_arch = "wasm32", test))]
 fn reviewed_supported(version: u16, request: &Request) -> Result<(), Failure> {
+    if version < a206_vault_channel::CREDENTIAL_STATE_BROKER_VERSION
+        && matches!(request, Request::SetCredentialDisabled { .. })
+    {
+        return Err(Failure {
+            code: Code::Other,
+            report: a206_core::ErrorReport::new(
+                a206_core::ErrorKind::Unavailable,
+                "This broker cannot enable or disable credentials through this panel. Stop the old vault broker and retry with the updated application.",
+            ),
+        });
+    }
     if version < a206_vault_channel::AGENT_ACCESS_BROKER_VERSION
         && matches!(request, Request::SetAgentAccess { .. })
     {
@@ -289,6 +300,28 @@ pub(crate) use imp::{Session, Target};
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn credential_state_changes_require_v19_but_keep_existing_features() {
+        for version in 0..=20 {
+            for disabled in [true, false] {
+                assert_eq!(
+                    reviewed_supported(
+                        version,
+                        &Request::SetCredentialDisabled {
+                            name: uuid::Uuid::new_v4().to_string(),
+                            disabled,
+                        }
+                    )
+                    .is_ok(),
+                    version >= 19
+                );
+            }
+            assert_eq!(
+                reviewed_supported(version, &Request::SetAgentAccess { enabled: false }).is_ok(),
+                version >= 18
+            );
+        }
+    }
     #[test]
     fn agent_access_changes_refuse_old_brokers_before_sending() {
         for version in 0..=19 {

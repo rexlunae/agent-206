@@ -2302,6 +2302,139 @@ async fn secure_call(
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn encrypted_credential_state_is_authenticated_targeted_and_metadata_only() {
+    use a206_vault_channel::{Code, Reply as R, Request as Q, Secret};
+    let (_dir, root, task) = start().await;
+    let password = random();
+    let mut owner = user(&root).await;
+    owner.call(unlock(&password, None, true)).await.unwrap();
+    let name = random();
+    let other = random();
+    let value = random();
+    let mut expected = meta(vec!["https://example.invalid".into()]);
+    expected.policy = AccessPolicy::SkillOnly(vec![random()]);
+    let mut untouched = meta(vec![]);
+    untouched.disabled = true;
+    for (name, meta) in [
+        (name.clone(), expected.clone()),
+        (other.clone(), untouched.clone()),
+    ] {
+        owner
+            .call(Request::PutCredential {
+                name,
+                meta,
+                value: WireValue::Single(WireSecret::new(value.clone())),
+                replace: false,
+            })
+            .await
+            .unwrap();
+    }
+    let (mut relay, mut channel) = secure_open(&root).await;
+    let change = |disabled| Q::SetCredentialDisabled {
+        name: name.clone(),
+        disabled,
+    };
+    for disabled in [true, false] {
+        assert!(
+            matches!(secure_call(&mut relay, &mut channel, change(disabled)).await,
+            R::Error(error) if error.code == Code::StepUpRequired)
+        );
+    }
+    assert!(matches!(
+        secure_call(
+            &mut relay,
+            &mut channel,
+            Q::StepUp {
+                password: Some(Secret::new(password.clone())),
+                totp: None,
+            }
+        )
+        .await,
+        R::Ok
+    ));
+    for disabled in [true, false, true] {
+        assert!(matches!(
+            secure_call(&mut relay, &mut channel, change(disabled)).await,
+            R::Ok
+        ));
+        let R::CredentialPage(page) = secure_call(
+            &mut relay,
+            &mut channel,
+            Q::CredentialPage {
+                version: a206_vault_channel::CREDENTIALS_SCHEMA_VERSION,
+                after: None,
+                limit: 5,
+            },
+        )
+        .await
+        else {
+            panic!("missing metadata");
+        };
+        expected.disabled = disabled;
+        assert_eq!(
+            page.entries.iter().find(|(key, _)| key == &name).unwrap().1,
+            expected
+        );
+        assert_eq!(
+            page.entries
+                .iter()
+                .find(|(key, _)| key == &other)
+                .unwrap()
+                .1,
+            untouched
+        );
+        let bytes = a206_protocol::encode(&page).unwrap();
+        assert!(
+            !bytes
+                .windows(value.len())
+                .any(|bytes| bytes == value.as_bytes())
+        );
+        assert_eq!(status(&mut owner).await.agent_access, Some(false));
+    }
+    assert!(matches!(
+        secure_call(
+            &mut relay,
+            &mut channel,
+            Q::SetCredentialDisabled {
+                name: random(),
+                disabled: false,
+            }
+        )
+        .await,
+        R::Error(_)
+    ));
+    owner.call(Request::Lock).await.unwrap();
+    assert!(matches!(
+        secure_call(&mut relay, &mut channel, change(false)).await,
+        R::Error(_)
+    ));
+    owner.call(unlock(&password, None, false)).await.unwrap();
+    // Persisted metadata and the private value are unchanged apart from the flag.
+    let Reply::CredentialPage(page) = owner.call(page_request(None, 5)).await.unwrap() else {
+        panic!();
+    };
+    assert_eq!(
+        page.entries.iter().find(|(key, _)| key == &name).unwrap().1,
+        expected
+    );
+    let Reply::Value(WireValue::Single(saved)) = owner
+        .call(Request::Reveal { name: name.clone() })
+        .await
+        .unwrap()
+    else {
+        panic!();
+    };
+    assert_eq!(saved.expose(), value);
+    // Lock revoked the channel's earlier authentication.
+    assert!(
+        matches!(secure_call(&mut relay, &mut channel, change(false)).await,
+        R::Error(error) if error.code == Code::StepUpRequired)
+    );
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn encrypted_agent_access_requires_connection_owned_step_up_and_survives_reopen() {
     use a206_vault_channel::{Code, Reply as R, Request as Q, Secret};
     let (_dir, root, task) = start().await;

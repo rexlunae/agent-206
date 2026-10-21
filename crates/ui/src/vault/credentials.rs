@@ -144,6 +144,7 @@ pub(super) fn Credentials(
     panel: Panel,
     onread: EventHandler<Option<String>>,
     onadd: EventHandler<KeyInput>,
+    onchange: EventHandler<(String, bool)>,
 ) -> Element {
     let busy = (panel.busy)();
     let page = (panel.credential_page)();
@@ -161,6 +162,7 @@ pub(super) fn Credentials(
     } else {
         Availability::Enabled
     };
+    let changing = busy || (panel.flow)() != Flow::Idle || (panel.key_editor)();
     let rows = page
         .as_ref()
         .map(|page| {
@@ -182,6 +184,12 @@ pub(super) fn Credentials(
                             meta.destinations.join(", ")
                         }),
                         TableCell::text(if meta.disabled { "Disabled" } else { "Enabled" }),
+                        TableCell::rich(name, rsx! {
+                            CredentialStateAction {
+                                name: name.clone(), label: meta.label.clone(), disabled: meta.disabled,
+                                busy: changing, onrequest: onchange,
+                            }
+                        }),
                     ],
                 })
                 .collect::<Vec<_>>()
@@ -195,7 +203,7 @@ pub(super) fn Credentials(
             p { class: "a206-muted", "Values are never displayed. Agent access, destination restrictions and per-use policies all apply." }
             if let Some(page) = &page {
                 Table { caption: rsx! { "Stored credential policies" }, compact: true, busy,
-                    columns: vec![TableColumn::new("Credential").row_header(), TableColumn::new("Kind"), TableColumn::new("Policy"), TableColumn::new("Destinations"), TableColumn::new("Status")], rows,
+                    columns: vec![TableColumn::new("Credential").row_header(), TableColumn::new("Kind"), TableColumn::new("Policy"), TableColumn::new("Destinations"), TableColumn::new("Status"), TableColumn::new("Action")], rows,
                     empty: rsx! { "No typed credentials on this page." },
                 }
                 if page.legacy_count > 0 { p { "{page.legacy_count} legacy entries are available through the trusted local CLI." } }
@@ -215,6 +223,24 @@ pub(super) fn Credentials(
             }
         }
     } }
+}
+
+#[component]
+fn CredentialStateAction(
+    name: String,
+    label: String,
+    disabled: bool,
+    busy: bool,
+    onrequest: EventHandler<(String, bool)>,
+) -> Element {
+    rsx! {
+        Button {
+            variant: ButtonVariant::Ghost,
+            availability: if busy { Availability::Disabled } else { Availability::Enabled },
+            onclick: move |_| onrequest.call((name.clone(), !disabled)),
+            if disabled { "Enable {label}" } else { "Disable {label}" }
+        }
+    }
 }
 #[component]
 fn KeyForm(
@@ -270,6 +296,23 @@ fn KeyForm(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn credential_state_actions_name_the_credential_and_disable_while_busy() {
+        fn root((disabled, busy, label): (bool, bool, String)) -> Element {
+            rsx! { CredentialStateAction { name: "metadata-key".to_string(), label, disabled, busy, onrequest: move |_| {} } }
+        }
+        let label = uuid::Uuid::new_v4().to_string();
+        for disabled in [false, true] {
+            for busy in [false, true] {
+                let mut dom = VirtualDom::new_with_props(root, (disabled, busy, label.clone()));
+                dom.rebuild_in_place();
+                let html = dioxus_ssr::render(&dom);
+                let action = if disabled { "Enable" } else { "Disable" };
+                assert!(html.contains(&format!("{action} {label}")), "{html}");
+                assert_eq!(html.contains(" disabled=true"), busy, "{html}");
+            }
+        }
+    }
     #[test]
     fn confirmed_rejections_and_uncertain_saves_have_different_recovery() {
         for kind in [
