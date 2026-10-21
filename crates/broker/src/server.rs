@@ -348,9 +348,9 @@ fn handle(shared: &Shared, session: &mut Session, request: Request) -> Handled {
                 let operation = channel
                     .open::<a206_vault_channel::Request>(&bytes)
                     .map_err(crate::channel::channel_error)?;
-                let request = crate::channel::request(operation);
                 session.role = Some(Role::User);
-                let outcome = handle(shared, session, request);
+                let outcome = crate::channel::validate(&operation)
+                    .and_then(|()| handle(shared, session, crate::channel::request(operation)));
                 session.role = Some(Role::Relay);
                 let reply = crate::channel::reply(outcome.map(|outcome| match outcome {
                     Outcome::Reply(reply) => reply,

@@ -195,3 +195,20 @@ remains unverified; the TUI guard is unchanged.
 Other GUI editing, SSH-key/form/payment entry, agent-use approvals and remote vault
 controls remain pending; the CLI supports SSH-key and other entry kinds and policy
 edits. Form and payment entry remain unavailable in both clients.
+
+Credential rows also offer Edit destinations. The editor replaces the complete
+list of permitted origins, including an empty list that prevents brokered use.
+The exact credential name and list are retained through step-up authentication;
+policy, enabled state and private value stay unchanged. Broker v20 adds this
+encrypted-panel operation, mapped to the existing native `UpdateCredential`.
+Panel validation rejects paths, queries and fragments instead of silently
+reducing a URL to an origin; the older CLI normalization remains compatible.
+Old web peers are refused before sealing. Owning broker tests cover invalid-input
+atomicity, empty/multiple origins, authentication, lock revocation, persistence,
+isolation from another entry and preservation of private values and restrictions.
+Release-web checks in a disposable synthetic vault verified rejection without a
+write, multiple-origin replacement, reconnect/step-up with the exact target/list,
+cancel without a change, an authenticated empty list and lock/reopen persistence.
+Approval policy, enabled state and global access remained unchanged; the gateway
+stayed stopped. No real credentials, accounts or model calls were used.
+Native desktop interaction remains unverified and TUI vault controls stay blocked.

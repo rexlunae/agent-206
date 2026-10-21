@@ -17,6 +17,8 @@ pub const CREDENTIALS_BROKER_VERSION: u16 = 17;
 pub const AGENT_ACCESS_BROKER_VERSION: u16 = 18;
 /// First broker that accepts credential-state changes through the encrypted panel.
 pub const CREDENTIAL_STATE_BROKER_VERSION: u16 = 19;
+/// First broker that accepts destination edits through the encrypted panel.
+pub const CREDENTIAL_DESTINATIONS_BROKER_VERSION: u16 = 20;
 pub const CREDENTIALS_SCHEMA_VERSION: u16 = 1;
 pub const MAX_CREDENTIAL_PAGE: u16 = 50;
 pub const MAX_CREDENTIAL_PAGE_BYTES: usize = 48 * 1024;
@@ -198,6 +200,10 @@ pub enum Request {
     SetCredentialDisabled {
         name: String,
         disabled: bool,
+    },
+    SetCredentialDestinations {
+        name: String,
+        destinations: Vec<String>,
     },
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

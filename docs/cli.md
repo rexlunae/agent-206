@@ -73,5 +73,8 @@ step-up reveal operations. Global agent-access enable/disable is also available 
 the shared desktop/web Security page through the same broker step-up policy
 (encrypted panel support requires broker v18). Per-credential enable/disable also
 uses shared Security controls with broker step-up (encrypted support requires v19).
-Policy, destination and value editing remain CLI operations. TUI vault controls remain unavailable.
+Destination-list replacement is also available through shared Security controls
+with broker step-up (encrypted support requires v20); the panel accepts exact
+origins only, while CLI `vault bind` keeps its existing URL normalization.
+Policy and value editing remain CLI operations. TUI vault controls remain unavailable.
 No additional agent-facing secret tool is introduced.

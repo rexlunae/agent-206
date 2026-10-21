@@ -2302,6 +2302,166 @@ async fn secure_call(
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn encrypted_destination_edits_preserve_private_values_and_other_restrictions() {
+    use a206_vault_channel::{Code, Reply as R, Request as Q, Secret};
+    let (_dir, root, task) = start().await;
+    let password = random();
+    let mut owner = user(&root).await;
+    owner.call(unlock(&password, None, true)).await.unwrap();
+    let name = random();
+    let other = random();
+    let value = random();
+    let mut expected = meta(vec!["https://old.example.invalid".into()]);
+    expected.policy = AccessPolicy::TriggerOnly(vec![random()]);
+    expected.disabled = true;
+    for key in [&name, &other] {
+        owner
+            .call(Request::PutCredential {
+                name: key.clone(),
+                meta: expected.clone(),
+                value: WireValue::Single(WireSecret::new(value.clone())),
+                replace: false,
+            })
+            .await
+            .unwrap();
+    }
+    let untouched = expected.clone();
+    let (mut relay, mut channel) = secure_open(&root).await;
+    let change = |destinations| Q::SetCredentialDestinations {
+        name: name.clone(),
+        destinations,
+    };
+    assert!(
+        matches!(secure_call(&mut relay, &mut channel, change(vec![])).await,
+        R::Error(error) if error.code == Code::StepUpRequired)
+    );
+    assert!(matches!(
+        secure_call(
+            &mut relay,
+            &mut channel,
+            Q::StepUp {
+                password: Some(Secret::new(password.clone())),
+                totp: None,
+            }
+        )
+        .await,
+        R::Ok
+    ));
+    // Invalid origins must not partially replace the saved list.
+    for bad in [
+        "https://example.invalid/path",
+        "https://example.invalid?query",
+        "https://example.invalid#fragment",
+        "not-an-origin",
+    ] {
+        assert!(matches!(
+            secure_call(
+                &mut relay,
+                &mut channel,
+                change(vec!["https://valid.example.invalid".into(), bad.into()])
+            )
+            .await,
+            R::Error(_)
+        ));
+    }
+    for oversized in [
+        vec!["https://example.invalid".into(); 17],
+        vec![format!(
+            "https://{}.invalid",
+            "x".repeat(a206_vault_channel::MAX_CREDENTIAL_DESTINATION_BYTES)
+        )],
+    ] {
+        assert!(matches!(
+            secure_call(&mut relay, &mut channel, change(oversized)).await,
+            R::Error(_)
+        ));
+    }
+    let Reply::CredentialPage(page) = owner.call(page_request(None, 5)).await.unwrap() else {
+        panic!()
+    };
+    assert_eq!(
+        page.entries.iter().find(|(key, _)| key == &name).unwrap().1,
+        expected
+    );
+    for destinations in [
+        vec!["https://new.example.invalid".into()],
+        vec![],
+        vec![
+            "https://one.example.invalid".into(),
+            "https://two.example.invalid".into(),
+            "ssh://key.example.invalid:22".into(),
+        ],
+    ] {
+        assert!(matches!(
+            secure_call(&mut relay, &mut channel, change(destinations.clone())).await,
+            R::Ok
+        ));
+        expected.destinations = destinations;
+        let Reply::CredentialPage(page) = owner.call(page_request(None, 5)).await.unwrap() else {
+            panic!()
+        };
+        assert_eq!(
+            page.entries.iter().find(|(key, _)| key == &name).unwrap().1,
+            expected
+        );
+        assert_eq!(
+            page.entries
+                .iter()
+                .find(|(key, _)| key == &other)
+                .unwrap()
+                .1,
+            untouched
+        );
+        let bytes = a206_protocol::encode(&page).unwrap();
+        assert!(
+            !bytes
+                .windows(value.len())
+                .any(|bytes| bytes == value.as_bytes())
+        );
+        assert_eq!(status(&mut owner).await.agent_access, Some(false));
+    }
+    assert!(matches!(
+        secure_call(
+            &mut relay,
+            &mut channel,
+            Q::SetCredentialDestinations {
+                name: random(),
+                destinations: vec![]
+            }
+        )
+        .await,
+        R::Error(_)
+    ));
+    owner.call(Request::Lock).await.unwrap();
+    assert!(matches!(
+        secure_call(&mut relay, &mut channel, change(vec![])).await,
+        R::Error(_)
+    ));
+    owner.call(unlock(&password, None, false)).await.unwrap();
+    let Reply::CredentialPage(page) = owner.call(page_request(None, 5)).await.unwrap() else {
+        panic!()
+    };
+    assert_eq!(
+        page.entries.iter().find(|(key, _)| key == &name).unwrap().1,
+        expected
+    );
+    let Reply::Value(WireValue::Single(saved)) = owner
+        .call(Request::Reveal { name: name.clone() })
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(saved.expose(), value);
+    assert!(
+        matches!(secure_call(&mut relay, &mut channel, change(vec![])).await,
+        R::Error(error) if error.code == Code::StepUpRequired)
+    );
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn encrypted_credential_state_is_authenticated_targeted_and_metadata_only() {
     use a206_vault_channel::{Code, Reply as R, Request as Q, Secret};
     let (_dir, root, task) = start().await;
