@@ -695,6 +695,8 @@ struct Homeserver {
     /// Room, transaction id and content of each sent event.
     sent: Arc<Mutex<Vec<(String, String, Value)>>>,
     send_statuses: Arc<Mutex<VecDeque<u16>>>,
+    /// Hold a send response after request receipt, when a test needs that boundary.
+    send_gate: Arc<Mutex<Option<Arc<tokio::sync::Notify>>>>,
 }
 
 fn check_bearer(server: &Homeserver, headers: &axum::http::HeaderMap) {
@@ -791,6 +793,10 @@ async fn serve_homeserver(server: Homeserver) -> String {
             .lock()
             .unwrap()
             .push((room, transaction, content));
+        let gate = server.send_gate.lock().unwrap().clone();
+        if let Some(gate) = gate {
+            gate.notified().await;
+        }
         let status = server
             .send_statuses
             .lock()
@@ -3437,6 +3443,8 @@ async fn a_saved_position_of_another_kind_or_account_is_not_resumed() {
 #[tokio::test(flavor = "multi_thread")]
 async fn matrix_answers_what_arrived_while_it_was_stopped() {
     let (server, origin, _dir, credential, host, _anchor) = matrix_setup().await;
+    let response = Arc::new(tokio::sync::Notify::new());
+    *server.send_gate.lock().unwrap() = Some(response.clone());
     let name = "matrix-resume";
     let domain = server.user.split_once(':').unwrap().1.to_owned();
     let (room, member) = (matrix_id('!', &domain), matrix_id('@', &domain));
@@ -3493,6 +3501,21 @@ async fn matrix_answers_what_arrived_while_it_was_stopped() {
     let supervisor = tokio::spawn(supervise(host.clone(), receiver, FAST, stop.clone()));
     host.until(|_| !server.sent.lock().unwrap().is_empty())
         .await;
+    // Receipt precedes the HTTP response, so the event is marked handled but
+    // the complete batch has not been checkpointed. Wait for that checkpoint
+    // before testing orderly stop, rather than racing cancellation against it.
+    let pending = host.cursors.lock().unwrap()[name].clone();
+    assert_eq!(pending.next.as_ref(), Some(&since));
+    assert!(!pending.handled.is_empty());
+    response.notify_one();
+    host.until(|h| {
+        h.cursors
+            .lock()
+            .unwrap()
+            .get(name)
+            .is_some_and(|saved| saved.next.is_some() && saved.next.as_ref() != Some(&since))
+    })
+    .await;
     stop.cancel();
     supervisor.await.unwrap();
     assert_eq!(*server.joined.lock().unwrap(), [invited]);
