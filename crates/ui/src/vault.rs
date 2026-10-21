@@ -20,6 +20,7 @@ use a206_vault_channel::{
     Status as BrokerStatus,
 };
 use fc_dioxus::prelude::*;
+mod credential_policy;
 mod credentials;
 mod migration;
 #[cfg(not(target_arch = "wasm32"))]
@@ -96,6 +97,10 @@ enum Task {
         name: String,
         destinations: Vec<String>,
     },
+    SetCredentialPolicy {
+        name: String,
+        policy: a206_vault_channel::AccessPolicy,
+    },
 }
 #[derive(Clone, PartialEq, Eq, Debug)]
 enum Flow {
@@ -142,6 +147,7 @@ struct Panel {
     credential_read_failure: Signal<Option<Failure>>,
     key_editor: Signal<bool>,
     destination_editor: Signal<Option<credentials::DestinationDraft>>,
+    policy_editor: Signal<Option<credential_policy::PolicyDraft>>,
     /// The Get started checklist, when this panel is on that page.
     progress: Option<VaultProgress>,
 }
@@ -232,6 +238,7 @@ impl Panel {
         self.credential_read_failure.set(None);
         self.key_editor.set(false);
         self.destination_editor.set(None);
+        self.policy_editor.set(None);
     }
     /// The Get started page's background re-read. It never starts a broker,
     /// so a deliberate `vault stop` stays stopped, and its failure is shown
@@ -398,6 +405,31 @@ impl Panel {
     }
     async fn perform(mut self, task: Task) {
         match task.clone() {
+            Task::SetCredentialPolicy { name, policy } => {
+                match self
+                    .session()
+                    .call(Request::SetCredentialPolicy { name, policy })
+                    .await
+                {
+                    Ok(Reply::Ok) => {
+                        self.flow.set(Flow::Idle);
+                        self.policy_editor.set(None);
+                        self.notice.set(Some("Credential policy saved. Its enabled state and destinations are unchanged."));
+                        self.credential_page.set(None);
+                        self.credential_read_failure.set(None);
+                    }
+                    Err(error) if broker_refused(&error, BrokerError::StepUpRequired) => {
+                        self.flow.set(Flow::StepUp(task))
+                    }
+                    result => {
+                        self.flow.set(Flow::Idle);
+                        let error = result.err().unwrap_or_else(unexpected);
+                        self.fail("vault_credential_policy", if error.report.kind == a206_core::ErrorKind::InvalidRequest {
+                            "Policy rejected; correct the scope identifiers and retry"
+                        } else { "Policy change not confirmed; cancel the edit and refresh credentials before retrying" }, &error);
+                    }
+                }
+            }
             Task::SetCredentialDestinations { name, destinations } => {
                 match self
                     .session()
@@ -655,6 +687,7 @@ fn VaultPanel(target: Target) -> Element {
         credential_read_failure: use_signal(|| None),
         key_editor: use_signal(|| false),
         destination_editor: use_signal(|| None),
+        policy_editor: use_signal(|| None),
         progress: VaultProgress::listener(),
     };
     // Reads only through `peek`, so this runs once, after the first render.
@@ -760,7 +793,11 @@ fn VaultPanel(target: Target) -> Element {
                     }
                 },
                 Flow::StepUp(task) => rsx! {
-                    p { match &task { Task::Pair => "Confirm it is you before pairing the gateway.", Task::Enroll => "Confirm it is you before enrolling an authenticator.", Task::AddCredential => "Confirm it is you before adding an API key.", Task::SetAgentAccess(true) => "Confirm it is you before enabling agent credential access.", Task::SetAgentAccess(false) => "Confirm it is you before disabling agent credential access.", Task::SetCredentialDisabled { disabled: true, .. } => "Confirm it is you before disabling this credential.", Task::SetCredentialDisabled { disabled: false, .. } => "Confirm it is you before enabling this credential.", Task::SetCredentialDestinations { .. } => "Confirm it is you before replacing this credential's permitted destinations." } }
+                    p { match &task { Task::Pair => "Confirm it is you before pairing the gateway.", Task::Enroll => "Confirm it is you before enrolling an authenticator.", Task::AddCredential => "Confirm it is you before adding an API key.", Task::SetAgentAccess(true) => "Confirm it is you before enabling agent credential access.", Task::SetAgentAccess(false) => "Confirm it is you before disabling agent credential access.", Task::SetCredentialDisabled { disabled: true, .. } => "Confirm it is you before disabling this credential.", Task::SetCredentialDisabled { disabled: false, .. } => "Confirm it is you before enabling this credential.", Task::SetCredentialDestinations { .. } => "Confirm it is you before replacing this credential's permitted destinations.", Task::SetCredentialPolicy { .. } => "Confirm it is you before changing this credential's policy." } }
+                    if let Task::SetCredentialPolicy { name, policy } = &task {
+                        code { class: "a206-policy-identifier", "{name:?}" }
+                        credential_policy::PolicySummary { policy: policy.clone() }
+                    }
                     if let Task::SetCredentialDisabled { name, .. } = &task { code { "{name}" } }
                     if let Task::SetCredentialDestinations { name, destinations } = &task {
                         code { "{name}" }

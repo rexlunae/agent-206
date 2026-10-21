@@ -29,6 +29,21 @@ fn text(value: wire::Secret) -> String {
 /// Validate panel-only constraints before mapping to compatible native opcodes.
 /// Native CLI destination normalization is an older, separate contract.
 pub fn validate(value: &wire::Request) -> Result<(), BrokerError> {
+    if let wire::Request::SetCredentialPolicy {
+        policy: wire::AccessPolicy::SkillOnly(scopes) | wire::AccessPolicy::TriggerOnly(scopes),
+        ..
+    } = value
+        && (scopes.len() > wire::MAX_POLICY_SCOPES
+            || scopes.iter().any(|scope| {
+                scope.is_empty()
+                    || scope.len() > wire::MAX_POLICY_SCOPE_BYTES
+                    || scope.chars().any(char::is_control)
+            }))
+    {
+        return Err(BrokerError::Invalid(
+            crate::InvalidRequest::CredentialPolicy,
+        ));
+    }
     if let wire::Request::SetCredentialDestinations { destinations, .. } = value {
         for destination in destinations {
             if destination.len() > wire::MAX_CREDENTIAL_DESTINATION_BYTES
@@ -119,6 +134,12 @@ pub fn request(value: wire::Request) -> Request {
                 destinations: Some(destinations),
             }
         }
+        wire::Request::SetCredentialPolicy { name, policy } => Request::UpdateCredential {
+            name,
+            policy: Some(policy),
+            disabled: None,
+            destinations: None,
+        },
     }
 }
 pub fn code(error: &BrokerError) -> wire::Code {

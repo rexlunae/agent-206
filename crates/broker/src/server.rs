@@ -687,17 +687,20 @@ fn handle(shared: &Shared, session: &mut Session, request: Request) -> Handled {
             let destinations = destinations.map(origins).transpose()?;
             let mut vault = shared.vault();
             require_step_up(session, vault.generation())?;
+            let mut updated = vault.credential(&name).map_err(vault_error)?;
+            if let Some(policy) = policy {
+                updated.policy = policy;
+            }
+            if let Some(disabled) = disabled {
+                updated.disabled = disabled;
+            }
+            if let Some(destinations) = destinations {
+                updated.destinations = destinations;
+            }
+            credentials::validate_updated_metadata(&name, updated.clone())?;
             vault
                 .update_credential(&name, |meta: &mut CredentialMeta| {
-                    if let Some(policy) = policy {
-                        meta.policy = policy;
-                    }
-                    if let Some(disabled) = disabled {
-                        meta.disabled = disabled;
-                    }
-                    if let Some(destinations) = destinations {
-                        meta.destinations = destinations;
-                    }
+                    *meta = updated;
                 })
                 .map_err(vault_error)?;
             ok()

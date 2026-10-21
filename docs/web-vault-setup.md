@@ -65,7 +65,7 @@ Both require recent authentication on this encrypted connection and broker v18.
 Enabling access does not approve an agent operation or override any credential's
 policy, destinations or disabled state. Locked or unknown state offers no action.
 
-Reveal, policy/destination edits, legacy adoption, deletion
+Reveal, legacy adoption, deletion
 and TOTP removal remain trusted CLI operations. The CLI also offers token, login,
 passkey, SSH-key, note and other entry kinds; this panel adds API keys only. Form
 and payment entry are still unavailable in both clients.
@@ -206,3 +206,29 @@ After a confirmed save, the panel reloads metadata. If confirmation fails, refre
 credentials before retrying. Policy, enabled state, private value and global agent
 access are unchanged. This encrypted operation requires broker v20; other panel
 features keep their existing minimum versions. TUI vault controls stay unavailable.
+
+### Edit a credential policy
+
+Choose Edit policy on the credential row. Select approval per use, fresh
+authentication, no per-use condition, listed skills only or listed triggers only.
+For scoped policies, add or remove individual identifiers. They are case-sensitive
+and are never trimmed or split; an empty list permits no uses. The panel accepts
+up to 64 identifiers of at most 256 bytes each, without empty identifiers or control
+characters. Stored lists above that count are retained with CLI guidance rather
+than mounting unbounded inputs or truncating the rule. Changing the selector and
+switching back preserves each scope draft.
+
+Save policy uses broker-owned authentication and shows the exact credential and
+proposed rule when authentication is required. A rejected save or authentication
+cancel keeps the nonsecret draft. Refresh and paging wait until Save confirms or
+you cancel the edit. An uncertain result asks you to cancel and refresh before
+retrying. Locking or disconnecting discards the draft.
+
+Only policy changes; enabled state, permitted destinations, global agent access
+and the private value are retained. Saving a policy neither approves a use nor
+authenticates an agent. Credential-use approval remains unavailable. Broker v21
+adds the encrypted request, with no fallback to an older peer. The desktop policy
+editor also requires v21's metadata-size capability before sending the existing
+native update opcode; other native/CLI operations keep their prior compatibility. Native updates
+also refuse a resulting metadata entry too large for a bounded page before saving
+any change, so scope expansion cannot strand the entry outside this panel.

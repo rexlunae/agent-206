@@ -34,6 +34,47 @@ fn create(password: &str) -> Request {
 }
 
 #[tokio::test]
+async fn feature_minimum_refuses_before_mutation_without_losing_connection_authentication() {
+    let dir = start_broker().await;
+    let session = Session::open(dir.path().to_owned());
+    session
+        .call(create(&uuid::Uuid::new_v4().to_string()))
+        .await
+        .unwrap();
+    let before = session.status().await.unwrap();
+    assert_eq!(before.agent_access, Some(false));
+    assert!(before.step_up_active);
+    let offered = a206_broker::BROKER_VERSION;
+    let required = offered + 1;
+    let error = session
+        .call_with_minimum(Request::SetAgentAccess { enabled: true }, required)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, VaultError::FeatureUnsupported { required: r, offered: o } if r == required && o == offered)
+    );
+    assert_eq!(
+        a206_runtime::error::report(&error).kind,
+        ErrorKind::Unavailable
+    );
+    let unchanged = session.status().await.unwrap();
+    assert_eq!(unchanged.agent_access, Some(false));
+    assert!(unchanged.step_up_active);
+    // An exactly supported capability is allowed on the same connection.
+    session
+        .call_with_minimum(Request::SetAgentAccess { enabled: true }, offered)
+        .await
+        .unwrap();
+    assert_eq!(session.status().await.unwrap().agent_access, Some(true));
+    // The old native operation is still supported through the ordinary path.
+    session
+        .call(Request::SetAgentAccess { enabled: false })
+        .await
+        .unwrap();
+    assert_eq!(session.status().await.unwrap().agent_access, Some(false));
+}
+
+#[tokio::test]
 async fn sessions_report_state_and_keep_step_up_per_connection() {
     let dir = start_broker().await;
     let mut direct = vault::connect(dir.path()).await.unwrap();

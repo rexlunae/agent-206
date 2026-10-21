@@ -46,6 +46,7 @@ body { max-inline-size: none; inline-size: 100%; padding: 0; background: var(--f
 .a206-conversation { display: flex; flex-direction: column; block-size: 100%; min-inline-size: 0; overflow: hidden; border-radius: min(var(--fc-radius-xl), 1rem); background: var(--fc-color-bg-surface); }
 .a206-messages { flex: 1; min-block-size: 100px; overflow: auto; padding: var(--fc-space-3) var(--fc-space-4); }
 .a206-message-text { white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.55; }
+.a206-policy-identifier { white-space: pre-wrap; overflow-wrap: anywhere; }
 .a206-message-reasoning { white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.55; color: var(--fc-color-text-muted); margin: 0; }
 .a206-composer { padding: var(--fc-space-2) var(--fc-space-3) var(--fc-space-3); flex: none; container-type: inline-size; }
 .a206-compose-surface { border: 1px solid var(--fc-color-border-subtle); padding: var(--fc-space-2); background: var(--fc-color-bg-raised); overflow: visible; border-color: var(--fc-color-border-interactive); border-radius: min(var(--fc-radius-xl), 1rem); box-shadow: var(--fc-shadow-raised); }

@@ -11,6 +11,10 @@ use std::path::PathBuf;
 #[derive(Debug, thiserror::Error)]
 pub enum VaultError {
     #[error(
+        "this vault operation requires broker protocol {required}, but the running broker uses {offered}; run `agent206 vault stop`, then retry"
+    )]
+    FeatureUnsupported { required: u16, offered: u16 },
+    #[error(
         "the running vault broker is from a different Agent 206 version; \
          run `agent206 vault stop`, then retry"
     )]
@@ -63,7 +67,9 @@ impl crate::error::Classified for VaultError {
             Self::UnexpectedReply | Self::UnexpectedGatewayReply => ErrorKind::Protocol,
             Self::GatewayTimeout(_) => ErrorKind::Timeout,
             Self::CurrentExe(_) | Self::Worker(_) => ErrorKind::Internal,
-            Self::Unsupported | Self::ChannelUnsupported => ErrorKind::Unavailable,
+            Self::Unsupported | Self::ChannelUnsupported | Self::FeatureUnsupported { .. } => {
+                ErrorKind::Unavailable
+            }
             // `transparent` hides these from the chain, so classify them here.
             Self::Broker(error) => return crate::error::classify(error),
             Self::Gateway(error) => return crate::error::classify(error),
@@ -231,7 +237,7 @@ mod imp {
         Act(Action),
     }
     enum Action {
-        Call(Box<Request>, oneshot::Sender<Result<Reply>>),
+        Call(Box<Request>, u16, oneshot::Sender<Result<Reply>>),
         Pair {
             if_running: bool,
             reply: oneshot::Sender<Result<bool>>,
@@ -263,10 +269,19 @@ mod imp {
             });
             Self { sender }
         }
+        /// Not cancel-safe: see `call_with_minimum`.
         pub async fn call(&self, request: Request) -> Result<Reply> {
+            self.call_with_minimum(request, a206_broker::MIN_BROKER_VERSION)
+                .await
+        }
+        /// Require a negotiated capability before sending a mutation. Existing
+        /// callers keep their previous compatibility through `call`.
+        /// Not cancel-safe: after queueing, a mutation may commit even if its
+        /// caller stops waiting. Refresh state before retrying an uncertain write.
+        pub async fn call_with_minimum(&self, request: Request, minimum: u16) -> Result<Reply> {
             let (reply, receiver) = oneshot::channel();
             self.sender
-                .send(Job::Act(Action::Call(Box::new(request), reply)))
+                .send(Job::Act(Action::Call(Box::new(request), minimum, reply)))
                 .map_err(|_| VaultError::Worker(None))?;
             receiver.await.map_err(|_| VaultError::Worker(None))?
         }
@@ -308,7 +323,7 @@ mod imp {
         while let Some(job) = receiver.blocking_recv() {
             // A caller that stopped waiting needs no reply.
             match job {
-                Job::Act(Action::Call(_, reply)) => reply.send(Err(lost())).ignore(),
+                Job::Act(Action::Call(_, _, reply)) => reply.send(Err(lost())).ignore(),
                 Job::Act(Action::Pair { reply, .. }) => reply.send(Err(lost())).ignore(),
                 Job::Peek(reply) => reply.send(Err(lost())).ignore(),
             }
@@ -356,14 +371,24 @@ mod imp {
                 Err(error) => {
                     // A caller that stopped waiting needs no reply.
                     match job {
-                        Action::Call(_, reply) => reply.send(Err(error)).ignore(),
+                        Action::Call(_, _, reply) => reply.send(Err(error)).ignore(),
                         Action::Pair { reply, .. } => reply.send(Err(error)).ignore(),
                     }
                     continue;
                 }
             };
             let healthy = match job {
-                Action::Call(request, reply) => {
+                Action::Call(request, minimum, reply) => {
+                    if connected.version() < minimum {
+                        reply
+                            .send(Err(VaultError::FeatureUnsupported {
+                                required: minimum,
+                                offered: connected.version(),
+                            }))
+                            .ignore();
+                        client = Some(connected);
+                        continue;
+                    }
                     if matches!(*request, Request::CancelTotp)
                         && connected.version() < a206_broker::SETUP_CHANNEL_VERSION
                     {
@@ -420,6 +445,13 @@ mod fallback {
             Self
         }
         pub async fn call(&self, _request: a206_broker::Request) -> Result<a206_broker::Reply> {
+            Err(VaultError::Unsupported)
+        }
+        pub async fn call_with_minimum(
+            &self,
+            _request: a206_broker::Request,
+            _minimum: u16,
+        ) -> Result<a206_broker::Reply> {
             Err(VaultError::Unsupported)
         }
         pub async fn status(&self) -> Result<a206_broker::BrokerStatus> {

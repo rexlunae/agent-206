@@ -12,6 +12,31 @@ fn version(session: &Session, schema: u16) -> Result<(), BrokerError> {
     Ok(())
 }
 
+/// Keep an updated entry readable by the bounded metadata panel. Reserve the
+/// cursor/count encoding too, so it fits even when it is not the last entry.
+pub(super) fn validate_updated_metadata(
+    name: &str,
+    meta: CredentialMeta,
+) -> Result<(), BrokerError> {
+    let page = CredentialPage {
+        version: CREDENTIALS_SCHEMA_VERSION,
+        entries: vec![(name.to_owned(), meta)],
+        next: Some(name.to_owned()),
+        total: usize::MAX,
+        legacy_count: usize::MAX,
+    };
+    match a206_protocol::encode(&page) {
+        Ok(bytes) if bytes.len() <= MAX_CREDENTIAL_PAGE_BYTES => Ok(()),
+        Ok(_) | Err(a206_protocol::Error::TooLarge) => {
+            Err(BrokerError::Vault(VaultFailure::MetadataTooLarge))
+        }
+        Err(error) => Err(BrokerError::Channel(
+            a206_core::ErrorReport::capture(&error, |_| Some(a206_core::ErrorKind::Protocol))
+                .with_correlation(uuid::Uuid::new_v4()),
+        )),
+    }
+}
+
 pub(super) fn page(
     shared: &Shared,
     session: &Session,
