@@ -145,7 +145,9 @@ pub(super) fn Credentials(
     onread: EventHandler<Option<String>>,
     onadd: EventHandler<KeyInput>,
     onchange: EventHandler<(String, bool)>,
+    ondestinations: EventHandler<(String, Vec<String>)>,
 ) -> Element {
+    let mut editing = use_signal(|| None::<(String, Vec<String>)>);
     let busy = (panel.busy)();
     let page = (panel.credential_page)();
     let failed = (panel.credential_read_failure)().is_some();
@@ -162,7 +164,8 @@ pub(super) fn Credentials(
     } else {
         Availability::Enabled
     };
-    let changing = busy || (panel.flow)() != Flow::Idle || (panel.key_editor)();
+    let changing =
+        busy || (panel.flow)() != Flow::Idle || (panel.key_editor)() || editing().is_some();
     let rows = page
         .as_ref()
         .map(|page| {
@@ -189,6 +192,16 @@ pub(super) fn Credentials(
                                 name: name.clone(), label: meta.label.clone(), disabled: meta.disabled,
                                 busy: changing, onrequest: onchange,
                             }
+                            Button {
+                                variant: ButtonVariant::Ghost,
+                                availability: if changing { Availability::Disabled } else { Availability::Enabled },
+                                onclick: {
+                                    let name = name.clone();
+                                    let destinations = meta.destinations.clone();
+                                    move |_| editing.set(Some((name.clone(), destinations.clone())))
+                                },
+                                "Edit destinations for {meta.label}"
+                            }
                         }),
                     ],
                 })
@@ -212,17 +225,52 @@ pub(super) fn Credentials(
                 KeyForm { busy, needs_auth: !(panel.status)().is_some_and(|s| s.step_up_active) || (panel.flow)() != Flow::Idle,
                     onadd, oncancel: move |_| panel.key_editor.set(false), onauthenticate: move |_| panel.start(Task::AddCredential) }
             }
+            if let Some((name, destinations)) = editing() {
+                DestinationForm { key: "{name}", name, destinations, busy: busy || (panel.flow)() != Flow::Idle,
+                    onsave: move |request| { editing.set(None); ondestinations.call(request); },
+                    oncancel: move |_| editing.set(None),
+                }
+            }
         }
         CardFooter {
             Button { variant: ButtonVariant::Ghost, availability: available.clone(), onclick: move |_| onread.call(None), if failed { "Retry credentials" } else { "Refresh credentials" } }
             if let Some(next) = page.as_ref().and_then(|p| p.next.clone()) {
                 Button { variant: ButtonVariant::Ghost, availability: available.clone(), onclick: move |_| onread.call(Some(next.clone())), "Next page" }
             }
-            if page.is_some() && !(panel.key_editor)() {
+            if page.is_some() && !(panel.key_editor)() && editing().is_none() {
                 Button { variant: ButtonVariant::Secondary, availability: available, onclick: move |_| panel.start(Task::AddCredential), "Add API key" }
             }
         }
     } }
+}
+
+#[component]
+fn DestinationForm(
+    name: String,
+    destinations: Vec<String>,
+    busy: bool,
+    onsave: EventHandler<(String, Vec<String>)>,
+    oncancel: EventHandler<()>,
+) -> Element {
+    let mut origins = use_signal(|| destinations.join(" "));
+    let available = if busy {
+        Availability::Disabled
+    } else {
+        Availability::Enabled
+    };
+    rsx! {
+        h3 { "Edit permitted destinations" }
+        code { "{name}" }
+        Field { label: rsx! { "New permitted destinations" },
+            hint: rsx! { "Replaces the complete destination list. Separate exact origins with spaces, without paths, queries or fragments. Leave empty to prevent brokered use. Policy and enabled state stay unchanged." },
+            Input { availability: available.clone(), value: ReadSignal::from(origins), oninput: move |value| origins.set(value) }
+        }
+        Button { variant: ButtonVariant::Primary, availability: available.clone(),
+            onclick: move |_| onsave.call((name.clone(), origins.read().split_whitespace().map(str::to_owned).collect())),
+            "Save destinations"
+        }
+        Button { variant: ButtonVariant::Ghost, availability: available, onclick: move |_| oncancel.call(()), "Cancel destinations" }
+    }
 }
 
 #[component]
@@ -296,6 +344,31 @@ fn KeyForm(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn destination_editor_shows_current_origins_and_disables_controls_while_busy() {
+        fn root((name, busy): (String, bool)) -> Element {
+            rsx! { DestinationForm {
+                name, destinations: vec!["https://one.example.invalid".into(), "ssh://two.example.invalid:22".into()], busy,
+                onsave: move |_| {}, oncancel: move |_| {},
+            } }
+        }
+        let name = uuid::Uuid::new_v4().to_string();
+        for busy in [false, true] {
+            let mut dom = VirtualDom::new_with_props(root, (name.clone(), busy));
+            dom.rebuild_in_place();
+            let html = dioxus_ssr::render(&dom);
+            assert!(html.contains(&name), "{html}");
+            assert!(
+                html.contains("https://one.example.invalid ssh://two.example.invalid:22"),
+                "{html}"
+            );
+            assert_eq!(
+                html.matches(" disabled=true").count(),
+                if busy { 3 } else { 0 },
+                "{html}"
+            );
+        }
+    }
     #[test]
     fn credential_state_actions_name_the_credential_and_disable_while_busy() {
         fn root((disabled, busy, label): (bool, bool, String)) -> Element {

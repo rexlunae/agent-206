@@ -26,6 +26,26 @@ fn secret(value: wire::Secret) -> WireSecret {
 fn text(value: wire::Secret) -> String {
     value.expose().to_owned()
 }
+/// Validate panel-only constraints before mapping to compatible native opcodes.
+/// Native CLI destination normalization is an older, separate contract.
+pub fn validate(value: &wire::Request) -> Result<(), BrokerError> {
+    if let wire::Request::SetCredentialDestinations { destinations, .. } = value {
+        for destination in destinations {
+            if destination.len() > wire::MAX_CREDENTIAL_DESTINATION_BYTES
+                || destination.chars().any(char::is_whitespace)
+            {
+                return Err(BrokerError::Invalid(crate::InvalidRequest::Destination));
+            }
+            let url = url::Url::parse(destination)
+                .map_err(|_| BrokerError::Invalid(crate::InvalidRequest::Destination))?;
+            if !matches!(url.path(), "" | "/") || url.query().is_some() || url.fragment().is_some()
+            {
+                return Err(BrokerError::Invalid(crate::InvalidRequest::Destination));
+            }
+        }
+    }
+    Ok(())
+}
 pub fn request(value: wire::Request) -> Request {
     match value {
         wire::Request::CredentialPage {
@@ -91,6 +111,14 @@ pub fn request(value: wire::Request) -> Request {
             disabled: Some(disabled),
             destinations: None,
         },
+        wire::Request::SetCredentialDestinations { name, destinations } => {
+            Request::UpdateCredential {
+                name,
+                policy: None,
+                disabled: None,
+                destinations: Some(destinations),
+            }
+        }
     }
 }
 pub fn code(error: &BrokerError) -> wire::Code {

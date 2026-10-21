@@ -19,6 +19,17 @@ fn checked(reply: Reply) -> Result<Reply, Failure> {
 // serializing a reviewed request or its secrets for an unsupported connection.
 #[cfg(any(target_arch = "wasm32", test))]
 fn reviewed_supported(version: u16, request: &Request) -> Result<(), Failure> {
+    if version < a206_vault_channel::CREDENTIAL_DESTINATIONS_BROKER_VERSION
+        && matches!(request, Request::SetCredentialDestinations { .. })
+    {
+        return Err(Failure {
+            code: Code::Other,
+            report: a206_core::ErrorReport::new(
+                a206_core::ErrorKind::Unavailable,
+                "This broker cannot edit credential destinations through this panel. Stop the old vault broker and retry with the updated application.",
+            ),
+        });
+    }
     if version < a206_vault_channel::CREDENTIAL_STATE_BROKER_VERSION
         && matches!(request, Request::SetCredentialDisabled { .. })
     {
@@ -106,6 +117,9 @@ mod imp {
             Self(a206_runtime::vault::Session::open(root))
         }
         pub async fn call(&self, request: Request) -> Result<Reply, Failure> {
+            if let Err(error) = a206_broker::channel::validate(&request) {
+                return checked(a206_broker::channel::reply(Err(error)));
+            }
             let result = self
                 .0
                 .call(a206_broker::channel::request(request))
@@ -300,6 +314,37 @@ pub(crate) use imp::{Session, Target};
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn destination_edits_refuse_old_web_peers_without_raising_older_minimums() {
+        for version in 0..=21 {
+            assert_eq!(
+                reviewed_supported(
+                    version,
+                    &Request::SetCredentialDestinations {
+                        name: uuid::Uuid::new_v4().to_string(),
+                        destinations: vec![],
+                    }
+                )
+                .is_ok(),
+                version >= 20
+            );
+            assert_eq!(
+                reviewed_supported(
+                    version,
+                    &Request::SetCredentialDisabled {
+                        name: uuid::Uuid::new_v4().to_string(),
+                        disabled: true,
+                    }
+                )
+                .is_ok(),
+                version >= 19
+            );
+            assert_eq!(
+                reviewed_supported(version, &Request::SetAgentAccess { enabled: false }).is_ok(),
+                version >= 18
+            );
+        }
+    }
     #[test]
     fn credential_state_changes_require_v19_but_keep_existing_features() {
         for version in 0..=20 {

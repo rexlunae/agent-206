@@ -88,7 +88,14 @@ enum Task {
     Enroll,
     AddCredential,
     SetAgentAccess(bool),
-    SetCredentialDisabled { name: String, disabled: bool },
+    SetCredentialDisabled {
+        name: String,
+        disabled: bool,
+    },
+    SetCredentialDestinations {
+        name: String,
+        destinations: Vec<String>,
+    },
 }
 #[derive(Clone, PartialEq, Eq, Debug)]
 enum Flow {
@@ -389,6 +396,31 @@ impl Panel {
     }
     async fn perform(mut self, task: Task) {
         match task.clone() {
+            Task::SetCredentialDestinations { name, destinations } => {
+                match self
+                    .session()
+                    .call(Request::SetCredentialDestinations { name, destinations })
+                    .await
+                {
+                    Ok(Reply::Ok) => {
+                        self.flow.set(Flow::Idle);
+                        self.notice.set(Some("Credential destinations saved. Its policy and enabled state are unchanged."));
+                        self.credential_page.set(None);
+                        self.credential_read_failure.set(None);
+                    }
+                    Err(error) if broker_refused(&error, BrokerError::StepUpRequired) => {
+                        self.flow.set(Flow::StepUp(task));
+                    }
+                    result => {
+                        self.flow.set(Flow::Idle);
+                        self.fail(
+                            "vault_credential_destinations",
+                            "Destination change not confirmed; refresh credentials before retrying",
+                            &result.err().unwrap_or_else(unexpected),
+                        );
+                    }
+                }
+            }
             Task::SetCredentialDisabled { name, disabled } => {
                 match self
                     .session()
@@ -723,8 +755,14 @@ fn VaultPanel(target: Target) -> Element {
                     }
                 },
                 Flow::StepUp(task) => rsx! {
-                    p { match &task { Task::Pair => "Confirm it is you before pairing the gateway.", Task::Enroll => "Confirm it is you before enrolling an authenticator.", Task::AddCredential => "Confirm it is you before adding an API key.", Task::SetAgentAccess(true) => "Confirm it is you before enabling agent credential access.", Task::SetAgentAccess(false) => "Confirm it is you before disabling agent credential access.", Task::SetCredentialDisabled { disabled: true, .. } => "Confirm it is you before disabling this credential.", Task::SetCredentialDisabled { disabled: false, .. } => "Confirm it is you before enabling this credential." } }
+                    p { match &task { Task::Pair => "Confirm it is you before pairing the gateway.", Task::Enroll => "Confirm it is you before enrolling an authenticator.", Task::AddCredential => "Confirm it is you before adding an API key.", Task::SetAgentAccess(true) => "Confirm it is you before enabling agent credential access.", Task::SetAgentAccess(false) => "Confirm it is you before disabling agent credential access.", Task::SetCredentialDisabled { disabled: true, .. } => "Confirm it is you before disabling this credential.", Task::SetCredentialDisabled { disabled: false, .. } => "Confirm it is you before enabling this credential.", Task::SetCredentialDestinations { .. } => "Confirm it is you before replacing this credential's permitted destinations." } }
                     if let Task::SetCredentialDisabled { name, .. } = &task { code { "{name}" } }
+                    if let Task::SetCredentialDestinations { name, destinations } = &task {
+                        code { "{name}" }
+                        p { "New permitted destinations:" }
+                        if destinations.is_empty() { p { "None: brokered use will be refused." } }
+                        for destination in destinations { p { code { "{destination}" } } }
+                    }
                     if enrolled {
                         Field { label: rsx! { "Authenticator code" },
                             Input { value: ReadSignal::from(code), oninput: move |v| code.set(v), autocomplete: "one-time-code", inputmode: "numeric" }
@@ -843,6 +881,7 @@ fn VaultPanel(target: Target) -> Element {
             onread: move |after| panel.read_credentials(after),
             onadd: move |input| panel.add_key(input),
             onchange: move |(name, disabled)| panel.start(Task::SetCredentialDisabled { name, disabled }),
+            ondestinations: move |(name, destinations)| panel.start(Task::SetCredentialDestinations { name, destinations }),
         }
     }
     }

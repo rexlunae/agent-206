@@ -334,8 +334,8 @@ origins, never values. Broker v17 enforces step-up, fixed per-use approval and
 atomic refusal to overwrite; global agent access is unchanged. Pages contain at
 most 50 entries and 48 KiB encoded, with explicit errors for oversized metadata.
 Native/encrypted integration tests cover the new operations and compatibility
-refusal; desktop/TUI interactive acceptance is still pending. Other CLI-supported
-entry kinds, edits, legacy adoption, removal and reveal
+refusal; native desktop interaction is still unverified and TUI vault controls
+are blocked. Other CLI-supported entry kinds, policy/value edits, legacy adoption, removal and reveal
 remain CLI operations, including SSH-key entry. Form and payment entry remain unavailable.
 Agent credential-use approval and remote SSH vault controls are pending.
 
@@ -351,6 +351,19 @@ lock/reopen. Approval policy and origin remained visible; global access stayed o
 and the gateway stayed deliberately stopped. No real credentials, accounts or
 model calls were used. Native desktop interaction remains unverified; the TUI vault
 guard remains in place.
+
+Shared desktop/web credential rows offer destination-list replacement through
+broker-owned step-up. Broker v20 adds the encrypted request, mapped to the existing
+native update operation without changing policy, disabled state or private value.
+The panel rejects non-origin URLs; empty lists deny brokered use. Owning tests
+cover validation, unchanged restrictions/value, another entry, authentication,
+lock revocation and persistence. Release-web checks in a fresh synthetic vault
+verified path rejection with the old list retained, multiple-origin replacement,
+reconnect requiring authentication with the exact target/list shown, cancellation
+without a write, an authenticated empty list and persistence across lock/reopen.
+Approval policy and enabled state stayed unchanged, global access stayed off and
+the gateway stayed stopped. Native desktop interaction remains unverified; the
+TUI vault guard stays in place.
 
 Shared desktop/web Security controls now offer explicit global agent-access
 enable/disable actions with broker-owned step-up. Broker v18 exposes the existing
