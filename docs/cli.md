@@ -83,7 +83,9 @@ exactly; an empty scope list permits no uses. Value editing remains a CLI operat
 TUI vault controls remain unavailable.
 No additional agent-facing secret tool is introduced.
 
-Authenticator removal is also available in desktop/web Security. It requires
+Authenticator removal is also available in desktop and loopback-web Security. It requires
 both the vault password and an unused current authenticator code, even with
 recent authentication. The encrypted panel requires broker v22; the existing
-native `RemoveTotp` request and CLI compatibility are unchanged.
+native `RemoveTotp` request and CLI compatibility are unchanged. Network web
+channels cannot remove the authenticator they need for future sign-ins; arrange
+access through desktop, loopback web or the trusted CLI first.

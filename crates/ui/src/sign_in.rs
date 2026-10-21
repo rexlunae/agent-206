@@ -17,6 +17,12 @@ pub(crate) fn network() -> bool {
     METHOD.load(Ordering::Relaxed) == NETWORK
 }
 
+/// Unknown and network contexts never offer local-only vault operations.
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn confirmed_loopback() -> bool {
+    METHOD.load(Ordering::Relaxed) == LOOPBACK
+}
+
 /// Ask the server how browsers sign in, until it answers. A failed request
 /// (the connection dropped, or an older server) says nothing, so the shell asks
 /// again on its next round; until then the browser is treated as loopback.

@@ -155,6 +155,7 @@ pub fn code(error: &BrokerError) -> wire::Code {
         BrokerError::StepUpRequired => wire::Code::StepUpRequired,
         BrokerError::AuthenticationFailed => wire::Code::AuthenticationFailed,
         BrokerError::ClockDrift { .. } => wire::Code::ClockDrift,
+        BrokerError::TotpRemovalUnavailable => wire::Code::TotpRemovalUnavailable,
         _ => wire::Code::Other,
     }
 }
@@ -186,9 +187,10 @@ pub fn reply(result: Result<Reply, BrokerError>) -> wire::Reply {
         },
         Ok(Reply::Error(error)) | Err(error) => {
             let kind = match &error {
-                BrokerError::Locked | BrokerError::NoVault | BrokerError::GatewayNotPaired => {
-                    ErrorKind::Unavailable
-                }
+                BrokerError::Locked
+                | BrokerError::NoVault
+                | BrokerError::GatewayNotPaired
+                | BrokerError::TotpRemovalUnavailable => ErrorKind::Unavailable,
                 BrokerError::NoPendingEnrollment
                 | BrokerError::AlreadyExists
                 | BrokerError::VaultExists => ErrorKind::Conflict,

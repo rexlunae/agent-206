@@ -24,8 +24,8 @@ use zeroize::Zeroizing;
 /// fixed-policy API-key creation; 18 adds encrypted-panel agent-access changes,
 /// 19 adds encrypted-panel credential enable/disable changes, and 20 adds
 /// encrypted-panel destination edits; 21 adds encrypted-panel policy edits;
-/// 22 adds encrypted-panel authenticator removal. The native UpdateCredential
-/// and RemoveTotp requests are unchanged.
+/// 22 adds encrypted-panel authenticator removal and an explicit local channel
+/// scope. The native UpdateCredential and RemoveTotp requests are unchanged.
 /// A broker accepts greetings from
 /// [`MIN_BROKER_VERSION`] up to this version, and a client falls back to the
 /// newest version an older broker accepts (see `Client::version`), so streams
@@ -390,6 +390,13 @@ pub enum Request {
         #[serde(with = "serde_bytes")]
         first: Vec<u8>,
     },
+    /// A trusted loopback web bridge may allow authenticator removal. Ordinary
+    /// channels, including those opened by older bridges, never allow it.
+    /// Since broker v22; network bridges must keep using OpenChannel.
+    OpenLocalChannel {
+        #[serde(with = "serde_bytes")]
+        first: Vec<u8>,
+    },
     ChannelMessage {
         #[serde(with = "serde_bytes")]
         bytes: Vec<u8>,
@@ -545,6 +552,10 @@ pub enum BrokerError {
     StepUpRequired,
     #[error("this connection's role cannot make that request")]
     Forbidden,
+    #[error(
+        "authenticator removal is unavailable on this web channel; use the desktop, an updated loopback web server or the trusted CLI after arranging access"
+    )]
+    TotpRemovalUnavailable,
     #[error("the gateway is not paired with the unlocked vault; run `agent206 vault pair`")]
     GatewayNotPaired,
     #[error("no two-factor enrollment is pending on this connection")]

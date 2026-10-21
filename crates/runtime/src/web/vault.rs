@@ -77,6 +77,16 @@ async fn connect(root: &std::path::Path) -> Result<Client, crate::vault::VaultEr
     Ok(Client::connect(root, Role::Relay).await?)
 }
 
+fn opening(version: u16, loopback: bool, first: Vec<u8>) -> BrokerRequest {
+    if loopback && version >= a206_vault_channel::TOTP_REMOVAL_BROKER_VERSION {
+        BrokerRequest::OpenLocalChannel { first }
+    } else {
+        // Older brokers cannot decode RemoveTotp; ordinary channels on new
+        // brokers refuse it. Never grant local scope from browser input.
+        BrokerRequest::OpenChannel { first }
+    }
+}
+
 async fn exchange(
     state: &Web,
     owner: String,
@@ -97,8 +107,13 @@ async fn exchange(
             }
             let mut client = connect(&state.root).await?;
             let broker_version = client.version();
-            let BrokerReply::ChannelOpened(response) =
-                client.call(BrokerRequest::OpenChannel { first }).await?
+            let BrokerReply::ChannelOpened(response) = client
+                .call(opening(
+                    broker_version,
+                    state.access.loopback().is_some(),
+                    first,
+                ))
+                .await?
             else {
                 return Err(VaultError::UnexpectedReply);
             };
@@ -191,6 +206,22 @@ mod compatibility_tests {
     use crate::transport::{read_frame, write_frame};
     use a206_broker::{BrokerError, InvalidRequest};
     use a206_protocol::{Request as Frame, Response};
+
+    #[test]
+    fn only_an_updated_loopback_bridge_grants_the_local_channel_scope() {
+        for version in [10, 17, 21, 22, 23] {
+            for local in [false, true] {
+                let request = opening(version, local, vec![1]);
+                assert_eq!(
+                    matches!(request, BrokerRequest::OpenLocalChannel { .. }),
+                    local && version >= 22
+                );
+                if !local || version < 22 {
+                    assert!(matches!(request, BrokerRequest::OpenChannel { .. }));
+                }
+            }
+        }
+    }
 
     #[tokio::test]
     async fn version_ten_can_still_open_the_generic_setup_relay() {

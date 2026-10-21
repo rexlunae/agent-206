@@ -66,7 +66,7 @@ struct Offer {
     enroll: bool,
     remove_totp: bool,
 }
-fn offer(status: &BrokerStatus) -> Offer {
+fn offer(status: &BrokerStatus, local: bool) -> Offer {
     Offer {
         create: !status.exists,
         unlock: status.exists && !status.unlocked,
@@ -74,7 +74,7 @@ fn offer(status: &BrokerStatus) -> Offer {
         pair: status.unlocked,
         // Enrollment is known only once unlocked: it lives inside the vault.
         enroll: status.unlocked && status.totp_enrolled == Some(false),
-        remove_totp: status.unlocked && status.totp_enrolled == Some(true),
+        remove_totp: local && status.unlocked && status.totp_enrolled == Some(true),
     }
 }
 fn known(value: Option<bool>) -> &'static str {
@@ -131,6 +131,7 @@ struct Failure {
 
 #[derive(Clone, Copy)]
 struct Panel {
+    allow_totp_removal: bool,
     session: Signal<Session>,
     status: Signal<Option<BrokerStatus>>,
     failure: Signal<Option<Failure>>,
@@ -641,7 +642,7 @@ impl Panel {
                 .status
                 .peek()
                 .as_ref()
-                .is_some_and(|s| offer(s).remove_totp)
+                .is_some_and(|s| offer(s, self.allow_totp_removal).remove_totp)
         {
             self.failure.set(None);
             self.notice.set(None);
@@ -689,7 +690,7 @@ fn VaultPlacement(placement: Placement, #[props(default)] terminal: bool) -> Ele
         };
     }
     match placement {
-        Placement::Local(root) => rsx! { VaultPanel { target: root } },
+        Placement::Local(root) => rsx! { VaultPanel { target: root, allow_totp_removal: true } },
         Placement::Remote(endpoint) => rsx! {
             Card { variant: CardVariant::Subtle,
                 CardHeader { CardTitle { "Vault" } Badge { tone: BadgeTone::Neutral, "Remote gateway" } }
@@ -737,8 +738,9 @@ fn TotpRemoval(
     }
 }
 #[component]
-fn VaultPanel(target: Target) -> Element {
+fn VaultPanel(target: Target, allow_totp_removal: bool) -> Element {
     let panel = Panel {
+        allow_totp_removal,
         session: use_signal(|| Session::open(target.clone())),
         status: use_signal(|| None),
         failure: use_signal(|| None),
@@ -801,12 +803,15 @@ fn VaultPanel(target: Target) -> Element {
     let enrolled = status
         .as_ref()
         .is_some_and(|s| s.totp_enrolled == Some(true));
-    let offer = status.as_ref().map(offer).unwrap_or_default();
+    let offer = status
+        .as_ref()
+        .map(|status| offer(status, allow_totp_removal))
+        .unwrap_or_default();
     use_effect(move || {
         if (panel.flow)() == Flow::RemoveTotp
             && !(panel.status)()
                 .as_ref()
-                .is_some_and(|status| self::offer(status).remove_totp)
+                .is_some_and(|status| self::offer(status, allow_totp_removal).remove_totp)
         {
             panel.cancel();
         }
@@ -829,6 +834,9 @@ fn VaultPanel(target: Target) -> Element {
                 }
                 if status.unlocked && status.totp_enrolled == Some(false) {
                     Alert { tone: AlertTone::Warning, title: rsx! { "Verify an authenticator next" }, "Your vault is encrypted. Set up two-factor authentication and confirm a code before considering enrollment complete. Agent credential access stays off by default." }
+                }
+                if status.unlocked && status.totp_enrolled == Some(true) && !allow_totp_removal {
+                    p { class: "a206-muted", "Network web sign-in needs an enrolled authenticator. Removal is available only through the desktop, a confirmed loopback web server or the trusted CLI after arranging access." }
                 }
                 if status.unlocked && status.totp_enrolled == Some(true) && status.gateway_paired == Some(true) {
                     Alert { tone: AlertTone::Success, title: rsx! { "Vault enrollment verified" }, "Encryption is active, an authenticator is enrolled, and the gateway holds a current pairing. Lock and unlock once to check your recovery workflow. Restarting the gateway requires pairing it again." }
@@ -1107,14 +1115,14 @@ mod tests {
     #[test]
     fn offers_only_what_the_vault_state_allows() {
         assert_eq!(
-            offer(&status(false, false, None)),
+            offer(&status(false, false, None), true),
             Offer {
                 create: true,
                 ..Offer::default()
             }
         );
         assert_eq!(
-            offer(&status(true, false, None)),
+            offer(&status(true, false, None), true),
             Offer {
                 unlock: true,
                 ..Offer::default()
@@ -1126,7 +1134,7 @@ mod tests {
             ..Offer::default()
         };
         assert_eq!(
-            offer(&status(true, true, Some(false))),
+            offer(&status(true, true, Some(false)), true),
             Offer {
                 enroll: true,
                 ..unlocked
@@ -1134,7 +1142,7 @@ mod tests {
         );
         // Enrolled vaults offer no second enrollment.
         assert_eq!(
-            offer(&status(true, true, Some(true))),
+            offer(&status(true, true, Some(true)), true),
             Offer {
                 lock: true,
                 pair: true,
@@ -1142,8 +1150,11 @@ mod tests {
                 ..Offer::default()
             }
         );
-        assert!(!offer(&status(true, true, None)).remove_totp);
-        assert!(!offer(&status(true, false, Some(true))).remove_totp);
+        assert!(!offer(&status(true, true, None), true).remove_totp);
+        assert!(!offer(&status(true, false, Some(true)), true).remove_totp);
+        // Network or unconfirmed web context must not offer removal, without
+        // hiding the unrelated lock/pair controls.
+        assert_eq!(offer(&status(true, true, Some(true)), false), unlocked);
     }
 
     #[test]
@@ -1225,7 +1236,7 @@ pub(crate) fn VaultSection() -> Element {
             Alert { tone: AlertTone::Success, title: rsx! { "Encrypted vault connection" },
                 "The broker key is verified for this panel. Passwords and authenticator setup travel encrypted directly to the vault broker."
             }
-            VaultPanel { target }
+            VaultPanel { target, allow_totp_removal: crate::sign_in::confirmed_loopback() }
             Button { variant: ButtonVariant::Ghost, onclick: move |_| verified.set(None), "Disconnect vault controls" }
         };
     }

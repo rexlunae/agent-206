@@ -407,12 +407,15 @@ stopped. The temporary browser tab, web server and broker were closed afterward.
 
 ## Authenticator removal
 
-Desktop/web Security now offers removal for a known unlocked enrolled vault.
+Desktop and confirmed loopback-web Security offer removal for a known unlocked enrolled vault.
 The confirmation requires both password and an unused code, including after
 recent authentication; cancel sends no mutation. Broker v22 adds the encrypted
 request, while native/CLI use the existing removal operation. Only a successful
 broker acknowledgement reports removal, followed by refreshed state. Lock or
 loss of confirmed state unmounts its inputs. TUI vault controls remain unavailable.
+Network web sign-in needs the authenticator, so ordinary encrypted channels
+cannot remove it. Only an updated trusted loopback bridge can open the local
+scope; neither browser input nor a second handshake can upgrade a channel.
 
 Owning tests cover old-peer refusal, both-factor mapping and redaction, encrypted
 rejection without storage changes, disabled inputs, and fixed-time replay,

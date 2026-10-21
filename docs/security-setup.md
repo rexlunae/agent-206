@@ -148,12 +148,15 @@ SSH vault controls,
 key-file workflows and modern at-rest encryption remain pending. Browser-delivered
 code and the serving origin remain trusted, as does the native client executable.
 
-The shared desktop/web Security page also offers authenticator removal only when
-the unlocked broker confirms enrollment. Its confirmation requires both password
+The shared Security page offers authenticator removal on desktop and confirmed
+loopback web only when the unlocked broker confirms enrollment. Its confirmation requires both password
 and an unused code; recent step-up never replaces either factor. Cancellation
 sends no removal request. Only `Reply::Ok` reports success, followed by refreshed
 broker state. The encrypted request requires broker v22 before sealing; native
-removal uses the existing opcode. TUI controls remain unavailable. Native desktop
+removal uses the existing opcode. Ordinary/network encrypted channels cannot
+remove the sign-in factor; only an updated trusted loopback bridge can open the
+explicit local scope, which cannot replace an existing channel's context.
+TUI controls remain unavailable. Native desktop
 interaction acceptance is pending.
 
 ## Shared credential controls

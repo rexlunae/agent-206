@@ -69,7 +69,7 @@ Reveal, legacy adoption and deletion remain trusted CLI operations. The CLI also
 passkey, SSH-key, note and other entry kinds; this panel adds API keys only. Form
 and payment entry are still unavailable in both clients.
 
-When the unlocked vault reports an enrolled authenticator, **Remove two-factor**
+On a confirmed loopback web server, when the unlocked vault reports an enrolled authenticator, **Remove two-factor**
 opens a separate confirmation. **Keep two-factor** cancels without a request.
 Removal requires both the vault password and an unused current code, even when
 this connection has recent authentication. Both fields clear on submit; only
@@ -79,6 +79,14 @@ and agent access are unchanged. Broker v22 adds this encrypted-panel request;
 older web peers are refused before either factor is sealed. Locking or losing
 the confirmed vault state unmounts the confirmation inputs. Native desktop uses
 the existing native removal request; TUI vault controls remain unavailable.
+
+Network web sessions cannot remove their sign-in factor. Broker v22 refuses
+removal on ordinary encrypted channels, including those opened by older
+bridges. Only an updated loopback bridge opens the explicit local scope; browser
+input cannot choose it or upgrade an existing channel. No plaintext is exposed
+to the bridge to enforce this restriction. Other setup operations and older
+broker negotiation remain available. Use desktop, an updated loopback server
+or the trusted CLI after arranging access if removal is intended.
 
 Each typed metadata row offers **Disable** or **Enable**, naming its credential.
 These actions require recent authentication and broker v19. They change only the

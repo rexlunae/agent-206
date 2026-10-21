@@ -105,6 +105,8 @@ struct Session {
     import_review: Option<a206_vault_channel::ImportReview>,
     channel: Option<a206_vault_channel::Channel>,
     channel_opened: bool,
+    /// Granted only by a trusted local bridge's explicit channel handshake.
+    allow_totp_removal: bool,
     role: Option<Role>,
     step_up: StepUpWindow,
     /// A pending enrollment and the vault generation it was started under.
@@ -302,6 +304,22 @@ fn totp_error(outcome: TotpOutcome) -> BrokerError {
     }
 }
 
+fn open_channel(shared: &Shared, session: &mut Session, first: &[u8], local: bool) -> Handled {
+    if session.channel_opened {
+        return Err(BrokerError::Forbidden);
+    }
+    // One attempt per socket: no context replacement may inherit a channel's
+    // authentication or pending seed, including after a failed handshake.
+    session.channel_opened = true;
+    let (channel, response) = shared
+        .identity
+        .accept(first)
+        .map_err(crate::channel::channel_error)?;
+    session.channel = Some(channel);
+    session.allow_totp_removal = local;
+    Ok(Outcome::Reply(Reply::ChannelOpened(response)))
+}
+
 fn handle(shared: &Shared, session: &mut Session, request: Request) -> Handled {
     let now = Instant::now();
     let Some(role) = session.role else {
@@ -331,16 +349,11 @@ fn handle(shared: &Shared, session: &mut Session, request: Request) -> Handled {
     }
     if role == Role::Relay {
         return match request {
-            Request::OpenChannel { first } if !session.channel_opened => {
-                // One handshake per socket. A relay must never replace a
-                // browser's channel and inherit its step-up or pending seed.
-                session.channel_opened = true;
-                let (channel, response) = shared
-                    .identity
-                    .accept(&first)
-                    .map_err(crate::channel::channel_error)?;
-                session.channel = Some(channel);
-                Ok(Outcome::Reply(Reply::ChannelOpened(response)))
+            Request::OpenChannel { first } => open_channel(shared, session, &first, false),
+            Request::OpenLocalChannel { first }
+                if session.version >= a206_vault_channel::TOTP_REMOVAL_BROKER_VERSION =>
+            {
+                open_channel(shared, session, &first, true)
             }
             Request::ChannelMessage { bytes } => {
                 // Take first: every crypto/protocol failure permanently voids this channel.
@@ -349,8 +362,14 @@ fn handle(shared: &Shared, session: &mut Session, request: Request) -> Handled {
                     .open::<a206_vault_channel::Request>(&bytes)
                     .map_err(crate::channel::channel_error)?;
                 session.role = Some(Role::User);
-                let outcome = crate::channel::validate(&operation)
-                    .and_then(|()| handle(shared, session, crate::channel::request(operation)));
+                let outcome = if matches!(operation, a206_vault_channel::Request::RemoveTotp { .. })
+                    && !session.allow_totp_removal
+                {
+                    Err(BrokerError::TotpRemovalUnavailable)
+                } else {
+                    crate::channel::validate(&operation)
+                        .and_then(|()| handle(shared, session, crate::channel::request(operation)))
+                };
                 session.role = Some(Role::Relay);
                 let reply = crate::channel::reply(outcome.map(|outcome| match outcome {
                     Outcome::Reply(reply) => reply,
@@ -444,6 +463,7 @@ fn handle(shared: &Shared, session: &mut Session, request: Request) -> Handled {
         Request::Hello { .. }
         | Request::ChannelKey
         | Request::OpenChannel { .. }
+        | Request::OpenLocalChannel { .. }
         | Request::ChannelMessage { .. } => Err(BrokerError::Forbidden),
         Request::CancelTotp => {
             session.pending = None;
