@@ -210,7 +210,7 @@ impl std::str::FromStr for Columns {
 #[component]
 fn NotFound(segments: Vec<String>) -> Element {
     rsx! {
-        PageFrame { kicker: "Navigation", title: "Page not found.", description: "This address does not point to an Agent 206 page.",
+        PageFrame { icon: IconName::Help, kicker: "Navigation", title: "Page not found.", description: "This address does not point to an Agent 206 page.",
             LinkButton { href: Route::Workspace {}.to_string(), variant: ButtonVariant::Primary, "Return to workspace" }
         }
     }

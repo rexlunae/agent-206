@@ -53,7 +53,7 @@ pub(crate) fn Imports() -> Element {
     let mut busy = use_signal(|| false);
     let mut tool = use_signal(|| Tool::RustyClaw);
     let tool_value = use_memo(move || Some(tool().label().to_owned()));
-    rsx! { PageFrame { kicker: "Settings", title: "Import", description: "Review settings from another installation before adding them.",
+    rsx! { PageFrame { icon: IconName::Download, kicker: "Settings", title: "Import", description: "Review settings from another installation before adding them.",
         Card { variant: CardVariant::Elevated,
             CardHeader { CardTitle { "Source settings" } CardSubtitle { "The path is on the gateway host, including when you connect remotely." } }
             CardBody {

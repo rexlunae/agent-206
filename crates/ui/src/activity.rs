@@ -152,7 +152,7 @@ pub fn Activity() -> Element {
     let now = clock();
     let snapshot = state.data.read();
     let current = shown();
-    rsx! { PageFrame { kicker: "Activity", title: "What happened, newest first.", description: "Approvals, questions, downloads and changes to extensions, connections and settings, from the gateway's event log.",
+    rsx! { PageFrame { icon: IconName::Clock, kicker: "Activity", title: "What happened, newest first.", description: "Approvals, questions, downloads and changes to extensions, connections and settings, from the gateway's event log.",
         if let Some(report) = failure() {
             ErrorNotice { report, title: "Could not read activity".to_string() }
         }

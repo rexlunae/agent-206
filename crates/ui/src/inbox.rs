@@ -44,7 +44,7 @@ pub fn Inbox() -> Element {
             .and_then(|parent| snapshot.threads.iter().find(|t| t.id == parent))
             .map(|t| t.title.clone())
     };
-    rsx! { PageFrame { kicker: "Supervision", title: "Waiting on you.", description: "Tool calls asking for approval and questions agents asked, from every conversation and subagent, oldest first. Each answer goes to the conversation that asked.",
+    rsx! { PageFrame { icon: IconName::Bell, kicker: "Supervision", title: "Waiting on you.", description: "Tool calls asking for approval and questions agents asked, from every conversation and subagent, oldest first. Each answer goes to the conversation that asked.",
         if !connected {
             // The cards would only fail; the last report may be stale too.
             Alert { tone: AlertTone::Warning, title: rsx! { "The gateway is not connected" }, "Approvals and questions can be answered once it reconnects." }

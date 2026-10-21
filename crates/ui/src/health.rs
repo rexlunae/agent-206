@@ -120,7 +120,7 @@ pub(crate) fn HealthChecks() -> Element {
     };
     let busy = running() || repairing.read().is_some();
     rsx! { Card { variant: CardVariant::Subtle,
-        CardHeader { CardTitle { "Health checks" } }
+        CardHeader { CardTitle { span { class: "a206-icon-label", Icon { name: IconName::Info, size: IconSize::Sm } "Health checks" } } }
         CardBody {
             match &*report.read() {
                 None => rsx! { p { class: "a206-muted", if cfg!(target_arch = "wasm32") { "Check the web server's profile, gateway, vault broker and provider accounts. Nothing is started or changed." } else { "Check the profile, gateway, vault broker and provider accounts. Nothing is started or changed." } } },
@@ -129,7 +129,15 @@ pub(crate) fn HealthChecks() -> Element {
                     ul { class: "a206-stack", aria_label: "Health check results",
                         for check in report.checks.iter() {
                             li { class: "a206-row",
-                                Badge { tone: tone(check.health), dot: true, "{label(check.health)}" }
+                                Badge { tone: tone(check.health),
+                                    Icon { size: IconSize::Sm, name: match check.health {
+                                        Level::Ok => IconName::Check,
+                                        Level::Warning => IconName::Warning,
+                                        Level::Unknown => IconName::Help,
+                                        Level::Problem => IconName::Error,
+                                    } }
+                                    "{label(check.health)}"
+                                }
                                 span { "{check.finding}" }
                                 if let Some(recovery) = check.finding.recovery().filter(|_| check.health != Level::Ok) {
                                     code { class: "a206-muted", "{recovery}" }
@@ -153,7 +161,7 @@ pub(crate) fn HealthChecks() -> Element {
                                         availability: if busy { Availability::Disabled } else { Availability::Enabled },
                                         aria_label: format!("Repair: {fix}"),
                                         onclick: { let fix = fix.clone(); move |_| make(fix.clone()) },
-                                        "Repair"
+                                        Icon { name: IconName::Settings, size: IconSize::Sm } "Repair"
                                     }
                                 }
                             }
@@ -166,7 +174,7 @@ pub(crate) fn HealthChecks() -> Element {
             }
         }
         CardFooter {
-            Button { variant: ButtonVariant::Secondary, busy: running(), availability: if busy { Availability::Disabled } else { Availability::Enabled }, onclick: move |_| refresh(), if running() { "Checking…" } else { "Run health checks" } }
+            Button { variant: ButtonVariant::Secondary, busy: running(), availability: if busy { Availability::Disabled } else { Availability::Enabled }, onclick: move |_| refresh(), if !running() { Icon { name: IconName::Refresh, size: IconSize::Sm } } if running() { "Checking…" } else { "Run health checks" } }
         }
     } }
 }

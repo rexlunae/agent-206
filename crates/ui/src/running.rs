@@ -132,7 +132,7 @@ pub fn Running() -> Element {
             .find(|t| t.id == id)
             .map(|t| t.title.clone())
     };
-    rsx! { PageFrame { kicker: "Supervision", title: "Running work.", description: "Every response in progress, across conversations, with the subagents it delegated to. Pausing or stopping a conversation also holds or stops its subagents.",
+    rsx! { PageFrame { icon: IconName::Play, kicker: "Supervision", title: "Running work.", description: "Every response in progress, across conversations, with the subagents it delegated to. Pausing or stopping a conversation also holds or stops its subagents.",
         div { class: "a206-grid",
             Metric { label: name!("Running responses"), title: rsx! { "Running" }, value: Some(responses as f64), display: responses.to_string(), meta: rsx! { "Including subagents" } }
             Metric { label: name!("Waiting on you"), title: rsx! { "Waiting on you" }, value: Some(waiting.len() as f64), display: waiting.len().to_string(), meta: rsx! { "Conversations with approvals or questions" } }

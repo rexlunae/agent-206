@@ -21,6 +21,10 @@ body { max-inline-size: none; inline-size: 100%; padding: 0; background: var(--f
 .a206-page-inner { max-inline-size: 1100px; margin-inline: auto; display: flex; flex-direction: column; gap: var(--fc-space-4); }
 .a206-page h1 { font-size: clamp(1.8rem, 3vw, 3.1rem); letter-spacing: -.055em; font-weight: 500; line-height: 1.1; margin: .5rem 0; }
 .a206-page h2 { font-size: 1.2rem; font-weight: 550; letter-spacing: -.025em; }
+.a206-page-heading { display: flex; align-items: center; gap: var(--fc-space-3); margin-block: var(--fc-space-2); }
+.a206-page-heading h1 { margin-block: 0; min-inline-size: 0; overflow-wrap: anywhere; }
+.a206-page-icon { display: inline-flex; align-items: center; justify-content: center; flex: none; padding: var(--fc-space-3); border: 1px solid var(--fc-color-border-subtle); border-radius: var(--fc-radius-lg); background: var(--fc-color-accent-bg-subtle); color: var(--fc-color-accent-text); }
+.a206-icon-label { display: inline-flex; align-items: center; gap: var(--fc-space-2); }
 .a206-muted { color: var(--fc-content-muted, var(--fc-color-text-muted)); }
 .a206-row { display: flex; gap: var(--fc-space-3); align-items: center; flex-wrap: wrap; }
 .a206-between { justify-content: space-between; }

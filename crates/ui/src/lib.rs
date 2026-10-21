@@ -822,13 +822,23 @@ fn Sidebar() -> Element {
 }
 #[component]
 pub(crate) fn PageFrame(
+    icon: IconName,
     kicker: String,
     title: String,
     description: String,
     children: Element,
 ) -> Element {
     rsx! { section { class: "a206-page", div { class: "a206-page-inner",
-        header { p { class: "a206-eyebrow", "{kicker}" } h1 { "{title}" } p { class: "a206-muted", "{description}" } }
+        header {
+            p { class: "a206-eyebrow", "{kicker}" }
+            div { class: "a206-page-heading", PageIcon { name: icon } h1 { "{title}" } }
+            p { class: "a206-muted", "{description}" }
+        }
         {children}
     } } }
+}
+
+#[component]
+pub(crate) fn PageIcon(name: IconName) -> Element {
+    rsx! { span { class: "a206-page-icon", Icon { name, size: IconSize::Lg } } }
 }
