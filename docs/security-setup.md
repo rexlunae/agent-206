@@ -175,6 +175,19 @@ read/reveal operation is added to the UI channel. Older/unknown peers are refuse
 before a new secret-bearing request is sealed; no plaintext fallback exists.
 Native and encrypted broker integration tests cover authentication/role denials,
 overwrite refusal, origin validation, byte/count bounds and metadata without values.
-GUI editing, SSH-key/form/payment entry, agent-use approvals and remote vault
+Shared credential rows also offer Enable/Disable through the same broker step-up.
+The requested name and target flag are retained across authentication; the panel
+reloads broker metadata after confirmation instead of optimistically changing a
+row. Broker v19 adds only this bounded encrypted request, mapped to the existing
+native `UpdateCredential` operation with policy and destinations absent. Older web
+peers are refused before sending it. Tests cover both directions, connection-owned
+authentication, lock revocation, persistence, the unchanged private value and other
+metadata, an untouched second entry and missing-name refusal. Release-web testing
+in a disposable synthetic vault verified disable, reconnect/step-up, cancel without
+change, authenticated re-enable and disabled-state persistence across lock/reopen,
+with policy and origin retained and global access off. Native desktop interaction
+remains unverified; the TUI guard is unchanged.
+
+Other GUI editing, SSH-key/form/payment entry, agent-use approvals and remote vault
 controls remain pending; the CLI supports SSH-key and other entry kinds and policy
 edits. Form and payment entry remain unavailable in both clients.

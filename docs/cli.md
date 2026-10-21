@@ -71,5 +71,7 @@ API keys with per-use approval through broker v17. The CLI keeps the broader
 `vault add`, `adopt`, `policy`, `bind`, enable/disable, delete, agent-access and
 step-up reveal operations. Global agent-access enable/disable is also available on
 the shared desktop/web Security page through the same broker step-up policy
-(encrypted panel support requires broker v18). TUI vault controls remain unavailable.
+(encrypted panel support requires broker v18). Per-credential enable/disable also
+uses shared Security controls with broker step-up (encrypted support requires v19).
+Policy, destination and value editing remain CLI operations. TUI vault controls remain unavailable.
 No additional agent-facing secret tool is introduced.

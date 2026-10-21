@@ -339,6 +339,19 @@ entry kinds, edits, legacy adoption, removal and reveal
 remain CLI operations, including SSH-key entry. Form and payment entry remain unavailable.
 Agent credential-use approval and remote SSH vault controls are pending.
 
+Typed credential rows now offer explicit enable/disable actions with the existing
+broker-owned step-up policy. Broker v19 exposes only the disabled flag on the
+verified encrypted channel; native `UpdateCredential` already supported it.
+Metadata reloads after a confirmed write. Owning tests cover authentication,
+exact target isolation, flag persistence, unchanged policy/destinations/private
+value, lock revocation and old web-peer refusal. Release-web acceptance in a fresh
+synthetic vault verified disable, reconnect requiring step-up, cancel without a
+state change, authenticated re-enable and disabled-state persistence after
+lock/reopen. Approval policy and origin remained visible; global access stayed off
+and the gateway stayed deliberately stopped. No real credentials, accounts or
+model calls were used. Native desktop interaction remains unverified; the TUI vault
+guard remains in place.
+
 Shared desktop/web Security controls now offer explicit global agent-access
 enable/disable actions with broker-owned step-up. Broker v18 exposes the existing
 mutation through the independently verified encrypted panel; older web peers are

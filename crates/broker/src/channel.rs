@@ -85,6 +85,12 @@ pub fn request(value: wire::Request) -> Request {
         wire::Request::CancelTotp => Request::CancelTotp,
         wire::Request::PairGateway => Request::PairGateway,
         wire::Request::SetAgentAccess { enabled } => Request::SetAgentAccess { enabled },
+        wire::Request::SetCredentialDisabled { name, disabled } => Request::UpdateCredential {
+            name,
+            policy: None,
+            disabled: Some(disabled),
+            destinations: None,
+        },
     }
 }
 pub fn code(error: &BrokerError) -> wire::Code {
