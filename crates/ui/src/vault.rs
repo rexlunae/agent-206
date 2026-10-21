@@ -241,6 +241,15 @@ impl Panel {
         self.status.set(Some(status));
     }
     fn forget_credentials(mut self) {
+        // Forget the pending operation as well as its confirmation when the
+        // vault locks or its state can no longer be confirmed.
+        let deleting = matches!(
+            &*self.flow.peek(),
+            Flow::StepUp(Task::DeleteCredential { .. })
+        );
+        if deleting {
+            self.flow.set(Flow::Idle);
+        }
         self.credential_page.set(None);
         // A page error belongs to the previous lock/connection state. Keep
         // mutation failures separately so an uncertain save is never hidden.
@@ -1089,6 +1098,59 @@ fn AgentAccessControl(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn forgetting_credentials_cancels_deletion_authentication() {
+        let mut dom = VirtualDom::new(|| rsx! { div {} });
+        dom.rebuild_in_place();
+        dom.in_scope(ScopeId::ROOT, || {
+            let mut panel = Panel {
+                allow_totp_removal: true,
+                session: Signal::new(Session::open(std::env::temp_dir())),
+                status: Signal::new(None),
+                failure: Signal::new(None),
+                warning: Signal::new(None),
+                poll_failure: Signal::new(None),
+                notice: Signal::new(None),
+                busy: Signal::new(false),
+                flow: Signal::new(Flow::Idle),
+                held: Signal::new(None),
+                enrollment: Signal::new(None),
+                import_review: Signal::new(None),
+                import_totp: Signal::new(false),
+                import_result: Signal::new(None),
+                credential_page: Signal::new(None),
+                credential_failure: Signal::new(None),
+                credential_read_failure: Signal::new(None),
+                key_editor: Signal::new(false),
+                destination_editor: Signal::new(None),
+                policy_editor: Signal::new(None),
+                delete_credential: Signal::new(None),
+                progress: None,
+            };
+            let name = uuid::Uuid::new_v4().to_string();
+            let pending = Flow::StepUp(Task::DeleteCredential { name: name.clone() });
+            panel.flow.set(pending.clone());
+            panel.delete_credential.set(Some(name.clone()));
+            panel.show(status(true, true, Some(false)));
+            assert_eq!((panel.flow)(), pending);
+            assert_eq!((panel.delete_credential)(), Some(name.clone()));
+            panel.cancel();
+            assert_eq!((panel.flow)(), Flow::Idle);
+            assert_eq!((panel.delete_credential)(), Some(name.clone()));
+            panel.flow.set(pending.clone());
+            panel.show(status(true, false, None));
+            assert_eq!((panel.flow)(), Flow::Idle);
+            assert_eq!((panel.delete_credential)(), None);
+            assert!(offer(panel.status.peek().as_ref().unwrap(), true).unlock);
+            // The unreadable/disconnected path forgets through the same method.
+            panel.flow.set(pending);
+            panel.delete_credential.set(Some(name));
+            panel.forget_credentials();
+            assert_eq!((panel.flow)(), Flow::Idle);
+            assert_eq!((panel.delete_credential)(), None);
+        });
+    }
 
     #[test]
     fn access_controls_offer_the_opposite_known_state_and_hide_unknown() {

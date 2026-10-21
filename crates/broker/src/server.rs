@@ -362,7 +362,16 @@ fn handle(shared: &Shared, session: &mut Session, request: Request) -> Handled {
                     .open::<a206_vault_channel::Request>(&bytes)
                     .map_err(crate::channel::channel_error)?;
                 session.role = Some(Role::User);
-                let outcome = if matches!(operation, a206_vault_channel::Request::RemoveTotp { .. })
+                let outcome = if matches!(
+                    operation,
+                    a206_vault_channel::Request::DeleteCredential { .. }
+                ) && session.version
+                    < a206_vault_channel::CREDENTIAL_DELETE_BROKER_VERSION
+                {
+                    // This is a new encrypted-panel capability; the native
+                    // User deletion opcode keeps its existing compatibility.
+                    Err(BrokerError::Invalid(InvalidRequest::UnsupportedVersion))
+                } else if matches!(operation, a206_vault_channel::Request::RemoveTotp { .. })
                     && !session.allow_totp_removal
                 {
                     Err(BrokerError::TotpRemovalUnavailable)

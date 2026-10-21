@@ -4414,3 +4414,134 @@ async fn encrypted_credential_deletion_is_targeted_authenticated_and_persistent(
     task.abort();
     assert!(task.await.unwrap_err().is_cancelled());
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn encrypted_deletion_requires_negotiated_v24_without_changing_native_deletion() {
+    use a206_vault_channel::{Handshake, Reply as R, Request as Q, Secret};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    async fn call(stream: &mut tokio::net::UnixStream, body: Request) -> Reply {
+        let id = uuid::Uuid::new_v4();
+        stream
+            .write_all(&a206_protocol::encode(&a206_protocol::Request { id, body }).unwrap())
+            .await
+            .unwrap();
+        let mut decoder = a206_protocol::Decoder::default();
+        let mut bytes = [0; 8192];
+        loop {
+            let count = stream.read(&mut bytes).await.unwrap();
+            assert_ne!(count, 0);
+            let replies: Vec<a206_protocol::Response<Reply>> =
+                decoder.feed(&bytes[..count]).unwrap();
+            if let Some(reply) = replies.into_iter().next() {
+                assert_eq!(reply.id, id);
+                return reply.body;
+            }
+        }
+    }
+    let (_dir, root, task) = start().await;
+    let password = random();
+    let mut owner = user(&root).await;
+    owner.call(unlock(&password, None, true)).await.unwrap();
+    let name = random();
+    owner
+        .call(Request::PutCredential {
+            name: name.clone(),
+            meta: meta(vec![]),
+            value: WireValue::Single(WireSecret::new(random())),
+            replace: false,
+        })
+        .await
+        .unwrap();
+    let before = tokio::fs::read(vault_path(&root)).await.unwrap();
+    for version in [23, 24] {
+        let mut stream = tokio::net::UnixStream::connect(socket_path(&root))
+            .await
+            .unwrap();
+        assert!(matches!(
+            call(
+                &mut stream,
+                Request::Hello {
+                    role: Role::Relay,
+                    version
+                }
+            )
+            .await,
+            Reply::Ok
+        ));
+        let Reply::ChannelKey(key) = call(&mut stream, Request::ChannelKey).await else {
+            panic!()
+        };
+        let (handshake, first) = Handshake::start(&key).unwrap();
+        let Reply::ChannelOpened(response) =
+            call(&mut stream, Request::OpenChannel { first }).await
+        else {
+            panic!()
+        };
+        let mut channel = handshake.finish(&response).unwrap();
+        for request in [
+            Q::StepUp {
+                password: Some(Secret::new(password.clone())),
+                totp: None,
+            },
+            Q::DeleteCredential { name: name.clone() },
+        ] {
+            let deleting = matches!(request, Q::DeleteCredential { .. });
+            let bytes = channel.seal(&request).unwrap();
+            let Reply::ChannelMessage(bytes) =
+                call(&mut stream, Request::ChannelMessage { bytes }).await
+            else {
+                panic!()
+            };
+            let reply: R = channel.open(&bytes).unwrap();
+            if deleting && version == 23 {
+                assert!(
+                    matches!(reply, R::Error(error) if error.report.kind == a206_core::ErrorKind::InvalidRequest)
+                );
+                assert_eq!(tokio::fs::read(vault_path(&root)).await.unwrap(), before);
+            } else {
+                assert!(matches!(reply, R::Ok), "{reply:?}");
+            }
+        }
+    }
+    // The old native opcode remains usable on a v23 User connection.
+    owner
+        .call(Request::PutCredential {
+            name: name.clone(),
+            meta: meta(vec![]),
+            value: WireValue::Single(WireSecret::new(random())),
+            replace: false,
+        })
+        .await
+        .unwrap();
+    let mut native = tokio::net::UnixStream::connect(socket_path(&root))
+        .await
+        .unwrap();
+    assert!(matches!(
+        call(
+            &mut native,
+            Request::Hello {
+                role: Role::User,
+                version: 23
+            }
+        )
+        .await,
+        Reply::Ok
+    ));
+    assert!(matches!(
+        call(
+            &mut native,
+            Request::StepUp {
+                password: Some(WireSecret::new(password)),
+                totp: None
+            }
+        )
+        .await,
+        Reply::Ok
+    ));
+    assert!(matches!(
+        call(&mut native, Request::DeleteCredential { name }).await,
+        Reply::Ok
+    ));
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+}
