@@ -21,16 +21,17 @@ use zeroize::Zeroizing;
 /// imports, 12 [`AuthScheme::WebhookUrl`], 13 [`Request::GitReceivePack`], 14
 /// [`Request::GitUploadPack`], 15 [`AuthScheme::SubscriptionToken`], 16
 /// [`Request::SshAgent`], and 17 bounded credential metadata pages and
-/// fixed-policy API-key creation. A broker accepts greetings from
+/// fixed-policy API-key creation; 18 adds encrypted-panel agent-access changes.
+/// A broker accepts greetings from
 /// [`MIN_BROKER_VERSION`] up to this version, and a client falls back to the
 /// newest version an older broker accepts (see `Client::version`), so streams
 /// are only requested from brokers that understand them.
-pub const BROKER_VERSION: u16 = 17;
+pub const BROKER_VERSION: u16 = 18;
 pub use a206_vault_channel::CREDENTIALS_BROKER_VERSION as CREDENTIALS_VERSION;
 /// First version with connection-held source reviews and guarded vault import.
 pub use a206_vault_channel::REVIEWED_IMPORT_BROKER_VERSION as REVIEWED_IMPORT_VERSION;
 /// The oldest protocol version this broker still serves and this client still
-/// speaks. Versions 3 to 17 differ only by the requests, roles and schemes they add.
+/// speaks. Versions 3 to 18 differ only by the requests, roles and schemes they add.
 pub const MIN_BROKER_VERSION: u16 = 3;
 /// The first version that serves [`Request::ProviderStream`].
 pub const STREAM_VERSION: u16 = 4;

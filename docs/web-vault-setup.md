@@ -60,7 +60,12 @@ confirmed, refresh metadata before retrying: the write may have committed.
 
 These controls require broker v17 and refuse older brokers before sending the
 new requests. Generic setup still works with v10, and migration with v11.
-Reveal, policy/destination edits, legacy adoption, agent-access changes, deletion
+Global agent credential access has separate enable/disable actions when unlocked.
+Both require recent authentication on this encrypted connection and broker v18.
+Enabling access does not approve an agent operation or override any credential's
+policy, destinations or disabled state. Locked or unknown state offers no action.
+
+Reveal, policy/destination edits, legacy adoption, deletion
 and TOTP removal remain trusted CLI operations. The CLI also offers token, login,
 passkey, SSH-key, note and other entry kinds; this panel adds API keys only. Form
 and payment entry are still unavailable in both clients.

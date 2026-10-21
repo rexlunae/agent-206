@@ -69,4 +69,7 @@ the broker restarts. See [web vault setup](web-vault-setup.md).
 The shared Security page now reads bounded typed credential metadata and adds
 API keys with per-use approval through broker v17. The CLI keeps the broader
 `vault add`, `adopt`, `policy`, `bind`, enable/disable, delete, agent-access and
-step-up reveal operations. No additional agent-facing secret tool is introduced.
+step-up reveal operations. Global agent-access enable/disable is also available on
+the shared desktop/web Security page through the same broker step-up policy
+(encrypted panel support requires broker v18). TUI vault controls remain unavailable.
+No additional agent-facing secret tool is introduced.

@@ -87,6 +87,7 @@ enum Task {
     Pair,
     Enroll,
     AddCredential,
+    SetAgentAccess(bool),
 }
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Flow {
@@ -387,6 +388,33 @@ impl Panel {
     }
     async fn perform(mut self, task: Task) {
         match task {
+            Task::SetAgentAccess(enabled) => {
+                match self
+                    .session()
+                    .call(Request::SetAgentAccess { enabled })
+                    .await
+                {
+                    Ok(Reply::Ok) => {
+                        self.flow.set(Flow::Idle);
+                        self.notice.set(Some(if enabled {
+                            "Agent credential access enabled. Individual credential policies still apply."
+                        } else {
+                            "Agent credential access disabled."
+                        }));
+                    }
+                    Err(error) if broker_refused(&error, BrokerError::StepUpRequired) => {
+                        self.flow.set(Flow::StepUp(task));
+                    }
+                    result => {
+                        self.flow.set(Flow::Idle);
+                        self.fail(
+                            "vault_agent_access",
+                            "Could not change agent credential access",
+                            &result.err().unwrap_or_else(unexpected),
+                        );
+                    }
+                }
+            }
             Task::AddCredential => {
                 self.flow.set(Flow::Idle);
                 self.key_editor.set(true);
@@ -668,7 +696,7 @@ fn VaultPanel(target: Target) -> Element {
                     }
                 },
                 Flow::StepUp(task) => rsx! {
-                    p { match task { Task::Pair => "Confirm it is you before pairing the gateway.", Task::Enroll => "Confirm it is you before enrolling an authenticator.", Task::AddCredential => "Confirm it is you before adding an API key." } }
+                    p { match task { Task::Pair => "Confirm it is you before pairing the gateway.", Task::Enroll => "Confirm it is you before enrolling an authenticator.", Task::AddCredential => "Confirm it is you before adding an API key.", Task::SetAgentAccess(true) => "Confirm it is you before enabling agent credential access.", Task::SetAgentAccess(false) => "Confirm it is you before disabling agent credential access." } }
                     if enrolled {
                         Field { label: rsx! { "Authenticator code" },
                             Input { value: ReadSignal::from(code), oninput: move |v| code.set(v), autocomplete: "one-time-code", inputmode: "numeric" }
@@ -769,6 +797,13 @@ fn VaultPanel(target: Target) -> Element {
             }
         }
     }
+    if flow == Flow::Idle {
+        AgentAccessControl {
+            enabled: status.as_ref().filter(|s| s.unlocked).and_then(|s| s.agent_access),
+            availability: availability.clone(),
+            onrequest: move |enabled| { take(password); take(confirm); take(code); panel.start(Task::SetAgentAccess(enabled)); },
+        }
+    }
     if let Some(Failure { title, report }) = (panel.credential_failure)() {
         ErrorNotice { report, title }
     }
@@ -784,9 +819,65 @@ fn VaultPanel(target: Target) -> Element {
     }
 }
 
+/// Offer an explicit target state only when the broker reports the current one.
+#[component]
+fn AgentAccessControl(
+    enabled: Option<bool>,
+    availability: Availability,
+    onrequest: EventHandler<bool>,
+) -> Element {
+    let Some(enabled) = enabled else {
+        return rsx! {};
+    };
+    rsx! {
+        Card { variant: CardVariant::Subtle,
+            CardHeader { CardTitle { "Agent credential access" } }
+            CardBody {
+                p { "This switch controls whether agents may use vault credentials. Enabling it does not approve an operation or override a credential's policy, destination restrictions or disabled state." }
+                p { "Changing this setting requires recent vault authentication. Your own credential access is separate." }
+            }
+            CardFooter {
+                Button { variant: ButtonVariant::Secondary, availability,
+                    onclick: move |_| onrequest.call(!enabled),
+                    if enabled { "Disable agent credential access" } else { "Enable agent credential access" }
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn access_controls_offer_the_opposite_known_state_and_hide_unknown() {
+        fn root(enabled: Option<bool>) -> Element {
+            rsx! { AgentAccessControl { enabled, availability: Availability::Enabled, onrequest: move |_| {} } }
+        }
+        for (state, action, absent) in [
+            (
+                Some(false),
+                "Enable agent credential access",
+                "Disable agent credential access",
+            ),
+            (
+                Some(true),
+                "Disable agent credential access",
+                "Enable agent credential access",
+            ),
+        ] {
+            let mut dom = VirtualDom::new_with_props(root, state);
+            dom.rebuild_in_place();
+            let html = dioxus_ssr::render(&dom);
+            assert!(html.contains(action), "{html}");
+            assert!(!html.contains(absent), "{html}");
+            assert!(html.contains("does not approve an operation"), "{html}");
+        }
+        let mut dom = VirtualDom::new_with_props(root, None);
+        dom.rebuild_in_place();
+        assert!(!dioxus_ssr::render(&dom).contains("<button"));
+    }
 
     fn status(exists: bool, unlocked: bool, totp: Option<bool>) -> BrokerStatus {
         BrokerStatus {

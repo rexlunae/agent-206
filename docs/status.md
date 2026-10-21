@@ -335,9 +335,22 @@ atomic refusal to overwrite; global agent access is unchanged. Pages contain at
 most 50 entries and 48 KiB encoded, with explicit errors for oversized metadata.
 Native/encrypted integration tests cover the new operations and compatibility
 refusal; desktop/TUI interactive acceptance is still pending. Other CLI-supported
-entry kinds, edits, legacy adoption, removal, reveal and global access changes
+entry kinds, edits, legacy adoption, removal and reveal
 remain CLI operations, including SSH-key entry. Form and payment entry remain unavailable.
 Agent credential-use approval and remote SSH vault controls are pending.
+
+Shared desktop/web Security controls now offer explicit global agent-access
+enable/disable actions with broker-owned step-up. Broker v18 exposes the existing
+mutation through the independently verified encrypted panel; older web peers are
+refused before sending it. Tests cover authentication on the same connection,
+both directions, lock revocation, encrypted persistence after reopening and
+known/unknown UI states. Individual approval, credential restrictions and user
+access remain separate. Release-web acceptance in a disposable empty vault verified
+enable, a fresh connection requiring step-up, incorrect-password refusal,
+authenticated disable, locked controls being hidden and the off state retained
+after reopening. The deliberately stopped gateway stayed stopped. No accounts or
+model calls were configured. Native desktop interaction remains unverified; the
+TUI vault guard remains in place.
 
 Release-web acceptance before the v17 integration used a disposable encrypted password vault: private
 metadata loaded, locked skill scopes and disabled flags were shown, a synthetic

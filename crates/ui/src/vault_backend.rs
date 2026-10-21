@@ -19,6 +19,17 @@ fn checked(reply: Reply) -> Result<Reply, Failure> {
 // serializing a reviewed request or its secrets for an unsupported connection.
 #[cfg(any(target_arch = "wasm32", test))]
 fn reviewed_supported(version: u16, request: &Request) -> Result<(), Failure> {
+    if version < a206_vault_channel::AGENT_ACCESS_BROKER_VERSION
+        && matches!(request, Request::SetAgentAccess { .. })
+    {
+        return Err(Failure {
+            code: Code::Other,
+            report: a206_core::ErrorReport::new(
+                a206_core::ErrorKind::Unavailable,
+                "This broker cannot change agent access through this panel. Stop the old vault broker and retry with the updated application.",
+            ),
+        });
+    }
     if version < a206_vault_channel::CREDENTIALS_BROKER_VERSION
         && matches!(
             request,
@@ -278,6 +289,18 @@ pub(crate) use imp::{Session, Target};
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn agent_access_changes_refuse_old_brokers_before_sending() {
+        for version in 0..=19 {
+            for enabled in [true, false] {
+                assert_eq!(
+                    reviewed_supported(version, &Request::SetAgentAccess { enabled }).is_ok(),
+                    version >= 18
+                );
+            }
+            assert!(reviewed_supported(version, &Request::Status).is_ok());
+        }
+    }
     #[test]
     fn credentials_require_v17_before_any_secret_is_serialized() {
         for version in 0..=18 {

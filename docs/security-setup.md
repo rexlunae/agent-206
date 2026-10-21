@@ -110,7 +110,7 @@ protection on a renderer or platform that cannot enforce it.
 | Authentication throttling | Shared 3-failure / 30-second lockout over a 60-second failure window | Library throttle keyed by principal, not connection, tested; failures during lockout neither shorten nor extend it. Broker-wide enforcement covers connections and encrypted sessions, tested |
 | Per-credential policy | Always, WithApproval, WithAuth, SkillOnly, TriggerOnly | All variants, RustyClaw JSON shape, unknown variants rejected; evaluated deny-by-default and tested. Approval/step-up facts must come from the broker's trusted surface, pending |
 | Disabled credentials | Disabled entry cannot be used | Enforced for agent use and tested; missing flag reads as RustyClaw's default; owner reveal still allowed |
-| Global agent switch | User access distinct from agent access | Held in the encrypted vault, off by default. Deliberate tightening: it is a precondition and never satisfies WithApproval (RustyClaw let it). CLI changes require broker step-up; GUI global-access controls pending |
+| Global agent switch | User access distinct from agent access | Held in the encrypted vault, off by default. Deliberate tightening: it is a precondition and never satisfies WithApproval (RustyClaw let it). CLI and shared desktop/web Security changes require broker step-up; the web panel requires broker v18 and independently verified identity. TUI vault controls remain unavailable |
 | Credential kinds | API/token, login, SSH key, passkey, form, payment and secure note | All kinds stored in RustyClaw's `cred:`/`val:` layout with kind/value checks and stale-value removal, tested; unknown kinds fail to parse and stay unavailable |
 | SSH key use | Keys stored as credentials | `vault add --kind ssh-key` generates an Ed25519 key or stores a decrypted Ed25519 or ECDSA (P-256, P-384) key file; RSA keys are refused, since the `rsa` crate's private-key operations leak timing (RUSTSEC-2023-0071). Broker v16 `SshAgent` (gateway role) returns the public key and signs only a public-key authentication request for that key (RFC 4252, or OpenSSH's host-bound method), for an exact `ssh://host:port` the key is bound to; the private key never leaves the broker. Tested in the vault and over the broker socket. No SSH client uses it yet |
 | Protected namespaces/paths | Internal/provider/service records cannot be read through generic bypasses | Private state and backend isolation tested; all tool/extension/import paths require explicit vault exclusion |
@@ -145,6 +145,20 @@ key-file workflows and modern at-rest encryption remain pending. Browser-deliver
 code and the serving origin remain trusted, as does the native client executable.
 
 ## Shared credential controls
+
+The Security page offers explicit enable/disable actions for global agent credential
+access when the unlocked broker reports its current state. Both actions use the
+existing broker-owned step-up check; a stale authentication window asks again.
+The setting is saved in the encrypted vault. It never replaces per-credential
+approval, destination checks or disabled flags, and does not change user access.
+Broker v18 adds this operation to the independently authenticated encrypted panel
+channel. Older web peers are refused before the request is sealed. Real encrypted
+broker tests cover both directions, cross-connection step-up denial, lock revocation
+and persisted state after reopening. Renderer tests cover known/unknown action
+visibility. Release-web testing in a fresh empty synthetic vault verified enable,
+reconnect/step-up, incorrect-password refusal, authenticated disable, lock hiding
+the controls and the saved off state after reopening; the gateway stayed stopped.
+Native desktop interaction remains unverified and the TUI guard is unchanged.
 
 Security uses the private broker session to read typed metadata and add API keys
 (broker v17). Metadata/policy definitions live in `a206-vault-types`, a pure data

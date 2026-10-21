@@ -2300,6 +2300,63 @@ async fn secure_call(
     };
     channel.open(&bytes).unwrap()
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn encrypted_agent_access_requires_connection_owned_step_up_and_survives_reopen() {
+    use a206_vault_channel::{Code, Reply as R, Request as Q, Secret};
+    let (_dir, root, task) = start().await;
+    let password = random();
+    let mut owner = user(&root).await;
+    owner.call(unlock(&password, None, true)).await.unwrap();
+    let (mut relay, mut channel) = secure_open(&root).await;
+    // Another connection's creation step-up cannot authorize this channel.
+    for enabled in [true, false] {
+        assert!(matches!(
+            secure_call(&mut relay, &mut channel, Q::SetAgentAccess { enabled }).await,
+            R::Error(error) if error.code == Code::StepUpRequired
+        ));
+        assert_eq!(status(&mut owner).await.agent_access, Some(false));
+    }
+    assert!(matches!(
+        secure_call(
+            &mut relay,
+            &mut channel,
+            Q::StepUp {
+                password: Some(Secret::new(password.clone())),
+                totp: None,
+            }
+        )
+        .await,
+        R::Ok
+    ));
+    for enabled in [true, false, true] {
+        assert!(matches!(
+            secure_call(&mut relay, &mut channel, Q::SetAgentAccess { enabled }).await,
+            R::Ok
+        ));
+        assert_eq!(status(&mut owner).await.agent_access, Some(enabled));
+    }
+    owner.call(Request::Lock).await.unwrap();
+    assert!(matches!(
+        secure_call(
+            &mut relay,
+            &mut channel,
+            Q::SetAgentAccess { enabled: false }
+        )
+        .await,
+        R::Error(_)
+    ));
+    owner.call(unlock(&password, None, false)).await.unwrap();
+    assert_eq!(status(&mut owner).await.agent_access, Some(true));
+    // Reopening does not restore this channel's revoked step-up window.
+    assert!(matches!(
+        secure_call(&mut relay, &mut channel, Q::SetAgentAccess { enabled: false }).await,
+        R::Error(error) if error.code == Code::StepUpRequired
+    ));
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+}
+
 #[tokio::test]
 async fn encrypted_setup_keeps_seeds_private_and_cancellation_discards_them() {
     use a206_vault_channel::{Code, Reply as R, Request as Q, Secret};
