@@ -90,6 +90,9 @@ enum Task {
     Pair,
     Enroll,
     AddCredential,
+    DeleteCredential {
+        name: String,
+    },
     SetAgentAccess(bool),
     SetCredentialDisabled {
         name: String,
@@ -153,6 +156,7 @@ struct Panel {
     key_editor: Signal<bool>,
     destination_editor: Signal<Option<credentials::DestinationDraft>>,
     policy_editor: Signal<Option<credential_policy::PolicyDraft>>,
+    delete_credential: Signal<Option<String>>,
     /// The Get started checklist, when this panel is on that page.
     progress: Option<VaultProgress>,
 }
@@ -244,6 +248,7 @@ impl Panel {
         self.key_editor.set(false);
         self.destination_editor.set(None);
         self.policy_editor.set(None);
+        self.delete_credential.set(None);
     }
     /// The Get started page's background re-read. It never starts a broker,
     /// so a deliberate `vault stop` stays stopped, and its failure is shown
@@ -410,6 +415,33 @@ impl Panel {
     }
     async fn perform(mut self, task: Task) {
         match task.clone() {
+            Task::DeleteCredential { name } => {
+                match self
+                    .session()
+                    .call(Request::DeleteCredential { name })
+                    .await
+                {
+                    Ok(Reply::Ok) => {
+                        self.flow.set(Flow::Idle);
+                        self.delete_credential.set(None);
+                        self.notice.set(Some("Credential deleted."));
+                        self.credential_page.set(None);
+                        self.credential_read_failure.set(None);
+                    }
+                    Err(error) if broker_refused(&error, BrokerError::StepUpRequired) => {
+                        self.flow.set(Flow::StepUp(task));
+                    }
+                    result => {
+                        self.flow.set(Flow::Idle);
+                        // An uncertain write must not leave a one-click retry
+                        // against stale metadata. Reload, then confirm again.
+                        self.delete_credential.set(None);
+                        self.credential_page.set(None);
+                        self.credential_read_failure.set(None);
+                        self.fail("vault_delete_credential", "Deletion not confirmed; check refreshed credentials before trying again", &result.err().unwrap_or_else(unexpected));
+                    }
+                }
+            }
             Task::SetCredentialPolicy { name, policy } => {
                 match self
                     .session()
@@ -760,6 +792,7 @@ fn VaultPanel(target: Target, allow_totp_removal: bool) -> Element {
         key_editor: use_signal(|| false),
         destination_editor: use_signal(|| None),
         policy_editor: use_signal(|| None),
+        delete_credential: use_signal(|| None),
         progress: VaultProgress::listener(),
     };
     // Reads only through `peek`, so this runs once, after the first render.
@@ -885,12 +918,13 @@ fn VaultPanel(target: Target, allow_totp_removal: bool) -> Element {
                     }
                 },
                 Flow::StepUp(task) => rsx! {
-                    p { match &task { Task::Pair => "Confirm it is you before pairing the gateway.", Task::Enroll => "Confirm it is you before enrolling an authenticator.", Task::AddCredential => "Confirm it is you before adding an API key.", Task::SetAgentAccess(true) => "Confirm it is you before enabling agent credential access.", Task::SetAgentAccess(false) => "Confirm it is you before disabling agent credential access.", Task::SetCredentialDisabled { disabled: true, .. } => "Confirm it is you before disabling this credential.", Task::SetCredentialDisabled { disabled: false, .. } => "Confirm it is you before enabling this credential.", Task::SetCredentialDestinations { .. } => "Confirm it is you before replacing this credential's permitted destinations.", Task::SetCredentialPolicy { .. } => "Confirm it is you before changing this credential's policy." } }
+                    p { match &task { Task::Pair => "Confirm it is you before pairing the gateway.", Task::Enroll => "Confirm it is you before enrolling an authenticator.", Task::AddCredential => "Confirm it is you before adding an API key.", Task::DeleteCredential { .. } => "Confirm it is you before permanently deleting this credential.", Task::SetAgentAccess(true) => "Confirm it is you before enabling agent credential access.", Task::SetAgentAccess(false) => "Confirm it is you before disabling agent credential access.", Task::SetCredentialDisabled { disabled: true, .. } => "Confirm it is you before disabling this credential.", Task::SetCredentialDisabled { disabled: false, .. } => "Confirm it is you before enabling this credential.", Task::SetCredentialDestinations { .. } => "Confirm it is you before replacing this credential's permitted destinations.", Task::SetCredentialPolicy { .. } => "Confirm it is you before changing this credential's policy." } }
                     if let Task::SetCredentialPolicy { name, policy } = &task {
                         code { class: "a206-policy-identifier", "{name:?}" }
                         credential_policy::PolicySummary { policy: policy.clone() }
                     }
                     if let Task::SetCredentialDisabled { name, .. } = &task { code { "{name}" } }
+                    if let Task::DeleteCredential { name } = &task { code { class: "a206-policy-identifier", "{name:?}" } }
                     if let Task::SetCredentialDestinations { name, destinations } = &task {
                         code { "{name}" }
                         p { "New permitted destinations:" }
@@ -990,7 +1024,7 @@ fn VaultPanel(target: Target, allow_totp_removal: bool) -> Element {
                     if offer.enroll {
                         Button { variant: ButtonVariant::Secondary, availability: availability.clone(), onclick: move |_| panel.start(Task::Enroll), "Set up two-factor" }
                     }
-                    if offer.remove_totp && !(panel.key_editor)() && (panel.destination_editor)().is_none() && (panel.policy_editor)().is_none() {
+                    if offer.remove_totp && !(panel.key_editor)() && (panel.destination_editor)().is_none() && (panel.policy_editor)().is_none() && (panel.delete_credential)().is_none() {
                         Button { variant: ButtonVariant::Secondary, availability: availability.clone(), onclick: move |_| { take(password); take(confirm); take(code); panel.request_totp_removal(); }, "Remove two-factor" }
                     }
                     if offer.lock {

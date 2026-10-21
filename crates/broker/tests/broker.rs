@@ -4320,3 +4320,97 @@ async fn credential_management_refuses_old_peers_before_sending() {
     }
     assert!(matches!(a.call(Request::Status).await.unwrap(), Reply::Ok));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn encrypted_credential_deletion_is_targeted_authenticated_and_persistent() {
+    use a206_vault_channel::{Code, Reply as R, Request as Q, Secret};
+    let (_dir, root, task) = start().await;
+    let password = random();
+    let mut owner = user(&root).await;
+    owner.call(unlock(&password, None, true)).await.unwrap();
+    let removed = random();
+    let retained = random();
+    let value = random();
+    let mut expected = meta(vec!["https://example.invalid".into()]);
+    expected.policy = AccessPolicy::WithAuth;
+    expected.disabled = true;
+    for name in [&removed, &retained] {
+        owner
+            .call(Request::PutCredential {
+                name: name.clone(),
+                meta: expected.clone(),
+                value: WireValue::Single(WireSecret::new(value.clone())),
+                replace: false,
+            })
+            .await
+            .unwrap();
+    }
+    let (mut relay, mut channel) = secure_open(&root).await;
+    let remove = |name: &str| Q::DeleteCredential {
+        name: name.to_owned(),
+    };
+    let before = tokio::fs::read(a206_broker::vault_path(&root))
+        .await
+        .unwrap();
+    // The owner's authentication does not authorize this encrypted connection.
+    assert!(
+        matches!(secure_call(&mut relay, &mut channel, remove(&removed)).await,
+        R::Error(error) if error.code == Code::StepUpRequired)
+    );
+    assert_eq!(
+        tokio::fs::read(a206_broker::vault_path(&root))
+            .await
+            .unwrap(),
+        before
+    );
+    assert!(matches!(
+        secure_call(
+            &mut relay,
+            &mut channel,
+            Q::StepUp {
+                password: Some(Secret::new(password.clone())),
+                totp: None,
+            }
+        )
+        .await,
+        R::Ok
+    ));
+    assert!(matches!(
+        secure_call(&mut relay, &mut channel, remove(&removed)).await,
+        R::Ok
+    ));
+    assert!(matches!(
+        secure_call(&mut relay, &mut channel, remove(&removed)).await,
+        R::Error(_)
+    ));
+    let Reply::CredentialPage(page) = owner.call(page_request(None, 5)).await.unwrap() else {
+        panic!()
+    };
+    assert_eq!(page.entries, vec![(retained.clone(), expected.clone())]);
+    assert_eq!(status(&mut owner).await.agent_access, Some(false));
+    owner.call(Request::Lock).await.unwrap();
+    assert!(matches!(
+        secure_call(&mut relay, &mut channel, remove(&retained)).await,
+        R::Error(_)
+    ));
+    owner.call(unlock(&password, None, false)).await.unwrap();
+    assert!(
+        matches!(secure_call(&mut relay, &mut channel, remove(&retained)).await,
+        R::Error(error) if error.code == Code::StepUpRequired)
+    );
+    let Reply::CredentialPage(page) = owner.call(page_request(None, 5)).await.unwrap() else {
+        panic!()
+    };
+    assert_eq!(page.entries, vec![(retained.clone(), expected)]);
+    assert!(owner.call(Request::Reveal { name: removed }).await.is_err());
+    let Reply::Value(WireValue::Single(saved)) = owner
+        .call(Request::Reveal { name: retained })
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(saved.expose(), value);
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+}

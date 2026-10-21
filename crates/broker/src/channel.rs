@@ -124,6 +124,7 @@ pub fn request(value: wire::Request) -> Request {
         },
         wire::Request::PairGateway => Request::PairGateway,
         wire::Request::SetAgentAccess { enabled } => Request::SetAgentAccess { enabled },
+        wire::Request::DeleteCredential { name } => Request::DeleteCredential { name },
         wire::Request::SetCredentialDisabled { name, disabled } => Request::UpdateCredential {
             name,
             policy: None,

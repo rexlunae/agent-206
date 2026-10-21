@@ -160,6 +160,7 @@ pub(super) fn Credentials(
     ondestinations: EventHandler<(String, Vec<String>)>,
 ) -> Element {
     let mut editing = panel.destination_editor;
+    let mut deleting = panel.delete_credential;
     let editor_origins =
         use_memo(move || editing().map_or_else(String::new, |draft| draft.origins));
     let busy = (panel.busy)();
@@ -177,6 +178,7 @@ pub(super) fn Credentials(
         || (panel.flow)() != Flow::Idle
         || (panel.key_editor)()
         || editing().is_some()
+        || deleting().is_some()
         || (panel.policy_editor)().is_some();
     let available = if changing {
         Availability::Disabled
@@ -227,6 +229,10 @@ pub(super) fn Credentials(
                                     move |_| panel.policy_editor.set(Some(super::credential_policy::PolicyDraft::new(name.clone(), policy.clone())))
                                 }, "Edit policy for {meta.label}"
                             }
+                            Button { variant: ButtonVariant::Ghost, availability: available.clone(),
+                                onclick: { let name = name.clone(); move |_| deleting.set(Some(name.clone())) },
+                                "Delete {meta.label}"
+                            }
                         }),
                     ],
                 })
@@ -263,15 +269,42 @@ pub(super) fn Credentials(
                     oncancel: move |_| panel.policy_editor.set(None),
                 }
             }
+            if let Some(name) = deleting() {
+                DeleteConfirmation { name, busy: busy || (panel.flow)() != Flow::Idle,
+                    ondelete: move |name| panel.start(Task::DeleteCredential { name }),
+                    oncancel: move |_| deleting.set(None),
+                }
+            }
         }
         CardFooter {
-            CredentialPaging { unavailable: busy || (panel.flow)() != Flow::Idle || (panel.key_editor)(), editing: editing().is_some() || (panel.policy_editor)().is_some(), failed,
+            CredentialPaging { unavailable: busy || (panel.flow)() != Flow::Idle || (panel.key_editor)(), editing: editing().is_some() || (panel.policy_editor)().is_some() || deleting().is_some(), failed,
                 next: page.as_ref().and_then(|p| p.next.clone()), onread }
-            if page.is_some() && !(panel.key_editor)() && editing().is_none() && (panel.policy_editor)().is_none() {
+            if page.is_some() && !(panel.key_editor)() && editing().is_none() && (panel.policy_editor)().is_none() && deleting().is_none() {
                 Button { variant: ButtonVariant::Secondary, availability: available, onclick: move |_| panel.start(Task::AddCredential), "Add API key" }
             }
         }
     } }
+}
+
+#[component]
+fn DeleteConfirmation(
+    name: String,
+    busy: bool,
+    ondelete: EventHandler<String>,
+    oncancel: EventHandler<()>,
+) -> Element {
+    let available = if busy {
+        Availability::Disabled
+    } else {
+        Availability::Enabled
+    };
+    rsx! {
+        h3 { "Delete this credential?" }
+        code { class: "a206-policy-identifier", "{name:?}" }
+        p { "Permanently removes this stored credential and its restrictions. This cannot be undone here. Applications using it may stop working; other credentials and global agent access are unchanged." }
+        Button { variant: ButtonVariant::Primary, availability: available.clone(), onclick: move |_| ondelete.call(name.clone()), "Delete credential permanently" }
+        Button { variant: ButtonVariant::Ghost, availability: available, onclick: move |_| oncancel.call(()), "Keep credential" }
+    }
 }
 
 #[component]
@@ -395,6 +428,28 @@ fn KeyForm(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn deletion_confirmation_names_exact_target_and_disables_both_actions_while_busy() {
+        fn root((name, busy): (String, bool)) -> Element {
+            rsx! { DeleteConfirmation { name, busy, ondelete: move |_| {}, oncancel: move |_| {} } }
+        }
+        let name = format!("  {}  ", uuid::Uuid::new_v4());
+        for busy in [false, true] {
+            let mut dom = VirtualDom::new_with_props(root, (name.clone(), busy));
+            dom.rebuild_in_place();
+            let html = dioxus_ssr::render(&dom);
+            assert!(html.contains(&name), "{html}");
+            assert!(
+                html.contains("Delete credential permanently") && html.contains("Keep credential"),
+                "{html}"
+            );
+            assert_eq!(
+                html.matches(" disabled=true").count(),
+                if busy { 2 } else { 0 },
+                "{html}"
+            );
+        }
+    }
     #[test]
     fn scoped_policy_labels_quote_exact_identifiers_including_whitespace() {
         let identifier = format!("  {}  ", uuid::Uuid::new_v4());

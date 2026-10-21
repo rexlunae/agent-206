@@ -335,9 +335,21 @@ atomic refusal to overwrite; global agent access is unchanged. Pages contain at
 most 50 entries and 48 KiB encoded, with explicit errors for oversized metadata.
 Native/encrypted integration tests cover the new operations and compatibility
 refusal; native desktop interaction is still unverified and TUI vault controls
-are blocked. Other CLI-supported entry kinds, value edits, legacy adoption, removal and reveal
+are blocked. Other CLI-supported entry kinds, value edits, legacy adoption and reveal
 remain CLI operations, including SSH-key entry. Form and payment entry remain unavailable.
 Agent credential-use approval and remote SSH vault controls are pending.
+
+Shared credential rows also offer deletion after a separate confirmation naming
+the exact stored identifier and explaining that it cannot be undone here. The
+request retains that identifier through broker-owned step-up; cancel, lock and
+disconnect do not delete it. Broker v24 adds only the encrypted-panel operation,
+mapped to the existing native `DeleteCredential`. Older web peers are refused
+before sealing. Only a confirmed broker response reports success and reloads
+metadata; an uncertain response closes the confirmation and reloads before any
+new attempt. Release-web testing in a disposable synthetic vault verified both
+cancel paths, lock clearing a pending confirmation, reconnect requiring exact-name
+step-up, targeted deletion and persistence after reopening with the second entry
+and global agent access unchanged. Native desktop interaction remains unverified.
 
 Typed credential rows now offer explicit enable/disable actions with the existing
 broker-owned step-up policy. Broker v19 exposes only the disabled flag on the

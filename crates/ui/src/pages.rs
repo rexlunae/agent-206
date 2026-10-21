@@ -207,7 +207,7 @@ pub fn Security() -> Element {
             if crate::terminal_mode() {
                 "Vault controls are unavailable in the TUI. Use the desktop client or `agent206 vault` on the gateway host for credential operations. Agent-requested credential use is unavailable."
             } else {
-                "Security can list credentials, edit their policies and destinations, enable or disable them, add API keys, and remove an enrolled authenticator after password and code verification. Use `agent206 vault` on the gateway host for other entry kinds or deletion. Agent-requested credential use is unavailable."
+                "Security can list and delete credentials, edit their policies and destinations, enable or disable them, add API keys, and remove an enrolled authenticator after password and code verification. Use `agent206 vault` on the gateway host for other entry kinds. Agent-requested credential use is unavailable."
             }
         }
     } }

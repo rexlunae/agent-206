@@ -207,6 +207,21 @@ Other entry kinds, SSH-key/form/payment entry, agent-use approvals and remote va
 controls remain pending; the CLI supports SSH-key and other entry kinds and policy
 edits. Form and payment entry remain unavailable in both clients.
 
+Credential rows can also delete an entry after a separate confirmation showing
+its exact identifier. Keep credential cancels without a write. Broker-owned
+step-up authenticates the same retained name; authentication cancellation leaves
+the confirmation available, while lock or disconnect clears it. Only `Reply::Ok`
+reports deletion and reloads metadata. An uncertain result closes the confirmation
+and reloads rather than leaving a one-click retry against stale metadata. Broker
+v24 adds the encrypted-panel request, mapped to the existing native deletion
+operation; older web peers refuse it before sealing. Other entries, global agent
+access and authentication settings remain unchanged. Release-web acceptance in a
+disposable synthetic vault verified Keep and authentication cancel without a write,
+lock clearing the confirmation, reconnect/step-up for the exact target, deletion
+and lock/reopen persistence with the other entry's policy and destination retained
+and global access off. Native desktop interaction remains unverified; the TUI guard
+stays in place.
+
 Credential rows also offer Edit destinations. The editor replaces the complete
 list of permitted origins, including an empty list that prevents brokered use.
 The exact credential name and list are retained through step-up authentication;

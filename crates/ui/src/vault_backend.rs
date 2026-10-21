@@ -19,6 +19,17 @@ fn checked(reply: Reply) -> Result<Reply, Failure> {
 // serializing a reviewed request or its secrets for an unsupported connection.
 #[cfg(any(target_arch = "wasm32", test))]
 fn reviewed_supported(version: u16, request: &Request) -> Result<(), Failure> {
+    if version < a206_vault_channel::CREDENTIAL_DELETE_BROKER_VERSION
+        && matches!(request, Request::DeleteCredential { .. })
+    {
+        return Err(Failure {
+            code: Code::Other,
+            report: a206_core::ErrorReport::new(
+                a206_core::ErrorKind::Unavailable,
+                "This broker cannot delete credentials through this panel. Stop the old vault broker and retry with the updated application.",
+            ),
+        });
+    }
     if version < a206_vault_channel::TOTP_REMOVAL_BROKER_VERSION
         && matches!(request, Request::RemoveTotp { .. })
     {
@@ -343,6 +354,32 @@ pub(crate) use imp::{Session, Target};
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn credential_deletion_requires_v24_without_raising_previous_minimums() {
+        for version in 0..=25 {
+            assert_eq!(
+                reviewed_supported(
+                    version,
+                    &Request::DeleteCredential {
+                        name: uuid::Uuid::new_v4().to_string(),
+                    }
+                )
+                .is_ok(),
+                version >= 24
+            );
+            assert_eq!(
+                reviewed_supported(
+                    version,
+                    &Request::SetCredentialPolicy {
+                        name: uuid::Uuid::new_v4().to_string(),
+                        policy: a206_vault_channel::AccessPolicy::WithApproval,
+                    }
+                )
+                .is_ok(),
+                version >= 21
+            );
+        }
+    }
     #[test]
     fn authenticator_removal_refuses_old_web_peers_before_sealing() {
         for version in 0..=23 {
