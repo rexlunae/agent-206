@@ -458,7 +458,7 @@ pub(crate) fn Welcome() -> Element {
         .read()
         .as_ref()
         .and_then(|read| read.as_ref().err().cloned());
-    rsx! { PageFrame { kicker: "Get started", title: "Set up Agent 206.", description: "Each step shows what your gateway and vault report now. Finish them in any order; this page updates as you go.",
+    rsx! { PageFrame { icon: IconName::Check, kicker: "Get started", title: "Set up Agent 206.", description: "Each step shows what your gateway and vault report now. Finish them in any order; this page updates as you go.",
         Card { variant: CardVariant::Feature,
             CardHeader { CardTitle { "Setup checklist" }
                 Badge { tone: if done == total { BadgeTone::Success } else { BadgeTone::Accent }, "{done} of {total} done" }

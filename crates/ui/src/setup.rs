@@ -200,10 +200,10 @@ pub(crate) fn GatewaySetup() -> Element {
     let status = use_resource(status);
     match &*status.read() {
         None => {
-            rsx! { PageFrame { kicker: "First-time setup", title: "Choose your gateway.", description: "Checking how this client is set up…" } }
+            rsx! { PageFrame { icon: IconName::Terminal, kicker: "First-time setup", title: "Choose your gateway.", description: "Checking how this client is set up…" } }
         }
         Some(Err(report)) => rsx! {
-            PageFrame { kicker: "First-time setup", title: "Choose your gateway.", description: "Gateway setup could not start.",
+            PageFrame { icon: IconName::Terminal, kicker: "First-time setup", title: "Choose your gateway.", description: "Gateway setup could not start.",
                 ErrorNotice { report: report.clone(), title: "Gateway setup unavailable".to_string() }
             }
         },
@@ -245,7 +245,7 @@ fn SetupForm(current: SetupStatus) -> Element {
             }
         });
     };
-    rsx! { PageFrame { kicker: "First-time setup", title: "Choose your gateway.", description: "The gateway runs your agents and holds their policy. Pick where it lives before this client connects to anything.",
+    rsx! { PageFrame { icon: IconName::Terminal, kicker: "First-time setup", title: "Choose your gateway.", description: "The gateway runs your agents and holds their policy. Pick where it lives before this client connects to anything.",
         if let (true, Some(GatewayTarget::Ssh { endpoint })) = (current.pinned, current.active.clone()) {
             Alert { title: rsx! { "Started with --remote" }, "This session uses {endpoint}. Saving here replaces it and sets the default for later sessions." }
         }

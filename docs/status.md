@@ -127,6 +127,12 @@ navigation, direct split-view reloads with the selected second thread, and
 unavailable/malformed conversation recovery. Desktop and web release builds and
 packaged Rust smoke tests pass; terminal navigation interaction remains unverified.
 
+Shared page headings, workspace cards and primary actions use the toolkit's SVG
+icons alongside visible labels. Health results pair each state label with a
+distinct icon. Browser checks cover Workspace, Projects and Gateway in light/dark
+rendering and a compact window; icons remain decorative and non-focusable. This
+does not establish native desktop or TUI interaction acceptance.
+
 `crates/app/tests/smoke.rs` exercises the actual executable, shared gateway process,
 WASM worker, ACP initialize/new-session and scoped MCP tool discovery/calls, denied title editing by default and explicit
 per-session authorization. Its Joshua test verifies local owned-process

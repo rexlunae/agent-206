@@ -255,7 +255,7 @@ pub fn Schedules() -> Element {
     // Soonest first; paused and finished jobs after every pending one.
     jobs.sort_by_key(|job| (job.next.is_none(), job.next, job.name.clone()));
     let destinations = post_destinations(&snapshot.settings.messengers);
-    rsx! { PageFrame { kicker: "Workbench", title: "Messages on a schedule.", description: "Send a conversation a message, a heartbeat check of its HEARTBEAT.md, or what an extension's trigger reports when it fires, once, on an interval or on a cron schedule. Each one runs as if you typed it, with that conversation's permissions at the time.",
+    rsx! { PageFrame { icon: IconName::Clock, kicker: "Workbench", title: "Messages on a schedule.", description: "Send a conversation a message, a heartbeat check of its HEARTBEAT.md, or what an extension's trigger reports when it fires, once, on an interval or on a cron schedule. Each one runs as if you typed it, with that conversation's permissions at the time.",
         if jobs.is_empty() { EmptyState { compact: true, title: rsx! { "Nothing scheduled" }, body: rsx! { "Scheduled messages appear here, whether you add them or a conversation's model does with your approval." } } }
         for job in jobs {
             JobCard { key: "{job.id}", job: job.clone(), conversation: title(&snapshot, job.thread), destinations: destinations.clone(), plugins: snapshot.plugins.clone() }

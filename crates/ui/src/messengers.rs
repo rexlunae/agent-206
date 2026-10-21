@@ -14,7 +14,7 @@ pub fn Messengers() -> Element {
     let state = use_context::<State>();
     let now = use_catalog_clock(state)();
     let snapshot = state.data.read();
-    rsx! { PageFrame { kicker: "Messengers", title: "Talk to a thread from chat.", description: "Each allowed chat gets its own conversation, which runs with that conversation's permissions and model. Bot tokens stay in the vault.",
+    rsx! { PageFrame { icon: IconName::Send, kicker: "Messengers", title: "Talk to a thread from chat.", description: "Each allowed chat gets its own conversation, which runs with that conversation's permissions and model. Bot tokens stay in the vault.",
         for messenger in &snapshot.settings.messengers {
             MessengerCard { key: "{messenger.name}", now, config: messenger.clone(), status: snapshot.messengers.iter().find(|s| s.name == messenger.name).cloned().unwrap_or_default() }
         }

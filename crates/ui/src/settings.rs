@@ -19,7 +19,7 @@ pub fn Providers() -> Element {
         .iter()
         .find(|p| Some(&p.id) == preset.read().as_ref());
     let snapshot = state.data.read();
-    rsx! { PageFrame { kicker: "Settings", title: "Connections", description: "Connect an API endpoint. Its available models and reported limits are discovered live.",
+    rsx! { PageFrame { icon: IconName::Link, kicker: "Settings", title: "Connections", description: "Connect an API endpoint. Its available models and reported limits are discovered live.",
         Card { CardHeader { CardTitle { "Add a provider" } CardSubtitle { "Choose a connector. Models and account facts come from its API." } }
             CardBody { div { class: "a206-grid",
                 Field { label: rsx! { "Provider" }, Select { label: name!("Provider connector"), value: ReadSignal::from(preset), placeholder: "Choose provider",
@@ -59,9 +59,9 @@ pub fn Providers() -> Element {
                     } else { p { class: "a206-muted", "No catalog fetched yet." } }
                 }
                 CardFooter {
-                    Button { variant: ButtonVariant::Secondary, onclick: move |_| editing.set(Some(provider_id)), "Edit connection" }
-                    Button { variant: ButtonVariant::Secondary, onclick: move |_| dispatch(state, Command::RefreshCatalog { provider: provider_id }), "Refresh models" }
-                    Button { variant: ButtonVariant::Ghost, onclick: move |_| { let mut settings = state.data.read().settings.clone(); settings.providers.retain(|p| p.id != provider_id); dispatch(state, Command::SaveSettings(Box::new(settings))); }, "Remove connection" }
+                    Button { variant: ButtonVariant::Secondary, onclick: move |_| editing.set(Some(provider_id)), Icon { name: IconName::Edit, size: IconSize::Sm } "Edit connection" }
+                    Button { variant: ButtonVariant::Secondary, onclick: move |_| dispatch(state, Command::RefreshCatalog { provider: provider_id }), Icon { name: IconName::Refresh, size: IconSize::Sm } "Refresh models" }
+                    Button { variant: ButtonVariant::Ghost, onclick: move |_| { let mut settings = state.data.read().settings.clone(); settings.providers.retain(|p| p.id != provider_id); dispatch(state, Command::SaveSettings(Box::new(settings))); }, Icon { name: IconName::Trash, size: IconSize::Sm } "Remove connection" }
                 }
               } }
             }
@@ -79,7 +79,7 @@ pub fn Providers() -> Element {
 #[component]
 pub fn Appearance() -> Element {
     let mut state = use_context::<State>();
-    rsx! { PageFrame { kicker: "Settings", title: "Appearance", description: "Choose a theme, palette, color scheme and contrast.",
+    rsx! { PageFrame { icon: IconName::Settings, kicker: "Settings", title: "Appearance", description: "Choose a theme, palette, color scheme and contrast.",
         ThemePicker { value: ReadSignal::from(state.theme), onchange: move |choice: ThemeChoice| {
             state.theme.set(choice);
             let mut settings = state.data.read().settings.clone();
@@ -92,7 +92,7 @@ pub fn Appearance() -> Element {
 #[component]
 pub fn Prompts() -> Element {
     let state = use_context::<State>();
-    rsx! { PageFrame { kicker: "Settings", title: "Agent modes", description: "Prompts guide behavior. Tool permissions are enforced separately at the gateway.",
+    rsx! { PageFrame { icon: IconName::Edit, kicker: "Settings", title: "Agent modes", description: "Prompts guide behavior. Tool permissions are enforced separately at the gateway.",
         for mode in Mode::ALL { PromptEditor { key: "{mode.label()}", mode, initial: state.data.read().settings.prompts.iter().find(|p| p.mode == mode).map(|p| p.prompt.clone()).unwrap_or_default() } }
         crate::profiles::AgentProfilesCard {}
         crate::teams::AgentTeamsCard {}

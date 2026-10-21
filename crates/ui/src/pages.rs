@@ -12,30 +12,30 @@ pub fn Overview() -> Element {
     rsx! { section { class: "a206-page", div { class: "a206-page-inner",
         Card { variant: CardVariant::Feature, as_: CardTag::Div, class: "a206-hero",
             div { class: "a206-hero-copy",
-                h1 { "Workspace" }
+                div { class: "a206-page-heading", crate::PageIcon { name: IconName::Home } h1 { "Workspace" } }
                 p { class: "a206-muted", "Conversations, projects, and local services." }
                 div { class: "a206-row",
-                    Button { variant: ButtonVariant::Primary, onclick: move |_| dispatch(state, Command::CreateThread { title: "New conversation".into(), mode: Mode::Chat }), "Start a conversation" }
-                    LinkButton { variant: ButtonVariant::Secondary, href: Route::Projects {}.to_string(), "Open a project" }
-                    LinkButton { variant: ButtonVariant::Secondary, href: Route::Gateway {}.to_string(), "Manage gateway" }
+                    Button { variant: ButtonVariant::Primary, onclick: move |_| dispatch(state, Command::CreateThread { title: "New conversation".into(), mode: Mode::Chat }), Icon { name: IconName::Plus, size: IconSize::Sm } "Start a conversation" }
+                    LinkButton { variant: ButtonVariant::Secondary, href: Route::Projects {}.to_string(), Icon { name: IconName::Folder, size: IconSize::Sm } "Open a project" }
+                    LinkButton { variant: ButtonVariant::Secondary, href: Route::Gateway {}.to_string(), Icon { name: IconName::Terminal, size: IconSize::Sm } "Manage gateway" }
                 }
             }
             LinkButton { variant: ButtonVariant::Ghost, href: Route::Running {}.to_string(),
-                Badge { tone: BadgeTone::Accent, "{snapshot.threads.iter().filter(|t| t.state == a206_core::RunState::Running).count()} active responses" } }
+                Badge { tone: BadgeTone::Accent, Icon { name: IconName::Play, size: IconSize::Sm } "{snapshot.threads.iter().filter(|t| t.state == a206_core::RunState::Running).count()} active responses" } }
         }
         if crate::welcome::unfinished(&snapshot, now) {
             Card { variant: CardVariant::Subtle, CardBody { div { class: "a206-row a206-between",
-                div { strong { "Setup incomplete" } p { class: "a206-muted", "Open the setup checklist to see the remaining steps." } }
-                LinkButton { variant: ButtonVariant::Primary, href: Route::Welcome {}.to_string(), "Get started" }
+                div { strong { class: "a206-icon-label", Icon { name: IconName::Warning, size: IconSize::Sm } "Setup incomplete" } p { class: "a206-muted", "Open the setup checklist to see the remaining steps." } }
+                LinkButton { variant: ButtonVariant::Primary, href: Route::Welcome {}.to_string(), Icon { name: IconName::ArrowEnd, size: IconSize::Sm } "Get started" }
             } } }
         }
         div { class: "a206-grid",
-            Metric { label: name!("Conversations"), title: rsx! { "Conversations" }, value: Some(snapshot.threads.len() as f64), display: snapshot.threads.len().to_string(), meta: rsx! {} }
-            Metric { label: name!("Projects"), title: rsx! { "Projects" }, value: Some(snapshot.projects.len() as f64), display: snapshot.projects.len().to_string(), meta: rsx! { "Coordinator conversations" } }
-            Metric { label: name!("Configured providers"), title: rsx! { "Providers" }, value: Some(snapshot.settings.providers.len() as f64), display: snapshot.settings.providers.len().to_string(), meta: rsx! { "Configured connections" } }
+            Metric { label: name!("Conversations"), title: rsx! { span { class: "a206-icon-label", Icon { name: IconName::Sparkles, size: IconSize::Sm } "Conversations" } }, value: Some(snapshot.threads.len() as f64), display: snapshot.threads.len().to_string(), meta: rsx! {} }
+            Metric { label: name!("Projects"), title: rsx! { span { class: "a206-icon-label", Icon { name: IconName::Folder, size: IconSize::Sm } "Projects" } }, value: Some(snapshot.projects.len() as f64), display: snapshot.projects.len().to_string(), meta: rsx! { "Coordinator conversations" } }
+            Metric { label: name!("Configured providers"), title: rsx! { span { class: "a206-icon-label", Icon { name: IconName::Link, size: IconSize::Sm } "Providers" } }, value: Some(snapshot.settings.providers.len() as f64), display: snapshot.settings.providers.len().to_string(), meta: rsx! { "Configured connections" } }
         }
         Card { variant: CardVariant::Elevated,
-            CardHeader { CardTitle { "Recent conversations" } }
+            CardHeader { CardTitle { span { class: "a206-icon-label", Icon { name: IconName::Sparkles, size: IconSize::Sm } "Recent conversations" } } }
             CardBody {
                 ConversationList { limit: 8 }
             }
@@ -48,19 +48,19 @@ pub fn Overview() -> Element {
                 ("Projects", "Create a project or open its coordinator.", Route::Projects {}),
                 ("Appearance", "Set the theme, color scheme and contrast.", Route::Appearance {}),
             ] {
-                Card { variant: CardVariant::Elevated, CardHeader { CardTitle { "{title}" } }
+                Card { variant: CardVariant::Elevated, CardHeader { CardTitle { span { class: "a206-icon-label", Icon { name: target.icon(), size: IconSize::Sm } "{title}" } } }
                     CardBody { p { class: "a206-muted", "{body}" } }
-                    CardFooter { LinkButton { variant: ButtonVariant::Ghost, href: target.to_string(), "Open {title}" } }
+                    CardFooter { LinkButton { variant: ButtonVariant::Ghost, href: target.to_string(), "Open {title}" Icon { name: IconName::ArrowEnd, size: IconSize::Sm } } }
                 }
             }
         }
-        Card { variant: CardVariant::Subtle, CardBody { div { class: "a206-row a206-between", div { strong { "Tool permissions" } p { class: "a206-muted", "Agents begin without tool grants. Modes and delegated tasks can narrow access further." } } LinkButton { variant: ButtonVariant::Secondary, href: Route::Security {}.to_string(), "Security details" } } } }
+        Card { variant: CardVariant::Subtle, CardBody { div { class: "a206-row a206-between", div { strong { class: "a206-icon-label", Icon { name: IconName::Lock, size: IconSize::Sm } "Tool permissions" } p { class: "a206-muted", "Agents begin without tool grants. Modes and delegated tasks can narrow access further." } } LinkButton { variant: ButtonVariant::Secondary, href: Route::Security {}.to_string(), "Security details" Icon { name: IconName::ArrowEnd, size: IconSize::Sm } } } } }
     } } }
 }
 #[component]
 pub fn Conversations() -> Element {
     let mut query = use_signal(String::new);
-    rsx! { PageFrame { kicker: "Workspace", title: "Conversations", description: "Find and reopen any conversation, including project coordinators and delegated work.",
+    rsx! { PageFrame { icon: IconName::Sparkles, kicker: "Workspace", title: "Conversations", description: "Find and reopen any conversation, including project coordinators and delegated work.",
         Card {
             CardBody {
                 Field { label: rsx! { "Search conversation titles" }, Input { value: ReadSignal::from(query), oninput: move |value| query.set(value), placeholder: "Search by title" } }
@@ -106,15 +106,15 @@ pub fn Projects() -> Element {
     let state = use_context::<State>();
     let mut name = use_signal(String::new);
     let mut root = use_signal(String::new);
-    rsx! { PageFrame { kicker: "Workspace", title: "Projects", description: "Create a project with a workspace directory and coordinator conversation.",
+    rsx! { PageFrame { icon: IconName::Folder, kicker: "Workspace", title: "Projects", description: "Create a project with a workspace directory and coordinator conversation.",
         Card { CardBody { div { class: "a206-grid",
             Field { label: rsx! { "Project name" }, Input { value: ReadSignal::from(name), oninput: move |v| name.set(v) } }
             Field { label: rsx! { "Workspace directory" }, Input { value: ReadSignal::from(root), oninput: move |v| root.set(v), placeholder: "Absolute path on the gateway host" } }
-        } } CardFooter { Button { variant: ButtonVariant::Primary, onclick: move |_| dispatch(state, Command::CreateProject { name: name(), root: root() }), "Create project" } } }
+        } } CardFooter { Button { variant: ButtonVariant::Primary, onclick: move |_| dispatch(state, Command::CreateProject { name: name(), root: root() }), Icon { name: IconName::Plus, size: IconSize::Sm } "Create project" } } }
         div { class: "a206-grid", for project in &state.data.read().projects {
             { let manager = project.manager; rsx! { Card {
-                CardHeader { CardTitle { "{project.name}" } CardSubtitle { "{project.root}" } }
-                CardFooter { LinkButton { variant: ButtonVariant::Secondary, href: Route::Chat { id: manager, split: None, message: None }.to_string(), "Open coordinator" } }
+                CardHeader { CardTitle { span { class: "a206-icon-label", Icon { name: IconName::Folder, size: IconSize::Sm } "{project.name}" } } CardSubtitle { "{project.root}" } }
+                CardFooter { LinkButton { variant: ButtonVariant::Secondary, href: Route::Chat { id: manager, split: None, message: None }.to_string(), Icon { name: IconName::Sparkles, size: IconSize::Sm } "Open coordinator" } }
             } } }
         } }
     } }
@@ -126,7 +126,7 @@ pub fn Downloads() -> Element {
     let mut name = use_signal(String::new);
     let mut hash = use_signal(String::new);
     let mut models_directory = use_signal(|| false);
-    rsx! { PageFrame { kicker: "Workbench", title: "Downloads", description: "Start, monitor or cancel downloads. Supply a SHA-256 hash to verify the file.",
+    rsx! { PageFrame { icon: IconName::Download, kicker: "Workbench", title: "Downloads", description: "Start, monitor or cancel downloads. Supply a SHA-256 hash to verify the file.",
         Card { CardBody { div { class: "a206-grid",
             Field { label: rsx! { "Download URL" }, Input { value: ReadSignal::from(url), oninput: move |v| url.set(v), r#type: InputType::Url } }
             Field { label: rsx! { "Filename" }, Input { value: ReadSignal::from(name), oninput: move |v| name.set(v) } }
@@ -150,7 +150,7 @@ pub fn Downloads() -> Element {
 pub fn Browser() -> Element {
     let mut address = use_signal(String::new);
     let mut source = use_signal(String::new);
-    rsx! { PageFrame { kicker: "Workbench", title: "Browser preview", description: "Preview a development server in a sandboxed browser surface.",
+    rsx! { PageFrame { icon: IconName::Globe, kicker: "Workbench", title: "Browser preview", description: "Preview a development server in a sandboxed browser surface.",
         div { class: "a206-row", div { class: "a206-grow", Field { label: rsx! { "Preview URL" }, Input { value: ReadSignal::from(address), oninput: move |v| address.set(v), r#type: InputType::Url, placeholder: "Enter your development server URL" } } }
             Button { variant: ButtonVariant::Primary, onclick: move |_| source.set(address()), "Open preview" }
         }
@@ -180,7 +180,7 @@ pub fn Documents() -> Element {
             }
         });
     };
-    rsx! { PageFrame { kicker: "Workbench", title: "Documents & Git", description: "Read a project file or inspect its Git status.",
+    rsx! { PageFrame { icon: IconName::File, kicker: "Workbench", title: "Documents & Git", description: "Read a project file or inspect its Git status.",
         div { class: "a206-grid",
             Field { label: rsx! { "Project" }, NativeSelect { value: project(), onchange: move |v| project.set(v), option { value: "", "Select a project…" } for p in &state.data.read().projects { option { value: "{p.id}", "{p.name}" } } } }
             Field { label: rsx! { "Document path" }, Input { value: ReadSignal::from(path), oninput: move |v| path.set(v), placeholder: "Path relative to your project" } }
@@ -195,7 +195,7 @@ pub fn Documents() -> Element {
 }
 #[component]
 pub fn Security() -> Element {
-    rsx! { PageFrame { kicker: "Settings", title: "Security", description: "Manage vault authentication and gateway access.",
+    rsx! { PageFrame { icon: IconName::Lock, kicker: "Settings", title: "Security", description: "Manage vault authentication and gateway access.",
         div { class: "a206-grid",
             Card { CardHeader { CardTitle { "Tool access" } } CardBody { p { "New conversations have no tool permissions. Subagents cannot receive more access than their parent or mode allows. Extensions require explicit grants." } } }
             Card { CardHeader { CardTitle { "Encrypted vault" } } CardBody { p { "Credentials stay encrypted when locked. Unlock the vault and pair the gateway before using provider credentials." } } }
@@ -226,7 +226,7 @@ pub fn Joshua() -> Element {
     let mut remote = use_signal(String::new);
     let mut service_status =
         use_signal(|| "Check status to inspect the managed process.".to_owned());
-    rsx! { PageFrame { kicker: "Services", title: "Joshua", description: "Run a model from ~/models locally or over SSH.",
+    rsx! { PageFrame { icon: IconName::Terminal, kicker: "Services", title: "Joshua", description: "Run a model from ~/models locally or over SSH.",
         Card { CardHeader { CardTitle { "Managed inference" } } CardBody { div { class: "a206-grid",
             Field { label: rsx! { "Connection name" }, Input { value: ReadSignal::from(label), oninput: move |v| label.set(v) } }
             Field { label: rsx! { "Model filename in ~/models" }, Input { value: ReadSignal::from(model), oninput: move |v| model.set(v) } }
@@ -251,7 +251,7 @@ pub fn Gateway() -> Element {
     let state = use_context::<State>();
     let report = state.gateway.read();
     let info = report.as_ref().and_then(|report| report.info.as_ref());
-    rsx! { PageFrame { kicker: "Services", title: "Gateway", description: "Manage the gateway shared by your clients. Starting a process and completing its security setup are separate steps.",
+    rsx! { PageFrame { icon: IconName::Terminal, kicker: "Services", title: "Gateway", description: "Manage the gateway shared by your clients. Starting a process and completing its security setup are separate steps.",
         GatewayControls {}
         Card { variant: CardVariant::Elevated,
             CardHeader { CardTitle { "Connection details" } }
@@ -316,7 +316,7 @@ fn GatewayControls() -> Element {
         Availability::Disabled
     };
     rsx! { Card { variant: CardVariant::Feature,
-        CardHeader { CardTitle { "Gateway controls" }
+        CardHeader { CardTitle { span { class: "a206-icon-label", Icon { name: IconName::Terminal, size: IconSize::Sm } "Gateway controls" } }
             Badge { tone: if running { BadgeTone::Success } else { BadgeTone::Warning }, dot: true,
                 if let Some(action) = busy { "{action:?} in progress" } else { "{label}" }
             }
@@ -324,13 +324,13 @@ fn GatewayControls() -> Element {
         CardBody { p { class: "a206-gateway-copy", if running { "Connected to the configured gateway." } else { "Start the gateway, or reconnect if another client has started it." } } }
         CardFooter {
             Button { variant: ButtonVariant::Primary, availability: if !running { availability.clone() } else { Availability::Disabled }, busy: busy == Some(GatewayAction::Start),
-                onclick: move |_| crate::control_gateway(state, GatewayAction::Start), "Start gateway" }
+                onclick: move |_| crate::control_gateway(state, GatewayAction::Start), Icon { name: IconName::Play, size: IconSize::Sm } "Start gateway" }
             Button { variant: ButtonVariant::Secondary, availability: if !stopped { availability.clone() } else { Availability::Disabled },
-                onclick: move |_| confirm.set(Some(GatewayAction::Stop)), "Stop gateway" }
+                onclick: move |_| confirm.set(Some(GatewayAction::Stop)), Icon { name: IconName::Stop, size: IconSize::Sm } "Stop gateway" }
             Button { variant: ButtonVariant::Secondary, availability: if !stopped { availability.clone() } else { Availability::Disabled },
-                onclick: move |_| confirm.set(Some(GatewayAction::Restart)), "Restart gateway" }
+                onclick: move |_| confirm.set(Some(GatewayAction::Restart)), Icon { name: IconName::Refresh, size: IconSize::Sm } "Restart gateway" }
             Button { variant: ButtonVariant::Secondary, availability,
-                onclick: move |_| crate::control_gateway(state, GatewayAction::Reconnect), "Reconnect" }
+                onclick: move |_| crate::control_gateway(state, GatewayAction::Reconnect), Icon { name: IconName::Link, size: IconSize::Sm } "Reconnect" }
         }
         if let Some(action) = confirm() {
             CardBody { Alert { title: rsx! { "Interrupt shared work?" }, "This affects all clients, active agent runs, downloads and managed local inference.",

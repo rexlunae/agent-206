@@ -96,7 +96,7 @@ pub(crate) fn SignIn() -> Element {
             busy.set(false);
         });
     };
-    rsx! { PageFrame { kicker: "Sign in", title: "Sign in to Agent 206.", description: "This web server is open to other devices. Enter the current code from the authenticator app enrolled in its vault.",
+    rsx! { PageFrame { icon: IconName::Lock, kicker: "Sign in", title: "Sign in to Agent 206.", description: "This web server is open to other devices. Enter the current code from the authenticator app enrolled in its vault.",
         form { onsubmit: move |event| { event.prevent_default(); send(); },
             Card { variant: CardVariant::Feature,
                 CardHeader { CardTitle { "Authenticator code" } }
