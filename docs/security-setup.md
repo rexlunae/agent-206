@@ -226,6 +226,8 @@ shrink even if it still exceeds that panel limit. The omitted-false flag's small
 encoding growth is allowed only for disabling an already oversized entry.
 Existing native flag and destination edits can therefore restrict oversized
 imported entries without blocking recovery.
+Comparisons count exact serialized bytes even for imported metadata larger than
+the 4 MiB transport frame, without allocating that frame or relaxing its limit.
 The desktop policy editor checks the negotiated v21 metadata-size capability
 before sending; this is not an unknown-opcode guard and leaves ordinary CLI/native
 operations compatible. Native `UpdateCredential` remains the opcode for policy changes; disabled state,

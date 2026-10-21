@@ -45,14 +45,12 @@ fn metadata_size(name: &str, meta: CredentialMeta) -> Result<usize, BrokerError>
         total: usize::MAX,
         legacy_count: usize::MAX,
     };
-    match a206_protocol::encode(&page) {
-        Ok(bytes) => Ok(bytes.len()),
-        Err(a206_protocol::Error::TooLarge) => Ok(usize::MAX),
-        Err(error) => Err(BrokerError::Channel(
+    a206_protocol::encoded_size(&page).map_err(|error| {
+        BrokerError::Channel(
             a206_core::ErrorReport::capture(&error, |_| Some(a206_core::ErrorKind::Protocol))
                 .with_correlation(uuid::Uuid::new_v4()),
-        )),
-    }
+        )
+    })
 }
 
 pub(super) fn page(

@@ -2445,6 +2445,114 @@ async fn encrypted_policy_edits_preserve_other_metadata_and_private_values() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn imported_metadata_above_frame_limit_rejects_growth_but_allows_recovery() {
+    use a206_vault_channel::{Reply as R, Request as Q, Secret};
+    let (_dir, root, task) = start().await;
+    let source_dir = tempfile::tempdir().unwrap();
+    let source = source_dir.path().join("secrets.json");
+    let password = random();
+    let name = random();
+    let scopes = vec![random(), random()];
+    let mut original = meta(vec!["https://example.invalid".into()]);
+    original.description = Some("x".repeat(a206_protocol::MAX_FRAME + 4096));
+    original.policy = AccessPolicy::SkillOnly(scopes.clone());
+    {
+        let mut vault = a206_vault::Vault::locked(source.clone());
+        vault
+            .unlock(&a206_vault::Secret::new(password.clone()))
+            .unwrap();
+        vault
+            .put_credential(
+                &name,
+                &original,
+                a206_vault::CredentialValue::Single(a206_vault::Secret::new(random())),
+            )
+            .unwrap();
+    }
+    let source_bytes = std::fs::read(&source).unwrap();
+    let mut owner = user(&root).await;
+    let review = migration_review(&mut owner, &source).await;
+    assert!(matches!(
+        owner
+            .call(migration_apply(review.id, &password))
+            .await
+            .unwrap(),
+        Reply::VaultImportApplied(_)
+    ));
+    let mut expanded = scopes.clone();
+    expanded.push(random());
+    let (mut relay, mut channel) = secure_open(&root).await;
+    assert!(matches!(
+        secure_call(
+            &mut relay,
+            &mut channel,
+            Q::StepUp {
+                password: Some(Secret::new(password.clone())),
+                totp: None,
+            }
+        )
+        .await,
+        R::Ok
+    ));
+    assert!(matches!(
+        secure_call(
+            &mut relay,
+            &mut channel,
+            Q::SetCredentialPolicy {
+                name: name.clone(),
+                policy: AccessPolicy::SkillOnly(expanded.clone()),
+            }
+        )
+        .await,
+        R::Error(_)
+    ));
+    assert!(matches!(
+        owner
+            .call(Request::UpdateCredential {
+                name: name.clone(),
+                policy: Some(AccessPolicy::SkillOnly(expanded)),
+                disabled: None,
+                destinations: None,
+            })
+            .await,
+        Err(ClientError::Broker(BrokerError::Vault(
+            VaultFailure::MetadataTooLarge
+        )))
+    ));
+    owner
+        .call(Request::UpdateCredential {
+            name: name.clone(),
+            policy: Some(AccessPolicy::SkillOnly(vec![scopes[0].clone()])),
+            disabled: None,
+            destinations: None,
+        })
+        .await
+        .unwrap();
+    owner
+        .call(Request::UpdateCredential {
+            name: name.clone(),
+            policy: None,
+            disabled: Some(true),
+            destinations: None,
+        })
+        .await
+        .unwrap();
+    owner.call(Request::Lock).await.unwrap();
+    owner.call(Request::Shutdown).await.unwrap();
+    task.await.unwrap();
+    let mut persisted = a206_vault::Vault::locked(vault_path(&root));
+    persisted
+        .unlock(&a206_vault::Secret::new(password))
+        .unwrap();
+    let stored = persisted.credential(&name).unwrap();
+    let mut expected = original;
+    expected.policy = AccessPolicy::SkillOnly(vec![scopes[0].clone()]);
+    expected.disabled = true;
+    assert_eq!(stored, expected);
+    assert_eq!(std::fs::read(source).unwrap(), source_bytes);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn oversized_legacy_metadata_still_allows_disabling_and_destination_recovery() {
     let (_dir, root, task) = start().await;
     let password = random();

@@ -236,3 +236,5 @@ entry outside this panel. An already oversized entry may be disabled or otherwis
 remain the same size or be reduced even when it still exceeds that page limit.
 Disabling an oversized imported entry or clearing its destinations remains available
 through the trusted native CLI.
+Size comparisons count actual serialized bytes above the 4 MiB transport limit;
+this does not permit oversized replies or raise the panel's 48 KiB limit.
