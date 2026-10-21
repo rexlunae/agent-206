@@ -229,6 +229,9 @@ and the private value are retained. Saving a policy neither approves a use nor
 authenticates an agent. Credential-use approval remains unavailable. Broker v21
 adds the encrypted request, with no fallback to an older peer. The desktop policy
 editor also requires v21's metadata-size capability before sending the existing
-native update opcode; other native/CLI operations keep their prior compatibility. Native updates
-also refuse a resulting metadata entry too large for a bounded page before saving
-any change, so scope expansion cannot strand the entry outside this panel.
+native update opcode; other native/CLI operations keep their prior compatibility. Native policy updates
+also refuse expansions beyond the bounded metadata page before saving any change,
+so scope expansion cannot strand the entry outside this panel. An already oversized
+entry may be reduced even when it still exceeds that page limit.
+Disabling an oversized imported entry or clearing its destinations remains available
+through the trusted native CLI.

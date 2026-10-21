@@ -219,8 +219,11 @@ preserved exactly with no trimming or splitting; empty scope lists deny every us
 Each scope draft survives selector changes, rejection and authentication cancel.
 Only a confirmed broker write clears the editor and reloads metadata. The broker
 limits panel policies to 64 nonempty identifiers of at most 256 bytes without
-control characters. It also refuses updated metadata that would exceed a bounded
-single-entry page, under the same vault lock before committing the change.
+control characters. It also refuses policy expansions whose metadata would exceed a bounded
+single-entry page, under the same vault lock before committing the change. An
+already oversized entry may shrink even if it still exceeds that panel limit.
+Existing native flag and destination edits can still restrict oversized imported
+entries; this policy-size check does not block those recovery operations.
 The desktop policy editor checks the negotiated v21 metadata-size capability
 before sending; this is not an unknown-opcode guard and leaves ordinary CLI/native
 operations compatible. Native `UpdateCredential` remains the opcode for policy changes; disabled state,

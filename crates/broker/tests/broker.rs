@@ -2445,6 +2445,71 @@ async fn encrypted_policy_edits_preserve_other_metadata_and_private_values() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn oversized_legacy_metadata_still_allows_disabling_and_destination_recovery() {
+    let (_dir, root, task) = start().await;
+    let password = random();
+    let mut owner = user(&root).await;
+    owner.call(unlock(&password, None, true)).await.unwrap();
+    let name = random();
+    let mut legacy = meta(vec!["https://example.invalid".into()]);
+    legacy.description = Some("x".repeat(a206_vault_channel::MAX_CREDENTIAL_PAGE_BYTES));
+    let scopes = vec![random(); a206_vault_channel::MAX_POLICY_SCOPES];
+    legacy.policy = AccessPolicy::SkillOnly(scopes.clone());
+    owner
+        .call(Request::PutCredential {
+            name: name.clone(),
+            meta: legacy,
+            value: WireValue::Single(WireSecret::new(random())),
+            replace: false,
+        })
+        .await
+        .unwrap();
+    // Policy expansion needs the new page budget. Existing restriction and
+    // recovery operations must still work on oversized imported metadata.
+    owner
+        .call(Request::UpdateCredential {
+            name: name.clone(),
+            policy: None,
+            disabled: Some(true),
+            destinations: Some(vec![]),
+        })
+        .await
+        .unwrap();
+    owner
+        .call(Request::UpdateCredential {
+            name: name.clone(),
+            policy: Some(AccessPolicy::SkillOnly(vec![])),
+            disabled: None,
+            destinations: None,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        owner
+            .call(Request::UpdateCredential {
+                name: name.clone(),
+                policy: Some(AccessPolicy::SkillOnly(scopes)),
+                disabled: None,
+                destinations: None,
+            })
+            .await,
+        Err(ClientError::Broker(BrokerError::Vault(
+            VaultFailure::MetadataTooLarge
+        )))
+    ));
+    let Reply::Credentials { typed: entries, .. } = owner.call(Request::Credentials).await.unwrap()
+    else {
+        panic!()
+    };
+    let (_, meta) = entries.iter().find(|(entry, _)| entry == &name).unwrap();
+    assert!(meta.disabled);
+    assert!(meta.destinations.is_empty());
+    assert_eq!(meta.policy, AccessPolicy::SkillOnly(vec![]));
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn oversized_policy_update_is_refused_before_persisting_any_change() {
     use a206_vault_channel::{Reply as R, Request as Q, Secret};
     let (_dir, root, task) = start().await;
