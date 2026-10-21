@@ -23,7 +23,7 @@ pub const CREDENTIAL_DESTINATIONS_BROKER_VERSION: u16 = 20;
 pub const CREDENTIAL_POLICY_BROKER_VERSION: u16 = 21;
 /// First broker accepting authenticator removal through an explicitly local
 /// encrypted channel. Ordinary/network channels cannot remove enrollment.
-pub const TOTP_REMOVAL_BROKER_VERSION: u16 = 22;
+pub const TOTP_REMOVAL_BROKER_VERSION: u16 = 23;
 pub const MAX_POLICY_SCOPES: usize = 64;
 pub const MAX_POLICY_SCOPE_BYTES: usize = 256;
 pub const CREDENTIALS_SCHEMA_VERSION: u16 = 1;

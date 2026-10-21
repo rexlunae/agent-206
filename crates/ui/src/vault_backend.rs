@@ -350,7 +350,7 @@ mod tests {
                 password: a206_vault_channel::Secret::new(uuid::Uuid::new_v4().to_string()),
                 code: a206_vault_channel::Secret::new(uuid::Uuid::new_v4().to_string()),
             };
-            assert_eq!(reviewed_supported(version, &request).is_ok(), version >= 22);
+            assert_eq!(reviewed_supported(version, &request).is_ok(), version >= 23);
             assert!(reviewed_supported(version, &Request::CancelTotp).is_ok());
         }
     }

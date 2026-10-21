@@ -75,12 +75,12 @@ Removal requires both the vault password and an unused current code, even when
 this connection has recent authentication. Both fields clear on submit; only
 the broker's successful acknowledgement reports removal, followed by a status
 refresh. Future unlocks then require the password alone. Credential restrictions
-and agent access are unchanged. Broker v22 adds this encrypted-panel request;
+and agent access are unchanged. Broker v23 adds this encrypted-panel request;
 older web peers are refused before either factor is sealed. Locking or losing
 the confirmed vault state unmounts the confirmation inputs. Native desktop uses
 the existing native removal request; TUI vault controls remain unavailable.
 
-Network web sessions cannot remove their sign-in factor. Broker v22 refuses
+Network web sessions cannot remove their sign-in factor. Broker v23 refuses
 removal on ordinary encrypted channels, including those opened by older
 bridges. Only an updated loopback bridge opens the explicit local scope; browser
 input cannot choose it or upgrade an existing channel. No plaintext is exposed

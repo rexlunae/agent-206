@@ -24,18 +24,19 @@ use zeroize::Zeroizing;
 /// fixed-policy API-key creation; 18 adds encrypted-panel agent-access changes,
 /// 19 adds encrypted-panel credential enable/disable changes, and 20 adds
 /// encrypted-panel destination edits; 21 adds encrypted-panel policy edits;
-/// 22 adds encrypted-panel authenticator removal and an explicit local channel
-/// scope. The native UpdateCredential and RemoveTotp requests are unchanged.
+/// 22 was the initial authenticator-removal preview. 23 adds an explicit local
+/// channel scope, required by the encrypted removal UI. The native
+/// UpdateCredential and RemoveTotp requests are unchanged.
 /// A broker accepts greetings from
 /// [`MIN_BROKER_VERSION`] up to this version, and a client falls back to the
 /// newest version an older broker accepts (see `Client::version`), so streams
 /// are only requested from brokers that understand them.
-pub const BROKER_VERSION: u16 = 22;
+pub const BROKER_VERSION: u16 = 23;
 pub use a206_vault_channel::CREDENTIALS_BROKER_VERSION as CREDENTIALS_VERSION;
 /// First version with connection-held source reviews and guarded vault import.
 pub use a206_vault_channel::REVIEWED_IMPORT_BROKER_VERSION as REVIEWED_IMPORT_VERSION;
 /// The oldest protocol version this broker still serves and this client still
-/// speaks. Versions 3 to 22 differ only by the requests, roles and schemes they add.
+/// speaks. Versions 3 to 23 differ only by the requests, roles and schemes they add.
 pub const MIN_BROKER_VERSION: u16 = 3;
 /// The first version that serves [`Request::ProviderStream`].
 pub const STREAM_VERSION: u16 = 4;
@@ -392,7 +393,7 @@ pub enum Request {
     },
     /// A trusted loopback web bridge may allow authenticator removal. Ordinary
     /// channels, including those opened by older bridges, never allow it.
-    /// Since broker v22; network bridges must keep using OpenChannel.
+    /// Since broker v23; network bridges must keep using OpenChannel.
     OpenLocalChannel {
         #[serde(with = "serde_bytes")]
         first: Vec<u8>,

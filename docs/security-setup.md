@@ -152,7 +152,7 @@ The shared Security page offers authenticator removal on desktop and confirmed
 loopback web only when the unlocked broker confirms enrollment. Its confirmation requires both password
 and an unused code; recent step-up never replaces either factor. Cancellation
 sends no removal request. Only `Reply::Ok` reports success, followed by refreshed
-broker state. The encrypted request requires broker v22 before sealing; native
+broker state. The encrypted request requires broker v23 before sealing; native
 removal uses the existing opcode. Ordinary/network encrypted channels cannot
 remove the sign-in factor; only an updated trusted loopback bridge can open the
 explicit local scope, which cannot replace an existing channel's context.
