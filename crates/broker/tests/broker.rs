@@ -2279,7 +2279,10 @@ async fn secure_open(root: &Path) -> (Client, a206_vault_channel::Channel) {
         panic!("missing key");
     };
     let (handshake, first) = Handshake::start(&key).unwrap();
-    let Reply::ChannelOpened(response) = relay.call(Request::OpenChannel { first }).await.unwrap()
+    let Reply::ChannelOpened(response) = relay
+        .call(Request::OpenLocalChannel { first })
+        .await
+        .unwrap()
     else {
         panic!("missing handshake");
     };
@@ -3070,6 +3073,101 @@ async fn encrypted_agent_access_requires_connection_owned_step_up_and_survives_r
     ));
     task.abort();
     assert!(task.await.unwrap_err().is_cancelled());
+}
+
+#[tokio::test]
+async fn encrypted_authenticator_removal_never_substitutes_step_up_for_its_factors() {
+    use a206_vault_channel::{Code, Reply as R, Request as Q, Secret};
+    let (_dir, root, task) = start().await;
+    let password = random();
+    let mut owner = user(&root).await;
+    owner.call(unlock(&password, None, true)).await.unwrap();
+    let before = std::fs::read(vault_path(&root)).unwrap();
+    let (mut relay, mut channel) = secure_open(&root).await;
+    assert!(matches!(
+        secure_call(
+            &mut relay,
+            &mut channel,
+            Q::StepUp {
+                password: Some(Secret::new(password.clone())),
+                totp: None
+            }
+        )
+        .await,
+        R::Ok
+    ));
+    // A fresh step-up must not bypass the removal request's password check.
+    assert!(
+        matches!(secure_call(&mut relay, &mut channel, Q::RemoveTotp {
+        password: Secret::new(random()), code: Secret::new("malformed".into())
+    }).await, R::Error(error) if error.code == Code::AuthenticationFailed)
+    );
+    // No enrolled factor is never reported as a successful removal.
+    assert!(matches!(
+        secure_call(
+            &mut relay,
+            &mut channel,
+            Q::RemoveTotp {
+                password: Secret::new(password.clone()),
+                code: Secret::new("malformed".into())
+            }
+        )
+        .await,
+        R::Error(_)
+    ));
+    assert_eq!(std::fs::read(vault_path(&root)).unwrap(), before);
+    owner.call(Request::Lock).await.unwrap();
+    assert!(
+        matches!(secure_call(&mut relay, &mut channel, Q::RemoveTotp {
+        password: Secret::new(password), code: Secret::new("malformed".into())
+    }).await, R::Error(error) if error.report.kind == a206_core::ErrorKind::Unavailable)
+    );
+    assert_eq!(std::fs::read(vault_path(&root)).unwrap(), before);
+    owner.call(Request::Shutdown).await.unwrap();
+    task.await.unwrap();
+}
+
+#[tokio::test]
+async fn an_ordinary_channel_cannot_remove_or_upgrade_to_local_scope() {
+    use a206_vault_channel::{Code, Handshake, Reply as R, Request as Q, Secret};
+    let (_dir, root, task) = start().await;
+    let mut owner = user(&root).await;
+    owner.call(unlock(&random(), None, true)).await.unwrap();
+    let original = std::fs::read(vault_path(&root)).unwrap();
+    let mut relay = Client::connect(&root, Role::Relay).await.unwrap();
+    let Reply::ChannelKey(key) = relay.call(Request::ChannelKey).await.unwrap() else {
+        panic!()
+    };
+    let (handshake, first) = Handshake::start(&key).unwrap();
+    let Reply::ChannelOpened(response) = relay.call(Request::OpenChannel { first }).await.unwrap()
+    else {
+        panic!()
+    };
+    let mut channel = handshake.finish(&response).unwrap();
+    let removal = || Q::RemoveTotp {
+        password: Secret::new(random()),
+        code: Secret::new("invalid".into()),
+    };
+    assert!(
+        matches!(secure_call(&mut relay, &mut channel, removal()).await,
+        R::Error(error) if error.code == Code::TotpRemovalUnavailable)
+    );
+    let (_, first) = Handshake::start(&key).unwrap();
+    assert_eq!(
+        denied(relay.call(Request::OpenLocalChannel { first }).await),
+        BrokerError::Forbidden
+    );
+    // The refused upgrade neither widens nor replaces the existing channel.
+    assert!(
+        matches!(secure_call(&mut relay, &mut channel, removal()).await,
+        R::Error(error) if error.code == Code::TotpRemovalUnavailable)
+    );
+    assert!(
+        matches!(secure_call(&mut relay, &mut channel, Q::Status).await, R::Status(status) if status.unlocked)
+    );
+    assert_eq!(std::fs::read(vault_path(&root)).unwrap(), original);
+    owner.call(Request::Shutdown).await.unwrap();
+    task.await.unwrap();
 }
 
 #[tokio::test]

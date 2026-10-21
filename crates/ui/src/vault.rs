@@ -64,8 +64,9 @@ struct Offer {
     lock: bool,
     pair: bool,
     enroll: bool,
+    remove_totp: bool,
 }
-fn offer(status: &BrokerStatus) -> Offer {
+fn offer(status: &BrokerStatus, local: bool) -> Offer {
     Offer {
         create: !status.exists,
         unlock: status.exists && !status.unlocked,
@@ -73,6 +74,7 @@ fn offer(status: &BrokerStatus) -> Offer {
         pair: status.unlocked,
         // Enrollment is known only once unlocked: it lives inside the vault.
         enroll: status.unlocked && status.totp_enrolled == Some(false),
+        remove_totp: local && status.unlocked && status.totp_enrolled == Some(true),
     }
 }
 fn known(value: Option<bool>) -> &'static str {
@@ -111,6 +113,8 @@ enum Flow {
     StepUp(Task),
     /// An enrollment was started; the app's first code confirms it.
     Confirm,
+    /// Removal always requires both password and a fresh authenticator code.
+    RemoveTotp,
 }
 struct Enrollment {
     otpauth_url: WireSecret,
@@ -127,6 +131,7 @@ struct Failure {
 
 #[derive(Clone, Copy)]
 struct Panel {
+    allow_totp_removal: bool,
     session: Signal<Session>,
     status: Signal<Option<BrokerStatus>>,
     failure: Signal<Option<Failure>>,
@@ -602,6 +607,48 @@ impl Panel {
     fn take_held(mut self) -> Option<WireSecret> {
         self.held.write().take()
     }
+    fn remove_totp(mut self, password: WireSecret, code: WireSecret) {
+        if !self.begin() {
+            return;
+        }
+        spawn(async move {
+            match self
+                .session()
+                .call(Request::RemoveTotp { password, code })
+                .await
+            {
+                Ok(Reply::Ok) => {
+                    self.flow.set(Flow::Idle);
+                    self.notice.set(Some("Two-factor authentication removed. Your vault still requires its password."));
+                }
+                Ok(_) => self.fail(
+                    "vault_totp_remove",
+                    "Removal was not confirmed; check the vault state before retrying",
+                    &unexpected(),
+                ),
+                Err(error) => self.fail(
+                    "vault_totp_remove",
+                    "Could not remove two-factor authentication",
+                    &error,
+                ),
+            }
+            self.finish().await;
+        });
+    }
+    fn request_totp_removal(mut self) {
+        if !*self.busy.peek()
+            && *self.flow.peek() == Flow::Idle
+            && self
+                .status
+                .peek()
+                .as_ref()
+                .is_some_and(|s| offer(s, self.allow_totp_removal).remove_totp)
+        {
+            self.failure.set(None);
+            self.notice.set(None);
+            self.flow.set(Flow::RemoveTotp);
+        }
+    }
     fn cancel(mut self) {
         let pending = self.enrollment.peek().is_some();
         self.held.set(None);
@@ -643,7 +690,7 @@ fn VaultPlacement(placement: Placement, #[props(default)] terminal: bool) -> Ele
         };
     }
     match placement {
-        Placement::Local(root) => rsx! { VaultPanel { target: root } },
+        Placement::Local(root) => rsx! { VaultPanel { target: root, allow_totp_removal: true } },
         Placement::Remote(endpoint) => rsx! {
             Card { variant: CardVariant::Subtle,
                 CardHeader { CardTitle { "Vault" } Badge { tone: BadgeTone::Neutral, "Remote gateway" } }
@@ -666,9 +713,34 @@ fn VaultPlacement(placement: Placement, #[props(default)] terminal: bool) -> Ele
 fn take(mut field: Signal<String>) -> String {
     std::mem::take(&mut *field.write())
 }
+/// Scoped to the removal confirmation so lock/disconnect unmounts its inputs.
 #[component]
-fn VaultPanel(target: Target) -> Element {
+fn TotpRemoval(
+    availability: Availability,
+    onremove: EventHandler<(WireSecret, WireSecret)>,
+    onkeep: EventHandler<()>,
+) -> Element {
+    let mut password = use_signal(String::new);
+    let mut code = use_signal(String::new);
+    rsx! {
+        Alert { tone: AlertTone::Warning, title: rsx! { "Remove two-factor authentication?" },
+            "Future unlocks will require only the vault password. This does not change credential policies or approve agent use. Enter your password and an unused current code; a recent authentication does not replace either check."
+        }
+        Field { label: rsx! { "Vault password" },
+            Input { r#type: InputType::Password, value: ReadSignal::from(password), availability: availability.clone(), oninput: move |v| password.set(v), autocomplete: "current-password" }
+        }
+        Field { label: rsx! { "Authenticator code" },
+            Input { value: ReadSignal::from(code), availability: availability.clone(), oninput: move |v| code.set(v), autocomplete: "one-time-code", inputmode: "numeric" }
+        }
+        Button { variant: ButtonVariant::Primary, availability: availability.clone(),
+            onclick: move |_| onremove.call((WireSecret::new(take(password)), WireSecret::new(take(code)))), "Remove two-factor" }
+        Button { variant: ButtonVariant::Ghost, availability, onclick: move |_| { take(password); take(code); onkeep.call(()); }, "Keep two-factor" }
+    }
+}
+#[component]
+fn VaultPanel(target: Target, allow_totp_removal: bool) -> Element {
     let panel = Panel {
+        allow_totp_removal,
         session: use_signal(|| Session::open(target.clone())),
         status: use_signal(|| None),
         failure: use_signal(|| None),
@@ -731,7 +803,19 @@ fn VaultPanel(target: Target) -> Element {
     let enrolled = status
         .as_ref()
         .is_some_and(|s| s.totp_enrolled == Some(true));
-    let offer = status.as_ref().map(offer).unwrap_or_default();
+    let offer = status
+        .as_ref()
+        .map(|status| offer(status, allow_totp_removal))
+        .unwrap_or_default();
+    use_effect(move || {
+        if (panel.flow)() == Flow::RemoveTotp
+            && !(panel.status)()
+                .as_ref()
+                .is_some_and(|status| self::offer(status, allow_totp_removal).remove_totp)
+        {
+            panel.cancel();
+        }
+    });
     let (label, tone) = match &status {
         None => ("Checking", BadgeTone::Neutral),
         Some(s) if !s.exists => ("No vault", BadgeTone::Warning),
@@ -750,6 +834,9 @@ fn VaultPanel(target: Target) -> Element {
                 }
                 if status.unlocked && status.totp_enrolled == Some(false) {
                     Alert { tone: AlertTone::Warning, title: rsx! { "Verify an authenticator next" }, "Your vault is encrypted. Set up two-factor authentication and confirm a code before considering enrollment complete. Agent credential access stays off by default." }
+                }
+                if status.unlocked && status.totp_enrolled == Some(true) && !allow_totp_removal {
+                    p { class: "a206-muted", "Network web sign-in needs an enrolled authenticator. Removal is available only through the desktop, a confirmed loopback web server or the trusted CLI after arranging access." }
                 }
                 if status.unlocked && status.totp_enrolled == Some(true) && status.gateway_paired == Some(true) {
                     Alert { tone: AlertTone::Success, title: rsx! { "Vault enrollment verified" }, "Encryption is active, an authenticator is enrolled, and the gateway holds a current pairing. Lock and unlock once to check your recovery workflow. Restarting the gateway requires pairing it again." }
@@ -787,6 +874,11 @@ fn VaultPanel(target: Target) -> Element {
                 ErrorNotice { report, title }
             }
             match flow.clone() {
+                Flow::RemoveTotp => rsx! {
+                    if offer.remove_totp {
+                        TotpRemoval { availability: availability.clone(), onremove: move |(password, code)| panel.remove_totp(password, code), onkeep: move |_| panel.cancel() }
+                    }
+                },
                 Flow::UnlockCode => rsx! {
                     Field { label: rsx! { "Authenticator code" }, hint: rsx! { "This vault has two-factor authentication. Enter the current code from your app." },
                         Input { r#type: InputType::Text, value: ReadSignal::from(code), oninput: move |v| code.set(v), autocomplete: "one-time-code", inputmode: "numeric" }
@@ -842,6 +934,7 @@ fn VaultPanel(target: Target) -> Element {
         }
         CardFooter {
             match flow.clone() {
+                Flow::RemoveTotp => rsx! {},
                 Flow::UnlockCode => rsx! {
                     Button { variant: ButtonVariant::Primary, availability: availability.clone(), busy,
                         onclick: move |_| {
@@ -896,6 +989,9 @@ fn VaultPanel(target: Target) -> Element {
                     }
                     if offer.enroll {
                         Button { variant: ButtonVariant::Secondary, availability: availability.clone(), onclick: move |_| panel.start(Task::Enroll), "Set up two-factor" }
+                    }
+                    if offer.remove_totp && !(panel.key_editor)() && (panel.destination_editor)().is_none() && (panel.policy_editor)().is_none() {
+                        Button { variant: ButtonVariant::Secondary, availability: availability.clone(), onclick: move |_| { take(password); take(confirm); take(code); panel.request_totp_removal(); }, "Remove two-factor" }
                     }
                     if offer.lock {
                         Button { variant: ButtonVariant::Secondary, availability: availability.clone(), onclick: move |_| panel.lock(), "Lock vault" }
@@ -1019,14 +1115,14 @@ mod tests {
     #[test]
     fn offers_only_what_the_vault_state_allows() {
         assert_eq!(
-            offer(&status(false, false, None)),
+            offer(&status(false, false, None), true),
             Offer {
                 create: true,
                 ..Offer::default()
             }
         );
         assert_eq!(
-            offer(&status(true, false, None)),
+            offer(&status(true, false, None), true),
             Offer {
                 unlock: true,
                 ..Offer::default()
@@ -1038,7 +1134,7 @@ mod tests {
             ..Offer::default()
         };
         assert_eq!(
-            offer(&status(true, true, Some(false))),
+            offer(&status(true, true, Some(false)), true),
             Offer {
                 enroll: true,
                 ..unlocked
@@ -1046,13 +1142,45 @@ mod tests {
         );
         // Enrolled vaults offer no second enrollment.
         assert_eq!(
-            offer(&status(true, true, Some(true))),
+            offer(&status(true, true, Some(true)), true),
             Offer {
                 lock: true,
                 pair: true,
+                remove_totp: true,
                 ..Offer::default()
             }
         );
+        assert!(!offer(&status(true, true, None), true).remove_totp);
+        assert!(!offer(&status(true, false, Some(true)), true).remove_totp);
+        // Network or unconfirmed web context must not offer removal, without
+        // hiding the unrelated lock/pair controls.
+        assert_eq!(offer(&status(true, true, Some(true)), false), unlocked);
+    }
+
+    #[test]
+    fn authenticator_removal_requires_both_inputs_and_disables_them_during_submit() {
+        fn root(availability: Availability) -> Element {
+            rsx! { TotpRemoval { availability, onremove: |_| {}, onkeep: |_| {} } }
+        }
+        for (availability, disabled) in [
+            (Availability::Enabled, false),
+            (Availability::Disabled, true),
+        ] {
+            let mut dom = VirtualDom::new_with_props(root, availability);
+            dom.rebuild_in_place();
+            let html = dioxus_ssr::render(&dom);
+            assert!(html.contains("type=\"password\""), "{html}");
+            assert!(
+                html.contains("current-password") && html.contains("one-time-code"),
+                "{html}"
+            );
+            assert!(html.contains("Keep two-factor"), "{html}");
+            assert_eq!(
+                html.matches("disabled=true").count(),
+                if disabled { 4 } else { 0 },
+                "{html}"
+            );
+        }
     }
 
     #[test]
@@ -1108,7 +1236,7 @@ pub(crate) fn VaultSection() -> Element {
             Alert { tone: AlertTone::Success, title: rsx! { "Encrypted vault connection" },
                 "The broker key is verified for this panel. Passwords and authenticator setup travel encrypted directly to the vault broker."
             }
-            VaultPanel { target }
+            VaultPanel { target, allow_totp_removal: crate::sign_in::confirmed_loopback() }
             Button { variant: ButtonVariant::Ghost, onclick: move |_| verified.set(None), "Disconnect vault controls" }
         };
     }

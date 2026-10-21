@@ -77,6 +77,16 @@ async fn connect(root: &std::path::Path) -> Result<Client, crate::vault::VaultEr
     Ok(Client::connect(root, Role::Relay).await?)
 }
 
+fn opening(version: u16, loopback: bool, first: Vec<u8>) -> BrokerRequest {
+    if loopback && version >= a206_vault_channel::TOTP_REMOVAL_BROKER_VERSION {
+        BrokerRequest::OpenLocalChannel { first }
+    } else {
+        // Older brokers cannot decode RemoveTotp; ordinary channels on new
+        // brokers refuse it. Never grant local scope from browser input.
+        BrokerRequest::OpenChannel { first }
+    }
+}
+
 async fn exchange(
     state: &Web,
     owner: String,
@@ -97,8 +107,13 @@ async fn exchange(
             }
             let mut client = connect(&state.root).await?;
             let broker_version = client.version();
-            let BrokerReply::ChannelOpened(response) =
-                client.call(BrokerRequest::OpenChannel { first }).await?
+            let BrokerReply::ChannelOpened(response) = client
+                .call(opening(
+                    broker_version,
+                    state.access.loopback().is_some(),
+                    first,
+                ))
+                .await?
             else {
                 return Err(VaultError::UnexpectedReply);
             };
@@ -192,65 +207,108 @@ mod compatibility_tests {
     use a206_broker::{BrokerError, InvalidRequest};
     use a206_protocol::{Request as Frame, Response};
 
-    #[tokio::test]
-    async fn version_ten_can_still_open_the_generic_setup_relay() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir(dir.path().join("vault")).unwrap();
-        let listener =
-            tokio::net::UnixListener::bind(a206_broker::socket_path(dir.path())).unwrap();
-        let key = a206_vault_channel::Identity::generate().unwrap().public;
-        let expected = key.clone();
-        let broker = tokio::spawn(async move {
-            for role in [Role::User, Role::Relay] {
-                let (mut socket, _) = listener.accept().await.unwrap();
-                for offered in (10..=a206_broker::BROKER_VERSION).rev() {
-                    let frame = read_frame::<Frame<BrokerRequest>>(&mut socket)
-                        .await
-                        .unwrap()
-                        .unwrap();
-                    assert!(
-                        matches!(frame.body, BrokerRequest::Hello { role: actual_role, version: actual } if actual_role == role && actual == offered)
-                    );
-                    write_frame(
-                        &mut socket,
-                        &Response {
-                            id: frame.id,
-                            body: if offered == 10 {
-                                BrokerReply::Ok
-                            } else {
-                                BrokerReply::Error(BrokerError::Invalid(
-                                    InvalidRequest::UnsupportedVersion,
-                                ))
-                            },
-                        },
-                    )
-                    .await
-                    .unwrap();
-                }
-                if role == Role::Relay {
-                    let frame = read_frame::<Frame<BrokerRequest>>(&mut socket)
-                        .await
-                        .unwrap()
-                        .unwrap();
-                    assert!(matches!(frame.body, BrokerRequest::ChannelKey));
-                    write_frame(
-                        &mut socket,
-                        &Response {
-                            id: frame.id,
-                            body: BrokerReply::ChannelKey(key.clone()),
-                        },
-                    )
-                    .await
-                    .unwrap();
+    #[test]
+    fn only_an_updated_loopback_bridge_grants_the_local_channel_scope() {
+        for version in [10, 17, 21, 22, 23, 24] {
+            for local in [false, true] {
+                let request = opening(version, local, vec![1]);
+                assert_eq!(
+                    matches!(request, BrokerRequest::OpenLocalChannel { .. }),
+                    local && version >= 23
+                );
+                if !local || version < 23 {
+                    assert!(matches!(request, BrokerRequest::OpenChannel { .. }));
                 }
             }
-        });
-        let mut client = connect(dir.path()).await.unwrap();
-        assert_eq!(client.version(), 10);
-        assert!(
-            matches!(client.call(BrokerRequest::ChannelKey).await.unwrap(), BrokerReply::ChannelKey(key) if key == expected)
-        );
-        broker.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn older_brokers_keep_the_ordinary_setup_handshake() {
+        for version in [10, 22] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir(dir.path().join("vault")).unwrap();
+            let listener =
+                tokio::net::UnixListener::bind(a206_broker::socket_path(dir.path())).unwrap();
+            let identity = a206_vault_channel::Identity::generate().unwrap();
+            let key = identity.public.clone();
+            let expected = key.clone();
+            let broker = tokio::spawn(async move {
+                for role in [Role::User, Role::Relay] {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    for offered in (version..=a206_broker::BROKER_VERSION).rev() {
+                        let frame = read_frame::<Frame<BrokerRequest>>(&mut socket)
+                            .await
+                            .unwrap()
+                            .unwrap();
+                        assert!(
+                            matches!(frame.body, BrokerRequest::Hello { role: actual_role, version: actual } if actual_role == role && actual == offered)
+                        );
+                        write_frame(
+                            &mut socket,
+                            &Response {
+                                id: frame.id,
+                                body: if offered == version {
+                                    BrokerReply::Ok
+                                } else {
+                                    BrokerReply::Error(BrokerError::Invalid(
+                                        InvalidRequest::UnsupportedVersion,
+                                    ))
+                                },
+                            },
+                        )
+                        .await
+                        .unwrap();
+                    }
+                    if role == Role::Relay {
+                        let frame = read_frame::<Frame<BrokerRequest>>(&mut socket)
+                            .await
+                            .unwrap()
+                            .unwrap();
+                        assert!(matches!(frame.body, BrokerRequest::ChannelKey));
+                        write_frame(
+                            &mut socket,
+                            &Response {
+                                id: frame.id,
+                                body: BrokerReply::ChannelKey(key.clone()),
+                            },
+                        )
+                        .await
+                        .unwrap();
+                        let frame = read_frame::<Frame<BrokerRequest>>(&mut socket)
+                            .await
+                            .unwrap()
+                            .unwrap();
+                        let BrokerRequest::OpenChannel { first } = frame.body else {
+                            panic!("old broker received a new channel opcode");
+                        };
+                        let (_channel, response) = identity.accept(&first).unwrap();
+                        write_frame(
+                            &mut socket,
+                            &Response {
+                                id: frame.id,
+                                body: BrokerReply::ChannelOpened(response),
+                            },
+                        )
+                        .await
+                        .unwrap();
+                    }
+                }
+            });
+            let mut client = connect(dir.path()).await.unwrap();
+            assert_eq!(client.version(), version);
+            assert!(
+                matches!(client.call(BrokerRequest::ChannelKey).await.unwrap(), BrokerReply::ChannelKey(key) if key == expected)
+            );
+            let (handshake, first) = a206_vault_channel::Handshake::start(&expected).unwrap();
+            let BrokerReply::ChannelOpened(response) =
+                client.call(opening(version, true, first)).await.unwrap()
+            else {
+                panic!("old setup handshake failed");
+            };
+            handshake.finish(&response).unwrap();
+            broker.await.unwrap();
+        }
     }
 
     #[tokio::test]

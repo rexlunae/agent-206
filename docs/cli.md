@@ -82,3 +82,10 @@ the native opcode and ordinary CLI compatibility are unchanged). Skill/trigger i
 exactly; an empty scope list permits no uses. Value editing remains a CLI operation.
 TUI vault controls remain unavailable.
 No additional agent-facing secret tool is introduced.
+
+Authenticator removal is also available in desktop and loopback-web Security. It requires
+both the vault password and an unused current authenticator code, even with
+recent authentication. The encrypted panel requires broker v23; the existing
+native `RemoveTotp` request and CLI compatibility are unchanged. Network web
+channels cannot remove the authenticator they need for future sign-ins; arrange
+access through desktop, loopback web or the trusted CLI first.

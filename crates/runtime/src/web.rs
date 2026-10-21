@@ -1671,6 +1671,114 @@ mod tests {
     }
     #[cfg(unix)]
     #[tokio::test]
+    async fn network_vault_channel_cannot_remove_the_sign_in_factor() {
+        use a206_broker::{Client, Reply as BR, Request as B, Role};
+        use a206_vault_channel::{
+            Handshake, RelayReply as RR, RelayRequest as RQ, Reply as R, Request as Q, Secret,
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().to_path_buf();
+        let serving = root.clone();
+        let broker = tokio::spawn(async move { a206_broker::serve(&serving).await.unwrap() });
+        let mut user = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                match Client::connect(&root, Role::User).await {
+                    Ok(user) => break user,
+                    Err(a206_broker::ClientError::Io(error))
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                        ) =>
+                    {
+                        tokio::task::yield_now().await
+                    }
+                    Err(error) => panic!("unexpected broker startup failure: {error:?}"),
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let password = uuid::Uuid::new_v4().to_string();
+        user.call(B::Unlock {
+            password: a206_broker::WireSecret::new(password.clone()),
+            totp: None,
+            create: true,
+        })
+        .await
+        .unwrap();
+        let original = std::fs::read(a206_broker::vault_path(&root)).unwrap();
+        let BR::ChannelKey(public) = user.call(B::ChannelKey).await.unwrap() else {
+            panic!()
+        };
+        let mut state = bridge(8206);
+        state.root = Arc::new(root.clone());
+        let network = Network {
+            hosts: vec![HOST.into()],
+            root: root.clone(),
+            sessions: Mutex::default(),
+        };
+        // A previously authenticated bearer: no TOTP clock dependence in this
+        // channel-policy test. Sign-in and replay have separate owning tests.
+        let bearer = network
+            .sessions
+            .lock()
+            .unwrap()
+            .start(std::time::Instant::now());
+        state.access = Arc::new(Access::Network(network));
+        let router = app(state, root.join("static"));
+        let (handshake, first) = Handshake::start(&public).unwrap();
+        let (_, opened) = post_as::<_, RR>(
+            &router,
+            (HOST, ORIGIN),
+            Some(&bearer),
+            "/api/vault/channel",
+            RQ::Open { first },
+        )
+        .await;
+        let Some(RR::Opened {
+            session, response, ..
+        }) = opened
+        else {
+            panic!("{opened:?}")
+        };
+        let mut channel = handshake.finish(&response).unwrap();
+        for candidate in [uuid::Uuid::new_v4().to_string(), password] {
+            let bytes = channel
+                .seal(&Q::RemoveTotp {
+                    password: Secret::new(candidate),
+                    code: Secret::new("invalid".into()),
+                })
+                .unwrap();
+            let (_, reply) = post_as::<_, RR>(
+                &router,
+                (HOST, ORIGIN),
+                Some(&bearer),
+                "/api/vault/channel",
+                RQ::Exchange {
+                    session: session.clone(),
+                    bytes,
+                },
+            )
+            .await;
+            let Some(RR::Message(bytes)) = reply else {
+                panic!("{reply:?}")
+            };
+            let R::Error(error) = channel.open::<R>(&bytes).unwrap() else {
+                panic!()
+            };
+            assert_eq!(error.report.kind, a206_core::ErrorKind::Unavailable);
+            assert_eq!(error.code, a206_vault_channel::Code::TotpRemovalUnavailable);
+            assert_eq!(
+                std::fs::read(a206_broker::vault_path(&root)).unwrap(),
+                original
+            );
+        }
+        user.call(B::Shutdown).await.unwrap();
+        broker.await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn browser_vault_setup_is_ciphertext_only_and_sessions_are_owner_bound() {
         use a206_broker::{Client, Reply as BR, Request as B, Role};
         use a206_vault_channel::{

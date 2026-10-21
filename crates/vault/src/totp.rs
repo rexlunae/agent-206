@@ -318,4 +318,40 @@ pub(crate) mod tests {
             .unwrap();
         assert!(!vault.totp_enrolled().unwrap());
     }
+
+    #[test]
+    fn removal_requires_an_unused_code_and_persists_without_changing_credentials() {
+        let (_dir, mut vault, password) = unlocked();
+        let t: u64 = 1_800_000;
+        let pending = PendingTotp {
+            seed: Zeroizing::new((0..20).collect()),
+            account: String::new(),
+            expires_at: t + ENROLLMENT_TTL,
+        };
+        let generator = pending.totp().unwrap();
+        let name = uuid::Uuid::new_v4().to_string();
+        let value = uuid::Uuid::new_v4().to_string();
+        vault.put(&name, Secret::new(value.clone())).unwrap();
+        let enrollment = generator.generate(t);
+        vault
+            .confirm_totp_enrollment(&pending, &enrollment, t)
+            .unwrap();
+        assert!(matches!(
+            vault.remove_totp(&enrollment, t),
+            Err(Error::TotpRejected)
+        ));
+        assert!(vault.totp_enrolled().unwrap());
+        let later = t + 2 * STEP;
+        assert!(matches!(
+            vault.remove_totp("invalid", later),
+            Err(Error::TotpRejected)
+        ));
+        vault
+            .remove_totp(&generator.generate(later), later)
+            .unwrap();
+        vault.lock();
+        vault.unlock(&password).unwrap();
+        assert!(!vault.totp_enrolled().unwrap());
+        assert_eq!(vault.with_secret(&name, str::to_owned).unwrap(), value);
+    }
 }

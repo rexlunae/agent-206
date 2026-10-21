@@ -65,10 +65,28 @@ Both require recent authentication on this encrypted connection and broker v18.
 Enabling access does not approve an agent operation or override any credential's
 policy, destinations or disabled state. Locked or unknown state offers no action.
 
-Reveal, legacy adoption, deletion
-and TOTP removal remain trusted CLI operations. The CLI also offers token, login,
+Reveal, legacy adoption and deletion remain trusted CLI operations. The CLI also offers token, login,
 passkey, SSH-key, note and other entry kinds; this panel adds API keys only. Form
 and payment entry are still unavailable in both clients.
+
+On a confirmed loopback web server, when the unlocked vault reports an enrolled authenticator, **Remove two-factor**
+opens a separate confirmation. **Keep two-factor** cancels without a request.
+Removal requires both the vault password and an unused current code, even when
+this connection has recent authentication. Both fields clear on submit; only
+the broker's successful acknowledgement reports removal, followed by a status
+refresh. Future unlocks then require the password alone. Credential restrictions
+and agent access are unchanged. Broker v23 adds this encrypted-panel request;
+older web peers are refused before either factor is sealed. Locking or losing
+the confirmed vault state unmounts the confirmation inputs. Native desktop uses
+the existing native removal request; TUI vault controls remain unavailable.
+
+Network web sessions cannot remove their sign-in factor. Broker v23 refuses
+removal on ordinary encrypted channels, including those opened by older
+bridges. Only an updated loopback bridge opens the explicit local scope; browser
+input cannot choose it or upgrade an existing channel. No plaintext is exposed
+to the bridge to enforce this restriction. Other setup operations and older
+broker negotiation remain available. Use desktop, an updated loopback server
+or the trusted CLI after arranging access if removal is intended.
 
 Each typed metadata row offers **Disable** or **Enable**, naming its credential.
 These actions require recent authentication and broker v19. They change only the
@@ -113,7 +131,7 @@ setup opcode. Pairing status from older brokers is unknown because their status
 counts an unredeemed pairing token as a paired gateway.
 
 Only a typed setup subset travels inside the encrypted channel: status,
-create/unlock, lock, step-up, begin/confirm/cancel TOTP, and minting a gateway
+create/unlock, lock, step-up, begin/confirm/cancel/remove TOTP, and minting a gateway
 pairing. Reveal, export, grants, provider requests and shutdown are absent. A new
 broker `Relay` role rejects plaintext privileged requests and allows just one
 handshake per socket, so a relay cannot replace a channel and inherit its step-up.
