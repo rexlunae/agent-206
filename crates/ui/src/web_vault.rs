@@ -190,7 +190,7 @@ pub(crate) fn WebVault() -> Element {
             if let Some((title, report)) = failure() {
                 ErrorNotice { report, title: title.to_string() }
             }
-            p { class: "a206-muted", "Verify the broker public key below to create, unlock and pair the vault or enroll two-factor authentication through an encrypted connection. You can also use the desktop, terminal app or `agent206 vault` on the gateway host." }
+            p { class: "a206-muted", "Verify the broker public key below to create, unlock and pair the vault or enroll two-factor authentication through an encrypted connection. You can also use the desktop client, or run `agent206 vault` in a trusted terminal on the gateway host. Vault controls are unavailable in the TUI." }
             if unlocked && crate::sign_in::network() {
                 p { class: "a206-muted", "Locking also stops new sign-ins from other devices until the vault is unlocked." }
             }

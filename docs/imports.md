@@ -180,10 +180,12 @@ failure returns a confirmed `VaultImportApplied` with a structured
 the CLI reports the copied vault and exits unsuccessfully before further import
 steps. A receipt failure never replaces or deletes the imported vault.
 
-These controls operate on this computer's broker for desktop/TUI, or the web
+These controls operate on this computer's broker for desktop, or the web
 server's local broker after trusted-key verification. Remote SSH vault controls,
 key-file migration, rollback and other import adapters remain pending. Native
-desktop/TUI interactive acceptance remains unverified.
+desktop interactive acceptance remains unverified. The TUI refuses vault-import
+controls along with other secret-entry forms; use the desktop or `agent206 vault
+import` in a trusted terminal on the broker host.
 
 ### Isolated source reader
 
