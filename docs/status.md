@@ -147,15 +147,23 @@ not a completed Security interaction check. Layout, graphics fallbacks and
 keyboard navigation still need investigation and acceptance.
 
 The terminal root now embeds the unchanged bundled toolkit styles and its own
-app stylesheet as style text, using fc-dioxus `dc98bdd` (inline delivery and
-native-compatible hidden attributes). Desktop and web keep linked stylesheets.
-A repeat 140×45 PTY run showed navigation text, but still omitted the main pane,
-showed an unsupported-image marker and produced no visible palette after Ctrl+K
+app stylesheet as style text, using fc-dioxus `e4e6a5d` (inline delivery,
+native-compatible hidden attributes and omission of the closed Dialog's `open`
+attribute). Desktop and web keep linked stylesheets.
+A repeat 140×45 PTY run before the Dialog fix showed navigation text, but still
+omitted the main pane, showed an unsupported-image marker and produced no visible palette after Ctrl+K
 or Tab/Ctrl+K. It exited cleanly with Ctrl+C and the disposable gateway stayed
 stopped. The renderer's independent flex-row painting failure is tracked in
 [dioxus-tui#5](https://github.com/JakkuSakura/dioxus-tui/issues/5); keyboard response
 still needs separate diagnosis. This is partial resource integration, not passed
 terminal interaction acceptance.
+
+The toolkit's native Rust regression covers open and closed Dialogs in both
+nonmodal and unsupported-modal fallback modes, checking attributes and computed
+visibility. The pinned terminal renderer still omits open positioned Dialog
+boxes ([dioxus-tui#8](https://github.com/JakkuSakura/dioxus-tui/issues/8)); the
+toolkit update does not establish working terminal palettes or full interaction
+acceptance.
 
 An isolated public-marker probe also found that the pinned terminal renderer
 paints password values as plain text ([dioxus-tui#6](https://github.com/JakkuSakura/dioxus-tui/issues/6)).
