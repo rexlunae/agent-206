@@ -4,12 +4,13 @@ use crate::{
 };
 use a206_core::{
     Capability, CodingBackend, Command, CompactionTrigger, ErrorKind, ErrorReport, ImageAttachment,
-    ImageType, InstructionStatus, MAX_IMAGE_BYTES, MAX_IMAGES, Mode, ModelKey, PlanStatus, Reply,
-    Role, RunState, Tally, TextAttachment, Thread, UsageTotal,
+    ImageType, InstructionStatus, MAX_IMAGE_BYTES, MAX_IMAGES, Mode, PlanStatus, Reply, Role,
+    RunState, Tally, TextAttachment, Thread, UsageTotal,
 };
 use fc_dioxus::prelude::*;
 use std::collections::HashMap;
 use uuid::Uuid;
+mod model_selector;
 /// Scrolls a linked message into view where the renderer can scroll.
 async fn reveal(mounted: MountedEvent) {
     match mounted.data().scroll_to(ScrollBehavior::Instant).await {
@@ -239,7 +240,6 @@ fn Conversation(thread: Thread, target: Option<Uuid>) -> Element {
     let has_model = thread.model.is_some();
     let selected_model = thread.model.clone();
     let allowed_for_mode = thread.subagent_models.clone();
-    let allowed_for_model = thread.subagent_models.clone();
     let mode = thread.mode;
     let mode_value = use_memo(move || {
         state
@@ -249,16 +249,6 @@ fn Conversation(thread: Thread, target: Option<Uuid>) -> Element {
             .iter()
             .find(|t| t.id == id)
             .map(|t| t.mode.label().to_owned())
-    });
-    let model_value = use_memo(move || {
-        state
-            .data
-            .read()
-            .threads
-            .iter()
-            .find(|t| t.id == id)
-            .and_then(|t| t.model.as_ref())
-            .map(|k| format!("{}:{}", k.provider, k.model))
     });
     let can_create = (state.connected)() && state.gateway_busy.read().is_none();
     let mut submit = move || {
@@ -366,23 +356,6 @@ fn Conversation(thread: Thread, target: Option<Uuid>) -> Element {
     };
     let snapshot = state.data.read();
     let models: Vec<_> = snapshot.catalogs.iter().flat_map(|c| &c.models).collect();
-    let model_options = models
-        .iter()
-        .map(|model| {
-            let provider = snapshot
-                .settings
-                .providers
-                .iter()
-                .find(|p| p.id == model.key.provider)
-                .map(|p| p.label.as_str())
-                .unwrap_or("Unavailable connection");
-            SelectChoice::new(
-                format!("{}:{}", model.key.provider, model.key.model),
-                &model.name,
-            )
-            .in_group(provider)
-        })
-        .collect::<Vec<_>>();
     let details = use_id();
     let model = thread
         .model
@@ -450,7 +423,6 @@ fn Conversation(thread: Thread, target: Option<Uuid>) -> Element {
             .chain(efforts.into_iter().map(|v| SelectChoice::new(v.clone(), v)))
             .collect()
     };
-    let effort_unavailable = effort_options.is_empty() || running;
     let commands = crate::slash::suggestions(&draft());
     // A command needs no model; Send runs it (or says why it cannot run).
     let typed_command = !matches!(
@@ -469,9 +441,8 @@ fn Conversation(thread: Thread, target: Option<Uuid>) -> Element {
         div { class: "a206-messages",
             if thread.messages.is_empty() {
                 Card { variant: CardVariant::Feature, class: "a206-chat-welcome",
-                EmptyState { compact: true, title: rsx! { "Let's make something worthwhile." },
-                    body: rsx! { if selected_model.is_some() { "Your conversation is ready. Describe the work you have in mind." } else { "Choose a model from a connected provider to begin." } },
-                    actions: rsx! { if models.is_empty() { LinkButton { variant: ButtonVariant::Secondary, href: Route::Providers {}.to_string(), "Connect a provider" } } }
+                EmptyState { compact: true, title: rsx! { "New conversation" },
+                    body: rsx! { if selected_model.is_some() { "Write a message to begin." } else { "Choose a model below. Use Manage models… in the selector to set up a provider." } },
                 }
                 }
             }
@@ -626,23 +597,13 @@ fn Conversation(thread: Thread, target: Option<Uuid>) -> Element {
                             options: Mode::ALL.into_iter().map(|m| SelectChoice::new(m.label(), m.label())).collect(),
                             onchange: move |value: String| { if let Some(mode) = Mode::ALL.into_iter().find(|m| m.label() == value) { dispatch(state, Command::ConfigureThread { id, mode, model: selected_model.clone(), subagent_models: allowed_for_mode.clone() }); } }
                         }
-                        if model_options.is_empty() {
-                            LinkButton { class: "a206-model-connect", size: ButtonSize::Sm, variant: ButtonVariant::Ghost,
-                                href: Route::Providers {}.to_string(), "Connect model" Icon { name: IconName::ChevronDown, size: IconSize::Sm }
-                            }
-                        } else {
-                            Select { class: "a206-compose-select a206-model-select", label: name!("Provider and model"), value: ReadSignal::from(model_value), availability,
-                                options: model_options, placeholder: "Choose model",
-                                onchange: move |value: String| {
-                                    let model = value.split_once(':').and_then(|(provider, model)| Some(ModelKey { provider: Uuid::parse_str(provider).ok()?, model: model.into() }));
-                                    dispatch(state, Command::ConfigureThread { id, mode, model, subagent_models: allowed_for_model.clone() });
-                                }
-                            }
-                        }
+                        model_selector::ModelSelector { thread: thread.clone(), availability }
+                        if !effort_options.is_empty() {
                         Select { class: "a206-compose-select a206-effort-select", label: name!("Reasoning effort"), value: ReadSignal::from(effort_value),
-                            options: effort_options, placeholder: "Effort —", title: if effort_unavailable { "Effort choices not reported by the selected model API" } else { "Reasoning effort" },
-                            availability: if effort_unavailable { Availability::Disabled } else { Availability::Enabled },
+                            options: effort_options, placeholder: "Reasoning effort", title: "Reasoning effort",
+                            availability: if running { Availability::Disabled } else { Availability::Enabled },
                             onchange: move |effort: String| dispatch(state, Command::SetEffort { thread: id, effort: (!effort.is_empty()).then_some(effort) })
+                        }
                         }
                     }
                     div { class: "a206-compose-widgets",

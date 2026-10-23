@@ -151,7 +151,7 @@ tests run through Cargo with bounded subprocess/protocol I/O and isolated profil
 and support packaged binaries through `A206_TEST_BINARY`. Windows smoke coverage
 awaits gateway named-pipe support. The
 macOS native bundle and release WASM web assets have been built. Browser UI checks
-cover conversation creation, full-width layout, theme persistence, explicit light/dark schemes, compact split-pane composers, independent mode controls, attachment staging/removal/re-selection, keyboard entry, usage/account popovers, and onscreen bottom-edge selectors. TUI has been
+cover conversation creation, full-width layout, theme persistence, explicit light/dark schemes, compact split-pane composers, independent mode controls, attachment staging/removal/re-selection, keyboard entry, usage/account popovers, and onscreen bottom-edge selectors. The composer model selector stays in chat even with an empty catalog, with explicit refresh and Manage models actions. Disposable browser checks against a local model API cover changing and persisting the selected model, Escape dismissal, refresh without changing selection, explicit setup navigation and the empty-catalog menu. Unsupported reasoning-effort choices are hidden. Native/TUI interaction acceptance for these selector changes is still pending. TUI has been
 compiled and launched against the pinned Dioxus 0.7 fork. A macOS PTY attempt at
 `91b8e57` (140 columns, 45 rows, `TERM=xterm-256color`) produced overlapping or
 truncated text and an unsupported-image marker. Ctrl+K and Tab/Ctrl+K did not
