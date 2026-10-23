@@ -332,6 +332,32 @@ fn param(kind: ParamKind, required: bool) -> ParamSpec {
 }
 
 #[test]
+fn parameter_controls_match_the_declared_type() {
+    #[component]
+    fn Fields() -> Element {
+        rsx! {
+            ArgField { param: param(ParamKind::Boolean, false), value: "false".to_string(), oninput: |_| {} }
+            ArgField { param: param(ParamKind::Integer, true), value: "3".to_string(), oninput: |_| {} }
+            ArgField { param: param(ParamKind::Number, false), value: "2.5".to_string(), oninput: |_| {} }
+            ArgField { param: param(ParamKind::Object, true), value: String::new(), oninput: |_| {} }
+        }
+    }
+    let mut dom = VirtualDom::new(Fields);
+    dom.rebuild_in_place();
+    let html = dioxus_ssr::render(&dom);
+    assert!(
+        html.contains("role=\"combobox\"")
+            && html.contains("Not set")
+            && html.contains("Yes")
+            && html.contains("No")
+    );
+    assert_eq!(html.matches("type=\"number\"").count(), 2);
+    assert!(html.contains("step=\"1\"") && html.contains("step=\"any\""));
+    assert!(!html.contains("type=\"text\""));
+    assert!(html.contains("structured argument"));
+}
+
+#[test]
 fn only_enabled_extensions_offer_their_triggers() {
     let (on, off) = (spec(vec![]), spec(vec![]));
     let plugins = vec![plugin(true, &on), plugin(false, &off)];

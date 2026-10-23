@@ -13,6 +13,10 @@ use a206_core::{
 use fc_dioxus::prelude::*;
 use jiff::{Timestamp, tz::TimeZone};
 use uuid::Uuid;
+mod controls;
+use controls::{
+    IntervalFields, IntervalUnit, WEEKDAYS, WeekdayChoice, ZoneSelector, calendar_expression,
+};
 
 /// A Unix time in `zone`, as people read it.
 fn show_time(at: u64, zone: &TimeZone) -> String {
@@ -428,15 +432,25 @@ fn RunList(runs: Vec<JobRun>, kind: JobKind) -> Element {
 enum Kind {
     Once,
     Every,
+    Daily,
+    Weekly,
     Cron,
 }
 impl Kind {
-    const ALL: [Self; 3] = [Self::Once, Self::Every, Self::Cron];
+    const ALL: [Self; 5] = [
+        Self::Once,
+        Self::Every,
+        Self::Daily,
+        Self::Weekly,
+        Self::Cron,
+    ];
     fn label(self) -> &'static str {
         match self {
             Self::Once => "Once",
             Self::Every => "On an interval",
-            Self::Cron => "On a cron schedule",
+            Self::Daily => "Daily",
+            Self::Weekly => "Weekly",
+            Self::Cron => "Custom cron (advanced)",
         }
     }
 }
@@ -460,8 +474,8 @@ fn form_schedule(
             seconds,
             anchor: None,
         })),
-        Kind::Cron if cron.trim().is_empty() => None,
-        Kind::Cron => Some(Ok(Schedule::Cron {
+        Kind::Cron | Kind::Daily | Kind::Weekly if cron.trim().is_empty() => None,
+        Kind::Cron | Kind::Daily | Kind::Weekly => Some(Ok(Schedule::Cron {
             expression: cron.trim().to_owned(),
             zone: Some(zone.trim().to_owned()).filter(|z| !z.is_empty()),
         })),
@@ -479,10 +493,13 @@ fn AddJob() -> Element {
     let mut kind = use_signal(|| Kind::Once);
     let mut date = use_signal(String::new);
     let mut time = use_signal(String::new);
-    let mut every = use_signal(String::new);
+    let every = use_signal(|| "1".to_owned());
+    let interval_unit = use_signal(|| IntervalUnit::Days);
+    let mut calendar_time = use_signal(|| "09:00".to_owned());
+    let weekdays = use_signal(|| vec![1, 2, 3, 4, 5]);
     let mut cron = use_signal(String::new);
     // The client's own zone; the field shows it so it is never assumed.
-    let mut zone = use_signal(|| {
+    let zone = use_signal(|| {
         TimeZone::system()
             .iana_name()
             .unwrap_or_default()
@@ -496,13 +513,25 @@ fn AddJob() -> Element {
         .collect::<Vec<_>>();
     let choices = send_choices(&snapshot.plugins);
     drop(snapshot);
-    let schedule = form_schedule(kind(), &date(), &time(), &zone(), &every(), &cron());
+    let expression = match kind() {
+        Kind::Daily => calendar_expression(&calendar_time(), None).unwrap_or_default(),
+        Kind::Weekly => {
+            calendar_expression(&calendar_time(), Some(&weekdays())).unwrap_or_default()
+        }
+        _ => cron(),
+    };
+    let interval = interval_unit().duration(&every()).unwrap_or_default();
+    let schedule = form_schedule(kind(), &date(), &time(), &zone(), &interval, &expression);
     let invalid = match &schedule {
         Some(Err(error)) => Some(error.to_string()),
         _ => None,
     };
     let target = thread().and_then(|id| id.parse::<Uuid>().ok());
     let valid = matches!(schedule, Some(Ok(_)));
+    let prepared_schedule = schedule
+        .as_ref()
+        .and_then(|schedule| schedule.as_ref().ok())
+        .cloned();
     let job_kind = match sends() {
         Sends::Message => Ok(JobKind::Message),
         Sends::Heartbeat => Ok(JobKind::Heartbeat),
@@ -565,18 +594,29 @@ fn AddJob() -> Element {
                     Field { label: rsx! { "Time" }, Input { r#type: InputType::Time, value: ReadSignal::from(time), oninput: move |v| time.set(v) } }
                 },
                 Kind::Every => rsx! {
-                    Field { label: rsx! { "Interval" }, hint: rsx! { "Such as 90m, 6h or 1d; at least a minute. Counted from when it is scheduled." }, error: invalid.clone().map(|e| rsx! { "{e}" }), Input { value: ReadSignal::from(every), oninput: move |v| every.set(v), placeholder: "1d" } }
+                    IntervalFields { amount: every, unit: interval_unit }
+                    if let Some(error) = invalid.clone() { p { role: "status", "{error}" } }
+                },
+                Kind::Daily | Kind::Weekly => rsx! {
+                    Field { label: rsx! { "Time" }, hint: rsx! { "Wall-clock time in the selected time zone." }, Input { aria_label: "Repeat time", r#type: InputType::Time, step: "60", value: ReadSignal::from(calendar_time), oninput: move |v| calendar_time.set(v) } }
+                    if kind() == Kind::Weekly {
+                        fieldset { legend { "Days of the week" }
+                            div { class: "a206-row", for (day, label) in WEEKDAYS { WeekdayChoice { key: "{day}", day, label, days: weekdays } } }
+                        }
+                        if weekdays.read().is_empty() { p { role: "status", "Choose at least one day." } }
+                    }
                 },
                 Kind::Cron => rsx! {
                     Field { label: rsx! { "Cron expression" }, hint: rsx! { "Five fields, or six with seconds first." }, Input { value: ReadSignal::from(cron), oninput: move |v| cron.set(v), placeholder: "0 9 * * 1-5" } }
                 },
             }
             if kind() != Kind::Every {
-                Field { label: rsx! { "Time zone" }, hint: rsx! { if kind() == Kind::Cron { "An IANA name such as Europe/Paris. Leave empty for the gateway's own zone." } else { "An IANA name such as Europe/Paris." } }, error: invalid.clone().map(|e| rsx! { "{e}" }), Input { value: ReadSignal::from(zone), oninput: move |v| zone.set(v) } }
+                ZoneSelector { zone, gateway_default: kind() != Kind::Once }
+                if kind() == Kind::Once && let Some(error) = invalid.clone() { p { role: "status", "{error}" } }
             }
         } }
         CardFooter { Button { variant: ButtonVariant::Primary, availability: if ready { Availability::Enabled } else { Availability::Disabled }, onclick: move |_| {
-            let Some(Ok(schedule)) = form_schedule(kind(), &date(), &time(), &zone(), &every(), &cron()) else { return };
+            let Some(schedule) = prepared_schedule.clone() else { return };
             let Some(thread) = target else { return };
             let Ok(kind) = job_kind.clone() else { return };
             let text = if kind == JobKind::Heartbeat { String::new() } else { text() };
@@ -589,9 +629,20 @@ fn AddJob() -> Element {
 #[component]
 fn ArgField(param: ParamSpec, value: String, oninput: EventHandler<String>) -> Element {
     let value = use_memo(use_reactive!(|value| value));
+    let selected = use_memo(move || Some(value()));
+    let label =
+        AccessibleName::try_from(param.name.as_str()).unwrap_or(name!("Boolean parameter value"));
     let need = if param.required { ", required" } else { "" };
     rsx! { Field { label: rsx! { "{param.name}" }, hint: rsx! { "{param.description} ({param.kind.label()}{need})" },
-        Input { value: ReadSignal::from(value), oninput: move |v| oninput.call(v) }
+        match param.kind {
+            ParamKind::Boolean => rsx! { Select { label, value: ReadSignal::from(selected),
+                options: vec![SelectChoice::new("", if param.required { "Choose a value" } else { "Not set" }), SelectChoice::new("true", "Yes"), SelectChoice::new("false", "No")],
+                onchange: move |v| oninput.call(v)
+            } },
+            ParamKind::Integer | ParamKind::Number => rsx! { Input { r#type: InputType::Number, step: if param.kind == ParamKind::Integer { "1" } else { "any" }, value: ReadSignal::from(value), oninput: move |v| oninput.call(v) } },
+            ParamKind::String => rsx! { Input { value: ReadSignal::from(value), oninput: move |v| oninput.call(v) } },
+            ParamKind::Array | ParamKind::Object => rsx! { p { class: "a206-muted", "This trigger needs a structured argument. Use agent206 schedule add --trigger to configure it." } },
+        }
     } }
 }
 
