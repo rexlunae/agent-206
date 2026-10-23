@@ -168,7 +168,7 @@ printed authorization link first in each new browser session.
 - Monitored HTTPS downloads with cancellation and optional SHA-256 verification;
   destinations include the transfer library and `~/models`.
 - Owned local/SSH Joshua process start/stop, configurable API port, and API discovery.
-- UTF-8 document previews, scoped Git status and a sandboxed browser preview.
+- UTF-8 document previews and scoped Git status.
 - A compiled bundled WASM extension in a separate limited worker process, confined
   on Linux by bubblewrap + Landlock with no network.
 - A separate vault broker process holds the SecureStore-compatible vault, with

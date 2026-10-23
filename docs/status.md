@@ -76,8 +76,9 @@ Credential-backed providers work only through the vault broker: the vault must b
 unlocked, the gateway paired for that unlock, and the credential bound to the
 provider's exact origin, or the request fails with an explanation. The gateway never reads a credential value, and agents
 still have no credential use. External coding backends still refuse credentialed
-providers. Browser
-preview has no credential injection. Third-party extensions install only from a package the user supplies or a package an agent prepared and the user installs; registry installs are unavailable.
+providers. Interactive agent-browser automation and credential injection are not
+implemented. Third-party extensions install only from a package the user supplies
+or a package an agent prepared and the user installs; registry installs are unavailable.
 Bundled extensions reach the workspace and their own state only through
 gateway-authorized host calls; no extension links WASI or any other
 capability-bearing WASM import. New coding conversations have no
