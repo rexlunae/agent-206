@@ -222,6 +222,14 @@ and lock/reopen persistence with the other entry's policy and destination retain
 and global access off. Native desktop interaction remains unverified; the TUI guard
 stays in place.
 
+Native broker request diagnostics expose only the operation name. This includes
+authenticator codes that retain their legacy string wire representation, along
+with passwords, credential values and user-supplied request payloads. Regression
+tests cover compact and alternate Debug output after MessagePack decoding and
+verify that authentication codes still reach the broker unchanged. This is a
+diagnostic redaction safeguard; broker decision auditing and comprehensive
+no-secret leakage testing remain pending.
+
 Credential rows also offer Edit destinations. The editor replaces the complete
 list of permitted origins, including an empty list that prevents brokered use.
 The exact credential name and list are retained through step-up authentication;

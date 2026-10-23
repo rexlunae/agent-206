@@ -194,6 +194,12 @@ vault migration or production security certification.
 
 ## Next gates
 
+Native broker request Debug output now identifies only the operation, omitting
+authenticator codes and all other request fields. Broker unit regressions check
+compact/alternate diagnostics after wire decoding and unchanged code delivery;
+both fail with the previous derived formatter. Comprehensive broker audit and
+leakage acceptance remain pending; see [security-setup.md](security-setup.md).
+
 The shared Import page now offers RustyClaw settings review and per-item apply
 through gateway-owned commands also available in the CLI. A release web client
 was checked with disposable source/target profiles: blank source and empty

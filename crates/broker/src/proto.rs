@@ -360,7 +360,7 @@ pub struct ApiKeyInput {
     pub value: WireSecret,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub enum Request {
     CredentialPage {
         version: u16,
@@ -508,6 +508,53 @@ pub enum Request {
     /// destination, and a signature of an authentication request. Answered
     /// with `SshAgent`; the private key never leaves the broker.
     SshAgent(SshAgentCall),
+}
+
+// Native authentication codes retain their existing string wire representation.
+// Never delegate diagnostics to request fields: codes, user-controlled URLs and
+// message bodies can contain secrets even when they are not WireSecret values.
+impl std::fmt::Debug for Request {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let operation = match self {
+            Self::CredentialPage { .. } => "CredentialPage",
+            Self::AddApiKey(_) => "AddApiKey",
+            Self::ReviewVaultImport { .. } => "ReviewVaultImport",
+            Self::ApplyVaultImport { .. } => "ApplyVaultImport",
+            Self::CancelVaultImport { .. } => "CancelVaultImport",
+            Self::Hello { .. } => "Hello",
+            Self::Status => "Status",
+            Self::ChannelKey => "ChannelKey",
+            Self::OpenChannel { .. } => "OpenChannel",
+            Self::OpenLocalChannel { .. } => "OpenLocalChannel",
+            Self::ChannelMessage { .. } => "ChannelMessage",
+            Self::ImportVault { .. } => "ImportVault",
+            Self::Unlock { .. } => "Unlock",
+            Self::Lock => "Lock",
+            Self::Shutdown => "Shutdown",
+            Self::StepUp { .. } => "StepUp",
+            Self::BeginTotp { .. } => "BeginTotp",
+            Self::ConfirmTotp { .. } => "ConfirmTotp",
+            Self::CancelTotp => "CancelTotp",
+            Self::RemoveTotp { .. } => "RemoveTotp",
+            Self::Credentials => "Credentials",
+            Self::AdoptLegacy { .. } => "AdoptLegacy",
+            Self::PutCredential { .. } => "PutCredential",
+            Self::UpdateCredential { .. } => "UpdateCredential",
+            Self::DeleteCredential { .. } => "DeleteCredential",
+            Self::SetAgentAccess { .. } => "SetAgentAccess",
+            Self::Reveal { .. } => "Reveal",
+            Self::PairGateway => "PairGateway",
+            Self::GatewayAuth { .. } => "GatewayAuth",
+            Self::Provider(_) => "Provider",
+            Self::ProviderStream(_) => "ProviderStream",
+            Self::SocketOpen(_) => "SocketOpen",
+            Self::SocketSend { .. } => "SocketSend",
+            Self::GitReceivePack(_) => "GitReceivePack",
+            Self::GitUploadPack(_) => "GitUploadPack",
+            Self::SshAgent(_) => "SshAgent",
+        };
+        f.debug_struct(operation).finish_non_exhaustive()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -762,4 +809,77 @@ pub enum Reply {
         code: Option<u16>,
     },
     Error(BrokerError),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn authentication_request_diagnostics_never_print_codes_or_passwords() {
+        let password = uuid::Uuid::new_v4().to_string();
+        let code = format!("{:06}", uuid::Uuid::new_v4().as_u128() % 1_000_000);
+        let requests = [
+            Request::Unlock {
+                password: WireSecret::new(password.clone()),
+                totp: Some(code.clone()),
+                create: false,
+            },
+            Request::ImportVault {
+                source: std::path::PathBuf::from(uuid::Uuid::new_v4().to_string()),
+                password: WireSecret::new(password.clone()),
+                totp: Some(code.clone()),
+            },
+            Request::StepUp {
+                password: Some(WireSecret::new(password.clone())),
+                totp: Some(code.clone()),
+            },
+            Request::ConfirmTotp { code: code.clone() },
+            Request::RemoveTotp {
+                password: WireSecret::new(password.clone()),
+                code: code.clone(),
+            },
+            Request::ApplyVaultImport {
+                version: IMPORT_REVIEW_SCHEMA_VERSION,
+                review: uuid::Uuid::new_v4(),
+                password: WireSecret::new(password.clone()),
+                totp: Some(WireSecret::new(code.clone())),
+            },
+        ];
+        for request in requests {
+            // Decoded requests must be equally safe to inspect. Serialization
+            // still carries the actual code to the isolated broker.
+            let bytes = a206_protocol::encode(&request).unwrap();
+            let decoded: Request = a206_protocol::Decoder::default()
+                .feed(&bytes)
+                .unwrap()
+                .pop()
+                .unwrap();
+            for diagnostic in [format!("{decoded:?}"), format!("{decoded:#?}")] {
+                assert!(!diagnostic.contains(&password));
+                assert!(!diagnostic.contains(&code));
+            }
+            match decoded {
+                Request::Unlock { totp, .. }
+                | Request::ImportVault { totp, .. }
+                | Request::StepUp { totp, .. } => assert_eq!(totp.as_deref(), Some(code.as_str())),
+                Request::ConfirmTotp { code: actual }
+                | Request::RemoveTotp { code: actual, .. } => assert_eq!(actual, code),
+                Request::ApplyVaultImport { totp, .. } => {
+                    assert_eq!(totp.unwrap().expose(), code);
+                }
+                _ => panic!("unexpected authentication request"),
+            }
+        }
+    }
+
+    #[test]
+    fn request_diagnostics_identify_operation_without_user_payload() {
+        let payload = uuid::Uuid::new_v4().to_string();
+        let request = Request::SocketSend {
+            text: payload.clone(),
+        };
+        assert_eq!(format!("{request:?}"), "SocketSend { .. }");
+        assert!(!format!("{request:#?}").contains(&payload));
+    }
 }
