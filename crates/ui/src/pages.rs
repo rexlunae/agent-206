@@ -50,7 +50,13 @@ pub fn Overview() -> Element {
             ] {
                 Card { variant: CardVariant::Elevated, CardHeader { CardTitle { span { class: "a206-icon-label", Icon { name: target.icon(), size: IconSize::Sm } "{title}" } } }
                     CardBody { p { class: "a206-muted", "{body}" } }
-                    CardFooter { LinkButton { variant: ButtonVariant::Ghost, href: target.to_string(), "Open {title}" Icon { name: IconName::ArrowEnd, size: IconSize::Sm } } }
+                    CardFooter {
+                        if target == (Route::Appearance {}) {
+                            Button { variant: ButtonVariant::Ghost, aria_haspopup: "dialog", onclick: move |_| { let mut open = state.appearance; open.set(true); }, "Open {title}" Icon { name: IconName::Settings, size: IconSize::Sm } }
+                        } else {
+                            LinkButton { variant: ButtonVariant::Ghost, href: target.to_string(), "Open {title}" Icon { name: IconName::ArrowEnd, size: IconSize::Sm } }
+                        }
+                    }
                 }
             }
         }

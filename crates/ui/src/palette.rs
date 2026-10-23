@@ -9,6 +9,7 @@ use fc_dioxus::prelude::*;
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Action {
     Open(Route),
+    Appearance,
     NewConversation,
     Compact(Id),
     Stop(Id),
@@ -135,7 +136,6 @@ pub(crate) fn entries(snapshot: &Snapshot, route: &Route, can_create: bool) -> V
     let pages = Route::navigation()
         .into_iter()
         .flatten()
-        .chain([Route::Appearance {}])
         .filter(|page| page != route);
     entries.extend(pages.map(|page| {
         Entry::new(
@@ -145,6 +145,12 @@ pub(crate) fn entries(snapshot: &Snapshot, route: &Route, can_create: bool) -> V
             Action::Open(page.clone()),
         )
     }));
+    entries.push(Entry::new(
+        "Appearance",
+        "Actions",
+        IconName::Settings,
+        Action::Appearance,
+    ));
     for thread in snapshot.threads.iter().rev() {
         let open = Route::Chat {
             id: thread.id,
@@ -219,11 +225,12 @@ pub(crate) fn filter(entries: Vec<Entry>, query: &str) -> Vec<Entry> {
     ranked.into_iter().map(|(_, entry)| entry).collect()
 }
 
-pub(crate) fn run(state: State, action: Action) {
+pub(crate) fn run(mut state: State, action: Action) {
     match action {
         Action::Open(route) => {
             state.navigator.push(route);
         }
+        Action::Appearance => state.appearance.set(true),
         Action::NewConversation => dispatch(
             state,
             Command::CreateThread {
@@ -383,7 +390,12 @@ mod tests {
                 "{page:?}"
             );
         }
-        assert!(opened.contains(&Route::Appearance {}));
+        assert!(!opened.contains(&Route::Appearance {}));
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.action == Action::Appearance)
+        );
         for t in &threads {
             assert!(titles(&entries).contains(&t.title.as_str()));
         }

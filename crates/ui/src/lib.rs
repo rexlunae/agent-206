@@ -1,6 +1,7 @@
 //! Shared desktop/web/terminal application tree, composed with fc-dioxus.
 #![forbid(unsafe_code)]
 mod activity;
+mod appearance_navigation;
 mod audit;
 mod budgets;
 mod connections;
@@ -144,6 +145,8 @@ pub(crate) struct State {
     pub gateway_busy: Signal<Option<GatewayAction>>,
     pub gateway_generation: Signal<u64>,
     pub theme: Signal<ThemeChoice>,
+    /// A workspace overlay; opening appearance never changes the content route.
+    pub appearance: Signal<bool>,
     /// First-time (or changed) gateway setup is showing instead of the workspace.
     pub setup: Signal<bool>,
     /// A server opened to other devices is asking this browser to sign in.
@@ -565,6 +568,7 @@ pub fn App() -> Element {
             provide_history_context(Rc::new(MemoryHistory::default()));
         }
     });
+    appearance_navigation::use_navigation();
     let theme = use_signal(|| ThemeChoice::from_design(Design::Helix));
     use_context_provider(|| theme);
     let picked = theme();
@@ -610,6 +614,7 @@ fn Shell() -> Element {
         gateway_generation,
         loaded,
         theme,
+        appearance: use_context::<appearance_navigation::Open>().0,
         setup,
         #[cfg(target_arch = "wasm32")]
         sign_in,
@@ -672,6 +677,8 @@ fn Shell() -> Element {
     let signing_in = false;
     let mut palette = use_signal(|| false);
     let route = use_route::<Route>();
+    let appearance_page = matches!(route, Route::Appearance {});
+    appearance_navigation::use_dismiss_on_host_navigation();
     // The palette reaches workspace pages, which sign-in and setup replace.
     let navigable = !signing_in && !setup();
     // Close it when they do, so it does not reappear unasked afterwards.
@@ -682,6 +689,10 @@ fn Shell() -> Element {
         let gated = setup();
         if gated && *palette.peek() {
             palette.set(false);
+        }
+        if gated && *state.appearance.peek() {
+            let mut appearance = state.appearance;
+            appearance.set(false);
         }
     });
     rsx! {
@@ -701,11 +712,12 @@ fn Shell() -> Element {
             onkeydown: move |event: KeyboardEvent| {
                 if navigable && palette::opens(&event) {
                     event.prevent_default();
-                    palette.set(true);
+                    if !*state.appearance.peek() && !appearance_page { palette.set(true); }
                 }
             },
             Header { palette, navigable }
             if navigable { palette::CommandPalette { open: palette, route } }
+            if navigable { settings::AppearanceDialog { open: (state.appearance)(), onclose: move |_| { let mut open = state.appearance; open.set(false); } } }
             if !status().is_empty() { div { class: "a206-status", role: "status", "{status}" } }
             if let Some(report) = state.outage.read().clone() {
                 div { class: "a206-status", ErrorNotice { report, title: "Gateway unreachable".to_string() } }
@@ -771,7 +783,9 @@ fn Header(palette: Signal<bool>, navigable: bool) -> Element {
                 onclick: move |_| palette.set(true),
                 Icon { name: IconName::Search, size: IconSize::Sm } "Go to…" }
             LinkButton { size: ButtonSize::Sm, variant: ButtonVariant::Ghost, href: Route::Gateway {}.to_string(), Icon { name: Route::Gateway {}.icon() } "Gateway" }
-            LinkButton { size: ButtonSize::Sm, variant: ButtonVariant::Ghost, href: Route::Appearance {}.to_string(), Icon { name: IconName::Settings } "Theme" }
+            Button { size: ButtonSize::Sm, variant: ButtonVariant::Ghost, aria_haspopup: "dialog",
+                availability: if navigable { Availability::Enabled } else { Availability::Disabled },
+                onclick: move |_| { let mut open = state.appearance; open.set(true); }, Icon { name: IconName::Settings } "Theme" }
             SignOut {}
             Button { size: ButtonSize::Sm, variant: ButtonVariant::Primary, availability: if (state.connected)() && state.gateway_busy.read().is_none() { Availability::Enabled } else { Availability::Disabled }, onclick: move |_| dispatch(state, Command::CreateThread { title: "New conversation".into(), mode: Mode::Chat }), "+ New chat" }
         }

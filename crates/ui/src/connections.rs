@@ -100,10 +100,16 @@ pub(crate) fn ConnectionEditor(
         busy(),
     )
     .is_some();
-    rsx! { div { class: "a206-stack",
-        Divider {}
-        h3 { "Edit connection" }
-        p { class: "a206-muted", "Changing a connection stops its active responses and clears its cached model catalog. Refresh models after saving. This does not grant access to a vault credential." }
+    rsx! { Dialog { open: true, title: rsx! { "Edit connection" }, size: DialogSize::Lg, scrollable: true,
+        close_label: name!("Close connection editor"), aria_busy: "{busy}",
+        description: rsx! { "Changing a connection stops its active responses and clears its cached model catalog. Refresh models after saving. This does not grant access to a vault credential." },
+        onclose: move |_| {
+            // Keep the editor alive until a sent save is confirmed and refreshed;
+            // closing a dialog cannot roll back a command already received.
+            if !busy() { onclose.call(()); }
+        },
+        div { class: "a206-stack",
+        if busy() { p { role: "status", "Saving connection… Wait for the result before closing." } }
         if stale { Alert { tone: AlertTone::Warning, "Settings changed. Your draft is preserved. Reload before editing the current connection." } }
         if !online { p { "Gateway is disconnected. Reconnect before saving." } }
         if draft().is_none() { p { "Connection is unavailable. Close this editor and refresh connections." } }
@@ -137,12 +143,58 @@ pub(crate) fn ConnectionEditor(
             }, "Reload saved values" }
             Button { variant: ButtonVariant::Ghost, availability: if busy() { Availability::Disabled } else { Availability::Enabled }, onclick: move |_| onclose.call(()), "Cancel" }
         }
-    } }
+    } } }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[derive(Clone, Debug, PartialEq, Routable)]
+    enum FixtureRoute {
+        #[route("/")]
+        Page {},
+    }
+    #[component]
+    fn Page() -> Element {
+        let snapshot = use_context::<a206_core::Snapshot>();
+        let state = crate::route::tests::loaded_state(snapshot.clone());
+        use_context_provider(|| state);
+        let provider = snapshot.settings.providers[0].id;
+        rsx! { ConnectionEditor { initial: snapshot.settings, provider, onclose: |_| {} } }
+    }
+    #[test]
+    fn account_edits_are_in_a_dialog_with_cancel_and_saved_value_recovery() {
+        use dioxus::history::{History, MemoryHistory};
+        use std::rc::Rc;
+        fn app() -> Element {
+            rsx! { Router::<FixtureRoute> {} }
+        }
+        let (settings, _) = fixture();
+        let mut snapshot = crate::empty_snapshot();
+        snapshot.settings = settings;
+        let mut dom = VirtualDom::new(app);
+        dom.provide_root_context(snapshot);
+        dom.provide_root_context(Rc::new(MemoryHistory::default()) as Rc<dyn History>);
+        dom.rebuild_in_place();
+        let html = dioxus_ssr::render(&dom);
+        let dialog = html
+            .split("<dialog")
+            .nth(1)
+            .unwrap()
+            .split("</dialog>")
+            .next()
+            .unwrap();
+        for control in [
+            "Edit connection",
+            "Close connection editor",
+            "Cancel",
+            "Reload saved values",
+            "Save changes",
+        ] {
+            assert!(dialog.contains(control));
+        }
+        assert!(!html.contains("<h3>Edit connection</h3>"));
+    }
     fn fixture() -> (Settings, ProviderConfig) {
         let account = ProviderConfig {
             id: Id::new_v4(),
