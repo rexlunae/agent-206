@@ -59,6 +59,17 @@ types (render and argument-conversion tests); native/TUI and live trigger-form
 interaction acceptance remain pending. Saved-credential, gateway-path and vault
 destination editors still need structured picker/row workflows.
 
+The sidebar has one Settings entry. The `/settings` page groups connections and
+services, agent modes and appearance, and security and setup. Existing settings
+addresses and command-palette entries remain available; child pages offer an
+All settings link, and the sidebar identifies Settings as their current section.
+Appearance still opens a modal over the settings page. Router/SSR tests cover the
+hub, child navigation and history, and preservation of palette destinations.
+Disposable browser checks verified keyboard navigation, Back/Forward and deep-link
+reloads, direct palette access, theme-dialog focus return and light/dark surfaces,
+and a single-column layout without horizontal overflow at 600px. Native desktop
+and TUI interaction acceptance for this navigation change remains pending.
+
 Appearance opens in a shared modal from the top bar, workspace shortcut and
 command palette without replacing the current conversation or split-view route.
 In-app requests for the legacy Appearance URL open the same overlay without
