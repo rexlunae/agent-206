@@ -50,6 +50,14 @@ implemented structure for finished agent execution or security parity.
 
 ## Current scope
 
+Workspace surfaces use palette tints in the top bar, sidebar, chat header and
+status bar. Selected navigation uses the design's own foreground/background pair,
+and the composer uses its theme surface with accent and focus-ring borders.
+Reading surfaces retain their neutral background. Browser checks verified loaded
+Helix, Ocean and Ember light/dark colors, Graphite, high contrast and forced colors,
+keyboard focus, draft retention and a 600px chat layout. Native desktop/TUI color
+interaction acceptance remains pending.
+
 Scheduling now has structured interval, daily/weekly calendar and time-zone
 controls. Disposable browser checks verified exact Sunday/time/zone and two-week
 interval persistence through the gateway, empty-week and fractional-interval
