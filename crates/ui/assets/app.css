@@ -63,7 +63,6 @@ body { max-inline-size: none; inline-size: 100%; padding: 0; background: var(--f
 .a206-compose-select[aria-expanded="true"], .a206-compose-select:hover:not([aria-disabled="true"]) { background: var(--fc-color-bg-muted); box-shadow: none; }
 .a206-mode-select { flex: none; }
 .a206-model-select { flex: 0 1 auto; }
-.a206-model-connect { white-space: nowrap; }
 .a206-context-widget { white-space: nowrap; color: var(--fc-color-text-muted); gap: var(--fc-space-1); font-variant-numeric: tabular-nums; }
 .a206-context-dot { inline-size: .5rem; block-size: .5rem; border: 1.5px solid currentColor; border-radius: 50%; opacity: .7; }
 .a206-compose-toolbar .a206-compose-send { inline-size: 1.875rem; padding: 0; border-radius: 50%; }
