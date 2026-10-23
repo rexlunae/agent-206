@@ -147,18 +147,6 @@ pub fn Downloads() -> Element {
     } }
 }
 #[component]
-pub fn Browser() -> Element {
-    let mut address = use_signal(String::new);
-    let mut source = use_signal(String::new);
-    rsx! { PageFrame { icon: IconName::Globe, kicker: "Workbench", title: "Browser preview", description: "Preview a development server in a sandboxed browser surface.",
-        div { class: "a206-row", div { class: "a206-grow", Field { label: rsx! { "Preview URL" }, Input { value: ReadSignal::from(address), oninput: move |v| address.set(v), r#type: InputType::Url, placeholder: "Enter your development server URL" } } }
-            Button { variant: ButtonVariant::Primary, onclick: move |_| source.set(address()), "Open preview" }
-        }
-        if !source().is_empty() { Webview { key: "{source}", class: "a206-browser", title: name!("Development browser"), src: source(), sandbox: "allow-scripts allow-forms" } }
-        Alert { title: rsx! { "Isolated preview" }, "This preview has no vault credentials. Browser automation and approved credential injection require the isolated browser broker, which is not enabled in this build." }
-    } }
-}
-#[component]
 pub fn Documents() -> Element {
     let state = use_context::<State>();
     let mut project = use_signal(String::new);

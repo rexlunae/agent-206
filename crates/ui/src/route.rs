@@ -8,8 +8,8 @@ use crate::{
     inbox::Inbox,
     messengers::Messengers,
     pages::{
-        Browser, Conversations, Documents, Downloads, Extensions, Joshua, Overview as Workspace,
-        Projects, Security,
+        Conversations, Documents, Downloads, Extensions, Joshua, Overview as Workspace, Projects,
+        Security,
     },
     running::Running,
     schedules::Schedules,
@@ -50,8 +50,6 @@ pub(crate) enum Route {
     Downloads {},
     #[route("/extensions")]
     Extensions {},
-    #[route("/browser")]
-    Browser {},
     #[route("/documents")]
     Documents {},
     #[route("/schedules")]
@@ -87,7 +85,6 @@ impl Route {
             Self::Messengers {} => IconName::Send,
             Self::Downloads {} => IconName::Download,
             Self::Extensions {} => IconName::Plus,
-            Self::Browser {} => IconName::Globe,
             Self::Documents {} => IconName::File,
             Self::Schedules {} => IconName::Clock,
             Self::Appearance {} => IconName::Settings,
@@ -111,7 +108,6 @@ impl Route {
             ],
             vec![
                 Self::Documents {},
-                Self::Browser {},
                 Self::Downloads {},
                 Self::Schedules {},
                 Self::Extensions {},
@@ -141,7 +137,6 @@ impl Route {
             Self::Messengers {} => "Messengers",
             Self::Downloads {} => "Downloads",
             Self::Extensions {} => "Extensions",
-            Self::Browser {} => "Browser",
             Self::Documents {} => "Documents & git",
             Self::Schedules {} => "Schedules",
             Self::Appearance {} => "Appearance",
@@ -351,6 +346,22 @@ pub(crate) mod tests {
         let html = dioxus_ssr::render(&dom);
         assert!(html.contains("Page not found."));
         assert!(html.contains("Return to workspace"));
+    }
+
+    #[test]
+    fn manual_browser_is_absent_and_its_old_address_offers_recovery() {
+        let (dom, _) = app_at("/");
+        let html = dioxus_ssr::render(&dom);
+        assert!(!html.contains("href=\"/browser\""));
+        let (dom, history) = app_at("/browser");
+        let html = dioxus_ssr::render(&dom);
+        assert_eq!(history.current_route(), "/browser");
+        assert!(matches!(
+            "/browser".parse::<Route>().unwrap(),
+            Route::NotFound { .. }
+        ));
+        assert!(html.contains("Page not found.") && html.contains("Return to workspace"));
+        assert!(!html.contains("<iframe") && !html.contains("Preview URL"));
     }
 
     #[derive(Clone)]

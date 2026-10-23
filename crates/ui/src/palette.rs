@@ -384,6 +384,7 @@ mod tests {
             );
         }
         assert!(opened.contains(&Route::Appearance {}));
+        assert!(!opened.iter().any(|route| route.to_string() == "/browser"));
         for t in &threads {
             assert!(titles(&entries).contains(&t.title.as_str()));
         }
