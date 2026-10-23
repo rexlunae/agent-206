@@ -231,13 +231,15 @@ fn CredentialRow(messenger: String, app: bool, current: Option<String>) -> Eleme
     };
     rsx! {
         p { class: "a206-muted", "{shown}" }
-        div { class: "a206-row",
-            Input { aria_label: label, value: ReadSignal::from(draft), oninput: move |v| draft.set(v), placeholder: "Credential name" }
+        Field { label: rsx! { "{label}" },
+          div { class: "a206-field-controls",
+            Input { value: ReadSignal::from(draft), oninput: move |v| draft.set(v), placeholder: "Credential name" }
             Button { size: ButtonSize::Sm, variant: ButtonVariant::Secondary, availability: if ready { Availability::Enabled } else { Availability::Disabled }, onclick: move |_| {
                 let value = Some(draft().trim().to_owned());
                 save_messenger(state, &messenger, |m| if app { m.app_credential = value } else { m.credential = value });
                 draft.set(String::new());
             }, if current.is_some() { "Change credential" } else { "Use credential" } }
+          }
         }
     }
 }
@@ -254,13 +256,15 @@ fn LoginRow(messenger: String, current: Option<String>) -> Element {
     };
     rsx! {
         p { class: "a206-muted", "{shown}" }
-        div { class: "a206-row",
-            Input { aria_label: "Login", value: ReadSignal::from(draft), oninput: move |v| draft.set(v), placeholder: "Nickname" }
+        Field { label: rsx! { "Login" },
+          div { class: "a206-field-controls",
+            Input { value: ReadSignal::from(draft), oninput: move |v| draft.set(v), placeholder: "Nickname" }
             Button { size: ButtonSize::Sm, variant: ButtonVariant::Secondary, availability: if ready { Availability::Enabled } else { Availability::Disabled }, onclick: move |_| {
                 let value = Some(draft().trim().to_owned());
                 save_messenger(state, &messenger, |m| m.login = value);
                 draft.set(String::new());
             }, if current.is_some() { "Change login" } else { "Use login" } }
+          }
         }
     }
 }
@@ -324,13 +328,15 @@ fn AllowList(
                 }
             }
         }
-        div { class: "a206-row",
-            Input { aria_label: if senders { "Sender id to allow" } else { "Chat id to allow" }, value: ReadSignal::from(draft), oninput: move |v| draft.set(v), placeholder: if senders { "Sender id" } else { "Chat id" } }
+        Field { label: rsx! { if senders { "Sender id to allow" } else { "Chat id to allow" } },
+          div { class: "a206-field-controls",
+            Input { value: ReadSignal::from(draft), oninput: move |v| draft.set(v), placeholder: if senders { "Sender id" } else { "Chat id" } }
             Button { size: ButtonSize::Sm, variant: ButtonVariant::Secondary, availability: if ready { Availability::Enabled } else { Availability::Disabled }, onclick: move |_| {
                 let value = draft().trim().to_owned();
                 edit_list(state, &messenger, senders, |list, kind| { list.insert(kind.fold(&value)); });
                 draft.set(String::new());
             }, if senders { "Allow sender" } else { "Allow chat" } }
+          }
         }
     }
 }

@@ -50,6 +50,13 @@ implemented structure for finished agent execution or security parity.
 
 ## Current scope
 
+Search and messenger inline actions share a control row inside their labelled
+field, so labels and help text do not affect the input/button alignment. Messenger
+reference, login and allow-list inputs have visible associated labels. Browser
+checks verified alignment at full width and 600px, wrapping without horizontal
+overflow at 420px, label focus, search keyboard submission and light/dark controls.
+Native desktop/TUI interaction acceptance for these rows remains pending.
+
 Scheduling now has structured interval, daily/weekly calendar and time-zone
 controls. Disposable browser checks verified exact Sunday/time/zone and two-week
 interval persistence through the gateway, empty-week and fractional-interval
