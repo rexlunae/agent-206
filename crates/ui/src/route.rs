@@ -14,6 +14,7 @@ use crate::{
     running::Running,
     schedules::Schedules,
     settings::{Appearance, Prompts, Providers},
+    settings_hub::Settings,
     welcome::Welcome,
 };
 use fc_dioxus::prelude::*;
@@ -56,6 +57,8 @@ pub(crate) enum Route {
     Documents {},
     #[route("/schedules")]
     Schedules {},
+    #[route("/settings")]
+    Settings {},
     #[route("/settings/appearance")]
     Appearance {},
     #[route("/settings/modes")]
@@ -90,7 +93,7 @@ impl Route {
             Self::Browser {} => IconName::Globe,
             Self::Documents {} => IconName::File,
             Self::Schedules {} => IconName::Clock,
-            Self::Appearance {} => IconName::Settings,
+            Self::Settings {} | Self::Appearance {} => IconName::Settings,
             Self::Prompts {} => IconName::Edit,
             Self::Security {} => IconName::Lock,
             Self::Imports {} => IconName::Download,
@@ -98,7 +101,7 @@ impl Route {
             Self::Welcome {} => IconName::Check,
         }
     }
-    /// The sidebar's page groups, also what the command palette can open.
+    /// The sidebar's page groups. Settings children stay in the page and palette.
     pub(crate) fn navigation() -> [Vec<Self>; 3] {
         [
             vec![
@@ -116,17 +119,26 @@ impl Route {
                 Self::Schedules {},
                 Self::Extensions {},
             ],
-            vec![
-                Self::Welcome {},
-                Self::Gateway {},
-                Self::Providers {},
-                Self::Messengers {},
-                Self::Joshua {},
-                Self::Prompts {},
-                Self::Security {},
-                Self::Imports {},
-            ],
+            vec![Self::Settings {}],
         ]
+    }
+    /// Keep individual settings pages discoverable without crowding the sidebar.
+    pub(crate) fn pages() -> impl Iterator<Item = Self> {
+        Self::navigation().into_iter().flatten().chain(
+            crate::settings_hub::sections()
+                .into_iter()
+                .flat_map(|section| section.items)
+                .map(|item| item.route)
+                // Appearance is a palette action that opens the shell dialog.
+                .filter(|route| *route != Self::Appearance {}),
+        )
+    }
+    pub(crate) fn is_settings(&self) -> bool {
+        *self == Self::Settings {}
+            || crate::settings_hub::sections()
+                .into_iter()
+                .flat_map(|section| section.items)
+                .any(|item| item.route == *self)
     }
     pub(crate) fn label(&self) -> &'static str {
         match self {
@@ -144,6 +156,7 @@ impl Route {
             Self::Browser {} => "Browser",
             Self::Documents {} => "Documents & git",
             Self::Schedules {} => "Schedules",
+            Self::Settings {} => "Settings",
             Self::Appearance {} => "Appearance",
             Self::Prompts {} => "Agent modes",
             Self::Security {} => "Security",
@@ -315,7 +328,8 @@ pub(crate) mod tests {
         let (mut dom, history) = app_at("/connections");
         let initial = dioxus_ssr::render(&dom);
         assert!(initial.contains("<h1>Connections</h1>"));
-        assert!(initial.contains("href=\"/connections\" aria-current=\"page\""));
+        assert!(initial.contains("All settings"));
+        assert!(initial.contains("href=\"/settings\" aria-current=\"true\""));
         let router = dom.in_scope(ScopeId::ROOT, || dioxus::router::root_router().unwrap());
         dom.in_scope(ScopeId::ROOT, || {
             router.push(Route::Projects {});
@@ -341,6 +355,70 @@ pub(crate) mod tests {
         assert!(!html.contains("<h1>Appearance</h1>"));
         assert!(history.can_go_back());
         assert!(!history.can_go_forward());
+    }
+
+    #[test]
+    fn settings_hub_replaces_sidebar_controls_and_preserves_child_history() {
+        let (mut dom, history) = app_at("/settings");
+        let html = dioxus_ssr::render(&dom);
+        assert!(html.contains("<h1>Settings</h1>"));
+        for title in [
+            "Connections & services",
+            "Agents & appearance",
+            "Security & setup",
+        ] {
+            assert!(
+                html.replace("&amp;", "&")
+                    .replace("&#38;", "&")
+                    .contains(title),
+                "missing section {title}"
+            );
+        }
+        assert!(!html.contains("Control center"));
+        // The main page offers all settings, but only the hub is in the sidebar.
+        let sidebar = html
+            .split("aria-label=\"Workspace navigation\"")
+            .nth(1)
+            .unwrap()
+            .split("</nav>")
+            .next()
+            .unwrap();
+        assert_eq!(sidebar.matches("href=\"/settings\"").count(), 1);
+        for path in [
+            "/connections",
+            "/messengers",
+            "/joshua",
+            "/gateway",
+            "/settings/modes",
+            "/settings/security",
+            "/settings/import",
+            "/welcome",
+        ] {
+            assert!(
+                html.contains(&format!("href=\"{path}\"")),
+                "missing hub link {path}"
+            );
+            assert!(
+                !sidebar.contains(&format!("href=\"{path}\"")),
+                "sidebar still contains {path}"
+            );
+            assert!(path.parse::<Route>().unwrap().is_settings());
+        }
+        assert!(!html.contains("href=\"/settings/appearance\""));
+        assert!(html.contains("aria-haspopup=\"dialog\""));
+        let router = dom.in_scope(ScopeId::ROOT, || dioxus::router::root_router().unwrap());
+        dom.in_scope(ScopeId::ROOT, || {
+            router.push(Route::Prompts {});
+        });
+        dom.render_immediate(&mut dioxus::core::NoOpMutations);
+        let child = dioxus_ssr::render(&dom);
+        assert!(child.contains("<h1>Agent modes</h1>") && child.contains("All settings"));
+        assert!(child.contains("href=\"/settings\" aria-current=\"true\""));
+        dom.in_scope(ScopeId::ROOT, || router.go_back());
+        dom.render_immediate(&mut dioxus::core::NoOpMutations);
+        assert_eq!(history.current_route(), "/settings");
+        assert!(dioxus_ssr::render(&dom).contains("<h1>Settings</h1>"));
+        assert!(!Route::Projects {}.is_settings());
     }
 
     #[test]

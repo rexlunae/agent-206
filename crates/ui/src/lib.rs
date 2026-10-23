@@ -24,6 +24,7 @@ mod schedules;
 mod search;
 mod search_services;
 mod settings;
+mod settings_hub;
 mod skills;
 mod slash;
 mod subagents;
@@ -827,10 +828,11 @@ fn Sidebar() -> Element {
             }
         }
         div { class: "a206-sidebar-footer a206-nav-group",
-            NavHeading { "Control center" }
-            for item in control {
-                LinkButton { size: ButtonSize::Sm, variant: ButtonVariant::Ghost, class: if route == item { "a206-nav-active" } else { "" }, href: item.to_string(), Icon { name: item.icon(), size: IconSize::Sm } "{item.label()}" }
-            }
+            NavList { for item in control {
+                NavLink { label: item.label(), href: item.to_string(), icon: rsx! { Icon { name: item.icon(), size: IconSize::Sm } },
+                    current: if route == item { NavCurrent::Page } else if route.is_settings() { NavCurrent::Section } else { NavCurrent::No }
+                }
+            } }
         }
     } }
 }
@@ -842,7 +844,15 @@ pub(crate) fn PageFrame(
     description: String,
     children: Element,
 ) -> Element {
+    let route = use_route::<Route>();
     rsx! { section { class: "a206-page", div { class: "a206-page-inner",
+        if route.is_settings() && route != (Route::Settings {}) {
+            nav { aria_label: "Settings navigation",
+                LinkButton { size: ButtonSize::Sm, variant: ButtonVariant::Ghost, href: Route::Settings {}.to_string(),
+                    Icon { name: IconName::ArrowStart, size: IconSize::Sm } "All settings"
+                }
+            }
+        }
         header {
             p { class: "a206-eyebrow", "{kicker}" }
             div { class: "a206-page-heading", PageIcon { name: icon } h1 { "{title}" } }

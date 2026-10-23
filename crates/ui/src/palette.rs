@@ -133,10 +133,7 @@ pub(crate) fn entries(snapshot: &Snapshot, route: &Route, can_create: bool) -> V
         )
         .detail("Find text in any conversation"),
     );
-    let pages = Route::navigation()
-        .into_iter()
-        .flatten()
-        .filter(|page| page != route);
+    let pages = Route::pages().filter(|page| page != route);
     entries.extend(pages.map(|page| {
         Entry::new(
             page.label(),
@@ -383,7 +380,16 @@ mod tests {
                 _ => None,
             })
             .collect();
-        for page in Route::navigation().into_iter().flatten() {
+        for page in Route::navigation().into_iter().flatten().chain([
+            Route::Providers {},
+            Route::Messengers {},
+            Route::Joshua {},
+            Route::Gateway {},
+            Route::Prompts {},
+            Route::Security {},
+            Route::Imports {},
+            Route::Welcome {},
+        ]) {
             assert_eq!(
                 opened.contains(&page),
                 page != Route::Activity {},
