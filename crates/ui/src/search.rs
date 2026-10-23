@@ -50,18 +50,18 @@ pub(crate) fn MessageSearch() -> Element {
     };
     let searching = found() == Found::Searching;
     rsx! {
-        div { class: "a206-row", onkeydown: move |event: KeyboardEvent| {
+        Field { label: rsx! { "Search message text" }, hint: rsx! { "Finds messages containing every word, in any conversation." },
+            div { class: "a206-field-controls", onkeydown: move |event: KeyboardEvent| {
                 if event.key() == Key::Enter && !event.is_composing() {
                     event.prevent_default();
                     run();
                 }
             },
-            Field { label: rsx! { "Search message text" }, hint: rsx! { "Finds messages containing every word, in any conversation." },
                 Input { value: ReadSignal::from(query), oninput: move |value| query.set(value), placeholder: "Words to find" }
+                Button { variant: ButtonVariant::Secondary, busy: searching,
+                    availability: if query().trim().is_empty() { Availability::Disabled } else { Availability::Enabled },
+                    onclick: move |_| run(), "Search" }
             }
-            Button { variant: ButtonVariant::Secondary, busy: searching,
-                availability: if query().trim().is_empty() { Availability::Disabled } else { Availability::Enabled },
-                onclick: move |_| run(), "Search" }
         }
         match found() {
             Found::Idle | Found::Searching => rsx! {},

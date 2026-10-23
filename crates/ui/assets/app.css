@@ -27,6 +27,10 @@ body { max-inline-size: none; inline-size: 100%; padding: 0; background: var(--f
 .a206-icon-label { display: inline-flex; align-items: center; gap: var(--fc-space-2); }
 .a206-muted { color: var(--fc-content-muted, var(--fc-color-text-muted)); }
 .a206-row { display: flex; gap: var(--fc-space-3); align-items: center; flex-wrap: wrap; }
+/* Only controls share this row. Labels/hints stay above it and errors below it. */
+.a206-field-controls { display: flex; gap: var(--fc-space-3); align-items: center; flex-wrap: wrap; }
+.a206-field-controls > .fc-input { flex: 1 1 14rem; inline-size: auto; min-inline-size: 0; }
+.a206-field-controls > .fc-btn { flex: none; }
 .a206-between { justify-content: space-between; }
 .a206-stack { display: flex; flex-direction: column; gap: var(--fc-space-4); }
 .a206-plan { display: flex; flex-direction: column; gap: var(--fc-space-2); }
