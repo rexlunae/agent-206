@@ -6,6 +6,15 @@ journaled and run like a message the user typed, under the conversation's grants
 mode, models, tool permissions and budget as they are when it fires. Narrowing any
 of those applies to the next run; a job never carries authority of its own.
 
+The Schedules form offers date/time controls for a one-time message, an amount
+and unit for fixed intervals, and daily or weekly wall-clock repeats with weekday
+checkboxes. Choose a time zone from the local IANA database; type a region or city
+in the open list to jump to it. Daily and weekly choices generate ordinary cron
+schedules, with the same gateway validation and daylight-saving behavior.
+Custom cron remains an advanced option. Trigger parameters use Yes/No/unset
+choices for booleans and number fields for numbers; list/table parameters still
+require the CLI and are explicitly identified as unsupported in the form.
+
 ## Heartbeat checks
 
 A job with `kind: Heartbeat` is RustyClaw's heartbeat, run by the same
