@@ -59,6 +59,19 @@ types (render and argument-conversion tests); native/TUI and live trigger-form
 interaction acceptance remain pending. Saved-credential, gateway-path and vault
 destination editors still need structured picker/row workflows.
 
+Appearance opens in a shared modal from the top bar, workspace shortcut and
+command palette without replacing the current conversation or split-view route.
+In-app requests for the legacy Appearance URL open the same overlay without
+adding or replacing a history entry; a direct bookmark opens it over Workspace.
+Closing only dismisses the overlay, and content navigation dismisses it too.
+Connection editing uses the
+same modal component, retaining revision checks and keeping pending saves alive.
+Browser checks verified native modal opening, draft/URL preservation, close and
+Escape focus return, theme persistence, narrow layout and loaded light/dark
+surfaces, connection cancel/save, and disabled theme editing while settings are
+unloaded or disconnected. Native desktop/TUI interaction acceptance remains
+pending; terminal modal/focus limitations are still tracked upstream.
+
 Gateway work targets the desktop and TUI clients first. Like RustyClaw, remote
 gateways are reached by SSH process transport; the wire format is Agent 206's own
 versioned MessagePack protocol, not RustyClaw's codec (see docs/upstream.md). The

@@ -336,7 +336,9 @@ pub(crate) mod tests {
             router.push(Route::Appearance {});
         });
         dom.render_immediate(&mut dioxus::core::NoOpMutations);
-        assert!(dioxus_ssr::render(&dom).contains("<h1>Appearance</h1>"));
+        let html = dioxus_ssr::render(&dom);
+        assert!(html.contains("<dialog") && html.contains("Close appearance"));
+        assert!(!html.contains("<h1>Appearance</h1>"));
         assert!(history.can_go_back());
         assert!(!history.can_go_forward());
     }
@@ -380,6 +382,7 @@ pub(crate) mod tests {
             error: use_signal(|| None),
             outage: use_signal(|| None),
             theme: use_signal(|| ThemeChoice::from_design(Design::Helix)),
+            appearance: use_signal(|| false),
             setup: use_signal(|| true),
             navigator: navigator(),
         };
@@ -430,6 +433,7 @@ pub(crate) mod tests {
             error: use_signal(|| None),
             outage: use_signal(|| None),
             theme: use_signal(|| ThemeChoice::from_design(Design::Helix)),
+            appearance: use_signal(|| false),
             setup: use_signal(|| false),
             navigator: navigator(),
         }

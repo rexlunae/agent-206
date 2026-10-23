@@ -78,16 +78,381 @@ pub fn Providers() -> Element {
 }
 #[component]
 pub fn Appearance() -> Element {
+    let state = use_context::<State>();
+    // Compatibility for a pre-existing legacy browser history entry. New
+    // in-app navigation is intercepted before it creates such an entry.
+    rsx! { AppearanceDialog { open: true, onclose: move |_| { state.navigator.replace(crate::route::Route::Workspace {}); } } }
+}
+#[component]
+pub(crate) fn AppearanceDialog(open: bool, onclose: EventHandler<()>) -> Element {
     let mut state = use_context::<State>();
-    rsx! { PageFrame { icon: IconName::Settings, kicker: "Settings", title: "Appearance", description: "Choose a theme, palette, color scheme and contrast.",
+    let ready = (state.loaded)() && (state.connected)();
+    rsx! { Dialog { open, onclose, title: rsx! { "Appearance" }, size: DialogSize::Lg, scrollable: true,
+        close_label: name!("Close appearance"),
+        description: rsx! { "Choose a theme, palette, color scheme and contrast. Changes are saved as you choose." },
+        footer: rsx! { Button { variant: ButtonVariant::Primary, onclick: move |_| onclose.call(()), "Done" } },
+        if let Some(report) = state.error.read().clone() {
+            crate::error::ErrorNotice { report, title: "Could not complete request".to_string(), dismiss: move |_| state.error.set(None) }
+        }
+        if !ready { p { role: "status", "Connect to the gateway and wait for settings to load before changing appearance." } }
+        fieldset { disabled: !ready, aria_label: "Theme settings",
         ThemePicker { value: ReadSignal::from(state.theme), onchange: move |choice: ThemeChoice| {
+            // A disabled fieldset handles normal input; also check at activation
+            // so a stale event cannot save settings from an unloaded snapshot.
+            if !*state.loaded.peek() || !*state.connected.peek() { return; }
             state.theme.set(choice);
             let mut settings = state.data.read().settings.clone();
             settings.theme_design = choice.design.as_str().into(); settings.theme_palette = Some(choice.palette.as_str().into());
             settings.theme_scheme = choice.scheme.as_str().into(); settings.theme_contrast = choice.contrast.as_str().into();
             dispatch(state, Command::SaveSettings(Box::new(settings)));
-        } }
+        } } }
     } }
+}
+
+#[cfg(test)]
+mod appearance_tests {
+    use super::*;
+    use dioxus::history::{History, MemoryHistory};
+    use std::{cell::RefCell, rc::Rc, sync::Arc};
+
+    /// Host-driven traversal callbacks, with optional unknown Back/Forward
+    /// availability matching WebHistory, without a browser or clock.
+    struct FixtureHistory {
+        inner: MemoryHistory,
+        unknown_back: bool,
+        updater: RefCell<Option<Arc<dyn Fn() + Send + Sync>>>,
+    }
+    impl FixtureHistory {
+        fn notify(&self) {
+            if let Some(callback) = self.updater.borrow().clone() {
+                callback();
+            }
+        }
+    }
+    impl History for FixtureHistory {
+        fn current_route(&self) -> String {
+            self.inner.current_route()
+        }
+        fn can_go_back(&self) -> bool {
+            self.unknown_back || self.inner.can_go_back()
+        }
+        fn can_go_forward(&self) -> bool {
+            self.unknown_back || self.inner.can_go_forward()
+        }
+        fn go_back(&self) {
+            self.inner.go_back();
+            self.notify();
+        }
+        fn go_forward(&self) {
+            self.inner.go_forward();
+            self.notify();
+        }
+        fn push(&self, route: String) {
+            self.inner.push(route);
+        }
+        fn replace(&self, route: String) {
+            self.inner.replace(route);
+        }
+        fn updater(&self, callback: Arc<dyn Fn() + Send + Sync>) {
+            *self.updater.borrow_mut() = Some(callback);
+        }
+    }
+
+    #[derive(Clone, Debug, PartialEq, Routable)]
+    enum FixtureRoute {
+        #[layout(FixtureShell)]
+        #[route("/")]
+        Page {},
+        #[route("/projects")]
+        Projects {},
+        #[route("/conversations/:id?:split&:message")]
+        Content {
+            id: uuid::Uuid,
+            split: Option<crate::route::Columns>,
+            message: Option<uuid::Uuid>,
+        },
+        #[route("/settings/appearance")]
+        LegacyAppearance {},
+    }
+    #[component]
+    fn Content(
+        id: uuid::Uuid,
+        split: Option<crate::route::Columns>,
+        message: Option<uuid::Uuid>,
+    ) -> Element {
+        rsx! { p { "Conversation {id}: {split:?} {message:?}" } }
+    }
+    #[component]
+    fn Projects() -> Element {
+        rsx! { p { "Projects" } }
+    }
+    #[component]
+    fn Page() -> Element {
+        rsx! { p { "Background workspace retained" } }
+    }
+    #[component]
+    fn FixtureShell() -> Element {
+        let captured = use_context::<Rc<RefCell<Option<State>>>>();
+        let mut state = crate::route::tests::loaded_state(crate::empty_snapshot());
+        state.appearance = use_context::<crate::appearance_navigation::Open>().0;
+        *captured.borrow_mut() = Some(state);
+        use_context_provider(|| state);
+        let _route = use_route::<FixtureRoute>();
+        crate::appearance_navigation::use_dismiss_on_host_navigation();
+        rsx! {
+            Outlet::<FixtureRoute> {}
+            AppearanceDialog { open: (state.appearance)(), onclose: move |_| { let mut open = state.appearance; open.set(false); } }
+        }
+    }
+    #[component]
+    fn LegacyAppearance() -> Element {
+        rsx! { Appearance {} }
+    }
+
+    fn settle(dom: &mut VirtualDom) {
+        // Commit the route render, then its navigation-dismissal effect.
+        dom.render_immediate(&mut dioxus::core::NoOpMutations);
+        dom.render_immediate(&mut dioxus::core::NoOpMutations);
+    }
+
+    fn fixture(path: &str, unknown_back: bool) -> (VirtualDom, Rc<FixtureHistory>, State) {
+        fn app() -> Element {
+            crate::appearance_navigation::use_navigation();
+            rsx! { Router::<FixtureRoute> {} }
+        }
+        let captured = Rc::new(RefCell::new(None::<State>));
+        let history = Rc::new(FixtureHistory {
+            inner: MemoryHistory::with_initial_path(path),
+            unknown_back,
+            updater: RefCell::new(None),
+        });
+        let mut dom = VirtualDom::new(app);
+        dom.provide_root_context(captured.clone());
+        dom.provide_root_context(history.clone() as Rc<dyn History>);
+        dom.rebuild_in_place();
+        settle(&mut dom);
+        let state = captured.borrow().unwrap();
+        (dom, history, state)
+    }
+
+    #[test]
+    fn legacy_appearance_opens_over_the_exact_content_route_or_workspace() {
+        for (has_previous, unknown_back) in
+            [(true, false), (false, false), (true, true), (false, true)]
+        {
+            let previous = crate::route::Route::Chat {
+                id: uuid::Uuid::new_v4(),
+                split: crate::route::Columns::of([uuid::Uuid::new_v4()]),
+                message: Some(uuid::Uuid::new_v4()),
+            }
+            .to_string();
+            let initial = if has_previous {
+                previous.as_str()
+            } else {
+                "/settings/appearance"
+            };
+            let (mut dom, history, mut state) = fixture(initial, unknown_back);
+            if has_previous {
+                dom.in_scope(ScopeId::ROOT, || {
+                    state.navigator.push(FixtureRoute::LegacyAppearance {})
+                });
+                settle(&mut dom);
+            }
+            assert_eq!(
+                history.current_route(),
+                if has_previous { previous.as_str() } else { "/" }
+            );
+            assert!((state.appearance)());
+            assert!(!history.inner.can_go_forward());
+            assert!(!history.inner.can_go_back());
+            dom.in_scope(ScopeId::ROOT, || state.appearance.set(false));
+            settle(&mut dom);
+            assert_eq!(
+                history.current_route(),
+                if has_previous { previous.as_str() } else { "/" }
+            );
+            assert!(!(state.appearance)());
+        }
+    }
+
+    #[test]
+    fn appearance_does_not_add_a_stop_to_multi_page_history() {
+        for close_before_back in [false, true] {
+            let (mut dom, history, mut state) = fixture("/projects", true);
+            let chat = FixtureRoute::Content {
+                id: uuid::Uuid::new_v4(),
+                split: None,
+                message: None,
+            };
+            dom.in_scope(ScopeId::ROOT, || state.navigator.push(chat.clone()));
+            settle(&mut dom);
+            dom.in_scope(ScopeId::ROOT, || {
+                state.navigator.push(FixtureRoute::LegacyAppearance {})
+            });
+            settle(&mut dom);
+            if close_before_back {
+                dom.in_scope(ScopeId::ROOT, || state.appearance.set(false));
+                settle(&mut dom);
+            }
+            dom.in_scope(ScopeId::ROOT, || state.navigator.go_back());
+            settle(&mut dom);
+            assert_eq!(history.current_route(), "/projects");
+            assert!(!(state.appearance)());
+            dom.in_scope(ScopeId::ROOT, || state.navigator.go_forward());
+            settle(&mut dom);
+            assert_eq!(history.current_route(), chat.to_string());
+            assert!(!(state.appearance)());
+        }
+    }
+    #[test]
+    fn legacy_modal_requests_preserve_forward_history_for_push_and_replace() {
+        for replace in [false, true] {
+            let (mut dom, history, mut state) = fixture("/projects", true);
+            let chat = FixtureRoute::Content {
+                id: uuid::Uuid::new_v4(),
+                split: None,
+                message: None,
+            };
+            dom.in_scope(ScopeId::ROOT, || state.navigator.push(chat.clone()));
+            settle(&mut dom);
+            dom.in_scope(ScopeId::ROOT, || state.navigator.go_back());
+            settle(&mut dom);
+            dom.in_scope(ScopeId::ROOT, || {
+                if replace {
+                    state.navigator.replace(FixtureRoute::LegacyAppearance {})
+                } else {
+                    state.navigator.push(FixtureRoute::LegacyAppearance {})
+                }
+            });
+            settle(&mut dom);
+            assert_eq!(history.current_route(), "/projects");
+            assert!((state.appearance)());
+            assert!(!history.inner.can_go_back());
+            assert!(history.inner.can_go_forward());
+            dom.in_scope(ScopeId::ROOT, || state.appearance.set(false));
+            dom.in_scope(ScopeId::ROOT, || state.navigator.go_forward());
+            settle(&mut dom);
+            assert_eq!(history.current_route(), chat.to_string());
+            assert!(!(state.appearance)());
+        }
+    }
+    #[test]
+    fn appearance_requested_in_the_same_callback_as_navigation_stays_open() {
+        let (mut dom, history, state) = fixture("/projects", true);
+        let chat = FixtureRoute::Content {
+            id: uuid::Uuid::new_v4(),
+            split: None,
+            message: None,
+        };
+        dom.in_scope(ScopeId::ROOT, || {
+            state.navigator.push(chat.clone());
+            state.navigator.push(FixtureRoute::LegacyAppearance {});
+        });
+        settle(&mut dom);
+        assert_eq!(history.current_route(), chat.to_string());
+        assert!((state.appearance)());
+    }
+    #[test]
+    fn host_history_navigation_dismisses_the_open_overlay() {
+        let (mut dom, history, state) = fixture("/projects", true);
+        let chat = FixtureRoute::Content {
+            id: uuid::Uuid::new_v4(),
+            split: None,
+            message: None,
+        };
+        dom.in_scope(ScopeId::ROOT, || state.navigator.push(chat.clone()));
+        settle(&mut dom);
+        dom.in_scope(ScopeId::ROOT, || {
+            state.navigator.push(FixtureRoute::LegacyAppearance {})
+        });
+        settle(&mut dom);
+        assert!((state.appearance)());
+        // Simulate a renderer-originated traversal and callback, bypassing Navigator.
+        history.go_back();
+        settle(&mut dom);
+        assert_eq!(history.current_route(), "/projects");
+        assert!(!(state.appearance)());
+        history.go_forward();
+        settle(&mut dom);
+        assert_eq!(history.current_route(), chat.to_string());
+        assert!(!(state.appearance)());
+    }
+    #[test]
+    fn revisiting_an_initial_appearance_bookmark_cannot_reopen_a_history_trap() {
+        for unknown_back in [false, true] {
+            let (mut dom, history, mut state) = fixture("/settings/appearance", unknown_back);
+            assert!((state.appearance)());
+            dom.in_scope(ScopeId::ROOT, || {
+                state.appearance.set(false);
+                state.navigator.push(FixtureRoute::Projects {});
+            });
+            settle(&mut dom);
+            assert_eq!(history.current_route(), "/projects");
+            dom.in_scope(ScopeId::ROOT, || state.navigator.go_back());
+            settle(&mut dom);
+            assert_eq!(history.current_route(), "/");
+            assert!(!(state.appearance)());
+            // The original bookmark was replaced, so Forward/Back cannot bring
+            // back a dialog with unknown Back availability.
+            dom.in_scope(ScopeId::ROOT, || state.navigator.go_forward());
+            settle(&mut dom);
+            dom.in_scope(ScopeId::ROOT, || state.navigator.go_back());
+            settle(&mut dom);
+            assert_eq!(history.current_route(), "/");
+            assert!(!(state.appearance)());
+        }
+    }
+    #[test]
+    fn appearance_action_preserves_route_and_keeps_errors_inside_the_dialog() {
+        fn app() -> Element {
+            crate::appearance_navigation::use_navigation();
+            rsx! { Router::<FixtureRoute> {} }
+        }
+        let captured = Rc::new(RefCell::new(None::<State>));
+        let history = Rc::new(MemoryHistory::default());
+        let mut dom = VirtualDom::new(app);
+        dom.provide_root_context(captured.clone());
+        dom.provide_root_context(history.clone() as Rc<dyn History>);
+        dom.rebuild_in_place();
+        let mut state = captured.borrow().unwrap();
+        let previous = (state.theme)();
+        dom.in_scope(ScopeId::ROOT, || {
+            crate::palette::run(state, crate::palette::Action::Appearance);
+            state.error.set(Some(a206_core::ErrorReport::new(
+                a206_core::ErrorKind::Unavailable,
+                "Fixture save failure",
+            )));
+        });
+        dom.render_immediate(&mut dioxus::core::NoOpMutations);
+        assert!((state.appearance)());
+        assert_eq!(history.current_route(), "/");
+        let html = dioxus_ssr::render(&dom);
+        let dialog = html
+            .split("<dialog")
+            .nth(1)
+            .unwrap()
+            .split("</dialog>")
+            .next()
+            .unwrap();
+        assert!(dialog.contains("Fixture save failure") && dialog.contains("Close appearance"));
+        assert!(
+            html.contains("Background workspace retained") && !html.contains("<h1>Appearance</h1>")
+        );
+        dom.in_scope(ScopeId::ROOT, || state.appearance.set(false));
+        assert_eq!((state.theme)(), previous);
+        assert_eq!(history.current_route(), "/");
+        for (loaded, connected) in [(false, true), (true, false)] {
+            dom.in_scope(ScopeId::ROOT, || {
+                state.loaded.set(loaded);
+                state.connected.set(connected);
+            });
+            dom.render_immediate(&mut dioxus::core::NoOpMutations);
+            let html = dioxus_ssr::render(&dom);
+            assert!(
+                html.contains("<fieldset disabled") && html.contains("wait for settings to load")
+            );
+        }
+    }
 }
 #[component]
 pub fn Prompts() -> Element {
