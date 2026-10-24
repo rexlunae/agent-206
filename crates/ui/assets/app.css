@@ -85,8 +85,6 @@ body { max-inline-size: none; inline-size: 100%; padding: 0; background: var(--f
 .a206-tool-output { margin: 0; max-block-size: 16rem; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; padding: var(--fc-space-2); border: 1px solid var(--fc-color-border-subtle); border-radius: var(--fc-radius-md, .375rem); background: var(--fc-color-bg-muted); font-family: var(--fc-font-family-mono, monospace); font-size: .8rem; }
 .a206-grow { flex: 1; }
 .a206-gateway-copy { color: var(--fc-theme-feature-fg, var(--fc-color-text-default)); }
-.a206-browser { min-block-size: 55vh; }
-.a206-browser iframe { min-block-size: 55vh; }
 .a206-kicker { border-inline-start: 2px solid var(--fc-color-accent-text); padding-inline-start: var(--fc-space-3); }
 
 .a206-pane-title { padding: var(--fc-space-2) var(--fc-space-4); flex: none; border-block-end: 1px solid var(--fc-color-border-subtle); font-size: .75rem; background: var(--fc-color-accent-bg-subtle); }

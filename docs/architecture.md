@@ -280,10 +280,16 @@ resizable panes. The desktop is the primary entry point. Concurrent conversation
 can share a split view. Projects have a coordinator; threads own mode/model policy.
 
 The shared tree uses fc-dioxus cards, buttons, fields, selects, composer, chat,
-messages, status, metrics, progress, transfers, splitters, alerts, browser chrome
+messages, status, metrics, progress, transfers, splitters, alerts
 and ThemePicker. Product CSS controls composition using future-css tokens; the
 component library owns component appearance and interaction. The new vector mark
 is in `crates/ui/assets/agent206.svg`.
+
+Interactive browsing belongs to agents through gateway-enforced tools and an
+isolated browser profile/driver, not a manual browser page in the workbench.
+That broker is still planned. The existing `agent206.web` fetch/read tools provide
+public HTTPS access under network policy; they do not implement interactive
+automation. Users review agent activity and approvals through conversations.
 
 The toolkit pin builds on stable Rust. The environment's default nightly rejects
 an upstream raw-identifier format capture; the stable toolchain avoids needing a
@@ -315,7 +321,7 @@ handler runs, so the one-use link is never claimed from an origin that cannot
 hold the bearer. Application-owned requests carry the bearer in
 an explicit Authorization header and require the exact Host, Origin and binary
 content type. The application issues no session cookie: cookies ignore ports and
-could otherwise be sent to a local development server inside the preview browser.
+could otherwise be sent to an unrelated local development server.
 App chrome cannot be framed. This is a single-user loopback bridge, not a public
 hosting/authentication system.
 
