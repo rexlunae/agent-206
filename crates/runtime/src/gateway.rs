@@ -19,6 +19,7 @@ mod compaction;
 mod mcp_servers;
 mod memory_flush;
 mod run;
+pub(crate) use run::current_capabilities;
 /// Snapshot bytes a user message needs beyond its text and attachments.
 const MESSAGE_OVERHEAD: usize = 4096;
 mod messengers;

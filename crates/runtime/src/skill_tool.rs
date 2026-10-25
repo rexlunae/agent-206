@@ -267,6 +267,13 @@ impl SkillToolHost {
         let store = self.store.lock().map_err(|_| SkillToolError::Poisoned)?;
         Ok(project_scope(&store, scope.thread, &scope.capabilities))
     }
+    fn current(&self, thread: Id) -> crate::extension_host::CurrentCeiling {
+        let store = self.store.clone();
+        crate::extension_host::CurrentCeiling::new(move || {
+            let store = store.lock().ok()?;
+            crate::gateway::current_capabilities(&store, thread)
+        })
+    }
     fn sources(&self, scope: &ToolScope) -> Result<Sources, SkillToolError> {
         let store = self.store.lock().map_err(|_| SkillToolError::Poisoned)?;
         let project = project_scope(&store, scope.thread, &scope.capabilities);
@@ -370,7 +377,10 @@ impl ToolHost for SkillToolHost {
                     Scope {
                         workspace: None,
                         ceiling: Some(scope.capabilities.clone()),
-                        current: None,
+                        // Project skills are read under the conversation's
+                        // grant as it stands at each read, not as it was
+                        // when the call began.
+                        current: Some(self.current(scope.thread)),
                         project_skills,
                     },
                 )

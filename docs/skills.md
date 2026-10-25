@@ -60,7 +60,8 @@ nothing. Supporting text files are audited too, with relative paths and line
 numbers; binary or NUL-containing files are explicitly flagged as uninspected.
 The review includes each file's path, size and text where readable, without
 executing any content. Installing or editing a skill changes files only, so the page's
-**Refresh** re-reads the folder.
+**Refresh** re-reads the folders, including those of projects that list no skills
+yet, so a project's first skill appears without reopening the page.
 
 Bounds: 256 skill folders, 256 KiB per `SKILL.md`, 1 MiB per supporting file,
 128 entries per package, 16 directory levels and 2 MiB total. Symlinks, special
@@ -108,7 +109,9 @@ skills, so nothing in the folder reaches a model until the user reviews it.
 A conversation is offered a project's approved, unchanged skills only when it
 belongs to that project and its effective grant (its grant within its mode's
 ceiling and every ancestor's) includes `ReadWorkspace`, the same condition as
-for the project's instruction files. The project folder is read for a
+for the project's instruction files. That condition is checked again at every
+read, so revoking the grant while a call runs withdraws the project's skills at
+its next read. The project folder is read for a
 conversation only once the user has approved at least one of its skills; from
 then on, a folder that cannot be read (for example because it was replaced by
 a link) makes the skill tools report that failure rather than leave the

@@ -1209,3 +1209,58 @@ async fn starting_keeps_proposed_packages_but_prunes_unrecorded_ones() {
         Err(ExtensionError::NotInstalled(_))
     ));
 }
+
+#[tokio::test]
+async fn project_skills_follow_the_conversations_current_grant() {
+    let (_dir, store) = store();
+    let project = tempfile::tempdir().unwrap();
+    let project_id = uuid::Uuid::new_v4();
+    let write = |root: PathBuf| {
+        std::fs::create_dir_all(&root).unwrap();
+        let body = uuid::Uuid::new_v4().to_string();
+        let source = format!("---\nname: notes\ndescription: Instructions\n---\n{body}");
+        std::fs::write(root.join("SKILL.md"), &source).unwrap();
+        (body, a206_skills::parse(&source, "notes").unwrap().digest)
+    };
+    let (profile_body, profile_digest) = write(store.lock().unwrap().root.join("skills/notes"));
+    let (project_body, project_digest) = write(project.path().join(".agent206/skills/notes"));
+    {
+        let settings = &mut store.lock().unwrap().state.settings;
+        settings
+            .enabled_skills
+            .insert("notes".into(), profile_digest);
+        settings
+            .enabled_project_skills
+            .entry(project_id)
+            .or_default()
+            .insert("notes".into(), project_digest);
+    }
+    let mut host = calls_for(crate::skill_tool::EXTENSION, &store, None, &[]);
+    host.project_skills = Some(crate::skill_tool::ProjectSkills {
+        project: project_id,
+        root: project.path().into(),
+    });
+    let ceiling = Arc::new(Mutex::new(Some(BTreeSet::from([
+        Capability::ReadWorkspace,
+    ]))));
+    let read_ceiling = Arc::clone(&ceiling);
+    host.current = Some(CurrentCeiling::new(move || {
+        read_ceiling.lock().unwrap().clone()
+    }));
+    let read = |name: &str| HostRequest::SkillRead {
+        name: name.into(),
+        path: None,
+    };
+    let text = |reply: HostReply| match reply {
+        HostReply::File(bytes) => String::from_utf8(bytes.into_vec()).unwrap(),
+        other => panic!("read failed: {other:?}"),
+    };
+    assert_eq!(text(host.handle(read("project:notes")).await), project_body);
+    // Revoking the project grant during the call withdraws project skills
+    // at the next read; profile skills stay readable.
+    *ceiling.lock().unwrap() = Some(BTreeSet::new());
+    assert!(code(host.handle(read("project:notes")).await).is_some());
+    assert_eq!(text(host.handle(read("notes")).await), profile_body);
+    *ceiling.lock().unwrap() = None;
+    assert!(code(host.handle(read("project:notes")).await).is_some());
+}

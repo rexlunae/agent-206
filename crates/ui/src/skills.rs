@@ -93,16 +93,19 @@ pub fn Skills() -> Element {
         .iter()
         .map(|project| (project.id, project.name.clone()))
         .collect();
+    // Any Refresh re-reads every folder: a project without skills shows no
+    // list of its own, so its first skill appears through this one.
+    let refreshes = use_signal(|| 0u64);
     rsx! {
-        SkillList { folder: Folder { project: None } }
+        SkillList { folder: Folder { project: None }, refreshes }
         for project in projects {
-            SkillList { key: "{project.0}", folder: Folder { project: Some(project.clone()) } }
+            SkillList { key: "{project.0}", folder: Folder { project: Some(project.clone()) }, refreshes }
         }
     }
 }
 
 #[component]
-fn SkillList(folder: Folder) -> Element {
+fn SkillList(folder: Folder, mut refreshes: Signal<u64>) -> Element {
     let state = use_context::<State>();
     let folder = use_signal(|| folder);
     let mut skills = use_signal(Vec::<SkillSummary>::new);
@@ -122,8 +125,9 @@ fn SkillList(folder: Folder) -> Element {
     };
     // Settings events follow approvals made here or from the CLI.
     let revision = state.data.read().settings.revision;
-    use_effect(use_reactive!(|revision| {
-        let _ = revision;
+    let refresh = refreshes();
+    use_effect(use_reactive!(|revision, refresh| {
+        let _ = (revision, refresh);
         reload();
     }));
     // Enabling pins the digest of the text shown in the review card, so an
@@ -167,11 +171,11 @@ fn SkillList(folder: Folder) -> Element {
             p { class: "a206-muted", "From the project's .agent206/skills folder. Approval applies only to this project's conversations that may read the project, and anyone who can write to the project can change these files: an edit turns a skill off until you approve it again. The model sees each one as project:NAME." }
         } else {
             h2 { "Skills" }
-            p { class: "a206-muted", "Instruction folders in your profile's skills directory. Review one before enabling it; any later edit turns it off until you approve it again. Skills never add permissions. Skills in a project's .agent206/skills folder are listed below, by project." }
+            p { class: "a206-muted", "Instruction folders in your profile's skills directory. Review one before enabling it; any later edit turns it off until you approve it again. Skills never add permissions. Skills in a project's .agent206/skills folder are listed below, by project; Refresh also finds a project's first skill." }
         }
         // Installing or editing a skill changes files, not settings, so the
         // list is re-read on request.
-        div { class: "a206-row", Button { variant: ButtonVariant::Secondary, onclick: move |_| reload(), "Refresh" } }
+        div { class: "a206-row", Button { variant: ButtonVariant::Secondary, onclick: move |_| *refreshes.write() += 1, "Refresh" } }
         if let Some(report) = failure() { ErrorNotice { report, title: "Skills unavailable".to_string(), dismiss: move |_| failure.set(None) } }
         if project.is_none() && skills.read().is_empty() { EmptyState { compact: true, title: rsx! { "No skills installed" }, body: rsx! { "Copy a skill folder containing SKILL.md into the skills directory of the gateway's profile, or into a project's .agent206/skills folder." } } }
         div { class: "a206-grid",

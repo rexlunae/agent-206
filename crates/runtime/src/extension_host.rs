@@ -899,12 +899,15 @@ impl HostCalls {
                 "skill reads are restricted to the skills builtin",
             ));
         }
+        // Project skills are read only while the conversation may still
+        // read its project, so a grant revoked during the call withdraws
+        // them; profile skills stay readable.
+        let project = self
+            .project_skills
+            .as_ref()
+            .filter(|_| self.may_read_project());
         let sources = |settings: &a206_core::Settings| {
-            crate::skill_tool::Sources::new(
-                settings,
-                &self.skills_root,
-                self.project_skills.as_ref(),
-            )
+            crate::skill_tool::Sources::new(settings, &self.skills_root, project)
         };
         let pins = sources(&self.lock()?.state.settings);
         let approved = pins.clone();
@@ -931,6 +934,13 @@ impl HostCalls {
                 };
                 failure(code, &report.message)
             })?;
+        // Read outside the store lock: the caller's ceiling takes it.
+        if project.is_some() && !self.may_read_project() {
+            return Err(failure(
+                HostErrorCode::Denied,
+                "the conversation this runs for no longer allows reading its project",
+            ));
+        }
         let store = self.lock()?;
         if sources(&store.state.settings) != pins
             || !store
@@ -945,6 +955,13 @@ impl HostCalls {
             ));
         }
         Ok(HostReply::File(text.into_bytes().into()))
+    }
+    /// Whether the caller's conversation may read its project now.
+    fn may_read_project(&self) -> bool {
+        self.current
+            .as_ref()
+            .and_then(CurrentCeiling::read)
+            .is_some_and(|ceiling| crate::instructions::permitted(&ceiling))
     }
     async fn execute(&mut self, request: HostRequest) -> Result<HostReply, HostFailure> {
         // The stored plugin is read again for every call, so disabling or
