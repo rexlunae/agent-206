@@ -56,7 +56,7 @@ pub(crate) struct PushTarget {
     pub tags: Vec<ObjectId>,
     pub remote: String,
     /// The repository URL the remote pushes to.
-    pub url: url::Url,
+    pub url: RemoteUrl,
     pub hash: gix::hash::Kind,
 }
 impl PushTarget {
@@ -271,9 +271,34 @@ pub(super) fn head_branch(repo: &gix::Repository) -> Result<Option<String>, Remo
         }))
 }
 
-/// An HTTPS repository URL (or loopback HTTP, for a forge on this computer)
-/// that carries no credentials, query or fragment.
-pub(super) fn remote_url(configured: &str) -> Result<url::Url, RemoteError> {
+/// A repository URL git_push and git_fetch reach.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemoteUrl {
+    /// HTTPS, or loopback HTTP, through the vault broker.
+    Https(url::Url),
+    /// git's ssh transport, through OpenSSH and a vault-held key.
+    Ssh(crate::git_ssh::SshRemote),
+}
+impl RemoteUrl {
+    /// The origin the vault binds this repository's credential to.
+    pub fn origin(&self) -> String {
+        match self {
+            Self::Https(url) => url.origin().ascii_serialization(),
+            Self::Ssh(remote) => remote.origin(),
+        }
+    }
+}
+
+/// An ssh repository URL, or an HTTPS one (or loopback HTTP, for a forge on
+/// this computer) that carries no credentials, query or fragment.
+pub(super) fn remote_url(configured: &str) -> Result<RemoteUrl, RemoteError> {
+    if let Some(remote) = crate::git_ssh::SshRemote::parse(configured) {
+        return remote.map(RemoteUrl::Ssh);
+    }
+    https_url(configured).map(RemoteUrl::Https)
+}
+
+fn https_url(configured: &str) -> Result<url::Url, RemoteError> {
     let url = url::Url::parse(configured).map_err(|_| RemoteError::RemoteUrl)?;
     let loopback = matches!(
         url.host(),
@@ -575,13 +600,16 @@ mod tests {
         ));
         let current = target_of(&dir, None, None).unwrap();
         assert_eq!(current.remote, "origin");
-        assert_eq!(current.url.as_str(), format!("https://{host}/a.git"));
+        assert_eq!(current.url.origin(), format!("https://{host}"));
         assert_eq!(current.reference(), format!("refs/heads/{}", current.name));
         let head = gix::open(dir.path()).unwrap().head_id().unwrap().detach();
         assert_eq!(current.tip, head);
         // A push URL wins over the fetch URL.
         let up = target_of(&dir, None, Some("up")).unwrap();
-        assert_eq!(up.url.as_str(), format!("https://{other}/push.git"));
+        assert_eq!(
+            up.url,
+            RemoteUrl::Https(format!("https://{other}/push.git").parse().unwrap())
+        );
         // The branch's configured remote is its default.
         let path = dir.path().join(".git/config");
         let mut text = std::fs::read_to_string(&path).unwrap();
@@ -612,12 +640,12 @@ mod tests {
         let host = format!("{}.example", nonce());
         let cases = [
             (
-                format!("[remote \"origin\"]\n\turl = git@{host}:a.git\n"),
+                format!("[remote \"origin\"]\n\turl = git://{host}/a.git\n"),
                 "url",
             ),
             (
-                format!("[remote \"origin\"]\n\turl = ssh://{host}/a.git\n"),
-                "url",
+                format!("[remote \"origin\"]\n\turl = ssh://{host}/a%20b.git\n"),
+                "ssh",
             ),
             (
                 format!("[remote \"origin\"]\n\turl = http://{host}/a.git\n"),
@@ -643,6 +671,7 @@ mod tests {
             let result = target_of(&dir, None, None);
             let matched = match expected {
                 "url" => matches!(result, Err(RemoteError::RemoteUrl)),
+                "ssh" => matches!(result, Err(RemoteError::SshUrl)),
                 "credentials" => matches!(result, Err(RemoteError::RemoteCredentials)),
                 _ => matches!(result, Err(RemoteError::Rewritten)),
             };

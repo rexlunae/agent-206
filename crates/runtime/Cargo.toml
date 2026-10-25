@@ -79,6 +79,14 @@ tokio = { workspace = true, features = ["test-util"] }
 axum = { version = "0.8", features = ["ws"] }
 # The test forge stores pushed packs with gitoxide's own indexer.
 gix-pack = { version = "0.76", default-features = false, features = ["streaming-input", "sha1"] }
+# The stand-in ssh verifies the vault's signatures.
+ssh-key = { version = "0.6", default-features = false, features = ["std", "ed25519"] }
+ssh-encoding = { version = "0.2", default-features = false, features = ["alloc"] }
+signature = { version = "2", default-features = false }
+# Its own `main` also serves as the `ssh` the gateway starts.
+[[test]]
+name = "git_ssh"
+harness = false
 [[test]]
 name = "native_exec"
 harness = false

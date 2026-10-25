@@ -623,7 +623,8 @@ name on the remote, like `git push <remote> <branch>`, and a tag to the tag
 of the same name, like `git push <remote> tag <tag>`:
 
 - The remote's `pushurl`, else `url`, must be an HTTPS URL without a username,
-  password, query or fragment; ssh remotes are refused. A remote URL that a
+  password, query or fragment, or an ssh one (see [over ssh](#git-over-ssh)).
+  Other transports (`git://`, local paths) are refused. A remote URL that a
   `url.*.insteadOf` or `pushInsteadOf` setting would rewrite is refused rather
   than pushed to the unrewritten URL.
 - Settings come from the repository's own configuration, then the user's
@@ -666,7 +667,7 @@ of the same name, like `git push <remote> tag <tag>`:
 
 The token never reaches the gateway, the model, the conversation or a log.
 Cancelling a call after the pack was sent may leave the server updated. Not
-yet: ssh remotes, force pushes, deleting remote branches or tags, pushing
+yet: force pushes, deleting remote branches or tags, pushing
 several references at once (`--tags`, `--follow-tags`) and pushing to a
 differently named branch or tag.
 
@@ -684,7 +685,7 @@ when `branch.<name>.remote` is that remote, else the current branch's own
 name), or `tag` instead of it, and `remote` (default: the current branch's
 remote, else `origin`).
 
-- The remote's `url` follows the push rules (HTTPS only, `insteadOf`
+- The remote's `url` follows the push rules (HTTPS or ssh, `insteadOf`
   rewrites refused, included configuration refused). For a branch, the
   remote's `remote.<name>.fetch` must be the mapping `git clone` sets up,
   `refs/heads/*:refs/remotes/<remote>/*`, with or without `+`, and be the
@@ -726,9 +727,52 @@ so a tag whose history is incomplete here is fetched again. A local tag of that 
 `up_to_date`. The pack's completeness is checked through the tag's tag
 objects (at most 10) to its commit, and a tag naming a tree or blob is
 refused. The result names the `tag`, whether it is `annotated` and the
-`commit` it leads to. Not yet: ssh remotes, several branches or tags at
-once (`--tags`, tags that follow a fetched branch), pruning, and packs over
-about 4 MiB.
+`commit` it leads to. Not yet: several branches or tags at once (`--tags`,
+tags that follow a fetched branch), pruning, and packs over about 4 MiB.
+
+### Git over ssh
+
+`git_push` and `git_fetch` also reach `ssh://[user@]host[:port]/path`
+(`git+ssh://` and `ssh+git://` too, `/~user/path` meaning a home directory)
+and scp-like `[user@]host:path` remotes (`runtime/src/git_ssh.rs`). The git
+credential for such a server has the origin `ssh://host[:port]`, written
+back as `ssh://host:port`, a vault SSH key (`vault add --kind ssh-key`)
+bound to that same origin, and as username the login used when the URL
+names none (`git` for most forges); it takes no forge API. The URL's host
+must be a plain name or IP address, the user and the path may not start
+with `-`, and a path with `%` or control characters is refused rather than
+decoded.
+
+The gateway runs OpenSSH's `ssh` from PATH with `-F none` (no user or system
+configuration, so no `ProxyCommand`, `Match exec` or included files) and
+`BatchMode`, `StrictHostKeyChecking=yes` against `~/.ssh/known_hosts` and the
+profile's `known_hosts` (a host must already be trusted there; nothing is
+added), `IdentitiesOnly` with the one vault key, public-key authentication
+only, no agent, X11 or port forwarding, no connection sharing, a 20 second
+connect timeout and keepalives every 15 seconds (three missed end the
+call). `SSH_AUTH_SOCK`, `SSH_ASKPASS` and `DISPLAY` are removed from its
+environment, the remote command is `git-receive-pack` or `git-upload-pack`
+with the path quoted as git quotes it, and ssh is killed when the call ends
+or is cancelled.
+
+The key is offered by a one-use SSH agent the gateway serves on a socket in
+an owner-only temporary directory. It answers only the ssh process it
+started (checked by the connecting process's id), lists only that key,
+signs at most three requests, and passes each to the broker's `SshAgent`
+request (broker protocol v16), which signs only a public-key authentication
+request for that key and only for the server the key is bound to. The
+private key never leaves the broker. The conversation then speaks git's
+protocol over ssh with the same requests, limits and checks as over HTTPS;
+when nothing needs sending, it ends with a flush. An unknown or changed host
+key and a refused key fail with `PermissionDenied`, and the vault's reason
+when it refused to sign; other ssh failures report ssh's last line of error
+output. Tested end to end with a stand-in `ssh` that checks the options,
+has the agent sign an authentication request and verifies the signature,
+and relays to the stand-in forge; not tried against a real OpenSSH server.
+Ssh remotes need a Unix system. For the pull request tools, an ssh remote
+names the repository at the same path on `https://host`, as GitHub, GitLab,
+Gitea and Forgejo serve it, so they use the git credential set for that
+HTTPS origin; a path under a home directory (`~user/...`) is refused.
 
 ## Pull requests (`pull_requests`, `pull_request`, `pull_request_create`, `pull_request_comment`, `pull_request_line_comment`, `pull_request_merge`)
 

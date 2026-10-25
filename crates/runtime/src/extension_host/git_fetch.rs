@@ -10,8 +10,8 @@ use super::{
     git_branch::branch_name,
     git_commit::{Settings, has_hooks},
     git_push::{
-        MAX_ANCESTRY, Named, RefKind, ancestor, direct, head_branch, host, peeled, remote_name,
-        remote_url, settings, tag_chain,
+        MAX_ANCESTRY, Named, RefKind, RemoteUrl, ancestor, direct, head_branch, host, peeled,
+        remote_name, remote_url, settings, tag_chain,
     },
     git_tag::tag_name,
 };
@@ -39,7 +39,7 @@ pub(crate) struct FetchTarget {
     pub name: String,
     pub remote: String,
     /// The repository URL the remote fetches from.
-    pub url: url::Url,
+    pub url: RemoteUrl,
     pub hash: gix::hash::Kind,
     /// Whether the remote's fetch refspec allows a forced update (`+`);
     /// never for a tag.
@@ -241,9 +241,9 @@ fn tag_target(
     Ok(target)
 }
 
-/// The HTTPS URL `remote` fetches from; one that a setting would rewrite is
+/// The URL `remote` fetches from; one that a setting would rewrite is
 /// refused.
-fn fetch_url(settings: &Settings, remote: &str) -> Result<url::Url, RemoteError> {
+fn fetch_url(settings: &Settings, remote: &str) -> Result<RemoteUrl, RemoteError> {
     let configured = settings
         .string(&format!("remote.{remote}.url"))
         .ok_or_else(|| RemoteError::NoRemote(remote.to_owned()))?;
@@ -266,7 +266,10 @@ pub(crate) fn remote_repository(
     let settings = settings(&repo).map_err(host)?;
     let current = head_branch(&repo)?;
     let remote = remote_name(&settings, current.as_deref().unwrap_or_default(), remote)?;
-    let url = fetch_url(&settings, &remote)?;
+    let url = match fetch_url(&settings, &remote)? {
+        RemoteUrl::Https(url) => url,
+        RemoteUrl::Ssh(ssh) => ssh.https().ok_or(RemoteError::ForgeSsh(remote.clone()))?,
+    };
     Ok((remote, url, current))
 }
 
