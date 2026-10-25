@@ -1,16 +1,17 @@
 //! Pushing and fetching branches and tags of the project's repository for
 //! the native run engine: a [`ToolHost`] whose `git_push` sends a local
 //! branch or tag to the branch or tag of the same name on one of the
-//! repository's HTTPS remotes, as `git push` does, and whose `git_fetch`
+//! repository's HTTPS or ssh remotes, as `git push` does, and whose `git_fetch`
 //! brings a remote branch into its remote-tracking branch, or a remote tag
 //! into the local tag of the same name, as `git fetch` does.
 //!
 //! Both reach a forge with the user's token, so the tools are denied until
 //! the user permits them on the conversation, need the conversation's
 //! GitWrite grant, and each call still waits for the user's approval. The
-//! forge's token stays in the vault: the user names, per forge origin, which
-//! vault credential git calls send, and the broker attaches it only for the
-//! origin it is bound to. Git itself never runs; only fast-forward updates
+//! forge's token or SSH key stays in the vault: the user names, per forge
+//! origin, which vault credential git calls use, and the broker attaches
+//! the token, or signs ssh's authentication with the key, only for the
+//! origin it is bound to (see [`crate::git_ssh`]). Git itself never runs; only fast-forward updates
 //! of one branch, or one tag the server lacks, are pushed, as a pack of whole objects, and a fetch's pack
 //! must likewise fit one broker message.
 //!
@@ -19,7 +20,7 @@
 use crate::{
     extension_host::{
         Interrupt, git_fetch as fetching,
-        git_push::{self as repository, Named, PushTarget, RefKind, Tracked},
+        git_push::{self as repository, Named, PushTarget, RefKind, RemoteUrl, Tracked},
     },
     gateway::Pushes,
     tools::{ToolHost, ToolListing, ToolOutput, ToolRequest, ToolScope, ToolSpec},
@@ -94,9 +95,41 @@ pub enum RemoteError {
     #[error("the repository has no remote named {0}")]
     NoRemote(String),
     #[error(
-        "only HTTPS remotes can be pushed to or fetched from; the remote's URL is not an HTTPS repository URL without a query or fragment"
+        "only HTTPS and ssh remotes can be pushed to or fetched from; the remote's URL is neither an HTTPS repository URL without a query or fragment nor an ssh one"
     )]
     RemoteUrl,
+    #[error(
+        "the remote's ssh URL is not one this tool follows: write it as ssh://[user@]host[:port]/path or [user@]host:path, with a plain host name and a path without `%` or control characters"
+    )]
+    SshUrl,
+    #[error(
+        "the ssh user name may hold only letters, digits, `.`, `_` and `-`, at most 64 of them, and may not start with `-`"
+    )]
+    SshUser,
+    #[error("the path {} cannot be passed to ssh", .0.display())]
+    SshPath(PathBuf),
+    #[error("ssh remotes are reached only on Unix systems")]
+    SshUnsupported,
+    #[error("ssh could not be started")]
+    SshStart(#[source] std::io::Error),
+    #[error("the ssh server sent more than {0} bytes, more than one call may receive")]
+    SshTooLarge(usize),
+    #[error("the ssh connection closed before the request was sent")]
+    SshClosed,
+    #[error(
+        "the host key of {host} is not in ~/.ssh/known_hosts or the profile's known_hosts, or has changed; verify it and add it there"
+    )]
+    SshHostKey { host: String },
+    #[error(
+        "{host} refused the vault's ssh key; check that its public key is added to your account there"
+    )]
+    SshDenied { host: String },
+    #[error("ssh failed{}: {message}", .code.map(|c| format!(" (exit {c})")).unwrap_or_default())]
+    SshFailed { code: Option<i32>, message: String },
+    #[error(
+        "remote {0} is an ssh path under a home directory, which no forge serves; the pull request tools need a forge repository"
+    )]
+    ForgeSsh(String),
     #[error(
         "the remote's URL carries a username or password; remove it, the vault supplies the credential"
     )]
@@ -186,7 +219,10 @@ impl crate::error::Classified for RemoteError {
             | Self::TagName
             | Self::BranchAndTag
             | Self::TagTarget(_)
-            | Self::RemoteName => ErrorKind::InvalidRequest,
+            | Self::RemoteName
+            | Self::SshUrl
+            | Self::SshUser
+            | Self::SshPath(_) => ErrorKind::InvalidRequest,
             Self::UnknownTool(_)
             | Self::NoBranch(_)
             | Self::NoTag(_)
@@ -194,11 +230,17 @@ impl crate::error::Classified for RemoteError {
             | Self::NoRepository
             | Self::NoRemoteBranch { .. }
             | Self::NoRemoteTag { .. } => ErrorKind::NotFound,
-            Self::NotApproved | Self::NoCredential { .. } | Self::Refused { .. } => {
-                ErrorKind::PermissionDenied
-            }
+            Self::NotApproved
+            | Self::NoCredential { .. }
+            | Self::Refused { .. }
+            | Self::SshHostKey { .. }
+            | Self::SshDenied { .. } => ErrorKind::PermissionDenied,
+            Self::SshStart(_) | Self::SshUnsupported => ErrorKind::Unavailable,
+            Self::SshTooLarge(_) | Self::SshClosed => ErrorKind::Protocol,
+            Self::SshFailed { .. } => ErrorKind::Provider,
             Self::NoProject
             | Self::RemoteUrl
+            | Self::ForgeSsh(_)
             | Self::RemoteCredentials
             | Self::Rewritten
             | Self::History
@@ -255,7 +297,7 @@ impl RemoteHost {
     fn fetch_spec() -> ToolSpec {
         ToolSpec {
             name: FETCH.into(),
-            description: "Fetch a branch from one of the project's HTTPS git remotes into its remote-tracking branch, like `git fetch <remote> <branch>` with the remote's usual refs/heads/*:refs/remotes/<remote>/* mapping, or a tag into the local tag of the same name, like `git fetch <remote> tag <tag>`. Only the remote-tracking branch (such as origin/main) or the new tag and the object store change; local branches and the working tree are left alone, and an existing local tag at another object is never replaced. The user approves each call. Refused when the repository has a reference-transaction hook, is shallow or a partial clone, or the remote's URL is not HTTPS.".into(),
+            description: "Fetch a branch from one of the project's HTTPS or ssh git remotes into its remote-tracking branch, like `git fetch <remote> <branch>` with the remote's usual refs/heads/*:refs/remotes/<remote>/* mapping, or a tag into the local tag of the same name, like `git fetch <remote> tag <tag>`. Only the remote-tracking branch (such as origin/main) or the new tag and the object store change; local branches and the working tree are left alone, and an existing local tag at another object is never replaced. The user approves each call. Refused when the repository has a reference-transaction hook, is shallow or a partial clone, or the remote's URL is neither HTTPS nor ssh.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -274,7 +316,7 @@ impl RemoteHost {
     fn push_spec() -> ToolSpec {
         ToolSpec {
             name: PUSH.into(),
-            description: "Push a local branch of the project's git repository to the branch of the same name on one of its HTTPS remotes, like `git push <remote> <branch>`, or a local tag to the tag of the same name, like `git push <remote> tag <tag>`. Only a fast-forward update of a branch is sent: if the remote branch has commits this branch lacks, the push is refused. A tag is sent only if the remote lacks it; one it has at a different object is never replaced. The user approves each call. Refused when the repository has a pre-push hook or the remote's URL is not HTTPS.".into(),
+            description: "Push a local branch of the project's git repository to the branch of the same name on one of its HTTPS or ssh remotes, like `git push <remote> <branch>`, or a local tag to the tag of the same name, like `git push <remote> tag <tag>`. Only a fast-forward update of a branch is sent: if the remote branch has commits this branch lacks, the push is refused. A tag is sent only if the remote lacks it; one it has at a different object is never replaced. The user approves each call. Refused when the repository has a pre-push hook or the remote's URL is neither HTTPS nor ssh.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -324,14 +366,16 @@ impl RemoteHost {
         }
     }
 
-    /// A broker connection that can make git calls of `version`, and the
-    /// call for `url` with the credential the user set for its origin.
-    async fn session(
+    /// How a call of `service` reaches the repository at `url` with the
+    /// credential the user set for its origin: through a broker that can
+    /// make git calls of `version` (HTTPS), or ssh with the vault's key.
+    async fn link(
         &self,
-        url: &url::Url,
+        url: &RemoteUrl,
+        service: Service,
         version: u16,
-    ) -> Result<(Broker, impl Fn(Option<Vec<u8>>) -> a206_broker::GitCall), RemoteError> {
-        let origin = url.origin().ascii_serialization();
+    ) -> Result<Link, RemoteError> {
+        let origin = url.origin();
         let credential = self
             .pushes
             .credential(&origin)
@@ -340,15 +384,50 @@ impl RemoteHost {
                 origin: origin.clone(),
             })?;
         let (broker_root, pairing) = self.pushes.broker().map_err(RemoteError::Gateway)?;
-        let broker = Broker::connect(&broker_root, pairing.as_ref(), version).await?;
-        let repository = url.to_string();
-        let call = move |request| a206_broker::GitCall {
-            credential: credential.credential.clone(),
-            username: credential.username.clone(),
-            repository: repository.clone(),
-            request,
-        };
-        Ok((broker, call))
+        match url {
+            RemoteUrl::Https(url) => Ok(Link::Https {
+                broker: Broker::connect(&broker_root, pairing.as_ref(), version).await?,
+                call: GitCaller {
+                    credential: credential.credential,
+                    username: credential.username,
+                    repository: url.to_string(),
+                },
+            }),
+            #[cfg(unix)]
+            RemoteUrl::Ssh(remote) => {
+                let mut broker = Broker::connect(
+                    &broker_root,
+                    pairing.as_ref(),
+                    a206_broker::SSH_AGENT_VERSION,
+                )
+                .await?;
+                let key = broker
+                    .ssh_agent(&credential.credential, &origin, None)
+                    .await?
+                    .0;
+                // The URL's user, as git uses it; else the one the user set.
+                let user = remote.user.as_deref().unwrap_or(&credential.username);
+                let session = crate::git_ssh::SshSession::open(
+                    remote,
+                    user,
+                    service,
+                    &crate::connection::known_hosts(&broker_root),
+                    key,
+                    BrokerSigner {
+                        broker,
+                        credential: credential.credential,
+                        destination: origin,
+                    },
+                )
+                .await?;
+                Ok(Link::Ssh(session))
+            }
+            #[cfg(not(unix))]
+            RemoteUrl::Ssh(_) => {
+                let _ = (broker_root, pairing, service);
+                Err(RemoteError::SshUnsupported)
+            }
+        }
     }
 
     async fn fetch(
@@ -364,12 +443,11 @@ impl RemoteHost {
             move || fetching::target(root, named(&branch, &tag), remote.as_deref(), &interrupt)
         })
         .await?;
-        let (mut broker, call) = self
-            .session(&target.url, a206_broker::GIT_FETCH_VERSION)
-            .await?;
         let service = Service::UploadPack;
-        let advertisement = broker.call(service, call(None)).await?;
-        let advertised = a206_git_push::parse_advertisement(&advertisement, service, target.hash)?;
+        let mut link = self
+            .link(&target.url, service, a206_broker::GIT_FETCH_VERSION)
+            .await?;
+        let advertised = link.advertisement(service, target.hash).await?;
         let tip = advertised
             .get(&target.reference())
             .ok_or_else(|| match target.kind {
@@ -391,10 +469,11 @@ impl RemoteHost {
         .await?;
         let pack = if needed {
             let request = a206_git_push::fetch_request(&advertised, tip, &target.haves)?;
-            let answer = broker.call(service, call(Some(request))).await?;
+            let answer = link.send(service, request).await?;
             let side_band = advertised.capabilities.iter().any(|c| c == "side-band-64k");
             Some(a206_git_push::parse_fetch(&answer, side_band, target.hash)?)
         } else {
+            link.close().await?;
             None
         };
         let fetched = blocking({
@@ -444,10 +523,11 @@ impl RemoteHost {
             move || repository::target(root, named(&branch, &tag), remote.as_deref(), &interrupt)
         })
         .await?;
-        let (mut broker, call) = self.session(&target.url, a206_broker::GIT_VERSION).await?;
         let service = Service::ReceivePack;
-        let advertisement = broker.call(service, call(None)).await?;
-        let advertised = a206_git_push::parse_advertisement(&advertisement, service, target.hash)?;
+        let mut link = self
+            .link(&target.url, service, a206_broker::GIT_VERSION)
+            .await?;
+        let advertised = link.advertisement(service, target.hash).await?;
         let packed = blocking({
             let (root, target) = (root.clone(), target.clone());
             move || {
@@ -457,6 +537,7 @@ impl RemoteHost {
         })
         .await?;
         let (Some(packed), advertised) = packed else {
+            link.close().await?;
             let mut result = pushed(&target);
             result.insert("up_to_date".into(), true.into());
             return Ok(result.into());
@@ -467,7 +548,7 @@ impl RemoteHost {
             name: target.reference(),
         };
         let body = update.request(&advertised, &packed.pack)?;
-        let answer = broker.call(service, call(Some(body))).await?;
+        let answer = link.send(service, body).await?;
         let report = a206_git_push::parse_report(&answer, &update.name)?;
         report.unpack.map_err(RemoteError::Unpack)?;
         match report.reference {
@@ -572,6 +653,97 @@ pub(crate) fn text(
     }
 }
 
+/// The git call for one repository with the credential set for its origin.
+struct GitCaller {
+    credential: String,
+    username: String,
+    repository: String,
+}
+impl GitCaller {
+    fn call(&self, request: Option<Vec<u8>>) -> a206_broker::GitCall {
+        a206_broker::GitCall {
+            credential: self.credential.clone(),
+            username: self.username.clone(),
+            repository: self.repository.clone(),
+            request,
+        }
+    }
+}
+
+/// How one push or fetch talks to the server: each round a broker call
+/// (git's stateless smart HTTP), or one ssh conversation.
+enum Link {
+    Https {
+        broker: Broker,
+        call: GitCaller,
+    },
+    #[cfg(unix)]
+    Ssh(crate::git_ssh::SshSession),
+}
+impl Link {
+    /// The references and capabilities the server advertises.
+    async fn advertisement(
+        &mut self,
+        service: Service,
+        hash: gix::hash::Kind,
+    ) -> Result<a206_git_push::Advertisement, RemoteError> {
+        Ok(match self {
+            Self::Https { broker, call } => {
+                let body = broker.call(service, call.call(None)).await?;
+                a206_git_push::parse_advertisement(&body, service, hash)?
+            }
+            #[cfg(unix)]
+            Self::Ssh(session) => {
+                let body = session.advertisement(LIMITS.bytes).await?;
+                a206_git_push::parse_stream_advertisement(&body, hash)?
+            }
+        })
+    }
+    /// Send the service `request`; its answer.
+    async fn send(self, service: Service, request: Vec<u8>) -> Result<Vec<u8>, RemoteError> {
+        match self {
+            Self::Https { mut broker, call } => {
+                broker.call(service, call.call(Some(request))).await
+            }
+            #[cfg(unix)]
+            Self::Ssh(session) => session.finish(Some(&request), MAX_ANSWER).await,
+        }
+    }
+    /// End the conversation without a request.
+    async fn close(self) -> Result<(), RemoteError> {
+        match self {
+            Self::Https { .. } => Ok(()),
+            #[cfg(unix)]
+            Self::Ssh(session) => session.finish(None, MAX_ANSWER).await.map(drop),
+        }
+    }
+}
+/// The most a service's answer over ssh may hold: what a broker relays.
+#[cfg(unix)]
+const MAX_ANSWER: usize = a206_broker::MAX_PROVIDER_BODY;
+
+/// Signs an ssh client's authentication with the vault's key, through
+/// the broker, for the one server the key is bound to.
+#[cfg(unix)]
+struct BrokerSigner {
+    broker: Broker,
+    credential: String,
+    destination: String,
+}
+#[cfg(unix)]
+impl crate::ssh_agent::Signer for BrokerSigner {
+    type Error = RemoteError;
+    fn sign(&mut self, data: Vec<u8>) -> BoxFuture<'_, Result<Vec<u8>, RemoteError>> {
+        Box::pin(async move {
+            self.broker
+                .ssh_agent(&self.credential, &self.destination, Some(data))
+                .await?
+                .1
+                .ok_or(RemoteError::UnexpectedReply)
+        })
+    }
+}
+
 /// A paired gateway connection to the vault broker that can make git and
 /// forge API calls.
 pub(crate) struct Broker {
@@ -643,6 +815,34 @@ impl Broker {
         _call: a206_broker::GitCall,
     ) -> Result<Vec<u8>, RemoteError> {
         Err(RemoteError::NotPaired)
+    }
+
+    /// The public key of the SSH key `credential`, bound to `destination`,
+    /// and with `sign`, its signature of that authentication request.
+    #[cfg(unix)]
+    async fn ssh_agent(
+        &mut self,
+        credential: &str,
+        destination: &str,
+        sign: Option<Vec<u8>>,
+    ) -> Result<(Vec<u8>, Option<Vec<u8>>), RemoteError> {
+        let reply = self
+            .client
+            .call(a206_broker::Request::SshAgent(a206_broker::SshAgentCall {
+                credential: credential.to_owned(),
+                destination: destination.to_owned(),
+                sign,
+            }))
+            .await
+            .map_err(RemoteError::Broker)?;
+        let a206_broker::Reply::SshAgent {
+            public_key,
+            signature,
+        } = reply
+        else {
+            return Err(RemoteError::UnexpectedReply);
+        };
+        Ok((public_key, signature))
     }
 
     /// One forge API request; the status and the body of a success (the

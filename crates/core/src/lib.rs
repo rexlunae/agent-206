@@ -299,8 +299,11 @@ pub struct ModePrompt {
 /// `origin`; the gateway never reads it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GitCredential {
-    /// `https://host[:port]`, as the vault binds credentials.
+    /// `https://host[:port]` or `ssh://host:port`, as the vault binds
+    /// credentials.
     pub origin: String,
+    /// Sent with an HTTPS token; for ssh, the login name used when the
+    /// remote's URL names none.
     pub username: String,
     pub credential: String,
     /// The forge's web API, for the pull request tools. `None` uses the

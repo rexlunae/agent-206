@@ -113,7 +113,7 @@ fn GitCredentials() -> Element {
         || username.read().trim().is_empty()
         || credential.read().trim().is_empty();
     rsx! { Card { variant: CardVariant::Elevated,
-        CardHeader { CardTitle { "Git credentials" } CardSubtitle { "The vault credential the git_push tool sends to each forge. Each push is still approved by you." } }
+        CardHeader { CardTitle { "Git credentials" } CardSubtitle { "The vault credential git_push and git_fetch use with each forge. Each call is still approved by you." } }
         CardBody {
             if entries.is_empty() {
                 p { class: "a206-muted", "None. Agents cannot push until you add one. Store the forge's access token in the vault, bound to the forge's origin, then name it here." }
@@ -125,9 +125,9 @@ fn GitCredentials() -> Element {
                     Button { variant: ButtonVariant::Ghost, onclick: { let origin = entry.origin.clone(); move |_| { let mut settings = state.data.read().settings.clone(); settings.git_credentials.retain(|e| e.origin != origin); dispatch(state, Command::SaveSettings(Box::new(settings))); } }, "Remove" }
                 }
             }
-            Field { label: rsx! { "Origin" }, hint: rsx! { "The forge's https:// origin, such as https://github.com, without a path." }, Input { value: ReadSignal::from(origin), oninput: move |v| origin.set(v), placeholder: "https://host" } }
-            Field { label: rsx! { "Username" }, hint: rsx! { "The username the forge expects with a token, such as x-access-token for GitHub, oauth2 for GitLab or your account name." }, Input { value: ReadSignal::from(username), oninput: move |v| username.set(v), placeholder: "Username" } }
-            Field { label: rsx! { "Vault credential" }, hint: rsx! { "The name of an API key or token credential in the vault, bound to this origin." }, Input { value: ReadSignal::from(credential), oninput: move |v| credential.set(v), placeholder: "Credential name" } }
+            Field { label: rsx! { "Origin" }, hint: rsx! { "The forge's https:// origin, such as https://github.com, or its ssh:// server, such as ssh://github.com, without a path." }, Input { value: ReadSignal::from(origin), oninput: move |v| origin.set(v), placeholder: "https://host" } }
+            Field { label: rsx! { "Username" }, hint: rsx! { "The username the forge expects with a token, such as x-access-token for GitHub, oauth2 for GitLab or your account name. For ssh, the login name used when a remote's URL names none, such as git." }, Input { value: ReadSignal::from(username), oninput: move |v| username.set(v), placeholder: "Username" } }
+            Field { label: rsx! { "Vault credential" }, hint: rsx! { "The name of an API key or token credential in the vault, or for ssh an SSH key, bound to this origin." }, Input { value: ReadSignal::from(credential), oninput: move |v| credential.set(v), placeholder: "Credential name" } }
         }
         CardFooter { Button { variant: ButtonVariant::Secondary, disabled: incomplete, onclick: move |_| { let mut settings = state.data.read().settings.clone(); settings.git_credentials.push(a206_core::GitCredential { origin: origin().trim().into(), username: username().trim().into(), credential: credential().trim().into(), forge: None }); dispatch(state, Command::SaveSettings(Box::new(settings))); }, "Add credential" } }
     } }

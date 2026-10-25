@@ -19,26 +19,47 @@ pub(super) fn validate(entries: &mut [GitCredential]) -> Result<()> {
     for entry in entries.iter_mut() {
         let invalid = || {
             GatewayError::Invalid(
-                "a git credential's origin must be https://host[:port], or http:// on a loopback host",
+                "a git credential's origin must be https://host[:port], http:// on a loopback host, or ssh://host[:port]",
             )
         };
-        let url = url::Url::parse(entry.origin.trim()).map_err(|_| invalid())?;
-        let loopback = matches!(
-            url.host(),
-            Some(url::Host::Domain("localhost"))
-                | Some(url::Host::Ipv4(std::net::Ipv4Addr::LOCALHOST))
-                | Some(url::Host::Ipv6(std::net::Ipv6Addr::LOCALHOST))
-        );
-        check(
-            (url.scheme() == "https" || url.scheme() == "http" && loopback)
-                && url.username().is_empty()
-                && url.password().is_none()
-                && url.path() == "/"
-                && url.query().is_none()
-                && url.fragment().is_none(),
-            invalid(),
-        )?;
-        entry.origin = url.origin().ascii_serialization();
+        let origin = entry.origin.trim();
+        let ssh = origin
+            .get(..6)
+            .is_some_and(|s| s.eq_ignore_ascii_case("ssh://"));
+        entry.origin = if ssh {
+            let host = a206_core::ssh_host::SshHost::parse(origin).map_err(|_| invalid())?;
+            check(
+                entry.forge.is_none(),
+                GatewayError::Invalid(
+                    "a forge API belongs on the forge's https:// credential, not its ssh:// one",
+                ),
+            )?;
+            check(
+                crate::git_ssh::check_user(&entry.username).is_ok(),
+                GatewayError::Invalid(
+                    "an ssh user name may hold only letters, digits, `.`, `_` and `-`, at most 64 of them, and may not start with `-`",
+                ),
+            )?;
+            host.origin()
+        } else {
+            let url = url::Url::parse(origin).map_err(|_| invalid())?;
+            let loopback = matches!(
+                url.host(),
+                Some(url::Host::Domain("localhost"))
+                    | Some(url::Host::Ipv4(std::net::Ipv4Addr::LOCALHOST))
+                    | Some(url::Host::Ipv6(std::net::Ipv6Addr::LOCALHOST))
+            );
+            check(
+                (url.scheme() == "https" || url.scheme() == "http" && loopback)
+                    && url.username().is_empty()
+                    && url.password().is_none()
+                    && url.path() == "/"
+                    && url.query().is_none()
+                    && url.fragment().is_none(),
+                invalid(),
+            )?;
+            url.origin().ascii_serialization()
+        };
         check(
             origins.insert(entry.origin.clone()),
             GatewayError::Invalid("each origin may have only one git credential"),
@@ -144,7 +165,8 @@ mod tests {
             format!("https://{host}/team/repo.git"),
             format!("https://user@{host}"),
             format!("https://{host}/?q"),
-            format!("ssh://{host}"),
+            format!("ssh://git@{host}"),
+            format!("ssh://{host}/team/repo.git"),
             host.clone(),
         ] {
             invalid(&mut [entry(&origin)]);
@@ -161,6 +183,21 @@ mod tests {
         let mut bad = entry(&format!("https://{host}"));
         bad.credential = " ".into();
         invalid(&mut [bad]);
+        // An ssh server is named as the vault binds SSH keys, with an
+        // ssh login name and no forge API.
+        let mut ssh = [entry(&format!("SSH://{}:2222", host.to_uppercase()))];
+        ssh[0].username = "git".into();
+        validate(&mut ssh).unwrap();
+        assert_eq!(ssh[0].origin, format!("ssh://{host}:2222"));
+        let mut bad = ssh.clone();
+        bad[0].username = "-oProxyCommand=x".into();
+        invalid(&mut bad);
+        let mut bad = ssh.clone();
+        bad[0].forge = Some(a206_core::ForgeApi {
+            kind: a206_core::ForgeKind::GitHub,
+            api: format!("https://{host}/api"),
+        });
+        invalid(&mut bad);
         let mut many: Vec<_> = (0..=MAX_GIT_CREDENTIALS)
             .map(|i| entry(&format!("https://h{i}.{host}")))
             .collect();

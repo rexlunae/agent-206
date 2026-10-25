@@ -88,6 +88,20 @@ pub fn parse_advertisement(
             "the service line is not followed by a flush",
         ));
     }
+    references(reader, hash)
+}
+
+/// Parse the advertisement a `git-upload-pack` or `git-receive-pack`
+/// process sends first over a stream such as ssh: the references up to a
+/// flush, without smart HTTP's service line.
+pub fn parse_stream_advertisement(
+    body: &[u8],
+    hash: gix::hash::Kind,
+) -> Result<Advertisement, WireError> {
+    references(Reader::new(body), hash)
+}
+
+fn references(mut reader: Reader<'_>, hash: gix::hash::Kind) -> Result<Advertisement, WireError> {
     let mut advertised = Advertisement {
         refs: vec![],
         haves: vec![],
@@ -306,6 +320,24 @@ mod tests {
     }
     fn service() -> Option<&'static [u8]> {
         Some(b"# service=git-receive-pack\n")
+    }
+
+    #[test]
+    fn a_stream_advertisement_has_no_service_line() {
+        let main = id();
+        let first = format!("{main} refs/heads/main\0side-band-64k\n");
+        let advertised =
+            parse_stream_advertisement(&body(&[Some(first.as_bytes()), None]), Kind::Sha1).unwrap();
+        assert_eq!(advertised.get("refs/heads/main"), Some(main));
+        assert_eq!(advertised.capabilities, ["side-band-64k"]);
+        // An HTTP advertisement's service line is not a reference.
+        assert!(matches!(
+            parse_stream_advertisement(
+                &body(&[service(), None, Some(first.as_bytes()), None]),
+                Kind::Sha1
+            ),
+            Err(WireError::Malformed(_))
+        ));
     }
 
     #[test]

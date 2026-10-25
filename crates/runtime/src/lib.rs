@@ -16,6 +16,7 @@ pub mod extension_tools;
 pub mod forge;
 pub mod gateway;
 pub mod git_remote;
+pub mod git_ssh;
 pub mod images;
 pub mod imports;
 pub mod instructions;
@@ -39,6 +40,8 @@ pub mod search_tool;
 pub mod service;
 pub mod skill_tool;
 pub mod sse;
+#[cfg(unix)]
+pub mod ssh_agent;
 pub mod status_tool;
 pub mod store;
 pub mod tool_calls;

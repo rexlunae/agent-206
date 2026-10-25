@@ -1,4 +1,4 @@
-//! A push or fetch over git's smart HTTP protocol (version 0 of
+//! A push or fetch over git's smart HTTP or ssh protocol (version 0 of
 //! `git-receive-pack` and `git-upload-pack`), without running git: the
 //! reference advertisement a server answers with, the update command and
 //! pack a push sends and the server's report, and a fetch's request and the
@@ -20,4 +20,5 @@ pub use fetch::{MAX_HAVES, Stored, check_complete, fetch_request, parse_fetch, s
 pub use pack::{Limits, Objects, PackError, objects, write_pack};
 pub use wire::{
     Advertisement, Report, Service, Update, WireError, parse_advertisement, parse_report,
+    parse_stream_advertisement,
 };
