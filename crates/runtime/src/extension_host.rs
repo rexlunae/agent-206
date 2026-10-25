@@ -906,6 +906,14 @@ impl HostCalls {
             .project_skills
             .as_ref()
             .filter(|_| self.may_read_project());
+        // The index includes project skills; a named read reaches the
+        // project only for a `project:` name.
+        let reads_project = project.is_some()
+            && (name != crate::skill_tool::INFO
+                || arguments
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|skill| skill.starts_with(crate::skill_tool::PROJECT_PREFIX)));
         let sources = |settings: &a206_core::Settings| {
             crate::skill_tool::Sources::new(settings, &self.skills_root, project)
         };
@@ -935,7 +943,7 @@ impl HostCalls {
                 failure(code, &report.message)
             })?;
         // Read outside the store lock: the caller's ceiling takes it.
-        if project.is_some() && !self.may_read_project() {
+        if reads_project && !self.may_read_project() {
             return Err(failure(
                 HostErrorCode::Denied,
                 "the conversation this runs for no longer allows reading its project",

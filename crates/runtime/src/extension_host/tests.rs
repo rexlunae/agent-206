@@ -1263,4 +1263,22 @@ async fn project_skills_follow_the_conversations_current_grant() {
     assert_eq!(text(host.handle(read("notes")).await), profile_body);
     *ceiling.lock().unwrap() = None;
     assert!(code(host.handle(read("project:notes")).await).is_some());
+
+    // A revocation that lands while a read runs withdraws a project result
+    // but never a profile one. The last ceiling read of a call is the check
+    // after the file read; count the reads a call makes, then revoke there.
+    let reads = Arc::new(Mutex::new(0usize));
+    let revoke_at = Arc::new(Mutex::new(usize::MAX));
+    let (counted, at) = (Arc::clone(&reads), Arc::clone(&revoke_at));
+    host.current = Some(CurrentCeiling::new(move || {
+        let mut reads = counted.lock().unwrap();
+        *reads += 1;
+        (*reads < *at.lock().unwrap()).then(|| BTreeSet::from([Capability::ReadWorkspace]))
+    }));
+    assert_eq!(text(host.handle(read("project:notes")).await), project_body);
+    let per_call = std::mem::take(&mut *reads.lock().unwrap());
+    *revoke_at.lock().unwrap() = per_call;
+    assert!(code(host.handle(read("project:notes")).await).is_some());
+    *reads.lock().unwrap() = 0;
+    assert_eq!(text(host.handle(read("notes")).await), profile_body);
 }
