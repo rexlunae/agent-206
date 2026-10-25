@@ -1020,24 +1020,35 @@ previous summary first.
   API-reported `ModelInfo::context_limit`, the run compacts everything before the
   current and the previous turn. Before the first round "previous" is the last
   request of the previous run. An unknown limit or input count never triggers it.
-  When only those two turns are in context there is nothing to compact and the
-  request is sent as it is (a single turn larger than the window is not reduced).
+  When only those two turns are in context, the run instead cuts inside the
+  earliest turn since the latest summary with more than two rounds (assistant
+  messages), usually the turn in progress: everything before that turn's last two
+  rounds is summarized except its request, which the summarizing model reads but
+  which stays verbatim. After such a cut, the rest of that turn counts as a turn of
+  its own, so a later whole-turn cut can summarize it. With
+  two rounds or fewer there is nothing to compact and the request is sent as it
+  is, so a single round larger than the window is not reduced.
 - **Manual.** `Command::CompactThread { thread }` compacts a native conversation
-  that is not running, keeping its latest turn, whatever its context usage or
-  limit. It marks the thread `Running` (so `Send` waits and `CancelRun` stops it)
+  that is not running, keeping its latest turn (or, when that turn is all
+  there is, its request and last two rounds, as above), whatever its context usage
+  or limit. It marks the thread `Running` (so `Send` waits and `CancelRun` stops it)
   with the previous state saved in `Thread::compacting`, restores that state
   afterwards, or on the next start if the gateway stopped meanwhile, and replies
   with the thread. Nothing to
   compact is a `Conflict` before any request. CLI: `agent206 compact THREAD`.
 - **Result.** The summary is inserted as a `Role::System` message with
   `Message::compaction` (trigger, messages covered, previous summary, input tokens
-  and context limit at the time, the summary request's usage) just before the first
-  kept turn. The covered messages stay in the thread for the user. A model request
+  and context limit at the time, the summary request's usage, and for a cut inside a
+  turn that turn's request in `Compaction::request`) just before the first kept turn
+  or round. The covered messages stay in the thread for the user. A model request
   carries only the latest summary and the messages after it: the summary, after a
   fixed preamble, is prefixed to the first following user message (so every
   protocol keeps a user-first, alternating history and the summary never gets
-  system-prompt authority). Since a call and its result live on one assistant
-  message and cuts fall only before user messages, every tool call keeps its
+  system-prompt authority). A summary inside a turn is instead appended, after its own
+  preamble, to the turn's request, which is sent first and keeps its attachments and
+  images; the kept rounds follow. A later summary's transcript shows that request
+  again, since no summary covers it. Since a call and its result live on one assistant
+  message and cuts fall only between whole messages, every tool call keeps its
   result in OpenAI, Anthropic and Gemini form. `Thread::usage` becomes unknown
   until the next request reports it.
 - **Accounting.** Every summary request is counted in `Thread::usage_total`,
@@ -1062,7 +1073,7 @@ previous summary first.
   answered. The flush is offered once per summary: `Thread::memory_flush` records
   the latest summary when a flush round completes, so restarts and later runs do
   not repeat it, while a failed or cancelled flush round is offered again. It is
-  offered only when the compaction would summarize at least one turn and the budget
+  offered only when the compaction would summarize something and the budget
   leaves a tool call for the save and a round to answer in. The tools offered are
   listed again after a compaction. Manual compaction has no
   flush. Follows RustyClaw's `memory_flush.rs`, but triggers at the compaction

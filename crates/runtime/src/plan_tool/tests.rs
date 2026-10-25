@@ -99,6 +99,7 @@ fn summary() -> Message {
             output_tokens: None,
             cost: None,
         },
+        request: None,
     });
     message
 }

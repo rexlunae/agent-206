@@ -974,23 +974,43 @@ pub async fn complete(
 }
 /// Introduces a compaction summary in the history a model receives.
 pub const SUMMARY_PREAMBLE: &str = "[Summary of the earlier conversation, written when it was compacted to save context. The original messages are no longer included.]";
+/// Introduces a summary that also covers earlier rounds of the request it
+/// follows.
+pub const ROUNDS_PREAMBLE: &str = "[Summary of the earlier conversation and of the work already done on the request above, written when it was compacted to save context. The original messages are no longer included; the most recent steps follow.]";
 /// The messages a model receives: the latest compaction summary, if any, and
-/// the messages after it. Every message before a summary is covered by it.
+/// the messages after it. Every message before a summary is covered by it,
+/// except the request of a turn whose earlier rounds it summarized.
 ///
 /// The summary is not sent with a role of its own: it is prefixed to the
 /// first following user message, so every protocol keeps a user-first,
 /// alternating history and no summary gains system-prompt authority. A
-/// summary followed by no user message is sent as a user message alone.
-/// Compaction keeps whole messages, so a call and its result (stored
-/// together on the assistant message) are never separated.
+/// summary of earlier rounds is instead appended to the request it kept,
+/// which is sent first. A summary followed by no user message is sent as a
+/// user message alone. Compaction keeps whole messages, so a call and its
+/// result (stored together on the assistant message) are never separated.
 pub(crate) fn history(thread: &Thread) -> Vec<std::borrow::Cow<'_, Message>> {
     use std::borrow::Cow;
     let Some(at) = thread.messages.iter().rposition(|m| m.compaction.is_some()) else {
         return thread.messages.iter().map(Cow::Borrowed).collect();
     };
-    let summary = format!("{SUMMARY_PREAMBLE}\n\n{}", thread.messages[at].text);
+    let kept = thread.messages[at]
+        .compaction
+        .as_ref()
+        .and_then(|record| record.request)
+        .and_then(|id| thread.messages[..at].iter().find(|m| m.id == id));
     let mut rest = thread.messages[at + 1..].iter();
     let mut out = vec![];
+    if let Some(request) = kept {
+        let mut request = request.clone();
+        request.text = format!(
+            "{}\n\n---\n\n{ROUNDS_PREAMBLE}\n\n{}",
+            request.text, thread.messages[at].text
+        );
+        out.push(Cow::Owned(request));
+        out.extend(rest.map(Cow::Borrowed));
+        return out;
+    }
+    let summary = format!("{SUMMARY_PREAMBLE}\n\n{}", thread.messages[at].text);
     match rest.as_slice().first() {
         Some(first) if first.role == Role::User => {
             let mut first = first.clone();
