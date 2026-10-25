@@ -462,38 +462,61 @@ pub async fn drives_both_agent_protocols_in_the_real_os_sandbox() {
         "fixture-wait-revoke",
         "fixture-wait-programs",
     ] {
-        let Reply::Thread(thread) = command(
-            &gateway,
-            Command::CreateThread {
-                title: Id::new_v4().to_string(),
-                mode: Mode::Code,
-            },
-        )
-        .await
-        else {
-            panic!();
+        // Only a runtime that may execute is given the program directories.
+        let (thread, capabilities) = if behavior.ends_with("programs") {
+            let Reply::Project(project) = command(
+                &gateway,
+                Command::CreateProject {
+                    name: Id::new_v4().to_string(),
+                    root: project_root.to_string_lossy().into(),
+                },
+            )
+            .await
+            else {
+                panic!();
+            };
+            (
+                project.manager,
+                [Capability::ReadWorkspace, Capability::Execute].into(),
+            )
+        } else {
+            let Reply::Thread(thread) = command(
+                &gateway,
+                Command::CreateThread {
+                    title: Id::new_v4().to_string(),
+                    mode: Mode::Code,
+                },
+            )
+            .await
+            else {
+                panic!();
+            };
+            (thread.id, Default::default())
         };
         command(
             &gateway,
             Command::ConfigureThread {
-                id: thread.id,
-                mode: thread.mode,
+                id: thread,
+                mode: Mode::Code,
                 model: Some(key.clone()),
                 subagent_models: Default::default(),
             },
         )
         .await;
-        command(
-            &gateway,
-            Command::SetBackend {
-                thread: thread.id,
-                backend: CodingBackend::Codex,
-                capabilities: Default::default(),
-            },
-        )
-        .await;
+        assert_eq!(
+            command(
+                &gateway,
+                Command::SetBackend {
+                    thread,
+                    backend: CodingBackend::Codex,
+                    capabilities,
+                },
+            )
+            .await,
+            Reply::Ok
+        );
         let actor = gateway.clone();
-        let id = thread.id;
+        let id = thread;
         let job = tokio::spawn(async move {
             command(
                 &actor,
@@ -516,7 +539,7 @@ pub async fn drives_both_agent_protocols_in_the_real_os_sandbox() {
                     };
                     if let Some(title) = events.iter().find_map(|event| match &event.kind {
                         EventKind::BackendActivity { thread: id, title }
-                            if *id == thread.id && title.starts_with("Codex: fixture:") =>
+                            if *id == thread && title.starts_with("Codex: fixture:") =>
                         {
                             Some(title.clone())
                         }
@@ -559,7 +582,7 @@ pub async fn drives_both_agent_protocols_in_the_real_os_sandbox() {
                 );
             } else {
                 assert_eq!(
-                    command(&gateway, Command::CancelRun { thread: thread.id }).await,
+                    command(&gateway, Command::CancelRun { thread }).await,
                     Reply::Ok
                 );
             }

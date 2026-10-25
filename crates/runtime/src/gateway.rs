@@ -945,7 +945,7 @@ impl Gateway {
             // A runtime given program directories holds the old mounts.
             let backend_changed = thread.backend != CodingBackend::Native
                 && (settings.backends.iter().find(|b| b.kind == thread.backend) != current
-                    || (programs_changed && current.is_some_and(|b| b.program_directories)));
+                    || (programs_changed && holds_programs(current, &thread.grant)));
             if (provider_changed || backend_changed)
                 && let Some(token) = running.get(&thread.id)
             {
@@ -2230,6 +2230,12 @@ pub fn scoped_path(root: &Path, path: &str) -> Result<PathBuf> {
     Ok(target)
 }
 /// Replace `settings.toml` atomically with `settings`.
+/// Whether an external runtime is given the program directories at launch:
+/// its backend opted in and the thread may run programs.
+fn holds_programs(backend: Option<&BackendConfig>, grant: &Grant) -> bool {
+    backend.is_some_and(|b| b.program_directories)
+        && grant.capabilities.contains(&Capability::Execute)
+}
 fn write_settings(root: &Path, settings: &Settings) -> Result<()> {
     let text = toml::to_string_pretty(settings).map_err(GatewayError::EncodeSettings)?;
     let temporary = root.join("settings.toml.new");
@@ -2388,6 +2394,26 @@ fn project_root(store: &Store, id: Id) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_runtimes_that_may_execute_hold_program_directories() {
+        let backend = |program_directories| BackendConfig {
+            kind: CodingBackend::Codex,
+            executable: "codex".into(),
+            runtime_root: "runtime".into(),
+            adapter_script: None,
+            program_directories,
+        };
+        let executes = Grant {
+            capabilities: [Capability::Execute].into(),
+            models: Default::default(),
+        };
+        assert!(holds_programs(Some(&backend(true)), &executes));
+        // Launch mounts nothing without Execute, so a directory edit spares the turn.
+        assert!(!holds_programs(Some(&backend(true)), &Grant::default()));
+        assert!(!holds_programs(Some(&backend(false)), &executes));
+        assert!(!holds_programs(None, &executes));
+    }
 
     #[test]
     fn shortened_reasoning_is_marked_while_streaming_before_any_final_reply() {
