@@ -643,6 +643,7 @@ fn received(params: &Value, login: &str) -> Option<(String, Event)> {
             title: None,
             text: text.to_owned(),
             encrypted: false,
+            thread: None,
         },
         // A group id signal-cli wrote some other way: nobody's chat.
         Some(_) => return Some((key, Event::Ignored)),
@@ -653,6 +654,7 @@ fn received(params: &Value, login: &str) -> Option<(String, Event)> {
             title,
             text: text.to_owned(),
             encrypted: false,
+            thread: None,
         },
     };
     Some((key, Event::Message(inbound)))

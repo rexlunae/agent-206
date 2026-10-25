@@ -80,6 +80,9 @@ struct Message {
     text: Option<String>,
     #[serde(default)]
     ts: Option<String>,
+    /// The thread's first message, for a message written in a thread.
+    #[serde(default)]
+    thread_ts: Option<String>,
 }
 
 fn malformed(source: serde_json::Error) -> MessengerError {
@@ -176,14 +179,23 @@ impl Slack {
     /// Send `text` to `chat`, split to Slack's advised length and escaped so
     /// it cannot mention anyone or link.
     pub(crate) async fn send(&self, chat: &str, text: &str) -> Result<()> {
+        self.send_in(chat, None, text).await
+    }
+
+    /// [`Slack::send`], into `thread` of `chat` when given (the `ts` of the
+    /// thread's first message), without also posting it to the channel.
+    pub(crate) async fn send_in(&self, chat: &str, thread: Option<&str>, text: &str) -> Result<()> {
         // Split before escaping so no part ends inside an entity.
         for part in split(text, MAX_MESSAGE_UNITS) {
-            let body = serde_json::json!({
+            let mut body = serde_json::json!({
                 "channel": chat,
                 "text": escape(part),
                 "unfurl_links": false,
                 "unfurl_media": false,
             });
+            if let Some(thread) = thread {
+                body["thread_ts"] = thread.into();
+            }
             self.call("chat.postMessage", Some(body)).await?;
         }
         Ok(())
@@ -294,6 +306,7 @@ fn message_event(message: Message, own: &str) -> Option<(String, Event)> {
             title: None,
             text: unescape(&text),
             encrypted: false,
+            thread: message.thread_ts,
         }),
     ))
 }

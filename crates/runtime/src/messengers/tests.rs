@@ -1904,6 +1904,71 @@ async fn slack_acknowledges_everything_and_answers_allowed_people_once() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn slack_answers_a_threaded_message_in_its_thread() {
+    let channel = random();
+    let (api, mut entry, _dir, host, _anchor) = slack_setup(&[&channel]).await;
+    let member = random();
+    entry.allowed_users.insert(member.clone());
+    let top = slack_event(&channel, "channel", &member, &random());
+    let mut threaded = slack_event(&channel, "channel", &member, &random());
+    let parent = top["payload"]["event"]["ts"].clone();
+    threaded["payload"]["event"]["thread_ts"] = parent.clone();
+    api.envelopes.lock().unwrap().extend([top, threaded]);
+    let (_desired, receiver) = watch::channel(vec![Desired {
+        config: entry,
+        run: true,
+    }]);
+    let stop = CancellationToken::new();
+    let supervisor = tokio::spawn(supervise(host.clone(), receiver, FAST, stop.clone()));
+    host.until(|_| api.sent.lock().unwrap().len() == 2).await;
+    stop.cancel();
+    supervisor.await.unwrap();
+    let sent = api.sent.lock().unwrap().clone();
+    assert!(sent.iter().all(|(chat, _)| *chat == channel));
+    // A channel message is answered in the channel, a threaded one in its
+    // thread, and not broadcast back to the channel.
+    assert!(sent[0].1.get("thread_ts").is_none());
+    assert_eq!(sent[1].1["thread_ts"], parent);
+    assert!(sent[1].1.get("reply_broadcast").is_none());
+    // Both belong to the channel's one conversation.
+    let turns = host.turns.lock().unwrap().clone();
+    assert_eq!(turns.len(), 2);
+    assert_eq!(turns[0].0, turns[1].0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn slack_reports_a_failed_turn_in_the_thread_it_came_from() {
+    let channel = random();
+    let (api, mut entry, _dir, host, _anchor) = slack_setup(&[&channel]).await;
+    let member = random();
+    entry.allowed_users.insert(member.clone());
+    // Without a model no turn can run, so the chat is told why.
+    entry.model = None;
+    let parent = random();
+    let mut threaded = slack_event(&channel, "channel", &member, &random());
+    threaded["payload"]["event"]["thread_ts"] = json!(parent);
+    api.envelopes.lock().unwrap().push_back(threaded);
+    let (_desired, receiver) = watch::channel(vec![Desired {
+        config: entry,
+        run: true,
+    }]);
+    let stop = CancellationToken::new();
+    let supervisor = tokio::spawn(supervise(host.clone(), receiver, FAST, stop.clone()));
+    host.until(|_| api.sent.lock().unwrap().len() == 1).await;
+    stop.cancel();
+    supervisor.await.unwrap();
+    let sent = api.sent.lock().unwrap().clone();
+    assert!(host.turns.lock().unwrap().is_empty());
+    assert_eq!(sent[0].0, channel);
+    assert_eq!(sent[0].1["thread_ts"], json!(parent));
+    assert!(
+        sent[0].1["text"]
+            .as_str()
+            .is_some_and(|text| text.starts_with("Agent 206 could not answer"))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn slack_reconnects_on_request_and_needs_both_tokens() {
     let channel = random();
     let (api, entry, _dir, host, _anchor) = slack_setup(&[&channel]).await;

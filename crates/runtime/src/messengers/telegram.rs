@@ -192,5 +192,6 @@ fn inbound(message: Message) -> Option<Inbound> {
         title,
         text,
         encrypted: false,
+        thread: None,
     })
 }
