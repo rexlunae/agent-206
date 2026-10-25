@@ -420,6 +420,7 @@ impl Gateway {
             current: Some(crate::extension_host::CurrentCeiling::new(move || {
                 gateway.scope(thread).ok().map(|scope| scope.capabilities)
             })),
+            project_skills: None,
         };
         let output = self
             .extensions

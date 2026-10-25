@@ -626,3 +626,89 @@ async fn activity_prints_journal_events_as_toml_pages() -> Result<()> {
     ensure!(next.events.len() == 1 && next.events[0].sequence < first.events[0].sequence);
     app.shutdown().await
 }
+
+#[tokio::test]
+async fn project_skills_are_listed_reviewed_and_approved_by_project() -> Result<()> {
+    #[derive(serde::Deserialize)]
+    struct Skills {
+        #[serde(default)]
+        skills: Vec<a206_core::SkillSummary>,
+    }
+    let mut app = App::start(tempfile::tempdir()?, BTreeMap::new()).await?;
+    let (first, second) = (tempfile::tempdir()?, tempfile::tempdir()?);
+    // Not UUID-shaped, so the CLI looks the project up by name.
+    let name = format!("skills-{}", uuid::Uuid::new_v4().simple());
+    let other = format!("skills-{}", uuid::Uuid::new_v4().simple());
+    for (project, root) in [(&name, &first), (&other, &second)] {
+        let root = root.path().display().to_string();
+        app.cli(&["project", project, &root]).await?;
+    }
+    let body = uuid::Uuid::new_v4().to_string();
+    for root in [&first, &second] {
+        let dir = root.path().join(".agent206/skills/notes");
+        std::fs::create_dir_all(&dir)?;
+        std::fs::write(
+            dir.join("SKILL.md"),
+            format!("---\nname: notes\ndescription: Project notes.\n---\n{body}"),
+        )?;
+    }
+    let list = |project: String| {
+        let app = &app;
+        async move {
+            let skills: Skills =
+                toml::from_str(&app.cli(&["skills", "list", "--project", &project]).await?)?;
+            Ok::<_, anyhow::Error>(skills.skills)
+        }
+    };
+    let listed = list(name.clone()).await?;
+    ensure!(listed.len() == 1 && !listed[0].enabled, "{:?}", listed);
+    let digest = listed[0].digest.clone().context("digest listed")?;
+    let profile: Skills = toml::from_str(&app.cli(&["skills", "list"]).await?)?;
+    ensure!(
+        profile.skills.is_empty(),
+        "project skills are not profile skills"
+    );
+
+    let shown = capture(app.command(&["skills", "show", "notes", "--project", &name])).await?;
+    ensure!(shown.status.success());
+    ensure!(String::from_utf8(shown.stdout)?.ends_with(&body));
+    let hint = String::from_utf8(shown.stderr)?;
+    ensure!(
+        hint.contains(&format!("--digest {digest} --project ")),
+        "{hint}"
+    );
+
+    app.cli(&[
+        "skills",
+        "enable",
+        "notes",
+        "--digest",
+        &digest,
+        "--project",
+        &name,
+    ])
+    .await?;
+    ensure!(list(name.clone()).await?[0].enabled);
+    // The same package in another project stays off; it is addressed by id too.
+    let projects = app.snapshot().await?.projects;
+    let second_id = projects
+        .iter()
+        .find(|project| project.name == other)
+        .context("second project")?
+        .id
+        .to_string();
+    ensure!(!list(second_id).await?[0].enabled);
+
+    app.cli(&["skills", "disable", "notes", "--project", &name])
+        .await?;
+    ensure!(!list(name.clone()).await?[0].enabled);
+    // A name that is not exactly one project's is refused.
+    app.cli(&["project", &name, &second.path().display().to_string()])
+        .await?;
+    let ambiguous = capture(app.command(&["skills", "list", "--project", &name])).await?;
+    ensure!(!ambiguous.status.success());
+    ensure!(String::from_utf8(ambiguous.stderr)?.contains("several projects"));
+    let missing = capture(app.command(&["skills", "list", "--project", "no such project"])).await?;
+    ensure!(!missing.status.success());
+    app.shutdown().await
+}

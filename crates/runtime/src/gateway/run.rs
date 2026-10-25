@@ -232,6 +232,11 @@ fn effective_budget(store: &Store, id: Id) -> Result<ToolBudget> {
             budget.intersect(thread.tool_budget)
         }))
 }
+/// The capabilities conversation `id` holds in `store` as it stands now, as
+/// its runs' tool scope computes them; `None` once it is gone.
+pub(crate) fn current_capabilities(store: &Store, id: Id) -> Option<BTreeSet<Capability>> {
+    view(store, id).ok().map(|view| view.scope.capabilities)
+}
 fn view(store: &Store, id: Id) -> Result<View> {
     let mut lineage = lineage(store, id)?.into_iter().cloned();
     let thread = lineage

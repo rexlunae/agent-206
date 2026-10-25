@@ -407,17 +407,36 @@ mod native {
     #[derive(Subcommand)]
     enum SkillAction {
         /// Show installed skills, whether each is approved, and problems.
-        List,
+        List {
+            /// List the skills in this project's .agent206/skills folder
+            /// instead of the profile's (project id or exact name).
+            #[arg(long)]
+            project: Option<String>,
+        },
         /// Print a skill's SKILL.md for review, followed by its digest.
-        Show { name: String },
+        Show {
+            name: String,
+            /// Review a skill of this project (id or exact name).
+            #[arg(long)]
+            project: Option<String>,
+        },
         /// Approve the skill exactly as reviewed: pass the digest `show` printed.
         Enable {
             name: String,
             #[arg(long)]
             digest: String,
+            /// Approve a skill of this project, for its conversations only
+            /// (id or exact name).
+            #[arg(long)]
+            project: Option<String>,
         },
         /// Withdraw approval.
-        Disable { name: String },
+        Disable {
+            name: String,
+            /// Withdraw approval of a skill of this project (id or exact name).
+            #[arg(long)]
+            project: Option<String>,
+        },
     }
     #[derive(Subcommand)]
     enum McpServerAction {
@@ -495,6 +514,52 @@ mod native {
         },
         Stop,
         Status,
+    }
+    /// The project `selector` names: an existing project's id, or the exact
+    /// name of exactly one project.
+    async fn project_id(
+        client: &a206_runtime::client::Client,
+        selector: &str,
+    ) -> anyhow::Result<uuid::Uuid> {
+        let projects = match client.call(Command::Snapshot).await? {
+            Reply::Snapshot(snapshot) => snapshot.projects,
+            Reply::Error(report) => return Err(report.into()),
+            _ => anyhow::bail!("gateway did not list projects"),
+        };
+        select_project(&projects, selector)
+    }
+    /// The project in `projects` that `selector` names. An existing
+    /// project's id wins over a project named like an id; otherwise the name
+    /// must match exactly one project.
+    fn select_project(
+        projects: &[a206_core::Project],
+        selector: &str,
+    ) -> anyhow::Result<uuid::Uuid> {
+        if let Ok(id) = selector.parse::<uuid::Uuid>()
+            && projects.iter().any(|project| project.id == id)
+        {
+            return Ok(id);
+        }
+        let mut named = projects.iter().filter(|project| project.name == selector);
+        match (named.next(), named.next()) {
+            (Some(project), None) => Ok(project.id),
+            (None, _) => {
+                anyhow::bail!("no project has the id or name \"{selector}\"")
+            }
+            (Some(_), Some(_)) => {
+                anyhow::bail!("several projects are named \"{selector}\"; pass the project's id")
+            }
+        }
+    }
+    /// The project id a `--project` option names, if one was given.
+    async fn project_option(
+        client: &a206_runtime::client::Client,
+        selector: Option<String>,
+    ) -> anyhow::Result<Option<uuid::Uuid>> {
+        match selector {
+            Some(selector) => Ok(Some(project_id(client, &selector).await?)),
+            None => Ok(None),
+        }
     }
     /// Settings that turn one MCP server on or off, leaving everything else as is.
     async fn mcp_server_enabled(
@@ -972,12 +1037,16 @@ mod native {
                         }
                     }
                     Action::Skills { command } => match command {
-                        SkillAction::List => {
+                        SkillAction::List { project } => {
                             #[derive(serde::Serialize)]
                             struct Skills {
                                 skills: Vec<a206_core::SkillSummary>,
                             }
-                            match client.call(Command::Skills).await? {
+                            let command = match project_option(&client, project).await? {
+                                Some(project) => Command::ProjectSkills { project },
+                                None => Command::Skills,
+                            };
+                            match client.call(command).await? {
                                 Reply::Skills(skills) => {
                                     print!("{}", toml::to_string_pretty(&Skills { skills })?);
                                     return Ok(());
@@ -986,8 +1055,13 @@ mod native {
                                 _ => anyhow::bail!("gateway did not list skills"),
                             }
                         }
-                        SkillAction::Show { name } => {
-                            match client.call(Command::ReadSkill { name }).await? {
+                        SkillAction::Show { name, project } => {
+                            let project = project_option(&client, project).await?;
+                            let command = match project {
+                                Some(project) => Command::ReadProjectSkill { project, name },
+                                None => Command::ReadSkill { name },
+                            };
+                            match client.call(command).await? {
                                 Reply::Skill(skill) => {
                                     print!("{}", skill.text);
                                     for file in &skill.files {
@@ -1014,8 +1088,12 @@ mod native {
                                         }
                                     }
                                     eprintln!(
-                                        "\nTo approve exactly this package: agent206 skills enable {} --digest {}",
-                                        skill.name, skill.digest
+                                        "\nTo approve exactly this package: agent206 skills enable {} --digest {}{}",
+                                        skill.name,
+                                        skill.digest,
+                                        project
+                                            .map(|project| format!(" --project {project}"))
+                                            .unwrap_or_default()
                                     );
                                     return Ok(());
                                 }
@@ -1023,16 +1101,38 @@ mod native {
                                 _ => anyhow::bail!("gateway did not return the skill"),
                             }
                         }
-                        SkillAction::Enable { name, digest } => Command::SetSkillEnabled {
+                        SkillAction::Enable {
                             name,
-                            enabled: true,
-                            digest: Some(digest),
+                            digest,
+                            project,
+                        } => match project_option(&client, project).await? {
+                            Some(project) => Command::SetProjectSkillEnabled {
+                                project,
+                                name,
+                                enabled: true,
+                                digest: Some(digest),
+                            },
+                            None => Command::SetSkillEnabled {
+                                name,
+                                enabled: true,
+                                digest: Some(digest),
+                            },
                         },
-                        SkillAction::Disable { name } => Command::SetSkillEnabled {
-                            name,
-                            enabled: false,
-                            digest: None,
-                        },
+                        SkillAction::Disable { name, project } => {
+                            match project_option(&client, project).await? {
+                                Some(project) => Command::SetProjectSkillEnabled {
+                                    project,
+                                    name,
+                                    enabled: false,
+                                    digest: None,
+                                },
+                                None => Command::SetSkillEnabled {
+                                    name,
+                                    enabled: false,
+                                    digest: None,
+                                },
+                            }
+                        }
                     },
                     Action::McpServers { command } => match command {
                         McpServerAction::List => {
@@ -1368,6 +1468,46 @@ mod native {
                 }
                 Ok(())
             }),
+        }
+    }
+    #[cfg(test)]
+    mod select_project_tests {
+        use super::select_project;
+        use a206_core::Project;
+        fn project(name: &str) -> Project {
+            Project {
+                id: uuid::Uuid::new_v4(),
+                name: name.into(),
+                root: format!("/{}", uuid::Uuid::new_v4()),
+                manager: uuid::Uuid::new_v4(),
+            }
+        }
+        #[test]
+        fn a_project_named_like_an_id_is_found_by_its_name() {
+            let named = project(&uuid::Uuid::new_v4().to_string());
+            let other = project("other");
+            let projects = [named.clone(), other.clone()];
+            assert_eq!(select_project(&projects, &named.name).unwrap(), named.id);
+            assert_eq!(
+                select_project(&projects, &other.id.to_string()).unwrap(),
+                other.id
+            );
+            assert_eq!(select_project(&projects, "other").unwrap(), other.id);
+            // An id no project has is not taken on trust.
+            assert!(select_project(&projects, &uuid::Uuid::new_v4().to_string()).is_err());
+            // An existing id wins over a name that spells it.
+            let spelled = project(&other.id.to_string());
+            let projects = [other.clone(), spelled];
+            assert_eq!(
+                select_project(&projects, &other.id.to_string()).unwrap(),
+                other.id
+            );
+        }
+        #[test]
+        fn a_shared_name_is_refused() {
+            let name = uuid::Uuid::new_v4().simple().to_string();
+            let projects = [project(&name), project(&name)];
+            assert!(select_project(&projects, &name).is_err());
         }
     }
 }

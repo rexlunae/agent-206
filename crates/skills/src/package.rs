@@ -1,18 +1,15 @@
 //! Bounded snapshots: audit and approval use exactly the bytes later served.
 use super::*;
 use a206_core::{AuditBuilder, AuditFinding, AuditLocation, AuditRule};
-use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt, OpenOptionsSyncExt};
-use cap_std::fs::Dir;
+use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt, OpenOptionsSyncExt};
 
 pub(super) fn inspect(
-    root: &Path,
+    root: &Dir,
     name: &str,
     instructions: &[u8],
     skill: &mut Skill,
 ) -> Result<(), SkillError> {
-    let dir = Dir::open_ambient_dir(root, cap_std::ambient_authority())
-        .and_then(|dir| dir.open_dir_nofollow(name))
-        .map_err(SkillError::Read)?;
+    let dir = root.open_dir_nofollow(name).map_err(SkillError::Read)?;
     let mut files = BTreeMap::new();
     walk(&dir, "", 0, &mut 0, &mut 0, &mut files)?;
     // Do not combine instructions from one read with approval of another.

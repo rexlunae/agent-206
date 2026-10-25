@@ -8,12 +8,14 @@
 //! and typed errors are Agent 206's.
 #![forbid(unsafe_code)]
 use a206_core::AuditReport;
+use cap_fs_ext::DirExt;
+use cap_std::fs::Dir;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::{
     io::Read,
-    path::{Component, Path},
+    path::{Component, Path, PathBuf},
 };
 
 /// Largest `SKILL.md` that is read.
@@ -22,6 +24,8 @@ pub const MAX_SKILL_BYTES: u64 = 256 << 10;
 pub const MAX_SKILLS: usize = 256;
 /// Largest supporting file a skill may hand to a model.
 pub const MAX_FILE_BYTES: u64 = 1 << 20;
+/// Where a project keeps its skills, below its root.
+pub const PROJECT_SKILLS: [&str; 2] = [".agent206", "skills"];
 
 /// Why a skill could not be read or used.
 #[derive(Debug, thiserror::Error)]
@@ -60,6 +64,8 @@ pub enum SkillError {
     Disabled,
     #[error("this skill changed after it was enabled; review and enable it again")]
     Changed,
+    #[error("the project's `{component}` directory is a symbolic link, which is not followed")]
+    Linked { component: &'static str },
 }
 
 /// A parsed skill. Every text field is author-written content.
@@ -262,6 +268,168 @@ pub fn valid_name(name: &str) -> bool {
         })
 }
 
+/// A directory of skill folders: the gateway profile's `skills` directory, or
+/// a project's `.agent206/skills`. A project's `.agent206` and `skills`
+/// directories are opened without following symlinks, so a project cannot
+/// point its skills anywhere else; every skill folder and file below either
+/// root is opened the same way.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillsDir {
+    base: PathBuf,
+    project: bool,
+}
+
+impl SkillsDir {
+    /// The skills directory at `root`, such as `<profile>/skills`.
+    pub fn profile(root: impl Into<PathBuf>) -> Self {
+        Self {
+            base: root.into(),
+            project: false,
+        }
+    }
+    /// The skills of the project at `root`: `<root>/.agent206/skills`.
+    pub fn project(root: impl Into<PathBuf>) -> Self {
+        Self {
+            base: root.into(),
+            project: true,
+        }
+    }
+    /// The directory's path, for display.
+    pub fn path(&self) -> PathBuf {
+        let mut path = self.base.clone();
+        if self.project {
+            path.extend(PROJECT_SKILLS);
+        }
+        path
+    }
+    /// The open directory, or `None` when it does not exist.
+    fn open(&self) -> Result<Option<Dir>, SkillError> {
+        let missing = |error: &std::io::Error| error.kind() == std::io::ErrorKind::NotFound;
+        let mut dir = match Dir::open_ambient_dir(&self.base, cap_std::ambient_authority()) {
+            Ok(dir) => dir,
+            Err(error) if missing(&error) => return Ok(None),
+            Err(error) => return Err(SkillError::Directory(error)),
+        };
+        if self.project {
+            for component in PROJECT_SKILLS {
+                // A typed refusal first; opening without following a link
+                // also refuses one swapped in after this check.
+                match dir.symlink_metadata(component) {
+                    Ok(meta) if meta.file_type().is_symlink() => {
+                        return Err(SkillError::Linked { component });
+                    }
+                    Ok(_) => {}
+                    Err(error) if missing(&error) => return Ok(None),
+                    Err(error) => return Err(SkillError::Directory(error)),
+                }
+                dir = dir
+                    .open_dir_nofollow(component)
+                    .map_err(SkillError::Directory)?;
+            }
+        }
+        Ok(Some(dir))
+    }
+
+    /// Read every skill's metadata and audit. Supporting bytes are discarded
+    /// after auditing; use [`SkillsDir::load`] for a complete review snapshot.
+    /// A missing directory has no skills; a parse failure is reported, not
+    /// skipped.
+    pub fn scan(&self) -> Result<Vec<Entry>, SkillError> {
+        let Some(root) = self.open()? else {
+            return Ok(vec![]);
+        };
+        let mut found = vec![];
+        for entry in root.entries().map_err(SkillError::Directory)? {
+            let entry = entry.map_err(SkillError::Directory)?;
+            let kind = entry.file_type().map_err(SkillError::Directory)?;
+            let Some(directory) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            // Hidden entries and loose files are not skills; symlinks are never followed.
+            if !kind.is_dir() || directory.starts_with('.') {
+                continue;
+            }
+            if found.len() == MAX_SKILLS {
+                return Err(SkillError::TooMany { limit: MAX_SKILLS });
+            }
+            let skill = load_in(&root, &directory).map(|(mut skill, _)| {
+                // Listings must not retain up to 256 complete 2-MiB packages.
+                skill.files.clear();
+                skill
+            });
+            found.push(Entry { directory, skill });
+        }
+        found.sort_by(|a, b| a.directory.cmp(&b.directory));
+        Ok(found)
+    }
+
+    /// Read and parse one skill, returning it with the exact `SKILL.md` text.
+    pub fn load(&self, name: &str) -> Result<(Skill, String), SkillError> {
+        if !valid_name(name) {
+            return Err(SkillError::Name);
+        }
+        load_in(&self.open()?.ok_or(SkillError::NotFound)?, name)
+    }
+
+    /// Read a supporting file of skill `name` by its path relative to the
+    /// skill. Paths that are absolute, climb out of the skill or pass through
+    /// a symlink are refused.
+    pub fn read_file(&self, name: &str, relative: &str) -> Result<Vec<u8>, SkillError> {
+        if !valid_name(name) {
+            return Err(SkillError::Name);
+        }
+        let relative = Path::new(relative);
+        if relative.as_os_str().is_empty()
+            || !relative
+                .components()
+                .all(|c| matches!(c, Component::Normal(_)))
+        {
+            return Err(SkillError::Path);
+        }
+        let root = self.open()?.ok_or(SkillError::NotFound)?;
+        unlinked(&root, name, relative)?;
+        read_bounded(&root, name, relative, MAX_FILE_BYTES).map_err(|error| match error {
+            Bounded::Io(error) => SkillError::Read(error),
+            Bounded::TooLarge => SkillError::FileTooLarge {
+                limit: MAX_FILE_BYTES,
+            },
+        })
+    }
+
+    /// Serve bytes from the package snapshot whose digest the user approved.
+    /// Never re-open a supporting file after checking a different snapshot.
+    pub fn read_approved_file(
+        &self,
+        name: &str,
+        relative: &str,
+        digest: &str,
+    ) -> Result<Vec<u8>, SkillError> {
+        if relative.is_empty()
+            || relative.contains('\\')
+            || !Path::new(relative)
+                .components()
+                .all(|c| matches!(c, Component::Normal(_)))
+        {
+            return Err(SkillError::Path);
+        }
+        // std::path accepts internal `.` and redundant separators. Use those
+        // validated components for the snapshot key, not the original spelling.
+        let key = Path::new(relative)
+            .components()
+            .map(|component| component.as_os_str().to_str().ok_or(SkillError::Path))
+            .collect::<Result<Vec<_>, _>>()?
+            .join("/");
+        let (mut skill, text) = self.load(name)?;
+        if skill.digest != digest {
+            return Err(SkillError::Changed);
+        }
+        if key == "SKILL.md" {
+            return Ok(text.into_bytes());
+        }
+        skill.files.remove(&key).ok_or(SkillError::NotFound)
+    }
+}
+
 /// One skill directory found by [`scan`].
 #[derive(Debug)]
 pub struct Entry {
@@ -269,47 +437,37 @@ pub struct Entry {
     pub skill: Result<Skill, SkillError>,
 }
 
-/// Read every skill's metadata and audit under `root`. Supporting bytes are
-/// discarded after auditing; use [`load`] for a complete review snapshot.
-/// A missing root has no skills; a parse failure is reported, not skipped.
+/// [`SkillsDir::scan`] of the profile skills directory `root`.
 pub fn scan(root: &Path) -> Result<Vec<Entry>, SkillError> {
-    let entries = match std::fs::read_dir(root) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
-        Err(error) => return Err(SkillError::Directory(error)),
-    };
-    let mut found = vec![];
-    for entry in entries {
-        let entry = entry.map_err(SkillError::Directory)?;
-        let kind = entry.file_type().map_err(SkillError::Directory)?;
-        let Some(directory) = entry.file_name().to_str().map(str::to_owned) else {
-            continue;
-        };
-        // Hidden entries and loose files are not skills; symlinks are never followed.
-        if !kind.is_dir() || directory.starts_with('.') {
-            continue;
-        }
-        if found.len() == MAX_SKILLS {
-            return Err(SkillError::TooMany { limit: MAX_SKILLS });
-        }
-        let skill = load(root, &directory).map(|(mut skill, _)| {
-            // Listings must not retain up to 256 complete 2-MiB packages.
-            skill.files.clear();
-            skill
-        });
-        found.push(Entry { directory, skill });
-    }
-    found.sort_by(|a, b| a.directory.cmp(&b.directory));
-    Ok(found)
+    SkillsDir::profile(root).scan()
 }
 
-/// Read and parse one skill, returning it with the exact `SKILL.md` text.
+/// [`SkillsDir::load`] from the profile skills directory `root`.
 pub fn load(root: &Path, name: &str) -> Result<(Skill, String), SkillError> {
+    SkillsDir::profile(root).load(name)
+}
+
+/// [`SkillsDir::read_file`] from the profile skills directory `root`.
+pub fn read_file(root: &Path, name: &str, relative: &str) -> Result<Vec<u8>, SkillError> {
+    SkillsDir::profile(root).read_file(name, relative)
+}
+
+/// [`SkillsDir::read_approved_file`] from the profile skills directory `root`.
+pub fn read_approved_file(
+    root: &Path,
+    name: &str,
+    relative: &str,
+    digest: &str,
+) -> Result<Vec<u8>, SkillError> {
+    SkillsDir::profile(root).read_approved_file(name, relative, digest)
+}
+
+fn load_in(root: &Dir, name: &str) -> Result<(Skill, String), SkillError> {
     if !valid_name(name) {
         return Err(SkillError::Name);
     }
     let relative = Path::new("SKILL.md");
-    unlinked(&root.join(name), relative)?;
+    unlinked(root, name, relative)?;
     let bytes =
         read_bounded(root, name, relative, MAX_SKILL_BYTES).map_err(|error| match error {
             Bounded::Io(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -326,82 +484,29 @@ pub fn load(root: &Path, name: &str) -> Result<(Skill, String), SkillError> {
     Ok((skill, text.to_owned()))
 }
 
-/// Read a supporting file of skill `name` by its path relative to the skill.
-/// Paths that are absolute, climb out of the skill or pass through a symlink
-/// are refused.
-pub fn read_file(root: &Path, name: &str, relative: &str) -> Result<Vec<u8>, SkillError> {
-    if !valid_name(name) {
-        return Err(SkillError::Name);
-    }
-    let relative = Path::new(relative);
-    if relative.as_os_str().is_empty()
-        || !relative
-            .components()
-            .all(|c| matches!(c, Component::Normal(_)))
-    {
-        return Err(SkillError::Path);
-    }
-    unlinked(&root.join(name), relative)?;
-    read_bounded(root, name, relative, MAX_FILE_BYTES).map_err(|error| match error {
-        Bounded::Io(error) => SkillError::Read(error),
-        Bounded::TooLarge => SkillError::FileTooLarge {
-            limit: MAX_FILE_BYTES,
-        },
-    })
-}
-
-/// Serve bytes from the package snapshot whose digest the user approved.
-/// Never re-open a supporting file after checking a different snapshot.
-pub fn read_approved_file(
-    root: &Path,
-    name: &str,
-    relative: &str,
-    digest: &str,
-) -> Result<Vec<u8>, SkillError> {
-    if relative.is_empty()
-        || relative.contains('\\')
-        || !Path::new(relative)
-            .components()
-            .all(|c| matches!(c, Component::Normal(_)))
-    {
-        return Err(SkillError::Path);
-    }
-    // std::path accepts internal `.` and redundant separators. Use those
-    // validated components for the snapshot key, not the original spelling.
-    let key = Path::new(relative)
-        .components()
-        .map(|component| component.as_os_str().to_str().ok_or(SkillError::Path))
-        .collect::<Result<Vec<_>, _>>()?
-        .join("/");
-    let (mut skill, text) = load(root, name)?;
-    if skill.digest != digest {
-        return Err(SkillError::Changed);
-    }
-    if key == "SKILL.md" {
-        return Ok(text.into_bytes());
-    }
-    skill.files.remove(&key).ok_or(SkillError::NotFound)
-}
-
 /// Refuse a symlink at the skill directory or any component of `relative`
 /// below it, with a typed error. [`read_bounded`] opens the file again without
 /// following symlinks, so a link swapped in after this check fails to open.
-fn unlinked(base: &Path, relative: &Path) -> Result<(), SkillError> {
-    let mut path = base.to_path_buf();
-    let check = |path: &Path| {
-        let meta = std::fs::symlink_metadata(path).map_err(|error| match error.kind() {
-            std::io::ErrorKind::NotFound => SkillError::NotFound,
-            _ => SkillError::Read(error),
-        })?;
+fn unlinked(root: &Dir, name: &str, relative: &Path) -> Result<(), SkillError> {
+    let fail = |error: std::io::Error| match error.kind() {
+        std::io::ErrorKind::NotFound => SkillError::NotFound,
+        _ => SkillError::Read(error),
+    };
+    let check = |dir: &Dir, entry: &Path| {
+        let meta = dir.symlink_metadata(entry).map_err(fail)?;
         if meta.file_type().is_symlink() {
             return Err(SkillError::Path);
         }
         Ok(())
     };
-    check(&path)?;
-    for component in relative.components() {
-        path.push(component);
-        check(&path)?;
+    check(root, Path::new(name))?;
+    let mut dir = root.open_dir_nofollow(name).map_err(fail)?;
+    let mut components = relative.components().peekable();
+    while let Some(component) = components.next() {
+        check(&dir, component.as_ref())?;
+        if components.peek().is_some() {
+            dir = dir.open_dir_nofollow(component).map_err(fail)?;
+        }
     }
     Ok(())
 }
@@ -413,11 +518,10 @@ enum Bounded {
 /// Read `<root>/<name>/<relative>` without following a symlink at any
 /// component, so nothing outside the skill can be read even if the tree
 /// changes while it is read.
-fn read_bounded(root: &Path, name: &str, relative: &Path, limit: u64) -> Result<Vec<u8>, Bounded> {
-    use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt, OpenOptionsSyncExt};
+fn read_bounded(root: &Dir, name: &str, relative: &Path, limit: u64) -> Result<Vec<u8>, Bounded> {
+    use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt, OpenOptionsSyncExt};
     let open = || -> std::io::Result<std::fs::File> {
-        let mut dir = cap_std::fs::Dir::open_ambient_dir(root, cap_std::ambient_authority())?
-            .open_dir_nofollow(name)?;
+        let mut dir = root.open_dir_nofollow(name)?;
         let mut components = relative.components().peekable();
         while let Some(component) = components.next() {
             if components.peek().is_none() {

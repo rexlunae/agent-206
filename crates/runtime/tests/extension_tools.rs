@@ -897,7 +897,56 @@ async fn approved_skills_reach_the_model_through_the_skill_tools() {
         .respond(calls_response(api, std::slice::from_ref(&call), &nonce()))
         .await;
     let second = rig.next_request().await;
-    assert_eq!(result_for(api, &second.body, &call.id), Some(body));
+    assert_eq!(result_for(api, &second.body, &call.id), Some(body.clone()));
+    second.respond(text_response(api, &nonce())).await;
+    let thread = finished(task).await;
+    assert_eq!(thread.state, RunState::Complete, "{:?}", thread.error);
+
+    // A skill in the conversation's project, approved for that project,
+    // reaches the model under its project name beside the profile skill.
+    let project_body = nonce();
+    let dir = rig.workspace.path().join(".agent206/skills/notes");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("SKILL.md"),
+        format!("---\nname: notes\ndescription: Project notes.\n---\n{project_body}"),
+    )
+    .unwrap();
+    let project = rig.gateway.snapshot().unwrap().projects[0].id;
+    let Reply::Skill(reviewed) = rig
+        .run(Command::ReadProjectSkill {
+            project,
+            name: "notes".into(),
+        })
+        .await
+    else {
+        panic!("project skill read for review");
+    };
+    let approved = rig
+        .run(Command::SetProjectSkillEnabled {
+            project,
+            name: "notes".into(),
+            enabled: true,
+            digest: Some(reviewed.digest),
+        })
+        .await;
+    assert_eq!(approved, Reply::Ok);
+    let task = rig.send();
+    let first = rig.next_request().await;
+    let calls = [
+        Call::new(
+            a206_runtime::skill_tool::INFO,
+            json!({"name": "project:notes"}),
+        ),
+        Call::new(a206_runtime::skill_tool::INFO, json!({"name": "notes"})),
+    ];
+    first.respond(calls_response(api, &calls, &nonce())).await;
+    let second = rig.next_request().await;
+    assert_eq!(
+        result_for(api, &second.body, &calls[0].id),
+        Some(project_body)
+    );
+    assert_eq!(result_for(api, &second.body, &calls[1].id), Some(body));
     second.respond(text_response(api, &nonce())).await;
     let thread = finished(task).await;
     assert_eq!(thread.state, RunState::Complete, "{:?}", thread.error);

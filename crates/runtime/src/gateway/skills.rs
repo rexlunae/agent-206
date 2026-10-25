@@ -1,68 +1,123 @@
-//! Skills in the gateway's profile (`<data dir>/skills/<name>/SKILL.md`).
+//! Skills in the gateway's profile (`<data dir>/skills/<name>/SKILL.md`) and
+//! in projects (`<project root>/.agent206/skills/<name>/SKILL.md`).
 //! The user approves a skill as it is; any later edit withdraws that approval.
-//! A model sees only approved, unchanged skills, and a skill adds no authority.
+//! A project skill's approval holds only in that project. A model sees only
+//! approved, unchanged skills, and a skill adds no authority.
 use super::{Gateway, Result, write_settings};
-use crate::skill_tool::{self, SkillOffer};
+use crate::skill_tool::{self, SkillOffer, Sources};
 use a206_core::*;
-use a206_skills::{Skill, SkillError};
-use std::path::PathBuf;
+use a206_skills::{Skill, SkillError, SkillsDir};
+use std::{collections::BTreeMap, path::PathBuf};
+
+/// Each skill in `dir`, with its approval state under `approved`.
+fn summaries(dir: &SkillsDir, approved: &BTreeMap<String, String>) -> Result<Vec<SkillSummary>> {
+    let entries = dir.scan()?;
+    Ok(entries
+        .into_iter()
+        .map(|entry| {
+            let pinned = approved.get(&entry.directory);
+            match entry.skill {
+                Ok(skill) => SkillSummary {
+                    enabled: pinned == Some(&skill.digest),
+                    changed: pinned.is_some_and(|digest| *digest != skill.digest),
+                    digest: Some(skill.digest),
+                    unmet: skill.requires.unmet(),
+                    expects_env: skill.requires.env.clone(),
+                    name: skill.name,
+                    description: skill.description,
+                    emoji: skill.emoji,
+                    audit: skill.audit,
+                    failure: None,
+                },
+                Err(error) => SkillSummary {
+                    name: entry.directory,
+                    changed: pinned.is_some(),
+                    failure: Some(crate::error::report(&super::GatewayError::from(error))),
+                    ..Default::default()
+                },
+            }
+        })
+        .collect())
+}
+
+/// The exact package of skill `name` in `dir`, for review.
+fn review(dir: &SkillsDir, name: &str) -> Result<SkillText> {
+    let (skill, text) = dir.load(name)?;
+    Ok(SkillText {
+        name: skill.name,
+        text,
+        digest: skill.digest,
+        audit: skill.audit,
+        files: skill
+            .files
+            .into_iter()
+            .map(|(path, bytes)| SkillReviewFile {
+                path,
+                bytes: bytes.len() as u64,
+                text: std::str::from_utf8(&bytes)
+                    .ok()
+                    .filter(|text| !text.contains('\0'))
+                    .map(str::to_owned),
+            })
+            .collect(),
+    })
+}
+
+/// The digest to pin when enabling skill `name` in `dir`: the `reviewed`
+/// one, if the package still has it. `None` withdraws approval.
+fn reviewed_pin(
+    dir: &SkillsDir,
+    name: &str,
+    enabled: bool,
+    reviewed: Option<&str>,
+) -> Result<Option<String>> {
+    if !enabled {
+        return Ok(None);
+    }
+    let reviewed = reviewed.ok_or(SkillError::Unreviewed)?;
+    let (skill, _) = dir.load(name)?;
+    if skill.digest != reviewed {
+        return Err(SkillError::Changed.into());
+    }
+    Ok(Some(skill.digest))
+}
 
 impl Gateway {
     fn skills_root(&self) -> Result<PathBuf> {
         Ok(self.lock()?.root.join("skills"))
     }
+    fn project_skills_dir(&self, project: Id) -> Result<SkillsDir> {
+        Ok(SkillsDir::project(self.project_root(project)?))
+    }
 
     pub(super) fn skills(&self) -> Result<Vec<SkillSummary>> {
         let approved = self.lock()?.state.settings.enabled_skills.clone();
-        let entries = a206_skills::scan(&self.skills_root()?)?;
-        Ok(entries
-            .into_iter()
-            .map(|entry| {
-                let pinned = approved.get(&entry.directory);
-                match entry.skill {
-                    Ok(skill) => SkillSummary {
-                        enabled: pinned == Some(&skill.digest),
-                        changed: pinned.is_some_and(|digest| *digest != skill.digest),
-                        digest: Some(skill.digest),
-                        unmet: skill.requires.unmet(),
-                        expects_env: skill.requires.env.clone(),
-                        name: skill.name,
-                        description: skill.description,
-                        emoji: skill.emoji,
-                        audit: skill.audit,
-                        failure: None,
-                    },
-                    Err(error) => SkillSummary {
-                        name: entry.directory,
-                        changed: pinned.is_some(),
-                        failure: Some(crate::error::report(&super::GatewayError::from(error))),
-                        ..Default::default()
-                    },
-                }
-            })
-            .collect())
+        summaries(&SkillsDir::profile(self.skills_root()?), &approved)
+    }
+
+    /// The skills in `project`'s `.agent206/skills` directory.
+    pub(super) fn project_skills(&self, project: Id) -> Result<Vec<SkillSummary>> {
+        let dir = self.project_skills_dir(project)?;
+        let approved = self.project_pins(project)?;
+        summaries(&dir, &approved)
+    }
+    fn project_pins(&self, project: Id) -> Result<BTreeMap<String, String>> {
+        Ok(self
+            .lock()?
+            .state
+            .settings
+            .enabled_project_skills
+            .get(&project)
+            .cloned()
+            .unwrap_or_default())
     }
 
     pub(super) fn read_skill(&self, name: &str) -> Result<SkillText> {
-        let (skill, text) = a206_skills::load(&self.skills_root()?, name)?;
-        Ok(SkillText {
-            name: skill.name,
-            text,
-            digest: skill.digest,
-            audit: skill.audit,
-            files: skill
-                .files
-                .into_iter()
-                .map(|(path, bytes)| SkillReviewFile {
-                    path,
-                    bytes: bytes.len() as u64,
-                    text: std::str::from_utf8(&bytes)
-                        .ok()
-                        .filter(|text| !text.contains('\0'))
-                        .map(str::to_owned),
-                })
-                .collect(),
-        })
+        review(&SkillsDir::profile(self.skills_root()?), name)
+    }
+
+    pub(super) fn read_project_skill(&self, project: Id, name: &str) -> Result<SkillText> {
+        review(&self.project_skills_dir(project)?, name)
     }
 
     /// Approve the version of the skill the user reviewed, identified by its
@@ -74,22 +129,44 @@ impl Gateway {
         enabled: bool,
         reviewed: Option<&str>,
     ) -> Result<()> {
-        let digest = if enabled {
-            let reviewed = reviewed.ok_or(SkillError::Unreviewed)?;
-            let (skill, _) = a206_skills::load(&self.skills_root()?, name)?;
-            if skill.digest != reviewed {
-                return Err(SkillError::Changed.into());
+        let dir = SkillsDir::profile(self.skills_root()?);
+        let digest = reviewed_pin(&dir, name, enabled, reviewed)?;
+        self.edit_skill_pins(|settings| {
+            match digest {
+                Some(digest) => settings.enabled_skills.insert(name.to_owned(), digest),
+                None => settings.enabled_skills.remove(name),
+            };
+        })
+    }
+
+    /// [`Gateway::set_skill_enabled`] for a skill of `project`, approved for
+    /// conversations in that project only.
+    pub(super) fn set_project_skill_enabled(
+        &self,
+        project: Id,
+        name: &str,
+        enabled: bool,
+        reviewed: Option<&str>,
+    ) -> Result<()> {
+        let dir = self.project_skills_dir(project)?;
+        let digest = reviewed_pin(&dir, name, enabled, reviewed)?;
+        self.edit_skill_pins(|settings| {
+            let pins = settings.enabled_project_skills.entry(project).or_default();
+            match digest {
+                Some(digest) => pins.insert(name.to_owned(), digest),
+                None => pins.remove(name),
+            };
+            if pins.is_empty() {
+                settings.enabled_project_skills.remove(&project);
             }
-            Some(skill.digest)
-        } else {
-            None
-        };
+        })
+    }
+
+    /// Record an approval change: skill approval is its own user operation.
+    fn edit_skill_pins(&self, edit: impl FnOnce(&mut Settings)) -> Result<()> {
         let mut store = self.lock()?;
         let mut settings = store.state.settings.clone();
-        match digest {
-            Some(digest) => settings.enabled_skills.insert(name.to_owned(), digest),
-            None => settings.enabled_skills.remove(name),
-        };
+        edit(&mut settings);
         settings.revision += 1;
         write_settings(&store.root, &settings)?;
         store.state.settings = settings;
@@ -97,22 +174,26 @@ impl Gateway {
         Ok(())
     }
 
+    /// The skill folders and approvals `thread` may read: the profile's,
+    /// and its project's when it may read that project.
+    fn skill_sources(&self, thread: Id) -> Result<Sources> {
+        let scope = self.scope(thread)?;
+        let root = self.skills_root()?;
+        let store = self.lock()?;
+        let project = skill_tool::project_scope(&store, thread, &scope.capabilities);
+        Ok(Sources::new(&store.state.settings, &root, project.as_ref()))
+    }
+
     /// Load a skill only if the user approved exactly this version of it.
     fn approved_skill(&self, thread: Id, name: &str) -> Result<Skill> {
-        let pins = self.skill_pins(thread)?;
-        Ok(skill_tool::approved(&self.skills_root()?, &pins, name)?)
-    }
-    fn skill_pins(&self, thread: Id) -> Result<std::collections::BTreeMap<String, String>> {
-        let store = self.lock()?;
-        store.thread(thread)?;
-        Ok(store.state.settings.enabled_skills.clone())
+        Ok(skill_tool::approved(&self.skill_sources(thread)?, name)?)
     }
 
     /// Approved, unchanged skills `thread` may be told about. Skills that
     /// changed or no longer parse are left out; the Skills page shows why.
+    /// Project skills are named with [`skill_tool::PROJECT_PREFIX`].
     pub fn skill_offers(&self, thread: Id) -> Result<Vec<SkillOffer>> {
-        let pins = self.skill_pins(thread)?;
-        Ok(skill_tool::offers(&self.skills_root()?, &pins)?)
+        Ok(skill_tool::offers(&self.skill_sources(thread)?)?)
     }
 
     /// The model-facing skill list for `thread`'s system prompt.
@@ -130,12 +211,10 @@ impl Gateway {
 
     /// A supporting file inside an approved skill, by relative path.
     pub fn skill_file(&self, thread: Id, name: &str, path: &str) -> Result<Vec<u8>> {
-        let pins = self.skill_pins(thread)?;
-        Ok(a206_skills::read_approved_file(
-            &self.skills_root()?,
+        Ok(skill_tool::approved_file(
+            &self.skill_sources(thread)?,
             name,
             path,
-            pins.get(name).ok_or(SkillError::Disabled)?,
         )?)
     }
 }
@@ -375,5 +454,257 @@ mod tests {
         // The audit only advises: the user can still approve the skill.
         let digest = g.read_skill("risky").unwrap().digest;
         g.set_skill_enabled("risky", true, Some(&digest)).unwrap();
+    }
+
+    /// Write skill `name` into the `.agent206/skills` folder of the project at `root`.
+    fn write_in_project(root: &std::path::Path, name: &str, body: &str) {
+        let dir = root.join(".agent206/skills").join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: Project help.\n---\n{body}"),
+        )
+        .unwrap();
+    }
+    /// A project at `root` and its manager conversation.
+    async fn project(g: &Gateway, root: &std::path::Path) -> (Id, Id) {
+        let Reply::Project(project) = send(
+            g,
+            Command::CreateProject {
+                name: Id::new_v4().to_string(),
+                root: root.display().to_string(),
+            },
+        )
+        .await
+        else {
+            panic!("project created");
+        };
+        (project.id, project.manager)
+    }
+    /// Let `thread` read its project, or not, within the Plan mode ceiling.
+    fn may_read(g: &Gateway, thread: Id, read: bool) {
+        let mut store = g.lock().unwrap();
+        let thread = store.thread_mut(thread).unwrap();
+        thread.mode = Mode::Plan;
+        thread.grant.capabilities = if read {
+            [Capability::ReadWorkspace].into()
+        } else {
+            Default::default()
+        };
+    }
+    fn offered(g: &Gateway, thread: Id) -> Vec<String> {
+        g.skill_offers(thread)
+            .unwrap()
+            .into_iter()
+            .map(|offer| offer.name)
+            .collect()
+    }
+    async fn project_list(g: &Gateway, project: Id) -> Vec<SkillSummary> {
+        let Reply::Skills(skills) = send(g, Command::ProjectSkills { project }).await else {
+            panic!("project skills listed");
+        };
+        skills
+    }
+
+    #[tokio::test]
+    async fn project_skills_are_approved_per_project_and_offered_only_there() {
+        let state = tempfile::tempdir().unwrap();
+        let (a_root, b_root) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let g = Gateway::open(state.path()).unwrap();
+        let (a, a_thread) = project(&g, a_root.path()).await;
+        let (b, b_thread) = project(&g, b_root.path()).await;
+        for thread in [a_thread, b_thread] {
+            may_read(&g, thread, true);
+        }
+        // The same package in both projects, as an agent with write access
+        // could create it, and a different profile skill of the same name.
+        let body = Id::new_v4().to_string();
+        write_in_project(a_root.path(), "notes", &body);
+        write_in_project(b_root.path(), "notes", &body);
+        let profile_body = Id::new_v4().to_string();
+        write(&g, "notes", &profile_body);
+
+        let listed = project_list(&g, a).await;
+        assert_eq!(listed.len(), 1);
+        assert!(!listed[0].enabled && !listed[0].changed, "{listed:?}");
+        assert!(offered(&g, a_thread).is_empty());
+
+        let Reply::Skill(reviewed) = send(
+            &g,
+            Command::ReadProjectSkill {
+                project: a,
+                name: "notes".into(),
+            },
+        )
+        .await
+        else {
+            panic!("project skill read for review");
+        };
+        assert!(reviewed.text.ends_with(&body));
+        // Saving settings cannot approve a project skill.
+        let mut settings = g.lock().unwrap().state.settings.clone();
+        settings
+            .enabled_project_skills
+            .entry(a)
+            .or_default()
+            .insert("notes".into(), reviewed.digest.clone());
+        assert_eq!(
+            send(&g, Command::SaveSettings(Box::new(settings))).await,
+            Reply::Ok
+        );
+        assert!(offered(&g, a_thread).is_empty());
+        let enable = |project, enabled, digest| Command::SetProjectSkillEnabled {
+            project,
+            name: "notes".into(),
+            enabled,
+            digest,
+        };
+        let Reply::Error(report) = send(&g, enable(a, true, None)).await else {
+            panic!("approval without a review is refused");
+        };
+        assert_eq!(report.kind, ErrorKind::InvalidRequest);
+        assert_eq!(
+            send(&g, enable(a, true, Some(reviewed.digest.clone()))).await,
+            Reply::Ok
+        );
+
+        // Approval in project A covers A's conversations only, although B
+        // holds the identical package.
+        assert_eq!(offered(&g, a_thread), ["project:notes"]);
+        assert!(offered(&g, b_thread).is_empty());
+        assert!(!project_list(&g, b).await[0].enabled);
+        assert!(project_list(&g, a).await[0].enabled);
+        assert!(matches!(
+            g.skill_instructions(b_thread, "project:notes"),
+            Err(GatewayError::Skill(SkillError::Disabled))
+        ));
+        assert_eq!(
+            g.skill_instructions(a_thread, "project:notes").unwrap(),
+            body
+        );
+        assert!(
+            g.skill_index(a_thread)
+                .unwrap()
+                .contains("<skill name=\"project:notes\">Project help.</skill>")
+        );
+
+        // Neither skill shadows the other: each keeps its own name.
+        assert!(matches!(
+            g.skill_instructions(a_thread, "notes"),
+            Err(GatewayError::Skill(SkillError::Disabled))
+        ));
+        let digest = g.read_skill("notes").unwrap().digest;
+        g.set_skill_enabled("notes", true, Some(&digest)).unwrap();
+        assert_eq!(offered(&g, a_thread), ["notes", "project:notes"]);
+        assert_eq!(offered(&g, b_thread), ["notes"]);
+        assert_eq!(
+            g.skill_instructions(a_thread, "notes").unwrap(),
+            profile_body
+        );
+        assert_eq!(
+            g.skill_instructions(a_thread, "project:notes").unwrap(),
+            body
+        );
+
+        // Without ReadWorkspace, or outside the project, it is not offered.
+        may_read(&g, a_thread, false);
+        assert_eq!(offered(&g, a_thread), ["notes"]);
+        assert!(matches!(
+            g.skill_instructions(a_thread, "project:notes"),
+            Err(GatewayError::Skill(SkillError::Disabled))
+        ));
+        may_read(&g, a_thread, true);
+        let Reply::Thread(loose) = send(
+            &g,
+            Command::CreateThread {
+                title: "Elsewhere".into(),
+                mode: Mode::Plan,
+            },
+        )
+        .await
+        else {
+            panic!("thread created");
+        };
+        may_read(&g, loose.id, true);
+        assert_eq!(offered(&g, loose.id), ["notes"]);
+
+        // The approval survives a restart.
+        drop(g);
+        let g = Gateway::open(state.path()).unwrap();
+        assert_eq!(offered(&g, a_thread), ["notes", "project:notes"]);
+
+        // An edit, for example by an agent, withdraws the approval.
+        write_in_project(a_root.path(), "notes", "Do something else.");
+        assert_eq!(offered(&g, a_thread), ["notes"]);
+        assert!(matches!(
+            g.skill_instructions(a_thread, "project:notes"),
+            Err(GatewayError::Skill(SkillError::Changed))
+        ));
+        let listed = project_list(&g, a).await;
+        assert!(listed[0].changed && !listed[0].enabled);
+        let Reply::Error(report) = send(&g, enable(a, true, Some(reviewed.digest))).await else {
+            panic!("approval of changed text is refused");
+        };
+        assert_eq!(report.kind, ErrorKind::PermissionDenied);
+
+        assert_eq!(send(&g, enable(a, false, None)).await, Reply::Ok);
+        assert!(
+            g.lock()
+                .unwrap()
+                .state
+                .settings
+                .enabled_project_skills
+                .is_empty()
+        );
+        let Reply::Error(report) = send(
+            &g,
+            Command::ProjectSkills {
+                project: Id::new_v4(),
+            },
+        )
+        .await
+        else {
+            panic!("an unknown project has no skills");
+        };
+        assert_eq!(report.kind, ErrorKind::NotFound);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_linked_project_skills_folder_is_refused() {
+        let state = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let g = Gateway::open(state.path()).unwrap();
+        let (project, thread) = project(&g, root.path()).await;
+        may_read(&g, thread, true);
+        write_in_project(root.path(), "notes", "Reviewed.");
+        let digest = g.read_project_skill(project, "notes").unwrap().digest;
+        g.set_project_skill_enabled(project, "notes", true, Some(&digest))
+            .unwrap();
+        assert_eq!(offered(&g, thread), ["project:notes"]);
+        // Replace the folder with a link to an identical copy elsewhere.
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::rename(
+            root.path().join(".agent206/skills"),
+            outside.path().join("skills"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("skills"),
+            root.path().join(".agent206/skills"),
+        )
+        .unwrap();
+        assert!(matches!(
+            g.skill_offers(thread),
+            Err(GatewayError::Skill(SkillError::Linked { .. }))
+        ));
+        assert!(matches!(
+            g.skill_instructions(thread, "project:notes"),
+            Err(GatewayError::Skill(SkillError::Linked { .. }))
+        ));
+        let Reply::Error(report) = send(&g, Command::ProjectSkills { project }).await else {
+            panic!("a linked folder is not listed");
+        };
+        assert_eq!(report.kind, ErrorKind::PermissionDenied);
     }
 }

@@ -284,7 +284,7 @@ unsafe operation.
 
 | Request | Needs | Reply | Bounds |
 | --- | --- | --- | --- |
-| `skill_list` | bundled `agent206.skills` only + enabled builtin/current approval pins | complete index as UTF-8 file bytes | 64 KiB, no partial success |
+| `skill_list` | bundled `agent206.skills` only + enabled builtin/current approval pins (profile, and the conversation's project's when it may read the project) | complete index as UTF-8 file bytes; project skills named `project:NAME` | 64 KiB, no partial success |
 | `skill_read { name, path }` | same builtin/pin checks; no workspace authority | approved instructions or supporting UTF-8 file bytes | 64 KiB result, relative paths only, no traversal or symlinks |
 | `read_file { path }` | `read_workspace` + a project | file bytes | 512 KiB, regular files only (opened without blocking) |
 | `list_directory { path }` | `read_workspace` + a project | entries (name, kind, size if known) | 1,024 entries |

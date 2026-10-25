@@ -178,6 +178,9 @@ pub struct Scope {
     /// each host call is checked against it as well, so a conversation grant
     /// withdrawn mid-invocation stops the calls that need it.
     pub current: Option<CurrentCeiling>,
+    /// The project whose approved skills the skills builtin may read for
+    /// this call; `None` for every other caller.
+    pub project_skills: Option<crate::skill_tool::ProjectSkills>,
 }
 
 /// Reads a caller's current ceiling; `None` once the caller is gone.
@@ -655,6 +658,7 @@ impl ExtensionHost {
             current: scope.current,
             workspace: scope.workspace,
             skills_root: self.data_dir.join("skills"),
+            project_skills: scope.project_skills,
             store: Arc::clone(&self.store),
             hosts: manifest.hosts.clone(),
             net: Arc::clone(&self.net),
@@ -820,6 +824,8 @@ async fn read_frame<T: serde::de::DeserializeOwned>(
 /// Executes relayed host calls for one invocation.
 struct HostCalls {
     skills_root: PathBuf,
+    /// The project skills the caller may read, if any.
+    project_skills: Option<crate::skill_tool::ProjectSkills>,
     extension: String,
     effective: BTreeSet<Capability>,
     /// The caller's current ceiling, read again for every call.
@@ -893,36 +899,58 @@ impl HostCalls {
                 "skill reads are restricted to the skills builtin",
             ));
         }
-        let pins = self.lock()?.state.settings.enabled_skills.clone();
+        // Project skills are read only while the conversation may still
+        // read its project, so a grant revoked during the call withdraws
+        // them; profile skills stay readable.
+        let project = self
+            .project_skills
+            .as_ref()
+            .filter(|_| self.may_read_project());
+        // The index includes project skills; a named read reaches the
+        // project only for a `project:` name.
+        let reads_project = project.is_some()
+            && (name != crate::skill_tool::INFO
+                || arguments
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|skill| skill.starts_with(crate::skill_tool::PROJECT_PREFIX)));
+        let sources = |settings: &a206_core::Settings| {
+            crate::skill_tool::Sources::new(settings, &self.skills_root, project)
+        };
+        let pins = sources(&self.lock()?.state.settings);
         let approved = pins.clone();
-        let root = self.skills_root.clone();
         let request = crate::tools::ToolRequest {
             call: String::new(),
             name: name.into(),
             arguments,
             approved: false,
         };
-        let text =
-            crate::skill_tool::io(move || crate::skill_tool::read(&root, &approved, &request))
-                .await
-                .map_err(|error| {
-                    let report = crate::error::handle("skill_host_read", &error);
-                    let code =
-                        if matches!(&error, crate::skill_tool::SkillToolError::TooLarge { .. }) {
-                            HostErrorCode::TooLarge
-                        } else {
-                            match report.kind {
-                                ErrorKind::PermissionDenied => HostErrorCode::Denied,
-                                ErrorKind::NotFound => HostErrorCode::NotFound,
-                                ErrorKind::InvalidRequest => HostErrorCode::Invalid,
-                                ErrorKind::Timeout => HostErrorCode::Timeout,
-                                _ => HostErrorCode::Io,
-                            }
-                        };
-                    failure(code, &report.message)
-                })?;
+        let text = crate::skill_tool::io(move || crate::skill_tool::read(&approved, &request))
+            .await
+            .map_err(|error| {
+                let report = crate::error::handle("skill_host_read", &error);
+                let code = if matches!(&error, crate::skill_tool::SkillToolError::TooLarge { .. }) {
+                    HostErrorCode::TooLarge
+                } else {
+                    match report.kind {
+                        ErrorKind::PermissionDenied => HostErrorCode::Denied,
+                        ErrorKind::NotFound => HostErrorCode::NotFound,
+                        ErrorKind::InvalidRequest => HostErrorCode::Invalid,
+                        ErrorKind::Timeout => HostErrorCode::Timeout,
+                        _ => HostErrorCode::Io,
+                    }
+                };
+                failure(code, &report.message)
+            })?;
+        // Read outside the store lock: the caller's ceiling takes it.
+        if reads_project && !self.may_read_project() {
+            return Err(failure(
+                HostErrorCode::Denied,
+                "the conversation this runs for no longer allows reading its project",
+            ));
+        }
         let store = self.lock()?;
-        if store.state.settings.enabled_skills != pins
+        if sources(&store.state.settings) != pins
             || !store
                 .state
                 .plugins
@@ -935,6 +963,13 @@ impl HostCalls {
             ));
         }
         Ok(HostReply::File(text.into_bytes().into()))
+    }
+    /// Whether the caller's conversation may read its project now.
+    fn may_read_project(&self) -> bool {
+        self.current
+            .as_ref()
+            .and_then(CurrentCeiling::read)
+            .is_some_and(|ceiling| crate::instructions::permitted(&ceiling))
     }
     async fn execute(&mut self, request: HostRequest) -> Result<HostReply, HostFailure> {
         // The stored plugin is read again for every call, so disabling or
