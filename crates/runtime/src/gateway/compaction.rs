@@ -120,32 +120,50 @@ struct Plan {
     transcript: String,
 }
 
-/// The latest summary's position, and where each turn after it starts (a
-/// turn starts at a user message).
+/// The latest summary's position, and where each turn after it starts. A
+/// turn starts at a user message, or, when the latest summary was cut inside
+/// a turn, just after the summary: the rest of that turn, whose request
+/// precedes the summary, is a turn of its own.
 fn turns(thread: &Thread) -> (Option<usize>, Vec<usize>) {
     let messages = &thread.messages;
     let previous = messages.iter().rposition(|m| m.compaction.is_some());
     let start = previous.map_or(0, |at| at + 1);
+    let continued = kept_request(thread, previous).is_some()
+        && messages.get(start).is_some_and(|m| m.role != Role::User);
     let turns = (start..messages.len())
-        .filter(|&at| messages[at].role == Role::User)
+        .filter(|&at| messages[at].role == Role::User || (continued && at == start))
         .collect();
     (previous, turns)
 }
 
-/// A cut inside the turn in progress: the position of the turn's request
-/// (the latest user message) and of the first round kept, when the turn has
-/// more than [`KEEP_ROUNDS`] rounds after the latest summary.
+/// The position of the request the summary at `summary` kept verbatim,
+/// when it was cut inside a turn.
+fn kept_request(thread: &Thread, summary: Option<usize>) -> Option<usize> {
+    let messages = &thread.messages;
+    let id = messages[summary?].compaction.as_ref()?.request?;
+    messages[..summary?].iter().position(|m| m.id == id)
+}
+
+/// A cut inside a turn: the position of that turn's request and of the first
+/// round kept, in the earliest turn after the latest summary with more than
+/// [`KEEP_ROUNDS`] rounds. The turn in progress is the usual case; an earlier
+/// one is cut when a run ended before its summary could be made (a memory
+/// flush answered with text), or when a later turn followed an in-turn cut.
 fn within_turn(thread: &Thread) -> Option<(usize, usize)> {
     let messages = &thread.messages;
-    let request = messages.iter().rposition(|m| m.role == Role::User)?;
-    let after_summary = messages
-        .iter()
-        .rposition(|m| m.compaction.is_some())
-        .map_or(0, |at| at + 1);
-    let rounds: Vec<usize> = (after_summary.max(request + 1)..messages.len())
-        .filter(|&at| messages[at].role == Role::Assistant)
-        .collect();
-    (rounds.len() > KEEP_ROUNDS).then(|| (request, rounds[rounds.len() - KEEP_ROUNDS]))
+    let (previous, starts) = turns(thread);
+    starts.iter().enumerate().find_map(|(index, &first)| {
+        let end = starts.get(index + 1).copied().unwrap_or(messages.len());
+        let request = if messages[first].role == Role::User {
+            first
+        } else {
+            kept_request(thread, previous)?
+        };
+        let rounds: Vec<usize> = (first..end)
+            .filter(|&at| messages[at].role == Role::Assistant)
+            .collect();
+        (rounds.len() > KEEP_ROUNDS).then(|| (request, rounds[rounds.len() - KEEP_ROUNDS]))
+    })
 }
 
 /// Whether a compaction keeping the last `keep_turns` turns, or else the
@@ -175,9 +193,7 @@ fn plan(thread: &Thread, keep_turns: usize) -> Result<Plan, CompactionError> {
     // The summarizing model reads the turn's request too, in order: the
     // one this cut keeps, or the one the previous summary kept, which no
     // summary has covered. A kept request is not counted as covered.
-    let earlier_request = previous
-        .and_then(|at| messages[at].compaction.as_ref()?.request)
-        .and_then(|id| messages[..start].iter().position(|m| m.id == id));
+    let earlier_request = kept_request(thread, previous);
     let shown: Vec<&Message> = request
         .or(earlier_request)
         .filter(|&at| at < start)
@@ -556,6 +572,52 @@ mod tests {
         assert_eq!(whole.request, None);
         assert_eq!(whole.previous, Some(summary));
         assert!(whole.transcript.contains(request.text.as_str()));
+    }
+    #[test]
+    fn the_rest_of_a_turn_cut_inside_counts_as_a_turn() {
+        let mut thread = Thread::new(Id::new_v4().to_string(), Mode::Code);
+        let request = message(Role::User);
+        thread.messages.push(request.clone());
+        for _ in 0..=KEEP_ROUNDS {
+            thread.messages.push(message(Role::Assistant));
+        }
+        let first = plan(&thread, KEEP_DURING_RUN).unwrap();
+        let summary = insert(&mut thread, &first);
+        let kept: Vec<Id> = thread.messages[thread.messages.len() - KEEP_ROUNDS..]
+            .iter()
+            .map(|m| m.id)
+            .collect();
+        // One new turn after the summary: a manual compaction keeping it
+        // summarizes the rounds the summary kept, with their request shown.
+        thread.messages.push(message(Role::User));
+        thread.messages.push(message(Role::Assistant));
+        assert!(compactable(&thread, KEEP_BETWEEN_RUNS));
+        let manual = plan(&thread, KEEP_BETWEEN_RUNS).unwrap();
+        assert_eq!(manual.previous, Some(summary));
+        assert_eq!(manual.request, None);
+        assert_eq!(manual.covered, u32::try_from(KEEP_ROUNDS).unwrap());
+        assert_eq!(manual.through, kept[KEEP_ROUNDS - 1]);
+        assert!(manual.transcript.contains(request.text.as_str()));
+    }
+    #[test]
+    fn an_earlier_long_turn_is_cut_inside_before_a_short_later_one() {
+        let mut thread = Thread::new(Id::new_v4().to_string(), Mode::Code);
+        let request = message(Role::User);
+        thread.messages.push(request.clone());
+        for _ in 0..=KEEP_ROUNDS + 1 {
+            thread.messages.push(message(Role::Assistant));
+        }
+        // A run ended before the long turn was summarized; a short turn follows.
+        let rounds = thread.messages[1..].to_vec();
+        thread.messages.push(message(Role::User));
+        assert!(compactable(&thread, KEEP_DURING_RUN));
+        let cut = plan(&thread, KEEP_DURING_RUN).unwrap();
+        assert_eq!(cut.request, Some(request.id));
+        assert_eq!(cut.first_kept, rounds[rounds.len() - KEEP_ROUNDS].id);
+        assert_eq!(
+            cut.covered,
+            u32::try_from(rounds.len() - KEEP_ROUNDS).unwrap()
+        );
     }
     #[test]
     fn a_long_transcript_leaves_out_its_earliest_messages() {

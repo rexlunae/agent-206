@@ -1020,10 +1020,12 @@ previous summary first.
   API-reported `ModelInfo::context_limit`, the run compacts everything before the
   current and the previous turn. Before the first round "previous" is the last
   request of the previous run. An unknown limit or input count never triggers it.
-  When only those two turns are in context, the run instead cuts inside the turn
-  in progress once it has more than two rounds (assistant messages) since the
-  latest summary: everything before its last two rounds is summarized except the
-  turn's request, which the summarizing model reads but which stays verbatim. With
+  When only those two turns are in context, the run instead cuts inside the
+  earliest turn since the latest summary with more than two rounds (assistant
+  messages), usually the turn in progress: everything before that turn's last two
+  rounds is summarized except its request, which the summarizing model reads but
+  which stays verbatim. After such a cut, the rest of that turn counts as a turn of
+  its own, so a later whole-turn cut can summarize it. With
   two rounds or fewer there is nothing to compact and the request is sent as it
   is, so a single round larger than the window is not reduced.
 - **Manual.** `Command::CompactThread { thread }` compacts a native conversation
