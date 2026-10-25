@@ -423,6 +423,11 @@ impl SshSession {
             .take(limit as u64 + 1)
             .read_to_end(&mut body)
             .await;
+        // Refused before waiting: ssh may be blocked writing the rest, and
+        // dropping the session kills it.
+        if body.len() > limit {
+            return Err(RemoteError::SshTooLarge(limit));
+        }
         let status = self.exit().await;
         match status {
             Some(status) if status.success() && read.is_ok() => {}
@@ -434,9 +439,6 @@ impl SshSession {
                 error = &error as &dyn std::error::Error,
                 "the vault refused a signature ssh asked for"
             );
-        }
-        if body.len() > limit {
-            return Err(RemoteError::SshTooLarge(limit));
         }
         Ok(body)
     }
@@ -607,6 +609,38 @@ mod tests {
         ] {
             assert!(matches!(parse(&bad), Some(Err(_))), "{bad}");
         }
+    }
+
+    /// An answer over the limit is refused at once, though the server
+    /// still has more to send.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_oversized_answer_is_refused_without_waiting_for_ssh() {
+        let mut child = Command::new("yes")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let (_, failures) = mpsc::channel(1);
+        let session = SshSession {
+            stdin: child.stdin.take(),
+            stdout: child.stdout.take().unwrap(),
+            stderr: tokio::spawn(tail(child.stderr.take().unwrap())),
+            agent: tokio::spawn(async {}),
+            failures,
+            remote: SshRemote::parse(&format!("{}.test:r", name()))
+                .unwrap()
+                .unwrap(),
+            _dir: tempfile::tempdir().unwrap(),
+            child,
+        };
+        let limit = 1024 + usize::from(uuid::Uuid::new_v4().as_bytes()[0]);
+        assert!(matches!(
+            session.finish(None, limit).await,
+            Err(RemoteError::SshTooLarge(l)) if l == limit
+        ));
     }
 
     #[test]
