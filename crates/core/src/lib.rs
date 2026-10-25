@@ -239,6 +239,10 @@ pub struct BackendConfig {
     pub runtime_root: String,
     /// Absolute Claude ACP adapter JavaScript entry point; absent for Codex.
     pub adapter_script: Option<String>,
+    /// Give the runtime the settings' program directories, read-only and
+    /// executable, when its thread is granted Execute. Off unless chosen.
+    #[serde(default)]
+    pub program_directories: bool,
 }
 
 /// Configured accounts are separate from bundled connector identities.

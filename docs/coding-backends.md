@@ -80,6 +80,17 @@ agent206 backend configure codex --executable "$CODEX_BINARY" --runtime-root "$C
 agent206 backend configure claude-agent --executable "$NODE_BINARY" --runtime-root "$CLAUDE_INSTALLATION" --adapter-script "$CLAUDE_ACP_ENTRY"
 ```
 
+A runtime can also be given the program directories chosen in Modes settings
+(Homebrew, toolchains), so the commands it runs can find them. Turn on "Use
+program directories" for that runtime, or add `--program-directories` to
+`backend configure`; it is off by default. The directories are given only when
+the conversation also grants command access. They are mounted read-only and
+executable, with each one's `bin` (or the directory itself) on the runtime's
+`PATH` after its own installation, and checked again each time the runtime
+starts. A missing, protected or too broad directory fails the turn with that
+error rather than starting without it. Changing the directories stops a running
+turn of a runtime that uses them, since its mounts no longer match.
+
 Codex requires a compatible provider endpoint with the Responses API, which is
 not implied by support for chat completions. Claude Agent requires the Anthropic
 Messages protocol. Both use the exact model selected from the provider's live API.

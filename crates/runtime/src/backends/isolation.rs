@@ -35,6 +35,7 @@ impl Process {
         thread: &Thread,
         workspace: Option<&Path>,
         state_root: &Path,
+        programs: &[PathBuf],
         port: u16,
         token: &str,
     ) -> Result<Self> {
@@ -113,6 +114,22 @@ impl Process {
         } else {
             None
         };
+        let mut hidden = a206_sandbox::hidden_home_paths();
+        hidden.push(state_root.clone());
+        // Checked again as the runtime starts: a directory may have changed
+        // since it was saved. Without Execute nothing in them could run.
+        let programs = if thread.grant.capabilities.contains(&Capability::Execute) {
+            let home = std::env::var_os("HOME").map(PathBuf::from);
+            crate::exec_tool::programs::validate(
+                programs,
+                &[],
+                &hidden,
+                home.as_deref(),
+                &state_root,
+            )?
+        } else {
+            vec![]
+        };
         // Start outside the user's project so engines cannot discover ambient project
         // settings, hooks, plugins or MCP servers during their own initialization.
         let cwd = scratch_root.join("workspace");
@@ -123,32 +140,30 @@ impl Process {
         std::fs::create_dir(&tmp).map_err(BackendError::Setup)?;
         #[cfg(target_os = "linux")]
         let control = crate::sandbox::Control::bind(&scratch_root.join("control"), Some(port))?;
-        let mut command = sandbox_command(
-            &executable,
-            &root,
-            &scratch_root,
-            workspace.as_deref().unwrap_or(&cwd),
-            &state_root,
-            thread,
-            port,
-        )?;
+        let mounts = Mounts {
+            root: &root,
+            scratch: &scratch_root,
+            workspace: workspace.as_deref().unwrap_or(&cwd),
+            hidden: &hidden,
+            programs: &programs,
+        };
+        let mut command = sandbox_command(&executable, &mounts, thread, port)?;
+        let bin = executable.parent().ok_or(BackendError::Placement(
+            "executable must be a file inside its installation directory",
+        ))?;
+        // `validate` refused program directories containing a separator.
+        let mut path = std::ffi::OsString::from(bin);
+        for directory in a206_sandbox::program_search_path(&programs) {
+            path.push(":");
+            path.push(directory);
+        }
+        path.push(":/usr/bin:/bin");
         command
             .env_clear()
             .current_dir(&cwd)
             .env("HOME", &home)
             .env("TMPDIR", &tmp)
-            .env(
-                "PATH",
-                format!(
-                    "{}:/usr/bin:/bin",
-                    executable
-                        .parent()
-                        .ok_or(BackendError::Placement(
-                            "executable must be a file inside its installation directory",
-                        ))?
-                        .display()
-                ),
-            )
+            .env("PATH", path)
             .env("LANG", "en_US.UTF-8")
             .env("NO_BROWSER", "1")
             .env("NO_COLOR", "1")
@@ -240,23 +255,38 @@ impl Process {
         }
     }
 }
+/// The paths a runtime's sandbox is built from.
+// Unread where the platform refuses to sandbox a runtime.
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
+struct Mounts<'a> {
+    /// The runtime's installation, read-only.
+    root: &'a Path,
+    scratch: &'a Path,
+    /// The project, when the thread may read it.
+    workspace: &'a Path,
+    hidden: &'a [PathBuf],
+    /// Checked program directories, read-only and executable.
+    programs: &'a [PathBuf],
+}
 /// `a206_sandbox`: bubblewrap and Landlock on Linux, Seatbelt on macOS.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn sandbox_command(
     executable: &Path,
-    root: &Path,
-    scratch: &Path,
-    cwd: &Path,
-    state: &Path,
+    mounts: &Mounts<'_>,
     thread: &Thread,
     port: u16,
 ) -> Result<Command> {
+    let Mounts {
+        root,
+        scratch,
+        workspace: cwd,
+        hidden,
+        programs,
+    } = *mounts;
     let helper = std::env::current_exe()
         .and_then(std::fs::canonicalize)
         .map_err(BackendError::Helper)?;
     let capabilities = &thread.grant.capabilities;
-    let mut hidden = a206_sandbox::hidden_home_paths();
-    hidden.push(state.to_path_buf());
     let control = scratch.join("control");
     let start = scratch.join("workspace");
     let profile = a206_sandbox::Profile {
@@ -269,8 +299,8 @@ fn sandbox_command(
             .contains(&Capability::ReadWorkspace)
             .then(|| (cwd, capabilities.contains(&Capability::WriteWorkspace))),
         execute: capabilities.contains(&Capability::Execute),
-        programs: &[],
-        hidden: &hidden,
+        programs,
+        hidden,
         cwd: &start,
         network: a206_sandbox::NetworkAccess::Proxy(port),
         stderr: false,
@@ -281,10 +311,7 @@ fn sandbox_command(
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn sandbox_command(
     _executable: &Path,
-    _root: &Path,
-    _scratch: &Path,
-    _cwd: &Path,
-    _state: &Path,
+    _mounts: &Mounts<'_>,
     _thread: &Thread,
     _port: u16,
 ) -> Result<Command> {

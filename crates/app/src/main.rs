@@ -456,6 +456,9 @@ mod native {
             runtime_root: String,
             #[arg(long)]
             adapter_script: Option<String>,
+            /// Give the runtime the program directories, when its thread may execute.
+            #[arg(long)]
+            program_directories: bool,
         },
         Select {
             thread: uuid::Uuid,
@@ -924,6 +927,7 @@ mod native {
                                 executable,
                                 runtime_root,
                                 adapter_script,
+                                program_directories,
                             },
                     } => {
                         let kind = backend_kind(&kind)?;
@@ -938,6 +942,7 @@ mod native {
                             executable,
                             runtime_root,
                             adapter_script,
+                            program_directories,
                         });
                         Command::SaveSettings(Box::new(settings))
                     }

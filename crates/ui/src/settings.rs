@@ -189,6 +189,14 @@ fn BackendEditor(kind: CodingBackend, initial: Option<BackendConfig>) -> Element
             .and_then(|c| c.adapter_script.clone())
             .unwrap_or_default()
     });
+    let mut programs = use_signal(|| initial.as_ref().is_some_and(|c| c.program_directories));
+    let programs_on = use_memo(move || {
+        if programs() {
+            CheckState::On
+        } else {
+            CheckState::Off
+        }
+    });
     rsx! { Card { variant: CardVariant::Elevated,
         CardHeader { CardTitle { "{kind.label()}" } CardSubtitle { if kind == CodingBackend::Codex { "Codex app-server · isolated stdio" } else { "Claude Agent SDK · ACP adapter · isolated stdio" } } }
         CardBody { div { class: "a206-grid",
@@ -198,14 +206,16 @@ fn BackendEditor(kind: CodingBackend, initial: Option<BackendConfig>) -> Element
                 Field { label: rsx! { "Claude Agent ACP entry point" }, Input { value: ReadSignal::from(script), oninput: move |v| script.set(v), placeholder: "Absolute adapter JavaScript path" } }
             }
         }
+        Checkbox { label: rsx! { "Use program directories" }, checked: ReadSignal::from(programs_on), onchange: move |on: bool| programs.set(on) }
+        p { class: "a206-muted", "When a thread grants Execute, mounts the program directories chosen in Modes settings read-only, with their programs on the runtime's PATH. Changing them stops a running turn." }
         p { class: "a206-muted", if kind == CodingBackend::Codex { "Requires a provider with the Responses API. Uses the exact API-discovered model you select." } else { "Requires the Anthropic Messages API. Uses API-key authentication through the future broker; subscription login is not offered." } }
-        p { class: "a206-muted", "Experimental · macOS isolation only · authenticated dispatch and external delegation remain disabled." }
+        p { class: "a206-muted", "Experimental · macOS and Linux isolation only · authenticated dispatch and external delegation remain disabled." }
         }
         CardFooter {
             Button { variant: ButtonVariant::Primary, onclick: move |_| {
                 let mut settings = state.data.read().settings.clone();
                 settings.backends.retain(|b| b.kind != kind);
-                settings.backends.push(BackendConfig { kind, executable: executable(), runtime_root: root(), adapter_script: (kind == CodingBackend::ClaudeAgent).then(&*script) });
+                settings.backends.push(BackendConfig { kind, executable: executable(), runtime_root: root(), adapter_script: (kind == CodingBackend::ClaudeAgent).then(&*script), program_directories: programs() });
                 dispatch(state, Command::SaveSettings(Box::new(settings)));
             }, if enabled { "Save runtime" } else { "Configure runtime" } }
             if enabled { Button { variant: ButtonVariant::Ghost, onclick: move |_| { let mut settings = state.data.read().settings.clone(); settings.backends.retain(|b| b.kind != kind); dispatch(state, Command::SaveSettings(Box::new(settings))); }, "Disconnect runtime" } }

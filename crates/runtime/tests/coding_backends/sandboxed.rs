@@ -17,6 +17,12 @@ async fn command(gateway: &Gateway, body: Command) -> Reply {
 fn literal(value: impl AsRef<str>) -> String {
     format!("{:?}", value.as_ref())
 }
+/// What the fixture is handed to look for: an image in its prompt, and a
+/// program it may run only from a program directory it was given.
+struct Probes<'a> {
+    image: &'a str,
+    program: &'a Path,
+}
 fn compile_fixture(
     root: &Path,
     model: &str,
@@ -24,8 +30,9 @@ fn compile_fixture(
     state: &Path,
     outside: &Path,
     project_root: &Path,
-    image: &str,
+    probes: Probes<'_>,
 ) -> std::path::PathBuf {
+    let Probes { image, program } = probes;
     let thread = Id::new_v4().to_string();
     let turn = Id::new_v4().to_string();
     let session = Id::new_v4().to_string();
@@ -46,6 +53,13 @@ fn check_scope(prompt: &str) {
         assert!(std::fs::read(PROJECT_FILE).is_ok());
         assert!(std::fs::read(PROJECT_LINK).is_err());
         assert_eq!(std::fs::write(PROJECT_FILE, "edited").is_ok(), prompt.contains("fixture-write"));
+    }
+    if prompt.contains("fixture-programs") {
+        let given = prompt.contains("fixture-programs-given");
+        let exit = |program: &str| std::process::Command::new(program).status().ok().and_then(|status| status.code());
+        // Found on PATH, and runnable at its own path, only when mounted.
+        assert_eq!(exit(PROGRAM_NAME) == Some(23), given);
+        assert_eq!(exit(PROGRAM_PATH) == Some(23), given);
     }
 }
 fn main() {
@@ -125,6 +139,11 @@ fn main() {
             ),
         ),
         ("BLOCKED_ADDRESS", literal(&blocked_address)),
+        (
+            "PROGRAM_NAME",
+            literal(program.file_name().unwrap().to_str().unwrap()),
+        ),
+        ("PROGRAM_PATH", literal(program.to_str().unwrap())),
         (
             "STATE_FILE",
             literal(state.join("private-marker").to_str().unwrap()),
@@ -237,6 +256,16 @@ pub async fn drives_both_agent_protocols_in_the_real_os_sandbox() {
     std::fs::write(&outside, Id::new_v4().to_string()).unwrap();
     std::fs::write(project_root.join("source"), Id::new_v4().to_string()).unwrap();
     std::os::unix::fs::symlink(&outside, project_root.join("link")).unwrap();
+    // A program directory the runtime is given only when it opts in.
+    let tools = directory.path().join("tools");
+    std::fs::create_dir_all(tools.join("bin")).unwrap();
+    let program = tools.join("bin").join(Id::new_v4().to_string());
+    std::fs::write(&program, "#!/bin/sh\nexit 23\n").unwrap();
+    std::fs::set_permissions(
+        &program,
+        std::os::unix::fs::PermissionsExt::from_mode(0o755),
+    )
+    .unwrap();
     let model = Id::new_v4().to_string();
     let text = Id::new_v4().to_string();
     let mut image = b"\x89PNG\r\n\x1a\n".to_vec();
@@ -252,7 +281,10 @@ pub async fn drives_both_agent_protocols_in_the_real_os_sandbox() {
         &state,
         &outside,
         &project_root,
-        &encoded,
+        Probes {
+            image: &encoded,
+            program: &program,
+        },
     );
     let script = installation.join("adapter.js");
     std::fs::write(&script, "").unwrap();
@@ -286,6 +318,7 @@ pub async fn drives_both_agent_protocols_in_the_real_os_sandbox() {
             runtime_root: installation.to_string_lossy().into(),
             adapter_script: (kind == CodingBackend::ClaudeAgent)
                 .then(|| script.to_string_lossy().into()),
+            program_directories: kind == CodingBackend::Codex,
         });
     }
     assert_eq!(
@@ -427,39 +460,63 @@ pub async fn drives_both_agent_protocols_in_the_real_os_sandbox() {
         "fixture-oversized",
         "fixture-wait",
         "fixture-wait-revoke",
+        "fixture-wait-programs",
     ] {
-        let Reply::Thread(thread) = command(
-            &gateway,
-            Command::CreateThread {
-                title: Id::new_v4().to_string(),
-                mode: Mode::Code,
-            },
-        )
-        .await
-        else {
-            panic!();
+        // Only a runtime that may execute is given the program directories.
+        let (thread, capabilities) = if behavior.ends_with("programs") {
+            let Reply::Project(project) = command(
+                &gateway,
+                Command::CreateProject {
+                    name: Id::new_v4().to_string(),
+                    root: project_root.to_string_lossy().into(),
+                },
+            )
+            .await
+            else {
+                panic!();
+            };
+            (
+                project.manager,
+                [Capability::ReadWorkspace, Capability::Execute].into(),
+            )
+        } else {
+            let Reply::Thread(thread) = command(
+                &gateway,
+                Command::CreateThread {
+                    title: Id::new_v4().to_string(),
+                    mode: Mode::Code,
+                },
+            )
+            .await
+            else {
+                panic!();
+            };
+            (thread.id, Default::default())
         };
         command(
             &gateway,
             Command::ConfigureThread {
-                id: thread.id,
-                mode: thread.mode,
+                id: thread,
+                mode: Mode::Code,
                 model: Some(key.clone()),
                 subagent_models: Default::default(),
             },
         )
         .await;
-        command(
-            &gateway,
-            Command::SetBackend {
-                thread: thread.id,
-                backend: CodingBackend::Codex,
-                capabilities: Default::default(),
-            },
-        )
-        .await;
+        assert_eq!(
+            command(
+                &gateway,
+                Command::SetBackend {
+                    thread,
+                    backend: CodingBackend::Codex,
+                    capabilities,
+                },
+            )
+            .await,
+            Reply::Ok
+        );
         let actor = gateway.clone();
-        let id = thread.id;
+        let id = thread;
         let job = tokio::spawn(async move {
             command(
                 &actor,
@@ -482,7 +539,7 @@ pub async fn drives_both_agent_protocols_in_the_real_os_sandbox() {
                     };
                     if let Some(title) = events.iter().find_map(|event| match &event.kind {
                         EventKind::BackendActivity { thread: id, title }
-                            if *id == thread.id && title.starts_with("Codex: fixture:") =>
+                            if *id == thread && title.starts_with("Codex: fixture:") =>
                         {
                             Some(title.clone())
                         }
@@ -500,7 +557,15 @@ pub async fn drives_both_agent_protocols_in_the_real_os_sandbox() {
             .await
             .unwrap();
             let old_backends = gateway.snapshot().unwrap().settings.backends.clone();
-            if behavior.ends_with("revoke") {
+            if behavior.ends_with("programs") {
+                // Codex opts in, so its runtime holds the old mounts.
+                let mut settings = gateway.snapshot().unwrap().settings;
+                settings.program_directories = vec![tools.clone()];
+                assert_eq!(
+                    command(&gateway, Command::SaveSettings(Box::new(settings))).await,
+                    Reply::Ok
+                );
+            } else if behavior.ends_with("revoke") {
                 let mut settings = gateway.snapshot().unwrap().settings;
                 settings
                     .backends
@@ -517,7 +582,7 @@ pub async fn drives_both_agent_protocols_in_the_real_os_sandbox() {
                 );
             } else {
                 assert_eq!(
-                    command(&gateway, Command::CancelRun { thread: thread.id }).await,
+                    command(&gateway, Command::CancelRun { thread }).await,
                     Reply::Ok
                 );
             }
@@ -617,6 +682,67 @@ pub async fn drives_both_agent_protocols_in_the_real_os_sandbox() {
                     thread: project.manager,
                     backend: CodingBackend::Codex,
                     capabilities
+                }
+            )
+            .await,
+            Reply::Ok
+        );
+        let Reply::Thread(result) = command(
+            &gateway,
+            Command::Send {
+                thread: project.manager,
+                text: behavior.into(),
+                attachments: vec![],
+                images: vec![],
+            },
+        )
+        .await
+        else {
+            panic!();
+        };
+        assert_eq!(result.state, RunState::Complete, "{:?}", result.messages);
+    }
+    // The program directories saved above, with Execute granted.
+    for (behavior, given) in [
+        ("fixture-programs-given", true),
+        ("fixture-programs-hidden", false),
+    ] {
+        let mut settings = gateway.snapshot().unwrap().settings;
+        for backend in &mut settings.backends {
+            backend.program_directories = given;
+        }
+        assert_eq!(
+            command(&gateway, Command::SaveSettings(Box::new(settings))).await,
+            Reply::Ok
+        );
+        let Reply::Project(project) = command(
+            &gateway,
+            Command::CreateProject {
+                name: Id::new_v4().to_string(),
+                root: project_root.to_string_lossy().into(),
+            },
+        )
+        .await
+        else {
+            panic!();
+        };
+        command(
+            &gateway,
+            Command::ConfigureThread {
+                id: project.manager,
+                mode: Mode::Code,
+                model: Some(key.clone()),
+                subagent_models: Default::default(),
+            },
+        )
+        .await;
+        assert_eq!(
+            command(
+                &gateway,
+                Command::SetBackend {
+                    thread: project.manager,
+                    backend: CodingBackend::Codex,
+                    capabilities: [Capability::ReadWorkspace, Capability::Execute].into(),
                 }
             )
             .await,
