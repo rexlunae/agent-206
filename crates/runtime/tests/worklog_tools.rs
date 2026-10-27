@@ -285,7 +285,7 @@ async fn an_item_is_recorded_checked_and_closed_with_evidence() {
         ),
     ];
     let (system, records, results) = rig.round_trip(&calls).await;
-    let states: Vec<_> = records.iter().map(|r| r.state.clone()).collect();
+    let states: Vec<_> = records.iter().map(|r| r.state).collect();
     use ToolCallState::{Failed, Succeeded};
     assert_eq!(
         states,
