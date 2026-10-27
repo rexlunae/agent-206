@@ -29,6 +29,13 @@ RustyClaw,
 https://github.com/rexlunae/RustyClaw,
 Copyright (c) 2026 Erica Stith, MIT License (included in LICENSE).
 
+The development process native runs follow (crates/runtime/src/process.toml)
+and the work queue format, ID rule and record/close checks of the work queue
+extension (plugins/worklog) are adapted from Literate AI's agent skills and
+`roadmap_work.py`,
+https://github.com/jordanhubbard/literate-ai,
+Apache License 2.0.
+
 fc-dioxus and future-css are MIT dependencies pinned in Cargo.lock.
 dioxus-tui is MIT OR Apache-2.0. ACP and MCP SDKs are Apache-2.0.
 Other dependency licenses remain with their respective crates.

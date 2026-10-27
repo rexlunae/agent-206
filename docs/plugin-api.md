@@ -52,7 +52,13 @@ stops with a notice naming how many files it ranked; under the default
 50,000,000 fuel that is roughly 230 KB of English or 30 KB of CJK text per
 search. Bundled tools cut text past
 192 KiB with a notice (the SDK's `excerpt`), so a long result never exceeds
-the outcome limit. Users can also install third-party packages (see
+the outcome limit. `agent206.worklog` (`plugins/worklog`) keeps a project's
+Literate AI work queue, `docs/roadmap/active-work.md`, and its changelog in the
+format `litai work record`/`close` use: `work_list` under `read_workspace`, and
+`work_record`, `work_add`, `work_check`, `work_close` and `changelog_add` under
+`read_workspace` + `write_workspace`. Like `memory_save`, every change is an
+`edit_file` over the whole old text, so a file changed meanwhile fails with
+`conflict`; see [Development process](development-process.md). Users can also install third-party packages (see
 [Installed packages](#installed-packages)), including packages agents prepare
 for review ([Agent-prepared packages](#agent-prepared-packages)).
 

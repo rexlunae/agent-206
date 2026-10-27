@@ -214,6 +214,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "a206-plugin-worklog"
+version = "0.1.0"
+dependencies = [
+ "a206-extension-sdk",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "a206-plugin-workspace"
 version = "0.1.0"
 dependencies = [

@@ -1,0 +1,178 @@
+id = "agent206.worklog"
+name = "Work queue"
+description = "Keeps the project's Literate AI work queue (docs/roadmap/active-work.md) and changelog: records work items with implementation and evidence checklists, checks boxes with their results, closes items only when every box is checked, and adds Unreleased changelog entries."
+version = "0.1.0"
+abi = 2
+capabilities = ["read_workspace", "write_workspace"]
+
+[[tools]]
+name = "work_list"
+description = "List the open items of the project's work queue (docs/roadmap/active-work.md) with their checklist progress and next unchecked task, or show one item in full."
+capabilities = ["read_workspace"]
+
+[[tools.params]]
+name = "id"
+type = "string"
+description = "Show this item's full text, such as API-012."
+
+[[tools.params]]
+name = "include_closed"
+type = "boolean"
+description = "Also list closed items. Defaults to false."
+
+# Every change reads the queue first, so changing needs both grants; the
+# write grant is what separates it from listing.
+[[tools]]
+name = "work_record"
+description = "Record a new work item in the project's work queue before implementing it, creating docs/roadmap/active-work.md if needed. The item starts open, with unchecked implementation and evidence checklists. Give either id or area."
+capabilities = ["read_workspace", "write_workspace"]
+
+[[tools.params]]
+name = "id"
+type = "string"
+description = "A new work ID: an uppercase letter, then uppercase letters, digits or hyphens, such as API-012."
+
+[[tools.params]]
+name = "area"
+type = "string"
+description = "Allocate the next free ID in this area instead, such as API for API-013."
+
+[[tools.params]]
+name = "title"
+type = "string"
+description = "A short outcome, as one line."
+required = true
+
+[[tools.params]]
+name = "priority"
+type = "string"
+description = "Such as P0, P1 or P2. The item goes under the queue's `## P1` section when it has one."
+required = true
+
+[[tools.params]]
+name = "owner"
+type = "string"
+description = "The narrowest owning authority: a component, specification, skill, workflow, documentation or core."
+required = true
+
+[[tools.params]]
+name = "direction"
+type = "string"
+description = "A concise paraphrase of what the user asked for, as one line."
+required = true
+
+[[tools.params]]
+name = "conclusion"
+type = "string"
+description = "The reasoned conclusion and scope boundary that decides the next action, as one line."
+required = true
+
+[[tools.params]]
+name = "depends_on"
+type = "string"
+description = "Work IDs this depends on, in execution order, one per line. Defaults to none."
+
+[[tools.params]]
+name = "implementation"
+type = "string"
+description = "Concrete implementation subtasks, one per line."
+required = true
+
+[[tools.params]]
+name = "evidence"
+type = "string"
+description = "The proof that must pass before completion (test targets, builds, reviews), one per line."
+required = true
+
+[[tools.params]]
+name = "release_target"
+type = "string"
+description = "The release this item is a goal of, when it is one."
+
+[[tools.params]]
+name = "issue"
+type = "string"
+description = "The URL of the tracker issue this item answers."
+
+[[tools]]
+name = "work_add"
+description = "Add a newly discovered subtask or evidence requirement to a work item, as an unchecked box. A closed item is opened again."
+capabilities = ["read_workspace", "write_workspace"]
+
+[[tools.params]]
+name = "id"
+type = "string"
+description = "The work item, such as API-012."
+required = true
+
+[[tools.params]]
+name = "section"
+type = "string"
+description = "The checklist: implementation or evidence."
+required = true
+
+[[tools.params]]
+name = "text"
+type = "string"
+description = "The task, as one line."
+required = true
+
+[[tools]]
+name = "work_check"
+description = "Check one box of a work item once it is done, with its result. An evidence box needs a result: a concise durable record such as the test target and outcome, platform or commit."
+capabilities = ["read_workspace", "write_workspace"]
+
+[[tools.params]]
+name = "id"
+type = "string"
+description = "The work item, such as API-012."
+required = true
+
+[[tools.params]]
+name = "section"
+type = "string"
+description = "The checklist: implementation or evidence."
+required = true
+
+[[tools.params]]
+name = "number"
+type = "integer"
+description = "The box's position in that checklist, counting from 1."
+required = true
+
+[[tools.params]]
+name = "result"
+type = "string"
+description = "What shows it is done, as one line. Required for evidence."
+
+[[tools]]
+name = "work_close"
+description = "Close a work item. Refused while any of its implementation or evidence boxes is unchecked."
+capabilities = ["read_workspace", "write_workspace"]
+
+[[tools.params]]
+name = "id"
+type = "string"
+description = "The work item, such as API-012."
+required = true
+
+[[tools]]
+name = "changelog_add"
+description = "Add one user-facing outcome to the Unreleased section of the project's changelog, creating the section or the file if needed."
+capabilities = ["read_workspace", "write_workspace"]
+
+[[tools.params]]
+name = "text"
+type = "string"
+description = "The outcome as release notes would state it. Several lines become one wrapped entry."
+required = true
+
+[[tools.params]]
+name = "category"
+type = "string"
+description = "A subsection within Unreleased, such as Added, Changed or Fixed. Defaults to none."
+
+[[tools.params]]
+name = "path"
+type = "string"
+description = "A component's own changelog, ending in /CHANGELOG.md. Defaults to CHANGELOG.md at the project root."

@@ -22,6 +22,10 @@ Inspected on 2026-10-15:
   a component-model/Wasmtime migration should follow measured requirements.
 - [cap-std](https://github.com/bytecodealliance/cap-std): directory-scoped document
   reads that resist symlink escape without application unsafe code.
+- [Literate AI](https://github.com/jordanhubbard/literate-ai) (inspected 2026-10-27):
+  Apache-2.0 specification-led SDLC harness. Its agent skills' development
+  process and its active-work queue format are adapted (docs/development-process.md);
+  no Python code or dependency is used.
 - [SecureStore](https://github.com/neosmart/securestore-rs): compatibility with the
   upstream vault's encrypted file format. Its pure-Rust crypto backend is selected.
 
