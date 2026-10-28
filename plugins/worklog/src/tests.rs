@@ -415,6 +415,40 @@ fn headings_and_checkboxes_in_code_blocks_are_not_items() {
 }
 
 #[test]
+fn a_shorter_fence_inside_a_longer_one_does_not_close_it() {
+    let text = "# Q\n\n````markdown\n```rust\n### [ ] FAKE-001 — example\n```\n````\n\n### [ ] REAL-001 — task\n- **Evidence:**\n  - [ ] proof\n~~~\n### [ ] TILDE-001 — no\n```\n### [ ] STILL-001 — no\n~~~~\n";
+    let ids: Vec<&str> = queue::items(text).iter().map(|i| i.id).collect();
+    assert_eq!(ids, ["REAL-001"]);
+    // A backtick fence followed by more text does not close the block.
+    let text = "```\n``` not a close\n### [ ] FAKE-001 — no\n```\n### [ ] REAL-001 — yes\n";
+    let ids: Vec<&str> = queue::items(text).iter().map(|i| i.id).collect();
+    assert_eq!(ids, ["REAL-001"]);
+    // The changelog finds Unreleased past a nested example, not inside it.
+    let log = "# Changelog\n\n````\n```\n## Unreleased\n```\n````\n\n## Unreleased\n\n- a\n";
+    assert_eq!(
+        changelog::add(Some(log), "b", None).unwrap(),
+        "# Changelog\n\n````\n```\n## Unreleased\n```\n````\n\n## Unreleased\n\n- a\n- b\n"
+    );
+}
+
+#[test]
+fn an_empty_changelog_is_refused_rather_than_overwritten() {
+    // An empty file gives `edit_file` nothing to compare, so a write could
+    // replace text added since the read; the tool refuses with guidance.
+    let mut fake = Fake::default().file("CHANGELOG.md", "");
+    let refused = changelog_add(&mut fake, &args(&[("text", "t")])).unwrap_err();
+    assert_eq!(code(refused), "empty_file");
+    assert_eq!(fake.text("CHANGELOG.md"), "");
+    // Whitespace alone is still text to compare, so it is initialized.
+    let mut fake = Fake::default().file("CHANGELOG.md", "\n");
+    changelog_add(&mut fake, &args(&[("text", "t")])).unwrap();
+    assert_eq!(
+        fake.text("CHANGELOG.md"),
+        "# Changelog\n\n## Unreleased\n\n- t\n"
+    );
+}
+
+#[test]
 fn oversized_and_non_text_queues_are_refused() {
     let mut fake = Fake::default().file(queue::QUEUE, &"x".repeat(MAX_FILE + 1));
     assert_eq!(

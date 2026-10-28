@@ -89,20 +89,53 @@ pub struct Task<'a> {
     pub line_end: usize,
 }
 
+/// A fence line's delimiter character and run length: up to three spaces
+/// of indentation, then at least three backticks or tildes.
+fn fence(line: &str) -> Option<(u8, usize)> {
+    let indent = line.len() - line.trim_start_matches(' ').len();
+    if indent > 3 {
+        return None;
+    }
+    let rest = &line[indent..];
+    let mark = *rest.as_bytes().first()?;
+    if mark != b'`' && mark != b'~' {
+        return None;
+    }
+    let run = rest.bytes().take_while(|b| *b == mark).count();
+    (run >= 3).then_some((mark, run))
+}
+
 /// Lines with their start offsets, the newline excluded, and whether each
-/// is inside a fenced code block (fence lines included).
-fn lines(text: &str) -> Vec<(usize, &str, bool)> {
+/// is inside a fenced code block (fence lines included). As in CommonMark, a
+/// block closes only at a fence of its own character, at least as long as
+/// the opening one and with nothing after it, so a shorter fence shown
+/// inside a longer one stays part of the block.
+pub(crate) fn lines(text: &str) -> Vec<(usize, &str, bool)> {
     let mut out = Vec::new();
-    let mut fenced = false;
+    let mut open: Option<(u8, usize)> = None;
     let mut offset = 0;
     for raw in text.split_inclusive('\n') {
         let line = raw.strip_suffix('\n').unwrap_or(raw);
         let line = line.strip_suffix('\r').unwrap_or(line);
-        let trimmed = line.trim_start();
-        let fence = trimmed.starts_with("```") || trimmed.starts_with("~~~");
-        out.push((offset, line, fenced || fence));
-        if fence {
-            fenced = !fenced;
+        let found = fence(line);
+        match (open, found) {
+            (None, Some((mark, run))) => {
+                // A backtick fence's info string may not contain backticks.
+                let info = &line.trim_start()[run..];
+                if mark != b'`' || !info.contains('`') {
+                    open = Some((mark, run));
+                }
+                out.push((offset, line, open.is_some()));
+            }
+            (Some((mark, run)), Some((closing, length)))
+                if closing == mark
+                    && length >= run
+                    && line.trim_start()[length..].trim().is_empty() =>
+            {
+                open = None;
+                out.push((offset, line, true));
+            }
+            (state, _) => out.push((offset, line, state.is_some())),
         }
         offset += raw.len();
     }

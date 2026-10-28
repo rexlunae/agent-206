@@ -8,27 +8,19 @@ pub const CHANGELOG: &str = "CHANGELOG.md";
 /// Longest entry, in bytes.
 pub const MAX_ENTRY: usize = 4 * MAX_FIELD;
 
-/// Lines with their start offsets and whether each is a heading outside a
-/// fenced code block, and of which level.
+/// Lines with their start offsets and, for a heading outside a fenced code
+/// block, its level.
 fn headings(text: &str) -> Vec<(usize, &str, Option<usize>)> {
-    let mut out = Vec::new();
-    let mut fenced = false;
-    let mut offset = 0;
-    for raw in text.split_inclusive('\n') {
-        let line = raw.trim_end_matches(['\n', '\r']);
-        let trimmed = line.trim_start();
-        let fence = trimmed.starts_with("```") || trimmed.starts_with("~~~");
-        let level = line.bytes().take_while(|b| *b == b'#').count();
-        let heading = (!fenced && !fence && (1..=6).contains(&level))
-            .then(|| line[level..].starts_with(' ').then_some(level))
-            .flatten();
-        out.push((offset, line, heading));
-        if fence {
-            fenced = !fenced;
-        }
-        offset += raw.len();
-    }
-    out
+    crate::queue::lines(text)
+        .into_iter()
+        .map(|(offset, line, fenced)| {
+            let level = line.bytes().take_while(|b| *b == b'#').count();
+            let heading = (!fenced && (1..=6).contains(&level))
+                .then(|| line[level..].starts_with(' ').then_some(level))
+                .flatten();
+            (offset, line, heading)
+        })
+        .collect()
 }
 
 /// The entry as a Markdown list item: `- ` before its first line and two

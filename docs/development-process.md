@@ -75,9 +75,10 @@ queue:
 Like every extension, the tools do nothing until the user grants the extension
 and permits each tool in a conversation. Each change reads the file and writes
 it back with `edit_file` over the whole old text, so a file edited meanwhile is
-refused with `conflict` rather than overwritten. Files over 256 KiB are refused;
-archive closed items first. Headings and checkboxes inside fenced code blocks are
-ignored.
+refused with `conflict` rather than overwritten; for the same reason an existing
+but empty queue or changelog is refused until it has a heading. Files over 256 KiB
+are refused; archive closed items first. Headings and checkboxes inside fenced code
+blocks are ignored, with fences closed as CommonMark closes them.
 
 Not implemented: release-goal manifests and `Release target` reconciliation,
 detailed-roadmap lifecycle headers, tracker reconciliation (`litai project tracker
