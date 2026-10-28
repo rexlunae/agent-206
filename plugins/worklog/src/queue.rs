@@ -89,14 +89,13 @@ pub struct Task<'a> {
     pub line_end: usize,
 }
 
-/// A fence line's delimiter character and run length: up to three spaces
-/// of indentation, then at least three backticks or tildes.
+/// A fence line's delimiter character and run length: at least three
+/// backticks or tildes after any indentation. Indentation is not limited,
+/// because queue entries are list items and a fence nested in one is
+/// indented with it; an indented code block shown outside a list is rare
+/// enough in a queue to be read as a fence too.
 fn fence(line: &str) -> Option<(u8, usize)> {
-    let indent = line.len() - line.trim_start_matches(' ').len();
-    if indent > 3 {
-        return None;
-    }
-    let rest = &line[indent..];
+    let rest = line.trim_start();
     let mark = *rest.as_bytes().first()?;
     if mark != b'`' && mark != b'~' {
         return None;

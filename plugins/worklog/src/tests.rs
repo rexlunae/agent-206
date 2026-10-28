@@ -419,6 +419,11 @@ fn a_shorter_fence_inside_a_longer_one_does_not_close_it() {
     let text = "# Q\n\n````markdown\n```rust\n### [ ] FAKE-001 — example\n```\n````\n\n### [ ] REAL-001 — task\n- **Evidence:**\n  - [ ] proof\n~~~\n### [ ] TILDE-001 — no\n```\n### [ ] STILL-001 — no\n~~~~\n";
     let ids: Vec<&str> = queue::items(text).iter().map(|i| i.id).collect();
     assert_eq!(ids, ["REAL-001"]);
+    // A fence nested in a list item is indented with it.
+    let text = "### [ ] A-001 — a\n- **Evidence:**\n  - [x] proof — ok\n    ```text\n    - [ ] example\n    ```\n";
+    let items = queue::items(text);
+    assert_eq!(items[0].tasks.len(), 1);
+    assert!(queue::close(text, "A-001").unwrap().is_some());
     // A backtick fence followed by more text does not close the block.
     let text = "```\n``` not a close\n### [ ] FAKE-001 — no\n```\n### [ ] REAL-001 — yes\n";
     let ids: Vec<&str> = queue::items(text).iter().map(|i| i.id).collect();
