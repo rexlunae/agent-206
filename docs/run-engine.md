@@ -982,8 +982,9 @@ At the start of each native run the gateway reads instruction files from the
 project root when the conversation may read its project: `ReadWorkspace` is in its
 grant within its mode's ceiling and in every ancestor's (the same intersection
 tools get, `ToolScope::capabilities`). Otherwise nothing is read. The reviewed
-list, in prompt order, is `AGENTS.md`, `CLAUDE.md`, `SOUL.md`, `IDENTITY.md`,
-`TOOLS.md` (`crates/runtime/src/instructions.rs`). RustyClaw's `USER.md`,
+list, in prompt order, is `AGENTS.md`, `CLAUDE.md`, `PROJECT.md`, `SOUL.md`,
+`IDENTITY.md`, `TOOLS.md` (`crates/runtime/src/instructions.rs`); `PROJECT.md`
+is a Literate AI project's goals file (see [Development process](development-process.md)). RustyClaw's `USER.md`,
 `MEMORY.md`, `HEARTBEAT.md` and daily memory files are personal or scheduling state
 and are not read into the prompt; a conversation the user lets use the bundled
 `agent206.memory` tools can search and read `MEMORY.md` and `memory/` on demand.
@@ -998,6 +999,10 @@ and are not read into the prompt; a conversation the user lets use the bundled
   (for example `CLAUDE.md` linked to `AGENTS.md`) is skipped.
 - They follow the mode prompt under a "Project instructions" heading that says they
   cannot grant permissions. They are read once per run.
+- Plan, Code and Review runs then get a "Development process" section, under the
+  same `ReadWorkspace` condition: the Literate AI process in full when the project
+  has `PROJECT.md`, `docs/roadmap/active-work.md` or `literate.project.json`, and
+  its lighter form otherwise ([Development process](development-process.md)).
 - `Thread::instructions` records every file found: `Included`, `Truncated` (with
   the reason as a report) or `Skipped` (with a structured `ErrorReport`: outside the
   project, not regular, not text, duplicate, total limit used), its included bytes,

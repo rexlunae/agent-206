@@ -8,6 +8,7 @@ const BUILTINS: &[(&str, &str)] = &[
     ("a206-plugin-git", "a206_plugin_git"),
     ("a206-plugin-web", "a206_plugin_web"),
     ("a206-plugin-memory", "a206_plugin_memory"),
+    ("a206-plugin-worklog", "a206_plugin_worklog"),
 ];
 
 fn main() {

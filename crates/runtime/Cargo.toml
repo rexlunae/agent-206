@@ -97,5 +97,9 @@ harness = false
 [[test]]
 name = "memory_tools"
 harness = false
+# And for the bundled work queue extension.
+[[test]]
+name = "worklog_tools"
+harness = false
 [lints]
 workspace = true

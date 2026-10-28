@@ -800,9 +800,10 @@ impl Gateway {
     /// their provenance on the thread, and return the prompt section.
     async fn load_instructions(&self, id: Id) -> Result<String> {
         let view = self.view(id)?;
+        let mode = view.thread.mode;
         let loaded = match view.scope.workspace {
             Some(root) if crate::instructions::permitted(&view.scope.capabilities) => {
-                tokio::task::spawn_blocking(move || crate::instructions::load(root)).await?
+                tokio::task::spawn_blocking(move || crate::instructions::load(root, mode)).await?
             }
             _ => crate::instructions::Loaded::default(),
         };

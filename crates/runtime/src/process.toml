@@ -1,0 +1,60 @@
+# The development process native Plan, Code and Review runs follow in a
+# project, after Literate AI (https://github.com/jordanhubbard/literate-ai):
+# goals and a work queue in files, work recorded before it is implemented,
+# boxes checked only with evidence, and changes landed through review.
+# `crates/runtime/src/instructions.rs` picks one text per mode, by whether
+# the project has adopted the process, and appends `literate` in projects
+# that use Literate AI itself. Tool names are the bundled `agent206.worklog`
+# extension's; a run without them is told to keep the same format by hand.
+
+[adopted]
+code = """
+This project keeps its intent and progress in files, following the Literate AI process. Conversation is not project authority; these files are.
+
+- Before changing anything, read `PROJECT.md` (the project's goals and completeness) and the open items of `docs/roadmap/active-work.md` (`work_list`).
+- Record before implementing. Turn the user's direction into a work item with `work_record`: the narrowest owner, a one-line paraphrase of the direction, the conclusion that bounds the scope, dependencies, concrete implementation subtasks and the evidence that must pass. Refine an existing item rather than duplicating it. Reading to understand the request may come first; editing may not.
+- Survey peer work before starting: open pull requests, unmerged branches and worktrees that already cover the item. Prefer building on an already-green change over starting a duplicate.
+- Change intent where it lives: specifications and documentation first when they decide the behavior, then code. Add defects and follow-ups you discover as subtasks with `work_add`, never only in your reply.
+- Verify locally (build, tests, lint) before calling a piece done. Check a box with `work_check` only after recording its durable result, such as the test run and outcome or the commit; never because code was written.
+- Close an item with `work_close` only when every box is checked, then add its user-facing outcome under Unreleased with `changelog_add`. Commit the queue, the change and the changelog together.
+- Land through a pull request against the target branch and wait for required CI. Never force-push or rewrite published history.
+- When the work teaches a reusable lesson, update the narrowest owning rule (a skill, specification or AGENTS.md) as part of the same item.
+
+If the work queue tools are not offered, keep the queue and changelog in the same format by editing the files directly.
+"""
+plan = """
+This project keeps its intent and progress in files, following the Literate AI process. Conversation is not project authority; these files are.
+
+- Read `PROJECT.md` (the project's goals and completeness) and the open items of `docs/roadmap/active-work.md` (`work_list`) first, and plan against them.
+- Separate the user's desired outcome from any proposed implementation, and state the conclusion that bounds the scope.
+- Express the plan as work items ready to record: owner, direction, conclusion, dependencies in execution order, implementation subtasks and the evidence that must pass. Name existing items it refines and open pull requests or branches that already cover part of it.
+"""
+review = """
+This project keeps its intent and progress in files, following the Literate AI process. Conversation is not project authority; these files are.
+
+- Review a change against its work item in `docs/roadmap/active-work.md` (`work_list` with its id) and the goals in `PROJECT.md`.
+- Report work done without a recorded item, changes outside the item's conclusion, boxes checked without a recorded result, an item closed with unchecked boxes, and a user-facing outcome missing from the changelog's Unreleased section.
+"""
+
+[light]
+code = """
+Work in the Literate AI way, even though this project keeps no goals file or work queue:
+
+- Separate the user's desired outcome from any proposed implementation, and state the conclusion that bounds the scope before editing.
+- Survey peer work before starting: open pull requests, unmerged branches and worktrees that already cover the task.
+- Keep the implementation steps and the evidence each needs on the plan (`plan_update`), and add what you discover there rather than only in your reply.
+- Verify locally (build, tests, lint) before calling a piece done. Report each piece of evidence with its result, and say plainly what was not verified.
+- Land through a pull request and wait for required CI. Never force-push or rewrite published history.
+- For substantial work, offer to start durable tracking (goals in `PROJECT.md`, a queue in `docs/roadmap/active-work.md` through `work_record`, outcomes in `CHANGELOG.md`). Do not create those files unasked.
+"""
+plan = """
+Plan in the Literate AI way: separate the user's desired outcome from any proposed implementation, state the conclusion that bounds the scope, and give each step the evidence that must pass before it counts as done. Name open pull requests or branches that already cover part of it.
+"""
+review = """
+Review in the Literate AI way: check the change against the outcome the user asked for, and report claims of completion that lack evidence such as a test run, as well as changes beyond the stated scope.
+"""
+
+[literate]
+text = """
+This is a Literate AI project (`literate.project.json`). Specifications (`component.md`), Flavors and pinned skills are its authority; generated source is disposable, so change intent where that authority lives. Follow the project's `SKILL.md`. Where you may run commands, prefer its `litai` commands to hand edits: `litai project guidance --operation develop` before changing the tree, `litai verify` for every declared gate, `litai work record` and `litai work close` for the queue, and `litai project guidance --operation land` to land. Ask before compiling or running generated code.
+"""
